@@ -31,23 +31,28 @@ publishes per-vCPU stolen time from bounded owner-thread wall/execution samples,
 enables standard 64-bit SMCCC discovery when the HVF measurement primitive is
 available, and has signed Linux contention/idle/pause certification. PVTime
 serialization and clone restore are implemented in the public bangbang-native
-v2 profile. Public `Full` creation now writes current `2.6.0` profile-3
-state/memory pairs from a strictly bounded paused production session with an
-ordered regular-file storage graph containing block and pmem devices over MMIO
-(or up to the product PCI endpoint budget). The graph may be rooted or
-rootless; block records retain their read-only/read-write, Sync/Async,
-Unsafe/Writeback, partuuid, and limiter state, while pmem records retain exact
-file/mapped geometry, protection, limiter/retry, queue, interrupt, mapping, and
-transport state. Public load classifies the opened state once: current
-native-v2 reconstructs that complete graph through one exact keyed authority
-transaction and read-only File/COW memory in a fresh process, while exact
-block-only profile-2 `2.5.0`, single-root `2.4.0`, device-free `2.3.0`, and
-frozen native-v1 remain compatibility readers. Every family publishes
-`Paused` before optional ordinary lifecycle resume. Repeated destinations keep
-state/memory immutable and memory writes private, but writable external block
-and pmem prefixes deliberately share bytes and require operator
-serialization; each pmem alignment tail is private and starts zero in a fresh
-mapping. Other optional-device state remains an explicit Wave 6 limit.
+v2 profile. Public `Full` creation now writes current `2.7.0` state/memory
+pairs from a strictly bounded paused production session. Every pair carries a
+complete serial component and may additionally carry the profile-3 ordered
+regular-file block/pmem graph over MMIO or the product PCI endpoint budget.
+The serial value retains endpoint intent, limiter configuration, every
+guest-visible UART register, bounded RX bytes, status, and pending work while
+excluding source descriptors, terminal state, pipe buffers, TX bytes, and
+metrics. The optional storage graph may be rooted or rootless; block records
+retain read-only/read-write, Sync/Async, Unsafe/Writeback, partuuid, and
+limiter state, while pmem records retain exact file/mapped geometry,
+protection, limiter/retry, queue, interrupt, mapping, and transport state.
+Public load classifies the opened state once and reconstructs fresh
+destination serial endpoints plus any complete storage graph through one exact
+authority transaction and read-only File/COW memory. Exact storage-only
+profile-3 `2.6.0`, block-only profile-2 `2.5.0`, single-root `2.4.0`,
+device-free `2.3.0`, and frozen native-v1 remain compatibility readers. Every
+family publishes `Paused` before optional ordinary lifecycle resume. Repeated
+destinations keep state/memory immutable and memory writes private, but
+writable external block and pmem prefixes deliberately share bytes and require
+operator serialization; each pmem alignment tail is private and starts zero
+in a fresh mapping. Other optional-device state remains an explicit Wave 6
+limit.
 Host discard never promises synchronous RSS or footprint
 reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
@@ -57,14 +62,14 @@ The checked
 [aggregate remaining-device contract](compat/firecracker/v1.16.0/remaining-device-contract.md)
 closes #1481's live and capture-ready certification boundary across balloon,
 virtio-mem, entropy, default serial stdio, and time/identity devices. Its exact
-85-record selector has 77 terminal records and eight `audit-required` records,
-all assigned to [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)
-for optional-device encoding, restore, clone/portability policy, and signed
-restored-guest outcomes. The aggregate signed profile composes those devices
-over both default MMIO and product PCI, while the production-bundle gate proves
-two launcher/App-Sandbox-worker default-stdio sessions remain isolated. This
-does not make the private capture-ready values a snapshot format or a restored
-device claim.
+85-record selector now has 78 terminal records and seven `audit-required`
+records. Exact native-v2 2.7 serial encoding, restoration, fresh endpoint
+authority, and signed restored-guest outcomes are terminal; the other
+remaining-device handoffs stay assigned to
+[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). The aggregate
+signed profile composes those devices over both default MMIO and product PCI,
+while the serial production gate proves fresh launcher/App-Sandbox-worker
+stdio and configured-output destinations remain isolated.
 
 On macOS arm64 hosts with the required macOS 15+ HVF GIC/MSI symbols,
 `--enable-pci` selects Firecracker's exclusive all-virtio startup transport.
@@ -91,7 +96,8 @@ exact-prefix synchronous flush/unmap, and reusable aligned guest range.
 PCI-mode network PUT/DELETE uses the same owner-thread boundary with independent
 MMDS-only or vmnet packet I/O,
 generation-safe metrics, and exact cleanup. Automatic guest hotplug
-notification, snapshot persistence for optional PCI devices other than pmem,
+notification, snapshot persistence for optional PCI devices other than pmem
+(serial remains a platform MMIO device with its own exact 2.7 component),
 external vmnet connectivity certification, and Firecracker's KVM ITS identity
 remain explicit limits.
 Current native-v2 create runs the complete paused live-storage preflight and
@@ -354,30 +360,30 @@ ZA-register allocations.
 
 These primitives back a deliberately narrow public native-v2 snapshot path on
 macOS Apple Silicon. `PUT /snapshot/create` supports only `Full` snapshots from
-a paused 1–32-vCPU VM with a configured boot source and an ordered
-regular-file block-and-pmem storage graph, no optional devices other than
-pmem, no MMDS/boot timer, default serial configuration, and a live UART that
-still exactly matches the canonical empty reset-compatible model. The graph
-may have no root or one first cross-storage root. Block records admit mixed
-read-only/read-write, Sync/Async, Unsafe/Writeback, partuuid, and limiter
-configurations; pmem records retain exact protection, limiter, queue, mapping,
-and file/private-tail geometry. Every record uses the process-selected MMIO or
-PCI transport, with PCI additionally bounded by the 31-endpoint product
-budget. It writes a current `2.6.0` profile-3 state/memory pair whose state
-binds the retained File/COW memory image, complete typed machine, GIC,
-topology, per-vCPU, and time/clone-identity graph, plus every block and pmem
-configuration, runtime, common virtio, queue, mapping, and MMIO or PCI
-transport state.
-The normal process-standard-stream binding is destination-local rather than
-serialized: create still requires the default backend-neutral serial
-configuration and canonical UART state, and each restored process binds that
-state to its own standard output.
+a paused 1–32-vCPU VM with a configured boot source, complete live serial
+state, and an optional ordered regular-file block/pmem storage graph. It
+rejects optional devices other than pmem and serial, MMDS, boot timer, and
+vhost-user. The storage graph may have no root or one first cross-storage root.
+Block records admit mixed read-only/read-write, Sync/Async, Unsafe/Writeback,
+partuuid, and limiter configurations; pmem records retain exact protection,
+limiter, queue, mapping, and file/private-tail geometry. Every storage record
+uses the process-selected MMIO or PCI transport, with PCI additionally bounded
+by the 31-endpoint product budget. It writes a current `2.7.0` pair whose state
+binds retained File/COW memory; the complete typed machine, GIC, topology,
+per-vCPU, and time/clone-identity graph; a required exact serial component; and
+any profile-3 block/pmem configuration, runtime, common virtio, queue, mapping,
+and MMIO or PCI transport state.
+Serial endpoint intent is serialized, but live process bindings are
+destination-local. Each restored process opens fresh default stdio or resolves
+one configured output under destination authority; no source descriptor,
+terminal state, pipe buffer, TX byte, metric, or wakeup handle enters the
+artifact.
 
 Create reserves one FIFO boot-worker transaction, then failure-atomically
 quiesces the block, PMEM, network, and entropy retry publishers. The same lease
 traverses capture-ready storage, balloon, memory-hotplug, entropy, serial, and
 network owners across their applicable MMIO/PCI transports before applying the
-narrow public rejection for optional devices other than pmem.
+narrow public rejection for optional devices other than pmem and serial.
 Entropy traversal validates exact queue, feature, limiter, pending-descriptor,
 and scheduler state without persisting host entropy bytes or a wall-clock
 value. Network traversal joins configuration order to generation-bound packet
@@ -409,17 +415,18 @@ failure and prevents resume.
 process, except that logger and metrics configuration are allowed. It opens and
 classifies state once, routes frozen native-v1 to its existing File/Uffd
 compatibility loader, and routes native-v2 only to retained read-only File/COW
-memory. The v2 path validates the complete typed graph and default UART shell
-before construction, creates the fresh HVF VM/GIC/vCPU topology,
+memory. The v2 path validates the complete typed graph and the versioned UART
+profile before construction, creates the fresh HVF VM/GIC/vCPU topology,
 reconstructs PL031 from destination wall clock, restores PVTime, replaces and
 signals VMGenID, updates and signals VMClock, and only then commits the session
 as `Paused`. Legacy 2.3 parses the retained default FDT shell. Exact 2.4, 2.5,
-and current 2.6 instead verify the retained live FDT address, length, and CRC,
-then require versioned source-product evidence. Exact 2.4 reconstructs its
-singleton root shell; exact 2.5 reconstructs the complete rooted or rootless
-block shell; current 2.6 reconstructs the complete profile-3 block-and-pmem
-shell from the typed machine/device graph. Linux may already have consumed or
-reclaimed the original FDT bytes. `track_dirty_pages: true` can install a clean destination epoch
+2.6, and current 2.7 instead verify the retained live FDT address, length, and
+CRC, then require versioned source-product evidence. Exact 2.4 reconstructs
+its singleton root shell; exact 2.5 reconstructs the complete rooted or
+rootless block shell; exact 2.6 reconstructs the profile-3 block/pmem shell;
+and current 2.7 reconstructs complete serial state with optional unchanged
+profile-3 storage. Linux may already have consumed or reclaimed the original
+FDT bytes. `track_dirty_pages: true` can install a clean destination epoch
 after the v2 memory baseline and before mapping, vCPU ownership, or identity
 writes. Deprecated fields remain a native-v1 compatibility surface. A load
 failure after identity/time mutation, session publication, or requested resume
@@ -434,8 +441,9 @@ In the production bundle, contained native-v2 describe/load inputs use exact
 read-only state and memory grants, and create outputs use retained
 `SnapshotOutputDirectory` anchors plus bounded UTF-8 child names. Load
 classifies a duplicate of the state descriptor, then atomically adopts the
-matching state/memory pair; no tag is reopened as a pathname. Legacy native-v1
-loads additionally adopt any persisted root grant required by that format.
+matching state/memory pair and any exact block, pmem, or configured serial
+grants; no tag is reopened as a pathname. Legacy native-v1 loads additionally
+adopt any persisted root grant required by that format.
 Create preserves the same anchor-relative no-clobber transaction and repeated
 output-directory authority. Direct mode keeps ordinary path behavior.
 
@@ -444,7 +452,8 @@ accepted profile excludes network and vsock devices and the transient vsock
 poller is joined before pause acknowledgement. It does not freeze or persist
 vmnet peers, vsock peers, or their host/kernel buffers. Native-v1 remains a
 frozen one-vCPU compatibility format; native-v2 carries 1–32-vCPU state, while
-optional devices other than pmem remain outside the current public profile.
+optional devices other than pmem and serial remain outside the current public
+profile.
 
 This is not Firecracker snapshot-file compatibility or a portable migration
 format. Machine `track_dirty_pages` now enables one shared guest-RAM epoch
@@ -455,8 +464,8 @@ re-protects guest-written pages before clearing and advancing the epoch while
 the source is still paused. Complete rollback keeps the old conservative epoch;
 incomplete rollback prevents resume and tears the VM down safely. `Diff`
 artifacts and merging, native-v2 `Uffd`, clock adjustment, restore overrides,
-vhost-user and other optional-device snapshot state, general serial state,
-active SVE/SME/debug state, EL2 GIC CPU-interface state, and cross-host
+vhost-user and optional-device snapshot state other than pmem and serial,
+active SVE/SME/debug state, EL2 GIC CPU-interface state, and broad cross-host
 portability remain unsupported. Frozen native-v1 `Uffd` compatibility is
 supported only on macOS Apple Silicon with dirty tracking disabled. Its
 `backend_path` names a `bangbang-pager-v1` Unix peer, not a Linux UFFD endpoint
@@ -574,16 +583,18 @@ policy. The public normal-process adapter admits only pristine File/COW
 destinations and loads direct or contained pairs state-first. Legacy 2.3
 validates the exact default arm64 FDT/UART/RTC/time shell; exact 2.4 validates
 the singleton-root product; exact 2.5 validates the complete versioned
-multi-block product; and current 2.6 validates the profile-3 block-and-pmem
-product plus its live-FDT identity. It installs fresh
-buffered or stdout-only output without stdin and publishes a closed supervisor
-session initially `Paused`. The same immutable pair can restore into multiple fresh
-destinations; requested resume still passes through the ordinary lifecycle
-gate. File/COW memory is private per destination, while external writable
-drive files are deliberately shared without snapshot COW isolation; load
-offers no per-drive selector or configuration override and validates exact
-identity, role, access, kind, size, and geometry before construction.
-`--snapshot-version` reports `v2.6.0`, and `--describe-snapshot` reports
+multi-block product; exact 2.6 validates the profile-3 block/pmem product; and
+current 2.7 validates complete serial state plus optional profile-3 storage and
+live-FDT identity. It installs fresh default process stdio or a fresh
+configured output, restores buffered RX and pending UART work, and publishes a
+closed supervisor session initially `Paused`. The same immutable pair can
+restore into multiple fresh destinations; requested resume still passes
+through the ordinary lifecycle gate. File/COW memory is private per
+destination, while external writable drive files are deliberately shared
+without snapshot COW isolation; load offers no per-drive selector or
+configuration override and validates exact identity, role, access, kind, size,
+and geometry before construction.
+`--snapshot-version` reports `v2.7.0`, and `--describe-snapshot` reports
 the actual validated native-v1 or native-v2 version. Recognizing a pinned
 Firecracker bitcode prefix reports incompatibility rather than claiming decode
 or translation. The exact wire,
@@ -632,7 +643,7 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
 - `--no-api` requires `--config-file <PATH>`, starts from that configuration
   without publishing an API socket, and exits cleanly on `SIGINT` or `SIGTERM`.
 - `--snapshot-version` prints the current bangbang-native writer version
-  (`v2.6.0`) and exits before startup.
+  (`v2.7.0`) and exits before startup.
 - `--describe-snapshot <PATH>` reads a bounded regular native state file,
   classifies and validates its complete native-v1 or native-v2 envelope and
   CRC, prints its exact embedded version, and exits before startup. In
@@ -1464,8 +1475,10 @@ mode and descriptor flags are restored when the final shared endpoint owner
 drops. There is no public streaming API. The bangbang-native v1 profile keeps
 its six-register encoding, rejects live RX/status/intent state that it cannot
 represent, restores a fresh output buffer, and does not capture a public path,
-host endpoint, TX/RX bytes, limiter state, or UART counters; complete encoding
-and endpoint reconstruction remain a Wave 6 handoff.
+host endpoint, TX/RX bytes, limiter state, or UART counters. Exact native-v2
+2.7 instead carries endpoint intent, limiter configuration, complete UART
+registers, bounded RX, status, and pending work, then reconstructs fresh
+destination endpoints without inheriting source handles or pipe contents.
 
 The exact field classes, failure semantics, and native-v1 boundary are in
 [Firecracker Compatibility Scope](docs/firecracker-compatibility.md#firecracker-v1160-observability-contract).
@@ -1486,7 +1499,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 235 implemented-and-verified, 163 audit-required, three
+delivery overlay with 236 implemented-and-verified, 162 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
@@ -1501,7 +1514,7 @@ records its exact 17-terminal/two-Wave-6 split, and the
 [entropy closure ledger](compat/firecracker/v1.16.0/entropy-contract.md)
 records its exact five-terminal/two-Wave-6 split, and the
 [serial closure ledger](compat/firecracker/v1.16.0/serial-contract.md) records
-its exact five-terminal/one-Wave-6 split. The
+all six records as terminal, including exact native-v2 2.7 continuation. The
 [time and identity restore ledger](compat/firecracker/v1.16.0/time-identity-contract.md)
 records the completed PL031, VMGenID, VMClock, and live/capture-ready public
 PVTime behavior plus focused native-v2 time/clone restore, while retaining its
@@ -1509,7 +1522,7 @@ one aggregate record for Wave 6 public composition and broader cross-host
 portability certification. The
 [aggregate remaining-device ledger](compat/firecracker/v1.16.0/remaining-device-contract.md)
 joins those five family ledgers into an exact 85-record,
-77-terminal/eight-Wave-6 closure. The
+78-terminal/seven-Wave-6 closure. The
 [network and MMDS closure ledger](compat/firecracker/v1.16.0/network-mmds-contract.md)
 then maps an exact 35-record set to the composed direct, contained, capture,
 and non-success external gates: 31 are terminal and four remain audit-owned by
@@ -1526,7 +1539,7 @@ bridge, ordered before/during/after removal, peer-failure propagation,
 complete consumer gates, native-v1 direct/contained restore, paused-host plus
 exact restored-guest demand, exact nested entitlement dictionaries, and
 cleanup are implemented and verified.
-The repository-wide disposition counts are 235/163/3/17.
+The repository-wide disposition counts are 236/162/3/17.
 
 ## Build And Test
 

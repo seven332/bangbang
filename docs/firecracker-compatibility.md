@@ -19,8 +19,9 @@ preparation and MMIO registration helpers, an internal virtio-block
 config-space capacity model, an internal virtio-block request parser, single-request
 executor, queue dispatcher, MMIO queue-state bridge, resettable activation
 state, notification/interrupt-status dispatch helper, guest-visible raw block
-read validation through the signed HVF boot test, an internal TX-only
-serial MMIO output device model with shared bounded capture support, and a minimal
+read validation through the signed HVF boot test, an internal
+serial MMIO device model with bounded TX, RX, register/status, interrupt,
+capture, and restore support, and a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
@@ -29,8 +30,9 @@ handling commands, narrow vCPU register wrappers, macOS 15+ HVF GIC v3 boot meta
 arm64 FDT generation with optional RTC, serial, VMGenID, and virtio-mmio device-node descriptors and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership and
 controlled mapped-memory access for allocated regions, an internal MMIO region ownership registry and operation/data
-model plus handler dispatch boundary, an internal TX-only serial MMIO output
-handler that captures transmit bytes without global state, an internal virtio-mmio register/access
+model plus handler dispatch boundary, an internal serial MMIO handler that
+owns transmit output, bounded receive state, and interrupt intents without
+global state, an internal virtio-mmio register/access
 decoder, feature/status, queue, queue notification, and interrupt
 status/acknowledgement register state, a composed runtime handler that routes
 common register accesses through those state models and exposes drained queue
@@ -75,9 +77,8 @@ There is no broader API request body model beyond the initial boot-source,
 drive configuration, drive update, network-interface configuration, vsock configuration, machine-configuration, metrics, logger, serial, and actions bodies, public guest
 execution beyond internal startup execution across bounded step windows, full public run-loop control beyond the current pause/resume subset, complete interrupt
 delivery, including timer EOI/deactivation-driven unmasking,
-general HVF runner-loop notification scheduling, public serial output streaming,
-serial/backend interrupt wiring beyond the internal boot block and network notification
-and retained serial capture paths,
+general HVF runner-loop notification scheduling, public host-driven serial
+injection/streaming beyond process stdin,
 broader device-backed feature negotiation,
 device-backed runner-loop MMIO scheduling, complete device emulation,
 production log rotation/syslog/journald/tracing/remote telemetry, process-global
@@ -420,7 +421,7 @@ without claiming KVM's registration mechanism.
 artifact support. The checked
 [aggregate remaining-device contract](../compat/firecracker/v1.16.0/remaining-device-contract.md)
 selects exactly 85 records across balloon, memory hotplug, entropy, serial, and
-time/identity: 77 are terminal and the same eight aggregate rows remain
+time/identity: 78 are terminal and seven aggregate rows remain
 `audit-required` for their Wave 6 terminal handoffs. One public signed process profile composes
 the full device set over default MMIO and product PCI, including concurrent
 virtio-mem and balloon control, entropy retry pressure, greater-than-FIFO
@@ -428,10 +429,12 @@ default serial input across pause, ordered snapshot preflight rejection, and
 same-name process/control-resource reuse. Focused tests pin the five-device
 preflight order and bounded MMIO/PCI owner release/reuse; a production-bundle
 test proves independent default-stdio sessions across two
-launcher/sandboxed-worker pairs. All eight retained records belong to
+launcher/sandboxed-worker pairs. All seven retained records belong to
 [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490); none belongs
-to Wave 7 #1491. These capture-ready values remain private validated live state,
-not a Firecracker-compatible artifact or restored optional-device contract.
+to Wave 7 #1491. Exact native-v2 2.7 now supplies the serial artifact and
+restored-device contract; the other capture-ready values remain private
+validated live state, not Firecracker-compatible artifacts or restored
+optional-device contracts.
 
 Balloon inflate, accepted hinting, and free-page reporting use whole-range
 validation, per-owner segmentation, inward host-page alignment, and Darwin
@@ -534,7 +537,7 @@ This includes handled shutdown, guest terminal outcomes, worker terminal
 errors, and ordinary bind/wait/server errors; it does not add process-global
 panic-hook or fatal-signal durability.
 
-### Serial output and native-v1
+### Serial output, input, and native snapshots
 
 `PUT /serial` stores a nullable public output path and optional byte token
 bucket before boot. A configured file or FIFO is opened nonblocking with
@@ -563,17 +566,26 @@ serial streaming API.
 Bangbang-native v1 accepts only `SerialConfig::default()`. Its device state
 captures the serial MMIO metadata plus interrupt-enable, line-control,
 modem-control, scratch, and both divisor-latch register bytes. Restore creates
-a fresh bounded output buffer with empty UART metrics. A separate immutable,
-redacted capture-ready value pairs reconstructible external configuration with
-complete UART registers, ordered RX bytes, status, and pending intents while
-excluding host descriptors, terminal state, pipe buffers, TX bytes, counters,
-locks, and wakeup handles. Paused public snapshot traversal obtains that value
-under supervisor/quiescence ownership before any artifact publication.
-Native-v1 deliberately keeps its existing encoding and rejects any
-nonrepresentable RX/status/intent state instead of dropping it. A public path,
-limiter configuration or budget, endpoint reconstruction, and complete UART
-encoding remain the explicit Wave 6 handoff. This exact local profile is not
-Firecracker snapshot-artifact compatibility.
+a fresh bounded output buffer with empty UART metrics. Native-v1 deliberately
+keeps its existing encoding and rejects any nonrepresentable RX/status/intent
+state instead of dropping it.
+
+Current exact native-v2 2.7 kind 8 carries endpoint intent, optional limiter
+configuration, complete guest-visible UART registers, ordered RX bytes,
+line/interrupt status, and pending receive/input-ready work. Paused public
+snapshot traversal obtains that immutable bounded value under
+supervisor/quiescence ownership before artifact publication. Restore prepares
+fresh default destination stdout plus supported stdin, a fresh direct
+file/FIFO, or one exact contained `SerialSink`/`WriteOnly` regular-file grant;
+configured output remains output-only. Source descriptors, terminal
+attributes, host pipe/FIFO buffers, TX bytes, counters, limiter clock/budget,
+metrics, locks, wakeups, and deadlines do not cross the artifact. Signed direct
+and normal-production evidence covers serial-only and MMIO/PCI-storage-bearing
+continuation, nondefault registers, buffered RX above FIFO capacity across
+source and destination input, pending receive interrupt, fresh metrics,
+pathname replacement resistance, repeated clone loads, recapture, redaction,
+and cleanup. The local format does not claim Firecracker snapshot bytes or
+broad cross-host portability.
 
 ### Stable product boundaries
 
@@ -581,8 +593,8 @@ The ordinary CLI has no production rotation, syslog, journald, tracing, remote
 telemetry, or resource-broker policy. Logger and metrics state remains
 process-owned rather than global, so there is no panic/fatal-signal durability
 claim. These named product and architecture boundaries, the sparse metrics
-schema, and the serial host-RX/stdout/native-v1 limits replace an open-ended “full
-logging and metrics” placeholder.
+schema, and the exact native-v1/current-2.7 serial limits replace an open-ended
+“full logging and metrics” placeholder.
 
 The ordinary `bangbang` CLI remains the direct, uncontained process entry point.
 The separate production `Bangbang.app` entry point has a fixed unsandboxed
@@ -782,8 +794,8 @@ checkpoint remain 191/207/3/17. Exactly
 #1480 adds public accounting, capture-ready continuity, and focused Linux guest
 certification without changing those counts. #1481 adds the checked aggregate
 MMIO/PCI, failure-ordering, reuse, and production-stdio certification. Its exact
-85-record selector has 77 terminal outcomes and retains eight `audit-required`
-outcomes, all assigned to Wave 6 #1490 for serialization, restore,
+85-record selector had 77 terminal outcomes and retained eight `audit-required`
+outcomes at that checkpoint, all assigned to Wave 6 #1490 for serialization, restore,
 clone/portability policy, and signed restored-guest proof. No selected row is a
 Wave 7 #1491 handoff, and the global counts at that checkpoint remain
 191/207/3/17.
@@ -880,8 +892,12 @@ multi-vCPU/failure/death/repeat/cleanup composition, exact nested entitlement
 dictionaries, and the full validation matrix. It promotes only
 `corpus:snapshot-page-faults`, producing 229/169/3/17 at that checkpoint.
 #1578 then promotes four public native-v2 process/snapshot records. #1634
-promotes the final two pmem storage composites after native-v2 2.6 profile-3
-certification, so the current global counts are 235/163/3/17.
+promotes the final two pmem storage composites after exact native-v2 2.6
+profile-3 certification. #1651 activates current exact native-v2 2.7 serial
+state with optional unchanged profile-3 storage, and #1652 promotes the serial
+snapshot semantic after signed direct/contained certification. The current
+aggregate selector is 78 terminal and seven `audit-required`, and the current
+global counts are 236/162/3/17.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
@@ -903,12 +919,13 @@ serial stdio and retained active, paused, terminal-outcome, or error status.
 Process-owned API-enabled and no-api runs exit successfully after guest PSCI
 `SYSTEM_OFF` or `SYSTEM_RESET` and fail on non-success terminal worker states.
 The logger, sparse interval metrics, initial/periodic/explicit/terminal trigger
-rules, serial limiter, and precise native-v1 UART profile are the implemented
-supported subset documented above. Default serial stdout, terminal/FIFO stdin,
-bounded RX readiness, and paused capture-ready traversal are implemented;
-public streaming and generalized serial artifact restore remain explicit
-boundaries alongside process-global panic/fatal durability and production
-telemetry facilities.
+rules, serial limiter, precise native-v1 UART profile, and current exact 2.7
+serial artifact contract are the implemented supported subset documented
+above. Default serial stdout, terminal/FIFO/pipe stdin, bounded RX readiness,
+paused capture, fresh default/configured destination endpoints, and complete
+UART restoration are implemented; public host-driven streaming, Firecracker
+artifact bytes, and broad portability remain explicit boundaries alongside
+process-global panic/fatal durability and production telemetry facilities.
 
 ## Offline Seccompiler Compatibility
 
@@ -1028,13 +1045,13 @@ management remains deferred.
 | `--show-level` | enables level prefix for minimal logger events | Writes `level=Info` before minimal API request, action, and boot-timer log lines. |
 | `--show-log-origin` | enables origin field for implemented logger events | Writes `origin=<file>:<line>` before API request, action, and boot-timer log messages. |
 | `--boot-timer` | enables guest boot-time logging | Registers the Firecracker aarch64 pseudo-MMIO boot timer at `0x4000_0000`; a guest write of byte value `123` at offset `0` logs elapsed wall and process CPU time through the configured logger sink when level and module filters allow `Info` for `bangbang_runtime::boot_timer`. This is process observability state and is not exposed in `GET /vm/config`. |
-| `--enable-pci` | selects all-virtio PCI startup on supported macOS arm64/HVF hosts | Exact flag syntax is immutable for the process. Required target and GIC/MSI symbols are checked before API/no-api readiness; one shared 31-endpoint slot/BAR/dispatcher budget plus exact fixed and worst-case runtime vector demand is checked before `Running`. Balloon, block, network, pmem, vsock, entropy, and virtio-mem use deterministic modern PCI functions while serial, RTC, boot timer, GIC, VMGenID, and VMClock remain platform MMIO devices. PCI mode omits the VMM-supplied `pci=off` and publishes only the PCI/GICv2m transport FDT; default startup remains all-virtio-MMIO. Current native-v2 2.6 create/load supports rooted or rootless profile-3 regular-file block/pmem vectors up to the same product endpoint budget; exact 2.5 retains its block-only profile 2 and exact 2.4 retains its singleton root. Frozen native-v1 and snapshot profiles for optional devices other than pmem still reject PCI. Running/Paused non-root block, pmem, and network PUT/DELETE share type-scoped identity and one owner-thread inventory with manual guest coordination. |
+| `--enable-pci` | selects all-virtio PCI startup on supported macOS arm64/HVF hosts | Exact flag syntax is immutable for the process. Required target and GIC/MSI symbols are checked before API/no-api readiness; one shared 31-endpoint slot/BAR/dispatcher budget plus exact fixed and worst-case runtime vector demand is checked before `Running`. Balloon, block, network, pmem, vsock, entropy, and virtio-mem use deterministic modern PCI functions while serial, RTC, boot timer, GIC, VMGenID, and VMClock remain platform MMIO devices. PCI mode omits the VMM-supplied `pci=off` and publishes only the PCI/GICv2m transport FDT; default startup remains all-virtio-MMIO. Current native-v2 2.7 create/load supports complete platform-MMIO serial state plus optional rooted or rootless profile-3 regular-file block/pmem vectors up to the same product endpoint budget; exact 2.6 retains the storage-only profile, exact 2.5 retains block-only profile 2, and exact 2.4 retains its singleton root. Frozen native-v1 and snapshot profiles for optional devices other than serial and pmem still reject PCI. Running/Paused non-root block, pmem, and network PUT/DELETE share type-scoped identity and one owner-thread inventory with manual guest coordination. |
 | `--mmds-size-limit <BYTES>` | configures the maximum serialized MMDS data-store size | When omitted, follows the effective HTTP API payload limit like Firecracker; with default HTTP settings this is `51200` bytes. The complete non-negative `usize` domain is accepted. A zero limit permits startup and rejects every serialized JSON object through the MMDS data-store-limit response. Malformed, overflowing, and duplicate values fail during argument parsing. |
 | `--metadata <PATH>` | initializes MMDS data before API serving or no-api readiness | Reads a readable regular UTF-8 JSON metadata file up to 1 MiB and applies it through the same runtime validation and serialized data-store limit as `PUT /mmds`. Malformed files, non-object data, oversized files, duplicate object keys, empty paths, control-character paths, and missing-value inputs fail before readiness. |
 | `--config-file <PATH>` | startup implemented for supported subset | Reads a Firecracker-shaped JSON configuration from a readable regular file up to 1 MiB, applies supported sections through the same validation path as matching API requests, and starts the VM with `InstanceStart`. In API-enabled mode, the API socket is published only after successful startup. Malformed files, oversized files, duplicate object keys, unknown sections, unsupported sections, or invalid sections fail before socket publication or no-api readiness. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
-| `--snapshot-version` | implemented native-envelope inspection | Prints the current public writer version `v2.6.0` and exits successfully before fd-table setup, API socket publication, signal setup, or HVF startup. This names bangbang's native data format and does not claim Firecracker v10 artifact compatibility. |
+| `--snapshot-version` | implemented native-envelope inspection | Prints the current public writer version `v2.7.0` and exits successfully before fd-table setup, API socket publication, signal setup, or HVF startup. This names bangbang's native data format and does not claim Firecracker v10 artifact compatibility. |
 | `--describe-snapshot <PATH>` | implemented native-envelope inspection | Opens one bounded regular file, classifies native-v1/native-v2/pinned-Firecracker/unknown input, fully validates the selected native envelope and CRC, and prints the exact embedded v1 or compatible v2 version. In contained mode an exact `bangbang-grant:<GrantId>` claims one `SnapshotDescribeInput`/`ReadOnly` descriptor and inspects it without reopening the tag; direct mode keeps ordinary pathname opening. Missing, non-regular, oversized, malformed, corrupt, future-version, incompatible, missing-grant, or wrong-role files fail before startup with the bad-configuration exit status and path/payload/reference-redacted diagnostics. Firecracker state files are intentionally incompatible and are never relabeled as v10 or native-v2. |
 | `--no-api` | config-file startup without API socket | Requires `--config-file`. Starts the supported config-file subset without binding or publishing the configured API socket, then waits for handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET`. Runtime control and remaining runtime error exit-code parity remain deferred; `SYSTEM_RESET` is a terminal process outcome. |
 | seccomp process flags | rejected | Firecracker's runtime seccomp installation is Linux-specific and has no public macOS equivalent. |
@@ -1361,13 +1378,13 @@ compatibility targets.
 | `PUT` | `/actions` | supported target; internal startup execution and explicit metrics flush implemented | Parses `InstanceStart` and `FlushMetrics` and routes them through the process VMM owner. Parsed request and successful action logger records are best effort and never gate the functional result. `InstanceStart` validates boot source and state, prepares an owned HVF session with configured serial output or default process stdout/terminal-or-FIFO stdin, starts the worker, and commits `Running` after the worker handle is retained. `FlushMetrics` is rejected before startup; after startup it returns `204` for an unconfigured/successful sink or a metrics fault for a failed configured write, and it retains its API/action/logger effects. Automatic initial, periodic, and terminal writes do not route through `/actions` and create no action log. The aarch64 `SendCtrlAltDel` parser path contributes to `put_api_requests.actions_count` but not `actions_fails`, matching Firecracker's parser-entry placement. |
 | `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. The unsupported request is counted under `put_api_requests.actions_count` without incrementing `actions_fails`. |
 | `PUT` | `/logger` | implemented supported process-local subset | Stores pre-boot configuration, opens an optional nonblocking sink, applies level/show/module filters, and omits observability state from `GET /vm/config`. Parsed API method/path and successful `InstanceStart`/explicit `FlushMetrics` actions are unrestricted host records with no bodies. Boot-timer records use the bounded callsite and recovery contract above. Sink contention/poison/write/flush failure increments `missed_log_count` and never changes the request, action, or guest result. No sink is configured by default. |
-| `PUT` | `/serial` | implemented output/limiter plus portable RX/state core | Stores an optional pre-boot public path and byte token bucket; `{}` or `"serial_out_path": null` clears the public path. Startup opens a configured file/FIFO nonblocking, otherwise it uses a bounded 64-KiB internal buffer rather than stdout. Exhausted TX bytes are dropped without blocking, sleeping, or failing the guest write. The backend-neutral UART has a bounded 64-byte RX FIFO, DR/OE/RDA/FCR behavior, typed delivery/drain intents, complete capture-ready state, and shared RX/TX metrics. Public RX/stdin/default-stdout/streaming, host-fd readiness, and GIC delivery are absent. |
+| `PUT` | `/serial` | implemented output/limiter, portable RX/state core, and exact 2.7 restore | Stores an optional pre-boot public path and byte token bucket; `{}` or `"serial_out_path": null` clears the public path. Startup opens a configured file/FIFO nonblocking and disables stdin, or duplicates nonblocking process stdout plus supported terminal/FIFO/pipe stdin. A contained selector adopts one exact write-only regular-file grant without reopening it. Exhausted TX bytes are dropped without blocking, sleeping, or failing the guest write. The backend-neutral UART has a bounded 64-byte RX FIFO, DR/OE/RDA/FCR behavior, typed delivery/drain intents, complete register/status state, GIC receive-interrupt delivery, and shared RX/TX metrics. Exact native-v2 2.7 retains endpoint intent, limiter configuration, registers, RX, status, and pending work while each destination prepares fresh endpoints, limiter budget, and metrics. Public host-driven streaming remains absent. |
 | `PUT` | `/cpu-config` | supported finite arm64 custom profile; all other categories terminally classified | Parses bounded ordered Firecracker aarch64 custom templates with a 256-entry limit per array, exact 32/64/128-bit ARM identities/bitmaps, fixed seven-word vCPU-feature indexes, stronger duplicate-identity checks, and value-redacted diagnostics. A successful custom PUT replaces static/custom state; empty input clears it. Exact `(baseline & !filter) | value` execution covers eleven U64 ID registers, ACTLR.EnTSO, U64 X0/X4-X30 and reviewed SP/PC/PSTATE fields, U128 Q0-Q31 with explicit little-endian transport, and U32 FPCR/FPSR with fail-closed scalar conversion. ZFR0/SMFR0 require a public macOS 15.2 pre-VM gate; ACTLR filters are limited to bit 1. Every requested typed baseline is read on every owner before any write, targets are common, and each write is immediately reread; boot setup then overrides X0/PC/PSTATE. Any failure destroys the unpublished VM. X1-X3, banked state, all named unsafe/dependency/time/ownership/EL2 public-HVF families, aliases, unnamed encodings, and invalid KVM fields receive stable value-free policy faults; KVM capability, vCPU-feature, demux, firmware, firmware-feature, SVE, and unknown classes have distinct platform faults. Custom contents are omitted from GET and excluded from native-v1 snapshots. See the checked CPU-template contract. |
 | `PUT` | `/network-interfaces/{iface_id}` | pre-boot storage, PCI-only Running/Paused insertion, and capture-ready handoff implemented | Stores up to 16 initial virtio-net configurations before boot without opening host networking resources, including Firecracker-shaped RX/TX bandwidth and ops limiters. Startup preparation attaches configured interfaces over the selected virtio-MMIO/FDT or modern PCI transport. In a live PCI session, a new validated ID/MAC prepares one independent packet-I/O entry using the immutable startup/MMDS policy, checks actual contained vmnet authority, publishes metrics and PCI ownership on the owner thread, and commits live configuration last. Existing entries keep their queues and resources. Duplicate ID/MAC, invalid host config, capacity, authority, command, and publication failures preserve prior state; uncertain cleanup is terminal. Default MMIO rejects runtime insertion. Internal notification dispatch and runtime PATCH retain the same limiter/retry behavior and detailed per-interface/aggregate metrics. Paused capture joins configuration-order packet-I/O and metrics generations to deterministic MMIO/PCI owners, exact queues/features/limiters and reconstructible TX retry, and optional MMDS identity while excluding host handles, callbacks, peer packets, live TCP/ARP state, cached responses, absolute clocks, and token secrets. External direct-vmnet connectivity plus network encoding and restore remain deferred. |
 | `PUT` | `/vsock` | supported target; implemented supported live MMIO-or-PCI startup/Unix-socket subset | Repeated valid pre-boot requests atomically replace stored configuration; post-start PUT is stably rejected without mutation. Direct mode defers opening the ordinary path until startup. Contained mode recognizes only exact `bangbang-grant:<GrantId>/<SocketChild>` references, claims one exact `VsockSocketDirectory` after complete request validation, and retains its scope/anchor without reopening the tag; rejected replacement preserves prior public and private state. Startup either binds and inode-tracks the direct path or exclusively publishes a supplied owner-only listener through the exact anchor, then attaches one guest-visible endpoint over the selected startup transport with three 256-entry queues and cleans up only its own socket. Host initiation uses that main listener. Guest initiation in contained mode uses a session-bound launcher facet fixed once to the anchor/child and carrying only monotonic `u32` ports plus connected stream descriptors; the launcher receives no guest payload and the worker gains no outgoing-network entitlement. The live handler supports bounded handshakes and four-packet directional backlogs, one 1023-connection active budget shared across both initiation directions, a separate 256-entry incomplete-host-handshake bound, round-robin host-local-port allocation, dynamic 64-KiB credit windows with wrapping counters, partial/full shutdown, two-second request/shutdown cleanup, reset/error handling, `EVENT_IDX`, validated source-side `TRANSPORT_RESET` publication, restored-origin signaling with runtime-only RX acknowledgement gating, and path/payload-redacted diagnostics. Signed Apple Silicon cases verify both initiation directions, ≥1 MiB direct transfers and a 1-MiB granted host-initiated transfer, both peers' write-half-close/EOF, terminal cleanup, two-stream isolation, an outside-container granted API listener, and no steady-state helper or entitlement change. Indirect descriptors are a supported bangbang extension. PATCH, DELETE, runtime hotplug, broader CID routing, broader event types, runtime PCI hotplug, vhost/KVM, and general performance/artifact parity remain excluded. Internal redacted MMIO/PCI capture and supplied-listener/connector reconstruction are implemented. The paused producer validates the exact controller/runtime/HVF MMIO-or-PCI owner, metrics, memory, reset, and capture before detaching source connection work under one lease; current native-v2 create invokes it before its optional-device rejection and creates no artifact. Internal destination restore resolves captured/override selectors before resource access, prepares owner-only stale-safe direct or exact transactional contained resources without ambient fallback, and transfers cleanup through single-use runtime adoption. The checked vsock ledger certifies all eight API/live records. Public native-v2 records still omit vsock encoding/placement and load rejects overrides; the six aggregate encoding, public invocation, restored-guest acknowledgement/reconnect/override, clone/version, and portability outcomes remain #1490 work. |
 | `GET`, `PUT`, `PATCH` | `/mmds` | supported target; bounded control-plane storage, guest HTTP/token handling, per-interface Ethernet/ARP/IPv4/TCP sessions, retransmission scheduling, vmnet detouring, MMDS-only packet I/O, and signed executable guest paths implemented | Stores bounded process-local JSON, serves control-plane GET and RFC 7396 PATCH, and preserves prior data on invalid or oversized updates. Guest HTTP supports GET plus token PUT, Firecracker-shaped v1/v2 behavior, stateless instance-bound AES-256-GCM tokens, accepted HTTP/1.0 and HTTP/1.1 response versions, IMDS text or JSON output, and redacted parse failures. Each selected interface owns an independent bounded stack while sharing only VM metadata, token authority, and aggregate metrics. A valid untagged Ethernet frame is speculatively owned from its ARP target or IPv4 destination; targeted malformed packets are consumed, VLAN is unsupported, non-TCP IPv4 is unusual, and IPv4 fragments are handled independently without reassembly. Exact ARP replies precede TCP output. Port 80 TCP follows the pinned 30-connection, 100-reset, 2,500-byte receive-buffer, single-response, MSS/window, sequence/ACK, FIN/RST, eviction, 1.2-second retransmission, and fifteenth-timeout reset rules. One generated frame is retained until guest RX commit; pending resets precede round-robin connection output. MMDS is offered before external vmnet RX, and an all-MMDS configuration never opens vmnet. Immediate readiness and the earliest future protocol deadline flow through generation-safe MMIO/PCI owner scheduling and merge with limiter deadlines across pause, hotplug deletion/reuse, and shutdown. Signed MMIO and PCI guests renew v2 tokens, consume a segmented 49,152-byte response, deliberately drop one ACK, and observe retransmission without external networking or credentials. ARP caching/gratuitous ARP/timeouts, IPv4 fragment reassembly, capture/restore of live network sessions, and positive external vmnet connectivity remain outside this slice. |
 | `PUT` | `/mmds/config` | supported target; control-plane config storage implemented | Parses Firecracker-shaped MMDS config with required `network_interfaces`, optional `version`, optional RFC 3927 usable link-local `ipv4_address`, and optional `imds_compat`; keeps empty or whitespace-only interface IDs as malformed request bodies, but routes empty interface lists to runtime semantic validation before mutation; validates referenced interface IDs against configured network interfaces; stores config before startup; and keeps post-start requests on the normal unsupported-state policy. The selected interfaces use the complete implemented bounded guest-visible MMDS path over MMIO or PCI; post-start config mutation remains intentionally unsupported. |
-| `PUT` | `/snapshot/create`, `/snapshot/load` | supported current native-v2 2.6 regular-file block-and-pmem profile-3 Full/File lifecycle, exact native-v2 2.5/2.4/2.3 loaders, plus frozen native-v1 File/Uffd reader | Parses Firecracker-shaped bodies, rejects malformed input first, and keeps paths/overrides redacted. Paused-only `Full` create admits a 1–32-vCPU source with 1–64 ordered regular-file block/pmem records over selected MMIO or the product PCI budget, with no root or one first cross-storage root. Profile 3 persists exact configuration/runtime/limiter/queue/interrupt/mapping/transport state; optional devices other than pmem, MMDS, boot timer, nondefault serial, vhost-user, and noncanonical UART reject before artifacts. Load opens state once and selects frozen native-v1, exact 2.3, 2.4, block-only 2.5, or current 2.6 File/COW. Current load derives one exact typed keyed block/pmem complete-set transaction; missing, extra, reordered/swapped, aliased, wrong-role/kind/access/length/geometry, consumed, or canceled authority rejects before construction with no ambient fallback or per-device override. The batch remains provisional until Paused publication. State/memory and guest File/COW writes stay immutable/private; writable external block and pmem prefixes are deliberately shared and require operator serialization, while each fresh pmem private tail starts zero. Signed direct and normal-production/App-Sandbox rooted pmem-only and rootless mixed MMIO/PCI matrices prove persistence, limiter/interrupt progress, recapture, exact grants, explicit/automatic resume, immutable-pair reuse, shared prefix epochs, read-only protection, fresh tails, redaction, and worker/launcher cleanup. No Firecracker artifact interoperability, native-v2 `Uffd`, `Diff`, other optional-device/general-serial profile, or broad portability is claimed. |
+| `PUT` | `/snapshot/create`, `/snapshot/load` | supported current native-v2 2.7 complete-serial Full/File lifecycle with optional regular-file block-and-pmem profile-3 storage, exact native-v2 2.6/2.5/2.4/2.3 loaders, plus frozen native-v1 File/Uffd reader | Parses Firecracker-shaped bodies, rejects malformed input first, and keeps paths/overrides redacted. Paused-only `Full` create admits a 1–32-vCPU source with complete bounded serial state and either no storage or 1–64 ordered regular-file block/pmem records over selected MMIO or the product PCI budget, with no root or one first cross-storage root. Serial kind 8 persists endpoint intent, limiter configuration, guest-visible UART registers, bounded RX, status, and pending work; optional profile-3 kind 7 retains exact storage configuration/runtime/limiter/queue/interrupt/mapping/transport state. Optional devices other than serial and pmem, MMDS, boot timer, and vhost-user reject before artifacts. Load opens state once and selects frozen native-v1, exact 2.3, 2.4, block-only 2.5, storage profile-3 2.6, or current serial-required 2.7 File/COW. Current load derives one exact serial-plus-optional-storage authority transaction; missing, extra, reordered/swapped, aliased, wrong-role/kind/access/length/geometry, consumed, or canceled authority rejects before construction with no ambient fallback or per-device override. Fresh default stdio or a fresh configured file/FIFO or contained write-only sink replaces source endpoints; source descriptors, terminal/FIFO buffers, TX bytes, counters, limiter budget, and metrics do not cross the artifact. The batch remains provisional until Paused publication. State/memory and guest File/COW writes stay immutable/private; writable external block and pmem prefixes are deliberately shared and require operator serialization, while each fresh pmem private tail starts zero. Signed direct and normal-production/App-Sandbox serial-only and rooted pmem-only/rootless mixed MMIO/PCI matrices prove UART register/RX/interrupt continuation, fresh endpoints and metrics, configured-output pathname replacement resistance, storage persistence, limiter/interrupt progress, recapture, exact grants, explicit/automatic resume, immutable-pair reuse, shared prefix epochs, read-only protection, fresh tails, redaction, and worker/launcher cleanup. No Firecracker artifact interoperability, native-v2 `Uffd`, `Diff`, optional-device profile beyond serial and pmem, or broad portability is claimed. |
 | `GET` | `/balloon` | supported target; pre-boot and runtime config read implemented | Returns the stored Firecracker-shaped balloon configuration after successful `PUT /balloon`, runtime `PATCH /balloon`, or valid runtime `PATCH /balloon/statistics`; returns the balloon-specific unsupported fault when no balloon configuration exists. Runtime derives backend-neutral virtio-balloon identity, features, queues, and config space from stored config. Startup attaches the current endpoint over the selected startup transport, and the HVF boot loop can dispatch inflate, deflate, statistics, free-page hinting, and free-page reporting notifications with interrupt signaling. Inflate/deflate descriptors update internal inflated-page accounting, hinting command descriptors update `guest_cmd`, and completed inflate plus accepted current-command hint and reporting ranges use best-effort inward-aligned Darwin zero/free advice before dispatch returns. Statistics queue reports are parsed and stored for `GET /balloon/statistics`, process-level periodic scheduling can complete a pending statistics descriptor with queue-interrupt intent while the VM is running, and device metrics distinguish discard attempts, reporting-requested bytes, actual advised bytes, skipped edges, and failures. |
 | `PUT`, `PATCH` | `/balloon` | implemented and verified; pre-boot configuration, live target/statistics updates, queue dispatch, accounting, and Darwin discard | `PUT /balloon` stores Firecracker-shaped balloon configuration before boot, rejects targets larger than current guest memory without mutating prior config, accepts and preserves `free_page_reporting: true`, appears in `GET /balloon` and `GET /vm/config`, and feeds startup attachment of a virtio-balloon endpoint over the selected transport with the reporting feature and compacted queue when enabled. Pre-boot machine-config updates also reject memory sizes smaller than an already configured balloon target. Runtime `PATCH /balloon` updates the stored `amount_mib`, active `num_pages` config space, config generation, and config interrupt. Runtime `PATCH /balloon/statistics` can update a nonzero statistics polling interval to another nonzero value while preserving Firecracker's rejection of runtime statistics enable/disable transitions. Runtime queue dispatch covers inflate, deflate, configured statistics reports, pending statistics descriptor completion from process-level periodic scheduling, active-run hinting ranges, and device-writable reporting ranges. Completed inflate plus accepted current-command hint and reporting ranges are zeroed and made clean/reclaimable on inward-aligned Darwin host-page interiors; advice is best effort, unsupported targets fail honestly, requested reporting bytes remain distinct from actual advised bytes, and no synchronous footprint reduction is promised. |
 | `GET` | `/balloon/statistics` | implemented and verified; required target/actual and optional guest-reported fields | Routes through the VMM state/action policy. Statistics queries are post-boot-only, require configured active balloon state, and return Firecracker-shaped required fields: `target_pages`, `actual_pages`, `target_mib`, and `actual_mib`. Target values come from the current stored balloon target, including runtime `PATCH /balloon` updates. Actual values come from active inflated-page accounting. Optional guest-reported fields are included only after a bounded statistics queue report records them; process-level periodic scheduling can complete a pending descriptor and request the next report while the VM is running. Linux's pre-`DRIVER_OK` statistics kick is admitted after `FEATURES_OK` and retained until balloon activation. |
@@ -1375,7 +1392,7 @@ compatibility targets.
 | `PATCH` | `/balloon/hinting/start` | implemented and verified; host command state, guest acknowledgement, and Darwin active-range discard | Parses Firecracker-shaped free-page hinting start commands, including empty/default commands, rejects malformed or invalid bodies first, and then routes valid requests through the VMM state/action policy. Hinting start is post-boot-only, requires a configured balloon with `free_page_hinting: true`, preserves `acknowledge_on_stop` in backend-neutral device state, advances the host command id while skipping reserved values, updates active config space, raises a config interrupt, and returns `204 No Content`. Hinting queue command acknowledgements can update `guest_cmd`, accepted current-command ranges use best-effort Darwin discard, stale/inactive ranges remain ignored, and completed guest `STOP(0)`/`DONE(1)` commands can automatically acknowledge host `DONE(1)`. |
 | `PATCH` | `/balloon/hinting/stop` | implemented and verified; host command state, guest acknowledgement, and Darwin active-range discard | Routes through the VMM state/action policy without parsing the request body, matching Firecracker's stop-command parser behavior. Hinting stop is post-boot-only, requires a configured balloon with `free_page_hinting: true`, writes the Firecracker done command into host-owned active device state and config space, raises a config interrupt, and returns `204 No Content`. Hinting queue command acknowledgements can update `guest_cmd`, accepted active-run ranges use best-effort Darwin discard before a stop takes effect, and completed guest `STOP(0)`/`DONE(1)` commands can automatically acknowledge host `DONE(1)`. |
 | `GET` | `/balloon/hinting/status` | implemented and verified; host and guest command status | Routes through the VMM state/action policy. Hinting status is post-boot-only, requires a configured balloon with `free_page_hinting: true`, and returns Firecracker-shaped `host_cmd` and `guest_cmd` fields from active device state. Current status reports the latest start/stop host command and the latest 4-byte guest command observed on the hinting queue; `guest_cmd` remains `null` until the guest sends a command descriptor. Accepted active-run ranges are validated and discarded best effort on Darwin but are not exposed in this response. |
-| `PUT`, `PATCH` | `/pmem/{id}` | implemented direct MMIO-or-PCI startup, pmem root, non-root PCI runtime, capture-ready state, aggregate live certification, and native-v2 2.6 serialization/restore | `PUT /pmem/{id}` stores strict Firecracker-shaped configuration with one cross-storage root, exact direct or contained regular-file authority, one file/private-tail mapping, and exact-prefix `MS_SYNC`. Runtime PCI insertion remains non-root-only and preflights every owner capacity before authority or mapping work. Profile 3 serializes exact file/mapped geometry plus configuration/runtime/limiter/queue/interrupt/mapping/transport state and restores it in the same typed complete-set transaction as block. Signed focused and aggregate coverage proves live protection/coherence/reuse; signed rooted pmem-only and rootless mixed MMIO/PCI direct/contained matrices prove shared writable prefix epochs, unchanged read-only peers, zero fresh private tails, immutable state/memory, recapture, exact grants after pathname replacement, and cleanup. |
+| `PUT`, `PATCH` | `/pmem/{id}` | implemented direct MMIO-or-PCI startup, pmem root, non-root PCI runtime, capture-ready state, aggregate live certification, and exact native-v2 2.6/current 2.7 serialization/restore | `PUT /pmem/{id}` stores strict Firecracker-shaped configuration with one cross-storage root, exact direct or contained regular-file authority, one file/private-tail mapping, and exact-prefix `MS_SYNC`. Runtime PCI insertion remains non-root-only and preflights every owner capacity before authority or mapping work. Profile 3 serializes exact file/mapped geometry plus configuration/runtime/limiter/queue/interrupt/mapping/transport state and restores it in the same typed complete-set transaction as block; current 2.7 composes that unchanged storage graph with required serial state. Signed focused and aggregate coverage proves live protection/coherence/reuse; signed rooted pmem-only and rootless mixed MMIO/PCI direct/contained matrices prove shared writable prefix epochs, unchanged read-only peers, zero fresh private tails, immutable state/memory, recapture, exact grants after pathname replacement, and cleanup. |
 | `PUT` | `/entropy` | implemented and verified for supported MMIO-or-PCI startup, limiting, metrics, and capture-ready state; optional serialization excluded | Stores one strict Firecracker-shaped virtio-rng configuration before boot. Missing, `null`, empty, and all-null `rate_limiter` objects remain unconfigured; valid `bandwidth` and `ops` buckets are stored, echoed through `GET /vm/config`, and applied to the selected queue path. Each writable request is capped at 64 KiB and filled by the session-owned host OS source. Throttled descriptors are returned and retained exactly once, with the earliest backend-neutral retry scheduled by the HVF session. Allocation, length, guest-write, and used-ring failures restore exact pre-consumption bucket state; a published zero-length host-source failure remains consumed. Paused capture validates exact features, activation, queue mapping/geometry/cursors, external limiter configuration, redacted bucket state, one pending descriptor, and scheduler agreement through exactly one MMIO or PCI owner. Native-v1 traverses it before optional-profile rejection but emits no entropy encoding. Signed Linux guests prove marker-gated first/repeated `/dev/hwrng` reads, real dual-bucket throttling, pause/capture/resume, metrics, and cleanup over both transports. Post-start PUT remains unsupported. Firecracker's exact Linux timerfd/eventfd identity and optional-device serialization/restore remain deferred. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | implemented and verified for supported MMIO-or-PCI startup, live metrics, and capture-ready state; DELETE and optional serialization excluded | `PUT` validates and stores block/slot/total sizing before boot; `GET` returns stored pre-start status or exact active requested/plugged status; `PATCH` validates and signals requested-size changes after start. Startup attaches one virtio-mem endpoint over the selected startup transport. Its queue validates request/response descriptors and complete block ranges, answers `STATE`, and applies `PLUG`, `UNPLUG`, and `UNPLUG_ALL` over exact block-owned guest/HVF mappings before ACK. Device state commits only after guest-visible completion; split/combined mappings and partial or late failures use reverse rollback and fail closed. Singleton metrics retain Firecracker's exact 18 fields while separate extensions expose interrupt, rollback, owner-cleanup, and teardown outcomes. Paused capture proves exact transport queue/interrupt state and shared-aperture guest/HVF/dirty ownership; current native-v2 preflights it without serializing it. Focused coverage crosses the conceptual slot boundary and adjacent mappings without claiming KVM slot identity. Signed direct-rootfs coverage proves Linux binding and public requested/plugged size `0 -> 128 MiB -> 0`. Runtime device deletion, broader public accounting, and optional-device serialization/restore remain deferred. |
 | `PATCH` | `/vm` | implemented and verified API semantics; native-v2 snapshot ownership implemented | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state. After startup, `Paused` transitions a `Running` instance to `Paused` only after a topology-wide active-run wakeup barrier drains every online vCPU and the process-owned boot worker closes its next-run gate. `Resumed` transitions it back to `Running` only after the worker accepts resume. Same-state `Paused` and `Resumed` requests return `204`, still require the retained process session, leave state unchanged, skip the backend command and generation, and record the successful API-request latency. Signed single-process and dual-process evidence repeats both requests, observes stable state and independent CPU0/CPU1 progress tokens, proves both stop while one process is paused as an isolated peer continues, and proves both resume without fixed sleeps. The native-v2 public profile layers a complete 1–32-vCPU four-scheduler capture/publication transaction over this topology barrier; generic optional-device artifact ownership remains deferred. |
@@ -1577,35 +1594,39 @@ validates process freshness and the committed pair before VM construction,
 commits a real restored session as `Paused`, and optionally uses ordinary
 resume. Load opens and classifies state once. Contained native-v2 load
 atomically adopts tagged state/memory inputs and never reopens their selectors;
-current 2.6 additionally derives every inert profile-3 block and pmem request
-from the decoded graph and resolves the keyed complete vector through one exact
-typed destination authority transaction. Missing, extra, reordered, swapped,
+current 2.7 additionally derives the serial endpoint intent and every inert
+optional profile-3 block and pmem request from the decoded graph, then resolves
+the configured serial sink plus keyed storage vector through one exact typed
+destination authority transaction. Missing, extra, reordered, swapped,
 cross-class aliased, wrong-access, wrong-role/kind, wrong-size,
-changed-geometry, or consumed
-resources fail before construction without ambient pathname fallback. The
-complete batch commits only with the restored session/controller. Exact 2.4
-uses the same boundary for its singleton root, while frozen native-v1
-additionally adopts its persisted-root input. Direct load keeps no-follow
-pathname adapters. Malformed bodies are rejected by the parser first, while
-execution faults remain typed and path/reference-redacted.
+changed-geometry, or consumed resources fail before construction without
+ambient pathname fallback. Default-stdio restore instead prepares fresh
+destination process endpoints. The complete batch commits only with the
+restored session/controller. Exact 2.6 retains the storage-only profile-3
+boundary, exact 2.4 uses the same boundary for its singleton root, and frozen
+native-v1 additionally adopts its persisted-root input. Direct load keeps
+no-follow pathname adapters. Malformed bodies are rejected by the parser first,
+while execution faults remain typed and path/reference-redacted.
 
 Firecracker's implementation saves
 microVM state, KVM VM state, vCPU state, and device-manager state, writes a
 separate guest-memory image, can load memory from a file or Linux userfaultfd,
 can enable KVM dirty-page tracking for diff snapshots, and can apply
 network/vsock restore overrides before optionally resuming the VM. bangbang
-supports native-v2 2.6 Full/File for 1–32 vCPUs and a rooted or rootless vector
-of 1–64 regular-file block and pmem devices over MMIO or the product PCI
-budget. Block records may mix access, Sync/Async engine, cache, partuuid,
-limiter/retry, queue, and interrupt state; pmem records bind access/root,
-file/mapped geometry, limiter/retry, queue/interrupt, mapping, and transport
-state. Optional devices other than pmem remain excluded and the canonical
-default UART is required. The process-standard-stream endpoint is
-destination-local and is rebound rather than serialized. Exact 2.5 retains its
-block-only profile-2 graph, exact 2.4 retains its
-singleton read-only File/Sync root, 2.3 retains its device-free profile, and
-frozen native-v1 retains the one-vCPU/read-only-root File/Uffd reader. All
-include public Paused handoff, optional resume, and
+supports current native-v2 2.7 Full/File for 1–32 vCPUs with required complete
+serial state and either no storage or a rooted/rootless vector of 1–64
+regular-file block and pmem devices over MMIO or the product PCI budget. Block
+records may mix access, Sync/Async engine, cache, partuuid, limiter/retry,
+queue, and interrupt state; pmem records bind access/root, file/mapped
+geometry, limiter/retry, queue/interrupt, mapping, and transport state. Serial
+retains endpoint intent, limiter configuration, guest-visible UART registers,
+bounded RX, status, and pending work while restoring a fresh destination
+endpoint, limiter budget, and metrics. Optional devices other than serial and
+pmem remain excluded. Exact 2.6 retains the storage-only profile-3 graph, exact
+2.5 retains its block-only profile-2 graph, exact 2.4 retains its singleton
+read-only File/Sync root, 2.3 retains its device-free profile, and frozen
+native-v1 retains the one-vCPU/read-only-root File/Uffd reader. All include
+public Paused handoff, optional resume, and
 recoverable-versus-terminal cleanup evidence.
 Its shared page epoch combines exact owned HVF guest-CPU write faults
 with bounded boot, VMM, device, discard, and dynamic-memory mutations. Normal
@@ -2942,7 +2963,7 @@ requires a configured boot source, applies `mem_size_mib` to the aarch64 DRAM
 layout, allocates guest memory, loads the arm64 Linux `Image` and optional
 initrd, prepares configured block and network devices, registers their
 virtio-mmio regions in a fresh internal `MmioDispatcher`, optionally registers
-one PL031 RTC handler and one TX-only serial MMIO handler in the same dispatcher,
+one PL031 RTC handler and one bounded TX/RX serial MMIO handler in the same dispatcher,
 pairs block and network registrations with supplied SPI interrupt lines, and
 writes the arm64 FDT with matching RTC, serial, and virtio-mmio metadata.
 
@@ -2984,21 +3005,21 @@ dispatcher, and dispatch or complete it on the vCPU-owning thread. This is
 still not continuous run-loop policy, complete device emulation, or interrupt
 delivery.
 
-The runtime crate also contains a TX-only `ns16550a`-shaped serial MMIO output
-device model. It supports one-byte transmit-register writes, divisor-latch
-writes when DLAB is set, deterministic status/configuration reads, and explicit
-errors for unsupported widths, invalid offsets, read-only writes, and output
-sink failures. Output is captured through an injected sink instead of global
-state, and the provided in-memory sink has an explicit byte limit, so
-independent device instances do not share guest console data or grow host
-memory without a caller-chosen bound. A shared sink lets the internal
-boot-resource assembly path register a serial handler while retaining an output
-handle for default internal capture or a configured file-backed output path.
-The internal arm64 FDT builder can describe the same serial MMIO descriptor as
-a Firecracker-shaped `uart@...` node. Public `/serial` supports pre-boot
-`serial_out_path` storage, startup-time host output redirection, rate limiting,
-and Firecracker-shaped metrics for implemented TX output paths; kernel
-`earlycon` wiring, serial input/RX, and public serial streaming remain
+The runtime crate also contains an `ns16550a`-shaped serial MMIO device model.
+It supports one-byte transmit writes, divisor-latch access, complete
+guest-visible configuration/status reads and writes, a bounded 64-byte RX
+FIFO, receive interrupt/input-ready intents, and explicit errors for invalid
+widths, offsets, or sink operations. Output is injected rather than global, and
+the in-memory sink has an explicit byte limit, so independent devices do not
+share guest console data or grow host memory without a caller-chosen bound.
+The boot-resource assembly path registers the handler with either a retained
+capture sink, configured file-backed output, or process stdio and owns
+supported terminal/FIFO/pipe input readiness. The arm64 FDT builder describes
+the same MMIO descriptor as a Firecracker-shaped `uart@...` node. Public
+`/serial` supports pre-boot `serial_out_path`, startup-time host output
+redirection, rate limiting, default stdout/stdin, RX/GIC delivery, metrics, and
+exact native-v2 2.7 capture/restore through fresh destination endpoints.
+Kernel `earlycon` wiring and public host-driven serial streaming remain
 deferred. The first internal guest boot integration test uses the bounded
 capture path directly.
 
@@ -3761,7 +3782,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PATCH /machine-config` | implemented; `204` empty response on successful partial config update | unsupported after start; `400` `fault_message` | Pre-boot-only partial configuration. Omitted/null fields preserve current stored values; empty/null-only candidates use `Empty PATCH request.`; invalid updates leave machine and balloon state unchanged. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config. Direct host paths open during startup preparation; contained grant tags claim exact read-only kernel/initrd descriptors during the successful request and move them into startup without reopening the tags. Host path and grant errors avoid leaking sensitive values. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response for valid regular/block-special file-backed or direct/contained socket-backed pre-boot config | PCI-only non-root file-backed and eligible direct/contained vhost runtime attach implemented; `204` on success | File-backed requests accept an exact regular file or macOS block-special descriptor, retain optional limiters, deferred direct opening or atomic BBG2 grants, selected-transport startup, and transactional PCI runtime attachment. Direct block geometry/cache sync uses public ioctls; contained block-special control is restricted to fresh inspect/cache-sync on the launcher's retained exact grant descriptor. Same-ID file-backed PUT can atomically replace regular/block kinds, engine, cache policy, capacity/config, and backing-derived GET_ID. Socket-backed requests use the strict vhost field matrix and separate contained connector facet. In Running or Paused all-PCI state, a new non-root file or vhost ID attaches only after owner profile/capacity/authority preflight and commits public config after endpoint publication. Default MMIO, root, duplicate, anonymous/shared-profile, invalid backing/access/geometry/grant/socket/negotiation, unavailable session, and capacity exhaustion preserve state. Vhost same-ID PUT remains duplicate rejection. DELETE releases exact owners for same-ID/slot reuse; manual guest PCI rescan/removal is required. Native-v1 remains regular-only. |
-| `PUT /pmem/{id}` | implemented; `204` empty response on successful config storage | implemented in Running/Paused public PCI; `204` after live commit | Pre-boot requests record Firecracker-shaped configuration with one cross-storage root and exact direct or contained regular-file authority. Startup maps each file/private-tail range once and retains the selected MMIO/PCI owner; runtime PCI insertion preflights all capacity before authority or mapping work. Exact-prefix `MS_SYNC`, read-only guest protection, rollback, and cleanup preserve the prior projection. Native-v2 2.6 profile 3 serializes and restores exact pmem configuration/runtime/limiter/queue/interrupt/mapping/transport state through the same complete-set transaction as block. Focused and signed direct/contained rooted pmem-only and rootless mixed matrices certify live and restored behavior, immutable-pair reuse, shared writable prefixes, zero private tails, exact grants, and cleanup. |
+| `PUT /pmem/{id}` | implemented; `204` empty response on successful config storage | implemented in Running/Paused public PCI; `204` after live commit | Pre-boot requests record Firecracker-shaped configuration with one cross-storage root and exact direct or contained regular-file authority. Startup maps each file/private-tail range once and retains the selected MMIO/PCI owner; runtime PCI insertion preflights all capacity before authority or mapping work. Exact-prefix `MS_SYNC`, read-only guest protection, rollback, and cleanup preserve the prior projection. Exact native-v2 2.6 and current 2.7 profile 3 serialize and restore exact pmem configuration/runtime/limiter/queue/interrupt/mapping/transport state through the same complete-set transaction as block; current 2.7 composes it with required serial state. Focused and signed direct/contained rooted pmem-only and rootless mixed matrices certify live and restored behavior, immutable-pair reuse, shared writable prefixes, zero private tails, exact grants, and cleanup. |
 | `PATCH /pmem/{id}` | recognized post-boot-only operation; `400` `fault_message` | runtime rate-limiter updates supported; `204` empty response on successful no-op, replacement, or clear | Parses Firecracker-shaped pmem rate-limiter updates, rejects malformed or mismatched bodies first, returns unsupported-state before startup, and validates the exact active pmem ID after startup. Omitted, `null`, empty, or all-null limiters are no-ops; present buckets replace, clear, or preserve individual live and stored buckets under shared update rules. Handler or owner-thread delivery failures do not commit stored configuration, and a replacement that unblocks pending work schedules an immediate bounded retry. |
 | `GET /hotplug/memory`, `PUT /hotplug/memory`, `PATCH /hotplug/memory` | `PUT` stores validated pre-boot config; `GET` reports configured or active status; `PATCH` is unsupported-state before start | Implemented and verified supported runtime subset; post-start `GET` reports exact requested/plugged size and `PATCH` changes requested size | Startup attaches one virtio-mem endpoint over the selected startup transport with the configured block and region shape. Active queue handling validates complete block ranges, applies exact block-owned HVF map/unmap work before ACK, supports split and combined unplug, commits device state only after guest-visible completion, and rolls partial or late failures back in reverse order. Firecracker-shaped singleton metrics and detached paused capture cover queue, interrupt, compact plugged-range, shared reservation identity, HVF mapping, dirty state, and exact byte accounting. Current public native-v2 create preflights capture before optional-profile rejection and intentionally writes no optional-device bytes. Signed Linux coverage proves the public lifecycle `0 -> 128 MiB -> 0`. No DELETE route is exposed. Runtime device deletion, broader public guest-memory accounting, optional-device serialization/restore, and Firecracker KVM slot identity remain excluded. |
 | `PATCH /drives/{drive_id}` | recognized post-boot-only operation; `400` `fault_message` | supported target; `204` on successful file update/no-op or ID-only vhost refresh | Parses Firecracker-shaped updates and routes valid bodies through `UpdateBlockDevice`. Ordinary drives retain backing replacement, contained exact-grant transfer, per-bucket limiter mutation, success-last stored config, and backend-neutral retry scheduling. A vhost drive rejects path or limiter fields before backend I/O; an ID-only body instead fetches and validates one exact 60-byte active CONFIG reply, publishes it through the selected MMIO/PCI transport, increments one generation, and delivers one configuration interrupt. Acquisition or confirmed pre-delivery failure preserves old config/generation and records `update_fails`; success records `update_count` plus optional latest-value `config_change_time_us` for aggregate and drive generation. Delivery ambiguity is terminal. Parser/state/unknown-drive failures remain outside block-attempt metrics, while an ordinary pathless no-op remains unreported. The limiter path still does not claim Linux timerfd/eventfd implementation identity. |
@@ -3926,13 +3947,13 @@ and tested.
 
 The checked
 [Firecracker v1.16.0 storage contract](../compat/firecracker/v1.16.0/storage-contract.md)
-owns exactly 40 block, vhost-user, and pmem identities. Thirty-eight are
-`implemented-and-verified`; only `corpus:pmem` and
-`semantic.storage:pmem-root-mapping-flush-and-state` remain
-`audit-required`, both assigned to Wave 6 optional-device serialization and
-restore. Parser recognition, config echo, or a family-level test alone is not
-enough to change those dispositions; the ledger records implementation and
-validation per identity.
+owns exactly 40 block, vhost-user, and pmem identities. All forty are
+`implemented-and-verified`. Exact native-v2 2.6 promoted the final pmem corpus
+and semantic after rooted pmem-only and rootless mixed MMIO/PCI direct and
+contained certification; current 2.7 preserves that profile-3 graph alongside
+required serial state. Parser recognition, config echo, or a family-level test
+alone is not enough to change those dispositions; the ledger records
+implementation and validation per identity.
 
 Two signed product-PCI profiles compose the live contract in one VM. Both boot
 a read-only Sync root plus writable Sync, portable Async, vhost-user, pmem, and
@@ -4004,32 +4025,36 @@ Their eventual support level should follow the endpoint matrix:
 - snapshot behavior beyond the implemented narrow native-v2 Full/File profile.
   The native-v2 reader retains readable `2.0.0`/`2.1.x`/`2.2.x` state and the
   exact device-free `2.3.0` and singleton-root `2.4.0` platform profiles. The
-  exact `2.5.0` reader retains profile 2's block-only graph. The current public
-  `2.6.0` writer carries an exact typed 1–32-vCPU
-  machine/global-GIC/topology/vCPU graph plus singleton portable
-  PL031/PVTime/VMGenID/VMClock state, with CPU-application evidence and closed
-  reviewed debug/SME state, and one mandatory profile-3 device graph containing
-  1–64 ordered regular-file block and pmem configurations, runtime,
-  limiter/retry, queue, common virtio, mapping, and MMIO-or-PCI transport state.
-  The graph may be rootless or select the first cross-storage record as root.
-  The focused boundary captures a
-  completed paused source into a fresh canonical 64-KiB-aligned memory binding
-  and reconstructs a complete never-run HVF topology from already-authorized
-  private-COW memory. It verifies CPU/cache/MPIDR/FDT/GIC/time compatibility,
-  restores global then canonical per-vCPU state, creates destination-current
-  PL031 and downtime-excluding PVTime, signals a fresh VMGenID followed by the
-  saved-counter VMClock transition, imports fresh offline/runnable/
-  timer-suspended lifecycle tokens, and publishes only Paused. Signed
-  three-vCPU proof covers repeat immutable loads, distinct clone identities,
-  ordered guest notifications/time observations, recapture-to-restore, timer
-  PPI, secondary PSCI completion, and initially offline continuation. A VM-free
-  closed native-family handoff publishes current-v2 and prepares/loads
-  compatible v1/v2 pairs through the existing anchored no-clobber transaction.
-  The public normal-process adapter admits only pristine File/COW destinations,
-  validates the live-FDT identity plus versioned product/UART/RTC/time/device
-  graph before HVF, authorizes and retains the complete keyed backing vector
+  exact `2.5.0` reader retains profile 2's block-only graph, and exact `2.6.0`
+  retains profile 3's storage-only graph. The current public `2.7.0` writer
+  carries an exact typed 1–32-vCPU machine/global-GIC/topology/vCPU graph plus
+  singleton portable PL031/PVTime/VMGenID/VMClock state, required complete
+  serial kind 8, and optional unchanged profile-3 kind 7 with 1–64 ordered
+  regular-file block and pmem configurations, runtime, limiter/retry, queue,
+  common virtio, mapping, and MMIO-or-PCI transport state. The storage graph
+  may be rootless or select the first cross-storage record as root. The focused
+  boundary captures a completed paused source into a fresh canonical
+  64-KiB-aligned memory binding and reconstructs a complete never-run HVF
+  topology from already-authorized private-COW memory. It verifies
+  CPU/cache/MPIDR/FDT/GIC/time compatibility, restores global then canonical
+  per-vCPU state, creates destination-current PL031 and downtime-excluding
+  PVTime, signals a fresh VMGenID followed by the saved-counter VMClock
+  transition, imports fresh offline/runnable/timer-suspended lifecycle tokens,
+  restores UART registers/RX/status/pending work against fresh serial endpoints,
+  and publishes only Paused. Signed three-vCPU proof covers repeat immutable
+  loads, distinct clone identities, ordered guest notifications/time
+  observations, recapture-to-restore, timer PPI, secondary PSCI completion, and
+  initially offline continuation. Signed serial-only and storage-bearing direct
+  and production cases additionally prove nondefault UART continuation,
+  source/destination RX, fresh metrics, configured file/FIFO replacement
+  resistance, exact grants, redaction, recapture, and cleanup. A VM-free closed
+  native-family handoff publishes current-v2 and prepares/loads compatible v1/v2
+  pairs through the existing anchored no-clobber transaction. The public
+  normal-process adapter admits only pristine File/COW destinations, validates
+  the live-FDT identity plus versioned product/UART/RTC/time/device graph before
+  HVF, authorizes and retains the complete serial-plus-storage transaction
   without reopening a contained selector or falling back to paths, installs
-  fresh destination serial output, and commits a closed session initially
+  fresh destination serial endpoints, and commits a closed session initially
   Paused.
   Public create emits v2, while one-open load dispatch retains frozen
   native-v1 File/Uffd reading and selects native-v2 File/COW without decoder
@@ -4039,10 +4064,10 @@ Their eventual support level should follow the endpoint matrix:
   and normal-production rooted pmem-only/rootless mixed MMIO/PCI matrices prove
   pre/post-capture persistence, read-only protection, zero fresh private tails,
   restored retry/interrupt progress, recapture, fresh destination ownership,
-  exact authority, and death-order cleanup. The CLI reports `v2.6.0` and
+  exact authority, and death-order cleanup. The CLI reports `v2.7.0` and
   describes exact v1/v2 versions. There is still no general optional-device
-  aggregate. Remaining work includes optional devices other than pmem,
-  general-serial state, native-v2 Uffd, Diff artifacts,
+  aggregate. Remaining work includes optional devices other than serial and
+  pmem, native-v2 Uffd, Diff artifacts,
   overrides, editing tools, Firecracker artifact compatibility,
   authentication, and broader cross-host portability
 - balloon producers outside the implemented queue/discard/reporting activity
@@ -4057,11 +4082,13 @@ Their eventual support level should follow the endpoint matrix:
 - full Firecracker active timerfd/eventfd rate-limiter wakeup parity beyond the
   current HVF block, PMEM, network, and entropy retry schedulers, including shared
   event-source behavior
-- public serial streaming plus generalized artifact encoding, destination
-  endpoint reconstruction, restore, migration/clone, and portability policy;
-  native-v1 captures only its legacy six UART bytes, rejects nonrepresentable
-  RX state, and excludes host endpoints, the output buffer, path, limiter
-  state, and counters
+- public host-driven serial injection/streaming beyond process stdin,
+  Firecracker artifact compatibility, and broad migration portability. Exact
+  native-v2 2.7 implements bounded serial encoding, fresh endpoint
+  reconstruction, restore, repeated clone loads, and recapture; native-v1
+  retains only its legacy six UART bytes, rejects nonrepresentable RX state,
+  and excludes host endpoints, the output buffer, path, limiter state, and
+  counters
 - process-global panic/fatal observability durability and production rotation,
   syslog, journald, tracing, or remote telemetry; the implemented logger and
   sparse interval metrics schema do not fabricate absent records or devices
@@ -4072,9 +4099,9 @@ Their eventual support level should follow the endpoint matrix:
   serialized/restorable optional-device snapshot state, and Firecracker's KVM
   slot mechanism
 - complete production snapshot ownership beyond the current native-v2
-  multi-vCPU block-and-pmem Full/File profile and frozen one-vCPU native-v1
-  reader, including other optional devices, general serial state,
-  external-buffer policy, and
+  multi-vCPU complete-serial Full/File profile with optional block/pmem storage
+  and frozen one-vCPU native-v1 reader, including other optional devices,
+  external-buffer policy beyond the exact fresh serial endpoint contract, and
   broader migration/portability rules
 - runtime device attach/remove behavior beyond implemented in-place updates and
   stable unsupported paths

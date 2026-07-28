@@ -2014,7 +2014,7 @@
     {
       "id": "api-path:/pmem/{id}",
       "family": "api-contract",
-      "summary": "Provide the complete currently applicable /pmem/{id} control-plane path: strict pre-boot configuration including deterministic root boot, PCI-only Running/Paused non-root PUT and bodyless DELETE transactions, and post-boot limiter PATCH. The path validates matching IDs, strict fields, and the one-block-or-pmem-root invariant before authority use; preserves the public projection until live commits succeed; preflights owner capacity before grant/open/map work; maps the retained file/private-tail range directly into HVF; synchronizes exactly the file prefix; redacts backing, descriptor, grant, and address details; and retains default-MMIO and runtime-root mutation as stable nonmutating rejections. Aggregate live storage and native-v2 2.6 profile-3 pmem create/load certification are complete.",
+      "summary": "Provide the complete currently applicable /pmem/{id} control-plane path: strict pre-boot configuration including deterministic root boot, PCI-only Running/Paused non-root PUT and bodyless DELETE transactions, and post-boot limiter PATCH. The path validates matching IDs, strict fields, and the one-block-or-pmem-root invariant before authority use; preserves the public projection until live commits succeed; preflights owner capacity before grant/open/map work; maps the retained file/private-tail range directly into HVF; synchronizes exactly the file prefix; redacts backing, descriptor, grant, and address details; and retains default-MMIO and runtime-root mutation as stable nonmutating rejections. Aggregate live storage and native-v2 profile-3 pmem create/load certification are complete in exact 2.6 and current 2.7.",
       "source_refs": [
         "api-path:/pmem/{id}"
       ],
@@ -7967,7 +7967,7 @@
     {
       "id": "api-schema:Pmem",
       "family": "api-contract",
-      "summary": "Implement the strict Firecracker Pmem shape with matching ID, required nonempty backing, default false root/read-only flags, optional limiter, exact configuration projection, direct or typed contained ownership, one file/private-tail mapping, deterministic root selection, MMIO/PCI startup, PCI runtime PUT/PATCH/DELETE/reuse, exact-prefix flush, rollback, redaction, metrics, cleanup, and native-v2 2.6 profile-3 serialization and restore.",
+      "summary": "Implement the strict Firecracker Pmem shape with matching ID, required nonempty backing, default false root/read-only flags, optional limiter, exact configuration projection, direct or typed contained ownership, one file/private-tail mapping, deterministic root selection, MMIO/PCI startup, PCI runtime PUT/PATCH/DELETE/reuse, exact-prefix flush, rollback, redaction, metrics, cleanup, and native-v2 profile-3 serialization and restore in exact 2.6 and current 2.7.",
       "source_refs": [
         "api-schema:Pmem"
       ],
@@ -8512,7 +8512,7 @@
     {
       "id": "corpus:device-hotplug",
       "family": "runtime-device-management",
-      "summary": "Implement the complete pinned Developer Preview live-device contract for non-root virtio-block, virtio-pmem, and virtio-net under public all-virtio PCI. Running and Paused PUT/DELETE use one failure-atomic owner inventory, require manual guest rescan/removal, preserve type-scoped IDs and global network-MAC uniqueness, commit live configuration last, and release exact backing, packet-I/O, mapping, metrics, scheduler, dispatcher, BAR, MSI-X, and function ownership before shared capacity is reusable. Default MMIO rejects runtime mutation. Automatic guest notification remains outside the pinned live corpus, and native-v1 retains no PCI state. Current native-v2 2.6 profile 3 persists startup- or runtime-origin regular-file block and pmem endpoints; network and every other optional device remain excluded.",
+      "summary": "Implement the complete pinned Developer Preview live-device contract for non-root virtio-block, virtio-pmem, and virtio-net under public all-virtio PCI. Running and Paused PUT/DELETE use one failure-atomic owner inventory, require manual guest rescan/removal, preserve type-scoped IDs and global network-MAC uniqueness, commit live configuration last, and release exact backing, packet-I/O, mapping, metrics, scheduler, dispatcher, BAR, MSI-X, and function ownership before shared capacity is reusable. Default MMIO rejects runtime mutation. Automatic guest notification remains outside the pinned live corpus, and native-v1 retains no PCI state. Exact native-v2 2.6 and current 2.7 persist startup- or runtime-origin regular-file block and pmem endpoints; network and every other optional device remain excluded.",
       "source_refs": [
         "corpus:device-hotplug"
       ],
@@ -8886,7 +8886,7 @@
     {
       "id": "corpus:pmem",
       "family": "storage",
-      "summary": "The applicable pinned pmem corpus is implemented and verified: strict live API, direct file/private-tail mapping, deterministic root, read-only protection, limiting, exact-prefix persistence, capture-ready traversal, PCI hotplug/delete/range reuse, rollback, metrics, cleanup, direct ownership, contained descriptor authority, and native-v2 2.6 profile-3 serialization and restore. Signed direct and normal-production MMIO/PCI matrices certify rooted pmem-only and rootless mixed-storage guests, immutable state/memory reuse, shared writable prefixes, fresh zero private tails, read-only peers, limiter continuation, recapture, and cleanup. DAX choice, host paging/RSS/eviction, same-backing sharing, side-channel risk, operator serialization, and cross-host portability remain documented policy rather than Linux numeric or Firecracker-artifact promises.",
+      "summary": "The applicable pinned pmem corpus is implemented and verified: strict live API, direct file/private-tail mapping, deterministic root, read-only protection, limiting, exact-prefix persistence, capture-ready traversal, PCI hotplug/delete/range reuse, rollback, metrics, cleanup, direct ownership, contained descriptor authority, and native-v2 profile-3 serialization and restore in exact 2.6 and current 2.7. Signed direct and normal-production MMIO/PCI matrices certify rooted pmem-only and rootless mixed-storage guests, immutable state/memory reuse, shared writable prefixes, fresh zero private tails, read-only peers, limiter continuation, recapture, and cleanup. DAX choice, host paging/RSS/eviction, same-backing sharing, side-channel risk, operator serialization, and cross-host portability remain documented policy rather than Linux numeric or Firecracker-artifact promises.",
       "source_refs": [
         "corpus:pmem"
       ],
@@ -9224,7 +9224,7 @@
     {
       "id": "corpus:snapshot-versioning",
       "family": "snapshots",
-      "summary": "Native-v2 provides bounded compatible-minor decoding; exact legacy device-free 2.3, singleton-root 2.4, and block-only profile-2 2.5 loading; and a current graph-required 2.6.0 public writer for rooted or rootless ordered regular-file block and pmem vectors over MMIO or the product PCI budget. It provides exact CLI version/description output, immutable repeated File/COW state-memory loads, deliberate shared writable external backings, and explicit Firecracker incompatibility. Continue auditing editor/rebase tooling, other optional/general device-schema evolution, Firecracker artifact interoperability, and broad portability owned by the pinned snapshot-versioning corpus.",
+      "summary": "Native-v2 provides bounded compatible-minor decoding; exact legacy device-free 2.3, singleton-root 2.4, block-only profile-2 2.5, and storage-only profile-3 2.6 loading; and a current serial-required 2.7.0 public writer with optional unchanged profile-3 block/pmem storage over MMIO or the product PCI budget. It provides exact CLI version/description output, immutable repeated File/COW state-memory loads, fresh destination serial endpoint ownership, deliberate shared writable external backings, and explicit Firecracker incompatibility. Continue auditing editor/rebase tooling, other optional-device schema evolution, Firecracker artifact interoperability, and broad portability owned by the pinned snapshot-versioning corpus.",
       "source_refs": [
         "corpus:snapshot-versioning"
       ],
@@ -9858,7 +9858,7 @@
     {
       "id": "firecracker-argument:snapshot-version",
       "family": "process",
-      "summary": "Report the current bangbang-native public writer version v2.6.0 through the early --snapshot-version command, while exact description and load retain block-only profile-2 2.5.0, singleton-root 2.4.0, and device-free 2.3.0, without claiming Firecracker v10 artifact compatibility.",
+      "summary": "Report the current bangbang-native public writer version v2.7.0 through the early --snapshot-version command, while exact description and load retain storage-only profile-3 2.6.0, block-only profile-2 2.5.0, singleton-root 2.4.0, and device-free 2.3.0, without claiming Firecracker v10 artifact compatibility.",
       "source_refs": [
         "firecracker-argument:snapshot-version"
       ],
@@ -10300,12 +10300,61 @@
     {
       "id": "semantic.device:serial-stdin-stdout-rx-and-restore",
       "family": "serial-and-time",
-      "summary": "Live serial default stdout, configured output, terminal/FIFO stdin, bounded RX dispatch, TX limiting, metrics, Running/Paused behavior, MMIO ownership, capture-ready state, endpoint restoration, and cleanup are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains this semantic aggregate solely for optional-device state encoding, artifact integration, fresh endpoint and UART restore construction, migration/clone and terminal/FIFO portability outcomes, and signed restored-guest certification; those missing outcomes must not be inferred from capture-ready state.",
+      "summary": "Implement and verify destination-local serial continuation in exact native-v2 2.7 Full/File artifacts: default process stdio or configured output intent, limiter configuration with fresh destination budget and metrics, every guest-visible UART register, bounded RX FIFO bytes, status, and pending input/interrupt work; serial-only and profile-3 MMIO/PCI-storage composition; fresh direct or contained endpoints with no source descriptor, terminal state, pipe buffer, TX byte, metric, or wakeup inheritance; explicit/automatic resume, recapture, immutable repeated loads, failure-atomic authority, redaction, and teardown. Signed direct and normal production/App Sandbox guests certify restored UART/RX/TX behavior, fresh FIFO/pipe and regular-file ownership, pathname replacement, source-only byte exclusion, isolation, and cleanup. Terminal and FIFO handling follows destination host capabilities; no Firecracker artifact-byte or broad cross-host portability claim is made.",
       "source_refs": [
         "corpus:device-api",
         "corpus:snapshot-support"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/snapshot_serial_restore.rs",
+          "anchor": "prepare_native_v2_serial_restore_bundle"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "restore_snapshot_v2_serial_only"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_serial_v2_7.rs",
+          "anchor": "SnapshotV2SerialState"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/snapshot_restore_resources.rs",
+          "anchor": "exact_2_7_serial_preflight_rejects_aliases_authority_crossing_and_cancellation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signed_native_v2_serial_destination_reconciles_and_recaptures_private_owner"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signed_native_v2_serial_storage_destination_preserves_mmio_and_pci_owners"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_serial_continuation_over_fresh_stdio"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_reopens_configured_serial_snapshot_file_and_fifo_destinations"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_serial_snapshot_continuation_and_containment"
+        }
+      ]
     },
     {
       "id": "semantic.hotplug:runtime-device-manager",
@@ -10761,7 +10810,7 @@
     {
       "id": "semantic.snapshot:full-create-load-and-public-lifecycle",
       "family": "snapshots",
-      "summary": "Implement and verify the bangbang-native v2.5 Full/File public lifecycle: paused 1–32-vCPU canonical-default-serial creation with a rooted or rootless ordered vector of 1–64 regular-file block devices over MMIO or the product PCI budget; mixed access, Sync/Async, cache, partuuid, limiter/retry, queue, interrupt, and transport state; graph-required no-clobber paired publication; one-open version/profile dispatch; retained private File/COW memory; one exact keyed complete-set backing transaction without fallback or overrides; Paused commit; optional resume; recapture; immutable repeated state/memory destinations with deliberately shared writable external backings; finite retryable/terminal failure classification; direct/contained authority; death-order cleanup and redaction; exact singleton-root 2.4 and device-free 2.3 loading; and frozen native-v1 reading.",
+      "summary": "Implement and verify the current bangbang-native v2.7 Full/File public lifecycle: paused 1–32-vCPU creation with required complete serial state and an optional rooted or rootless ordered vector of 1–64 regular-file block/pmem devices over MMIO or the product PCI budget; exact serial registers/RX/status/pending work, fresh default or configured destination endpoints, storage configuration/runtime/limiter/retry/queue/interrupt/mapping/transport state, graph-required no-clobber paired publication, one-open version/profile dispatch, retained private File/COW memory, one exact complete-set backing transaction without fallback or overrides, Paused commit, optional resume, recapture, immutable repeated state/memory destinations, finite retryable/terminal failure classification, direct/contained authority, death-order cleanup, and redaction. Exact storage-only 2.6, block-only 2.5, singleton-root 2.4, device-free 2.3, and frozen native-v1 readers remain supported.",
       "source_refs": [
         "corpus:snapshot-support",
         "corpus:snapshot-versioning"
@@ -10820,7 +10869,7 @@
     {
       "id": "semantic.snapshot:multi-vcpu-drives-devices-and-mmds",
       "family": "snapshots",
-      "summary": "The current native-v2 2.6 Full/File profile serializes and restores a complete typed 1–32-vCPU platform with GIC, topology, timers, portable time/identity, applied CPU evidence, and a rooted or rootless ordered regular-file storage vector containing block and pmem devices with exact configuration, runtime, limiter/retry, queue, interrupt, mapping, and MMIO or PCI transport state plus complete destination backing authority. Signed direct and contained product matrices certify active block-and-pmem persistence, recapture, fresh destination ownership, immutable state/memory, deliberate shared writable external prefixes, volatile private pmem tails, finite failure classification, and cleanup. It deliberately excludes vhost-user, all optional devices other than pmem, MMDS, boot timer, and mutated/general serial state. Generalized typed remaining-device restore-resource preparation and signed exact contained root-plus-vsock transaction evidence cover coherent authority, failure atomicity, one-time adoption, cleanup, replacement, redaction, and concurrency, but those other optional-device/MMDS codecs, artifact placement, public load invocation, resource binding, and restored-guest outcomes remain under audit.",
+      "summary": "The current native-v2 2.7 Full/File profile serializes and restores a complete typed 1–32-vCPU platform with GIC, topology, timers, portable time/identity, applied CPU evidence, complete serial state, and an optional rooted or rootless ordered regular-file storage vector containing block and pmem devices with exact configuration, runtime, limiter/retry, queue, interrupt, mapping, and MMIO or PCI transport state plus complete destination backing authority. Signed direct and contained product matrices certify serial-only and storage-bearing UART/RX/TX continuation, fresh endpoints, active block-and-pmem persistence, recapture, immutable state/memory, deliberate shared writable external prefixes, volatile private pmem tails, finite failure classification, and cleanup. It deliberately excludes vhost-user, optional devices other than pmem and serial, MMDS, and boot timer. Generalized typed remaining-device restore-resource preparation and signed exact contained root-plus-vsock transaction evidence cover coherent authority, failure atomicity, one-time adoption, cleanup, replacement, redaction, and concurrency, but those other optional-device/MMDS codecs, artifact placement, public load invocation, resource binding, and restored-guest outcomes remain under audit.",
       "source_refs": [
         "corpus:snapshot-support"
       ],
@@ -10907,7 +10956,7 @@
     {
       "id": "semantic.storage:pmem-root-mapping-flush-and-state",
       "family": "storage",
-      "summary": "Selected MMIO/PCI activation, deterministic pmem root, runtime PCI attach/update/delete, one authoritative file/private-tail mapping, exact-prefix persistence, limiting/retry, capacity preflight, exact cleanup, direct or contained descriptor authority, metrics, capture-ready state, and native-v2 2.6 profile-3 serialization and restore are implemented and verified. Signed direct and normal-production matrices prove rooted pmem-only and rootless mixed-storage continuation, immutable state/memory reuse, shared writable prefixes, zero private tails on every fresh mapping, read-only protection, recapture, cancellation/fault cleanup, and exact grant ownership. This makes no Firecracker artifact, automatic migration, or broad host-portability claim.",
+      "summary": "Selected MMIO/PCI activation, deterministic pmem root, runtime PCI attach/update/delete, one authoritative file/private-tail mapping, exact-prefix persistence, limiting/retry, capacity preflight, exact cleanup, direct or contained descriptor authority, metrics, capture-ready state, and native-v2 profile-3 serialization and restore in exact 2.6 and current 2.7 are implemented and verified. Signed direct and normal-production matrices prove rooted pmem-only and rootless mixed-storage continuation, immutable state/memory reuse, shared writable prefixes, zero private tails on every fresh mapping, read-only protection, recapture, cancellation/fault cleanup, and exact grant ownership. This makes no Firecracker artifact, automatic migration, or broad host-portability claim.",
       "source_refs": [
         "corpus:pmem"
       ],
@@ -10982,7 +11031,7 @@
     {
       "id": "semantic.transport:pci-msi-and-coexistence",
       "family": "device-transport",
-      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all-virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and current native-v2 2.6 create/load persists and reconstructs every block and pmem endpoint in a rooted or rootless regular-file profile-3 vector, including configuration, runtime, limiter/retry, common virtio, queue, mapping, BAR/capability, MSI-X, registry, and GICv2m placement under the same product budget. Signed direct and contained storage matrices prove active I/O, recapture, immutable-pair reuse, and cleanup. Snapshot persistence for other optional PCI devices remains outside this terminal transport aggregate.",
+      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all-virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and current native-v2 2.7 create/load persists and reconstructs every block and pmem endpoint in an optional rooted or rootless regular-file profile-3 vector, including configuration, runtime, limiter/retry, common virtio, queue, mapping, BAR/capability, MSI-X, registry, and GICv2m placement under the same product budget, while serial remains platform MMIO. Signed direct and contained storage/serial matrices prove active I/O, UART continuation, recapture, immutable-pair reuse, and cleanup. Snapshot persistence for other optional PCI devices remains outside this terminal transport aggregate.",
       "source_refs": [
         "corpus:device-api",
         "corpus:device-hotplug"

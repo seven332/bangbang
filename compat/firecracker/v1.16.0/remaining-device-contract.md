@@ -6,14 +6,16 @@ replacing their row-specific semantic contracts. The selector contains exactly
 85 identities: 52 balloon, 19 memory-hotplug, seven entropy, six serial, and
 one time/identity aggregate.
 
-Exactly 77 rows are `implemented-and-verified`. Eight rows remain
-`audit-required` because their remaining optional-device or public-production
-snapshot composition, clone/migration portability, and terminal certification belong to
+The original #1481 checkpoint had 77 terminal rows and eight Wave 6 handoffs.
+The exact 2.7 serial closure in #1652 now makes 78 rows
+`implemented-and-verified`; seven rows remain `audit-required` because their
+remaining optional-device or public-production snapshot composition,
+clone/migration portability, and terminal certification belong to
 [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). The
 repository-wide observability, tools, and specification work belongs to
 [Wave 7 #1491](https://github.com/seven332/bangbang/issues/1491), but zero rows
 in this 85-record selector are handed to Wave 7. Global inventory totals remain
-191 implemented, 207 audit-required, three missing-platform-feasible, and 17
+236 implemented, 162 audit-required, three missing-platform-feasible, and 17
 proven-platform-impossible.
 
 ## Evidence keys
@@ -27,7 +29,8 @@ proven-platform-impossible.
 - `PRODUCTION-SERIAL` —
   `crates/launcher/tests/production_bundle_e2e.rs::normal_bundle_isolates_concurrent_default_serial_stdio_sessions`,
   plus `normal_bundle_streams_default_serial_stdio_across_launcher_worker_boundary`
-  and the configured-output grant isolation/redaction tests in that module.
+  and
+  `normal_bundle_certifies_native_v2_serial_snapshot_continuation_and_containment`.
 - `B-IMPL` — `crates/api/src/http.rs`,
   `crates/bangbang/src/{api_server,vmm}.rs`,
   `crates/runtime/src/balloon.rs`, and
@@ -72,15 +75,22 @@ proven-platform-impossible.
   also `AGG-SIGNED`.
 - `S-IMPL` — `crates/api/src/http.rs`,
   `crates/bangbang/src/{api_server,vmm}.rs`,
-  `crates/runtime/src/serial.rs`, `crates/hvf/src/startup.rs`, and
+  `crates/bangbang/src/{snapshot_restore_resources,snapshot_serial_restore}.rs`,
+  `crates/runtime/src/{serial,snapshot_serial_v2_7}.rs`,
+  `crates/hvf/src/{snapshot_v2,snapshot_v2_platform,startup}.rs`, and
   `crates/launcher/src/supervisor.rs`.
 - `S-FOCUSED` —
   `serial_input_dispatch_bounds_rearms_and_detaches_after_eof`,
   `serial_input_interrupt_intent_is_taken_only_after_successful_signal`, and
-  `aggregate_remaining_device_snapshot_preflight_failures_preserve_order_and_reuse`.
+  `aggregate_remaining_device_snapshot_preflight_failures_preserve_order_and_reuse`,
+  plus the exact-2.7 codec, authority, endpoint, fault, reconstruction, and
+  recapture tests mapped in [the serial ledger](serial-contract.md).
 - `S-SIGNED` —
   `signed_executable_streams_default_serial_stdio_across_lifecycle_boundaries`
-  and `signed_executable_isolates_concurrent_default_serial_stdio_streams`;
+  `signed_executable_isolates_concurrent_default_serial_stdio_streams`,
+  `signed_executable_certifies_native_v2_serial_continuation_over_fresh_stdio`,
+  and
+  `signed_executable_reopens_configured_serial_snapshot_file_and_fifo_destinations`;
   also `AGG-SIGNED`.
 - `T-IMPL` —
   `crates/runtime/src/{pvtime,rtc,snapshot_device,snapshot_format_v2,startup,vmclock}.rs`
@@ -112,10 +122,11 @@ proven-platform-impossible.
   [#1490](https://github.com/seven332/bangbang/issues/1490): encode and restore
   queues, limiter buckets, retained retry timing, fresh scheduler ownership,
   clone/migration policy, portability, and signed restored-guest reads.
-- `W6-SERIAL` — exact owner
-  [#1490](https://github.com/seven332/bangbang/issues/1490): encode and restore
-  UART/RX/pending-intent state, reconstruct fresh authorized endpoints, define
-  terminal/FIFO portability, and prove signed restored-guest behavior.
+- `SERIAL-SNAPSHOT` — completed by
+  [#1652](https://github.com/seven332/bangbang/issues/1652): exact 2.7
+  UART/RX/pending-intent encoding, fresh authorized endpoint reconstruction,
+  destination terminal/FIFO policy, direct and contained serial-only plus
+  MMIO/PCI-storage certification, and signed restored-guest behavior.
 - `W6-TIME` — exact owner
   [#1490](https://github.com/seven332/bangbang/issues/1490): connect #1529's
   implemented portable time/identity graph and repeat-clone restore to the
@@ -212,7 +223,7 @@ proven-platform-impossible.
 | `api-property:SerialDevice.rate_limiter` | [serial](serial-contract.md) | `implemented-and-verified` | `S-IMPL` | `S-FOCUSED` | `S-SIGNED + PRODUCTION-SERIAL` | `terminal` |
 | `api-property:SerialDevice.serial_out_path` | [serial](serial-contract.md) | `implemented-and-verified` | `S-IMPL` | `S-FOCUSED` | `S-SIGNED + PRODUCTION-SERIAL` | `terminal` |
 | `api-schema:SerialDevice` | [serial](serial-contract.md) | `implemented-and-verified` | `S-IMPL` | `S-FOCUSED` | `S-SIGNED + PRODUCTION-SERIAL` | `terminal` |
-| `semantic.device:serial-stdin-stdout-rx-and-restore` | [serial](serial-contract.md) | `audit-required` | `S-IMPL` | `S-FOCUSED` | `S-SIGNED + PRODUCTION-SERIAL` | `W6-SERIAL` |
+| `semantic.device:serial-stdin-stdout-rx-and-restore` | [serial](serial-contract.md) | `implemented-and-verified` | `S-IMPL` | `S-FOCUSED` | `S-SIGNED + PRODUCTION-SERIAL` | `terminal` |
 | `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | [time-identity](time-identity-contract.md) | `audit-required` | `T-IMPL` | `T-FOCUSED` | `T-SIGNED` | `W6-TIME` |
 
 ## Closure boundary
@@ -228,9 +239,11 @@ endpoint and interrupt ownership, release, and reuse. The production test proves
 two launcher/App-Sandbox-worker sessions remain isolated and leave no steady
 helper, socket, or session root after independent EOF and termination.
 
-Capture-ready values remain private validated live state. This contract does
-not claim Firecracker artifact compatibility, restored optional devices,
-public native-v2 production composition, arbitrary cross-host time-source
-portability, or Wave 7 aggregate observability. #1529 separately proves the
-focused native-v2 PVTime/identity clone boundary without changing this
-aggregate row's disposition.
+Capture-ready values remain private validated live state except where a
+family-specific terminal ledger now binds them to a public artifact profile.
+Exact native-v2 2.7 serial state and its fresh endpoints are implemented and
+signed; the remaining optional-device rows are not implied by that closure.
+This contract still does not claim Firecracker artifact compatibility,
+arbitrary cross-host time-source portability, or Wave 7 aggregate
+observability. #1529 separately proves the focused native-v2 PVTime/identity
+clone boundary without changing that aggregate row's disposition.
