@@ -36,8 +36,8 @@ use crate::snapshot_format::{
 };
 use crate::snapshot_format_v2::{
     NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
-    NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2ComponentDisposition, SnapshotV2DecodeError,
-    decode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2ComponentDisposition,
+    SnapshotV2DecodeError, decode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_format_v2::{NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES, decode_snapshot_v2_state};
@@ -53,6 +53,10 @@ use crate::snapshot_memory_v2::{
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory_v2::{
     load_snapshot_v2_memory_file, verify_snapshot_v2_memory_image_output,
+};
+use crate::snapshot_serial_v2_7::{
+    NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
+    SnapshotV2SerialStateDecodeError,
 };
 
 const REDACTED: &str = "<redacted>";
@@ -86,6 +90,8 @@ pub enum NativeV2SnapshotArtifactProfile {
     MultiBlockDeviceGraphV2_5,
     /// Exact 2.6 block-and-pmem storage graph profile 3.
     StorageDeviceGraphV2_6,
+    /// Exact 2.7 serial profile with optional unchanged profile-3 storage.
+    SerialStateV2_7,
 }
 
 /// Validation failure for one owned native snapshot artifact state.
@@ -190,8 +196,8 @@ impl NativeSnapshotArtifactState {
 
     /// Validates exact current-version native-v2 bytes for publication.
     pub fn from_current_v2(bytes: Vec<u8>) -> Result<Self, NativeSnapshotArtifactStateError> {
-        NativeV2StorageSnapshotCandidateState::from_storage_device_graph_v2_6(bytes)
-            .map(NativeV2StorageSnapshotCandidateState::into_current_artifact_state)
+        NativeV2SerialSnapshotCandidateState::from_serial_state_v2_7(bytes)
+            .map(NativeV2SerialSnapshotCandidateState::into_current_artifact_state)
             .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)
     }
 
@@ -323,7 +329,7 @@ impl NativeSnapshotArtifactState {
         };
         if *version == NATIVE_V2_SNAPSHOT_VERSION && binding.version() == NATIVE_V2_SNAPSHOT_VERSION
         {
-            let (actual_binding, _) = decode_storage_device_graph_v2_6(bytes)
+            let (actual_binding, _, _) = decode_serial_state_v2_7(bytes)
                 .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
             if &actual_binding == binding {
                 Ok(())
@@ -551,8 +557,8 @@ impl NativeV2StorageSnapshotCandidateState {
         (self.bytes, self.binding, self.device_graph)
     }
 
-    /// Consumes this exact current candidate into artifact authority.
-    pub fn into_current_artifact_state(self) -> NativeSnapshotArtifactState {
+    /// Consumes this exact 2.6 candidate into compatible artifact authority.
+    pub fn into_compatible_artifact_state(self) -> NativeSnapshotArtifactState {
         let (bytes, binding, _) = self.into_parts();
         NativeSnapshotArtifactState {
             inner: NativeSnapshotArtifactStateInner::V2 {
@@ -572,6 +578,96 @@ impl fmt::Debug for NativeV2StorageSnapshotCandidateState {
             .field("state", &REDACTED)
             .field("memory_binding", &REDACTED)
             .field("device_graph", &REDACTED)
+            .finish()
+    }
+}
+
+/// One closed exact native-v2 2.7 serial candidate.
+///
+/// The required serial singleton and optional unchanged profile-3 storage
+/// graph are derived from the same immutable bytes as the retained memory
+/// commitment. This is the only native-v2 candidate that can enter the
+/// current publication authority.
+pub struct NativeV2SerialSnapshotCandidateState {
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+}
+
+impl NativeV2SerialSnapshotCandidateState {
+    /// Validates and retains one exact serial-bearing native-v2 2.7 state.
+    pub fn from_serial_state_v2_7(
+        bytes: Vec<u8>,
+    ) -> Result<Self, NativeV2SnapshotCandidateStateError> {
+        let (binding, device_graph, serial) = decode_serial_state_v2_7(&bytes)?;
+        Ok(Self {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+        })
+    }
+
+    /// Returns the exact current compatibility version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+    }
+
+    /// Returns the immutable encoded state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the memory commitment derived from the encoded state.
+    pub const fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.binding
+    }
+
+    /// Returns the optional unchanged profile-3 storage graph.
+    pub const fn device_graph(&self) -> Option<&SnapshotV2StorageDeviceGraph> {
+        self.device_graph.as_ref()
+    }
+
+    /// Returns the required complete serial state.
+    pub const fn serial(&self) -> &SnapshotV2SerialState {
+        &self.serial
+    }
+
+    /// Consumes the closed candidate into its exact committed components.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<u8>,
+        SnapshotV2MemoryBinding,
+        Option<SnapshotV2StorageDeviceGraph>,
+        SnapshotV2SerialState,
+    ) {
+        (self.bytes, self.binding, self.device_graph, self.serial)
+    }
+
+    /// Consumes this exact current candidate into artifact authority.
+    pub fn into_current_artifact_state(self) -> NativeSnapshotArtifactState {
+        let (bytes, binding, _, _) = self.into_parts();
+        NativeSnapshotArtifactState {
+            inner: NativeSnapshotArtifactStateInner::V2 {
+                bytes,
+                version: NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+                binding,
+            },
+        }
+    }
+}
+
+impl fmt::Debug for NativeV2SerialSnapshotCandidateState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2SerialSnapshotCandidateState")
+            .field("version", &self.version())
+            .field("has_storage", &self.device_graph.is_some())
+            .field("state", &REDACTED)
+            .field("memory_binding", &REDACTED)
+            .field("serial", &REDACTED)
             .finish()
     }
 }
@@ -675,15 +771,80 @@ fn decode_storage_device_graph_v2_6(
     Ok((binding, device_graph))
 }
 
+fn decode_serial_state_v2_7(
+    bytes: &[u8],
+) -> Result<
+    (
+        SnapshotV2MemoryBinding,
+        Option<SnapshotV2StorageDeviceGraph>,
+        SnapshotV2SerialState,
+    ),
+    NativeV2SnapshotCandidateStateError,
+> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        bytes,
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+    )
+    .map_err(NativeV2SnapshotCandidateStateError::Format)?;
+    let version = state.metadata().version();
+    if version != NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION {
+        return Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version });
+    }
+    let binding = decode_snapshot_v2_memory_binding(&state)
+        .map_err(NativeV2SnapshotCandidateStateError::Memory)?;
+    if binding.version() != version {
+        return Err(NativeV2SnapshotCandidateStateError::VersionMismatch {
+            state: version,
+            memory: binding.version(),
+        });
+    }
+
+    let mut graph_components = state
+        .components()
+        .filter(|component| component.key().kind() == NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind());
+    let graph = graph_components.next();
+    if graph_components.next().is_some()
+        || graph.is_some_and(|component| {
+            component.key() != NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY
+                || component.disposition() != SnapshotV2ComponentDisposition::Semantic
+        })
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidDeviceGraphComponent);
+    }
+    let device_graph = graph
+        .map(|component| {
+            SnapshotV2StorageDeviceGraph::decode(
+                NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                component.payload(),
+            )
+            .map_err(NativeV2SnapshotCandidateStateError::StorageDeviceGraph)
+        })
+        .transpose()?;
+
+    let mut serial_components = state
+        .components()
+        .filter(|component| component.key().kind() == NATIVE_V2_SERIAL_COMPONENT_KEY.kind());
+    let serial = serial_components
+        .next()
+        .ok_or(NativeV2SnapshotCandidateStateError::MissingSerialState)?;
+    if serial_components.next().is_some()
+        || serial.key() != NATIVE_V2_SERIAL_COMPONENT_KEY
+        || serial.disposition() != SnapshotV2ComponentDisposition::Semantic
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidSerialComponent);
+    }
+    let serial = SnapshotV2SerialState::decode(version, serial.payload())
+        .map_err(NativeV2SnapshotCandidateStateError::SerialState)?;
+    Ok((binding, device_graph, serial))
+}
+
 fn classify_native_v2_profile(
     bytes: &[u8],
     expected_binding: &SnapshotV2MemoryBinding,
 ) -> Result<NativeV2SnapshotArtifactProfile, NativeV2SnapshotCandidateStateError> {
-    let state = decode_snapshot_v2_state_with_compatibility_version(
-        bytes,
-        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-    )
-    .map_err(NativeV2SnapshotCandidateStateError::Format)?;
+    let state =
+        decode_snapshot_v2_state_with_compatibility_version(bytes, NATIVE_V2_SNAPSHOT_VERSION)
+            .map_err(NativeV2SnapshotCandidateStateError::Format)?;
     let version = state.metadata().version();
     let binding = decode_snapshot_v2_memory_binding(&state)
         .map_err(NativeV2SnapshotCandidateStateError::Memory)?;
@@ -728,6 +889,30 @@ fn classify_native_v2_profile(
             SnapshotV2StorageDeviceGraph::decode(version, graph.payload())
                 .map_err(NativeV2SnapshotCandidateStateError::StorageDeviceGraph)?;
             Ok(NativeV2SnapshotArtifactProfile::StorageDeviceGraphV2_6)
+        }
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION => {
+            if let Some(graph) = graph {
+                SnapshotV2StorageDeviceGraph::decode(
+                    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                    graph.payload(),
+                )
+                .map_err(NativeV2SnapshotCandidateStateError::StorageDeviceGraph)?;
+            }
+            let mut serial_components = state.components().filter(|component| {
+                component.key().kind() == NATIVE_V2_SERIAL_COMPONENT_KEY.kind()
+            });
+            let serial = serial_components
+                .next()
+                .ok_or(NativeV2SnapshotCandidateStateError::MissingSerialState)?;
+            if serial_components.next().is_some()
+                || serial.key() != NATIVE_V2_SERIAL_COMPONENT_KEY
+                || serial.disposition() != SnapshotV2ComponentDisposition::Semantic
+            {
+                return Err(NativeV2SnapshotCandidateStateError::InvalidSerialComponent);
+            }
+            SnapshotV2SerialState::decode(version, serial.payload())
+                .map_err(NativeV2SnapshotCandidateStateError::SerialState)?;
+            Ok(NativeV2SnapshotArtifactProfile::SerialStateV2_7)
         }
         _ => Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version }),
     }
@@ -774,6 +959,12 @@ pub enum NativeV2SnapshotCandidateStateError {
     MultiBlockDeviceGraph(SnapshotV2MultiBlockDeviceGraphDecodeError),
     /// The required block-and-pmem storage-graph payload is invalid.
     StorageDeviceGraph(SnapshotV2StorageDeviceGraphDecodeError),
+    /// The exact-2.7 state omits its required serial singleton.
+    MissingSerialState,
+    /// The required serial state is not one semantic singleton component.
+    InvalidSerialComponent,
+    /// The required serial-state payload is invalid.
+    SerialState(SnapshotV2SerialStateDecodeError),
 }
 
 impl fmt::Display for NativeV2SnapshotCandidateStateError {
@@ -818,6 +1009,18 @@ impl fmt::Display for NativeV2SnapshotCandidateStateError {
                     "invalid native-v2 candidate storage device graph: {source}"
                 )
             }
+            Self::MissingSerialState => {
+                formatter.write_str("native-v2 candidate serial state is missing")
+            }
+            Self::InvalidSerialComponent => {
+                formatter.write_str("native-v2 candidate serial component is invalid")
+            }
+            Self::SerialState(source) => {
+                write!(
+                    formatter,
+                    "invalid native-v2 candidate serial state: {source}"
+                )
+            }
         }
     }
 }
@@ -830,10 +1033,13 @@ impl std::error::Error for NativeV2SnapshotCandidateStateError {
             Self::DeviceGraph(source) => Some(source),
             Self::MultiBlockDeviceGraph(source) => Some(source),
             Self::StorageDeviceGraph(source) => Some(source),
+            Self::SerialState(source) => Some(source),
             Self::UnexpectedVersion { .. }
             | Self::VersionMismatch { .. }
             | Self::MissingDeviceGraph
-            | Self::InvalidDeviceGraphComponent => None,
+            | Self::InvalidDeviceGraphComponent
+            | Self::MissingSerialState
+            | Self::InvalidSerialComponent => None,
         }
     }
 }
@@ -1778,11 +1984,11 @@ impl LoadedNativeSnapshotArtifacts {
         Ok((candidate, memory))
     }
 
-    /// Consumes one exact current 2.6 pair into the storage load handoff.
+    /// Consumes one exact compatible 2.6 pair into the storage load handoff.
     ///
     /// The state bytes are neither reopened nor re-encoded, and the already
     /// loaded guest memory remains bound to the candidate derived from them.
-    pub fn into_current_v2_candidate(
+    pub fn into_v2_6_candidate(
         self,
     ) -> Result<
         (NativeV2StorageSnapshotCandidateState, GuestMemory),
@@ -1799,6 +2005,28 @@ impl LoadedNativeSnapshotArtifacts {
         let candidate =
             NativeV2StorageSnapshotCandidateState::from_storage_device_graph_v2_6(bytes)
                 .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
+        debug_assert_eq!(candidate.memory_binding(), &binding);
+        Ok((candidate, memory))
+    }
+
+    /// Consumes one exact current 2.7 pair into the serial load handoff.
+    ///
+    /// The state bytes are neither reopened nor re-encoded, and the already
+    /// loaded guest memory remains bound to the candidate derived from them.
+    pub fn into_current_v2_candidate(
+        self,
+    ) -> Result<(NativeV2SerialSnapshotCandidateState, GuestMemory), NativeSnapshotArtifactStateError>
+    {
+        let actual = self.family();
+        let (state, memory) = self.into_parts();
+        let (bytes, binding) = state.into_v2_parts().map_err(|_| {
+            NativeSnapshotArtifactStateError::UnexpectedFamily {
+                expected: NativeSnapshotArtifactFamily::V2,
+                actual,
+            }
+        })?;
+        let candidate = NativeV2SerialSnapshotCandidateState::from_serial_state_v2_7(bytes)
+            .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
         debug_assert_eq!(candidate.memory_binding(), &binding);
         Ok((candidate, memory))
     }

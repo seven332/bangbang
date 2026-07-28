@@ -1468,7 +1468,7 @@ fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
     assert_output_success(&describe_output, "granted snapshot description");
     assert_eq!(
         String::from_utf8_lossy(&describe_output.stdout).trim(),
-        "v2.6.0"
+        "v2.7.0"
     );
     assert_snapshot_output_redacted(&describe_output, &describe.sensitive_strings());
 

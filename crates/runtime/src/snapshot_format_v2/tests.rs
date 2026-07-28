@@ -204,7 +204,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn device_graph_starts_at_four_serial_starts_at_seven_and_writer_stays_at_six() {
+fn device_graph_starts_at_four_and_writer_activates_serial_at_seven() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -213,7 +213,11 @@ fn device_graph_starts_at_four_serial_starts_at_seven_and_writer_stays_at_six() 
     );
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
-        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        SnapshotFormatVersion::new(2, 6, 0)
     );
     assert_eq!(
         NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
@@ -263,7 +267,7 @@ fn device_graph_starts_at_four_serial_starts_at_seven_and_writer_stays_at_six() 
             .expect("current state should decode")
             .metadata()
             .version(),
-        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        NATIVE_V2_SNAPSHOT_VERSION
     );
 
     let downgraded = with_u16_field_and_checksum(&encoded, VERSION_MINOR_OFFSET, 3);
@@ -354,13 +358,16 @@ fn device_graph_starts_at_four_serial_starts_at_seven_and_writer_stays_at_six() 
         decoded_serial.component(NATIVE_V2_SERIAL_COMPONENT_KEY),
         Some(serial)
     );
-    assert!(matches!(
-        decode_snapshot_v2_state(&serial_state),
-        Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found,
-            supported: NATIVE_V2_SNAPSHOT_VERSION,
-        }) if found == NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
-    ));
+    let public_serial =
+        decode_snapshot_v2_state(&serial_state).expect("current public seam should decode 2.7");
+    assert_eq!(
+        public_serial.metadata().version(),
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        public_serial.component(NATIVE_V2_SERIAL_COMPONENT_KEY),
+        Some(serial)
+    );
 
     let downgraded_serial = with_u16_field_and_checksum(&serial_state, VERSION_MINOR_OFFSET, 6);
     assert_eq!(
@@ -444,11 +451,11 @@ fn version_policy_rejects_major_and_newer_minor_but_accepts_patch() {
         })
     );
 
-    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 7);
+    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 8);
     assert_eq!(
         decode_snapshot_v2_state(&minor),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: SnapshotFormatVersion::new(2, 7, 0),
+            found: SnapshotFormatVersion::new(2, 8, 0),
             supported: NATIVE_V2_SNAPSHOT_VERSION,
         })
     );

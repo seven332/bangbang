@@ -26,13 +26,11 @@ mod macos_arm64 {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use bangbang_hvf::decode_hvf_snapshot_v2_storage_state;
+    use bangbang_hvf::decode_hvf_snapshot_v2_serial_state;
     use bangbang_runtime::block::{DriveCacheType, DriveIoEngine};
     use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
-    use bangbang_runtime::snapshot_device_v2_6::{
-        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
-    };
-    use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version;
+    use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
+    use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
     use bangbang_runtime::storage_capture::StorageRetryState;
 
     use crate::macos_virtual_block::{
@@ -1991,10 +1989,11 @@ mod macos_arm64 {
         assert!(!paused_stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
         assert!(!paused_stdout.contains(GUEST_SERIAL_RX_FAILURE_MARKER));
 
-        assert_capture_ready_snapshot_rejected_without_artifacts(
+        assert_capture_ready_snapshot_succeeds(
             &socket_path,
             test_dir.path(),
             "paused serial stdio capture preflight",
+            false,
         );
         let captured_stdout = bangbang.stdout_snapshot();
         assert!(!captured_stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
@@ -6737,10 +6736,11 @@ mod macos_arm64 {
             !reused_config.contains(path_text(&second_backing_path)),
             "same-ID replacement must remove the intermediate backing projection: {reused_config}"
         );
-        assert_capture_ready_snapshot_rejected_without_artifacts(
+        assert_capture_ready_snapshot_succeeds(
             &socket_path,
             test_dir.path(),
             "paused dynamic PCI Async storage preflight",
+            true,
         );
         write_block_marker_at(
             &control_backing_path,
@@ -7776,10 +7776,11 @@ mod macos_arm64 {
             path_text(&second_backing_path),
             "GET /vm/config after pmem reuse",
         );
-        assert_capture_ready_snapshot_rejected_without_artifacts(
+        assert_capture_ready_snapshot_succeeds(
             &socket_path,
             test_dir.path(),
             "paused dynamic PCI pmem storage preflight",
+            true,
         );
         write_block_marker_at(
             &control_backing_path,
@@ -7999,10 +8000,11 @@ mod macos_arm64 {
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
             "pause before direct pmem storage preflight",
         );
-        assert_capture_ready_snapshot_rejected_without_artifacts(
+        assert_capture_ready_snapshot_succeeds(
             &socket_path,
             test_dir.path(),
             "paused direct pmem storage preflight",
+            true,
         );
         assert_no_content_response(
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
@@ -11178,7 +11180,7 @@ mod macos_arm64 {
             "native-v2 description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.6.0");
+        assert_eq!(described.stdout.trim(), "v2.7.0");
 
         let collision = http_json_with_io_timeout(
             &source_socket,
@@ -11701,7 +11703,7 @@ mod macos_arm64 {
             "{transport} native-v2 root description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.6.0");
+        assert_eq!(described.stdout.trim(), "v2.7.0");
         let source_output = source.terminate();
         assert_clean_shutdown(
             source_output,
@@ -12813,14 +12815,12 @@ mod macos_arm64 {
                 state_path.display()
             )
         });
-        let structural = decode_snapshot_v2_state_with_compatibility_version(
-            &bytes,
-            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-        )
-        .expect("native-v2 state should decode structurally");
-        decode_hvf_snapshot_v2_storage_state(&structural)
+        let structural =
+            decode_snapshot_v2_state(&bytes).expect("native-v2 state should decode structurally");
+        decode_hvf_snapshot_v2_serial_state(&structural)
             .expect("native-v2 state should decode semantically")
             .device_graph()
+            .expect("storage-bearing native-v2 state should contain a device graph")
             .clone()
     }
 
@@ -13067,6 +13067,42 @@ mod macos_arm64 {
             context,
             "Snapshot and restore are not supported.",
         );
+    }
+
+    fn assert_capture_ready_snapshot_succeeds(
+        socket_path: &Path,
+        directory: &Path,
+        context: &str,
+        expect_storage: bool,
+    ) {
+        let state_path = directory.join("capture-ready.state");
+        let memory_path = directory.join("capture-ready.memory");
+        let response = http_json_with_io_timeout(
+            socket_path,
+            "PUT",
+            "/snapshot/create",
+            &format!(
+                r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+                json_string(path_text(&state_path)),
+                json_string(path_text(&memory_path))
+            ),
+            GUEST_EXECUTION_TIMEOUT,
+        );
+
+        assert_no_content_response(&response, context);
+        assert!(state_path.is_file(), "{context} state should exist");
+        assert!(memory_path.is_file(), "{context} memory should exist");
+        let bytes = fs::read(&state_path).expect("capture-ready state should read");
+        let structural =
+            decode_snapshot_v2_state(&bytes).expect("capture-ready state should be exact current");
+        let serial = decode_hvf_snapshot_v2_serial_state(&structural)
+            .expect("capture-ready state should use the exact-2.7 serial profile");
+        assert_eq!(
+            serial.device_graph().is_some(),
+            expect_storage,
+            "{context} storage profile presence should match"
+        );
+        assert_no_snapshot_staging(directory);
     }
 
     fn assert_snapshot_rejected_without_artifacts(

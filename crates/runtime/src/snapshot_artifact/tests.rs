@@ -5,6 +5,8 @@ use crate::memory::{
     GuestMemoryRegionBacking, aarch64,
 };
 #[cfg(target_os = "macos")]
+use crate::serial::{CaptureReadySerialState, SerialConfig, SerialMmioDevice};
+#[cfg(target_os = "macos")]
 use crate::snapshot_device_v2::{
     NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceTransportKind,
 };
@@ -12,13 +14,16 @@ use crate::snapshot_device_v2::{
 use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 #[cfg(target_os = "macos")]
 use crate::snapshot_format_v2::{
-    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component,
-    SnapshotV2ComponentDisposition, encode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY,
+    NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
+    SnapshotV2ComponentKey, encode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory_v2::{
     write_snapshot_v2_memory_image, write_snapshot_v2_memory_image_with_compatibility_version,
 };
+#[cfg(target_os = "macos")]
+use crate::snapshot_serial_v2_7::SnapshotV2SerialState;
 
 #[cfg(target_os = "macos")]
 use std::fs;
@@ -122,8 +127,8 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
     assert_eq!(
         state
             .v2_profile()
-            .expect("current state should classify as exact profile 3"),
-        NativeV2SnapshotArtifactProfile::StorageDeviceGraphV2_6
+            .expect("current state should classify as exact serial profile"),
+        NativeV2SnapshotArtifactProfile::SerialStateV2_7
     );
     assert!(state.v1_record().is_none());
     let debug = format!("{state:?}");
@@ -247,7 +252,7 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn current_v2_artifact_boundary_rejects_graphless_minor_five() {
+fn current_v2_artifact_boundary_rejects_missing_serial_state() {
     let memory = test_v2_memory();
     let mut image = Cursor::new(Vec::new());
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
@@ -255,10 +260,10 @@ fn current_v2_artifact_boundary_rejects_graphless_minor_five() {
         &mut image,
         NATIVE_V2_SNAPSHOT_VERSION,
     )
-    .expect("graphless minor-five memory should encode internally");
+    .expect("graphless current memory should encode internally");
     let binding_payload = binding
         .encode()
-        .expect("graphless minor-five binding should encode");
+        .expect("graphless current binding should encode");
     let memory_component = SnapshotV2Component::new(
         NATIVE_V2_MEMORY_COMPONENT_KEY,
         SnapshotV2ComponentDisposition::Semantic,
@@ -269,19 +274,87 @@ fn current_v2_artifact_boundary_rejects_graphless_minor_five() {
         &[],
         &[memory_component],
     )
-    .expect("graphless minor-five state should encode internally");
+    .expect("graphless current state should encode internally");
 
     assert!(matches!(
         NativeSnapshotArtifactState::from_current_v2(bytes),
         Err(NativeSnapshotArtifactStateError::CurrentV2Profile(
-            NativeV2SnapshotCandidateStateError::MissingDeviceGraph
+            NativeV2SnapshotCandidateStateError::MissingSerialState
         ))
     ));
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn current_v2_artifact_boundary_accepts_exact_minor_six_storage() {
+fn current_v2_artifact_boundary_rejects_duplicate_and_nonsemantic_serial_state() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_SNAPSHOT_VERSION,
+    )
+    .expect("current memory should encode internally");
+    let binding_payload = binding.encode().expect("current binding should encode");
+    let serial_device = SerialMmioDevice::discarding()
+        .capture_state()
+        .expect("serial fixture should capture");
+    let serial_payload = SnapshotV2SerialState::try_from_capture_ready(
+        CaptureReadySerialState::new(SerialConfig::default(), serial_device),
+    )
+    .expect("serial fixture should normalize")
+    .encode(NATIVE_V2_SNAPSHOT_VERSION)
+    .expect("serial fixture should encode");
+    let memory_component = SnapshotV2Component::new(
+        NATIVE_V2_MEMORY_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &binding_payload,
+    );
+    let serial = SnapshotV2Component::new(
+        NATIVE_V2_SERIAL_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &serial_payload,
+    );
+    let duplicate_serial = SnapshotV2Component::new(
+        SnapshotV2ComponentKey::new(NATIVE_V2_SERIAL_COMPONENT_KEY.kind(), 1),
+        SnapshotV2ComponentDisposition::Semantic,
+        &serial_payload,
+    );
+    let duplicate = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_SNAPSHOT_VERSION,
+        &[],
+        &[memory_component, serial, duplicate_serial],
+    )
+    .expect("structural encoder should retain duplicate serial-kind fixture");
+    assert!(matches!(
+        NativeSnapshotArtifactState::from_current_v2(duplicate),
+        Err(NativeSnapshotArtifactStateError::CurrentV2Profile(
+            NativeV2SnapshotCandidateStateError::InvalidSerialComponent
+        ))
+    ));
+
+    let nonsemantic_serial = SnapshotV2Component::new(
+        NATIVE_V2_SERIAL_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::NonSemantic,
+        &serial_payload,
+    );
+    let nonsemantic = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_SNAPSHOT_VERSION,
+        &[],
+        &[memory_component, nonsemantic_serial],
+    )
+    .expect("structural encoder should retain nonsemantic serial fixture");
+    assert!(matches!(
+        NativeSnapshotArtifactState::from_current_v2(nonsemantic),
+        Err(NativeSnapshotArtifactStateError::CurrentV2Profile(
+            NativeV2SnapshotCandidateStateError::InvalidSerialComponent
+        ))
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compatible_v2_artifact_boundary_accepts_exact_minor_six_storage() {
     let memory = test_v2_memory();
     let mut image = Cursor::new(Vec::new());
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
@@ -315,8 +388,8 @@ fn current_v2_artifact_boundary_accepts_exact_minor_six_storage() {
     )
     .expect("internal minor-six state should encode explicitly");
 
-    let state = NativeSnapshotArtifactState::from_current_v2(bytes)
-        .expect("exact minor-six storage state should be current");
+    let state = NativeSnapshotArtifactState::from_compatible_bytes(bytes)
+        .expect("exact minor-six storage state should remain compatible");
     assert_eq!(
         state
             .v2_profile()
@@ -2622,6 +2695,15 @@ fn current_v2_state(binding: &SnapshotV2MemoryBinding) -> Result<Vec<u8>, String
     let graph_payload = fixture_bytes(include_str!(
         "../snapshot_device_v2_6/fixtures/block-root-mmio.hex"
     ));
+    let serial_device = SerialMmioDevice::discarding()
+        .capture_state()
+        .map_err(|source| source.to_string())?;
+    let serial_payload = SnapshotV2SerialState::try_from_capture_ready(
+        CaptureReadySerialState::new(SerialConfig::default(), serial_device),
+    )
+    .map_err(|source| source.to_string())?
+    .encode(NATIVE_V2_SNAPSHOT_VERSION)
+    .map_err(|source| source.to_string())?;
     let components = [
         SnapshotV2Component::new(
             NATIVE_V2_MEMORY_COMPONENT_KEY,
@@ -2632,6 +2714,11 @@ fn current_v2_state(binding: &SnapshotV2MemoryBinding) -> Result<Vec<u8>, String
             NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
             SnapshotV2ComponentDisposition::Semantic,
             &graph_payload,
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_SERIAL_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &serial_payload,
         ),
     ];
     encode_snapshot_v2_state_with_compatibility_version(
