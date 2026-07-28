@@ -50,6 +50,7 @@ pub(crate) struct TokenBucket {
     budget: u64,
     one_time_burst: u64,
     last_update: Instant,
+    elapsed_refill_credit_nanos: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +89,7 @@ impl TokenBucket {
             budget: config.size(),
             one_time_burst: config.one_time_burst().unwrap_or(0),
             last_update: now,
+            elapsed_refill_credit_nanos: 0,
         })
     }
 
@@ -110,6 +112,7 @@ impl TokenBucket {
         if self.one_time_burst >= tokens {
             self.one_time_burst -= tokens;
             self.last_update = now;
+            self.elapsed_refill_credit_nanos = 0;
             return TokenBucketReduction::Allowed;
         }
 
@@ -144,6 +147,7 @@ impl TokenBucket {
         if self.one_time_burst >= tokens {
             self.one_time_burst -= tokens;
             self.last_update = now;
+            self.elapsed_refill_credit_nanos = 0;
             return TokenBucketReduction::Allowed;
         }
 
@@ -169,6 +173,7 @@ impl TokenBucket {
             budget: self.budget,
             one_time_burst: self.one_time_burst,
             last_update: self.last_update,
+            elapsed_refill_credit_nanos: self.elapsed_refill_credit_nanos,
         }
     }
 
@@ -176,6 +181,7 @@ impl TokenBucket {
         self.budget = snapshot.budget;
         self.one_time_burst = snapshot.one_time_burst;
         self.last_update = snapshot.last_update;
+        self.elapsed_refill_credit_nanos = snapshot.elapsed_refill_credit_nanos;
     }
 
     pub(crate) fn persisted_state_at(
@@ -200,11 +206,14 @@ impl TokenBucket {
             return Err(PersistedTokenBucketStateError::BurstOutOfBounds);
         }
 
-        let age = now
+        let physical_age = now
             .checked_duration_since(self.last_update)
             .ok_or(PersistedTokenBucketStateError::CaptureTimeBeforeLastUpdate)?;
-        let age_nanos = u64::try_from(age.as_nanos())
-            .map_err(|_| PersistedTokenBucketStateError::AgeOutOfBounds)?;
+        let age_nanos = physical_age
+            .as_nanos()
+            .checked_add(u128::from(self.elapsed_refill_credit_nanos))
+            .and_then(|age| u64::try_from(age).ok())
+            .ok_or(PersistedTokenBucketStateError::AgeOutOfBounds)?;
 
         Ok(PersistedTokenBucketState::new(
             config,
@@ -227,27 +236,26 @@ impl TokenBucket {
         if state.one_time_burst() > config.one_time_burst().unwrap_or(0) {
             return Err(PersistedTokenBucketStateError::BurstOutOfBounds);
         }
-        let last_update = now
-            .checked_sub(Duration::from_nanos(state.age_nanos()))
-            .ok_or(PersistedTokenBucketStateError::RestoreTimeUnderflow)?;
-
         bucket.budget = state.budget();
         bucket.one_time_burst = state.one_time_burst();
-        bucket.last_update = last_update;
+        bucket.last_update = now;
+        bucket.elapsed_refill_credit_nanos = state.age_nanos();
         Ok(bucket)
     }
 
     fn replenish_at(&mut self, now: Instant) {
-        if now <= self.last_update {
+        let Some(physical_elapsed) = now.checked_duration_since(self.last_update) else {
             return;
-        }
+        };
 
-        let elapsed = now.duration_since(self.last_update);
-        let elapsed_nanos = elapsed.as_nanos();
+        let elapsed_nanos = physical_elapsed
+            .as_nanos()
+            .saturating_add(u128::from(self.elapsed_refill_credit_nanos));
         let refill_time_nanos = u128::from(self.refill_time_nanos);
         if elapsed_nanos >= refill_time_nanos {
             self.budget = self.size;
             self.last_update = now;
+            self.elapsed_refill_credit_nanos = 0;
             return;
         }
 
@@ -271,7 +279,15 @@ impl TokenBucket {
             Ok(value) => value,
             Err(_) => self.refill_time_nanos,
         };
-        self.last_update += Duration::from_nanos(adjusted_nanos);
+        let consumed_credit = self.elapsed_refill_credit_nanos.min(adjusted_nanos);
+        self.elapsed_refill_credit_nanos -= consumed_credit;
+        let consumed_physical = adjusted_nanos - consumed_credit;
+        if consumed_physical != 0 {
+            self.last_update = self
+                .last_update
+                .checked_add(Duration::from_nanos(consumed_physical))
+                .unwrap_or(now);
+        }
     }
 
     fn retry_after_for_tokens(&self, tokens: u64, now: Instant) -> Duration {
@@ -281,11 +297,11 @@ impl TokenBucket {
             return Duration::ZERO;
         }
 
-        let nanos_since_update = if now > self.last_update {
-            now.duration_since(self.last_update).as_nanos()
-        } else {
-            0
-        };
+        let nanos_since_update = now
+            .checked_duration_since(self.last_update)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+            .saturating_add(u128::from(self.elapsed_refill_credit_nanos));
         let nanos_until_budget = u128::from(token_deficit)
             .saturating_mul(u128::from(self.refill_time_nanos))
             .div_ceil(u128::from(self.size));
@@ -306,6 +322,7 @@ pub(crate) struct TokenBucketSnapshot {
     budget: u64,
     one_time_burst: u64,
     last_update: Instant,
+    elapsed_refill_credit_nanos: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -364,7 +381,6 @@ pub(crate) enum PersistedTokenBucketStateError {
     BurstOutOfBounds,
     CaptureTimeBeforeLastUpdate,
     AgeOutOfBounds,
-    RestoreTimeUnderflow,
 }
 
 impl fmt::Display for PersistedTokenBucketStateError {
@@ -384,9 +400,6 @@ impl fmt::Display for PersistedTokenBucketStateError {
                 f.write_str("persisted token bucket capture time precedes its last update")
             }
             Self::AgeOutOfBounds => f.write_str("persisted token bucket age is out of bounds"),
-            Self::RestoreTimeUnderflow => {
-                f.write_str("persisted token bucket age cannot be represented at restore time")
-            }
         }
     }
 }
@@ -520,6 +533,90 @@ mod tests {
             TokenBucketReduction::Throttled {
                 retry_after: Duration::from_millis(25),
             }
+        );
+    }
+
+    #[test]
+    fn logical_restore_credit_matches_a_representable_physical_anchor() {
+        let now = Instant::now();
+        let age = Duration::from_millis(25);
+        let config = TokenBucketConfig::new(4, None, 100);
+        let mut physical = TokenBucket::new_at(
+            config,
+            now.checked_sub(age)
+                .expect("short physical anchor should be representable"),
+        )
+        .expect("physical bucket should build");
+        physical.budget = 1;
+        let state = PersistedTokenBucketState::new(
+            config,
+            1,
+            0,
+            u64::try_from(age.as_nanos()).expect("test age should fit"),
+        );
+        let mut logical = TokenBucket::from_persisted_state_at(state, now)
+            .expect("logical bucket should restore");
+
+        assert_eq!(
+            logical.reduce_with_retry_at(2, now),
+            physical.reduce_with_retry_at(2, now)
+        );
+        assert_eq!(
+            logical
+                .persisted_state_at(config, now)
+                .expect("logical bucket should recapture"),
+            physical
+                .persisted_state_at(config, now)
+                .expect("physical bucket should recapture")
+        );
+    }
+
+    #[test]
+    fn logical_restore_credit_does_not_depend_on_destination_uptime() {
+        let now = Instant::now();
+        let config = TokenBucketConfig::new(4, None, 100);
+        let state = PersistedTokenBucketState::new(config, 0, 0, u64::MAX);
+        let restored = TokenBucket::from_persisted_state_at(state, now)
+            .expect("maximum logical age should not subtract from destination time");
+
+        assert_eq!(
+            restored
+                .persisted_state_at(config, now)
+                .expect("restore-time recapture should retain exact age"),
+            state
+        );
+        assert_eq!(
+            restored
+                .persisted_state_at(config, now + Duration::from_nanos(1))
+                .expect_err("age beyond the persisted representation should fail"),
+            PersistedTokenBucketStateError::AgeOutOfBounds
+        );
+    }
+
+    #[test]
+    fn bucket_snapshot_restores_logical_credit_after_time_reset() {
+        let now = Instant::now();
+        let config = TokenBucketConfig::new(4, Some(2), 100);
+        let state = PersistedTokenBucketState::new(config, 1, 2, 25_000_000);
+        let mut restored = TokenBucket::from_persisted_state_at(state, now)
+            .expect("logical bucket should restore");
+        let snapshot = restored.snapshot();
+
+        assert!(restored.reduce_at(1, now));
+        assert_ne!(
+            restored
+                .persisted_state_at(config, now)
+                .expect("mutated bucket should capture"),
+            state,
+            "one-time burst consumption resets elapsed progress"
+        );
+
+        restored.restore(snapshot);
+        assert_eq!(
+            restored
+                .persisted_state_at(config, now)
+                .expect("rolled-back bucket should capture"),
+            state
         );
     }
 

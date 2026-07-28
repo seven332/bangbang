@@ -10,6 +10,7 @@ use bangbang_runtime::snapshot_device_v2_6::{
 };
 use bangbang_runtime::snapshot_entropy_v2_8::{
     NATIVE_V2_ENTROPY_STATE_HEADER_BYTES, NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES,
+    SnapshotV2EntropyStateDecodeError,
 };
 use bangbang_runtime::snapshot_format_v2::{
     NATIVE_V2_COMPONENT_DIRECTORY_ENTRY_BYTES, NATIVE_V2_LEGACY_PLATFORM_VERSION,
@@ -538,6 +539,17 @@ fn decode_serial_state(bytes: &[u8]) -> Result<HvfSnapshotV2SerialState, HvfSnap
     decode_hvf_snapshot_v2_serial_state(&state)
 }
 
+fn decode_entropy_state(
+    bytes: &[u8],
+) -> Result<HvfSnapshotV2EntropyState, HvfSnapshotV2DecodeError> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        bytes,
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("mutated entropy fixture should remain structurally compatible");
+    decode_hvf_snapshot_v2_entropy_state(&state)
+}
+
 fn rebuild_components<F>(encoded: &[u8], mut transform: F) -> Vec<u8>
 where
     F: FnMut(&mut SnapshotV2ComponentKey, &mut SnapshotV2ComponentDisposition, &mut Vec<u8>),
@@ -780,6 +792,69 @@ fn rebuild_serial_without_component(encoded: &[u8], excluded: SnapshotV2Componen
         &components,
     )
     .expect("reduced serial components should re-encode")
+}
+
+fn rebuild_entropy_components<F>(encoded: &[u8], mut transform: F) -> Vec<u8>
+where
+    F: FnMut(&mut SnapshotV2ComponentKey, &mut SnapshotV2ComponentDisposition, &mut Vec<u8>),
+{
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        encoded,
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("entropy fixture should decode structurally");
+    let mut owned = state
+        .components()
+        .map(|component| {
+            (
+                component.key(),
+                component.disposition(),
+                component.payload().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (key, disposition, payload) in &mut owned {
+        transform(key, disposition, payload);
+    }
+    let components = owned
+        .iter()
+        .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
+        .collect::<Vec<_>>();
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("mutated entropy components should re-encode")
+}
+
+fn rebuild_entropy_without_component(encoded: &[u8], excluded: SnapshotV2ComponentKey) -> Vec<u8> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        encoded,
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("entropy fixture should decode structurally");
+    let owned = state
+        .components()
+        .filter(|component| component.key() != excluded)
+        .map(|component| {
+            (
+                component.key(),
+                component.disposition(),
+                component.payload().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let components = owned
+        .iter()
+        .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
+        .collect::<Vec<_>>();
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("reduced entropy components should re-encode")
 }
 
 fn replace_state_checksum(bytes: &mut [u8]) {
@@ -1240,6 +1315,9 @@ fn internal_exact_minor_eight_entropy_compositions_encode_nested_versions_canoni
             NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
         )
         .expect("minor-eight entropy composition should decode structurally");
+        let decoded = decode_hvf_snapshot_v2_entropy_state(&structural)
+            .expect("minor-eight entropy composition should decode");
+        assert_eq!(decoded, original);
 
         let keys = structural
             .components()
@@ -1305,11 +1383,11 @@ fn internal_exact_minor_eight_entropy_compositions_encode_nested_versions_canoni
             expected_transport
         );
         assert_eq!(
-            encode_hvf_snapshot_v2_entropy_state(&original)
+            encode_hvf_snapshot_v2_entropy_state(&decoded)
                 .expect("minor-eight composition should re-encode"),
             encoded
         );
-        let debug = format!("{original:?}");
+        let debug = format!("{decoded:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("serial-log"));
     }
@@ -1356,6 +1434,112 @@ fn exact_minor_eight_composition_rejects_transport_and_placement_conflicts() {
             Some(entropy),
         ),
         Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+}
+
+#[test]
+fn exact_minor_eight_decoder_rejects_malformed_profile_and_nested_entropy() {
+    let original = complete_entropy_state_fixture(
+        Some(STORAGE_PCI_GRAPH_FIXTURE_HEX),
+        SERIAL_CONFIGURED_FIXTURE_HEX,
+        Some(ENTROPY_ACTIVE_PCI_FIXTURE_HEX),
+        true,
+    );
+    let encoded = encode_hvf_snapshot_v2_entropy_state(&original)
+        .expect("complete minor-eight state should encode");
+
+    let missing_serial =
+        rebuild_entropy_without_component(&encoded, NATIVE_V2_SERIAL_COMPONENT_KEY);
+    assert!(matches!(
+        decode_entropy_state(&missing_serial),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let wrong_instance = rebuild_entropy_components(&encoded, |key, _, _| {
+        if *key == NATIVE_V2_ENTROPY_COMPONENT_KEY {
+            *key = SnapshotV2ComponentKey::new(NATIVE_V2_ENTROPY_COMPONENT_KEY.kind(), 1);
+        }
+    });
+    assert!(matches!(
+        decode_entropy_state(&wrong_instance),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let nonsemantic = rebuild_entropy_components(&encoded, |key, disposition, _| {
+        if *key == NATIVE_V2_ENTROPY_COMPONENT_KEY {
+            *disposition = SnapshotV2ComponentDisposition::NonSemantic;
+        }
+    });
+    assert!(matches!(
+        decode_entropy_state(&nonsemantic),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let structural = decode_snapshot_v2_state_with_compatibility_version(
+        &encoded,
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("entropy fixture should decode structurally");
+    let mut owned = structural
+        .components()
+        .map(|component| {
+            (
+                component.key(),
+                component.disposition(),
+                component.payload().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let duplicate_payload = structural
+        .component(NATIVE_V2_ENTROPY_COMPONENT_KEY)
+        .expect("entropy fixture should contain entropy")
+        .payload()
+        .to_vec();
+    owned.push((
+        SnapshotV2ComponentKey::new(NATIVE_V2_ENTROPY_COMPONENT_KEY.kind(), 1),
+        SnapshotV2ComponentDisposition::Semantic,
+        duplicate_payload,
+    ));
+    let components = owned
+        .iter()
+        .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
+        .collect::<Vec<_>>();
+    let duplicate = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("duplicate entropy instance should encode structurally");
+    assert!(matches!(
+        decode_entropy_state(&duplicate),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let invalid_entropy = rebuild_entropy_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_ENTROPY_COMPONENT_KEY {
+            payload[0] ^= 0xff;
+        }
+    });
+    assert!(matches!(
+        decode_entropy_state(&invalid_entropy),
+        Err(HvfSnapshotV2DecodeError::EntropyState(
+            SnapshotV2EntropyStateDecodeError::InvalidMagic
+        ))
+    ));
+
+    let serial_only = encode_hvf_snapshot_v2_serial_state(&complete_serial_state_fixture(
+        None,
+        SERIAL_DEFAULT_FIXTURE_HEX,
+    ))
+    .expect("minor-seven serial state should encode");
+    let structural = decode_snapshot_v2_state_with_compatibility_version(
+        &serial_only,
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("minor-seven serial state should decode structurally");
+    assert!(matches!(
+        decode_hvf_snapshot_v2_entropy_state(&structural),
+        Err(HvfSnapshotV2DecodeError::UnsupportedProfile)
     ));
 }
 
