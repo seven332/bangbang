@@ -19290,14 +19290,14 @@ mod tests {
     };
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotPublicationOutcome,
-        NativeV2SerialSnapshotCandidateState, SnapshotArtifactOutputs, SnapshotArtifactPaths,
-        SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
+        NativeV2EntropySnapshotCandidateState, NativeV2SerialSnapshotCandidateState,
+        NativeV2SnapshotArtifactProfile, PreparedNativeSnapshotState, SnapshotArtifactOutputs,
+        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_artifact::{
-        NativeSnapshotArtifactFamily, NativeV2SnapshotArtifactProfile,
-        NativeV2SnapshotCandidateState, SnapshotArtifactOutput, SnapshotCommitDurability,
-        load_native_snapshot_artifacts, load_snapshot_artifacts,
+        NativeSnapshotArtifactFamily, NativeV2SnapshotCandidateState, SnapshotArtifactOutput,
+        SnapshotCommitDurability, load_native_snapshot_artifacts, load_snapshot_artifacts,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_commit::SnapshotCommitKind;
@@ -19312,6 +19312,7 @@ mod tests {
     use bangbang_runtime::snapshot_device_v2_6::{
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
     };
+    use bangbang_runtime::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
     use bangbang_runtime::snapshot_format_v2::{
         NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
         NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component,
@@ -25609,6 +25610,69 @@ mod tests {
             HvfInstanceStartExecutor::default().preflight_snapshot_v2_process(),
             Ok(())
         );
+    }
+
+    #[test]
+    fn native_v2_process_preflight_rejects_exact_minor_eight_profile() {
+        let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
+            .expect("exact minor-eight fixture range should validate");
+        let layout = GuestMemoryLayout::new(vec![range])
+            .expect("exact minor-eight fixture layout should validate");
+        let memory =
+            GuestMemory::allocate(&layout).expect("exact minor-eight fixture should allocate");
+        let mut image = Cursor::new(Vec::new());
+        let binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+            &memory,
+            &mut image,
+            NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+            |_| false,
+        )
+        .expect("exact minor-eight memory should encode internally");
+        let binding = binding
+            .encode()
+            .expect("exact minor-eight binding should encode");
+        let serial_device = SerialMmioDevice::discarding()
+            .capture_state()
+            .expect("fixture serial device should capture");
+        let serial = SnapshotV2SerialState::try_from_capture_ready(CaptureReadySerialState::new(
+            SerialConfig::default(),
+            serial_device,
+        ))
+        .expect("fixture serial state should validate")
+        .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+        .expect("fixture serial state should encode");
+        let components = [
+            SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &binding,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_SERIAL_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &serial,
+            ),
+        ];
+        let encoded = encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+            &[],
+            &components,
+        )
+        .expect("exact minor-eight state should encode internally");
+        let state = NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(encoded)
+            .expect("exact minor-eight candidate should validate")
+            .into_compatible_artifact_state();
+        let prepared = PreparedNativeSnapshotState::from_state(state);
+
+        assert!(matches!(
+            HvfInstanceStartExecutor::default().validate_snapshot_v2_artifact_profile(
+                &prepared,
+                NativeV2SnapshotArtifactProfile::EntropyStateV2_8,
+            ),
+            Err(NativeV2SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported
+            ))
+        ));
     }
 
     #[test]
