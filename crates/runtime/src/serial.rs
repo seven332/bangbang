@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioHandler, MmioHandlerError,
@@ -901,6 +901,7 @@ impl SerialOutput for SerialOutputFile {
 pub struct SerialStdio {
     output: SerialStdioOutput,
     input: Option<SerialStdioInput>,
+    restoration: SerialStdioRestoration,
 }
 
 impl fmt::Debug for SerialStdio {
@@ -941,18 +942,25 @@ impl SerialStdio {
             return Err(SerialStdioError::OutputNotWritable);
         }
 
+        let restoration = Arc::new(SerialStdioRestorationState::default());
         let descriptors = Arc::new(SerialStdioDescriptors {
             output,
             output_flags,
             input: None,
             input_flags: None,
             input_termios: None,
+            restoration: Arc::clone(&restoration),
         });
-        set_descriptor_status_flags(
+        if let Err(source) = set_descriptor_status_flags(
             descriptors.output.as_raw_fd(),
             output_flags | libc::O_NONBLOCK,
-        )
-        .map_err(|source| SerialStdioError::ConfigureOutput { source })?;
+        ) {
+            return Err(serial_stdio_configuration_error(
+                descriptors,
+                &restoration,
+                SerialStdioError::ConfigureOutput { source },
+            ));
+        }
         Ok(SerialStdioOutput { descriptors })
     }
 
@@ -1001,26 +1009,45 @@ impl SerialStdio {
             None => (None, None, None),
         };
 
+        let restoration = Arc::new(SerialStdioRestorationState::default());
         let descriptors = Arc::new(SerialStdioDescriptors {
             output,
             output_flags,
             input,
             input_flags,
             input_termios,
+            restoration: Arc::clone(&restoration),
         });
 
-        set_descriptor_status_flags(
+        if let Err(source) = set_descriptor_status_flags(
             descriptors.output.as_raw_fd(),
             output_flags | libc::O_NONBLOCK,
-        )
-        .map_err(|source| SerialStdioError::ConfigureOutput { source })?;
+        ) {
+            return Err(serial_stdio_configuration_error(
+                descriptors,
+                &restoration,
+                SerialStdioError::ConfigureOutput { source },
+            ));
+        }
         if let (Some(input), Some(flags)) = (&descriptors.input, input_flags) {
-            if let Some(termios) = input_termios {
-                set_raw_terminal(input.as_raw_fd(), termios)
-                    .map_err(|source| SerialStdioError::ConfigureTerminal { source })?;
+            if let Some(termios) = input_termios
+                && let Err(source) = set_raw_terminal(input.as_raw_fd(), termios)
+            {
+                return Err(serial_stdio_configuration_error(
+                    descriptors,
+                    &restoration,
+                    SerialStdioError::ConfigureTerminal { source },
+                ));
             }
-            set_descriptor_status_flags(input.as_raw_fd(), flags | libc::O_NONBLOCK)
-                .map_err(|source| SerialStdioError::ConfigureInput { source })?;
+            if let Err(source) =
+                set_descriptor_status_flags(input.as_raw_fd(), flags | libc::O_NONBLOCK)
+            {
+                return Err(serial_stdio_configuration_error(
+                    descriptors,
+                    &restoration,
+                    SerialStdioError::ConfigureInput { source },
+                ));
+            }
         }
 
         let input = descriptors.input.as_ref().map(|input| SerialStdioInput {
@@ -1030,11 +1057,126 @@ impl SerialStdio {
         Ok(Self {
             output: SerialStdioOutput { descriptors },
             input,
+            restoration: SerialStdioRestoration { state: restoration },
         })
     }
 
     pub fn into_parts(self) -> (SerialStdioOutput, Option<SerialStdioInput>) {
-        (self.output, self.input)
+        let Self {
+            output,
+            input,
+            restoration: _,
+        } = self;
+        (output, input)
+    }
+
+    /// Splits the prepared endpoints while retaining an explicit final cleanup
+    /// receipt.
+    ///
+    /// The receipt does not retain either descriptor. Call
+    /// [`SerialStdioRestoration::finish`] only after every output and input
+    /// owner has been dropped.
+    pub fn into_restorable_parts(
+        self,
+    ) -> (
+        SerialStdioOutput,
+        Option<SerialStdioInput>,
+        SerialStdioRestoration,
+    ) {
+        (self.output, self.input, self.restoration)
+    }
+}
+
+#[derive(Default)]
+struct SerialStdioRestorationState {
+    result: OnceLock<Result<(), SerialStdioRestorationError>>,
+}
+
+/// Move-only receipt for one shared serial stdio restoration lifetime.
+pub struct SerialStdioRestoration {
+    state: Arc<SerialStdioRestorationState>,
+}
+
+impl SerialStdioRestoration {
+    /// Verifies that final-owner teardown restored every mutable endpoint
+    /// attribute.
+    pub fn finish(self) -> Result<(), SerialStdioRestorationError> {
+        self.state
+            .result
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Err(SerialStdioRestorationError::endpoints_still_owned()))
+    }
+}
+
+impl fmt::Debug for SerialStdioRestoration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SerialStdioRestoration")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+const SERIAL_STDIO_RESTORE_ENDPOINTS_STILL_OWNED: u8 = 1 << 0;
+const SERIAL_STDIO_RESTORE_TERMINAL: u8 = 1 << 1;
+const SERIAL_STDIO_VERIFY_TERMINAL: u8 = 1 << 2;
+const SERIAL_STDIO_RESTORE_INPUT_STATUS: u8 = 1 << 3;
+const SERIAL_STDIO_VERIFY_INPUT_STATUS: u8 = 1 << 4;
+const SERIAL_STDIO_RESTORE_OUTPUT_STATUS: u8 = 1 << 5;
+const SERIAL_STDIO_VERIFY_OUTPUT_STATUS: u8 = 1 << 6;
+
+/// Value-free failure while restoring destination process serial endpoints.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SerialStdioRestorationError {
+    failures: u8,
+}
+
+impl SerialStdioRestorationError {
+    const fn endpoints_still_owned() -> Self {
+        Self {
+            failures: SERIAL_STDIO_RESTORE_ENDPOINTS_STILL_OWNED,
+        }
+    }
+
+    const fn from_failures(failures: u8) -> Self {
+        Self { failures }
+    }
+}
+
+impl fmt::Debug for SerialStdioRestorationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SerialStdioRestorationError")
+            .field("failure_count", &self.failures.count_ones())
+            .finish()
+    }
+}
+
+impl fmt::Display for SerialStdioRestorationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("serial standard stream restoration failed")
+    }
+}
+
+impl std::error::Error for SerialStdioRestorationError {}
+
+fn serial_stdio_configuration_error(
+    descriptors: Arc<SerialStdioDescriptors>,
+    restoration: &Arc<SerialStdioRestorationState>,
+    source: SerialStdioError,
+) -> SerialStdioError {
+    drop(descriptors);
+    match restoration.result.get().cloned() {
+        Some(Ok(())) => source,
+        Some(Err(cleanup)) => SerialStdioError::ConfigurationCleanup {
+            source: Box::new(source),
+            cleanup,
+        },
+        None => SerialStdioError::ConfigurationCleanup {
+            source: Box::new(source),
+            cleanup: SerialStdioRestorationError::endpoints_still_owned(),
+        },
     }
 }
 
@@ -1044,6 +1186,7 @@ struct SerialStdioDescriptors {
     input: Option<File>,
     input_flags: Option<libc::c_int>,
     input_termios: Option<libc::termios>,
+    restoration: Arc<SerialStdioRestorationState>,
 }
 
 impl fmt::Debug for SerialStdioDescriptors {
@@ -1057,18 +1200,72 @@ impl fmt::Debug for SerialStdioDescriptors {
 
 impl Drop for SerialStdioDescriptors {
     fn drop(&mut self) {
-        if let Some(input) = self.input.as_ref() {
-            if let Some(termios) = self.input_termios.as_ref() {
-                // SAFETY: The descriptor and retained terminal attributes remain
-                // valid until this restoration owner finishes dropping.
-                let _ = unsafe { libc::tcsetattr(input.as_raw_fd(), libc::TCSANOW, termios) };
-            }
-            if let Some(flags) = self.input_flags {
-                let _ = set_descriptor_status_flags(input.as_raw_fd(), flags);
+        let result = restore_serial_stdio_descriptors(self);
+        let _ = self.restoration.result.set(result);
+    }
+}
+
+fn restore_serial_stdio_descriptors(
+    descriptors: &SerialStdioDescriptors,
+) -> Result<(), SerialStdioRestorationError> {
+    let mut failures = 0_u8;
+    if let Some(input) = descriptors.input.as_ref() {
+        if let Some(termios) = descriptors.input_termios.as_ref() {
+            // SAFETY: The descriptor and retained terminal attributes remain
+            // valid until this restoration owner finishes dropping.
+            if unsafe { libc::tcsetattr(input.as_raw_fd(), libc::TCSANOW, termios) } != 0 {
+                failures |= SERIAL_STDIO_RESTORE_TERMINAL;
+            } else if match terminal_attributes(input.as_raw_fd()) {
+                Ok(observed) => !restored_terminal_matches(&observed, termios),
+                Err(_) => true,
+            } {
+                failures |= SERIAL_STDIO_VERIFY_TERMINAL;
             }
         }
-        let _ = set_descriptor_status_flags(self.output.as_raw_fd(), self.output_flags);
+        if let Some(flags) = descriptors.input_flags {
+            if set_descriptor_status_flags(input.as_raw_fd(), flags).is_err() {
+                failures |= SERIAL_STDIO_RESTORE_INPUT_STATUS;
+            } else if match descriptor_status_flags(input.as_raw_fd()) {
+                Ok(observed) => !restored_status_matches(observed, flags),
+                Err(_) => true,
+            } {
+                failures |= SERIAL_STDIO_VERIFY_INPUT_STATUS;
+            }
+        }
     }
+    if set_descriptor_status_flags(descriptors.output.as_raw_fd(), descriptors.output_flags)
+        .is_err()
+    {
+        failures |= SERIAL_STDIO_RESTORE_OUTPUT_STATUS;
+    } else if match descriptor_status_flags(descriptors.output.as_raw_fd()) {
+        Ok(observed) => !restored_status_matches(observed, descriptors.output_flags),
+        Err(_) => true,
+    } {
+        failures |= SERIAL_STDIO_VERIFY_OUTPUT_STATUS;
+    }
+
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(SerialStdioRestorationError::from_failures(failures))
+    }
+}
+
+fn restored_status_matches(observed: libc::c_int, expected: libc::c_int) -> bool {
+    let mask = libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK | libc::O_ASYNC | libc::O_SYNC;
+    observed & mask == expected & mask
+}
+
+fn restored_terminal_matches(observed: &libc::termios, expected: &libc::termios) -> bool {
+    observed.c_iflag == expected.c_iflag
+        && observed.c_oflag == expected.c_oflag
+        && observed.c_cflag == expected.c_cflag
+        && observed.c_lflag & !libc::PENDIN == expected.c_lflag & !libc::PENDIN
+        && observed.c_cc == expected.c_cc
+        // SAFETY: Both pointers refer to complete live termios values.
+        && unsafe { libc::cfgetispeed(observed) } == unsafe { libc::cfgetispeed(expected) }
+        // SAFETY: Both pointers refer to complete live termios values.
+        && unsafe { libc::cfgetospeed(observed) } == unsafe { libc::cfgetospeed(expected) }
 }
 
 /// Nonblocking stdout half of one prepared serial stdio lifetime.
@@ -1129,16 +1326,42 @@ impl fmt::Debug for SerialStdioInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SerialStdioError {
-    InspectInput { source: std::io::ErrorKind },
-    InspectOutput { source: std::io::ErrorKind },
-    DuplicateInput { source: std::io::ErrorKind },
-    DuplicateOutput { source: std::io::ErrorKind },
+    InspectInput {
+        source: std::io::ErrorKind,
+    },
+    InspectOutput {
+        source: std::io::ErrorKind,
+    },
+    DuplicateInput {
+        source: std::io::ErrorKind,
+    },
+    DuplicateOutput {
+        source: std::io::ErrorKind,
+    },
     InputNotReadable,
     OutputNotWritable,
-    InspectTerminal { source: std::io::ErrorKind },
-    ConfigureTerminal { source: std::io::ErrorKind },
-    ConfigureInput { source: std::io::ErrorKind },
-    ConfigureOutput { source: std::io::ErrorKind },
+    InspectTerminal {
+        source: std::io::ErrorKind,
+    },
+    ConfigureTerminal {
+        source: std::io::ErrorKind,
+    },
+    ConfigureInput {
+        source: std::io::ErrorKind,
+    },
+    ConfigureOutput {
+        source: std::io::ErrorKind,
+    },
+    ConfigurationCleanup {
+        source: Box<SerialStdioError>,
+        cleanup: SerialStdioRestorationError,
+    },
+}
+
+impl SerialStdioError {
+    pub const fn cleanup_failed(&self) -> bool {
+        matches!(self, Self::ConfigurationCleanup { .. })
+    }
 }
 
 impl fmt::Display for SerialStdioError {
@@ -1191,11 +1414,30 @@ impl fmt::Display for SerialStdioError {
                     "serial stdout could not be configured: {source:?}"
                 )
             }
+            Self::ConfigurationCleanup { .. } => formatter.write_str(
+                "serial standard stream configuration failed and restoration also failed",
+            ),
         }
     }
 }
 
-impl std::error::Error for SerialStdioError {}
+impl std::error::Error for SerialStdioError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ConfigurationCleanup { source, .. } => Some(source.as_ref()),
+            Self::InspectInput { .. }
+            | Self::InspectOutput { .. }
+            | Self::DuplicateInput { .. }
+            | Self::DuplicateOutput { .. }
+            | Self::InputNotReadable
+            | Self::OutputNotWritable
+            | Self::InspectTerminal { .. }
+            | Self::ConfigureTerminal { .. }
+            | Self::ConfigureInput { .. }
+            | Self::ConfigureOutput { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SerialStdioInputKind {
@@ -2502,10 +2744,10 @@ mod tests {
         let original_output_flags =
             super::descriptor_status_flags(output_writer.as_raw_fd()).expect("output flags");
 
-        let (mut output, input) =
+        let (mut output, input, restoration) =
             SerialStdio::from_descriptors(input_reader.as_raw_fd(), output_writer.as_raw_fd())
                 .expect("pipe stdio should prepare")
-                .into_parts();
+                .into_restorable_parts();
         let mut input = input.expect("pipe stdin should attach");
 
         assert_ne!(
@@ -2546,6 +2788,9 @@ mod tests {
             "the remaining input owner must retain the shared stdio lifetime"
         );
         drop(input);
+        restoration
+            .finish()
+            .expect("final-owner pipe restoration should be verified");
         assert_eq!(
             super::descriptor_status_flags(input_reader.as_raw_fd()).expect("restored input flags")
                 & (libc::O_ACCMODE | libc::O_NONBLOCK),
@@ -2564,16 +2809,25 @@ mod tests {
         let unsupported_input = File::open("/dev/null").expect("null input should open");
         let (_output_reader, output_writer) = pipe_files();
 
-        let (_, input) =
+        let (output, input, restoration) =
             SerialStdio::from_descriptors(unsupported_input.as_raw_fd(), output_writer.as_raw_fd())
                 .expect("unsupported stdin should not prevent stdout setup")
-                .into_parts();
+                .into_restorable_parts();
         assert!(input.is_none());
+        drop(output);
+        restoration
+            .finish()
+            .expect("output-only lifetime should restore");
 
-        let (_, input) = SerialStdio::from_descriptors(-1, output_writer.as_raw_fd())
-            .expect("closed stdin should not prevent stdout setup")
-            .into_parts();
+        let (output, input, restoration) =
+            SerialStdio::from_descriptors(-1, output_writer.as_raw_fd())
+                .expect("closed stdin should not prevent stdout setup")
+                .into_restorable_parts();
         assert!(input.is_none());
+        drop(output);
+        restoration
+            .finish()
+            .expect("invalid-input lifetime should restore");
     }
 
     #[test]
@@ -2628,9 +2882,10 @@ mod tests {
         let slave = unsafe { File::from_raw_fd(slave_descriptor) };
         let original = super::terminal_attributes(slave.as_raw_fd()).expect("terminal state");
 
-        let (output, input) = SerialStdio::from_descriptors(slave.as_raw_fd(), slave.as_raw_fd())
-            .expect("terminal stdio should prepare")
-            .into_parts();
+        let (output, input, restoration) =
+            SerialStdio::from_descriptors(slave.as_raw_fd(), slave.as_raw_fd())
+                .expect("terminal stdio should prepare")
+                .into_restorable_parts();
         let input = input.expect("terminal stdin should attach");
         let raw = super::terminal_attributes(slave.as_raw_fd()).expect("raw terminal state");
         assert_eq!(raw.c_lflag & (libc::ICANON | libc::ECHO), 0);
@@ -2644,6 +2899,9 @@ mod tests {
             0
         );
         drop(input);
+        restoration
+            .finish()
+            .expect("final-owner terminal restoration should be verified");
         let restored =
             super::terminal_attributes(slave.as_raw_fd()).expect("restored terminal state");
         assert_eq!(restored.c_iflag, original.c_iflag);

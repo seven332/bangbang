@@ -3189,6 +3189,10 @@ pub(crate) struct PreparedSnapshotSerialRestoreOutput {
 }
 
 impl PreparedSnapshotSerialRestoreOutput {
+    pub(crate) const fn key(&self) -> &SnapshotRestoreResourceKey {
+        &self.key
+    }
+
     pub(crate) fn into_parts(self) -> (SnapshotRestoreResourceKey, SerialOutputFile) {
         (self.key, self.output)
     }
@@ -3222,6 +3226,17 @@ impl PreparedSnapshotSerialRestoreBatch {
         PreparedSnapshotDriveRestoreCompletion,
     ) {
         (self.blocks, self.pmems, self.serial, self.completion)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_serial_resource_class_for_test(&mut self) {
+        if let Some(serial) = self.serial.as_mut() {
+            serial.key = SnapshotRestoreResourceKey::new(
+                serial.key.device_key(),
+                serial.key.public_id().clone(),
+                SnapshotRestoreResourceClass::BlockBacking,
+            );
+        }
     }
 }
 
@@ -4537,6 +4552,8 @@ impl RequestedSnapshotRestoreResources {
         let _profile_3_bundle_producer =
             Self::prepare_native_v2_storage_restore_bundle::<fn() -> bool>;
         let _profile_4_producer = Self::prepare_native_v2_serial_state::<fn() -> bool>;
+        let _profile_4_bundle_producer =
+            crate::snapshot_serial_restore::prepare_native_v2_serial_restore_bundle::<fn() -> bool>;
         Self::try_from_native_v2_device_graph_and_vsock(graph, None)
     }
 
