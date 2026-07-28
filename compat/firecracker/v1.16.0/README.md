@@ -49,8 +49,8 @@ claims mechanically visible.
 - [`storage-contract.md`](storage-contract.md) is the #1471 aggregate storage
   ledger, completed by #1634's pmem snapshot certification. It pins the exact
   40-record family with 40 terminal outcomes, field-specific implementation
-  evidence, and signed direct/production live plus native-v2 2.6
-  create/load/cleanup proof.
+  evidence, and signed direct/production live plus exact native-v2 2.6/current
+  2.7 create/load/cleanup proof.
 - [`balloon-contract.md`](balloon-contract.md) is the #1473 balloon ledger. It
   pins all 52 records, promotes the 50 complete API/path/property/schema leaves,
   records publication-safe paired PFN accounting and coherent MMIO/PCI
@@ -66,11 +66,12 @@ claims mechanically visible.
   API/path/property/schema leaves, records dual-bucket retry and exact
   MMIO/PCI capture-ready ownership, and hands exactly two
   serialization/restore aggregates to Wave 6.
-- [`serial-contract.md`](serial-contract.md) is the #1479 serial stdio ledger.
-  It pins all six records, promotes the five complete API/path/property/schema
-  leaves, records default stdout, configured-output stdin exclusion, bounded
-  terminal/FIFO RX and exact MMIO capture-ready ownership, and hands the one
-  serialization/endpoint-reconstruction aggregate to Wave 6.
+- [`serial-contract.md`](serial-contract.md) is the #1479/#1652 serial stdio
+  and snapshot ledger. It pins all six records as terminal, records default
+  stdout, configured-output stdin exclusion, bounded terminal/FIFO/pipe RX,
+  exact MMIO capture ownership, current native-v2 2.7 encoding, fresh endpoint
+  reconstruction, signed serial-only and storage-bearing continuation, clone
+  loads, recapture, redaction, and cleanup.
 - [`time-identity-contract.md`](time-identity-contract.md) is the
   #1477/#1478/#1480/#1529 PL031, VMGenID, VMClock, and PVTime ledger. It records complete
   typed VMClock capture, backward-compatible native-v1 state, ordered
@@ -82,9 +83,9 @@ claims mechanically visible.
   cross-host portability certification.
 - [`remaining-device-contract.md`](remaining-device-contract.md) is the #1481
   checked aggregate ledger. It joins the exact 52 balloon, 19 memory-hotplug,
-  seven entropy, six serial, and one time/identity records; pins the 77 terminal
-  and eight Wave 6 outcomes; and binds focused, signed MMIO/PCI, and production
-  serial-isolation evidence without changing family semantics.
+  seven entropy, six serial, and one time/identity records; pins the current 78
+  terminal and seven Wave 6 outcomes; and binds focused, signed MMIO/PCI,
+  production serial-isolation, and exact 2.7 restored-serial evidence.
 - [`network-mmds-contract.md`](network-mmds-contract.md) is the #1496 checked
   aggregate network/MMDS ledger. It pins an exact 35-record set, promotes 31
   complete live/capture-ready outcomes, and retains four explicit #1378,
@@ -627,12 +628,18 @@ public native-v2 `2.5.0` activation for a rooted or rootless ordered vector of
 1–64 regular-file block devices. #1617 certifies active all-drive
 pre/post-capture persistence, exact failure boundaries, and the signed direct
 and normal-production matrix. Exact `2.4.0` and device-free `2.3.0` remain
-loadable. #1634 advances the current writer to `2.6.0` profile 3 with ordered
+loadable. #1634 advanced the writer at that checkpoint to `2.6.0` profile 3 with ordered
 regular-file block and pmem devices, exact complete-set authority, and signed
 rooted/rootless × MMIO/PCI persistence certification. Exact block-only
-`2.5.0` remains loadable. Other optional devices/MMDS, Diff, tools,
-Firecracker interoperability, and broad portability remain audited, so the
-current overlay is 235/163/3/17.
+`2.5.0` remains loadable. #1651 then activates current `2.7.0` with one required
+complete serial component and optional unchanged profile-3 storage. #1652
+certifies fresh default/configured endpoint authority, complete UART/RX/pending
+work continuation, serial-only and MMIO/PCI-storage-bearing restore, repeated
+clone loads, recapture, containment, redaction, and cleanup; it promotes the
+final serial semantic. Other optional devices/MMDS, Diff, tools, Firecracker
+interoperability, and broad portability remain audited. The current aggregate
+selector is 78 terminal and seven `audit-required`, and the current overlay is
+236/162/3/17.
 
 ## Commands
 

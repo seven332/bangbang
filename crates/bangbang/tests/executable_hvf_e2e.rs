@@ -9,6 +9,8 @@
 
 #[path = "../../../tests/support/macos_virtual_block.rs"]
 mod macos_virtual_block;
+#[path = "../../../tests/support/snapshot_serial.rs"]
+mod snapshot_serial;
 mod support;
 #[path = "../../../tests/support/vhost_user_block.rs"]
 mod vhost_user_block;
@@ -19,7 +21,8 @@ mod macos_arm64 {
     use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
     use std::net::Shutdown;
     use std::os::fd::OwnedFd;
-    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::ExitStatusExt as _;
     use std::path::{Path, PathBuf};
@@ -11073,6 +11076,824 @@ mod macos_arm64 {
         );
     }
 
+    #[derive(Clone, Copy)]
+    enum SerialSnapshotProduct {
+        SerialOnly,
+        MmioStorage,
+        PciStorage,
+    }
+
+    impl SerialSnapshotProduct {
+        const fn name(self) -> &'static str {
+            match self {
+                Self::SerialOnly => "serial-only",
+                Self::MmioStorage => "mmio-storage",
+                Self::PciStorage => "pci-storage",
+            }
+        }
+
+        const fn code(self) -> &'static str {
+            match self {
+                Self::SerialOnly => "s",
+                Self::MmioStorage => "m",
+                Self::PciStorage => "p",
+            }
+        }
+
+        const fn has_storage(self) -> bool {
+            !matches!(self, Self::SerialOnly)
+        }
+
+        const fn enable_pci(self) -> bool {
+            matches!(self, Self::PciStorage)
+        }
+
+        const fn process_args(self) -> &'static [&'static str] {
+            if self.enable_pci() {
+                &["--enable-pci"]
+            } else {
+                &[]
+            }
+        }
+    }
+
+    #[test]
+    fn signed_executable_certifies_native_v2_serial_continuation_over_fresh_stdio() {
+        for product in [
+            SerialSnapshotProduct::SerialOnly,
+            SerialSnapshotProduct::MmioStorage,
+            SerialSnapshotProduct::PciStorage,
+        ] {
+            run_native_v2_serial_continuation_case(product);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ConfiguredSerialOutputKind {
+        RegularFile,
+        Fifo,
+    }
+
+    impl ConfiguredSerialOutputKind {
+        const fn name(self) -> &'static str {
+            match self {
+                Self::RegularFile => "file",
+                Self::Fifo => "fifo",
+            }
+        }
+    }
+
+    #[test]
+    fn signed_executable_reopens_configured_serial_snapshot_file_and_fifo_destinations() {
+        for kind in [
+            ConfiguredSerialOutputKind::RegularFile,
+            ConfiguredSerialOutputKind::Fifo,
+        ] {
+            run_configured_serial_snapshot_output_case(kind);
+        }
+    }
+
+    fn run_configured_serial_snapshot_output_case(kind: ConfiguredSerialOutputKind) {
+        let test_dir = TestDir::new();
+        let case = kind.name();
+        let kernel_path = test_dir.path().join(format!("configured-{case}.image"));
+        let serial_path = test_dir.path().join(format!("configured-{case}.out"));
+        let opened_serial_path = test_dir.path().join(format!("source-{case}.opened"));
+        let state_path = test_dir.path().join(format!("configured-{case}.state"));
+        let memory_path = test_dir.path().join(format!("configured-{case}.memory"));
+        let source_socket = test_dir.path().join("c-s");
+        let destination_socket = test_dir.path().join("c-d");
+        let instance_id = test_dir.instance_id();
+
+        fs::write(
+            &kernel_path,
+            crate::snapshot_serial::configured_output_guest_image(),
+        )
+        .expect("configured serial snapshot guest image should write");
+        let mut source_fifo = match kind {
+            ConfiguredSerialOutputKind::RegularFile => {
+                create_empty_file(&serial_path);
+                None
+            }
+            ConfiguredSerialOutputKind::Fifo => {
+                create_named_fifo(&serial_path);
+                Some(open_named_fifo_reader(&serial_path))
+            }
+        };
+        let mut source_fifo_output = Vec::new();
+
+        let source = BangbangProcess::start(
+            &source_socket,
+            &format!("{instance_id}-configured-{case}-source"),
+        );
+        configure_and_start_configured_serial_snapshot_source(
+            &source_socket,
+            &kernel_path,
+            &serial_path,
+        );
+        match source_fifo.as_mut() {
+            Some(reader) => {
+                source_fifo_output = wait_for_fifo_marker(
+                    reader,
+                    crate::snapshot_serial::CONFIGURED_SOURCE_MARKER,
+                    GUEST_EXECUTION_TIMEOUT,
+                    &format!("{case} configured serial source"),
+                );
+                assert!(
+                    !String::from_utf8_lossy(&source_fifo_output)
+                        .contains(crate::snapshot_serial::CONFIGURED_RESTORED_MARKER)
+                );
+            }
+            None => wait_for_file_contains_marker(
+                &serial_path,
+                crate::snapshot_serial::CONFIGURED_SOURCE_MARKER.as_bytes(),
+                GUEST_EXECUTION_TIMEOUT,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{case} configured source marker should become visible: {error}")
+            }),
+        }
+        assert_no_content_response(
+            &http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            &format!("pause configured {case} serial source"),
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &source_socket,
+                "PUT",
+                "/snapshot/create",
+                &format!(
+                    r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+                    json_string(path_text(&state_path)),
+                    json_string(path_text(&memory_path))
+                ),
+                GUEST_EXECUTION_TIMEOUT,
+            ),
+            &format!("create configured {case} serial snapshot"),
+        );
+        assert_configured_serial_snapshot_state(&state_path, &serial_path);
+        let state_before =
+            fs::read(&state_path).expect("configured serial snapshot state should read");
+        let memory_before =
+            fs::read(&memory_path).expect("configured serial snapshot memory should read");
+        assert_clean_shutdown(
+            source.terminate(),
+            &source_socket,
+            &format!("configured {case} serial source"),
+        );
+
+        fs::rename(&serial_path, &opened_serial_path)
+            .expect("source configured serial pathname should move");
+        let mut destination_fifo = match kind {
+            ConfiguredSerialOutputKind::RegularFile => {
+                create_empty_file(&serial_path);
+                None
+            }
+            ConfiguredSerialOutputKind::Fifo => {
+                create_named_fifo(&serial_path);
+                Some(open_named_fifo_reader(&serial_path))
+            }
+        };
+        let destination = BangbangProcess::start(
+            &destination_socket,
+            &format!("{instance_id}-configured-{case}-destination"),
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &destination_socket,
+                "PUT",
+                "/snapshot/load",
+                &snapshot_load_body(&state_path, &memory_path, true),
+                GUEST_EXECUTION_TIMEOUT,
+            ),
+            &format!("load configured {case} serial destination"),
+        );
+        let output = destination.wait_for_exit_with_timeout(
+            GUEST_EXECUTION_TIMEOUT,
+            &format!("configured {case} restored serial guest"),
+        );
+        assert_clean_shutdown(
+            output,
+            &destination_socket,
+            &format!("configured {case} serial destination"),
+        );
+
+        match destination_fifo.as_mut() {
+            Some(reader) => {
+                let output = wait_for_fifo_marker(
+                    reader,
+                    crate::snapshot_serial::CONFIGURED_RESTORED_MARKER,
+                    GUEST_EXECUTION_TIMEOUT,
+                    &format!("{case} configured serial destination"),
+                );
+                assert!(
+                    !String::from_utf8_lossy(&output)
+                        .contains(crate::snapshot_serial::CONFIGURED_FAILURE_MARKER)
+                );
+            }
+            None => {
+                wait_for_file_contains_marker(
+                    &serial_path,
+                    crate::snapshot_serial::CONFIGURED_RESTORED_MARKER.as_bytes(),
+                    GUEST_EXECUTION_TIMEOUT,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{case} configured destination marker should become visible: {error}")
+                });
+                assert!(
+                    !fs::read_to_string(&serial_path)
+                        .expect("configured destination output should read")
+                        .contains(crate::snapshot_serial::CONFIGURED_FAILURE_MARKER)
+                );
+            }
+        }
+        let source_output = match kind {
+            ConfiguredSerialOutputKind::RegularFile => {
+                fs::read(&opened_serial_path).expect("opened configured source output should read")
+            }
+            ConfiguredSerialOutputKind::Fifo => {
+                if let Some(reader) = source_fifo.as_mut() {
+                    read_available_fifo(reader, &mut source_fifo_output);
+                }
+                source_fifo_output
+            }
+        };
+        let source_output = String::from_utf8_lossy(&source_output);
+        assert!(source_output.contains(crate::snapshot_serial::CONFIGURED_SOURCE_MARKER));
+        assert!(
+            !source_output.contains(crate::snapshot_serial::CONFIGURED_RESTORED_MARKER),
+            "{case} source endpoint must not receive destination TX"
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("configured serial state should remain readable"),
+            state_before
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("configured serial memory should remain readable"),
+            memory_before
+        );
+        assert_no_snapshot_staging(test_dir.path());
+    }
+
+    fn run_native_v2_serial_continuation_case(product: SerialSnapshotProduct) {
+        let test_dir = TestDir::new();
+        let case = product.name();
+        let kernel_path = test_dir.path().join(format!("{case}.image"));
+        let drive_path = test_dir.path().join(format!("{case}.drive"));
+        let state_path = test_dir.path().join(format!("{case}.state"));
+        let memory_path = test_dir.path().join(format!("{case}.memory"));
+        let source_socket = test_dir.path().join(format!("{}-s", product.code()));
+        let source_metrics = test_dir.path().join(format!("{case}-source.metrics"));
+        let instance_id = test_dir.instance_id();
+
+        fs::write(
+            &kernel_path,
+            crate::snapshot_serial::default_stdio_guest_image(),
+        )
+        .expect("serial snapshot guest image should write");
+        if product.has_storage() {
+            create_zeroed_block_backing(&drive_path);
+        }
+        create_empty_file(&source_metrics);
+
+        let mut source = BangbangProcess::start_with_extra_args(
+            &source_socket,
+            &format!("{instance_id}-{case}-source"),
+            product.process_args(),
+        );
+        configure_serial_snapshot_source(
+            &source_socket,
+            &kernel_path,
+            &source_metrics,
+            product.has_storage().then_some(drive_path.as_path()),
+        );
+        source
+            .wait_for_stdout_marker(
+                crate::snapshot_serial::SOURCE_READY_MARKER,
+                GUEST_EXECUTION_TIMEOUT,
+            )
+            .unwrap_or_else(|error| panic!("{case} serial source should become ready: {error}"));
+
+        source.write_stdin(&crate::snapshot_serial::source_input());
+        wait_for_uart_metric(
+            &source_socket,
+            &source_metrics,
+            "input_count",
+            u64::try_from(crate::snapshot_serial::SOURCE_PREFIX_LEN)
+                .expect("serial source prefix length should fit"),
+            &format!("{case} source RX fill"),
+        );
+        wait_for_uart_metric(
+            &source_socket,
+            &source_metrics,
+            "interrupt_count",
+            1,
+            &format!("{case} source receive interrupt"),
+        );
+        assert_no_content_response(
+            &http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            &format!("PATCH {case} serial source Paused"),
+        );
+        let create = http_json_with_io_timeout(
+            &source_socket,
+            "PUT",
+            "/snapshot/create",
+            &format!(
+                r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+                json_string(path_text(&state_path)),
+                json_string(path_text(&memory_path))
+            ),
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert_no_content_response(&create, &format!("create {case} serial snapshot"));
+        assert_default_serial_snapshot_state(&state_path, product);
+        let state_before = fs::read(&state_path).expect("serial snapshot state should read");
+        let memory_before = fs::read(&memory_path).expect("serial snapshot memory should read");
+        assert_no_snapshot_staging(test_dir.path());
+
+        let source_output = source.terminate();
+        assert!(
+            source_output
+                .stdout
+                .contains(crate::snapshot_serial::SOURCE_READY_MARKER)
+        );
+        assert!(
+            !source_output
+                .stdout
+                .contains(crate::snapshot_serial::RESTORED_SUCCESS_MARKER)
+        );
+        assert_clean_shutdown(
+            source_output,
+            &source_socket,
+            &format!("{case} serial snapshot source"),
+        );
+
+        let destination_modes: &[bool] = if product.has_storage() {
+            &[false]
+        } else {
+            &[false, true]
+        };
+        for (index, resume_vm) in destination_modes.iter().copied().enumerate() {
+            let mode = if resume_vm { "automatic" } else { "explicit" };
+            let destination_socket = test_dir.path().join(format!(
+                "{}-{}",
+                product.code(),
+                if resume_vm { "a" } else { "e" }
+            ));
+            let destination_metrics = test_dir
+                .path()
+                .join(format!("{case}-{mode}-destination.metrics"));
+            create_empty_file(&destination_metrics);
+            let mut destination = BangbangProcess::start_with_extra_args(
+                &destination_socket,
+                &format!("{instance_id}-{case}-{mode}-destination"),
+                product.process_args(),
+            );
+            configure_serial_snapshot_destination_metrics(
+                &destination_socket,
+                &destination_metrics,
+                &format!("{case} {mode} serial destination"),
+            );
+            if resume_vm {
+                destination.write_stdin(&crate::snapshot_serial::destination_input());
+            }
+            let load = http_json_with_io_timeout(
+                &destination_socket,
+                "PUT",
+                "/snapshot/load",
+                &snapshot_load_body(&state_path, &memory_path, resume_vm),
+                GUEST_EXECUTION_TIMEOUT,
+            );
+            assert_no_content_response(&load, &format!("load {case} {mode} serial destination"));
+            if !resume_vm {
+                let info = http_get(&destination_socket, "/");
+                assert_response_contains(
+                    &info,
+                    r#""state":"Paused""#,
+                    &format!("GET {case} explicit serial destination"),
+                );
+                if index == 0 {
+                    let recaptured_state = test_dir.path().join(format!("{case}-recaptured.state"));
+                    let recaptured_memory =
+                        test_dir.path().join(format!("{case}-recaptured.memory"));
+                    let recapture = http_json_with_io_timeout(
+                        &destination_socket,
+                        "PUT",
+                        "/snapshot/create",
+                        &format!(
+                            r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+                            json_string(path_text(&recaptured_state)),
+                            json_string(path_text(&recaptured_memory))
+                        ),
+                        GUEST_EXECUTION_TIMEOUT,
+                    );
+                    assert_no_content_response(
+                        &recapture,
+                        &format!("recapture {case} serial destination"),
+                    );
+                    assert_default_serial_snapshot_state(&recaptured_state, product);
+                }
+                destination.write_stdin(&crate::snapshot_serial::destination_input());
+                destination.close_stdin();
+                assert_no_content_response(
+                    &http_json(
+                        &destination_socket,
+                        "PATCH",
+                        "/vm",
+                        r#"{"state":"Resumed"}"#,
+                    ),
+                    &format!("resume {case} serial destination"),
+                );
+            } else {
+                destination.close_stdin();
+            }
+            let output = destination.wait_for_exit_with_timeout(
+                GUEST_EXECUTION_TIMEOUT,
+                &format!("{case} {mode} restored serial guest"),
+            );
+            assert!(
+                output
+                    .stdout
+                    .contains(crate::snapshot_serial::RESTORED_SUCCESS_MARKER),
+                "{case} {mode} destination should report restored serial success; stdout:\n{}",
+                output.stdout
+            );
+            assert!(
+                !output
+                    .stdout
+                    .contains(crate::snapshot_serial::RESTORED_FAILURE_MARKER),
+                "{case} {mode} destination must not report restored serial failure"
+            );
+            assert_clean_shutdown(
+                output,
+                &destination_socket,
+                &format!("{case} {mode} serial destination"),
+            );
+            assert_eq!(
+                uart_metric_total(&destination_metrics, "input_count"),
+                u64::try_from(crate::snapshot_serial::DESTINATION_SUFFIX_LEN)
+                    .expect("serial destination suffix length should fit"),
+                "{case} {mode} metrics must count only fresh destination bytes"
+            );
+            assert!(
+                uart_metric_total(&destination_metrics, "read_count")
+                    >= u64::try_from(
+                        crate::snapshot_serial::SOURCE_PREFIX_LEN
+                            + crate::snapshot_serial::DESTINATION_SUFFIX_LEN,
+                    )
+                    .expect("serial restored read count should fit"),
+                "{case} {mode} guest must drain the restored prefix and fresh suffix"
+            );
+            assert_eq!(
+                fs::read(&state_path).expect("serial snapshot state should remain readable"),
+                state_before,
+                "{case} repeated loads must not mutate state"
+            );
+            assert_eq!(
+                fs::read(&memory_path).expect("serial snapshot memory should remain readable"),
+                memory_before,
+                "{case} repeated loads must not mutate memory"
+            );
+        }
+    }
+
+    fn configure_serial_snapshot_source(
+        socket: &Path,
+        kernel: &Path,
+        metrics: &Path,
+        drive: Option<&Path>,
+    ) {
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":16,"track_dirty_pages":true}"#,
+            ),
+            "PUT serial snapshot machine config",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/boot-source",
+                &format!(
+                    r#"{{"kernel_image_path":{}}}"#,
+                    json_string(path_text(kernel))
+                ),
+            ),
+            "PUT serial snapshot boot source",
+        );
+        if let Some(drive) = drive {
+            assert_no_content_response(
+                &http_put_json(
+                    socket,
+                    "/drives/serial_data",
+                    &format!(
+                        r#"{{"drive_id":"serial_data","path_on_host":{},"is_root_device":false,"is_read_only":false,"io_engine":"Sync"}}"#,
+                        json_string(path_text(drive))
+                    ),
+                ),
+                "PUT serial snapshot storage",
+            );
+        }
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/metrics",
+                &format!(r#"{{"metrics_path":{}}}"#, json_string(path_text(metrics))),
+            ),
+            "PUT serial snapshot source metrics",
+        );
+        assert_no_content_response(
+            &http_put_json(socket, "/actions", r#"{"action_type":"InstanceStart"}"#),
+            "PUT serial snapshot InstanceStart",
+        );
+    }
+
+    fn configure_and_start_configured_serial_snapshot_source(
+        socket: &Path,
+        kernel: &Path,
+        serial: &Path,
+    ) {
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":16}"#,
+            ),
+            "PUT configured serial snapshot machine config",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/boot-source",
+                &format!(
+                    r#"{{"kernel_image_path":{}}}"#,
+                    json_string(path_text(kernel))
+                ),
+            ),
+            "PUT configured serial snapshot boot source",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/serial",
+                &format!(
+                    r#"{{"serial_out_path":{}}}"#,
+                    json_string(path_text(serial))
+                ),
+            ),
+            "PUT configured serial snapshot output",
+        );
+        assert_no_content_response(
+            &http_put_json(socket, "/actions", r#"{"action_type":"InstanceStart"}"#),
+            "PUT configured serial snapshot InstanceStart",
+        );
+    }
+
+    fn create_named_fifo(path: &Path) {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .expect("FIFO path should not contain NUL");
+        // SAFETY: `path` is a live NUL-terminated pathname and the fixed mode
+        // carries only filesystem permission bits.
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "configured serial FIFO should create: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn open_named_fifo_reader(path: &Path) -> fs::File {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .expect("configured serial FIFO reader should open")
+    }
+
+    fn wait_for_fifo_marker(
+        reader: &mut fs::File,
+        marker: &str,
+        timeout: Duration,
+        context: &str,
+    ) -> Vec<u8> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .expect("FIFO marker deadline should fit");
+        let mut output = Vec::new();
+        loop {
+            read_available_fifo(reader, &mut output);
+            if output
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes())
+            {
+                return output;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{context} should publish marker {marker:?}; output:\n{}",
+                String::from_utf8_lossy(&output)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn read_available_fifo(reader: &mut fs::File, output: &mut Vec<u8>) {
+        let mut buffer = [0_u8; 512];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(count) => output.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(error) => panic!("configured serial FIFO should read: {error}"),
+            }
+        }
+    }
+
+    fn configure_serial_snapshot_destination_metrics(socket: &Path, metrics: &Path, context: &str) {
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/metrics",
+                &format!(r#"{{"metrics_path":{}}}"#, json_string(path_text(metrics))),
+            ),
+            &format!("PUT {context} metrics"),
+        );
+    }
+
+    fn wait_for_uart_metric(
+        socket: &Path,
+        metrics: &Path,
+        field: &str,
+        expected: u64,
+        context: &str,
+    ) {
+        let deadline = Instant::now()
+            .checked_add(GUEST_EXECUTION_TIMEOUT)
+            .expect("UART metric deadline should fit");
+        loop {
+            assert_no_content_response(
+                &http_put_json(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+                &format!("FlushMetrics while waiting for {context}"),
+            );
+            let observed = uart_metric_total(metrics, field);
+            if observed >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{context} should reach uart.{field} >= {expected}; observed={observed}; metrics:\n{}",
+                fs::read_to_string(metrics).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn uart_metric_total(path: &Path, field: &str) -> u64 {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()?
+                    .get("uart")?
+                    .get(field)?
+                    .as_u64()
+            })
+            .fold(0, u64::saturating_add)
+    }
+
+    fn assert_configured_serial_snapshot_state(path: &Path, selector: &Path) {
+        let bytes = fs::read(path).expect("configured serial snapshot state should read");
+        let structural = decode_snapshot_v2_state(&bytes)
+            .expect("configured serial snapshot state should decode");
+        let decoded = decode_hvf_snapshot_v2_serial_state(&structural)
+            .expect("configured serial snapshot state should decode semantically");
+        assert!(decoded.device_graph().is_none());
+        assert_eq!(
+            decoded.serial().endpoint_intent().configured_selector(),
+            Some(path_text(selector))
+        );
+        assert_eq!(decoded.serial().rate_limiter(), None);
+        let device = decoded.serial().device();
+        let legacy = device.legacy_state();
+        assert_eq!(
+            legacy.interrupt_enable(),
+            crate::snapshot_serial::INTERRUPT_ENABLE
+        );
+        assert_eq!(legacy.line_control(), crate::snapshot_serial::LINE_CONTROL);
+        assert_eq!(
+            legacy.modem_control(),
+            crate::snapshot_serial::MODEM_CONTROL
+        );
+        assert_eq!(legacy.scratch(), crate::snapshot_serial::SCRATCH);
+        assert_eq!(
+            legacy.divisor_latch_low(),
+            crate::snapshot_serial::DIVISOR_LATCH_LOW
+        );
+        assert_eq!(
+            legacy.divisor_latch_high(),
+            crate::snapshot_serial::DIVISOR_LATCH_HIGH
+        );
+        assert_eq!(
+            device.interrupt_identification(),
+            bangbang_runtime::serial::SERIAL_INTERRUPT_IDENTIFICATION_NO_INTERRUPT_PENDING
+        );
+        assert_eq!(
+            device.line_status(),
+            bangbang_runtime::serial::SERIAL_LINE_STATUS_DEFAULT
+        );
+        assert!(device.receive_bytes().is_empty());
+        assert!(!device.receive_interrupt_intent_pending());
+        assert!(!device.input_ready_intent_pending());
+    }
+
+    fn assert_default_serial_snapshot_state(path: &Path, product: SerialSnapshotProduct) {
+        let bytes = fs::read(path).expect("serial snapshot state should read");
+        let structural =
+            decode_snapshot_v2_state(&bytes).expect("serial snapshot state should decode");
+        let decoded = decode_hvf_snapshot_v2_serial_state(&structural)
+            .expect("serial snapshot state should decode semantically");
+        assert!(
+            decoded
+                .serial()
+                .endpoint_intent()
+                .is_default_process_stdio(),
+            "{} snapshot should reconstruct destination process stdio",
+            product.name()
+        );
+        assert_eq!(decoded.serial().rate_limiter(), None);
+        let device = decoded.serial().device();
+        let legacy = device.legacy_state();
+        assert_eq!(
+            legacy.interrupt_enable(),
+            crate::snapshot_serial::INTERRUPT_ENABLE
+        );
+        assert_eq!(legacy.line_control(), crate::snapshot_serial::LINE_CONTROL);
+        assert_eq!(
+            legacy.modem_control(),
+            crate::snapshot_serial::MODEM_CONTROL
+        );
+        assert_eq!(legacy.scratch(), crate::snapshot_serial::SCRATCH);
+        assert_eq!(
+            legacy.divisor_latch_low(),
+            crate::snapshot_serial::DIVISOR_LATCH_LOW
+        );
+        assert_eq!(
+            legacy.divisor_latch_high(),
+            crate::snapshot_serial::DIVISOR_LATCH_HIGH
+        );
+        assert_eq!(
+            device.interrupt_identification(),
+            bangbang_runtime::serial::SERIAL_INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE
+        );
+        assert_eq!(
+            device.line_status(),
+            bangbang_runtime::serial::SERIAL_LINE_STATUS_DEFAULT
+                | bangbang_runtime::serial::SERIAL_LINE_STATUS_DATA_READY
+        );
+        assert_eq!(device.modem_status(), 0);
+        assert_eq!(
+            device.receive_bytes(),
+            vec![
+                crate::snapshot_serial::SOURCE_PREFIX_BYTE;
+                crate::snapshot_serial::SOURCE_PREFIX_LEN
+            ]
+        );
+        assert!(!device.input_ready_intent_pending());
+        assert!(
+            device.receive_interrupt_intent_pending()
+                || decoded.platform().vcpus()[0]
+                    .pending_interrupts()
+                    .irq_pending()
+                || device.interrupt_identification()
+                    == bangbang_runtime::serial::SERIAL_INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE,
+            "{} snapshot must retain pending receive delivery in serial or platform state",
+            product.name()
+        );
+        match decoded.device_graph() {
+            None => assert!(
+                !product.has_storage(),
+                "{} snapshot should retain its storage graph",
+                product.name()
+            ),
+            Some(graph) => {
+                assert!(product.has_storage());
+                assert_eq!(graph.block_records().len(), 1);
+                assert!(graph.pmem_records().is_empty());
+                assert_eq!(
+                    graph.transport_kind(),
+                    if product.enable_pci() {
+                        SnapshotV2DeviceTransportKind::Pci
+                    } else {
+                        SnapshotV2DeviceTransportKind::Mmio
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn signed_executable_creates_and_restores_native_v2_snapshot_across_processes() {
         let test_dir = TestDir::new();
@@ -12882,6 +13703,11 @@ mod macos_arm64 {
         assert!(SNAPSHOT_GUEST_WRITE_OFFSET.is_multiple_of(0x4000));
         assert!(SNAPSHOT_GUEST_SECONDARY_READ_OFFSET.is_multiple_of(0x4000));
         assert!(SNAPSHOT_GUEST_SECONDARY_WRITE_OFFSET.is_multiple_of(0x4000));
+    }
+
+    #[test]
+    fn snapshot_serial_guest_images_have_bounded_headers_and_protocols() {
+        crate::snapshot_serial::assert_guest_images();
     }
 
     fn snapshot_load_body(state_path: &Path, memory_path: &Path, resume_vm: bool) -> String {

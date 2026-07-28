@@ -7,6 +7,8 @@
 
 #[path = "../../../tests/support/macos_virtual_block.rs"]
 mod macos_virtual_block;
+#[path = "../../../tests/support/snapshot_serial.rs"]
+mod snapshot_serial;
 #[path = "../../../tests/support/vhost_user_block.rs"]
 mod vhost_user_block;
 
@@ -195,6 +197,8 @@ const SNAPSHOT_REPEAT_MEMORY_OUTPUT_REF: &str =
 const SNAPSHOT_STATE_INPUT_REF: &str = "bangbang-grant:grant-snapshot-state-input-1368";
 const SNAPSHOT_MEMORY_INPUT_REF: &str = "bangbang-grant:grant-snapshot-memory-input-1368";
 const SNAPSHOT_DESCRIBE_INPUT_REF: &str = "bangbang-grant:grant-snapshot-describe-input-1368";
+const SNAPSHOT_SERIAL_SINK_ID: &str = "grant-snapshot-serial-sink-1652";
+const SNAPSHOT_SERIAL_SINK_REF: &str = "bangbang-grant:grant-snapshot-serial-sink-1652";
 const SNAPSHOT_STAGING_HOLD_OPTION: &str = "--bangbang-internal-snapshot-staging-hold-v1";
 const SNAPSHOT_STAGING_RECORD_BYTES: u64 = 128;
 const SNAPSHOT_STATE_CHILD: &str = "state-1368.snap";
@@ -1338,6 +1342,315 @@ fn normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restor
     for enable_pci in [false, true] {
         run_native_v2_snapshot_grant_case(&bundle, enable_pci);
     }
+}
+
+#[test]
+fn normal_bundle_certifies_native_v2_serial_snapshot_continuation_and_containment() {
+    snapshot_serial::assert_guest_images();
+    let bundle = production_bundle();
+    let baseline_sessions = session_entries();
+
+    run_production_default_serial_snapshot_continuation(&bundle);
+    for enable_pci in [false, true] {
+        run_production_configured_serial_snapshot_continuation(&bundle, enable_pci);
+    }
+
+    assert_eq!(
+        session_entries(),
+        baseline_sessions,
+        "serial snapshot launcher and worker teardown must restore the session namespace"
+    );
+}
+
+fn run_production_default_serial_snapshot_continuation(bundle: &Path) {
+    let source_fixture = SerialSnapshotSourceGrantFixture::new("stdio", false, false);
+    let source_sensitive = source_fixture.sensitive_strings();
+    let mut source = spawn_ready_serial_snapshot_grant_api_launcher(
+        bundle,
+        &source_fixture.manifest,
+        "serial-snapshot-stdio-source",
+        false,
+    );
+    source_fixture.replace_source_pathnames();
+    configure_and_start_serial_snapshot_grant_source(&source.socket, false, false);
+    source
+        .wait_for_stdout_marker(snapshot_serial::SOURCE_READY_MARKER, PROCESS_TIMEOUT)
+        .unwrap_or_else(|error| panic!("production serial source should become ready: {error}"));
+    source.write_stdin(&snapshot_serial::source_input());
+    wait_for_production_uart_metric(
+        &source.socket,
+        &source_fixture.opened_metrics,
+        "input_count",
+        u64::try_from(snapshot_serial::SOURCE_PREFIX_LEN)
+            .expect("serial source prefix length should fit"),
+        "production serial source RX fill",
+    );
+    wait_for_production_uart_metric(
+        &source.socket,
+        &source_fixture.opened_metrics,
+        "interrupt_count",
+        1,
+        "production serial source receive interrupt",
+    );
+    assert_http_status(
+        &http_request(&source.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause production serial source",
+    );
+    assert_http_status(
+        &http_put(&source.socket, "/snapshot/create", &snapshot_create_body()),
+        204,
+        "create production serial snapshot",
+    );
+    let artifacts = source_fixture.artifacts();
+    assert!(artifacts.state.is_file());
+    assert!(artifacts.memory.is_file());
+    assert_no_snapshot_staging(&source_fixture.state_directory);
+    assert_no_snapshot_staging(&source_fixture.memory_directory);
+    let state_before = fs::read(&artifacts.state).expect("production serial state should read");
+    let memory_before = fs::read(&artifacts.memory).expect("production serial memory should read");
+
+    let source_pid = i32::try_from(source.child.id()).expect("launcher PID should fit");
+    // SAFETY: The unreaped source launcher owns this PID.
+    assert_eq!(unsafe { libc::kill(source_pid, libc::SIGTERM) }, 0);
+    let (source_status, source_stdout, source_stderr) =
+        source.wait("production serial snapshot source");
+    assert!(
+        source_status.success(),
+        "production serial source should stop cleanly: {source_status:?}\nstdout:\n{source_stdout}\nstderr:\n{source_stderr}"
+    );
+    assert!(source_stdout.contains(snapshot_serial::SOURCE_READY_MARKER));
+    assert!(!source_stdout.contains(snapshot_serial::RESTORED_SUCCESS_MARKER));
+    assert_serial_snapshot_output_redacted(
+        &source_stdout,
+        &source_stderr,
+        &source_sensitive,
+        "production serial source",
+    );
+    assert!(!source.socket.exists());
+
+    let destination_fixture = SerialSnapshotInputGrantFixture::new("stdio", artifacts, false);
+    let destination_sensitive = destination_fixture.sensitive_strings();
+    let mut destination = spawn_ready_serial_snapshot_grant_api_launcher(
+        bundle,
+        &destination_fixture.manifest,
+        "serial-snapshot-stdio-destination",
+        false,
+    );
+    let opened = destination_fixture.replace_source_pathnames();
+    configure_serial_snapshot_grant_destination_metrics(&destination.socket);
+    assert_http_status(
+        &http_put(
+            &destination.socket,
+            "/snapshot/load",
+            &snapshot_load_body(false),
+        ),
+        204,
+        "load production serial snapshot paused",
+    );
+    assert!(
+        http_get(&destination.socket, "/").contains(r#""state":"Paused""#),
+        "production serial destination should remain paused until explicitly resumed"
+    );
+    destination.write_stdin(&snapshot_serial::destination_input());
+    destination.close_stdin();
+    assert_http_status(
+        &http_request(
+            &destination.socket,
+            "PATCH",
+            "/vm",
+            r#"{"state":"Resumed"}"#,
+        ),
+        204,
+        "resume production serial destination",
+    );
+    let (destination_status, destination_stdout, destination_stderr) =
+        destination.wait("production restored serial guest");
+    assert!(
+        destination_status.success(),
+        "production serial destination should exit cleanly: {destination_status:?}\nstdout:\n{destination_stdout}\nstderr:\n{destination_stderr}"
+    );
+    assert!(
+        destination_stdout.contains(snapshot_serial::RESTORED_SUCCESS_MARKER),
+        "production destination should validate restored UART state and fresh input; stdout:\n{destination_stdout}"
+    );
+    assert!(!destination_stdout.contains(snapshot_serial::RESTORED_FAILURE_MARKER));
+    assert_serial_snapshot_output_redacted(
+        &destination_stdout,
+        &destination_stderr,
+        &destination_sensitive,
+        "production serial destination",
+    );
+    assert!(!destination.socket.exists());
+    assert_eq!(
+        production_uart_metric_total(&destination_fixture.opened_metrics, "input_count"),
+        u64::try_from(snapshot_serial::DESTINATION_SUFFIX_LEN)
+            .expect("serial destination suffix length should fit"),
+        "destination metrics must exclude bytes left in the terminated source pipe"
+    );
+    assert!(
+        production_uart_metric_total(&destination_fixture.opened_metrics, "read_count")
+            >= u64::try_from(
+                snapshot_serial::SOURCE_PREFIX_LEN + snapshot_serial::DESTINATION_SUFFIX_LEN,
+            )
+            .expect("restored serial read count should fit"),
+        "destination guest must drain the restored FIFO and fresh destination input"
+    );
+    assert_eq!(
+        fs::read(&opened.state).expect("opened production serial state should read"),
+        state_before,
+        "destination load must not mutate the immutable state artifact"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("opened production serial memory should read"),
+        memory_before,
+        "destination load must not mutate the immutable memory artifact"
+    );
+    assert_eq!(
+        fs::read(&destination_fixture.metrics)
+            .expect("replacement destination metrics should read"),
+        b"replacement metrics must remain unused\n"
+    );
+}
+
+fn run_production_configured_serial_snapshot_continuation(bundle: &Path, enable_pci: bool) {
+    let transport = if enable_pci { "pci" } else { "mmio" };
+    let source_fixture = SerialSnapshotSourceGrantFixture::new(transport, true, true);
+    let mut source = spawn_ready_snapshot_grant_api_launcher(
+        bundle,
+        &source_fixture.manifest,
+        source_fixture.sensitive_strings(),
+        &format!("serial-snapshot-{transport}-source"),
+        false,
+        enable_pci,
+    );
+    source_fixture.replace_source_pathnames();
+    configure_and_start_serial_snapshot_grant_source(&source.socket, true, true);
+    let source_serial = source_fixture
+        .opened_serial
+        .as_ref()
+        .expect("configured source serial output should exist");
+    wait_for_file_contains(
+        source_serial,
+        snapshot_serial::CONFIGURED_SOURCE_MARKER.as_bytes(),
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        panic!("production configured {transport} serial source should become ready: {error}")
+    });
+    assert_http_status(
+        &http_request(&source.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        &format!("pause production configured {transport} serial source"),
+    );
+    assert_http_status(
+        &http_put(&source.socket, "/snapshot/create", &snapshot_create_body()),
+        204,
+        &format!("create production configured {transport} serial snapshot"),
+    );
+    let artifacts = source_fixture.artifacts();
+    let state_before =
+        fs::read(&artifacts.state).expect("configured production serial state should read");
+    let memory_before =
+        fs::read(&artifacts.memory).expect("configured production serial memory should read");
+    let drive_before = fs::read(
+        artifacts
+            .drive
+            .as_ref()
+            .expect("configured production serial drive should exist"),
+    )
+    .expect("configured production serial drive should read");
+    stop_running_launcher(
+        &mut source,
+        &format!("production configured {transport} serial source"),
+    );
+    let source_output =
+        fs::read_to_string(source_serial).expect("configured source serial output should read");
+    assert!(source_output.contains(snapshot_serial::CONFIGURED_SOURCE_MARKER));
+    assert!(!source_output.contains(snapshot_serial::CONFIGURED_RESTORED_MARKER));
+    assert_eq!(
+        fs::read(
+            source_fixture
+                .serial
+                .as_ref()
+                .expect("configured source replacement serial should exist")
+        )
+        .expect("configured source replacement serial should read"),
+        b"replacement serial output must remain unused\n"
+    );
+
+    let destination_fixture = SerialSnapshotInputGrantFixture::new(transport, artifacts, true);
+    let mut destination = spawn_ready_snapshot_grant_api_launcher(
+        bundle,
+        &destination_fixture.manifest,
+        destination_fixture.sensitive_strings(),
+        &format!("serial-snapshot-{transport}-destination"),
+        false,
+        enable_pci,
+    );
+    let opened = destination_fixture.replace_source_pathnames();
+    configure_serial_snapshot_grant_destination_metrics(&destination.socket);
+    assert_http_status(
+        &http_put(
+            &destination.socket,
+            "/snapshot/load",
+            &snapshot_load_body(true),
+        ),
+        204,
+        &format!("load production configured {transport} serial snapshot"),
+    );
+    let status = destination.wait(&format!(
+        "production configured {transport} restored serial guest"
+    ));
+    assert!(
+        status.success(),
+        "production configured {transport} destination should exit cleanly: {status:?}"
+    );
+    assert!(!destination.socket.exists());
+    let destination_serial = destination_fixture
+        .opened_serial
+        .as_ref()
+        .expect("configured destination serial output should exist");
+    wait_for_file_contains(
+        destination_serial,
+        snapshot_serial::CONFIGURED_RESTORED_MARKER.as_bytes(),
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        panic!("production configured {transport} destination should publish success: {error}")
+    });
+    let destination_output = fs::read_to_string(destination_serial)
+        .expect("configured destination serial output should read");
+    assert!(destination_output.contains(snapshot_serial::CONFIGURED_RESTORED_MARKER));
+    assert!(!destination_output.contains(snapshot_serial::CONFIGURED_FAILURE_MARKER));
+    assert_eq!(
+        fs::read(
+            destination_fixture
+                .serial
+                .as_ref()
+                .expect("configured destination replacement serial should exist")
+        )
+        .expect("configured destination replacement serial should read"),
+        b"replacement serial output must remain unused\n"
+    );
+    assert_eq!(
+        fs::read(&opened.state).expect("opened configured serial state should read"),
+        state_before
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("opened configured serial memory should read"),
+        memory_before
+    );
+    assert_eq!(
+        fs::read(
+            opened
+                .drive
+                .as_ref()
+                .expect("opened configured serial drive should exist")
+        )
+        .expect("opened configured serial drive should read"),
+        drive_before
+    );
 }
 
 fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
@@ -7160,6 +7473,380 @@ struct SnapshotArtifactSet {
 }
 
 #[derive(Debug, Clone)]
+struct SerialSnapshotGrantArtifacts {
+    state: PathBuf,
+    memory: PathBuf,
+    drive: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct SerialSnapshotSourceGrantFixture {
+    _root: TestDir,
+    manifest: PathBuf,
+    kernel: PathBuf,
+    metrics: PathBuf,
+    drive: Option<PathBuf>,
+    serial: Option<PathBuf>,
+    state_directory: PathBuf,
+    memory_directory: PathBuf,
+    opened_kernel: PathBuf,
+    opened_metrics: PathBuf,
+    opened_drive: Option<PathBuf>,
+    opened_serial: Option<PathBuf>,
+}
+
+impl SerialSnapshotSourceGrantFixture {
+    fn new(case: &str, with_storage: bool, configured_output: bool) -> Self {
+        let root = TestDir::new(&format!("serial-snapshot-source-{case}"));
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("serial snapshot source root should canonicalize");
+        let manifest = canonical_root.join("grant-manifest.json");
+        let kernel = canonical_root.join("serial-snapshot.image");
+        let metrics = canonical_root.join("serial-snapshot.metrics");
+        let drive = with_storage.then(|| canonical_root.join("serial-snapshot.drive"));
+        let serial = configured_output.then(|| canonical_root.join("serial-snapshot.out"));
+        let state_directory = canonical_root.join("state-output");
+        let memory_directory = canonical_root.join("memory-output");
+        let opened_kernel = canonical_root.join("opened-serial-snapshot.image");
+        let opened_metrics = canonical_root.join("opened-serial-snapshot.metrics");
+        let opened_drive = drive
+            .as_ref()
+            .map(|_| canonical_root.join("opened-serial-snapshot.drive"));
+        let opened_serial = serial
+            .as_ref()
+            .map(|_| canonical_root.join("opened-serial-snapshot.out"));
+
+        fs::write(
+            &kernel,
+            if configured_output {
+                snapshot_serial::configured_output_guest_image()
+            } else {
+                snapshot_serial::default_stdio_guest_image()
+            },
+        )
+        .expect("serial snapshot guest image should write");
+        fs::write(&metrics, b"").expect("serial snapshot metrics should write");
+        if let Some(drive) = drive.as_ref() {
+            create_sized_file(drive, 4096);
+        }
+        if let Some(serial) = serial.as_ref() {
+            fs::write(serial, b"").expect("serial snapshot output should write");
+        }
+        fs::create_dir(&state_directory).expect("serial state output directory should create");
+        fs::create_dir(&memory_directory).expect("serial memory output directory should create");
+
+        let mut grants = vec![
+            serde_json::json!({
+                "id": SNAPSHOT_KERNEL_ID,
+                "role": "kernel-image",
+                "access": "read-only",
+                "source": path_text(&kernel),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_METRICS_ID,
+                "role": "metrics-sink",
+                "access": "write-only",
+                "source": path_text(&metrics),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_STATE_OUTPUT_ID,
+                "role": "snapshot-output-directory",
+                "access": "create-children",
+                "source": path_text(&state_directory),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_MEMORY_OUTPUT_ID,
+                "role": "snapshot-output-directory",
+                "access": "create-children",
+                "source": path_text(&memory_directory),
+            }),
+        ];
+        if let Some(drive) = drive.as_ref() {
+            grants.push(serde_json::json!({
+                "id": SNAPSHOT_DATA_ID,
+                "role": "drive-backing",
+                "access": "read-write",
+                "source": path_text(drive),
+            }));
+        }
+        if let Some(serial) = serial.as_ref() {
+            grants.push(serde_json::json!({
+                "id": SNAPSHOT_SERIAL_SINK_ID,
+                "role": "serial-sink",
+                "access": "write-only",
+                "source": path_text(serial),
+            }));
+        }
+        let manifest_json = serde_json::json!({"version": 1, "grants": grants});
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json)
+                .expect("serial snapshot source manifest should serialize"),
+        )
+        .expect("serial snapshot source manifest should write");
+
+        Self {
+            _root: root,
+            manifest,
+            kernel,
+            metrics,
+            drive,
+            serial,
+            state_directory,
+            memory_directory,
+            opened_kernel,
+            opened_metrics,
+            opened_drive,
+            opened_serial,
+        }
+    }
+
+    fn replace_source_pathnames(&self) {
+        for (source, opened) in [
+            (&self.kernel, &self.opened_kernel),
+            (&self.metrics, &self.opened_metrics),
+        ] {
+            fs::rename(source, opened).expect("opened serial snapshot source file should move");
+        }
+        fs::write(&self.kernel, b"replacement kernel must not boot")
+            .expect("replacement serial snapshot kernel should write");
+        fs::write(&self.metrics, b"replacement metrics must remain unused\n")
+            .expect("replacement serial snapshot metrics should write");
+        if let (Some(source), Some(opened)) = (&self.drive, &self.opened_drive) {
+            fs::rename(source, opened).expect("opened serial snapshot drive should move");
+            fs::write(source, vec![0xff_u8; 4096])
+                .expect("replacement serial snapshot drive should write");
+        }
+        if let (Some(source), Some(opened)) = (&self.serial, &self.opened_serial) {
+            fs::rename(source, opened).expect("opened serial snapshot output should move");
+            fs::write(source, b"replacement serial output must remain unused\n")
+                .expect("replacement serial snapshot output should write");
+        }
+    }
+
+    fn artifacts(&self) -> SerialSnapshotGrantArtifacts {
+        SerialSnapshotGrantArtifacts {
+            state: self.state_directory.join(SNAPSHOT_STATE_CHILD),
+            memory: self.memory_directory.join(SNAPSHOT_MEMORY_CHILD),
+            drive: self.opened_drive.clone(),
+        }
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        let mut sensitive = [
+            path_text(&self.manifest),
+            path_text(&self.kernel),
+            path_text(&self.metrics),
+            path_text(&self.state_directory),
+            path_text(&self.memory_directory),
+            path_text(&self.opened_kernel),
+            path_text(&self.opened_metrics),
+            SNAPSHOT_KERNEL_ID,
+            SNAPSHOT_METRICS_ID,
+            SNAPSHOT_STATE_OUTPUT_ID,
+            SNAPSHOT_MEMORY_OUTPUT_ID,
+            SNAPSHOT_KERNEL_REF,
+            SNAPSHOT_METRICS_REF,
+            SNAPSHOT_STATE_OUTPUT_REF,
+            SNAPSHOT_MEMORY_OUTPUT_REF,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        if let (Some(source), Some(opened)) = (&self.drive, &self.opened_drive) {
+            sensitive.extend(
+                [
+                    path_text(source),
+                    path_text(opened),
+                    SNAPSHOT_DATA_ID,
+                    SNAPSHOT_DATA_REF,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        if let (Some(source), Some(opened)) = (&self.serial, &self.opened_serial) {
+            sensitive.extend(
+                [
+                    path_text(source),
+                    path_text(opened),
+                    SNAPSHOT_SERIAL_SINK_ID,
+                    SNAPSHOT_SERIAL_SINK_REF,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        sensitive
+    }
+}
+
+#[derive(Debug)]
+struct SerialSnapshotInputGrantFixture {
+    _root: TestDir,
+    manifest: PathBuf,
+    sources: SerialSnapshotGrantArtifacts,
+    opened: SerialSnapshotGrantArtifacts,
+    metrics: PathBuf,
+    opened_metrics: PathBuf,
+    serial: Option<PathBuf>,
+    opened_serial: Option<PathBuf>,
+}
+
+impl SerialSnapshotInputGrantFixture {
+    fn new(case: &str, sources: SerialSnapshotGrantArtifacts, configured_output: bool) -> Self {
+        let root = TestDir::new(&format!("serial-snapshot-input-{case}"));
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("serial snapshot input root should canonicalize");
+        let manifest = canonical_root.join("grant-manifest.json");
+        let metrics = canonical_root.join("serial-snapshot.metrics");
+        let opened_metrics = canonical_root.join("opened-serial-snapshot.metrics");
+        let serial = configured_output.then(|| canonical_root.join("serial-snapshot.out"));
+        let opened_serial = serial
+            .as_ref()
+            .map(|_| canonical_root.join("opened-serial-snapshot.out"));
+        fs::write(&metrics, b"").expect("serial destination metrics should write");
+        if let Some(serial) = serial.as_ref() {
+            fs::write(serial, b"").expect("serial destination output should write");
+        }
+        let opened = SerialSnapshotGrantArtifacts {
+            state: replacement_opened_path(&sources.state, case),
+            memory: replacement_opened_path(&sources.memory, case),
+            drive: sources
+                .drive
+                .as_ref()
+                .map(|drive| replacement_opened_path(drive, case)),
+        };
+        let mut grants = vec![
+            serde_json::json!({
+                "id": SNAPSHOT_STATE_INPUT_ID,
+                "role": "snapshot-state-input",
+                "access": "read-only",
+                "source": path_text(&sources.state),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_MEMORY_INPUT_ID,
+                "role": "snapshot-memory-input",
+                "access": "read-only",
+                "source": path_text(&sources.memory),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_METRICS_ID,
+                "role": "metrics-sink",
+                "access": "write-only",
+                "source": path_text(&metrics),
+            }),
+        ];
+        if let Some(drive) = sources.drive.as_ref() {
+            grants.push(serde_json::json!({
+                "id": SNAPSHOT_DATA_ID,
+                "role": "drive-backing",
+                "access": "read-write",
+                "source": path_text(drive),
+            }));
+        }
+        if let Some(serial) = serial.as_ref() {
+            grants.push(serde_json::json!({
+                "id": SNAPSHOT_SERIAL_SINK_ID,
+                "role": "serial-sink",
+                "access": "write-only",
+                "source": path_text(serial),
+            }));
+        }
+        let manifest_json = serde_json::json!({"version": 1, "grants": grants});
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json)
+                .expect("serial snapshot input manifest should serialize"),
+        )
+        .expect("serial snapshot input manifest should write");
+        Self {
+            _root: root,
+            manifest,
+            sources,
+            opened,
+            metrics,
+            opened_metrics,
+            serial,
+            opened_serial,
+        }
+    }
+
+    fn replace_source_pathnames(&self) -> SerialSnapshotGrantArtifacts {
+        for (source, opened) in [
+            (&self.sources.state, &self.opened.state),
+            (&self.sources.memory, &self.opened.memory),
+            (&self.metrics, &self.opened_metrics),
+        ] {
+            fs::rename(source, opened).expect("opened serial snapshot input should move");
+        }
+        fs::write(&self.sources.state, b"replacement state must not load")
+            .expect("replacement serial snapshot state should write");
+        fs::write(&self.sources.memory, b"replacement memory must not load")
+            .expect("replacement serial snapshot memory should write");
+        fs::write(&self.metrics, b"replacement metrics must remain unused\n")
+            .expect("replacement serial destination metrics should write");
+        if let (Some(source), Some(opened)) = (&self.sources.drive, &self.opened.drive) {
+            fs::rename(source, opened).expect("opened serial snapshot input drive should move");
+            fs::write(source, vec![0xee_u8; 4096])
+                .expect("replacement serial snapshot input drive should write");
+        }
+        if let (Some(source), Some(opened)) = (&self.serial, &self.opened_serial) {
+            fs::rename(source, opened).expect("opened serial destination output should move");
+            fs::write(source, b"replacement serial output must remain unused\n")
+                .expect("replacement serial destination output should write");
+        }
+        self.opened.clone()
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        let mut sensitive = [
+            path_text(&self.manifest),
+            path_text(&self.sources.state),
+            path_text(&self.sources.memory),
+            path_text(&self.opened.state),
+            path_text(&self.opened.memory),
+            path_text(&self.metrics),
+            path_text(&self.opened_metrics),
+            SNAPSHOT_STATE_INPUT_ID,
+            SNAPSHOT_MEMORY_INPUT_ID,
+            SNAPSHOT_METRICS_ID,
+            SNAPSHOT_STATE_INPUT_REF,
+            SNAPSHOT_MEMORY_INPUT_REF,
+            SNAPSHOT_METRICS_REF,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        if let (Some(source), Some(opened)) = (&self.sources.drive, &self.opened.drive) {
+            sensitive.extend(
+                [
+                    path_text(source),
+                    path_text(opened),
+                    SNAPSHOT_DATA_ID,
+                    SNAPSHOT_DATA_REF,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        if let (Some(source), Some(opened)) = (&self.serial, &self.opened_serial) {
+            sensitive.extend(
+                [
+                    path_text(source),
+                    path_text(opened),
+                    SNAPSHOT_SERIAL_SINK_ID,
+                    SNAPSHOT_SERIAL_SINK_REF,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        sensitive
+    }
+}
+
+#[derive(Debug, Clone)]
 struct SnapshotEpochBlockArtifacts {
     root: PathBuf,
     data: PathBuf,
@@ -10449,6 +11136,62 @@ fn spawn_ready_serial_api_launcher(bundle: &Path, name: &str) -> RunningSerialAp
     }
 }
 
+fn spawn_ready_serial_snapshot_grant_api_launcher(
+    bundle: &Path,
+    manifest: &Path,
+    name: &str,
+    enable_pci: bool,
+) -> RunningSerialApiLauncher {
+    initialize_worker_container(bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let socket =
+        container_tmp_dir().join(format!("bbss-{:x}-{test_id:x}.sock", std::process::id()));
+    let mut command = Command::new(launcher(bundle));
+    command.arg(GRANT_MANIFEST_OPTION).arg(manifest).arg("--");
+    if enable_pci {
+        command.arg("--enable-pci");
+    }
+    let mut child = command
+        .args(["--api-sock", path_text(&socket)])
+        .args(["--id", &format!("{name}-{test_id}")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("serial snapshot grant launcher should start");
+    let stdin = child
+        .stdin
+        .take()
+        .expect("serial snapshot launcher stdin should be piped");
+    let (ready, stdout_reader, stdout) =
+        read_stdout_until_line_shared(&mut child, "status: API server listening");
+    let stderr_reader = read_stream(
+        child
+            .stderr
+            .take()
+            .expect("serial snapshot launcher stderr should be piped"),
+    );
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "serial snapshot launcher should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    RunningSerialApiLauncher {
+        child,
+        stdin: Some(stdin),
+        socket,
+        stdout_reader: Some(stdout_reader),
+        stdout,
+        stderr_reader: Some(stderr_reader),
+        completed: false,
+    }
+}
+
 impl Drop for RunningApiLauncher {
     fn drop(&mut self) {
         if !self.completed {
@@ -10920,6 +11663,156 @@ fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_pat
         204,
         "pause snapshot source",
     );
+}
+
+fn configure_and_start_serial_snapshot_grant_source(
+    socket: &Path,
+    with_storage: bool,
+    configured_output: bool,
+) {
+    for (path, body, context) in [
+        (
+            "/machine-config",
+            serde_json::json!({
+                "vcpu_count": 1,
+                "mem_size_mib": 16,
+                "track_dirty_pages": true,
+            }),
+            "PUT production serial snapshot machine config",
+        ),
+        (
+            "/boot-source",
+            serde_json::json!({"kernel_image_path": SNAPSHOT_KERNEL_REF}),
+            "PUT production serial snapshot boot source",
+        ),
+        (
+            "/metrics",
+            serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}),
+            "PUT production serial snapshot metrics",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                socket,
+                path,
+                &serde_json::to_string(&body)
+                    .expect("production serial snapshot request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    if with_storage {
+        assert_http_status(
+            &http_put(
+                socket,
+                "/drives/serial_data",
+                &serde_json::json!({
+                    "drive_id": "serial_data",
+                    "path_on_host": SNAPSHOT_DATA_REF,
+                    "is_root_device": false,
+                    "is_read_only": false,
+                    "io_engine": "Sync",
+                })
+                .to_string(),
+            ),
+            204,
+            "PUT production serial snapshot storage",
+        );
+    }
+    if configured_output {
+        assert_http_status(
+            &http_put(
+                socket,
+                "/serial",
+                &serde_json::json!({"serial_out_path": SNAPSHOT_SERIAL_SINK_REF}).to_string(),
+            ),
+            204,
+            "PUT production serial snapshot output",
+        );
+    }
+    assert_http_status(
+        &http_put(socket, "/actions", r#"{"action_type":"InstanceStart"}"#),
+        204,
+        "start production serial snapshot source",
+    );
+}
+
+fn configure_serial_snapshot_grant_destination_metrics(socket: &Path) {
+    assert_http_status(
+        &http_put(
+            socket,
+            "/metrics",
+            &serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}).to_string(),
+        ),
+        204,
+        "PUT production serial snapshot destination metrics",
+    );
+}
+
+fn wait_for_production_uart_metric(
+    socket: &Path,
+    metrics: &Path,
+    field: &str,
+    expected: u64,
+    context: &str,
+) {
+    let deadline = Instant::now()
+        .checked_add(PROCESS_TIMEOUT)
+        .expect("production UART metric deadline should fit");
+    loop {
+        assert_http_status(
+            &http_put(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+            204,
+            &format!("FlushMetrics while waiting for {context}"),
+        );
+        let observed = production_uart_metric_total(metrics, field);
+        if observed >= expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{context} should reach uart.{field} >= {expected}; observed={observed}; metrics:\n{}",
+            fs::read_to_string(metrics).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn production_uart_metric_total(path: &Path, field: &str) -> u64 {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("uart")?
+                .get(field)?
+                .as_u64()
+        })
+        .fold(0, u64::saturating_add)
+}
+
+fn assert_serial_snapshot_output_redacted(
+    stdout: &str,
+    stderr: &str,
+    sensitive: &[String],
+    context: &str,
+) {
+    assert!(
+        !stderr.contains("session-debug"),
+        "{context} must not expose private diagnostics\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    for value in sensitive {
+        assert!(
+            !stdout.contains(value),
+            "{context} stdout leaked startup grant data"
+        );
+        assert!(
+            !stderr.contains(value),
+            "{context} stderr leaked startup grant data"
+        );
+    }
 }
 
 fn configure_and_pause_snapshot_epoch_source(

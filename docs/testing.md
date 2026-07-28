@@ -561,13 +561,15 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
 production catalog admits semantic memory kind 1 introduced in minor 1; the
-current `2.6.0` writer additionally admits machine/global/topology kinds 2–4
+current `2.7.0` writer additionally admits machine/global/topology kinds 2–4
 and per-vCPU kind 5 introduced in minor 2, singleton time kind 6 introduced in
-minor 3, and mandatory singleton device-graph kind 7 introduced in minor 4.
+minor 3, optional singleton device-graph kind 7 introduced in minor 4, and
+mandatory singleton serial kind 8 introduced in minor 7.
 Exact `2.4.0` retains device-graph profile 1's singleton root, while `2.5.0`
 uses profile 2's bounded ordered block vector and `2.6.0` uses profile 3's
-bounded ordered block-and-pmem vector. Exact `2.3.0` remains the legacy
-device-free platform profile. The mutation corpus
+bounded ordered block-and-pmem vector. Exact `2.7.0` requires kind 8 and
+optionally composes the unchanged profile-3 graph. Exact `2.3.0` remains the
+legacy device-free platform profile. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
 lengths, all three offsets, CRC and every truncation, feature
 zero/order/duplicate/unknown cases, and component
@@ -579,7 +581,7 @@ resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
 Native-v2 lazy-memory tests retain exact multi-extent binding and complete
-`2.1.0` compatibility fixtures while proving that new output uses `2.6.0`.
+`2.1.0` compatibility fixtures while proving that new output uses `2.7.0`.
 They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
 binding/header/topology/length mutation, exact admitted-version retention,
 typed state profiles,
@@ -657,9 +659,9 @@ The wrapper builds the `bangbang` binary unit-test harness, locates and signs
 that exact test executable, and runs only the ignored private-seam proof. Its
 minimal two-vCPU guest does not touch serial or optional devices beyond the
 required read-only root. The first test starts and pauses the real
-process-owned HVF supervisor, publishes one current 2.6 profile-3 MMIO-root
-pair, resumes and repauses the source, publishes a fresh recapture, and drops
-the source. It
+process-owned HVF supervisor, publishes one current 2.7 serial-plus-profile-3
+MMIO-root pair, resumes and repauses the source, publishes a fresh recapture,
+and drops the source. It
 restores the first immutable pair into one fresh normal process initially
 `Paused`, proves the exact root configuration plus fresh destination
 UART/metrics state, explicitly resumes and repauses it, then shuts it down. A
@@ -729,6 +731,31 @@ across destinations. They also require immutable state/memory, unchanged
 read-only prefixes, limiter/retry and interrupt continuation, graph-stable
 recapture, explicit/automatic resume, exact direct or contained ownership,
 redaction, and staging/session/grant cleanup.
+
+### Native-v2 2.7 serial certification matrix
+
+Exact 2.7 retains the profile-3 storage failure boundary and adds one required
+serial singleton plus a configured-output authority class:
+
+| Requirement | Exact anchors |
+| --- | --- |
+| Canonical bytes, exact version/profile, bounded selector/RX, every header/reserved/length mutation, complete UART cross-fields, allocation, and redaction | `canonical_default_and_configured_fixtures_round_trip`, `exact_version_and_endpoint_profile_fail_closed`, `limiter_presence_and_complete_uart_semantics_are_rejected_when_inconsistent`, `every_owned_decode_and_encode_allocation_is_fallible`, `debug_output_redacts_endpoint_and_device_values` |
+| Default/configured direct and contained endpoint preparation, terminal/FIFO lifetime, fresh limiter/metrics, missing/extra output, cancellation, and repeated cleanup | `default_fifo_endpoints_preserve_uart_and_start_fresh_limiter_and_metrics`, `default_terminal_is_raw_until_explicit_abort_then_fully_restored`, `configured_output_skips_stdio_and_commits_through_explicit_lifecycle`, `contained_configured_output_is_output_only_and_rebinds_after_abort`, `construction_failure_and_repeated_bundles_restore_shared_stdio_lifetime` |
+| Complete storage-plus-serial authority, alias/role/access/reference/cancellation rejection, rollback/reuse, construction/controller/completion/cleanup failure | `exact_2_7_mixed_contained_storage_and_serial_share_one_rollback`, `exact_2_7_serial_preflight_rejects_aliases_authority_crossing_and_cancellation`, `storage_and_serial_owners_remain_one_graph_ordered_abort_lifetime`, `stdio_failure_and_post_endpoint_cancellation_are_retryable_after_cleanup`, `retained_output_clone_surfaces_split_lifetime_cleanup_failure`, `exact_v2_serial_commit_classifies_missing_projection_as_terminal` |
+| Private signed HVF reconstruction and recapture | `signed_native_v2_serial_destination_reconciles_and_recaptures_private_owner`, `signed_native_v2_serial_storage_destination_preserves_mmio_and_pci_owners` |
+| Direct signed public continuation | `signed_executable_certifies_native_v2_serial_continuation_over_fresh_stdio`, `signed_executable_reopens_configured_serial_snapshot_file_and_fifo_destinations` |
+| Normal production/App Sandbox continuation and containment | `normal_bundle_certifies_native_v2_serial_snapshot_continuation_and_containment` |
+
+The shared bare-arm64 image programs nondefault valid UART registers, retains a
+full 64-byte prefix, and leaves a distinct 40-byte suffix in the source pipe.
+After source termination, the destination must supply a different 40-byte
+suffix. Guest checks and destination metrics therefore distinguish serialized
+UART bytes from forbidden inherited host-pipe bytes. The matrix covers
+serial-only, MMIO-storage, PCI-storage, explicit/automatic resume, paused
+recapture, immutable pair reuse, default FIFO/pipe stdio, direct configured
+regular-file/FIFO replacement, contained write-only output grants, TX, EOF,
+redaction, and teardown. Destination terminal raw-mode/restoration remains a
+focused test because the signed harness supplies pipes rather than a PTY.
 
 Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
 record, preserve kind-1 bytes exactly, and pin kind 2's exact nested binding,
@@ -1263,7 +1290,9 @@ premature promotion. #1555 subsequently adds direct signed host/guest demand,
 removal-generation, exact entitlement, and full-matrix evidence and promotes
 only that record. #1578 then promotes four public native-v2 process/snapshot
 records. #1634 promotes the final two pmem storage composites after native-v2
-2.6 profile-3 certification. The current overlay is 235/163/3/17.
+2.6 profile-3 certification. #1652 promotes the serial semantic aggregate
+after exact 2.7 direct and normal-production continuation certification. The
+current overlay is 236/162/3/17.
 
 Snapshot paging feasibility, its standalone protocol/client, internal
 lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
@@ -1599,16 +1628,18 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
-- exact external snapshot grants creating native-v2 2.6 profile-3 rooted three-drive
-  MMIO and PCI pairs into separate output directories, reusing both retained
+- exact external snapshot grants creating native-v2 2.7
+  serial-plus-profile-3 rooted three-drive MMIO and PCI pairs into separate
+  output directories, reusing both retained
   directories for a second successful pair, preserving all finals on
   collision, and keeping same-GrantId concurrent source workers in their own
   directories; granted early description and two fresh complete-set
   state/memory/drive File/COW loads per transport then prove exact graph
   reconstruction, explicit and automatic resume, and a root-read-conditional
   guest `SYSTEM_OFF`;
-- a deterministic native-v2 2.6 profile-3 block certifier running rooted and rootless
-  graphs over MMIO and PCI through the normal launcher/worker boundary. It
+- a deterministic native-v2 2.7 serial-plus-profile-3 block certifier running
+  rooted and rootless graphs over MMIO and PCI through the normal
+  launcher/worker boundary. It
   validates all three seeded drives, persists two writable pre-capture epochs,
   rejects audit-drive writes, observes limiter retry metrics, recaptures a
   Paused destination, explicitly resumes one destination, and automatically
@@ -1624,6 +1655,14 @@ may skip execution. On supported Apple Silicon it proves:
   recaptures, resumes explicitly/automatically, and proves staging,
   descriptor, grant, session, replacement, worker-first, and launcher-first
   cleanup;
+- `normal_bundle_certifies_native_v2_serial_snapshot_continuation_and_containment`,
+  which runs a serial-only default-stdio source/destination through fresh
+  launcher pipes and configured-output sources/destinations with profile-3
+  storage over MMIO and PCI. It retains a full UART RX prefix, excludes bytes
+  left in the terminated source pipe, supplies only destination input, resolves
+  fresh write-only serial grants after pathname replacement, verifies
+  destination-only metrics and immutable artifacts, redacts every private
+  selector, and restores the session namespace after launcher/worker teardown;
 - a feature-gated root-plus-vsock restore-resource probe that uses the real
   coherent contained-session authority, exact typed take/adopt/commit, reverse
   reservation abort and reuse, and all nine deterministic cancellation points;
@@ -1785,9 +1824,9 @@ punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
 separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
-checks exact `v2.6.0` output for `--snapshot-version`, exact description of
-native-v1, legacy `2.3.0`, `2.4.0`, and `2.5.0`, and current/compatible
-native-v2 fixtures, and explicit pinned Firecracker/unknown incompatibility. It also
+checks exact `v2.7.0` output for `--snapshot-version`, exact description of
+native-v1, legacy `2.3.0`, `2.4.0`, `2.5.0`, and `2.6.0`, and current
+native-v2 fixtures, plus explicit pinned Firecracker/unknown incompatibility. It also
 covers missing, non-regular,
 oversized, malformed, truncated, trailing/inconsistent-length, corrupt,
 unsupported-version, incompatible-architecture, and incompatible-page-size
@@ -1841,7 +1880,7 @@ pausing, proving the source has already followed live MMIO or PCI root I/O.
 The source UART must remain canonical, while its Linux-consumed FDT bytes are
 captured and CRC-bound without being reparsed as trusted post-boot topology.
 Creation through `/snapshot/create` then verifies the real CLI reports
-`v2.6.0`. Fresh signed processes repeatedly load the same immutable pair: one
+`v2.7.0`. Fresh signed processes repeatedly load the same immutable pair: one
 remains paused until public `PATCH /vm`, and one uses `resume_vm: true`. The
 paused destination is also publicly recaptured and its decoded root graph must
 equal the source graph. After resume Linux reads the known root marker through
@@ -1857,7 +1896,7 @@ stdout reader before resume; deterministic guest UART output reaches the
 ordinary `BrokenPipe` terminal path without SIGPIPE killing the process, and
 the API socket is cleaned.
 
-The retained block-only profile-3 completion case
+The retained block-storage completion case
 `macos_arm64::signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci`
 runs one deterministic `snapshot-block-init` protocol in four signed cells:
 rooted/rootless × MMIO/PCI. Each cell carries three regular-file drives with
@@ -1895,6 +1934,27 @@ scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
   macos_arm64::signed_executable_certifies_native_v2_storage_epochs_over_mmio_and_pci \
   --exact
 ```
+
+Run the exact-2.7 serial continuation and configured-output matrices with:
+
+```sh
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  signed_executable_certifies_native_v2_serial_continuation_over_fresh_stdio \
+  --exact
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  signed_executable_reopens_configured_serial_snapshot_file_and_fifo_destinations \
+  --exact
+```
+
+The first shared bare-arm64 guest programs nondefault UART registers, fills the
+64-byte FIFO, leaves a distinct suffix in the source process pipe, terminates
+the source, and accepts only a different suffix from each fresh destination.
+It runs serial-only plus MMIO/PCI storage products, decodes exact state,
+recaptures while paused, exercises explicit/automatic resume, verifies
+destination-only metrics, and preserves the immutable pair. The second test
+renames source regular-file/FIFO output endpoints and creates fresh destination
+endpoints at the persisted selector; restored TX must reach only the
+destination endpoint.
 
 The
 tiny-initrd scenarios write `BANGBANG_BLOCK_WRITE_OK` to scratch block backing
@@ -1948,8 +2008,9 @@ send more than the UART FIFO capacity, pause with input queued, require ordered
 capture-ready optional-profile rejection with no artifacts, resume, shrink and
 deflate, detach stdin at EOF while the API remains live, and repeat a short
 session with the same socket/control-resource names. This proves live and
-capture-ready coexistence only; it does not prove optional-device encoding,
-restore, or PVTime clone portability.
+capture-ready coexistence only. Exact serial encoding/restore is certified by
+the dedicated 2.7 matrix above; this aggregate case does not by itself prove
+the other optional-device encodings or PVTime clone portability.
 It also includes a direct-rootfs balloon scenario that configures `/balloon`,
 enables free-page reporting, checks that the guest bound a virtio-balloon driver
 and negotiated reporting feature bit 5, observes periodic optional statistics,

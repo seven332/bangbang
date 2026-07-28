@@ -545,8 +545,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 235);
-    assert_eq!(count(Disposition::AuditRequired), 163);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 236);
+    assert_eq!(count(Disposition::AuditRequired), 162);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -770,8 +770,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 235);
-    assert_eq!(count(Disposition::AuditRequired), 163);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 236);
+    assert_eq!(count(Disposition::AuditRequired), 162);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -982,8 +982,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 235);
-    assert_eq!(count(Disposition::AuditRequired), 163);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 236);
+    assert_eq!(count(Disposition::AuditRequired), 162);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -1194,14 +1194,14 @@ fn delivery_closure_policy_is_stable() {
         "corpus:entropy",
         "semantic.device:entropy-queues-limits-metrics-and-state",
     ];
-    const SERIAL_TERMINAL: [&str; 5] = [
+    const SERIAL_TERMINAL: [&str; 6] = [
         "api-operation:PUT /serial",
         "api-path:/serial",
         "api-property:SerialDevice.rate_limiter",
         "api-property:SerialDevice.serial_out_path",
         "api-schema:SerialDevice",
+        "semantic.device:serial-stdin-stdout-rx-and-restore",
     ];
-    const SERIAL_WAVE_6: [&str; 1] = ["semantic.device:serial-stdin-stdout-rx-and-restore"];
 
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1250,8 +1250,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 235);
-    assert_eq!(count(Disposition::AuditRequired), 163);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 236);
+    assert_eq!(count(Disposition::AuditRequired), 162);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -1515,10 +1515,7 @@ fn delivery_closure_policy_is_stable() {
         );
     }
 
-    let serial_ids = SERIAL_TERMINAL
-        .into_iter()
-        .chain(SERIAL_WAVE_6)
-        .collect::<BTreeSet<_>>();
+    let serial_ids = SERIAL_TERMINAL.into_iter().collect::<BTreeSet<_>>();
     assert_eq!(serial_ids.len(), 6, "serial closure ledger must stay exact");
     for id in SERIAL_TERMINAL {
         let capability = by_id.get(id).expect("terminal serial record must exist");
@@ -1532,19 +1529,6 @@ fn delivery_closure_policy_is_stable() {
             "terminal serial record must retain concrete evidence: {id}"
         );
     }
-    for id in SERIAL_WAVE_6 {
-        let capability = by_id.get(id).expect("Wave 6 serial record must exist");
-        assert_eq!(
-            capability.disposition,
-            Disposition::AuditRequired,
-            "Wave 6 serial handoff must remain audit-owned: {id}"
-        );
-        assert!(
-            capability.summary.contains("Wave 6"),
-            "Wave 6 serial handoff must name its owner: {id}"
-        );
-    }
-
     let serial_contract = std::fs::read_to_string(
         repository_root.join("compat/firecracker/v1.16.0/serial-contract.md"),
     )
@@ -1577,10 +1561,7 @@ fn delivery_closure_policy_is_stable() {
         .into_iter()
         .chain(ENTROPY_WAVE_6)
         .collect::<BTreeSet<_>>();
-    let serial_ids = SERIAL_TERMINAL
-        .into_iter()
-        .chain(SERIAL_WAVE_6)
-        .collect::<BTreeSet<_>>();
+    let serial_ids = SERIAL_TERMINAL.into_iter().collect::<BTreeSet<_>>();
     let time_identity_ids = TIME_IDENTITY_WAVE_6.into_iter().collect::<BTreeSet<_>>();
     assert_eq!(balloon_ids.len(), 52);
     assert_eq!(memory_hotplug_ids.len(), 19);
@@ -1641,11 +1622,10 @@ fn delivery_closure_policy_is_stable() {
         .into_iter()
         .chain(MEMORY_HOTPLUG_WAVE_6)
         .chain(ENTROPY_WAVE_6)
-        .chain(SERIAL_WAVE_6)
         .chain(TIME_IDENTITY_WAVE_6)
         .collect::<BTreeSet<_>>();
-    assert_eq!(remaining_terminal_ids.len(), 77);
-    assert_eq!(remaining_wave_6_ids.len(), 8);
+    assert_eq!(remaining_terminal_ids.len(), 78);
+    assert_eq!(remaining_wave_6_ids.len(), 7);
     assert!(remaining_terminal_ids.is_disjoint(&remaining_wave_6_ids));
     assert_eq!(
         remaining_terminal_ids
