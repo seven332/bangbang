@@ -439,6 +439,21 @@ fn fixture_matrix_covers_required_semantic_variants() {
 }
 
 #[test]
+fn pending_retry_accepts_equal_device_local_queue_cursors() {
+    let mut graph = fixture_graph(SnapshotV2DeviceTransportKind::Mmio, false);
+    let continuation = graph.records[0].block.continuation();
+    graph.records[0].block.continuation = SnapshotV2BlockState::from_parts(
+        continuation.capacity_sectors(),
+        continuation.device_id(),
+        Some(VirtioBlockQueueState::new(6, 6)),
+        continuation.limiter(),
+        continuation.retry(),
+    );
+
+    assert_eq!(validate_graph(&graph), Ok(()));
+}
+
+#[test]
 fn drive_config_projection_is_complete_ordered_and_all_or_nothing() {
     for with_root in [false, true] {
         let graph = fixture_graph(SnapshotV2DeviceTransportKind::Mmio, with_root);

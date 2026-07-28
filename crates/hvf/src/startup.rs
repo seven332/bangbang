@@ -6602,6 +6602,48 @@ const fn storage_retry_state(state: SnapshotV1BlockRetryState) -> StorageRetrySt
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CaptureReadySharedStorageRetryAttribution {
+    shared: StorageRetryState,
+    has_pending_owner: bool,
+}
+
+impl CaptureReadySharedStorageRetryAttribution {
+    const fn new(shared: StorageRetryState) -> Self {
+        Self {
+            shared,
+            has_pending_owner: false,
+        }
+    }
+
+    fn attribute(
+        &mut self,
+        pending: bool,
+    ) -> Result<StorageRetryState, HvfArm64BootStorageCaptureError> {
+        if !pending {
+            return Ok(StorageRetryState::None);
+        }
+        if self.shared == StorageRetryState::None {
+            return Err(HvfArm64BootStorageCaptureError::new(
+                HvfArm64BootStorageCaptureErrorKind::RetryState,
+                false,
+            ));
+        }
+        self.has_pending_owner = true;
+        Ok(self.shared)
+    }
+
+    fn finish(self) -> Result<(), HvfArm64BootStorageCaptureError> {
+        if self.shared != StorageRetryState::None && !self.has_pending_owner {
+            return Err(HvfArm64BootStorageCaptureError::new(
+                HvfArm64BootStorageCaptureErrorKind::RetryState,
+                false,
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn storage_retry_state_at(
     deadline: Option<Instant>,
     now: Instant,
@@ -8388,6 +8430,10 @@ fn capture_ready_storage_transaction_at_with_cancel(
     let shared_pmem_retry = storage_retry_state(guard.pmem_retry_state_at(now).map_err(|_| {
         HvfArm64BootStorageCaptureError::new(HvfArm64BootStorageCaptureErrorKind::RetryState, false)
     })?);
+    let mut block_retry_attribution =
+        CaptureReadySharedStorageRetryAttribution::new(shared_block_retry);
+    let mut pmem_retry_attribution =
+        CaptureReadySharedStorageRetryAttribution::new(shared_pmem_retry);
     let mut mmio_dispatcher_guard =
         lock_boot_mmio_dispatcher(mmio_dispatcher).map_err(|error| match error {
             HvfArm64BootMmioDispatcherError::Busy => HvfArm64BootStorageCaptureError::new(
@@ -8561,10 +8607,23 @@ fn capture_ready_storage_transaction_at_with_cancel(
         let pci_match = pci_matches.next().map(|(index, _)| index);
         let duplicate_pci = pci_matches.next().is_some();
         let owner = match (mmio_match, duplicate_mmio, pci_match, duplicate_pci) {
-            (Some(interrupt_line), false, None, false) => CaptureReadyBlockOwner::Mmio {
-                retry: shared_block_retry,
-                interrupt_line,
-            },
+            (Some(interrupt_line), false, None, false) => {
+                let pending = runtime_resources
+                    .capture_ready_mmio_block_has_pending_rate_limited_queue(
+                        &mut mmio_dispatcher_guard,
+                        config.drive_id(),
+                    )
+                    .map_err(|_| {
+                        HvfArm64BootStorageCaptureError::new(
+                            HvfArm64BootStorageCaptureErrorKind::BlockCapture,
+                            false,
+                        )
+                    })?;
+                CaptureReadyBlockOwner::Mmio {
+                    retry: block_retry_attribution.attribute(pending)?,
+                    interrupt_line,
+                }
+            }
             (None, false, Some(index), false) => {
                 let device = pci_data_devices
                     .as_ref()
@@ -8599,6 +8658,7 @@ fn capture_ready_storage_transaction_at_with_cancel(
         };
         block_owners.push(owner);
     }
+    block_retry_attribution.finish()?;
 
     for config in configs.pmem() {
         let mut mmio_matches = runtime_resources
@@ -8615,9 +8675,22 @@ fn capture_ready_storage_transaction_at_with_cancel(
         let pci_match = pci_matches.next().map(|(index, _)| index);
         let duplicate_pci = pci_matches.next().is_some();
         let owner = match (mmio_match, duplicate_mmio, pci_match, duplicate_pci) {
-            (true, false, None, false) => CaptureReadyPmemOwner::Mmio {
-                retry: shared_pmem_retry,
-            },
+            (true, false, None, false) => {
+                let pending = runtime_resources
+                    .capture_ready_mmio_pmem_has_pending_rate_limited_queue(
+                        &mut mmio_dispatcher_guard,
+                        config.id(),
+                    )
+                    .map_err(|_| {
+                        HvfArm64BootStorageCaptureError::new(
+                            HvfArm64BootStorageCaptureErrorKind::PmemCapture,
+                            false,
+                        )
+                    })?;
+                CaptureReadyPmemOwner::Mmio {
+                    retry: pmem_retry_attribution.attribute(pending)?,
+                }
+            }
             (false, false, Some(index), false) => {
                 let device = pci_data_devices
                     .as_ref()
@@ -8651,6 +8724,7 @@ fn capture_ready_storage_transaction_at_with_cancel(
         };
         pmem_owners.push(owner);
     }
+    pmem_retry_attribution.finish()?;
 
     if mode != CaptureReadyStorageMode::Diagnostic {
         let first_is_mmio = block_owners
@@ -25885,7 +25959,7 @@ mod tests {
         memory_hotplug_status_for_device, pending_serial_interrupt_intent_for_device,
         update_memory_hotplug_config_for_device,
     };
-    use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
+    use bangbang_runtime::storage_capture::{CaptureReadyStorageConfigs, StorageRetryState};
     use bangbang_runtime::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
@@ -25902,12 +25976,13 @@ mod tests {
     };
 
     use super::{
-        CaptureReadyMmioBlockInterrupt, HvfArm64BootBalloonDeviceConfig,
-        HvfArm64BootBalloonNotificationDispatchError, HvfArm64BootBlockNotificationDispatchError,
-        HvfArm64BootEntropyDeviceConfig, HvfArm64BootEntropyNotificationDispatchError,
-        HvfArm64BootInterruptLinePurpose, HvfArm64BootInterruptRequest,
-        HvfArm64BootLimiterRetrySnapshotError, HvfArm64BootLimiterRetryWakeupOwner,
-        HvfArm64BootLimiterRetryWakeupQuiescenceError, HvfArm64BootLimiterRetryWakeupScheduler,
+        CaptureReadyMmioBlockInterrupt, CaptureReadySharedStorageRetryAttribution,
+        HvfArm64BootBalloonDeviceConfig, HvfArm64BootBalloonNotificationDispatchError,
+        HvfArm64BootBlockNotificationDispatchError, HvfArm64BootEntropyDeviceConfig,
+        HvfArm64BootEntropyNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
+        HvfArm64BootInterruptRequest, HvfArm64BootLimiterRetrySnapshotError,
+        HvfArm64BootLimiterRetryWakeupOwner, HvfArm64BootLimiterRetryWakeupQuiescenceError,
+        HvfArm64BootLimiterRetryWakeupScheduler,
         HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceError,
         HvfArm64BootLimiterRetryWakeupSchedulerStatus, HvfArm64BootLimiterRetryWakeupToken,
         HvfArm64BootMemoryHotplugDeviceConfig, HvfArm64BootMemoryHotplugNotificationDispatchError,
@@ -25916,10 +25991,10 @@ mod tests {
         HvfArm64BootRunLoopControlWakeupToken, HvfArm64BootRunLoopOutcome,
         HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSerialInput,
         HvfArm64BootSerialInputDispatchError, HvfArm64BootSessionConfig, HvfArm64BootSessionError,
-        HvfArm64BootTimeIdentityRestoreError, HvfArm64BootTimerDeviceConfig,
-        HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
-        HvfArm64BootVsockNotificationDispatchError, PCI_ENDPOINT_SLOT_COUNT,
-        allocate_interrupt_lines, capture_hvf_snapshot_v2_time_state,
+        HvfArm64BootStorageCaptureErrorKind, HvfArm64BootTimeIdentityRestoreError,
+        HvfArm64BootTimerDeviceConfig, HvfArm64BootVmClockRestoreError,
+        HvfArm64BootVmGenIdRestoreError, HvfArm64BootVsockNotificationDispatchError,
+        PCI_ENDPOINT_SLOT_COUNT, allocate_interrupt_lines, capture_hvf_snapshot_v2_time_state,
         collect_balloon_notification_dispatches, collect_block_notification_dispatches,
         collect_entropy_notification_dispatches, collect_memory_hotplug_notification_dispatches,
         collect_network_notification_dispatches, collect_vsock_notification_dispatches,
@@ -26815,6 +26890,89 @@ mod tests {
         while state.publication_in_flight {
             state = super::wait_limiter_retry_wakeup_state(&scheduler.shared, state);
         }
+    }
+
+    #[test]
+    fn shared_storage_retry_attribution_covers_zero_one_and_multiple_pending_owners() {
+        let mut zero = CaptureReadySharedStorageRetryAttribution::new(StorageRetryState::None);
+        assert_eq!(
+            zero.attribute(false)
+                .expect("idle owner without a scheduler should attribute"),
+            StorageRetryState::None
+        );
+        zero.finish()
+            .expect("zero pending owners should accept an idle scheduler");
+
+        let mut one = CaptureReadySharedStorageRetryAttribution::new(StorageRetryState::Immediate);
+        assert_eq!(
+            one.attribute(false)
+                .expect("idle peer should retain no retry"),
+            StorageRetryState::None
+        );
+        assert_eq!(
+            one.attribute(true)
+                .expect("pending owner should receive the shared retry"),
+            StorageRetryState::Immediate
+        );
+        one.finish()
+            .expect("one pending owner should account for the scheduler");
+
+        let retry = StorageRetryState::After {
+            remaining_nanos: 25,
+        };
+        let mut multiple = CaptureReadySharedStorageRetryAttribution::new(retry);
+        assert_eq!(
+            multiple
+                .attribute(true)
+                .expect("first pending owner should receive the shared retry"),
+            retry
+        );
+        assert_eq!(
+            multiple
+                .attribute(false)
+                .expect("idle middle peer should retain no retry"),
+            StorageRetryState::None
+        );
+        assert_eq!(
+            multiple
+                .attribute(true)
+                .expect("second pending owner should receive the shared retry"),
+            retry
+        );
+        multiple
+            .finish()
+            .expect("multiple pending owners should share one family scheduler");
+    }
+
+    #[test]
+    fn shared_storage_retry_attribution_rejects_both_mismatch_directions() {
+        let mut missing_scheduler =
+            CaptureReadySharedStorageRetryAttribution::new(StorageRetryState::None);
+        let error = missing_scheduler
+            .attribute(true)
+            .expect_err("pending work without a scheduler must fail");
+        assert_eq!(
+            error.kind(),
+            HvfArm64BootStorageCaptureErrorKind::RetryState
+        );
+        assert!(!error.terminal());
+
+        let mut missing_owner =
+            CaptureReadySharedStorageRetryAttribution::new(StorageRetryState::Immediate);
+        assert_eq!(
+            missing_owner
+                .attribute(false)
+                .expect("idle owner observation should succeed"),
+            StorageRetryState::None
+        );
+        let error = missing_owner
+            .finish()
+            .expect_err("scheduler retry without a pending owner must fail");
+        assert_eq!(
+            error.kind(),
+            HvfArm64BootStorageCaptureErrorKind::RetryState
+        );
+        assert!(!error.terminal());
     }
 
     #[test]

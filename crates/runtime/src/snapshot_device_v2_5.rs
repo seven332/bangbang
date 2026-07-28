@@ -751,24 +751,11 @@ pub(crate) fn validate_record(
         return Err(GraphValidationError::Block);
     }
     validate_limiter_relationship(record.config.rate_limiter, block.limiter())?;
-    if block.retry() != StorageRetryState::None
-        && (block.active_queue().is_none() || block.limiter().is_empty())
-    {
-        return Err(GraphValidationError::Block);
-    }
-    if matches!(
+    validate_block_retry_state(
+        block.active_queue().is_some(),
+        block.limiter(),
         block.retry(),
-        StorageRetryState::After { remaining_nanos: 0 }
-    ) {
-        return Err(GraphValidationError::Block);
-    }
-    if block.retry() != StorageRetryState::None
-        && block
-            .active_queue()
-            .is_some_and(|queue| queue.next_available() == queue.next_used())
-    {
-        return Err(GraphValidationError::Block);
-    }
+    )?;
 
     let expected_features = VirtioBlockConfigSpace::new(
         record.block.backing_bytes,
@@ -794,6 +781,23 @@ pub(crate) fn validate_record(
         SnapshotV2DeviceTransport::Mmio(state) => validate_mmio(state),
         SnapshotV2DeviceTransport::Pci(state) => validate_pci(state),
     }
+}
+
+fn validate_block_retry_state(
+    has_active_queue: bool,
+    limiter: SnapshotV2BlockLimiterState,
+    retry: StorageRetryState,
+) -> Result<(), GraphValidationError> {
+    // A throttled descriptor remains authoritative in the guest available
+    // ring until admission succeeds. The device-local available and used
+    // cursors can therefore be equal; restore validation cross-checks the
+    // guest ring before rebuilding the pending retry.
+    if (retry != StorageRetryState::None && (!has_active_queue || limiter.is_empty()))
+        || matches!(retry, StorageRetryState::After { remaining_nanos: 0 })
+    {
+        return Err(GraphValidationError::Block);
+    }
+    Ok(())
 }
 
 fn validate_limiter_config(

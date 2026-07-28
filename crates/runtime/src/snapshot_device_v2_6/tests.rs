@@ -1247,6 +1247,11 @@ fn build_rejects_empty_root_order_selector_geometry_and_resource_conflicts() {
 #[test]
 fn pending_rate_limit_state_requires_queue_limiter_and_retry() {
     let baseline = fixture_graph(SnapshotV2DeviceTransportKind::Mmio, 0, 1, None);
+    let mut equal_internal_cursors = baseline.clone();
+    equal_internal_cursors.pmem_records[0].pmem.active_queue =
+        Some(VirtioPmemQueueState::new(6, 6));
+    assert_eq!(validate_graph(&equal_internal_cursors), Ok(()));
+
     for mutate in [
         |record: &mut SnapshotV2PmemDeviceRecord| record.pmem.active_queue = None,
         |record: &mut SnapshotV2PmemDeviceRecord| {
@@ -1265,7 +1270,7 @@ fn pending_rate_limit_state_requires_queue_limiter_and_retry() {
     retry_without_pending.pmem_records[0]
         .pmem
         .pending_rate_limited_queue = false;
-    assert!(validate_graph(&retry_without_pending).is_ok());
+    assert!(validate_graph(&retry_without_pending).is_err());
 }
 
 #[test]

@@ -8223,6 +8223,10 @@ impl VirtioBlockMmioHandler {
         self.activation_handler().backend_kind()
     }
 
+    pub fn has_pending_block_rate_limited_queue(&self) -> bool {
+        self.activation_handler().has_pending_rate_limited_queue()
+    }
+
     pub fn block_snapshot_persistence_binding(
         &self,
         config: &DriveConfig,
