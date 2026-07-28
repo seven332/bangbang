@@ -2,12 +2,19 @@
 
 use std::convert::Infallible;
 use std::fmt;
+use std::time::Instant;
 
+use bangbang_runtime::memory::GuestMemory;
 use bangbang_runtime::serial::{
-    SerialMmioDevice, SerialStdio, SerialStdioError, SerialStdioInput, SerialStdioRestoration,
-    SerialStdioRestorationError, SharedSerialOutput,
+    SerialConfig, SerialConfigError, SerialConfigInput, SerialMmioDevice, SerialStdio,
+    SerialStdioError, SerialStdioInput, SerialStdioRestoration, SerialStdioRestorationError,
+    SharedSerialOutput,
 };
-use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
+use bangbang_runtime::snapshot_device_v2_5::SnapshotV2MultiBlockRestorePlanError;
+use bangbang_runtime::snapshot_device_v2_6::{
+    PreparedSnapshotV2StorageBundle, SnapshotV2StorageBundleError, SnapshotV2StorageDeviceGraph,
+    SnapshotV2StorageRestorePlan, SnapshotV2StorageRestorePlanError,
+};
 use bangbang_runtime::snapshot_restore::{
     NATIVE_V2_SERIAL_RESTORE_PUBLIC_ID, SnapshotRestoreResourceClass,
 };
@@ -31,6 +38,7 @@ pub(crate) struct PreparedSnapshotV2SerialRestoreOwners {
     serial: Option<SerialMmioDevice<SharedSerialOutput>>,
     input: Option<SerialStdioInput>,
     restoration: Option<SerialStdioRestoration>,
+    serial_config: Option<SerialConfig>,
 }
 
 pub(crate) type PreparedSnapshotV2SerialRestoreOwnerParts = (
@@ -39,6 +47,7 @@ pub(crate) type PreparedSnapshotV2SerialRestoreOwnerParts = (
     Option<SerialMmioDevice<SharedSerialOutput>>,
     Option<SerialStdioInput>,
     Option<SerialStdioRestoration>,
+    Option<SerialConfig>,
 );
 
 impl PreparedSnapshotV2SerialRestoreOwners {
@@ -57,7 +66,142 @@ impl PreparedSnapshotV2SerialRestoreOwners {
             self.serial.take(),
             self.input.take(),
             self.restoration.take(),
+            self.serial_config.take(),
         )
+    }
+
+    pub(crate) fn from_parts(parts: PreparedSnapshotV2SerialRestoreOwnerParts) -> Self {
+        let (blocks, pmems, serial, input, restoration, serial_config) = parts;
+        Self {
+            blocks,
+            pmems,
+            serial,
+            input,
+            restoration,
+            serial_config,
+        }
+    }
+
+    pub(crate) fn endpoint_cleanup(restoration: Option<SerialStdioRestoration>) -> Self {
+        Self {
+            blocks: Vec::new(),
+            pmems: Vec::new(),
+            serial: None,
+            input: None,
+            restoration,
+            serial_config: None,
+        }
+    }
+
+    /// Validates and transfers graph-ordered storage backings into the
+    /// profile-3 bundle without reopening any selector or authority.
+    pub(crate) fn adopt_storage<F>(
+        mut self,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        memory: &GuestMemory,
+        now: Instant,
+        cancelled: &F,
+    ) -> Result<
+        (Self, Option<PreparedSnapshotV2StorageBundle>),
+        (Box<Self>, SnapshotV2SerialStorageAdoptionError),
+    >
+    where
+        F: Fn() -> bool,
+    {
+        let Some(graph) = graph else {
+            if !self.blocks.is_empty() || !self.pmems.is_empty() {
+                return Err((
+                    Box::new(self),
+                    SnapshotV2SerialStorageAdoptionError::InvalidResourceSet,
+                ));
+            }
+            return Ok((self, None));
+        };
+
+        let mut expected_keys = Vec::new();
+        if expected_keys
+            .try_reserve_exact(graph.record_count())
+            .is_err()
+        {
+            return Err((
+                Box::new(self),
+                SnapshotV2SerialStorageAdoptionError::Plan(
+                    SnapshotV2StorageRestorePlanError::Allocation,
+                ),
+            ));
+        }
+        expected_keys.extend(
+            graph
+                .block_records()
+                .iter()
+                .map(|record| (record.key(), SnapshotRestoreResourceClass::BlockBacking))
+                .chain(
+                    graph
+                        .pmem_records()
+                        .iter()
+                        .map(|record| (record.key(), SnapshotRestoreResourceClass::PmemBacking)),
+                ),
+        );
+        let plan = match SnapshotV2StorageRestorePlan::prepare(graph, memory, now) {
+            Ok(plan) => plan,
+            Err(source) => {
+                return Err((
+                    Box::new(self),
+                    SnapshotV2SerialStorageAdoptionError::Plan(source),
+                ));
+            }
+        };
+
+        let mut block_backings = Vec::new();
+        let mut pmem_backings = Vec::new();
+        if block_backings.try_reserve_exact(self.blocks.len()).is_err()
+            || pmem_backings.try_reserve_exact(self.pmems.len()).is_err()
+        {
+            return Err((
+                Box::new(self),
+                SnapshotV2SerialStorageAdoptionError::Plan(
+                    SnapshotV2StorageRestorePlanError::Allocation,
+                ),
+            ));
+        }
+
+        let mut expected = expected_keys.iter();
+        let mut valid = true;
+        for owner in std::mem::take(&mut self.blocks) {
+            let (key, backing) = owner.into_parts();
+            valid &= expected.next().is_some_and(|(device_key, resource_class)| {
+                key.device_key() == *device_key
+                    && key.resource_class() == *resource_class
+                    && *resource_class == SnapshotRestoreResourceClass::BlockBacking
+            });
+            block_backings.push(backing);
+        }
+        for owner in std::mem::take(&mut self.pmems) {
+            let (key, backing) = owner.into_parts();
+            valid &= expected.next().is_some_and(|(device_key, resource_class)| {
+                key.device_key() == *device_key
+                    && key.resource_class() == *resource_class
+                    && *resource_class == SnapshotRestoreResourceClass::PmemBacking
+            });
+            pmem_backings.push(backing);
+        }
+        valid &= expected.next().is_none();
+        if !valid {
+            drop(block_backings);
+            drop(pmem_backings);
+            return Err((
+                Box::new(self),
+                SnapshotV2SerialStorageAdoptionError::InvalidResourceSet,
+            ));
+        }
+
+        match plan.prepare_backings(block_backings, pmem_backings, cancelled) {
+            Ok(storage) => Ok((self, Some(storage))),
+            Err(source) => Err((
+                Box::new(self),
+                SnapshotV2SerialStorageAdoptionError::Bundle(source),
+            )),
+        }
     }
 
     pub(crate) fn abort(mut self) -> Result<(), PreparedSnapshotV2SerialRestoreOwnerCleanupError> {
@@ -74,12 +218,85 @@ impl PreparedSnapshotV2SerialRestoreOwners {
         {
             let _serial = self.serial.take();
         }
+        {
+            let _serial_config = self.serial_config.take();
+        }
         let restoration = self
             .restoration
             .take()
             .and_then(|restoration| restoration.finish().err());
         release_restore_backings(&mut self.blocks, &mut self.pmems);
         restoration
+    }
+}
+
+pub(crate) enum SnapshotV2SerialStorageAdoptionError {
+    Plan(SnapshotV2StorageRestorePlanError),
+    InvalidResourceSet,
+    Bundle(SnapshotV2StorageBundleError),
+}
+
+impl SnapshotV2SerialStorageAdoptionError {
+    pub(crate) const fn disposition(&self) -> SnapshotRestoreResourceDisposition {
+        match self {
+            Self::Plan(
+                SnapshotV2StorageRestorePlanError::Allocation
+                | SnapshotV2StorageRestorePlanError::Block(
+                    SnapshotV2MultiBlockRestorePlanError::Allocation,
+                ),
+            ) => SnapshotRestoreResourceDisposition::Retryable,
+            Self::Bundle(source) if source.is_retryable() => {
+                SnapshotRestoreResourceDisposition::Retryable
+            }
+            Self::Plan(_) | Self::InvalidResourceSet | Self::Bundle(_) => {
+                SnapshotRestoreResourceDisposition::Terminal
+            }
+        }
+    }
+
+    pub(crate) const fn is_terminal(&self) -> bool {
+        matches!(
+            self.disposition(),
+            SnapshotRestoreResourceDisposition::Terminal
+        )
+    }
+}
+
+impl fmt::Debug for SnapshotV2SerialStorageAdoptionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotV2SerialStorageAdoptionError")
+            .field(
+                "stage",
+                &match self {
+                    Self::Plan(_) => "plan",
+                    Self::InvalidResourceSet => "resource-set",
+                    Self::Bundle(_) => "bundle",
+                },
+            )
+            .field("disposition", &self.disposition())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotV2SerialStorageAdoptionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "snapshot serial storage adoption failed ({:?})",
+            self.disposition()
+        )
+    }
+}
+
+impl std::error::Error for SnapshotV2SerialStorageAdoptionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Plan(source) => Some(source),
+            Self::Bundle(source) => Some(source),
+            Self::InvalidResourceSet => None,
+        }
     }
 }
 
@@ -97,6 +314,7 @@ impl fmt::Debug for PreparedSnapshotV2SerialRestoreOwners {
             .field("pmem_count", &self.pmems.len())
             .field("has_serial", &self.serial.is_some())
             .field("has_input", &self.input.is_some())
+            .field("has_serial_config", &self.serial_config.is_some())
             .field("state", &"<redacted>")
             .finish()
     }
@@ -521,6 +739,10 @@ pub(crate) enum SnapshotV2SerialRestoreBundleError {
         source: SerialStdioError,
         completion_abort: Option<PreparedSnapshotDriveRestoreCompletionError>,
     },
+    SerialConfig {
+        source: SerialConfigError,
+        completion_abort: Option<PreparedSnapshotDriveRestoreCompletionError>,
+    },
     InvalidResourceSet {
         owners_cleanup: Option<PreparedSnapshotV2SerialRestoreOwnerCleanupError>,
         completion_abort: Option<PreparedSnapshotDriveRestoreCompletionError>,
@@ -545,6 +767,12 @@ impl SnapshotV2SerialRestoreBundleError {
                 owners_cleanup: None,
                 completion_abort: None,
             } => SnapshotRestoreResourceDisposition::Retryable,
+            Self::SerialConfig {
+                completion_abort, ..
+            } => {
+                let _cleanup_failed = completion_abort.is_some();
+                SnapshotRestoreResourceDisposition::Terminal
+            }
             Self::Stdio { .. } | Self::Cancelled { .. } => {
                 SnapshotRestoreResourceDisposition::Terminal
             }
@@ -557,6 +785,7 @@ impl fmt::Debug for SnapshotV2SerialRestoreBundleError {
         let kind = match self {
             Self::Resources(_) => "resources",
             Self::Stdio { .. } => "stdio",
+            Self::SerialConfig { .. } => "serial-config",
             Self::InvalidResourceSet { .. } => "invalid-resource-set",
             Self::Cancelled { .. } => "cancelled",
         };
@@ -584,6 +813,7 @@ impl std::error::Error for SnapshotV2SerialRestoreBundleError {
         match self {
             Self::Resources(source) => Some(source),
             Self::Stdio { source, .. } => Some(source),
+            Self::SerialConfig { source, .. } => Some(source),
             Self::InvalidResourceSet {
                 owners_cleanup,
                 completion_abort,
@@ -667,8 +897,23 @@ where
     }
 
     let (endpoint_intent, rate_limiter, device_state) = state.into_parts();
-    let (output, input, restoration) = match endpoint_intent {
+    let (output, input, restoration, serial_config) = match endpoint_intent {
         SnapshotV2SerialEndpointIntent::DefaultProcessStdio => {
+            let mut config = SerialConfigInput::new();
+            if let Some(rate_limiter) = rate_limiter {
+                config = config.with_rate_limiter(rate_limiter);
+            }
+            let serial_config = match config.validate() {
+                Ok(config) => config,
+                Err(source) => {
+                    let completion_abort =
+                        abort_unassembled(blocks, pmems, prepared_serial, completion);
+                    return Err(SnapshotV2SerialRestoreBundleError::SerialConfig {
+                        source,
+                        completion_abort,
+                    });
+                }
+            };
             if prepared_serial.is_some() {
                 let completion_abort =
                     abort_unassembled(blocks, pmems, prepared_serial, completion);
@@ -693,9 +938,25 @@ where
                 SharedSerialOutput::with_rate_limiter(output, rate_limiter),
                 input,
                 Some(restoration),
+                serial_config,
             )
         }
-        SnapshotV2SerialEndpointIntent::ConfiguredOutput { selector: _ } => {
+        SnapshotV2SerialEndpointIntent::ConfiguredOutput { selector } => {
+            let mut config = SerialConfigInput::new().with_serial_out_path(selector);
+            if let Some(rate_limiter) = rate_limiter {
+                config = config.with_rate_limiter(rate_limiter);
+            }
+            let serial_config = match config.validate() {
+                Ok(config) => config,
+                Err(source) => {
+                    let completion_abort =
+                        abort_unassembled(blocks, pmems, prepared_serial, completion);
+                    return Err(SnapshotV2SerialRestoreBundleError::SerialConfig {
+                        source,
+                        completion_abort,
+                    });
+                }
+            };
             let Some(serial) = prepared_serial.as_ref() else {
                 let completion_abort =
                     abort_unassembled(blocks, pmems, prepared_serial, completion);
@@ -730,6 +991,7 @@ where
                 SharedSerialOutput::with_rate_limiter(output, rate_limiter),
                 None,
                 None,
+                serial_config,
             )
         }
     };
@@ -740,6 +1002,7 @@ where
         serial: Some(serial),
         input,
         restoration,
+        serial_config: Some(serial_config),
     };
     if cancelled() {
         let owners_cleanup = owners.abort().err();
@@ -787,6 +1050,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use bangbang_runtime::memory::{
+        GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
+    };
     use bangbang_runtime::serial::{
         SERIAL_INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE, SERIAL_LINE_STATUS_DATA_READY,
         SERIAL_LINE_STATUS_DEFAULT, SERIAL_LINE_STATUS_OVERRUN_ERROR, SerialMmioCaptureState,
@@ -796,6 +1062,7 @@ mod tests {
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
     };
     use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialEndpointIntent;
+    use bangbang_runtime::storage_capture::StorageRetryState;
     use bangbang_session::{GrantAccess, ResourceRole};
 
     use super::*;
@@ -970,6 +1237,71 @@ mod tests {
         .expect("storage fixture should decode")
     }
 
+    fn restore_memory_for(graph: &SnapshotV2StorageDeviceGraph) -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), 0x80_0000)
+                .expect("restore memory range should validate"),
+        ])
+        .expect("restore memory layout should validate");
+        let mut memory = GuestMemory::allocate(&layout).expect("restore memory should allocate");
+        for record in graph.block_records() {
+            let Some(cursor) = record.block().continuation().active_queue() else {
+                continue;
+            };
+            let queue = record
+                .virtio()
+                .queues()
+                .first()
+                .expect("block queue should exist");
+            let available_index =
+                if record.block().continuation().retry() == StorageRetryState::None {
+                    cursor.next_available()
+                } else {
+                    cursor.next_available().wrapping_add(1)
+                };
+            memory
+                .write_slice(
+                    &available_index.to_le_bytes(),
+                    GuestAddress::new(queue.driver_ring().raw_value() + 2),
+                )
+                .expect("block available index should write");
+            memory
+                .write_slice(
+                    &cursor.next_used().to_le_bytes(),
+                    GuestAddress::new(queue.device_ring().raw_value() + 2),
+                )
+                .expect("block used index should write");
+        }
+        for record in graph.pmem_records() {
+            let Some(cursor) = record.pmem().active_queue() else {
+                continue;
+            };
+            let queue = record
+                .virtio()
+                .queues()
+                .first()
+                .expect("pmem queue should exist");
+            let available_index = if record.pmem().retry() == StorageRetryState::None {
+                cursor.next_available()
+            } else {
+                cursor.next_available().wrapping_add(1)
+            };
+            memory
+                .write_slice(
+                    &available_index.to_le_bytes(),
+                    GuestAddress::new(queue.driver_ring().raw_value() + 2),
+                )
+                .expect("pmem available index should write");
+            memory
+                .write_slice(
+                    &cursor.next_used().to_le_bytes(),
+                    GuestAddress::new(queue.device_ring().raw_value() + 2),
+                )
+                .expect("pmem used index should write");
+        }
+        memory
+    }
+
     #[test]
     fn default_fifo_endpoints_preserve_uart_and_start_fresh_limiter_and_metrics() {
         let captured = capture_state();
@@ -998,6 +1330,14 @@ mod tests {
         assert_eq!(owners.block_count(), 0);
         assert_eq!(owners.pmem_count(), 0);
         assert!(owners.input.is_some());
+        assert_eq!(
+            owners
+                .serial_config
+                .as_ref()
+                .expect("serial config should be projected")
+                .rate_limiter(),
+            Some(SerialRateLimiterConfig::new(1, None, 60_000))
+        );
         assert_ne!(status_flags(input_reader.as_raw_fd()) & libc::O_NONBLOCK, 0);
         assert_ne!(
             status_flags(output_writer.as_raw_fd()) & libc::O_NONBLOCK,
@@ -1172,6 +1512,13 @@ mod tests {
             .construct_destination(|mut owners| {
                 assert!(owners.input.is_none());
                 assert!(owners.restoration.is_none());
+                assert_eq!(
+                    owners
+                        .serial_config
+                        .as_ref()
+                        .and_then(|config| config.serial_out_path()),
+                    Some(sink.path())
+                );
                 let serial = owners.serial.as_mut().expect("UART should exist");
                 assert!(serial.metrics().is_empty());
                 serial
@@ -1519,5 +1866,64 @@ mod tests {
         prepared
             .abort()
             .expect("aggregate storage and serial lifetime should abort");
+    }
+
+    #[test]
+    fn graph_ordered_storage_is_adopted_without_reopening_serial_owners() {
+        let block_path = unique_block_path();
+        let pmem_path = unique_pmem_path();
+        let graph = storage_graph(&block_path, &pmem_path);
+        let memory = restore_memory_for(&graph);
+        let _block = TempFile::sized(block_path, graph.block_records()[0].block().backing_bytes());
+        let _pmem = TempFile::sized(pmem_path, graph.pmem_records()[0].pmem().file_bytes());
+        let captured = capture_state();
+        let state = SnapshotV2SerialState::try_new(
+            SnapshotV2SerialEndpointIntent::default_process_stdio(),
+            None,
+            captured.clone(),
+        )
+        .expect("serial state should validate");
+        let resources = batch(Some(&graph), &state);
+        let (input_reader, _input_writer) = pipe_files();
+        let (_output_reader, output_writer) = pipe_files();
+        let cancelled = || false;
+        let prepared =
+            prepare_native_v2_serial_restore_bundle_with(state, resources, &cancelled, || {
+                SerialStdio::from_descriptors(input_reader.as_raw_fd(), output_writer.as_raw_fd())
+            })
+            .expect("mixed destination bundle should prepare");
+
+        let destination = prepared
+            .construct_destination(|owners| {
+                let (owners, storage) =
+                    owners.adopt_storage(Some(graph), &memory, Instant::now(), &|| false)?;
+                assert_eq!(owners.block_count(), 0);
+                assert_eq!(owners.pmem_count(), 0);
+                assert_eq!(
+                    owners
+                        .serial
+                        .as_ref()
+                        .expect("UART should remain owned")
+                        .capture_state()
+                        .expect("UART should recapture"),
+                    captured
+                );
+                let storage = storage.expect("profile-3 bundle should be adopted");
+                assert_eq!(storage.pmem_records().len(), 1);
+                assert_eq!(
+                    storage
+                        .block_bundle()
+                        .map_or(0, |bundle| bundle.records().len()),
+                    1
+                );
+                storage
+                    .abort()
+                    .expect("adopted storage should abort cleanly");
+                Ok(owners)
+            })
+            .expect("destination should adopt storage");
+        destination
+            .abort(PreparedSnapshotV2SerialRestoreOwners::abort)
+            .expect("adopted destination should roll back as one lifetime");
     }
 }

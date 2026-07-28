@@ -25,7 +25,9 @@ use bangbang_runtime::pvtime::{
     Arm64PvTimeStAbi,
 };
 use bangbang_runtime::rtc::{RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
-use bangbang_runtime::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SharedSerialOutput};
+use bangbang_runtime::serial::{
+    SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutput,
+};
 use bangbang_runtime::snapshot_device_v2::{
     SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind, SnapshotV2RootRestorePlan,
     SnapshotV2RootRestorePlanError,
@@ -37,8 +39,8 @@ use bangbang_runtime::snapshot_memory_v2::{
 use bangbang_runtime::startup::{
     Arm64BootResourceError, Arm64BootRtcDevice, Arm64BootSerialDevice, Arm64BootSerialDeviceConfig,
     Arm64BootVmClockDevice, Arm64BootVmGenIdDevice, PrepareArm64SnapshotTimeIdentityError,
-    prepare_arm64_snapshot_time_identity, register_arm64_boot_rtc_mmio,
-    register_arm64_boot_serial_mmio, replace_arm64_boot_vmgenid,
+    prepare_arm64_snapshot_time_identity, register_arm64_boot_restored_serial_mmio,
+    register_arm64_boot_rtc_mmio, register_arm64_boot_serial_mmio, replace_arm64_boot_vmgenid,
 };
 use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
 use bangbang_runtime::virtio_pci::{
@@ -353,6 +355,65 @@ impl fmt::Debug for HvfSnapshotV2DefaultProcessShell {
     }
 }
 
+/// Closed complete-UART shell accepted only by exact-2.7 reconstruction.
+#[doc(hidden)]
+pub struct HvfSnapshotV2RestoredSerialShell {
+    serial: SerialMmioDevice<SharedSerialOutput>,
+}
+
+impl HvfSnapshotV2RestoredSerialShell {
+    /// Bind one complete restored UART to destination platform placement.
+    pub const fn new(serial: SerialMmioDevice<SharedSerialOutput>) -> Self {
+        Self { serial }
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2RestoredSerialShell {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2RestoredSerialShell")
+            .field("profile", &"restored-uart")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Destination product policy for an exact-2.7 serial-only platform.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfSnapshotV2SerialOnlyProcessConfig {
+    pci_enabled: bool,
+}
+
+impl HvfSnapshotV2SerialOnlyProcessConfig {
+    /// Select the exact destination process PCI policy.
+    pub const fn new(pci_enabled: bool) -> Self {
+        Self { pci_enabled }
+    }
+
+    /// Returns whether the destination selected the product PCI host.
+    pub const fn pci_enabled(self) -> bool {
+        self.pci_enabled
+    }
+}
+
+enum HvfSnapshotV2ProcessSerialShell {
+    Default(HvfSnapshotV2DefaultProcessShell),
+    Restored(HvfSnapshotV2RestoredSerialShell),
+}
+
+impl From<HvfSnapshotV2DefaultProcessShell> for HvfSnapshotV2ProcessSerialShell {
+    fn from(shell: HvfSnapshotV2DefaultProcessShell) -> Self {
+        Self::Default(shell)
+    }
+}
+
+impl From<HvfSnapshotV2RestoredSerialShell> for HvfSnapshotV2ProcessSerialShell {
+    fn from(shell: HvfSnapshotV2RestoredSerialShell) -> Self {
+        Self::Restored(shell)
+    }
+}
+
 pub(crate) struct HvfSnapshotV2MultiBlockMmioShellPlan<'a> {
     pub(crate) command_line: &'a str,
     pub(crate) records: &'a [HvfSnapshotV2MultiBlockMmioRecordPlan],
@@ -387,26 +448,30 @@ pub(crate) struct HvfSnapshotV2StoragePciShellPlan<'a> {
 }
 
 enum HvfSnapshotV2ProcessShellRestore<'a> {
-    DeviceFree(HvfSnapshotV2DefaultProcessShell),
+    DeviceFree(HvfSnapshotV2ProcessSerialShell),
+    SerialOnly {
+        shell: HvfSnapshotV2ProcessSerialShell,
+        process: HvfSnapshotV2SerialOnlyProcessConfig,
+    },
     Root {
-        shell: HvfSnapshotV2DefaultProcessShell,
+        shell: HvfSnapshotV2ProcessSerialShell,
         resources: HvfSnapshotV2RootResourcePlan,
         partuuid: Option<String>,
     },
     MultiBlockMmio {
-        shell: HvfSnapshotV2DefaultProcessShell,
+        shell: HvfSnapshotV2ProcessSerialShell,
         plan: HvfSnapshotV2MultiBlockMmioShellPlan<'a>,
     },
     MultiBlockPci {
-        shell: HvfSnapshotV2DefaultProcessShell,
+        shell: HvfSnapshotV2ProcessSerialShell,
         plan: HvfSnapshotV2MultiBlockPciShellPlan<'a>,
     },
     StorageMmio {
-        shell: HvfSnapshotV2DefaultProcessShell,
+        shell: HvfSnapshotV2ProcessSerialShell,
         plan: HvfSnapshotV2StorageMmioShellPlan<'a>,
     },
     StoragePci {
-        shell: HvfSnapshotV2DefaultProcessShell,
+        shell: HvfSnapshotV2ProcessSerialShell,
         plan: HvfSnapshotV2StoragePciShellPlan<'a>,
     },
 }
@@ -1323,7 +1388,28 @@ pub fn restore_hvf_snapshot_v2_process_platform(
     restore_hvf_snapshot_v2_platform_with_shell(
         state,
         memory,
-        Some(HvfSnapshotV2ProcessShellRestore::DeviceFree(shell)),
+        Some(HvfSnapshotV2ProcessShellRestore::DeviceFree(shell.into())),
+    )
+}
+
+/// Reconstruct one unpublished exact-2.7 serial-only process platform.
+///
+/// The complete restored UART is installed at the validated fixed product
+/// placement while the vCPU topology remains never-run and Paused.
+#[doc(hidden)]
+pub fn restore_hvf_snapshot_v2_serial_only_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2RestoredSerialShell,
+    process: HvfSnapshotV2SerialOnlyProcessConfig,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::SerialOnly {
+            shell: shell.into(),
+            process,
+        }),
     )
 }
 
@@ -1338,7 +1424,7 @@ pub(crate) fn restore_hvf_snapshot_v2_root_process_platform(
         state,
         memory,
         Some(HvfSnapshotV2ProcessShellRestore::Root {
-            shell,
+            shell: shell.into(),
             resources,
             partuuid,
         }),
@@ -1354,7 +1440,10 @@ pub(crate) fn restore_hvf_snapshot_v2_multi_block_mmio_process_platform(
     restore_hvf_snapshot_v2_platform_with_shell(
         state,
         memory,
-        Some(HvfSnapshotV2ProcessShellRestore::MultiBlockMmio { shell, plan }),
+        Some(HvfSnapshotV2ProcessShellRestore::MultiBlockMmio {
+            shell: shell.into(),
+            plan,
+        }),
     )
 }
 
@@ -1367,7 +1456,10 @@ pub(crate) fn restore_hvf_snapshot_v2_multi_block_pci_process_platform(
     restore_hvf_snapshot_v2_platform_with_shell(
         state,
         memory,
-        Some(HvfSnapshotV2ProcessShellRestore::MultiBlockPci { shell, plan }),
+        Some(HvfSnapshotV2ProcessShellRestore::MultiBlockPci {
+            shell: shell.into(),
+            plan,
+        }),
     )
 }
 
@@ -1380,7 +1472,10 @@ pub(crate) fn restore_hvf_snapshot_v2_storage_mmio_process_platform(
     restore_hvf_snapshot_v2_platform_with_shell(
         state,
         memory,
-        Some(HvfSnapshotV2ProcessShellRestore::StorageMmio { shell, plan }),
+        Some(HvfSnapshotV2ProcessShellRestore::StorageMmio {
+            shell: shell.into(),
+            plan,
+        }),
     )
 }
 
@@ -1393,7 +1488,42 @@ pub(crate) fn restore_hvf_snapshot_v2_storage_pci_process_platform(
     restore_hvf_snapshot_v2_platform_with_shell(
         state,
         memory,
-        Some(HvfSnapshotV2ProcessShellRestore::StoragePci { shell, plan }),
+        Some(HvfSnapshotV2ProcessShellRestore::StoragePci {
+            shell: shell.into(),
+            plan,
+        }),
+    )
+}
+
+pub(crate) fn restore_hvf_snapshot_v2_serial_storage_mmio_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2RestoredSerialShell,
+    plan: HvfSnapshotV2StorageMmioShellPlan<'_>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::StorageMmio {
+            shell: shell.into(),
+            plan,
+        }),
+    )
+}
+
+pub(crate) fn restore_hvf_snapshot_v2_serial_storage_pci_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2RestoredSerialShell,
+    plan: HvfSnapshotV2StoragePciShellPlan<'_>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::StoragePci {
+            shell: shell.into(),
+            plan,
+        }),
     )
 }
 
@@ -2291,6 +2421,29 @@ fn prepare_process_shell(
                     None,
                 )
             }
+            HvfSnapshotV2ProcessShellRestore::SerialOnly { shell, process } => {
+                let policy_matches = match (process.pci_enabled(), gic.msi) {
+                    (false, None) => true,
+                    (true, Some(msi)) => {
+                        pci_root_restore_gic_msi_configuration().is_ok_and(|expected| {
+                            msi.interrupt_range.count == expected.interrupt_count().get()
+                        })
+                    }
+                    (false, Some(_)) | (true, None) => false,
+                };
+                if !policy_matches {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                        mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                    });
+                }
+                (
+                    shell,
+                    HvfSnapshotV2ProcessBlockFdtPlan::None,
+                    true,
+                    false,
+                    None,
+                )
+            }
             HvfSnapshotV2ProcessShellRestore::Root {
                 shell,
                 resources,
@@ -2468,15 +2621,26 @@ fn prepare_process_shell(
         )?;
     }
 
-    let serial = register_arm64_boot_serial_mmio(
-        &mut dispatcher,
-        Arm64BootSerialDeviceConfig::new(
-            PROCESS_SERIAL_MMIO_REGION_ID,
-            PROCESS_SERIAL_MMIO_BASE,
-            serial_interrupt,
-            shell.serial_output,
+    let serial = match shell {
+        HvfSnapshotV2ProcessSerialShell::Default(shell) => register_arm64_boot_serial_mmio(
+            &mut dispatcher,
+            Arm64BootSerialDeviceConfig::new(
+                PROCESS_SERIAL_MMIO_REGION_ID,
+                PROCESS_SERIAL_MMIO_BASE,
+                serial_interrupt,
+                shell.serial_output,
+            ),
         ),
-    )
+        HvfSnapshotV2ProcessSerialShell::Restored(shell) => {
+            register_arm64_boot_restored_serial_mmio(
+                &mut dispatcher,
+                PROCESS_SERIAL_MMIO_REGION_ID,
+                PROCESS_SERIAL_MMIO_BASE,
+                serial_interrupt,
+                shell.serial,
+            )
+        }
+    }
     .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellSerial)?;
     Ok((dispatcher, Some(serial)))
 }
@@ -3731,6 +3895,46 @@ pub(crate) mod tests {
             .expect("process fixture platform should cross-validate")
     }
 
+    fn product_process_platform_fixture() -> HvfSnapshotV2PlatformState {
+        let state = process_platform_fixture();
+        let layout = bangbang_runtime::memory::GuestMemoryLayout::new(
+            state
+                .memory()
+                .extents()
+                .iter()
+                .map(|extent| extent.range())
+                .collect(),
+        )
+        .expect("product process memory layout should validate");
+        let memory =
+            GuestMemory::allocate(&layout).expect("product process memory should allocate");
+        let mut image = std::io::Cursor::new(Vec::new());
+        let binding =
+            bangbang_runtime::snapshot_memory_v2::write_snapshot_v2_memory_image_with_compatibility_version(
+                &memory,
+                &mut image,
+                bangbang_runtime::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("exact-2.7 memory binding should encode");
+        let (_old_binding, machine, global, topology, vcpus, time) = state.into_parts();
+        let source_fdt = machine.fdt();
+        let fdt = crate::snapshot_v2::HvfSnapshotV2FdtState::try_new_product_process_profile(
+            source_fdt.address(),
+            usize::try_from(source_fdt.size()).expect("FDT size should fit usize"),
+            source_fdt.checksum(),
+        )
+        .expect("product process FDT marker should validate");
+        let machine = HvfSnapshotV2MachineState::try_new(
+            machine.machine(),
+            machine.boot().clone(),
+            fdt,
+            machine.cpu_template().cloned(),
+        )
+        .expect("product process machine should validate");
+        HvfSnapshotV2PlatformState::try_new(binding, machine, global, topology, vcpus, time)
+            .expect("product process platform should cross-validate")
+    }
+
     fn fixture_shell_devices(
         state: &HvfSnapshotV2PlatformState,
     ) -> (
@@ -4533,6 +4737,77 @@ pub(crate) mod tests {
             validate_default_process_fdt(&with_optional, &state, serial.interrupt_line),
             Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory)
         );
+    }
+
+    #[test]
+    fn serial_only_shell_registers_complete_uart_at_fixed_product_identity() {
+        let state = product_process_platform_fixture();
+        assert!(state.global().compatibility().gic_metadata().msi.is_none());
+        let expected = bangbang_runtime::serial::SerialMmioCaptureState::try_from_parts(
+            bangbang_runtime::serial::SerialMmioCaptureStateParts {
+                legacy_state: bangbang_runtime::serial::SerialMmioState::new(
+                    1, 3, 8, 0x5a, 12, 0,
+                ),
+                interrupt_identification:
+                    bangbang_runtime::serial::SERIAL_INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE,
+                line_status: bangbang_runtime::serial::SERIAL_LINE_STATUS_DEFAULT
+                    | bangbang_runtime::serial::SERIAL_LINE_STATUS_DATA_READY
+                    | bangbang_runtime::serial::SERIAL_LINE_STATUS_OVERRUN_ERROR,
+                modem_status: 0,
+                receive_bytes: b"restored".to_vec(),
+                receive_interrupt_intent_pending: true,
+                input_ready_intent_pending: false,
+            },
+        )
+        .expect("complete restored UART state should validate");
+        let output =
+            SharedSerialOutput::new(bangbang_runtime::serial::SharedSerialOutputBuffer::default());
+        let serial =
+            SerialMmioDevice::from_capture_state_with_shared_output(output, expected.clone());
+
+        let (mut dispatcher, device) = prepare_process_shell(
+            Some(HvfSnapshotV2ProcessShellRestore::SerialOnly {
+                shell: HvfSnapshotV2RestoredSerialShell::new(serial).into(),
+                process: HvfSnapshotV2SerialOnlyProcessConfig::new(false),
+            }),
+            &state,
+            b"authenticated product FDT bytes are not reparsed",
+        )
+        .expect("serial-only restored shell should prepare");
+        let device = device.expect("serial metadata should be retained");
+        let (serial_fdt, _, _, _) = fixture_shell_devices(&state);
+        assert_eq!(device.region.id(), PROCESS_SERIAL_MMIO_REGION_ID);
+        assert_eq!(device.region.range().start(), PROCESS_SERIAL_MMIO_BASE);
+        assert_eq!(device.fdt_device, serial_fdt);
+        assert_eq!(
+            bangbang_runtime::startup::capture_serial_state_for_device(&device, &mut dispatcher,)
+                .expect("registered UART should recapture"),
+            expected
+        );
+    }
+
+    #[test]
+    fn serial_only_shell_rejects_pci_policy_before_uart_registration() {
+        let state = product_process_platform_fixture();
+        assert!(state.global().compatibility().gic_metadata().msi.is_none());
+        let serial = SerialMmioDevice::with_shared_output(SharedSerialOutput::new(
+            bangbang_runtime::serial::SharedSerialOutputBuffer::default(),
+        ));
+        let error = prepare_process_shell(
+            Some(HvfSnapshotV2ProcessShellRestore::SerialOnly {
+                shell: HvfSnapshotV2RestoredSerialShell::new(serial).into(),
+                process: HvfSnapshotV2SerialOnlyProcessConfig::new(true),
+            }),
+            &state,
+            b"authenticated product FDT bytes are not reparsed",
+        )
+        .expect_err("MMIO GIC must reject a PCI serial-only policy");
+        assert!(matches!(
+            error,
+            HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+            }
+        ));
     }
 
     #[test]

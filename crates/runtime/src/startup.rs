@@ -6351,6 +6351,31 @@ pub fn register_arm64_boot_serial_mmio(
     register_serial_mmio(dispatcher, config)
 }
 
+/// Install one already-restored destination-owned serial device into an
+/// existing arm64 boot MMIO dispatcher.
+///
+/// The caller supplies the complete validated UART value and fresh output
+/// owner. This function assigns only destination placement and interrupt
+/// identity; it does not reset or otherwise mutate the UART state.
+#[doc(hidden)]
+pub fn register_arm64_boot_restored_serial_mmio(
+    dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    address: crate::memory::GuestAddress,
+    interrupt_line: GuestInterruptLine,
+    serial: SerialMmioDevice<SharedSerialOutput>,
+) -> Result<Arm64BootSerialDevice, Arm64BootResourceError> {
+    let output = serial.output().clone();
+    register_serial_mmio_handler(
+        dispatcher,
+        region_id,
+        address,
+        interrupt_line,
+        output,
+        serial,
+    )
+}
+
 fn register_rtc_mmio(
     dispatcher: &mut MmioDispatcher,
     config: Arm64BootRtcDeviceConfig,
@@ -6398,28 +6423,40 @@ fn register_serial_mmio(
     dispatcher: &mut MmioDispatcher,
     config: Arm64BootSerialDeviceConfig,
 ) -> Result<Arm64BootSerialDevice, Arm64BootResourceError> {
+    let serial = SerialMmioDevice::with_shared_output(config.output.clone());
+    register_serial_mmio_handler(
+        dispatcher,
+        config.region_id,
+        config.address,
+        config.interrupt_line,
+        config.output,
+        serial,
+    )
+}
+
+fn register_serial_mmio_handler(
+    dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    address: crate::memory::GuestAddress,
+    interrupt_line: GuestInterruptLine,
+    output: SharedSerialOutput,
+    serial: SerialMmioDevice<SharedSerialOutput>,
+) -> Result<Arm64BootSerialDevice, Arm64BootResourceError> {
     let region = dispatcher
-        .insert_region(
-            config.region_id,
-            config.address,
-            SERIAL_MMIO_DEVICE_WINDOW_SIZE,
-        )
+        .insert_region(region_id, address, SERIAL_MMIO_DEVICE_WINDOW_SIZE)
         .map_err(|source| Arm64BootResourceError::RegisterSerialMmio {
             source: Box::new(Arm64BootSerialMmioRegistrationError::InsertRegion {
-                region_id: config.region_id,
-                address: config.address,
+                region_id,
+                address,
                 source,
             }),
         })?;
 
     dispatcher
-        .register_handler(
-            config.region_id,
-            SerialMmioDevice::with_shared_output(config.output.clone()),
-        )
+        .register_handler(region_id, serial)
         .map_err(|source| Arm64BootResourceError::RegisterSerialMmio {
             source: Box::new(Arm64BootSerialMmioRegistrationError::RegisterHandler {
-                region_id: config.region_id,
+                region_id,
                 source,
             }),
         })?;
@@ -6429,12 +6466,12 @@ fn register_serial_mmio(
             base: region.range().start().raw_value(),
             size: region.range().size(),
         },
-        interrupt_line: config.interrupt_line,
+        interrupt_line,
     };
 
     Ok(Arm64BootSerialDevice {
         region,
-        output: config.output,
+        output,
         fdt_device,
     })
 }
@@ -11927,6 +11964,44 @@ mod tests {
             error,
             Arm64BootSerialCaptureError::HandlerLookup { .. }
         ));
+    }
+
+    #[test]
+    fn registers_complete_restored_serial_state_without_resetting_it() {
+        let output_buffer = SharedSerialOutputBuffer::default();
+        let output = SharedSerialOutput::new(output_buffer.clone());
+        let mut restored = SerialMmioDevice::with_shared_output(output);
+        restored
+            .inject_receive_bytes(b"restored")
+            .expect("restored receive bytes should inject");
+        let expected = restored
+            .capture_state()
+            .expect("restored serial state should capture");
+        let mut dispatcher = MmioDispatcher::new();
+
+        let device = super::register_arm64_boot_restored_serial_mmio(
+            &mut dispatcher,
+            MmioRegionId::new(9),
+            TEST_SERIAL_MMIO_BASE,
+            line(32),
+            restored,
+        )
+        .expect("restored serial handler should register");
+
+        assert_eq!(device.region.id(), MmioRegionId::new(9));
+        assert_eq!(device.region.range().start(), TEST_SERIAL_MMIO_BASE);
+        assert_eq!(device.fdt_device.interrupt_line, line(32));
+        assert_eq!(
+            capture_serial_state_for_device(&device, &mut dispatcher)
+                .expect("registered restored state should capture"),
+            expected
+        );
+        assert!(
+            output_buffer
+                .bytes()
+                .expect("fresh output should remain readable")
+                .is_empty()
+        );
     }
 
     #[test]

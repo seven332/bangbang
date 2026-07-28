@@ -3577,6 +3577,53 @@ mod tests {
     }
 
     #[test]
+    fn private_native_v2_serial_commit_atomically_publishes_serial_and_storage() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let machine = MachineConfigInput::new(2, 256)
+            .validate()
+            .expect("restored machine fixture should validate");
+        let boot = BootSourceConfigInput::new("/inert/source/kernel")
+            .validate()
+            .expect("inert boot metadata should validate");
+        let drive = drive_input("restored", "/private/restored.img", true)
+            .validate()
+            .expect("restored drive fixture should validate");
+        let serial = SerialConfigInput::new()
+            .with_serial_out_path("serial-grant")
+            .with_rate_limiter(SerialRateLimiterConfig::new(64, Some(8), 1_000))
+            .validate()
+            .expect("restored serial fixture should validate");
+        let commit = SnapshotV2ControllerCommit::with_storage_and_serial_configs(
+            machine,
+            boot.clone(),
+            CaptureReadyStorageConfigs::new(vec![drive.clone()], Vec::new()),
+            serial.clone(),
+            false,
+        );
+
+        assert!(!controller.commit_snapshot_v2_load(commit));
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
+        assert_eq!(controller.drive_configs(), &[drive]);
+        assert!(controller.pmem_configs().is_empty());
+        assert_eq!(controller.serial_config(), &serial);
+
+        let serial_only = SerialConfigInput::new()
+            .with_rate_limiter(SerialRateLimiterConfig::new(32, None, 500))
+            .validate()
+            .expect("serial-only fixture should validate");
+        let commit = SnapshotV2ControllerCommit::with_serial_config(
+            machine,
+            boot,
+            serial_only.clone(),
+            true,
+        );
+        assert!(controller.commit_snapshot_v2_load(commit));
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.pmem_configs().is_empty());
+        assert_eq!(controller.serial_config(), &serial_only);
+    }
+
+    #[test]
     fn controller_native_v1_create_profile_is_fail_closed() {
         let input = snapshot_create_input(SnapshotType::Full);
         let mut supported = supported_snapshot_controller();

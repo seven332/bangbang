@@ -144,6 +144,45 @@ impl SnapshotV2ControllerCommit {
         }
     }
 
+    /// Retains one exact serial configuration without storage.
+    #[doc(hidden)]
+    pub fn with_serial_config(
+        machine_config: MachineConfig,
+        boot_source_config: BootSourceConfig,
+        serial_config: SerialConfig,
+        resume_requested: bool,
+    ) -> Self {
+        Self {
+            machine_config,
+            boot_source_config,
+            drive_configs: DriveConfigs::new(),
+            pmem_configs: PmemConfigs::new(),
+            serial_config,
+            resume_requested,
+        }
+    }
+
+    /// Retains an exact block/pmem projection and serial configuration as one
+    /// atomic destination controller value.
+    #[doc(hidden)]
+    pub fn with_storage_and_serial_configs(
+        machine_config: MachineConfig,
+        boot_source_config: BootSourceConfig,
+        storage_configs: CaptureReadyStorageConfigs,
+        serial_config: SerialConfig,
+        resume_requested: bool,
+    ) -> Self {
+        let (drive_configs, pmem_configs) = storage_configs.into_parts();
+        Self {
+            machine_config,
+            boot_source_config,
+            drive_configs: DriveConfigs::from_validated(drive_configs),
+            pmem_configs: PmemConfigs::from_validated(pmem_configs),
+            serial_config,
+            resume_requested,
+        }
+    }
+
     pub const fn resume_requested(&self) -> bool {
         self.resume_requested
     }
