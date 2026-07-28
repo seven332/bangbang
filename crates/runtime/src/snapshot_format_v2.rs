@@ -7,6 +7,7 @@ use crc64::crc64;
 
 use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_format::{SnapshotArchitecture, SnapshotFormatVersion, SnapshotIntegrity};
+use crate::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
 
 pub(crate) const NATIVE_V2_ARM64_MAGIC: [u8; 8] = *b"BANGV2A\0";
 const MAGIC_OFFSET: usize = 0;
@@ -42,6 +43,10 @@ pub const NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION: SnapshotFormatVersion =
 /// Semantic version emitted by the current native-v2 writer.
 pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 6, 0);
 
+/// Newest compatibility version understood through an explicit internal seam.
+const NATIVE_V2_LATEST_KNOWN_COMPATIBILITY_VERSION: SnapshotFormatVersion =
+    NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
+
 /// Exact native-v2 version of the complete legacy device-free platform profile.
 ///
 /// This identity stays separate from [`NATIVE_V2_SNAPSHOT_VERSION`] so advancing
@@ -61,6 +66,12 @@ const _: () = assert!(
             == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor()
         && NATIVE_V2_SNAPSHOT_VERSION.patch()
             == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.patch()
+);
+const _: () = assert!(
+    NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
+        && NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.minor()
+            == NATIVE_V2_SNAPSHOT_VERSION.minor() + 1
+        && NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.patch() == 0
 );
 
 /// Fixed native-v2 state header size.
@@ -116,6 +127,10 @@ const PRODUCTION_SEMANTIC_COMPONENTS: &[CatalogEntry] = &[
     CatalogEntry {
         id: NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind,
         introduced_minor: 4,
+    },
+    CatalogEntry {
+        id: NATIVE_V2_SERIAL_COMPONENT_KEY.kind,
+        introduced_minor: 7,
     },
 ];
 
@@ -199,6 +214,13 @@ pub const NATIVE_V2_TIME_COMPONENT_KEY: SnapshotV2ComponentKey = SnapshotV2Compo
 /// every later block-bearing native-v2 profile.
 pub const NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY: SnapshotV2ComponentKey =
     SnapshotV2ComponentKey::new(7, 0);
+
+/// Canonical identity of the singleton native-v2 serial state.
+///
+/// This semantic component is introduced by exact 2.7. Product-profile code
+/// requires precisely one instance zero component.
+pub const NATIVE_V2_SERIAL_COMPONENT_KEY: SnapshotV2ComponentKey =
+    SnapshotV2ComponentKey::new(8, 0);
 
 impl fmt::Debug for SnapshotV2ComponentKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -653,7 +675,7 @@ pub fn decode_snapshot_v2_state_with_compatibility_version(
     if !is_known_compatibility_version(supported_version) {
         return Err(SnapshotV2DecodeError::UnsupportedVersion {
             found: supported_version,
-            supported: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_LATEST_KNOWN_COMPATIBILITY_VERSION,
         });
     }
     decode_snapshot_v2_state_with_catalog(
@@ -689,7 +711,7 @@ pub fn encode_snapshot_v2_state_with_compatibility_version(
     if !is_known_compatibility_version(version) {
         return Err(SnapshotV2EncodeError::UnsupportedVersion {
             requested: version,
-            maximum: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            maximum: NATIVE_V2_LATEST_KNOWN_COMPATIBILITY_VERSION,
         });
     }
     encode_snapshot_v2_state_with_catalog_and_reserve(
@@ -703,8 +725,8 @@ pub fn encode_snapshot_v2_state_with_compatibility_version(
 }
 
 fn is_known_compatibility_version(version: SnapshotFormatVersion) -> bool {
-    version.major() == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.major()
-        && version.minor() <= NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor()
+    version.major() == NATIVE_V2_LATEST_KNOWN_COMPATIBILITY_VERSION.major()
+        && version.minor() <= NATIVE_V2_LATEST_KNOWN_COMPATIBILITY_VERSION.minor()
 }
 
 fn decode_snapshot_v2_state_with_catalog<'state>(
