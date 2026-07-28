@@ -1668,6 +1668,15 @@ pub(crate) fn restore_mmio_transport_state_for_device(
     common: &SnapshotV2VirtioState,
     mmio: &SnapshotV2MmioDeviceState,
 ) -> Result<VirtioMmioTransportState, SnapshotV2RootTransportRestoreError> {
+    restore_mmio_transport_state_for_device_with_config_status_gate(device_id, common, mmio, true)
+}
+
+pub(crate) fn restore_mmio_transport_state_for_device_with_config_status_gate(
+    device_id: u32,
+    common: &SnapshotV2VirtioState,
+    mmio: &SnapshotV2MmioDeviceState,
+    requires_device_config_write_status: bool,
+) -> Result<VirtioMmioTransportState, SnapshotV2RootTransportRestoreError> {
     let device = VirtioMmioDeviceRegisters::with_vendor_id_and_config_generation(
         device_id,
         VIRTIO_MMIO_VENDOR_ID,
@@ -1718,7 +1727,7 @@ pub(crate) fn restore_mmio_transport_state_for_device(
         pending_notifications,
         interrupt_status,
         common.is_activated(),
-        true,
+        requires_device_config_write_status,
     ))
 }
 
@@ -2859,7 +2868,7 @@ fn queue_ranges(
     Ok(Some([descriptor, available, used]))
 }
 
-fn range_is_wholly_contained(memory: &GuestMemory, range: GuestMemoryRange) -> bool {
+pub(crate) fn range_is_wholly_contained(memory: &GuestMemory, range: GuestMemoryRange) -> bool {
     memory.regions().iter().any(|region| {
         let region = region.range();
         region.start().raw_value() <= range.start().raw_value()

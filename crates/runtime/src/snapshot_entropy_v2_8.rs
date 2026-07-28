@@ -6,27 +6,35 @@
 //! and scheduler ownership remain destination-local.
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use crate::entropy::{
     EntropyConfig, EntropyRateLimiterConfig, EntropyTokenBucketConfig, VIRTIO_RNG_DEVICE_ID,
-    VIRTIO_RNG_QUEUE_SIZE, VirtioRngDeviceCaptureState, VirtioRngMmioCaptureState,
-    VirtioRngPciCaptureState, VirtioRngRetryCaptureState, VirtioRngTokenBucketCaptureState,
+    VIRTIO_RNG_QUEUE_SIZE, VirtioRngDevice, VirtioRngDeviceCaptureState, VirtioRngMmioCaptureState,
+    VirtioRngPciCaptureState, VirtioRngQueue, VirtioRngRateLimiter,
+    VirtioRngRateLimiterRestoreState, VirtioRngRetryCaptureState, VirtioRngTokenBucketCaptureState,
+    VirtioRngTokenBucketRestoreState,
 };
 use crate::interrupt::GuestInterruptLine;
-use crate::memory::GuestMemoryRange;
+use crate::memory::{GuestMemory, GuestMemoryRange};
 use crate::mmio::MmioRegion;
 use crate::pci::PciSbdf;
 use crate::snapshot_device_v2::{
-    SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport, SnapshotV2VirtioState,
-    capture_mmio_common_for_device_with_config_status_gate, capture_mmio_transport,
-    capture_pci_common_for_device, capture_pci_transport_parts,
+    SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
+    SnapshotV2VirtioState, capture_mmio_common_for_device_with_config_status_gate,
+    capture_mmio_transport, capture_pci_common_for_device, capture_pci_transport_parts,
+    range_is_wholly_contained, restore_mmio_transport_state_for_device_with_config_status_gate,
 };
 use crate::snapshot_device_v2_5::{
     queue_ranges, validate_mmio, validate_pci, validate_virtio_with_queue_size,
 };
 use crate::snapshot_format::SnapshotFormatVersion;
 use crate::storage_capture::StorageDeviceOrigin;
-use crate::virtio_mmio::VIRTIO_MMIO_VERSION_1_FEATURE;
+use crate::virtio::VirtioDeviceType;
+use crate::virtio_mmio::{
+    VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioQueueState, VirtioMmioTransportState,
+};
+use crate::virtio_pci::{VirtioPciIdentity, VirtioPciTransportState};
 
 mod codec;
 
@@ -444,6 +452,417 @@ impl fmt::Debug for SnapshotV2EntropyState {
             .finish()
     }
 }
+
+/// Complete pathless entropy continuation validated against loaded memory.
+///
+/// The plan contains only detached runtime and transport values. It owns no
+/// entropy source, metrics, scheduler, notifier, interrupt route, dispatcher,
+/// PCI endpoint, platform VM, or publication authority.
+pub struct SnapshotV2EntropyRestorePlan {
+    config: EntropyConfig,
+    queue_ranges: Option<[GuestMemoryRange; 3]>,
+    retry: SnapshotV2EntropyRetryState,
+    retry_deadline: Option<Instant>,
+    transport: PreparedSnapshotV2EntropyTransport,
+}
+
+impl SnapshotV2EntropyRestorePlan {
+    /// Validates and reconstructs one decoded entropy continuation at a
+    /// destination-local monotonic-time sample.
+    pub fn prepare(
+        state: SnapshotV2EntropyState,
+        memory: &GuestMemory,
+        now: Instant,
+    ) -> Result<Self, SnapshotV2EntropyRestorePlanError> {
+        validate_entropy_state(&state)
+            .map_err(|_| SnapshotV2EntropyRestorePlanError::InvalidState)?;
+        let (config, active_queue, limiter, retry, pending, virtio, transport) = state.into_parts();
+        let queue_state = *virtio
+            .queues()
+            .first()
+            .ok_or(SnapshotV2EntropyRestorePlanError::InvalidState)?;
+        let queue_ranges = queue_ranges(&queue_state)
+            .map_err(|_| SnapshotV2EntropyRestorePlanError::InvalidState)?;
+        if queue_ranges.is_some_and(|ranges| {
+            ranges
+                .into_iter()
+                .any(|range| !range_is_wholly_contained(memory, range))
+        }) {
+            return Err(SnapshotV2EntropyRestorePlanError::QueueMemory);
+        }
+
+        let active_queue = active_queue
+            .map(|cursor| {
+                let queue = VirtioMmioQueueState::from_parts(
+                    queue_state.max_size(),
+                    queue_state.size(),
+                    queue_state.ready(),
+                    queue_state.descriptor_table(),
+                    queue_state.driver_ring(),
+                    queue_state.device_ring(),
+                );
+                let queue = VirtioRngQueue::from_snapshot_state(
+                    &queue,
+                    cursor.next_available(),
+                    cursor.next_used(),
+                    pending,
+                )
+                .map_err(|_| SnapshotV2EntropyRestorePlanError::QueueContinuation)?;
+                queue
+                    .validate_snapshot_state(memory, pending)
+                    .map_err(|_| SnapshotV2EntropyRestorePlanError::QueueContinuation)?;
+                Ok(queue)
+            })
+            .transpose()?;
+
+        let limiter = restore_limiter_state(config.rate_limiter(), limiter)?;
+        let rate_limiter =
+            VirtioRngRateLimiter::from_persisted_state_at(config.rate_limiter(), limiter, now)
+                .map_err(|_| SnapshotV2EntropyRestorePlanError::RateLimiter)?;
+        let retry_deadline = match retry {
+            SnapshotV2EntropyRetryState::None => None,
+            SnapshotV2EntropyRetryState::Immediate => Some(now),
+            SnapshotV2EntropyRetryState::After { remaining_nanos } => Some(
+                now.checked_add(Duration::from_nanos(remaining_nanos))
+                    .ok_or(SnapshotV2EntropyRestorePlanError::Retry)?,
+            ),
+        };
+        let device = VirtioRngDevice::from_snapshot_parts(active_queue, rate_limiter, pending);
+
+        let transport = match transport {
+            SnapshotV2DeviceTransport::Mmio(mmio) => {
+                let retained = restore_mmio_transport_state_for_device_with_config_status_gate(
+                    VIRTIO_RNG_DEVICE_ID,
+                    &virtio,
+                    &mmio,
+                    false,
+                )
+                .map_err(|_| SnapshotV2EntropyRestorePlanError::MmioTransport)?;
+                PreparedSnapshotV2EntropyTransport::Mmio(Box::new(
+                    PreparedSnapshotV2EntropyMmioTransport {
+                        region: mmio.region(),
+                        interrupt_line: mmio.interrupt_line(),
+                        device,
+                        retained,
+                    },
+                ))
+            }
+            SnapshotV2DeviceTransport::Pci(pci) => {
+                let device_type = VirtioDeviceType::new(VIRTIO_RNG_DEVICE_ID)
+                    .map_err(|_| SnapshotV2EntropyRestorePlanError::DeviceType)?;
+                let identity = VirtioPciIdentity::new(device_type, virtio.available_features())
+                    .with_config_generation(virtio.config_generation());
+                let retained =
+                    VirtioPciTransportState::from_snapshot_v2_parts(identity, &virtio, &pci, false)
+                        .map_err(|_| SnapshotV2EntropyRestorePlanError::PciTransport)?;
+                PreparedSnapshotV2EntropyTransport::Pci(Box::new(
+                    PreparedSnapshotV2EntropyPciTransport {
+                        origin: pci.origin(),
+                        sbdf: pci.sbdf(),
+                        bar_range: pci.bar_range(),
+                        identity,
+                        device,
+                        retained,
+                    },
+                ))
+            }
+        };
+
+        Ok(Self {
+            config,
+            queue_ranges,
+            retry,
+            retry_deadline,
+            transport,
+        })
+    }
+
+    /// Returns the exact public entropy configuration.
+    pub const fn config(&self) -> EntropyConfig {
+        self.config
+    }
+
+    /// Returns the loaded-memory ranges occupied by an active queue.
+    pub const fn queue_ranges(&self) -> Option<[GuestMemoryRange; 3]> {
+        self.queue_ranges
+    }
+
+    /// Returns the retained retry disposition.
+    pub const fn retry(&self) -> SnapshotV2EntropyRetryState {
+        self.retry
+    }
+
+    /// Returns the destination-local retry deadline without scheduling it.
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_deadline
+    }
+
+    /// Returns the selected transport kind.
+    pub const fn transport_kind(&self) -> SnapshotV2DeviceTransportKind {
+        self.transport.kind()
+    }
+
+    /// Returns the checked detached transport.
+    pub const fn transport(&self) -> &PreparedSnapshotV2EntropyTransport {
+        &self.transport
+    }
+
+    /// Consumes the plan into common continuation and detached transport.
+    pub fn into_parts(
+        self,
+    ) -> (
+        EntropyConfig,
+        Option<[GuestMemoryRange; 3]>,
+        SnapshotV2EntropyRetryState,
+        Option<Instant>,
+        PreparedSnapshotV2EntropyTransport,
+    ) {
+        (
+            self.config,
+            self.queue_ranges,
+            self.retry,
+            self.retry_deadline,
+            self.transport,
+        )
+    }
+}
+
+impl fmt::Debug for SnapshotV2EntropyRestorePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotV2EntropyRestorePlan")
+            .field("transport", &self.transport.kind())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// One checked detached MMIO or PCI entropy transport.
+pub enum PreparedSnapshotV2EntropyTransport {
+    /// Value-only virtio-mmio continuation.
+    Mmio(Box<PreparedSnapshotV2EntropyMmioTransport>),
+    /// Value-only virtio-pci continuation.
+    Pci(Box<PreparedSnapshotV2EntropyPciTransport>),
+}
+
+impl PreparedSnapshotV2EntropyTransport {
+    /// Returns the selected transport kind.
+    pub const fn kind(&self) -> SnapshotV2DeviceTransportKind {
+        match self {
+            Self::Mmio(_) => SnapshotV2DeviceTransportKind::Mmio,
+            Self::Pci(_) => SnapshotV2DeviceTransportKind::Pci,
+        }
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2EntropyTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2EntropyTransport")
+            .field("kind", &self.kind())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Checked value-only MMIO entropy continuation.
+pub struct PreparedSnapshotV2EntropyMmioTransport {
+    region: MmioRegion,
+    interrupt_line: GuestInterruptLine,
+    device: VirtioRngDevice,
+    retained: VirtioMmioTransportState,
+}
+
+impl PreparedSnapshotV2EntropyMmioTransport {
+    /// Returns the exact retained MMIO region.
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    /// Returns the exact retained guest interrupt line.
+    pub const fn interrupt_line(&self) -> GuestInterruptLine {
+        self.interrupt_line
+    }
+
+    /// Returns the detached entropy device.
+    pub const fn device(&self) -> &VirtioRngDevice {
+        &self.device
+    }
+
+    /// Returns the detached MMIO register/queue/interrupt state.
+    pub const fn retained(&self) -> &VirtioMmioTransportState {
+        &self.retained
+    }
+
+    /// Consumes the value into placement, device, and retained transport.
+    pub fn into_parts(
+        self,
+    ) -> (
+        MmioRegion,
+        GuestInterruptLine,
+        VirtioRngDevice,
+        VirtioMmioTransportState,
+    ) {
+        (self.region, self.interrupt_line, self.device, self.retained)
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2EntropyMmioTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2EntropyMmioTransport")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Checked value-only PCI entropy continuation.
+pub struct PreparedSnapshotV2EntropyPciTransport {
+    origin: StorageDeviceOrigin,
+    sbdf: PciSbdf,
+    bar_range: GuestMemoryRange,
+    identity: VirtioPciIdentity,
+    device: VirtioRngDevice,
+    retained: VirtioPciTransportState,
+}
+
+impl PreparedSnapshotV2EntropyPciTransport {
+    /// Returns the retained startup/runtime origin.
+    pub const fn origin(&self) -> StorageDeviceOrigin {
+        self.origin
+    }
+
+    /// Returns the exact retained PCI function.
+    pub const fn sbdf(&self) -> PciSbdf {
+        self.sbdf
+    }
+
+    /// Returns the exact retained capability BAR.
+    pub const fn bar_range(&self) -> GuestMemoryRange {
+        self.bar_range
+    }
+
+    /// Returns the fixed entropy PCI identity.
+    pub const fn identity(&self) -> VirtioPciIdentity {
+        self.identity
+    }
+
+    /// Returns the detached entropy device.
+    pub const fn device(&self) -> &VirtioRngDevice {
+        &self.device
+    }
+
+    /// Returns the detached PCI configuration/queue/MSI-X state.
+    pub const fn retained(&self) -> &VirtioPciTransportState {
+        &self.retained
+    }
+
+    /// Consumes the value into placement, identity, device, and retained state.
+    pub fn into_parts(
+        self,
+    ) -> (
+        StorageDeviceOrigin,
+        PciSbdf,
+        GuestMemoryRange,
+        VirtioPciIdentity,
+        VirtioRngDevice,
+        VirtioPciTransportState,
+    ) {
+        (
+            self.origin,
+            self.sbdf,
+            self.bar_range,
+            self.identity,
+            self.device,
+            self.retained,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2EntropyPciTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2EntropyPciTransport")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+fn restore_limiter_state(
+    config: Option<EntropyRateLimiterConfig>,
+    state: SnapshotV2EntropyLimiterState,
+) -> Result<VirtioRngRateLimiterRestoreState, SnapshotV2EntropyRestorePlanError> {
+    Ok(VirtioRngRateLimiterRestoreState::new(
+        restore_bucket_state(
+            config.and_then(EntropyRateLimiterConfig::bandwidth),
+            state.bandwidth(),
+        )?,
+        restore_bucket_state(config.and_then(EntropyRateLimiterConfig::ops), state.ops())?,
+    ))
+}
+
+fn restore_bucket_state(
+    config: Option<EntropyTokenBucketConfig>,
+    state: Option<SnapshotV2EntropyBucketState>,
+) -> Result<Option<VirtioRngTokenBucketRestoreState>, SnapshotV2EntropyRestorePlanError> {
+    match (config, state) {
+        (Some(config), Some(state)) if config.is_enabled() => {
+            Ok(Some(VirtioRngTokenBucketRestoreState::new(
+                config,
+                state.budget(),
+                state.remaining_burst(),
+                state.age_nanos(),
+            )))
+        }
+        (Some(config), None) if !config.is_enabled() => Ok(None),
+        (None, None) => Ok(None),
+        _ => Err(SnapshotV2EntropyRestorePlanError::RateLimiter),
+    }
+}
+
+/// Failure while proving decoded entropy state against destination memory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2EntropyRestorePlanError {
+    /// The decoded typed state no longer satisfies the exact profile.
+    InvalidState,
+    /// A queue range is not wholly contained by loaded guest memory.
+    QueueMemory,
+    /// Queue cursors, rings, or retained pending work are inconsistent.
+    QueueContinuation,
+    /// Token-bucket state cannot be restored at destination time.
+    RateLimiter,
+    /// Relative retry time cannot be represented at the destination sample.
+    Retry,
+    /// The fixed entropy virtio identity cannot be represented.
+    DeviceType,
+    /// Detached MMIO retained state reconstruction failed.
+    MmioTransport,
+    /// Detached PCI retained state reconstruction failed.
+    PciTransport,
+}
+
+impl fmt::Debug for SnapshotV2EntropyRestorePlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2EntropyRestorePlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidState => "native-v2 entropy restore state is invalid",
+            Self::QueueMemory => "native-v2 entropy restore queue memory is invalid",
+            Self::QueueContinuation => "native-v2 entropy restore queue continuation is invalid",
+            Self::RateLimiter => "native-v2 entropy restore limiter state is invalid",
+            Self::Retry => "native-v2 entropy restore retry state is invalid",
+            Self::DeviceType => "native-v2 entropy restore device identity is invalid",
+            Self::MmioTransport => "native-v2 entropy MMIO retained state is invalid",
+            Self::PciTransport => "native-v2 entropy PCI retained state is invalid",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2EntropyRestorePlanError {}
 
 fn capture_entropy_state(
     config: EntropyConfig,

@@ -2,7 +2,7 @@ use super::codec::{self, ReservePolicy};
 use super::*;
 
 use crate::interrupt::GuestInterruptLine;
-use crate::memory::{GuestAddress, GuestMemoryRange};
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::{
     PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO, PCI_SEGMENT_ZERO,
@@ -16,12 +16,13 @@ use crate::snapshot_device_v2::{
 };
 use crate::virtio::{
     VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK,
-    VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT,
+    VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT, VirtioInterruptIntent,
 };
 use crate::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
 use crate::virtio_pci::{
     VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VirtioPciEndpointPhase,
 };
+use crate::virtio_queue::VIRTQUEUE_DESC_F_WRITE;
 
 const HEALTHY_DRIVER_OK: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
     | VIRTIO_DEVICE_STATUS_DRIVER
@@ -29,6 +30,14 @@ const HEALTHY_DRIVER_OK: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
     | VIRTIO_DEVICE_STATUS_DRIVER_OK;
 const INACTIVE_MMIO_FIXTURE_HEX: &str = include_str!("fixtures/inactive-mmio.hex");
 const ACTIVE_PCI_FIXTURE_HEX: &str = include_str!("fixtures/active-pci.hex");
+const RESTORE_MEMORY_SIZE: u64 = 0x20_0000;
+const ACTIVE_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x10_0000);
+const ACTIVE_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x12_0000);
+const ACTIVE_USED_RING: GuestAddress = GuestAddress::new(0x14_0000);
+const ACTIVE_DATA: GuestAddress = GuestAddress::new(0x18_0000);
+const AVAILABLE_INDEX_OFFSET: u64 = 2;
+const AVAILABLE_RING_OFFSET: u64 = 4;
+const USED_INDEX_OFFSET: u64 = 2;
 
 fn inactive_mmio_state() -> SnapshotV2EntropyState {
     let bandwidth = EntropyTokenBucketConfig::new(0, Some(7), 100);
@@ -74,6 +83,107 @@ fn active_pci_state() -> SnapshotV2EntropyState {
         SnapshotV2DeviceTransport::Pci(pci_transport()),
     )
     .expect("active PCI fixture should validate")
+}
+
+fn restore_memory() -> GuestMemory {
+    let layout = GuestMemoryLayout::new(vec![
+        GuestMemoryRange::new(GuestAddress::new(0), RESTORE_MEMORY_SIZE)
+            .expect("restore memory range should validate"),
+    ])
+    .expect("restore memory layout should validate");
+    GuestMemory::allocate(&layout).expect("restore memory should allocate")
+}
+
+fn split_restore_memory() -> GuestMemory {
+    let layout = GuestMemoryLayout::new(vec![
+        GuestMemoryRange::new(GuestAddress::new(0), 0x10_0000)
+            .expect("first restore memory range should validate"),
+        GuestMemoryRange::new(GuestAddress::new(0x10_0000), 0x10_0000)
+            .expect("second restore memory range should validate"),
+    ])
+    .expect("split restore memory layout should validate");
+    GuestMemory::allocate(&layout).expect("split restore memory should allocate")
+}
+
+fn write_pending_queue(
+    memory: &mut GuestMemory,
+    descriptor_table: GuestAddress,
+    artifact_next_available: u16,
+    next_used: u16,
+) {
+    let descriptor = descriptor_table;
+    write_memory_u64(memory, descriptor, ACTIVE_DATA.raw_value());
+    write_memory_u32(
+        memory,
+        descriptor
+            .checked_add(8)
+            .expect("descriptor length address should not overflow"),
+        8,
+    );
+    write_memory_u16(
+        memory,
+        descriptor
+            .checked_add(12)
+            .expect("descriptor flags address should not overflow"),
+        VIRTQUEUE_DESC_F_WRITE,
+    );
+    write_memory_u16(
+        memory,
+        descriptor
+            .checked_add(14)
+            .expect("descriptor next address should not overflow"),
+        0,
+    );
+
+    let runtime_next_available = artifact_next_available.wrapping_sub(1);
+    let ring_index = runtime_next_available % VIRTIO_RNG_QUEUE_SIZE;
+    write_memory_u16(
+        memory,
+        ACTIVE_AVAILABLE_RING
+            .checked_add(AVAILABLE_RING_OFFSET + u64::from(ring_index) * 2)
+            .expect("available entry address should not overflow"),
+        0,
+    );
+    write_memory_u16(
+        memory,
+        ACTIVE_AVAILABLE_RING
+            .checked_add(AVAILABLE_INDEX_OFFSET)
+            .expect("available index address should not overflow"),
+        artifact_next_available,
+    );
+    write_memory_u16(
+        memory,
+        ACTIVE_USED_RING
+            .checked_add(USED_INDEX_OFFSET)
+            .expect("used index address should not overflow"),
+        next_used,
+    );
+}
+
+fn write_memory_u64(memory: &mut GuestMemory, address: GuestAddress, value: u64) {
+    memory
+        .write_slice(&value.to_le_bytes(), address)
+        .expect("u64 should write to restore memory");
+}
+
+fn write_memory_u32(memory: &mut GuestMemory, address: GuestAddress, value: u32) {
+    memory
+        .write_slice(&value.to_le_bytes(), address)
+        .expect("u32 should write to restore memory");
+}
+
+fn write_memory_u16(memory: &mut GuestMemory, address: GuestAddress, value: u16) {
+    memory
+        .write_slice(&value.to_le_bytes(), address)
+        .expect("u16 should write to restore memory");
+}
+
+fn read_restore_queue_memory(memory: &GuestMemory) -> Vec<u8> {
+    let mut bytes = vec![0; 0x60_000];
+    memory
+        .read_slice(&mut bytes, ACTIVE_DESCRIPTOR_TABLE)
+        .expect("restore queue memory should read");
+    bytes
 }
 
 fn inactive_virtio() -> SnapshotV2VirtioState {
@@ -209,6 +319,163 @@ fn inactive_mmio_and_active_pci_round_trip_canonically() {
             encoded
         );
     }
+}
+
+#[test]
+fn inactive_mmio_restore_plan_retains_only_detached_values() {
+    let memory = restore_memory();
+    let now = Instant::now();
+    let plan = SnapshotV2EntropyRestorePlan::prepare(inactive_mmio_state(), &memory, now)
+        .expect("inactive MMIO restore plan should prepare");
+
+    assert_eq!(plan.queue_ranges(), None);
+    assert_eq!(plan.retry(), SnapshotV2EntropyRetryState::None);
+    assert_eq!(plan.retry_deadline(), None);
+    assert_eq!(plan.transport_kind(), SnapshotV2DeviceTransportKind::Mmio);
+    let PreparedSnapshotV2EntropyTransport::Mmio(mmio) = plan.transport() else {
+        panic!("inactive fixture should prepare MMIO transport");
+    };
+    assert_eq!(mmio.region(), mmio_transport().region());
+    assert_eq!(mmio.interrupt_line(), mmio_transport().interrupt_line());
+    assert!(!mmio.device().is_activated());
+    assert!(!mmio.device().has_pending_rate_limited_queue());
+    assert!(!mmio.retained().is_device_activated());
+    assert_eq!(mmio.retained().pending_notifications(), [false]);
+    assert_eq!(mmio.retained().interrupt_status().bits(), 0);
+    assert!(!mmio.retained().requires_device_config_write_status());
+}
+
+#[test]
+fn active_pci_restore_plan_rewinds_pending_cursor_without_writing_memory() {
+    let mut memory = restore_memory();
+    write_pending_queue(&mut memory, ACTIVE_DESCRIPTOR_TABLE, 7, 6);
+    let before = read_restore_queue_memory(&memory);
+    let now = Instant::now();
+    let plan = SnapshotV2EntropyRestorePlan::prepare(active_pci_state(), &memory, now)
+        .expect("active PCI restore plan should prepare");
+
+    assert_eq!(read_restore_queue_memory(&memory), before);
+    assert!(plan.queue_ranges().is_some());
+    assert_eq!(
+        plan.retry(),
+        SnapshotV2EntropyRetryState::try_after(75_000_000).expect("delayed retry should validate")
+    );
+    assert_eq!(
+        plan.retry_deadline(),
+        now.checked_add(Duration::from_millis(75))
+    );
+    assert_eq!(plan.transport_kind(), SnapshotV2DeviceTransportKind::Pci);
+    let debug = format!("{plan:?}");
+    for sentinel in ["1048576", "1179648", "1310720", "25000000", "75000000"] {
+        assert!(!debug.contains(sentinel));
+    }
+    assert!(debug.contains("<redacted>"));
+    let PreparedSnapshotV2EntropyTransport::Pci(pci) = plan.transport() else {
+        panic!("active fixture should prepare PCI transport");
+    };
+    assert_eq!(pci.origin(), StorageDeviceOrigin::Startup);
+    assert_eq!(pci.sbdf(), pci_transport().sbdf());
+    assert_eq!(pci.bar_range(), pci_transport().bar_range());
+    assert!(pci.device().is_activated());
+    assert!(pci.device().has_pending_rate_limited_queue());
+    let queue = pci
+        .device()
+        .active_queue()
+        .expect("restored entropy queue should be active");
+    assert_eq!(queue.available_ring().next_avail(), 6);
+    assert_eq!(queue.used_ring().next_used(), 6);
+    assert!(pci.retained().is_device_activated());
+    assert_eq!(
+        pci.retained()
+            .queue_notifications()
+            .pending_queue_notifications(),
+        [0]
+    );
+    assert_eq!(
+        pci.retained().interrupt_intents(),
+        [
+            VirtioInterruptIntent::Queue { queue_index: 0 },
+            VirtioInterruptIntent::Configuration,
+        ]
+    );
+    assert!(!pci.retained().requires_device_config_write_status());
+}
+
+#[test]
+fn active_mmio_restore_plan_retains_pending_notification_and_interrupts() {
+    let mut state = active_pci_state();
+    state.transport = SnapshotV2DeviceTransport::Mmio(mmio_transport());
+    let mut memory = restore_memory();
+    write_pending_queue(&mut memory, ACTIVE_DESCRIPTOR_TABLE, 7, 6);
+
+    let plan = SnapshotV2EntropyRestorePlan::prepare(state, &memory, Instant::now())
+        .expect("active MMIO restore plan should prepare");
+    let PreparedSnapshotV2EntropyTransport::Mmio(mmio) = plan.transport() else {
+        panic!("active MMIO state should prepare MMIO transport");
+    };
+    assert!(mmio.device().is_activated());
+    assert!(mmio.device().has_pending_rate_limited_queue());
+    assert!(mmio.retained().is_device_activated());
+    assert_eq!(mmio.retained().pending_notifications(), [true]);
+    assert_eq!(mmio.retained().interrupt_status().bits(), 0b11);
+    assert!(!mmio.retained().requires_device_config_write_status());
+}
+
+#[test]
+fn active_restore_plan_accepts_wrapping_pending_cursor() {
+    let mut state = active_pci_state();
+    state.active_queue = Some(
+        SnapshotV2EntropyQueueState::try_new(0, u16::MAX, VIRTIO_RNG_QUEUE_SIZE)
+            .expect("wrapping queue cursors should validate"),
+    );
+    let mut memory = restore_memory();
+    write_pending_queue(&mut memory, ACTIVE_DESCRIPTOR_TABLE, 0, u16::MAX);
+
+    let plan = SnapshotV2EntropyRestorePlan::prepare(state, &memory, Instant::now())
+        .expect("wrapping pending queue should prepare");
+    let PreparedSnapshotV2EntropyTransport::Pci(pci) = plan.transport() else {
+        panic!("active fixture should prepare PCI transport");
+    };
+    let queue = pci
+        .device()
+        .active_queue()
+        .expect("restored entropy queue should be active");
+    assert_eq!(queue.available_ring().next_avail(), u16::MAX);
+    assert_eq!(queue.used_ring().next_used(), u16::MAX);
+}
+
+#[test]
+fn active_restore_plan_maps_immediate_retry_to_destination_sample() {
+    let mut state = active_pci_state();
+    state.retry = SnapshotV2EntropyRetryState::Immediate;
+    let mut memory = restore_memory();
+    write_pending_queue(&mut memory, ACTIVE_DESCRIPTOR_TABLE, 7, 6);
+    let now = Instant::now();
+
+    let plan = SnapshotV2EntropyRestorePlan::prepare(state, &memory, now)
+        .expect("immediate retry should prepare");
+    assert_eq!(plan.retry(), SnapshotV2EntropyRetryState::Immediate);
+    assert_eq!(plan.retry_deadline(), Some(now));
+}
+
+#[test]
+fn restore_plan_rejects_queue_range_split_across_adjacent_regions() {
+    let mut state = active_pci_state();
+    let mut virtio = parts_from_virtio(active_virtio());
+    virtio.queues[0] = SnapshotV2VirtioQueueState::from_parts(
+        VIRTIO_RNG_QUEUE_SIZE,
+        VIRTIO_RNG_QUEUE_SIZE,
+        true,
+        GuestAddress::new(0x0f_f800),
+        ACTIVE_AVAILABLE_RING,
+        ACTIVE_USED_RING,
+    );
+    state.virtio = SnapshotV2VirtioState::from_parts(virtio);
+
+    assert!(matches!(
+        SnapshotV2EntropyRestorePlan::prepare(state, &split_restore_memory(), Instant::now()),
+        Err(SnapshotV2EntropyRestorePlanError::QueueMemory)
+    ));
 }
 
 fn fixture_bytes(hex: &str) -> Vec<u8> {
