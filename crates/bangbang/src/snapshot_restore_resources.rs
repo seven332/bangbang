@@ -5752,6 +5752,34 @@ mod tests {
             _ => panic!("pmem fixture access should be read-only or read-write"),
         };
 
+        let missing_pmem = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[(
+                "block0",
+                ResourceRole::DriveBacking,
+                block_access,
+                block.path(),
+            )]),
+            false,
+        );
+        let missing_error = contained_storage_request(&graph, &block_reference, &pmem_reference)
+            .prepare(Some(missing_pmem.authority()), || false)
+            .expect_err("missing pmem grant must reject the complete contained vector");
+        assert_eq!(
+            missing_error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+        assert_eq!(
+            missing_error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        missing_pmem
+            .grants()
+            .prepare_drive_backing_claim(&block_reference, block_access)
+            .expect("missing-pmem failure should preserve block authority")
+            .expect("block reference should remain contained")
+            .abort()
+            .expect("preserved block authority should restore");
+
         let wrong_access = contained_restore_authority_with_grants_for_test(
             snapshot_storage_grant_authority_for_test(&[
                 (
@@ -5863,7 +5891,7 @@ mod tests {
         );
 
         let diagnostics = format!(
-            "{access_error:?} {length_error:?} {selector_error:?} \
+            "{missing_error:?} {access_error:?} {length_error:?} {selector_error:?} \
              {cancellation_error:?}"
         );
         for private in [
@@ -5877,7 +5905,8 @@ mod tests {
     }
 
     #[test]
-    fn profile_3_storage_batch_rejects_omitted_and_swapped_typed_outputs_with_full_rollback() {
+    fn profile_3_storage_batch_rejects_omitted_extra_and_swapped_typed_outputs_with_full_rollback()
+    {
         let block_path = unique_short_path();
         let pmem_path = unique_pmem_short_path();
         let graph = storage_fixture_graph(&block_path, &pmem_path);
@@ -5921,6 +5950,26 @@ mod tests {
             pmem_access,
         );
 
+        let mut extra = contained_storage_request(&graph, &block_reference, &pmem_reference)
+            .prepare(Some(fixture.authority()), || false)
+            .expect("extra-output fixture should prepare");
+        extra.pmem_count = 2;
+        let extra_error = extra
+            .into_storage_batch()
+            .expect_err("extra typed pmem output count must reject before consumption");
+        assert_eq!(extra_error.stage, SnapshotRestoreResourceStage::Take);
+        assert_eq!(
+            extra_error.disposition,
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+        assert_storage_grants_reusable(
+            &fixture,
+            &block_reference,
+            block_access,
+            &pmem_reference,
+            pmem_access,
+        );
+
         let mut swapped = contained_storage_request(&graph, &block_reference, &pmem_reference)
             .prepare(Some(fixture.authority()), || false)
             .expect("swapped-output fixture should prepare");
@@ -5941,7 +5990,7 @@ mod tests {
             pmem_access,
         );
 
-        let diagnostics = format!("{omitted_error:?} {swapped_error:?}");
+        let diagnostics = format!("{omitted_error:?} {extra_error:?} {swapped_error:?}");
         for private in [
             block.path(),
             pmem.path(),

@@ -312,7 +312,7 @@ mod macos_arm64 {
     const SNAPSHOT_BLOCK_PARTUUID: &str = "1617-CAFE";
     const SNAPSHOT_PMEM_SECTOR_SIZE: usize = 512;
     const SNAPSHOT_PMEM_FILE_BYTES: usize =
-        bangbang_runtime::pmem::VIRTIO_PMEM_ALIGNMENT as usize + 4096;
+        bangbang_runtime::pmem::VIRTIO_PMEM_ALIGNMENT as usize + (16 * 1024);
     const SNAPSHOT_PMEM_MAPPED_BYTES: u64 = 2 * bangbang_runtime::pmem::VIRTIO_PMEM_ALIGNMENT;
     const SNAPSHOT_PMEM_WRITABLE_INITIAL_BYTE: u8 = 0x41;
     const SNAPSHOT_PMEM_WRITABLE_PRE_CAPTURE_BYTE: u8 = 0x42;

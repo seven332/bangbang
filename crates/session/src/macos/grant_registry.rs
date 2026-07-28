@@ -3292,7 +3292,7 @@ mod tests {
     }
 
     #[test]
-    fn receiver_rejects_descriptor_aliases_and_closes_the_whole_batch() {
+    fn receiver_rejects_cross_class_descriptor_aliases_and_closes_the_whole_batch() {
         let session = SessionId::from_bytes([15; 32]);
         let batch = BatchId::from_bytes([16; 16]);
         let file = unlinked_file();
@@ -3345,8 +3345,8 @@ mod tests {
                     batch,
                     2,
                     GrantRecord::Descriptor {
-                        id: GrantId::parse("drive-two").expect("ID should parse"),
-                        role: ResourceRole::DriveBacking,
+                        id: GrantId::parse("pmem-two").expect("ID should parse"),
+                        role: ResourceRole::PmemBacking,
                         access: GrantAccess::ReadOnly,
                         kind: GrantObjectKind::RegularFile,
                         identity,

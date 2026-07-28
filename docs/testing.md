@@ -273,7 +273,7 @@ broker requests, opens, and mappings remain zero, and the exact grant stays
 reusable. Shared endpoint, pmem inventory, PCI function, BAR, MSI-X,
 dispatcher, and metrics checks remain focused lower-layer companions. The
 checked capability-audit test must continue enforcing an exact 40-row storage
-ledger with 38 terminal records and exactly two Wave 6 handoffs.
+ledger with all 40 records terminal.
 
 Runtime network hotplug changes additionally require both
 `macos_arm64::signed_executable_hotplugs_mmds_network_and_reuses_product_pci_slot`
@@ -561,11 +561,12 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
 production catalog admits semantic memory kind 1 introduced in minor 1; the
-current `2.5.0` writer additionally admits machine/global/topology kinds 2–4
+current `2.6.0` writer additionally admits machine/global/topology kinds 2–4
 and per-vCPU kind 5 introduced in minor 2, singleton time kind 6 introduced in
 minor 3, and mandatory singleton device-graph kind 7 introduced in minor 4.
 Exact `2.4.0` retains device-graph profile 1's singleton root, while `2.5.0`
-uses profile 2's bounded ordered block vector. Exact `2.3.0` remains the legacy
+uses profile 2's bounded ordered block vector and `2.6.0` uses profile 3's
+bounded ordered block-and-pmem vector. Exact `2.3.0` remains the legacy
 device-free platform profile. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
 lengths, all three offsets, CRC and every truncation, feature
@@ -578,7 +579,7 @@ resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
 Native-v2 lazy-memory tests retain exact multi-extent binding and complete
-`2.1.0` compatibility fixtures while proving that new output uses `2.5.0`.
+`2.1.0` compatibility fixtures while proving that new output uses `2.6.0`.
 They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
 binding/header/topology/length mutation, exact admitted-version retention,
 typed state profiles,
@@ -656,7 +657,7 @@ The wrapper builds the `bangbang` binary unit-test harness, locates and signs
 that exact test executable, and runs only the ignored private-seam proof. Its
 minimal two-vCPU guest does not touch serial or optional devices beyond the
 required read-only root. The first test starts and pauses the real
-process-owned HVF supervisor, publishes one current 2.5 profile-2 MMIO-root
+process-owned HVF supervisor, publishes one current 2.6 profile-3 MMIO-root
 pair, resumes and repauses the source, publishes a fresh recapture, and drops
 the source. It
 restores the first immutable pair into one fresh normal process initially
@@ -671,7 +672,7 @@ group is part of the default integration set and must run without
 `--allow-unsupported` on supported Apple Silicon. It adds no API, CLI,
 config-file, or environment activation for native-v2.
 
-### Native-v2 2.5 finite transaction failure matrix
+### Native-v2 2.5 compatibility transaction failure matrix
 
 Profile-2 certification treats “every stage” as the following finite public
 transaction boundaries. It does not multiply pre-HVF failures across every
@@ -703,6 +704,31 @@ not accept another load/create even when no final artifact escaped.
 | Aggregate completion and Paused publication | Completion failure after irreversible resource commit destroys the destination and is terminal; successful completion publishes exactly one Paused session/controller. | `profile_2_completion_failure_destroys_destination_and_is_terminal`, `public_native_v2_load_commits_one_paused_session`, `native_v2_resource_adoption_failure_latches_all_process_construction_paths` |
 | Optional resume | Resume occurs only after Paused publication; failure is terminal and the destination never returns to pristine eligibility. | `public_native_v2_load_resumes_only_after_paused_commit`, `native_v2_requested_resume_failure_latches_after_paused_publication` |
 | Public signed continuation and process death | Rooted/rootless MMIO/PCI active I/O, recapture, immutable state/memory, shared writable backings, and exact worker-first/launcher-first cleanup are certified at the real direct and normal bundle boundaries. | `signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci`, `normal_bundle_certifies_native_v2_multi_block_epochs_over_mmio_and_pci` |
+
+### Native-v2 2.6 profile-3 pmem certification matrix
+
+Profile 3 retains the complete profile-2 failure boundary and adds typed pmem
+authority, mapping, and lifecycle terms. These exact anchors form the #1634
+negative/fault ledger:
+
+| Requirement | Exact anchors |
+| --- | --- |
+| Direct/contained complete-set derivation, missing authority, access, length, selector, and cancellation | `profile_3_contained_preflight_rejects_access_length_selector_and_cancellation`, `profile_3_direct_rejects_pmem_geometry_changes_and_cancellation_before_batch` |
+| Extra, omitted, swapped, and cross-class aliased typed outputs | `profile_3_storage_batch_rejects_omitted_extra_and_swapped_typed_outputs_with_full_rollback`, `profile_3_direct_preflight_rejects_cross_class_alias_before_conversion`, `receiver_rejects_cross_class_descriptor_aliases_and_closes_the_whole_batch` |
+| Wrong role/kind and no path fallback | `profile_3_contained_mode_rejects_wrong_pmem_role_atomically_without_path_fallback`, `snapshot_pmem_restore_returns_only_exact_regular_file_authority` |
+| Preparation, construction, controller, completion, cancellation, and exact cleanup | `profile_3_destination_failures_and_drop_preserve_clean_retry`, `profile_3_plan_failure_precedes_backing_access_and_bundle_failure_aborts_completion`, `profile_3_completion_failure_destroys_destination_and_is_terminal`, `profile_3_runtime_cancellation_and_contained_abort_release_all_authority` |
+| Signed owner capture/reconstruction | `capture_ready_storage_traverses_signed_mmio_and_pci_owners` |
+| Direct rooted pmem-only/rootless mixed MMIO/PCI continuation | `signed_executable_certifies_native_v2_storage_epochs_over_mmio_and_pci` |
+| Normal production/App Sandbox exact-grant continuation and death cleanup | `normal_bundle_certifies_native_v2_storage_epochs_over_mmio_and_pci` |
+
+The two signed matrices use writable and read-only pmem backings whose exact
+file length is 2 MiB plus one 16-KiB Apple-Silicon host page. The deterministic
+guest accesses the aligned private tail through `/dev/pmem0` DAX, proving it is
+zero for every fresh mapping while the writable external prefix advances
+across destinations. They also require immutable state/memory, unchanged
+read-only prefixes, limiter/retry and interrupt continuation, graph-stable
+recapture, explicit/automatic resume, exact direct or contained ownership,
+redaction, and staging/session/grant cleanup.
 
 Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
 record, preserve kind-1 bytes exactly, and pin kind 2's exact nested binding,
@@ -1236,7 +1262,8 @@ moves one exact corpus record to #1527-owned
 premature promotion. #1555 subsequently adds direct signed host/guest demand,
 removal-generation, exact entitlement, and full-matrix evidence and promotes
 only that record. #1578 then promotes four public native-v2 process/snapshot
-records. The current overlay is 233/165/3/17.
+records. #1634 promotes the final two pmem storage composites after native-v2
+2.6 profile-3 certification. The current overlay is 235/163/3/17.
 
 Snapshot paging feasibility, its standalone protocol/client, internal
 lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
@@ -1572,7 +1599,7 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
-- exact external snapshot grants creating native-v2 2.5 rooted three-drive
+- exact external snapshot grants creating native-v2 2.6 profile-3 rooted three-drive
   MMIO and PCI pairs into separate output directories, reusing both retained
   directories for a second successful pair, preserving all finals on
   collision, and keeping same-GrantId concurrent source workers in their own
@@ -1580,7 +1607,7 @@ may skip execution. On supported Apple Silicon it proves:
   state/memory/drive File/COW loads per transport then prove exact graph
   reconstruction, explicit and automatic resume, and a root-read-conditional
   guest `SYSTEM_OFF`;
-- a deterministic native-v2 2.5 block certifier running rooted and rootless
+- a deterministic native-v2 2.6 profile-3 block certifier running rooted and rootless
   graphs over MMIO and PCI through the normal launcher/worker boundary. It
   validates all three seeded drives, persists two writable pre-capture epochs,
   rejects audit-drive writes, observes limiter retry metrics, recaptures a
@@ -1589,6 +1616,14 @@ may skip execution. On supported Apple Silicon it proves:
   backings. Representative rootless-MMIO worker-first and launcher-first
   deaths after Paused publication prove exact API socket, session, staging,
   artifact, backing, and replacement cleanup;
+- `normal_bundle_certifies_native_v2_storage_epochs_over_mmio_and_pci`,
+  which extends that protocol to rooted pmem-only and rootless mixed
+  block/pmem cells over MMIO and PCI. It uses exact `PmemBacking` grants after
+  pathname replacement, advances shared writable file prefixes, preserves
+  read-only peers, verifies zero private DAX tails on each fresh mapping,
+  recaptures, resumes explicitly/automatically, and proves staging,
+  descriptor, grant, session, replacement, worker-first, and launcher-first
+  cleanup;
 - a feature-gated root-plus-vsock restore-resource probe that uses the real
   coherent contained-session authority, exact typed take/adopt/commit, reverse
   reservation abort and reuse, and all nine deterministic cancellation points;
@@ -1750,9 +1785,9 @@ punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
 separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
-checks exact `v2.5.0` output for `--snapshot-version`, exact description of
-native-v1, legacy `2.3.0` and `2.4.0`, and current/compatible native-v2
-fixtures, and explicit pinned Firecracker/unknown incompatibility. It also
+checks exact `v2.6.0` output for `--snapshot-version`, exact description of
+native-v1, legacy `2.3.0`, `2.4.0`, and `2.5.0`, and current/compatible
+native-v2 fixtures, and explicit pinned Firecracker/unknown incompatibility. It also
 covers missing, non-regular,
 oversized, malformed, truncated, trailing/inconsistent-length, corrupt,
 unsupported-version, incompatible-architecture, and incompatible-page-size
@@ -1806,7 +1841,7 @@ pausing, proving the source has already followed live MMIO or PCI root I/O.
 The source UART must remain canonical, while its Linux-consumed FDT bytes are
 captured and CRC-bound without being reparsed as trusted post-boot topology.
 Creation through `/snapshot/create` then verifies the real CLI reports
-`v2.5.0`. Fresh signed processes repeatedly load the same immutable pair: one
+`v2.6.0`. Fresh signed processes repeatedly load the same immutable pair: one
 remains paused until public `PATCH /vm`, and one uses `resume_vm: true`. The
 paused destination is also publicly recaptured and its decoded root graph must
 equal the source graph. After resume Linux reads the known root marker through
@@ -1822,7 +1857,7 @@ stdout reader before resume; deterministic guest UART output reaches the
 ordinary `BrokenPipe` terminal path without SIGPIPE killing the process, and
 the API socket is cleaned.
 
-The profile-2 completion case
+The retained block-only profile-3 completion case
 `macos_arm64::signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci`
 runs one deterministic `snapshot-block-init` protocol in four signed cells:
 rooted/rootless × MMIO/PCI. Each cell carries three regular-file drives with
@@ -1845,11 +1880,19 @@ scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
   --exact
 ```
 
-Run just the profile-2 completion matrix with:
+Run just the retained block-only completion matrix with:
 
 ```sh
 scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
   macos_arm64::signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci \
+  --exact
+```
+
+Run the profile-3 pmem certification matrix with:
+
+```sh
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  macos_arm64::signed_executable_certifies_native_v2_storage_epochs_over_mmio_and_pci \
   --exact
 ```
 

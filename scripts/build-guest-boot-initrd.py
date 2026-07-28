@@ -60,7 +60,7 @@ SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE = 0x23
 SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE = 0x24
 SNAPSHOT_BLOCK_AUDIT_BYTE = 0x31
 SNAPSHOT_PMEM_SECTOR_SIZE = 512
-SNAPSHOT_PMEM_FILE_SIZE = (2 * 1024 * 1024) + 4096
+SNAPSHOT_PMEM_FILE_SIZE = (2 * 1024 * 1024) + (16 * 1024)
 SNAPSHOT_PMEM_PRIVATE_TAIL_OFFSET = SNAPSHOT_PMEM_FILE_SIZE + 4096
 SNAPSHOT_PMEM_WRITABLE_INITIAL_BYTE = 0x41
 SNAPSHOT_PMEM_WRITABLE_PRE_CAPTURE_BYTE = 0x42
@@ -113,6 +113,9 @@ AARCH64_COND_MI = 4
 LINUX_MOUNT_FLAG_RDONLY = 1
 LINUX_OPEN_FLAG_RDWR = 2
 LINUX_OPEN_FLAG_WRONLY = 1
+LINUX_MMAP_PROT_READ = 1
+LINUX_MMAP_FLAG_SHARED = 1
+LINUX_GUEST_PAGE_SIZE = 4096
 LINUX_AARCH64_SYSCALL_MOUNT = 40
 LINUX_AARCH64_SYSCALL_IOCTL = 29
 LINUX_AARCH64_SYSCALL_OPENAT = 56
@@ -127,7 +130,9 @@ LINUX_AARCH64_SYSCALL_REBOOT = 142
 LINUX_AARCH64_SYSCALL_SCHED_SETAFFINITY = 122
 LINUX_AARCH64_SYSCALL_SCHED_YIELD = 124
 LINUX_AARCH64_SYSCALL_GETCPU = 168
+LINUX_AARCH64_SYSCALL_MUNMAP = 215
 LINUX_AARCH64_SYSCALL_CLONE = 220
+LINUX_AARCH64_SYSCALL_MMAP = 222
 LINUX_CLONE_VM = 0x100
 LINUX_SIGCHLD = 17
 LINUX_TCSETS = 0x5402
@@ -752,6 +757,50 @@ def emit_snapshot_file_expect_byte_at(
     code.branch_cond("failure", AARCH64_COND_NE)
 
 
+def emit_snapshot_pmem_expect_mapped_byte_at(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    path: str,
+    offset: int,
+    expected: int,
+) -> None:
+    emit_snapshot_block_open(code, addresses, path=path, flags=0)
+    code.emit(
+        b"".join(
+            (
+                movz_64(0, 0),
+                movz_64(1, LINUX_GUEST_PAGE_SIZE),
+                movz_64(2, LINUX_MMAP_PROT_READ),
+                movz_64(3, LINUX_MMAP_FLAG_SHARED),
+                mov_reg_64(4, 19),
+                mov_imm_64(5, offset),
+                movz_64(8, LINUX_AARCH64_SYSCALL_MMAP),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_MI)
+    code.emit(mov_reg_64(21, 0))
+    emit_snapshot_block_close(code)
+    code.emit(ldrb_u32(22, 21))
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 21),
+                movz_64(1, LINUX_GUEST_PAGE_SIZE),
+                movz_64(8, LINUX_AARCH64_SYSCALL_MUNMAP),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(cmp_imm_64(22, expected))
+    code.branch_cond("failure", AARCH64_COND_NE)
+
+
 def emit_snapshot_block_read_byte(
     code: Aarch64CodeBuilder,
     addresses: dict[str, int],
@@ -989,6 +1038,13 @@ def emit_snapshot_pmem_advance(
         path="pmem1",
         offset=0,
         expected=SNAPSHOT_PMEM_READ_ONLY_BYTE,
+    )
+    emit_snapshot_pmem_expect_mapped_byte_at(
+        code,
+        addresses,
+        path="pmem0",
+        offset=SNAPSHOT_PMEM_PRIVATE_TAIL_OFFSET,
+        expected=0,
     )
     emit_snapshot_file_read_byte_at(
         code,
@@ -2899,6 +2955,8 @@ def validate_snapshot_block_init_entry(
         (LINUX_AARCH64_SYSCALL_READ, "read"),
         (LINUX_AARCH64_SYSCALL_WRITE, "write"),
         (LINUX_AARCH64_SYSCALL_FSYNC, "fsync"),
+        (LINUX_AARCH64_SYSCALL_MMAP, "mmap"),
+        (LINUX_AARCH64_SYSCALL_MUNMAP, "munmap"),
         (LINUX_AARCH64_SYSCALL_NANOSLEEP, "nanosleep"),
         (LINUX_AARCH64_SYSCALL_REBOOT, "reboot"),
     ):

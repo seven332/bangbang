@@ -1,15 +1,13 @@
 # Firecracker v1.16.0 storage closure contract
 
 This ledger is the checked closure record for #1471, the final aggregate child
-of #1450 under #1348. It covers exactly 40 directly owned Firecracker v1.16.0
-storage identities. Thirty-eight are `implemented-and-verified`; exactly
-`corpus:pmem` and
-`semantic.storage:pmem-root-mapping-flush-and-state` remain `audit-required`
-for Wave 6 optional-device snapshot serialization and restore.
+of #1450 under #1348, completed by #1634's native-v2 pmem snapshot
+certification under #1534. It covers exactly 40 directly owned Firecracker
+v1.16.0 storage identities, and all 40 are `implemented-and-verified`.
 
 The generated source manifest remains 381 identities, the overlay retains 37
-local semantic identities and 418 total records, and this reconciliation moves
-the global disposition counts from 86/312/3/17 to 114/284/3/17.
+local semantic identities and 418 total records, and the current global
+disposition counts are 235/163/3/17.
 
 ## Evidence keys
 
@@ -20,6 +18,10 @@ row-specific focused evidence:
   `crates/bangbang/tests/executable_hvf_e2e.rs::macos_arm64::signed_executable_certifies_aggregate_storage_semantics_over_product_pci`.
 - **Contained aggregate** —
   `crates/launcher/tests/production_bundle_e2e.rs::normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants`.
+- **Direct snapshot aggregate** —
+  `crates/bangbang/tests/executable_hvf_e2e.rs::macos_arm64::signed_executable_certifies_native_v2_storage_epochs_over_mmio_and_pci`.
+- **Contained snapshot aggregate** —
+  `crates/launcher/tests/production_bundle_e2e.rs::normal_bundle_certifies_native_v2_storage_epochs_over_mmio_and_pci`.
 - **VMM ordering** —
   `crates/bangbang/src/vmm.rs::runtime_pmem_owner_preflight_precedes_grant_claim_mapping_and_config_commit`
   plus the contained vhost zero-request owner-preflight test.
@@ -39,6 +41,13 @@ slot or pmem guest-range reuse, and final configuration. The direct branch then
 proves terminal vhost-backend death and process cleanup. The production branch
 proves exact grant and child authority, pathname-replacement resistance,
 frontend/session/helper cleanup, redaction, and unchanged entitlements.
+
+The native-v2 2.6 profile-3 matrices additionally run rooted pmem-only and
+rootless mixed block/pmem cells over MMIO and PCI. They reuse one immutable
+state/memory pair in fresh destinations and prove exact external writable
+prefix epochs, read-only peer protection, zero private aligned tails on each
+fresh mapping, limiter/retry continuation, recapture, direct or exact
+contained backing authority, and cleanup.
 
 ## Exact 40-record ledger
 
@@ -81,9 +90,9 @@ frontend/session/helper cleanup, redaction, and unchanged entitlements.
 | `corpus:block-io-engine` | implemented and verified | Bounded portable Async executor with generation-safe completion plus Sync default and explicit native-v1 boundary. | Executor/queue/lifecycle tests and signed Sync/Async families; both aggregate modes. |
 | `corpus:block-vhost-user` | implemented and verified | Complete applicable frontend protocol, shared-memory aperture, MMIO/PCI lifecycle, CONFIG, runtime reuse, contained brokerage, death, and snapshot rejection. | Focused protocol/broker tests; Direct aggregate terminal branch; Contained aggregate orderly branch. |
 | `corpus:patch-block` | implemented and verified | Cooperative failure-atomic file/Async refresh, incremental limiter update, and ID-only existing-stream vhost CONFIG refresh. | Focused update/rollback tests; concurrent and paused aggregate phases in both modes. |
-| `corpus:pmem` | audit required | Live API, mapping, root, protection, flush, limiter, capture-ready state, hotplug/reuse, and containment are implemented. | **Wave 6** owns optional-device snapshot serialization/restore against the same external backing plus artifact, migration, portability, and signed restore outcomes. |
+| `corpus:pmem` | implemented and verified | Complete applicable live API, mapping, root, protection, flush, limiter, capture-ready state, hotplug/reuse, containment, and native-v2 2.6 profile-3 serialization/restore. | Focused mapping/authority/fault tests; Direct and Contained aggregates; Direct and Contained snapshot aggregates. |
 | `semantic.storage:block-sync-async-vhost-and-limits` | implemented and verified | Complete applicable block aggregate across Sync, portable Async, vhost, cache/flush, limiting, replacement, shared aperture, PCI lifecycle, failure, and cleanup. | Focused owner/resource tests; Direct aggregate; Contained aggregate. |
-| `semantic.storage:pmem-root-mapping-flush-and-state` | audit required | Live root/mapping/protection/flush/limiter/capture-ready/runtime/cleanup behavior is implemented. | **Wave 6** owns optional-pmem serialization/restore, generalized artifact state, migration/portability, and signed restore evidence. |
+| `semantic.storage:pmem-root-mapping-flush-and-state` | implemented and verified | Exact live and profile-3 root/mapping/protection/flush/limiter/state/runtime/restore/cleanup behavior over MMIO or PCI. | Profile-3 complete-set, alias, cardinality, geometry, cancellation, rollback, completion, and cleanup tests; Direct and Contained snapshot aggregates. |
 
 ## Observable storage contract
 
@@ -135,17 +144,20 @@ frontend/session/helper cleanup, redaction, and unchanged entitlements.
   page-cache/RSS accounting, eviction, same-backing physical-page sharing and
   side channels, and performance must be profiled on the deployed macOS/HVF
   system; Firecracker's Linux numeric observations are not portable promises.
-- Capture-ready traversal retains the live owner and mapping identity but does
-  not serialize optional pmem state. Wave 6 must implement and certify restore
-  with the same external backing before the two retained composites can move.
+- Native-v2 2.6 profile 3 serializes the complete ordered block-and-pmem
+  configuration/runtime/queue/limiter/transport graph and restores it through
+  one keyed complete-set authority transaction. The state and memory artifacts
+  remain immutable across repeated loads; writable external prefixes are
+  deliberately shared, while each aligned private tail starts zero and stays
+  outside the backing file.
 
 ## Explicit exclusions and later owners
 
-This closure claims no native-v1 optional-device persistence, generalized
-migration or portable Firecracker artifacts, bundled/managed vhost backend,
-physical-disk certification, Darwin memfd seals, Linux cgroup or io_uring
-mechanism identity, automatic guest PCI notification, or new entitlement.
-Wave 6 owns exactly the two pmem composite records above. Wave 7 retains
+This closure claims no native-v1 optional-device persistence, snapshot support
+for optional devices other than pmem, generalized migration or portable
+Firecracker artifacts, bundled/managed vhost backend, physical-disk
+certification, Darwin memfd seals, Linux cgroup or io_uring mechanism identity,
+automatic guest PCI notification, or new entitlement. Wave 7 retains
 repository-wide metrics/schema/timing closure, #1351 retains credentialed
 production and vmnet gates, and Wave 8 retains the final cross-capability
 export audit.
