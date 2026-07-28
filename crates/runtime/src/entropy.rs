@@ -2452,12 +2452,16 @@ mod tests {
     use std::error::Error as _;
     use std::time::{Duration, Instant};
 
-    use crate::interrupt::DeviceInterruptKind;
+    use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::memory::{GuestMemoryError, GuestMemoryLayout, GuestMemoryRange};
     use crate::metrics::{EntropyDeviceMetrics, SharedEntropyDeviceMetrics};
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandler,
-        MmioHandlerError, MmioHandlerLookupError, MmioRegionId,
+        MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
+    };
+    use crate::snapshot_entropy_v2_8::{
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, SnapshotV2EntropyRetryState,
+        SnapshotV2EntropyState, SnapshotV2EntropyStateCaptureError,
     };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -2482,6 +2486,7 @@ mod tests {
         VirtioRngMmioHandler, VirtioRngOsEntropySource, VirtioRngQueue, VirtioRngQueueBuildError,
         VirtioRngQueueCaptureError, VirtioRngQueueDispatch, VirtioRngQueueDispatchError,
         VirtioRngRateLimiter, VirtioRngRateLimiterCaptureError, VirtioRngRateLimiterReduction,
+        VirtioRngRetryCaptureState,
     };
 
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
@@ -3791,6 +3796,175 @@ mod tests {
                 source: VirtioRngQueueCaptureError::PendingDescriptorDuplicated
             })
         ));
+    }
+
+    #[test]
+    fn rng_mmio_capture_converts_to_exact_entropy_state_without_mutating_source() {
+        let now = Instant::now();
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        write_descriptor(
+            &mut memory,
+            1,
+            TEST_SECOND_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        queue_head(&mut memory, 1, 1);
+        set_available_index(&mut memory, 2);
+        let rate_limiter = EntropyRateLimiterConfig::new(
+            Some(EntropyTokenBucketConfig::new(4, Some(2), 100)),
+            Some(EntropyTokenBucketConfig::new(1, Some(1), 100)),
+        );
+        let config = EntropyConfig::new().with_rate_limiter(rate_limiter);
+        let mut handler = rng_mmio_handler_with_entropy_config(config, now);
+        configure_rng_mmio_handler_queue(&mut handler, TEST_USED_RING);
+        activate_rng_mmio_handler(&mut handler);
+        notify_rng_queue(&mut handler, 0);
+        handler
+            .dispatch_rng_queue_notifications_at(
+                &mut memory,
+                &mut TestEntropySource::default(),
+                now,
+            )
+            .expect("first request should complete and retain throttled work");
+        let captured = handler
+            .capture_entropy_state_at(config, &memory, now)
+            .expect("throttled entropy device should capture");
+        let region = MmioRegion::new(
+            MmioRegionId::new(77),
+            TEST_MMIO_BASE,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("test entropy MMIO placement should validate");
+        let interrupt_line =
+            GuestInterruptLine::new(32).expect("test entropy interrupt should validate");
+
+        let state = SnapshotV2EntropyState::try_from_mmio_capture(
+            config,
+            VirtioRngRetryCaptureState::After {
+                remaining_nanos: 100_000_000,
+            },
+            region,
+            interrupt_line,
+            &captured,
+        )
+        .expect("live MMIO capture should convert");
+
+        assert_eq!(state.config(), config);
+        assert_eq!(
+            state
+                .active_queue()
+                .map(|queue| (queue.next_available(), queue.next_used())),
+            Some((2, 1))
+        );
+        assert_eq!(
+            state.retry(),
+            SnapshotV2EntropyRetryState::After {
+                remaining_nanos: 100_000_000
+            }
+        );
+        assert!(state.has_pending_work());
+        assert_eq!(
+            state.limiter().bandwidth().map(|bucket| (
+                bucket.budget(),
+                bucket.remaining_burst(),
+                bucket.age_nanos()
+            )),
+            captured.device().rate_limiter().bandwidth().map(|bucket| (
+                bucket.budget(),
+                bucket.one_time_burst(),
+                bucket.age_nanos()
+            ))
+        );
+        assert_eq!(
+            state.limiter().ops().map(|bucket| (
+                bucket.budget(),
+                bucket.remaining_burst(),
+                bucket.age_nanos()
+            )),
+            captured.device().rate_limiter().ops().map(|bucket| (
+                bucket.budget(),
+                bucket.one_time_burst(),
+                bucket.age_nanos()
+            ))
+        );
+        let encoded = state
+            .encode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION)
+            .expect("converted state should encode");
+        assert_eq!(
+            SnapshotV2EntropyState::decode(
+                NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                &encoded,
+            )
+            .expect("converted state should decode"),
+            state
+        );
+        assert_eq!(
+            handler
+                .capture_entropy_state_at(config, &memory, now)
+                .expect("conversion must leave source capture reusable"),
+            captured
+        );
+    }
+
+    #[test]
+    fn rng_mmio_capture_conversion_rejects_external_and_retry_mismatch() {
+        let now = Instant::now();
+        let config = EntropyConfig::new();
+        let handler = rng_mmio_handler_with_entropy_config(config, now);
+        let memory = memory();
+        let captured = handler
+            .capture_entropy_state_at(config, &memory, now)
+            .expect("inactive entropy device should capture");
+        let region = MmioRegion::new(
+            MmioRegionId::new(78),
+            TEST_MMIO_BASE,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("test entropy MMIO placement should validate");
+        let interrupt_line =
+            GuestInterruptLine::new(33).expect("test entropy interrupt should validate");
+        let mismatched = EntropyConfig::new().with_rate_limiter(EntropyRateLimiterConfig::new(
+            Some(EntropyTokenBucketConfig::new(1, None, 100)),
+            None,
+        ));
+
+        assert!(matches!(
+            SnapshotV2EntropyState::try_from_mmio_capture(
+                mismatched,
+                VirtioRngRetryCaptureState::None,
+                region,
+                interrupt_line,
+                &captured,
+            ),
+            Err(SnapshotV2EntropyStateCaptureError::Device)
+        ));
+        assert!(matches!(
+            SnapshotV2EntropyState::try_from_mmio_capture(
+                config,
+                VirtioRngRetryCaptureState::Immediate,
+                region,
+                interrupt_line,
+                &captured,
+            ),
+            Err(SnapshotV2EntropyStateCaptureError::Retry)
+        ));
+        let error = SnapshotV2EntropyState::try_from_mmio_capture(
+            mismatched,
+            VirtioRngRetryCaptureState::None,
+            region,
+            interrupt_line,
+            &captured,
+        )
+        .expect_err("mismatched configuration should fail");
+        assert_eq!(
+            format!("{error:?}"),
+            "native-v2 captured entropy device state is inconsistent"
+        );
+        assert!(!format!("{error:?} {error}").contains("100"));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use bangbang_runtime::rtc::{RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
 use bangbang_runtime::snapshot_device::SnapshotV1PlatformDeviceMetadata;
 use bangbang_runtime::snapshot_device_v2::{
     NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
-    SnapshotV2DeviceGraphDecodeError, SnapshotV2DeviceGraphEncodeError,
+    SnapshotV2DeviceGraphDecodeError, SnapshotV2DeviceGraphEncodeError, SnapshotV2DeviceTransport,
 };
 use bangbang_runtime::snapshot_device_v2_5::{
     NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
@@ -30,14 +30,19 @@ use bangbang_runtime::snapshot_device_v2_6::{
     NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
     SnapshotV2StorageDeviceGraphDecodeError, SnapshotV2StorageDeviceGraphEncodeError,
 };
+use bangbang_runtime::snapshot_entropy_v2_8::{
+    NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, SnapshotV2EntropyState,
+    SnapshotV2EntropyStateEncodeError,
+};
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::{
-    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_GLOBAL_COMPONENT_KEY,
-    NATIVE_V2_LEGACY_PLATFORM_VERSION, NATIVE_V2_MACHINE_COMPONENT_KEY,
-    NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_TIME_COMPONENT_KEY,
-    NATIVE_V2_TOPOLOGY_COMPONENT_KEY, NATIVE_V2_VCPU_COMPONENT_KIND, SnapshotV2Component,
-    SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
-    encode_snapshot_v2_state_with_compatibility_version, native_v2_vcpu_component_key,
+    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_ENTROPY_COMPONENT_KEY,
+    NATIVE_V2_GLOBAL_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
+    NATIVE_V2_MACHINE_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY,
+    NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_TIME_COMPONENT_KEY, NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
+    NATIVE_V2_VCPU_COMPONENT_KIND, SnapshotV2Component, SnapshotV2ComponentDisposition,
+    SnapshotV2EncodeError, SnapshotV2State, encode_snapshot_v2_state_with_compatibility_version,
+    native_v2_vcpu_component_key,
 };
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError, SnapshotV2MemoryStateError,
@@ -1056,6 +1061,144 @@ impl fmt::Debug for HvfSnapshotV2SerialState {
     }
 }
 
+/// Complete internal exact native-v2 2.8 HVF state with optional entropy.
+///
+/// Required serial remains the unchanged exact-2.7 payload and optional
+/// storage remains the unchanged exact-2.6 profile-3 payload.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfSnapshotV2EntropyState {
+    platform: HvfSnapshotV2PlatformState,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+}
+
+impl HvfSnapshotV2EntropyState {
+    /// Constructs one exact-2.8 composition after validating nested versions
+    /// and transport agreement.
+    pub fn try_new(
+        platform: HvfSnapshotV2PlatformState,
+        device_graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        validate_platform(&platform)?;
+        if platform.memory().version() != NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
+            || serial.compatibility_version() != NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+            || device_graph.as_ref().is_some_and(|graph| {
+                graph.compatibility_version()
+                    != NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+            })
+            || entropy.as_ref().is_some_and(|state| {
+                state.compatibility_version() != NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
+            })
+            || !platform.machine().fdt().is_product_process_profile()
+        {
+            return Err(HvfSnapshotV2BuildError::Version);
+        }
+        validate_entropy_product_placement(device_graph.as_ref(), entropy.as_ref())?;
+        Ok(Self {
+            platform,
+            device_graph,
+            serial,
+            entropy,
+        })
+    }
+
+    /// Returns the complete exact-2.8 platform state.
+    pub const fn platform(&self) -> &HvfSnapshotV2PlatformState {
+        &self.platform
+    }
+
+    /// Returns the optional unchanged profile-3 storage graph.
+    pub const fn device_graph(&self) -> Option<&SnapshotV2StorageDeviceGraph> {
+        self.device_graph.as_ref()
+    }
+
+    /// Returns the required unchanged exact-2.7 serial state.
+    pub const fn serial(&self) -> &SnapshotV2SerialState {
+        &self.serial
+    }
+
+    /// Returns the optional exact-2.8 entropy state.
+    pub const fn entropy(&self) -> Option<&SnapshotV2EntropyState> {
+        self.entropy.as_ref()
+    }
+
+    /// Consumes the composition without discarding any owned state.
+    pub fn into_parts(
+        self,
+    ) -> (
+        HvfSnapshotV2PlatformState,
+        Option<SnapshotV2StorageDeviceGraph>,
+        SnapshotV2SerialState,
+        Option<SnapshotV2EntropyState>,
+    ) {
+        (self.platform, self.device_graph, self.serial, self.entropy)
+    }
+}
+
+fn validate_entropy_product_placement(
+    device_graph: Option<&SnapshotV2StorageDeviceGraph>,
+    entropy: Option<&SnapshotV2EntropyState>,
+) -> Result<(), HvfSnapshotV2BuildError> {
+    let (Some(device_graph), Some(entropy)) = (device_graph, entropy) else {
+        return Ok(());
+    };
+    if device_graph.transport_kind() != entropy.transport().kind() {
+        return Err(HvfSnapshotV2BuildError::CrossComponent);
+    }
+
+    for record in device_graph.block_records() {
+        validate_entropy_transport_pair(record.transport(), entropy.transport())?;
+    }
+    for record in device_graph.pmem_records() {
+        validate_entropy_transport_pair(record.transport(), entropy.transport())?;
+        let entropy_placement = match entropy.transport() {
+            SnapshotV2DeviceTransport::Mmio(state) => state.region().range(),
+            SnapshotV2DeviceTransport::Pci(state) => state.bar_range(),
+        };
+        if record.pmem().guest_range().overlaps(entropy_placement) {
+            return Err(HvfSnapshotV2BuildError::CrossComponent);
+        }
+    }
+    Ok(())
+}
+
+fn validate_entropy_transport_pair(
+    storage: &SnapshotV2DeviceTransport,
+    entropy: &SnapshotV2DeviceTransport,
+) -> Result<(), HvfSnapshotV2BuildError> {
+    let conflicts = match (storage, entropy) {
+        (SnapshotV2DeviceTransport::Mmio(storage), SnapshotV2DeviceTransport::Mmio(entropy)) => {
+            storage.region().id() == entropy.region().id()
+                || storage.interrupt_line() == entropy.interrupt_line()
+                || storage.region().range().overlaps(entropy.region().range())
+        }
+        (SnapshotV2DeviceTransport::Pci(storage), SnapshotV2DeviceTransport::Pci(entropy)) => {
+            storage.sbdf() == entropy.sbdf() || storage.bar_range().overlaps(entropy.bar_range())
+        }
+        _ => true,
+    };
+    if conflicts {
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    } else {
+        Ok(())
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2EntropyState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2EntropyState")
+            .field("vcpu_count", &self.platform.vcpus.len())
+            .field("has_storage", &self.device_graph.is_some())
+            .field("has_entropy", &self.entropy.is_some())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
 /// Value-free rejection while constructing a native-v2 platform graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvfSnapshotV2BuildError {
@@ -1083,7 +1226,7 @@ pub enum HvfSnapshotV2BuildError {
     Optional,
     /// Time or clone-identity state is locally invalid.
     Time,
-    /// Outer, memory, device-graph, or serial versions disagree.
+    /// Outer, memory, device-graph, serial, or entropy versions disagree.
     Version,
     /// Two otherwise valid components disagree.
     CrossComponent,
@@ -1178,6 +1321,8 @@ fn validate_platform(state: &HvfSnapshotV2PlatformState) -> Result<(), HvfSnapsh
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
             if state.machine.fdt.is_product_process_profile() => {}
         NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+            if state.machine.fdt.is_product_process_profile() => {}
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
             if state.machine.fdt.is_product_process_profile() => {}
         _ => return Err(HvfSnapshotV2BuildError::Version),
     }
@@ -1610,6 +1755,8 @@ pub enum HvfSnapshotV2EncodeError {
     StorageDeviceGraph(SnapshotV2StorageDeviceGraphEncodeError),
     /// Exact-2.7 serial component encoding failed.
     SerialState(SnapshotV2SerialStateEncodeError),
+    /// Exact-2.8 entropy component encoding failed.
+    EntropyState(SnapshotV2EntropyStateEncodeError),
     /// Nested mandatory-vCPU encoding failed.
     Mandatory(HvfSnapshotV1EncodeError),
     /// A bounded component allocation failed.
@@ -1639,6 +1786,7 @@ impl fmt::Display for HvfSnapshotV2EncodeError {
                 f.write_str("native-v2 storage device graph encoding failed")
             }
             Self::SerialState(_) => f.write_str("native-v2 serial state encoding failed"),
+            Self::EntropyState(_) => f.write_str("native-v2 entropy state encoding failed"),
             Self::Mandatory(_) => f.write_str("native-v2 mandatory vCPU state encoding failed"),
             Self::Allocation(_) => f.write_str("native-v2 HVF component allocation failed"),
             Self::LengthOverflow => {
@@ -1658,6 +1806,7 @@ impl std::error::Error for HvfSnapshotV2EncodeError {
             Self::MultiBlockDeviceGraph(source) => Some(source),
             Self::StorageDeviceGraph(source) => Some(source),
             Self::SerialState(source) => Some(source),
+            Self::EntropyState(source) => Some(source),
             Self::Mandatory(source) => Some(source),
             Self::Allocation(source) => Some(source),
             Self::Container(source) => Some(source),
@@ -1770,7 +1919,7 @@ impl std::error::Error for HvfSnapshotV2DecodeError {
 pub fn encode_hvf_snapshot_v2_platform_state(
     state: &HvfSnapshotV2PlatformState,
 ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
-    encode_hvf_snapshot_v2_components(state, NATIVE_V2_LEGACY_PLATFORM_VERSION, None, None)
+    encode_hvf_snapshot_v2_components(state, NATIVE_V2_LEGACY_PLATFORM_VERSION, None, None, None)
 }
 
 /// Encode one complete exact native-v2 2.4 HVF state with its device graph.
@@ -1781,6 +1930,7 @@ pub fn encode_hvf_snapshot_v2_state(
         state.platform(),
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         Some(HvfSnapshotV2DeviceGraphRef::V2_4(state.device_graph())),
+        None,
         None,
     )
 }
@@ -1794,6 +1944,7 @@ pub fn encode_hvf_snapshot_v2_multi_block_state(
         NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         Some(HvfSnapshotV2DeviceGraphRef::V2_5(state.device_graph())),
         None,
+        None,
     )
 }
 
@@ -1805,6 +1956,7 @@ pub fn encode_hvf_snapshot_v2_storage_state(
         state.platform(),
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         Some(HvfSnapshotV2DeviceGraphRef::V2_6(state.device_graph())),
+        None,
         None,
     )
 }
@@ -1818,6 +1970,20 @@ pub fn encode_hvf_snapshot_v2_serial_state(
         NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
         state.device_graph().map(HvfSnapshotV2DeviceGraphRef::V2_6),
         Some(state.serial()),
+        None,
+    )
+}
+
+/// Encodes one complete internal exact native-v2 2.8 entropy composition.
+pub fn encode_hvf_snapshot_v2_entropy_state(
+    state: &HvfSnapshotV2EntropyState,
+) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+    encode_hvf_snapshot_v2_components(
+        state.platform(),
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+        state.device_graph().map(HvfSnapshotV2DeviceGraphRef::V2_6),
+        Some(state.serial()),
+        state.entropy(),
     )
 }
 
@@ -1857,20 +2023,28 @@ fn encode_hvf_snapshot_v2_components(
     version: SnapshotFormatVersion,
     device_graph: Option<HvfSnapshotV2DeviceGraphRef<'_>>,
     serial: Option<&SnapshotV2SerialState>,
+    entropy: Option<&SnapshotV2EntropyState>,
 ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
     validate_platform(state).map_err(HvfSnapshotV2EncodeError::Build)?;
-    match (device_graph, serial) {
-        (device_graph, Some(serial))
-            if version == NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
-                && serial.compatibility_version() == version
+    match (device_graph, serial, entropy) {
+        (device_graph, Some(serial), entropy)
+            if matches!(
+                (version, entropy),
+                (NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, None)
+                    | (NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, _)
+            ) && serial.compatibility_version()
+                == NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
                 && device_graph.is_none_or(|graph| {
                     graph.version() == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
                 })
+                && entropy.is_none_or(|state| {
+                    state.compatibility_version() == NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
+                })
                 && state.machine().fdt().is_product_process_profile() => {}
-        (Some(graph), None)
+        (Some(graph), None, None)
             if graph.version() == version && state.machine().fdt().is_product_process_profile() => {
         }
-        (None, None)
+        (None, None, None)
             if version == NATIVE_V2_LEGACY_PLATFORM_VERSION
                 && !state.machine().fdt().is_product_process_profile() => {}
         _ => {
@@ -1903,14 +2077,19 @@ fn encode_hvf_snapshot_v2_components(
         .map(HvfSnapshotV2DeviceGraphRef::encode)
         .transpose()?;
     let serial = serial
-        .map(|serial| serial.encode(version))
+        .map(|serial| serial.encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION))
         .transpose()
         .map_err(HvfSnapshotV2EncodeError::SerialState)?;
+    let entropy = entropy
+        .map(|entropy| entropy.encode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION))
+        .transpose()
+        .map_err(HvfSnapshotV2EncodeError::EntropyState)?;
 
     let component_count = 5_usize
         .checked_add(vcpu_payloads.len())
         .and_then(|count| count.checked_add(usize::from(device_graph.is_some())))
         .and_then(|count| count.checked_add(usize::from(serial.is_some())))
+        .and_then(|count| count.checked_add(usize::from(entropy.is_some())))
         .ok_or(HvfSnapshotV2EncodeError::LengthOverflow)?;
     let mut components = Vec::new();
     components
@@ -1954,6 +2133,13 @@ fn encode_hvf_snapshot_v2_components(
             NATIVE_V2_SERIAL_COMPONENT_KEY,
             SnapshotV2ComponentDisposition::Semantic,
             serial,
+        ));
+    }
+    if let Some(entropy) = entropy.as_deref() {
+        components.push(SnapshotV2Component::new(
+            NATIVE_V2_ENTROPY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            entropy,
         ));
     }
     encode_snapshot_v2_state_with_compatibility_version(version, &[], &components)

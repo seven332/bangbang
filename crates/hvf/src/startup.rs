@@ -122,6 +122,10 @@ use bangbang_runtime::snapshot_device_v2_6::{
     SnapshotV2StorageDeviceGraph, SnapshotV2StorageMmioTransportError,
     SnapshotV2StoragePciTransportError,
 };
+use bangbang_runtime::snapshot_entropy_v2_8::{
+    NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, SnapshotV2EntropyState,
+    SnapshotV2EntropyStateCaptureError,
+};
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
 use bangbang_runtime::snapshot_memory_v2::{
@@ -6306,6 +6310,36 @@ impl HvfArm64BootEntropyCaptureState {
     pub const fn transport(&self) -> &HvfArm64BootEntropyTransportState {
         &self.transport
     }
+
+    /// Converts the detached capture into canonical exact-2.8 entropy state.
+    pub fn try_to_snapshot_v2(
+        &self,
+    ) -> Result<SnapshotV2EntropyState, SnapshotV2EntropyStateCaptureError> {
+        match &self.transport {
+            HvfArm64BootEntropyTransportState::Mmio {
+                region,
+                interrupt_line,
+                state,
+            } => SnapshotV2EntropyState::try_from_mmio_capture(
+                self.config,
+                self.retry,
+                *region,
+                *interrupt_line,
+                state,
+            ),
+            HvfArm64BootEntropyTransportState::Pci {
+                sbdf,
+                bar_range,
+                state,
+            } => SnapshotV2EntropyState::try_from_pci_capture(
+                self.config,
+                self.retry,
+                *sbdf,
+                *bar_range,
+                state,
+            ),
+        }
+    }
 }
 
 impl fmt::Debug for HvfArm64BootEntropyCaptureState {
@@ -11260,6 +11294,33 @@ impl HvfArm64BootSession<'_> {
             input,
             memory_writer,
             NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+            is_cancelled,
+        )
+    }
+
+    /// Captures the unpublished exact native-v2 2.8 entropy platform.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_entropy_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel(
+            input,
+            memory_writer,
+            NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
             is_cancelled,
         )
     }
@@ -18434,6 +18495,33 @@ impl OwnedHvfArm64BootSession {
             input,
             memory_writer,
             NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+            is_cancelled,
+        )
+    }
+
+    /// Captures the unpublished exact native-v2 2.8 entropy platform.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_entropy_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: &self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel(
+            input,
+            memory_writer,
+            NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
             is_cancelled,
         )
     }
