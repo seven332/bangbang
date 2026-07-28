@@ -24,6 +24,8 @@ pub mod host_network;
 mod periodic_metrics;
 #[cfg(target_os = "macos")]
 mod snapshot_restore_resources;
+#[cfg(target_os = "macos")]
+mod snapshot_serial_restore;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
