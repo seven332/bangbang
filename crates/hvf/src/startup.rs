@@ -6620,17 +6620,37 @@ impl CaptureReadySharedStorageRetryAttribution {
         &mut self,
         pending: bool,
     ) -> Result<StorageRetryState, HvfArm64BootStorageCaptureError> {
-        if !pending {
-            return Ok(StorageRetryState::None);
-        }
-        if self.shared == StorageRetryState::None {
+        self.account_pending_owner(pending)?;
+        Ok(if pending {
+            self.shared
+        } else {
+            StorageRetryState::None
+        })
+    }
+
+    fn account_endpoint_retry(
+        &mut self,
+        retry: StorageRetryState,
+    ) -> Result<(), HvfArm64BootStorageCaptureError> {
+        // PCI retains the exact endpoint-local retry in the artifact, while
+        // the shared scheduler retains only the aggregate wakeup. Their
+        // independently materialized durations can differ, so family
+        // consistency depends on retry ownership rather than exact duration.
+        self.account_pending_owner(retry != StorageRetryState::None)
+    }
+
+    fn account_pending_owner(
+        &mut self,
+        pending: bool,
+    ) -> Result<(), HvfArm64BootStorageCaptureError> {
+        if pending && self.shared == StorageRetryState::None {
             return Err(HvfArm64BootStorageCaptureError::new(
                 HvfArm64BootStorageCaptureErrorKind::RetryState,
                 false,
             ));
         }
-        self.has_pending_owner = true;
-        Ok(self.shared)
+        self.has_pending_owner |= pending;
+        Ok(())
     }
 
     fn finish(self) -> Result<(), HvfArm64BootStorageCaptureError> {
@@ -8644,10 +8664,9 @@ fn capture_ready_storage_transaction_at_with_cancel(
                         false,
                     ));
                 }
-                CaptureReadyBlockOwner::Pci {
-                    index,
-                    retry: storage_retry_state_at(device.retry_deadline, now)?,
-                }
+                let retry = storage_retry_state_at(device.retry_deadline, now)?;
+                block_retry_attribution.account_endpoint_retry(retry)?;
+                CaptureReadyBlockOwner::Pci { index, retry }
             }
             _ => {
                 return Err(HvfArm64BootStorageCaptureError::new(
@@ -8710,10 +8729,9 @@ fn capture_ready_storage_transaction_at_with_cancel(
                         false,
                     ));
                 }
-                CaptureReadyPmemOwner::Pci {
-                    index,
-                    retry: storage_retry_state_at(device.retry_deadline, now)?,
-                }
+                let retry = storage_retry_state_at(device.retry_deadline, now)?;
+                pmem_retry_attribution.account_endpoint_retry(retry)?;
+                CaptureReadyPmemOwner::Pci { index, retry }
             }
             _ => {
                 return Err(HvfArm64BootStorageCaptureError::new(
@@ -26968,6 +26986,36 @@ mod tests {
         let error = missing_owner
             .finish()
             .expect_err("scheduler retry without a pending owner must fail");
+        assert_eq!(
+            error.kind(),
+            HvfArm64BootStorageCaptureErrorKind::RetryState
+        );
+        assert!(!error.terminal());
+    }
+
+    #[test]
+    fn shared_storage_retry_attribution_accounts_endpoint_local_pci_retries() {
+        let shared = StorageRetryState::After {
+            remaining_nanos: 100,
+        };
+        let mut attribution = CaptureReadySharedStorageRetryAttribution::new(shared);
+        attribution
+            .account_endpoint_retry(StorageRetryState::None)
+            .expect("idle PCI peer should not own the shared scheduler");
+        attribution
+            .account_endpoint_retry(StorageRetryState::After {
+                remaining_nanos: 75,
+            })
+            .expect("pending PCI endpoint should account for the shared scheduler");
+        attribution
+            .finish()
+            .expect("endpoint-local retry should satisfy family ownership");
+
+        let mut missing_scheduler =
+            CaptureReadySharedStorageRetryAttribution::new(StorageRetryState::None);
+        let error = missing_scheduler
+            .account_endpoint_retry(StorageRetryState::Immediate)
+            .expect_err("PCI endpoint retry without a family scheduler must fail");
         assert_eq!(
             error.kind(),
             HvfArm64BootStorageCaptureErrorKind::RetryState
