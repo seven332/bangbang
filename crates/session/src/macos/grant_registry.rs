@@ -11,7 +11,9 @@ use std::path::Path;
 
 use crate::macos::bookmark::{BookmarkError, ScopedBookmark};
 use crate::macos::grant_transport::ReceivedGrant;
-use crate::macos::{normalized_block_status_flags, peer_identity};
+use crate::macos::{
+    normalized_block_status_flags, normalized_regular_file_status_flags, peer_identity,
+};
 use crate::{
     BatchId, BlockDeviceGrant, ConnectedUnixPeer, GrantAccess, GrantId, GrantObjectKind,
     GrantRecord, MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES, MAX_GRANT_RECORDS, MAX_GRANTS,
@@ -1753,14 +1755,18 @@ fn validate_descriptor(
         || !access_matches(status_flags, access)
         || (kind == GrantObjectKind::BlockDevice && status_flags & libc::O_APPEND != 0)
         || expected_status_flags.is_some_and(|expected| {
-            let actual = if kind == GrantObjectKind::BlockDevice {
-                normalized_block_status_flags(status_flags)
-            } else if kind == GrantObjectKind::ConnectedUnixStream {
-                u32::try_from(status_flags & (libc::O_ACCMODE | libc::O_NONBLOCK)).ok()
-            } else {
-                u32::try_from(status_flags).ok()
+            let normalize = |flags: libc::c_int| {
+                if kind == GrantObjectKind::RegularFile {
+                    normalized_regular_file_status_flags(flags)
+                } else if kind == GrantObjectKind::BlockDevice {
+                    normalized_block_status_flags(flags)
+                } else if kind == GrantObjectKind::ConnectedUnixStream {
+                    u32::try_from(flags & (libc::O_ACCMODE | libc::O_NONBLOCK)).ok()
+                } else {
+                    u32::try_from(flags).ok()
+                }
             };
-            actual != Some(expected)
+            normalize(status_flags) != libc::c_int::try_from(expected).ok().and_then(normalize)
         })
     {
         return Err(GrantRegistryError);

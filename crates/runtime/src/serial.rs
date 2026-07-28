@@ -6,7 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -704,6 +704,160 @@ fn serial_token_bucket(config: SerialRateLimiterConfig) -> Option<TokenBucket> {
 
 pub struct SerialOutputFile {
     file: File,
+}
+
+/// Supported direct destination class for one restored serial output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotSerialOutputKind {
+    /// One append-only host regular file.
+    RegularFile,
+    /// One nonblocking host named pipe.
+    Fifo,
+}
+
+/// Descriptor-derived identity of one reserved serial output destination.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotSerialOutputIdentity {
+    device: u64,
+    inode: u64,
+    kind: SnapshotSerialOutputKind,
+}
+
+impl SnapshotSerialOutputIdentity {
+    /// Returns the containing device identity.
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    /// Returns the inode identity.
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+
+    /// Returns the admitted endpoint class.
+    pub const fn kind(self) -> SnapshotSerialOutputKind {
+        self.kind
+    }
+}
+
+impl fmt::Debug for SnapshotSerialOutputIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotSerialOutputIdentity")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Value-free failure while reserving one direct serial restore output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotSerialOutputError {
+    /// The destination could not be opened.
+    Open,
+    /// Descriptor metadata could not be read.
+    ReadMetadata,
+    /// The destination is neither a regular file nor a FIFO.
+    UnsupportedKind,
+    /// Descriptor access, status, lifetime, or identity changed.
+    InvalidDescriptor,
+}
+
+impl fmt::Display for SnapshotSerialOutputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Open => "failed to open snapshot serial output",
+            Self::ReadMetadata => "failed to inspect snapshot serial output",
+            Self::UnsupportedKind => "snapshot serial output has an unsupported kind",
+            Self::InvalidDescriptor => "snapshot serial output descriptor is invalid",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotSerialOutputError {}
+
+/// Fresh direct serial destination awaiting complete-set validation.
+///
+/// The path is resolved only by [`Self::open`]. Adoption revalidates the same
+/// owned descriptor and never resolves the path again.
+pub struct SnapshotSerialOutputReservation {
+    file: File,
+    identity: SnapshotSerialOutputIdentity,
+}
+
+impl SnapshotSerialOutputReservation {
+    /// Opens one fresh regular-file or FIFO serial destination.
+    pub fn open(path: &Path) -> Result<Self, SnapshotSerialOutputError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|_| SnapshotSerialOutputError::Open)?;
+        let identity = inspect_snapshot_serial_output(&file)?;
+        Ok(Self { file, identity })
+    }
+
+    /// Returns the descriptor-derived pre-adoption observation.
+    pub const fn identity(&self) -> SnapshotSerialOutputIdentity {
+        self.identity
+    }
+
+    /// Revalidates and adopts the reserved descriptor.
+    pub fn into_output(
+        self,
+    ) -> Result<(SerialOutputFile, SnapshotSerialOutputIdentity), SnapshotSerialOutputError> {
+        let identity = inspect_snapshot_serial_output(&self.file)?;
+        if identity != self.identity {
+            return Err(SnapshotSerialOutputError::InvalidDescriptor);
+        }
+        Ok((SerialOutputFile { file: self.file }, identity))
+    }
+}
+
+impl fmt::Debug for SnapshotSerialOutputReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotSerialOutputReservation")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+fn inspect_snapshot_serial_output(
+    file: &File,
+) -> Result<SnapshotSerialOutputIdentity, SnapshotSerialOutputError> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| SnapshotSerialOutputError::ReadMetadata)?;
+    let kind = if metadata.file_type().is_file() {
+        SnapshotSerialOutputKind::RegularFile
+    } else if metadata.file_type().is_fifo() {
+        SnapshotSerialOutputKind::Fifo
+    } else {
+        return Err(SnapshotSerialOutputError::UnsupportedKind);
+    };
+
+    let descriptor = file.as_raw_fd();
+    // SAFETY: `descriptor` is borrowed from the live owned `File`.
+    let status = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    // SAFETY: `descriptor` is borrowed from the live owned `File`.
+    let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    let required_status = libc::O_APPEND | libc::O_NONBLOCK;
+    if status < 0
+        || descriptor_flags < 0
+        || status & libc::O_ACCMODE != libc::O_RDWR
+        || status & required_status != required_status
+        || descriptor_flags & libc::FD_CLOEXEC == 0
+    {
+        return Err(SnapshotSerialOutputError::InvalidDescriptor);
+    }
+
+    Ok(SnapshotSerialOutputIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        kind,
+    })
 }
 
 impl fmt::Debug for SerialOutputFile {
@@ -2244,9 +2398,12 @@ fn has_control_character(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::ffi::CString;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read as _, Write as _};
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2270,7 +2427,8 @@ mod tests {
         SerialMmioDevice, SerialMmioError, SerialMmioLegacyStateError, SerialMmioState,
         SerialOutput, SerialOutputBuffer, SerialOutputError, SerialOutputFile, SerialOutputMetrics,
         SerialRateLimiterConfig, SerialStdio, SharedSerialOutput, SharedSerialOutputBuffer,
-        SharedSerialOutputMetrics,
+        SharedSerialOutputMetrics, SnapshotSerialOutputError, SnapshotSerialOutputKind,
+        SnapshotSerialOutputReservation,
     };
     use crate::memory::GuestAddress;
     use crate::mmio::{
@@ -3673,6 +3831,91 @@ mod tests {
             b"seedab"
         );
         fs::remove_file(path).expect("serial output should clean up");
+    }
+
+    #[test]
+    fn snapshot_serial_output_reservation_pins_replaced_regular_file() {
+        let path = unique_serial_output_path("snapshot-regular");
+        let replacement = unique_serial_output_path("snapshot-replacement");
+        fs::write(&path, b"original").expect("original fixture should write");
+        let mut original = File::open(&path).expect("original observer should open");
+        let reservation =
+            SnapshotSerialOutputReservation::open(&path).expect("regular file should reserve");
+        assert_eq!(
+            reservation.identity().kind(),
+            SnapshotSerialOutputKind::RegularFile
+        );
+        assert!(!format!("{reservation:?}").contains(path.to_string_lossy().as_ref()));
+
+        fs::write(&replacement, b"replacement").expect("replacement fixture should write");
+        fs::rename(&replacement, &path).expect("destination path should replace");
+        let (mut output, adopted) = reservation
+            .into_output()
+            .expect("reserved descriptor should adopt");
+        assert_eq!(adopted.kind(), SnapshotSerialOutputKind::RegularFile);
+        output
+            .write_byte(b'!')
+            .expect("pinned original descriptor should write");
+
+        let mut original_bytes = Vec::new();
+        original
+            .read_to_end(&mut original_bytes)
+            .expect("original descriptor should read");
+        assert_eq!(original_bytes, b"original!");
+        assert_eq!(
+            fs::read(&path).expect("replacement path should read"),
+            b"replacement"
+        );
+        fs::remove_file(path).expect("replacement fixture should clean up");
+    }
+
+    #[test]
+    fn snapshot_serial_output_reservation_supports_nonblocking_fifo() {
+        let path = unique_serial_output_path("snapshot-fifo");
+        let path_bytes =
+            CString::new(path.as_os_str().as_bytes()).expect("fixture path should be C-compatible");
+        // SAFETY: `path_bytes` is a live NUL-terminated path and the mode is
+        // bounded to ordinary user read/write permissions.
+        assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
+        let reservation =
+            SnapshotSerialOutputReservation::open(&path).expect("FIFO should reserve");
+        assert_eq!(
+            reservation.identity().kind(),
+            SnapshotSerialOutputKind::Fifo
+        );
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .expect("FIFO reader should open");
+        let (mut output, adopted) = reservation
+            .into_output()
+            .expect("FIFO descriptor should adopt");
+        assert_eq!(adopted.kind(), SnapshotSerialOutputKind::Fifo);
+        output.write_byte(b'f').expect("FIFO byte should write");
+        let mut byte = [0_u8; 1];
+        reader
+            .read_exact(&mut byte)
+            .expect("FIFO byte should become readable");
+        assert_eq!(byte, [b'f']);
+        fs::remove_file(path).expect("FIFO fixture should clean up");
+    }
+
+    #[test]
+    fn snapshot_serial_output_reservation_rejects_symlink_without_path_echo() {
+        let target = unique_serial_output_path("snapshot-target");
+        let link = unique_serial_output_path("snapshot-link");
+        fs::write(&target, b"target").expect("target fixture should write");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink fixture should create");
+
+        let error =
+            SnapshotSerialOutputReservation::open(&link).expect_err("symlink output should reject");
+        assert_eq!(error, SnapshotSerialOutputError::Open);
+        assert!(!error.to_string().contains(link.to_string_lossy().as_ref()));
+        assert!(!format!("{error:?}").contains(link.to_string_lossy().as_ref()));
+
+        fs::remove_file(link).expect("symlink fixture should clean up");
+        fs::remove_file(target).expect("target fixture should clean up");
     }
 
     #[test]

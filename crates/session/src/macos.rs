@@ -21,6 +21,21 @@ pub fn normalized_block_status_flags(flags: libc::c_int) -> Option<u32> {
     u32::try_from(flags & (libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK)).ok()
 }
 
+/// Canonicalizes mutable security-relevant regular-file descriptor status.
+///
+/// Darwin may expose private bookkeeping bits after `F_SETFL`. Path-resolution
+/// and creation flags no longer affect an authenticated live descriptor, while
+/// access, append, nonblocking, asynchronous-notification, and synchronous-I/O
+/// state remain meaningful to its consumer.
+#[must_use]
+pub fn normalized_regular_file_status_flags(flags: libc::c_int) -> Option<u32> {
+    u32::try_from(
+        flags
+            & (libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK | libc::O_ASYNC | libc::O_SYNC),
+    )
+    .ok()
+}
+
 /// Kernel-authenticated identity of a connected local-socket peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerIdentity {
@@ -153,6 +168,24 @@ mod tests {
         assert_eq!(
             normalized_block_status_flags(flags),
             u32::try_from(libc::O_RDWR | libc::O_NONBLOCK).ok()
+        );
+    }
+
+    #[test]
+    fn regular_file_status_normalization_keeps_only_mutable_consumer_state() {
+        let flags = libc::O_WRONLY
+            | libc::O_APPEND
+            | libc::O_NONBLOCK
+            | libc::O_ASYNC
+            | libc::O_SYNC
+            | libc::O_NOFOLLOW
+            | 0x0001_0000;
+        assert_eq!(
+            normalized_regular_file_status_flags(flags),
+            u32::try_from(
+                libc::O_WRONLY | libc::O_APPEND | libc::O_NONBLOCK | libc::O_ASYNC | libc::O_SYNC
+            )
+            .ok()
         );
     }
 }

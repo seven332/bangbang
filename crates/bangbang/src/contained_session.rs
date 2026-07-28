@@ -338,7 +338,9 @@ mod platform {
         VhostUserBrokerError, VhostUserBrokerMessage, receive_vhost_user_broker_message,
         send_vhost_user_broker_message,
     };
-    use bangbang_session::macos::{set_cloexec, verify_peer, verify_peer_pid};
+    use bangbang_session::macos::{
+        normalized_regular_file_status_flags, set_cloexec, verify_peer, verify_peer_pid,
+    };
     use bangbang_session::{
         BLOCK_CONTROL_BROKER_FD, BlockDeviceGrant, Frame, FrameDecoder, GRANT_FD, GrantAccess,
         GrantId, GrantObjectKind, Message, ObjectIdentity, Readiness, ResourceRole,
@@ -534,6 +536,21 @@ mod platform {
                 .field("state", &"<redacted>")
                 .finish()
         }
+    }
+
+    const fn valid_snapshot_restore_file_request(
+        role: ResourceRole,
+        access: GrantAccess,
+        kind: GrantObjectKind,
+    ) -> bool {
+        matches!(kind, GrantObjectKind::RegularFile)
+            && matches!(
+                (role, access),
+                (
+                    ResourceRole::DriveBacking | ResourceRole::PmemBacking,
+                    GrantAccess::ReadOnly | GrantAccess::ReadWrite
+                ) | (ResourceRole::SerialSink, GrantAccess::WriteOnly)
+            )
     }
 
     impl ContainedSnapshotRestoreError {
@@ -847,7 +864,11 @@ mod platform {
         duplicate: Option<File>,
     }
 
-    /// One exact drive grant reserved for a failure-atomic runtime transaction.
+    /// One exact snapshot file grant reserved for a failure-atomic runtime
+    /// transaction.
+    ///
+    /// The historical drive-oriented name remains private compatibility for
+    /// existing block/pmem callers; serial restore uses the generic alias.
     pub(crate) struct PreparedDriveBackingClaim {
         registry: Arc<Mutex<Option<FileGrantRegistry>>>,
         block_control: Option<BlockControlBrokerAuthority>,
@@ -859,6 +880,7 @@ mod platform {
     }
 
     pub(crate) type PreparedSnapshotBackingClaim = PreparedDriveBackingClaim;
+    pub(crate) type PreparedSnapshotFileClaim = PreparedDriveBackingClaim;
 
     impl std::fmt::Debug for PreparedFileGrantClaim {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -928,6 +950,9 @@ mod platform {
             }
             let mut registry = self.registry.lock().map_err(|_| GrantClaimError)?;
             let registry = registry.as_mut().ok_or(GrantClaimError)?;
+            if self.role == ResourceRole::SerialSink {
+                restore_serial_sink_status(self.original.as_ref().ok_or(GrantClaimError)?)?;
+            }
             let original = self.original.take().ok_or(GrantClaimError)?;
             match self.role {
                 ResourceRole::DriveBacking => {
@@ -936,6 +961,7 @@ mod platform {
                 ResourceRole::PmemBacking => {
                     registry.restore_pmem_backing(self.id.clone(), original)
                 }
+                ResourceRole::SerialSink => registry.restore_file(self.id.clone(), original),
                 _ => Err(bangbang_session::macos::grant_registry::GrantRegistryError),
             }
             .map_err(|_| GrantClaimError)
@@ -957,15 +983,23 @@ mod platform {
             role: ResourceRole,
             is_read_only: bool,
         ) -> Result<(File, Option<ExactRegularFileGrantObservation>), GrantClaimError> {
-            let duplicate = self.duplicate.take().ok_or(GrantClaimError)?;
-            let expected_access = if is_read_only {
+            let access = if is_read_only {
                 GrantAccess::ReadOnly
             } else {
                 GrantAccess::ReadWrite
             };
+            self.take_snapshot_file_for_access(role, access)
+        }
+
+        fn take_snapshot_file_for_access(
+            &mut self,
+            role: ResourceRole,
+            access: GrantAccess,
+        ) -> Result<(File, Option<ExactRegularFileGrantObservation>), GrantClaimError> {
+            let duplicate = self.duplicate.take().ok_or(GrantClaimError)?;
             if self.role != role
                 || duplicate.role() != role
-                || duplicate.access() != expected_access
+                || duplicate.access() != access
                 || duplicate.kind() != GrantObjectKind::RegularFile
                 || duplicate.block_device().is_some()
             {
@@ -1006,6 +1040,17 @@ mod platform {
                 return Err(GrantClaimError);
             }
             self.take_snapshot_file_for_role(role, is_read_only)
+        }
+
+        pub(crate) fn take_snapshot_serial_sink_for_reference(
+            &mut self,
+            reference: &Path,
+        ) -> Result<File, GrantClaimError> {
+            if grant_reference_id(reference)?.as_ref() != Some(&self.id) {
+                return Err(GrantClaimError);
+            }
+            self.take_snapshot_file_for_access(ResourceRole::SerialSink, GrantAccess::WriteOnly)
+                .map(|(file, _)| file)
         }
 
         pub(crate) fn take_backing(
@@ -1071,6 +1116,11 @@ mod platform {
             let Some(registry) = registry.as_mut() else {
                 return;
             };
+            if self.role == ResourceRole::SerialSink
+                && restore_serial_sink_status(&original).is_err()
+            {
+                return;
+            }
             let _ = match self.role {
                 ResourceRole::DriveBacking => {
                     registry.restore_drive_backing(self.id.clone(), original)
@@ -1078,8 +1128,30 @@ mod platform {
                 ResourceRole::PmemBacking => {
                     registry.restore_pmem_backing(self.id.clone(), original)
                 }
+                ResourceRole::SerialSink => registry.restore_file(self.id.clone(), original),
                 _ => Err(bangbang_session::macos::grant_registry::GrantRegistryError),
             };
+        }
+    }
+
+    fn restore_serial_sink_status(original: &GrantedFile) -> Result<(), GrantClaimError> {
+        let expected = original.status_flags();
+        let expected = libc::c_int::try_from(expected).map_err(|_| GrantClaimError)?;
+        // SAFETY: the descriptor is borrowed from the retained original grant;
+        // F_SETFL changes only mutable status flags on its open file
+        // description.
+        if unsafe { libc::fcntl(original.as_raw_fd(), libc::F_SETFL, expected) } < 0 {
+            return Err(GrantClaimError);
+        }
+        // SAFETY: the same retained original descriptor remains live.
+        let observed = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFL) };
+        if observed < 0
+            || normalized_regular_file_status_flags(observed)
+                != normalized_regular_file_status_flags(expected)
+        {
+            Err(GrantClaimError)
+        } else {
+            Ok(())
         }
     }
 
@@ -1322,9 +1394,7 @@ mod platform {
             mut buffers: SnapshotRestoreDriveClaimBuffers,
         ) -> Result<Vec<PreparedDriveBackingClaim>, ContainedSnapshotRestoreError> {
             if requests.iter().any(|(_, role, access, kind)| {
-                !matches!(role, ResourceRole::DriveBacking | ResourceRole::PmemBacking)
-                    || !matches!(access, GrantAccess::ReadOnly | GrantAccess::ReadWrite)
-                    || *kind != GrantObjectKind::RegularFile
+                !valid_snapshot_restore_file_request(*role, *access, *kind)
             }) || buffers.observations.len() != requests.len()
             {
                 return Err(ContainedSnapshotRestoreError::new(
@@ -1372,6 +1442,7 @@ mod platform {
                             ResourceRole::PmemBacking => {
                                 registry.restore_pmem_backing(id.clone(), original)
                             }
+                            ResourceRole::SerialSink => registry.restore_file(id.clone(), original),
                             _ => Err(bangbang_session::macos::grant_registry::GrantRegistryError),
                         }
                         .is_err();
@@ -2401,11 +2472,11 @@ mod platform {
                         )
                     })?;
                 if !matches!(
-                    file.access(),
-                    GrantAccess::ReadOnly | GrantAccess::ReadWrite
-                ) || !matches!(
-                    file.role(),
-                    ResourceRole::DriveBacking | ResourceRole::PmemBacking
+                    (file.role(), file.access()),
+                    (
+                        ResourceRole::DriveBacking | ResourceRole::PmemBacking,
+                        GrantAccess::ReadOnly | GrantAccess::ReadWrite
+                    ) | (ResourceRole::SerialSink, GrantAccess::WriteOnly)
                 ) {
                     return Err(ContainedSnapshotRestoreError::new(
                         ContainedSnapshotRestoreErrorKind::InvalidRequest,
@@ -4301,6 +4372,10 @@ mod platform {
                 self.authority.generations.invalidate();
             }
 
+            pub(crate) fn invalidate_grants(&self) {
+                self.grants.invalidate();
+            }
+
             pub(crate) fn invalidate_broker(&self) {
                 self.broker.invalidate();
             }
@@ -5083,6 +5158,7 @@ mod platform {
                     options.read(true).write(true);
                 }
             }
+            options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW);
             let file = options.open(path).expect("grant fixture should open");
             let descriptor: OwnedFd = file.into();
             let mut stat = MaybeUninit::<libc::stat>::uninit();
@@ -6784,9 +6860,9 @@ pub(crate) use platform::{
 pub(crate) use platform::{
     ClaimedVhostUserSocket, ContainedSnapshotRestoreAuthority, ContainedSnapshotRestoreError,
     ContainedSnapshotRestoreFileRequest, ContainedSnapshotRestoreTransaction,
-    PreparedSnapshotBackingClaim, PreparedSocketBrokerEndpoint, PreparedVhostUserSocketClaim,
-    SnapshotStagingRecordTracker, SocketBrokerAuthority, SocketBrokerEndpoint,
-    VhostUserBrokerAuthority,
+    PreparedSnapshotBackingClaim, PreparedSnapshotFileClaim, PreparedSocketBrokerEndpoint,
+    PreparedVhostUserSocketClaim, SnapshotStagingRecordTracker, SocketBrokerAuthority,
+    SocketBrokerEndpoint, VhostUserBrokerAuthority,
 };
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use platform::{

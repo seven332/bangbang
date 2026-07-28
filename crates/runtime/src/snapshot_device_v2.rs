@@ -135,6 +135,7 @@ const PCI_QUEUE_VECTOR_BYTES: usize = 2;
 
 const DEVICE_KIND_BLOCK: u32 = 1;
 const DEVICE_KIND_PMEM: u32 = 2;
+const DEVICE_KIND_SERIAL: u32 = 3;
 const DEVICE_INSTANCE_ROOT: u32 = 0;
 const SECTION_KIND_CONFIG: u16 = 1;
 const SECTION_KIND_BLOCK: u16 = 2;
@@ -190,6 +191,13 @@ impl SnapshotV2DeviceKey {
         Self {
             kind: DEVICE_KIND_PMEM,
             instance,
+        }
+    }
+
+    pub(crate) const fn serial() -> Self {
+        Self {
+            kind: DEVICE_KIND_SERIAL,
+            instance: 0,
         }
     }
 
