@@ -128,6 +128,7 @@ use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
     write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
 };
+use bangbang_runtime::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
 use bangbang_runtime::startup::{
     ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonNotificationDispatch,
     Arm64BootBalloonNotificationDispatchError, Arm64BootBalloonNotificationDispatches,
@@ -9652,6 +9653,27 @@ struct HvfArm64BootSnapshotV2CaptureOwner<'a, 'vm> {
     gic: HvfGicMetadata,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HvfArm64BootSnapshotV2PlatformProfile {
+    Legacy,
+    ProductProcess,
+}
+
+fn hvf_arm64_boot_snapshot_v2_platform_profile(
+    version: SnapshotFormatVersion,
+) -> Option<HvfArm64BootSnapshotV2PlatformProfile> {
+    match version {
+        NATIVE_V2_LEGACY_PLATFORM_VERSION => Some(HvfArm64BootSnapshotV2PlatformProfile::Legacy),
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        | NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        | NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        | NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION => {
+            Some(HvfArm64BootSnapshotV2PlatformProfile::ProductProcess)
+        }
+        _ => None,
+    }
+}
+
 impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
     fn capture(
         self,
@@ -9682,12 +9704,8 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
         version: SnapshotFormatVersion,
         is_cancelled: impl FnMut(SnapshotV2MemoryIoStage) -> bool,
     ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
-        debug_assert!(
-            version == NATIVE_V2_LEGACY_PLATFORM_VERSION
-                || version == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
-                || version == NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
-                || version == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
-        );
+        let profile = hvf_arm64_boot_snapshot_v2_platform_profile(version);
+        debug_assert!(profile.is_some());
         let (stable, captures, pvtime_capture) =
             self.runner
                 .capture_arm64_snapshot_v2_topology()
@@ -9719,10 +9737,7 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
             .read_slice(&mut fdt_bytes, fdt_write.address)
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::FdtRead { source })?;
         let fdt_checksum = crc64(0, &fdt_bytes);
-        let fdt = if version == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
-            || version == NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
-            || version == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
-        {
+        let fdt = if profile == Some(HvfArm64BootSnapshotV2PlatformProfile::ProductProcess) {
             HvfSnapshotV2FdtState::try_new_product_process_profile(
                 fdt_write.address,
                 fdt_write.size,
@@ -11102,6 +11117,33 @@ impl HvfArm64BootSession<'_> {
             input,
             memory_writer,
             NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            is_cancelled,
+        )
+    }
+
+    /// Captures the unpublished exact native-v2 2.7 serial platform.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_serial_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel(
+            input,
+            memory_writer,
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
             is_cancelled,
         )
     }
@@ -17911,6 +17953,33 @@ impl OwnedHvfArm64BootSession {
             input,
             memory_writer,
             NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            is_cancelled,
+        )
+    }
+
+    /// Captures the unpublished exact native-v2 2.7 serial platform.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_serial_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: &self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel(
+            input,
+            memory_writer,
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
             is_cancelled,
         )
     }
@@ -37460,6 +37529,39 @@ mod tests {
             assert!(!diagnostics.contains("secret-pci"));
             assert!(!diagnostics.contains("secret-platform"));
         }
+    }
+
+    #[test]
+    fn native_v2_platform_capture_classifies_exact_serial_profile_as_product_process() {
+        use super::{
+            HvfArm64BootSnapshotV2PlatformProfile, hvf_arm64_boot_snapshot_v2_platform_profile,
+        };
+        use bangbang_runtime::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+        use bangbang_runtime::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+        use bangbang_runtime::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+        use bangbang_runtime::snapshot_format::NATIVE_V1_SNAPSHOT_VERSION;
+        use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
+        use bangbang_runtime::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
+
+        assert_eq!(
+            hvf_arm64_boot_snapshot_v2_platform_profile(NATIVE_V2_LEGACY_PLATFORM_VERSION),
+            Some(HvfArm64BootSnapshotV2PlatformProfile::Legacy)
+        );
+        for version in [
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        ] {
+            assert_eq!(
+                hvf_arm64_boot_snapshot_v2_platform_profile(version),
+                Some(HvfArm64BootSnapshotV2PlatformProfile::ProductProcess)
+            );
+        }
+        assert_eq!(
+            hvf_arm64_boot_snapshot_v2_platform_profile(NATIVE_V1_SNAPSHOT_VERSION),
+            None
+        );
     }
 
     #[test]

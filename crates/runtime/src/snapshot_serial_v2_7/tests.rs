@@ -2,10 +2,10 @@ use super::codec::{self, ReservePolicy};
 use super::*;
 
 use crate::serial::{
-    SERIAL_INTERRUPT_IDENTIFICATION_NO_INTERRUPT_PENDING,
+    CaptureReadySerialState, SERIAL_INTERRUPT_IDENTIFICATION_NO_INTERRUPT_PENDING,
     SERIAL_INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE, SERIAL_LINE_STATUS_DATA_READY,
-    SERIAL_LINE_STATUS_DEFAULT, SERIAL_LINE_STATUS_OVERRUN_ERROR, SerialMmioCaptureStateParts,
-    SerialMmioState,
+    SERIAL_LINE_STATUS_DEFAULT, SERIAL_LINE_STATUS_OVERRUN_ERROR, SerialConfig, SerialConfigInput,
+    SerialMmioCaptureStateParts, SerialMmioState,
 };
 
 const DEFAULT_HEX: &str = include_str!("fixtures/default.hex");
@@ -94,6 +94,15 @@ fn decode_hex(value: &str) -> Vec<u8> {
 
 fn encode_hex(value: &[u8]) -> String {
     value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn configured_capture(device: SerialMmioCaptureState) -> CaptureReadySerialState {
+    let config = SerialConfigInput::new()
+        .with_serial_out_path("serial-log")
+        .with_rate_limiter(SerialRateLimiterConfig::new(1024, Some(128), 1000))
+        .validate()
+        .expect("configured capture input should validate");
+    CaptureReadySerialState::new(config, device)
 }
 
 fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -423,6 +432,102 @@ impl ReservePolicy for FailingReserve {
         self.reserve_or_fail()?;
         value.try_reserve_exact(additional)
     }
+}
+
+impl CaptureReservePolicy for FailingReserve {
+    fn reserve_string(
+        &mut self,
+        value: &mut String,
+        additional: usize,
+    ) -> Result<(), TryReserveError> {
+        self.reserve_or_fail()?;
+        value.try_reserve_exact(additional)
+    }
+}
+
+#[test]
+fn capture_ready_conversion_preserves_endpoint_limiter_and_complete_uart() {
+    let default = default_state();
+    let default_captured =
+        CaptureReadySerialState::new(SerialConfig::default(), default.device().clone());
+    assert_eq!(
+        SnapshotV2SerialState::try_from_capture_ready(default_captured)
+            .expect("default capture should convert"),
+        default
+    );
+
+    let configured = configured_state();
+    let configured_captured = configured_capture(configured.device().clone());
+    let converted = SnapshotV2SerialState::try_from_capture_ready(configured_captured)
+        .expect("configured capture should convert");
+    assert_eq!(converted, configured);
+    assert!(converted.device().receive_interrupt_intent_pending());
+    assert!(!converted.device().input_ready_intent_pending());
+    assert_eq!(converted.device().receive_bytes(), b"abc");
+}
+
+#[test]
+fn capture_resource_preflight_accounts_for_the_future_configured_sink() {
+    let configured = SerialConfigInput::new()
+        .with_serial_out_path("serial-log")
+        .validate()
+        .expect("configured input should validate");
+
+    SnapshotV2SerialState::preflight_capture(
+        &SerialConfig::default(),
+        MAX_SNAPSHOT_RESTORE_RESOURCES,
+    )
+    .expect("default serial should consume no restore resource");
+    assert!(matches!(
+        SnapshotV2SerialState::preflight_capture(
+            &SerialConfig::default(),
+            MAX_SNAPSHOT_RESTORE_RESOURCES + 1,
+        ),
+        Err(SnapshotV2SerialStateCaptureError::RestoreResourceCapacity)
+    ));
+    SnapshotV2SerialState::preflight_capture(&configured, MAX_SNAPSHOT_RESTORE_RESOURCES - 1)
+        .expect("configured serial plus 63 storage resources should fit");
+    assert!(matches!(
+        SnapshotV2SerialState::preflight_capture(&configured, MAX_SNAPSHOT_RESTORE_RESOURCES,),
+        Err(SnapshotV2SerialStateCaptureError::RestoreResourceCapacity)
+    ));
+
+    let oversized = SerialConfigInput::new()
+        .with_serial_out_path("x".repeat(NATIVE_V2_SERIAL_STATE_MAX_SELECTOR_BYTES + 1))
+        .validate()
+        .expect("live configuration has no snapshot-specific byte bound");
+    assert!(matches!(
+        SnapshotV2SerialState::preflight_capture(&oversized, 0),
+        Err(SnapshotV2SerialStateCaptureError::InvalidEndpointIntent)
+    ));
+}
+
+#[test]
+fn capture_selector_allocation_is_fallible_and_redacted() {
+    let configured = configured_state();
+    assert!(matches!(
+        SnapshotV2SerialState::try_from_capture_ready_with_policy(
+            configured_capture(configured.device().clone()),
+            &mut FailingReserve::new(0),
+        ),
+        Err(SnapshotV2SerialStateCaptureError::Allocation(_))
+    ));
+
+    let error =
+        SnapshotV2SerialState::preflight_capture(
+            &SerialConfigInput::new()
+                .with_serial_out_path("sensitive-selector".repeat(
+                    NATIVE_V2_SERIAL_STATE_MAX_SELECTOR_BYTES / "sensitive-selector".len() + 1,
+                ))
+                .validate()
+                .expect("live configuration should validate"),
+            0,
+        )
+        .expect_err("oversized selector should fail preflight");
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    assert!(!display.contains("sensitive-selector"));
+    assert!(!debug.contains("sensitive-selector"));
 }
 
 #[test]
