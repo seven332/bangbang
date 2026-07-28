@@ -994,19 +994,8 @@ fn internal_exact_minor_seven_serial_only_mmio_and_pci_states_round_trip() {
         let original = complete_serial_state_fixture(graph_hex, serial_hex);
         let encoded = encode_hvf_snapshot_v2_serial_state(&original)
             .expect("complete minor-seven serial state should encode");
-        assert!(matches!(
-            decode_snapshot_v2_state(&encoded),
-            Err(SnapshotV2DecodeError::UnsupportedVersion {
-                found,
-                supported,
-            }) if found == NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
-                && supported == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
-        ));
-        let structural = decode_snapshot_v2_state_with_compatibility_version(
-            &encoded,
-            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
-        )
-        .expect("minor-seven serial state should decode structurally");
+        let structural =
+            decode_snapshot_v2_state(&encoded).expect("current minor-seven state should decode");
         assert_eq!(
             structural.metadata().version(),
             NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION

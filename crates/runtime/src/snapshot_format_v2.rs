@@ -41,7 +41,7 @@ pub const NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION: SnapshotFormatVersion =
     SnapshotFormatVersion::new(2, 0, 0);
 
 /// Semantic version emitted by the current native-v2 writer.
-pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 6, 0);
+pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 7, 0);
 
 /// Newest compatibility version understood through an explicit internal seam.
 const NATIVE_V2_LATEST_KNOWN_COMPATIBILITY_VERSION: SnapshotFormatVersion =
@@ -60,18 +60,18 @@ const _: () = assert!(
         && NATIVE_V2_LEGACY_PLATFORM_VERSION.minor() < NATIVE_V2_SNAPSHOT_VERSION.minor()
 );
 const _: () = assert!(
-    NATIVE_V2_SNAPSHOT_VERSION.major()
-        == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.major()
-        && NATIVE_V2_SNAPSHOT_VERSION.minor()
-            == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor()
-        && NATIVE_V2_SNAPSHOT_VERSION.patch()
-            == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.patch()
+    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.major()
+        == NATIVE_V2_SNAPSHOT_VERSION.major()
+        && NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor() + 1
+            == NATIVE_V2_SNAPSHOT_VERSION.minor()
+        && NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.patch() == 0
 );
 const _: () = assert!(
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
         && NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.minor()
-            == NATIVE_V2_SNAPSHOT_VERSION.minor() + 1
-        && NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.patch() == 0
+            == NATIVE_V2_SNAPSHOT_VERSION.minor()
+        && NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.patch()
+            == NATIVE_V2_SNAPSHOT_VERSION.patch()
 );
 
 /// Fixed native-v2 state header size.

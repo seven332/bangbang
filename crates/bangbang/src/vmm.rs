@@ -57,11 +57,11 @@ use bangbang_hvf::{
     PrepareHvfSnapshotV2StoragePciPlatformPlanError, PreparedHvfArm64BootPciNetworkRemoval,
     PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2Platform,
     decode_hvf_snapshot_v2_multi_block_state, decode_hvf_snapshot_v2_platform_state,
-    decode_hvf_snapshot_v2_state, decode_hvf_snapshot_v2_storage_state,
-    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_serial_state,
-    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
-    prepare_hvf_snapshot_v2_multi_block_platform_plan, prepare_hvf_snapshot_v2_root_plan,
-    prepare_hvf_snapshot_v2_storage_mmio_platform_plan,
+    decode_hvf_snapshot_v2_serial_state, decode_hvf_snapshot_v2_state,
+    decode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_multi_block_state,
+    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
+    encode_hvf_snapshot_v2_storage_state, prepare_hvf_snapshot_v2_multi_block_platform_plan,
+    prepare_hvf_snapshot_v2_root_plan, prepare_hvf_snapshot_v2_storage_mmio_platform_plan,
     prepare_hvf_snapshot_v2_storage_pci_platform_plan, restore_hvf_snapshot_v2_process_platform,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
@@ -136,15 +136,15 @@ use bangbang_runtime::snapshot_artifact::SnapshotStagingTracker;
 use bangbang_runtime::snapshot_artifact::{
     LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactFamily, NativeSnapshotArtifactState,
     NativeSnapshotArtifactStateError, NativeSnapshotPublicationOutcome,
-    NativeV2MultiBlockSnapshotCandidateState, NativeV2SnapshotArtifactProfile,
-    NativeV2SnapshotCandidateState, NativeV2SnapshotCandidateStateError,
-    NativeV2StorageSnapshotCandidateState, PreparedNativeSnapshotState, SnapshotArtifactLoadError,
-    SnapshotArtifactOutput, SnapshotArtifactOutputs, SnapshotArtifactPaths,
-    SnapshotCommitDurability, SnapshotMemoryStagingWriter, SnapshotPublicationOutcome,
-    SnapshotPublicationTransactionError, load_prepared_native_snapshot_memory_file,
-    load_prepared_native_snapshot_memory_path, load_snapshot_artifacts,
-    prepare_native_snapshot_state_file, prepare_native_snapshot_state_path,
-    prepare_snapshot_state_file, prepare_snapshot_state_path,
+    NativeV2MultiBlockSnapshotCandidateState, NativeV2SerialSnapshotCandidateState,
+    NativeV2SnapshotArtifactProfile, NativeV2SnapshotCandidateState,
+    NativeV2SnapshotCandidateStateError, NativeV2StorageSnapshotCandidateState,
+    PreparedNativeSnapshotState, SnapshotArtifactLoadError, SnapshotArtifactOutput,
+    SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotCommitDurability,
+    SnapshotMemoryStagingWriter, SnapshotPublicationOutcome, SnapshotPublicationTransactionError,
+    load_prepared_native_snapshot_memory_file, load_prepared_native_snapshot_memory_path,
+    load_snapshot_artifacts, prepare_native_snapshot_state_file,
+    prepare_native_snapshot_state_path, prepare_snapshot_state_file, prepare_snapshot_state_path,
     publish_native_snapshot_artifacts_to_with, publish_native_snapshot_artifacts_with,
     publish_snapshot_artifacts_to_with, publish_snapshot_artifacts_with,
 };
@@ -175,7 +175,8 @@ use bangbang_runtime::snapshot_memory::{
 };
 use bangbang_runtime::snapshot_memory_v2::{SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError};
 use bangbang_runtime::snapshot_serial_v2_7::{
-    SnapshotV2SerialState, SnapshotV2SerialStateCaptureError,
+    NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
+    SnapshotV2SerialStateCaptureError,
 };
 use bangbang_runtime::startup::{
     Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice,
@@ -242,7 +243,8 @@ use crate::snapshot_restore_resources::{
 use crate::snapshot_serial_restore::{
     PreparedSnapshotV2SerialDestinationCommitError,
     PreparedSnapshotV2SerialDestinationConstructionError, PreparedSnapshotV2SerialRestoreBundle,
-    PreparedSnapshotV2SerialRestoreOwners, SnapshotV2SerialStorageAdoptionError,
+    PreparedSnapshotV2SerialRestoreOwners, SnapshotV2SerialRestoreBundleError,
+    SnapshotV2SerialStorageAdoptionError, prepare_native_v2_serial_restore_bundle,
 };
 #[cfg(target_os = "macos")]
 use crate::vsock_restore::{
@@ -384,6 +386,18 @@ pub(crate) struct ProcessSnapshotV2StorageLoadRequest<'a> {
     pub(crate) pci_enabled: bool,
     pub(crate) input: &'a SnapshotLoadInput,
     pub(crate) candidate: NativeV2StorageSnapshotCandidateState,
+    pub(crate) memory: GuestMemory,
+    pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
+pub(crate) struct ProcessSnapshotV2SerialLoadRequest<'a> {
+    pub(crate) controller: &'a VmmController,
+    pub(crate) vmnet_authority: ProcessVmnetAuthority,
+    #[cfg(target_os = "macos")]
+    pub(crate) contained_restore_authority: Option<&'a ContainedSnapshotRestoreAuthority>,
+    pub(crate) pci_enabled: bool,
+    pub(crate) input: &'a SnapshotLoadInput,
+    pub(crate) candidate: NativeV2SerialSnapshotCandidateState,
     pub(crate) memory: GuestMemory,
     pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
 }
@@ -582,6 +596,15 @@ pub(crate) trait InstanceStartExecutor {
         ))
     }
 
+    fn load_prepared_snapshot_v2_serial(
+        &mut self,
+        _request: ProcessSnapshotV2SerialLoadRequest<'_>,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        Err(NativeV2SnapshotLoadError::ProcessPreparation(
+            BackendError::InvalidState("native-v2 serial snapshot loading is unavailable"),
+        ))
+    }
+
     fn commit_prepared_snapshot_v2_root_load(
         &mut self,
         _completion: ProcessSnapshotV2RootLoadCompletion,
@@ -657,6 +680,10 @@ enum NativeV2SnapshotCaptureProfile {
         storage_configs: CaptureReadyStorageConfigs,
         expected_transport: SnapshotV2DeviceTransportKind,
     },
+    #[allow(
+        dead_code,
+        reason = "exact-2.6 capture remains a compatibility-only typed seam"
+    )]
     Storage {
         storage_configs: CaptureReadyStorageConfigs,
         expected_transport: SnapshotV2DeviceTransportKind,
@@ -686,7 +713,18 @@ struct NativeV2MultiBlockCandidateProductProfile {
     expected_transport: SnapshotV2DeviceTransportKind,
 }
 
+#[allow(
+    dead_code,
+    reason = "exact-2.6 product classification remains compatibility-tested after activation"
+)]
 struct NativeV2StorageCandidateProductProfile {
+    input: HvfArm64BootSnapshotV2CaptureInput,
+    serial_config: SerialConfig,
+    storage_configs: CaptureReadyStorageConfigs,
+    expected_transport: SnapshotV2DeviceTransportKind,
+}
+
+struct NativeV2SerialCandidateProductProfile {
     input: HvfArm64BootSnapshotV2CaptureInput,
     serial_config: SerialConfig,
     storage_configs: CaptureReadyStorageConfigs,
@@ -744,6 +782,10 @@ pub(crate) enum NativeV2MultiBlockCandidateProfileError {
     IncompatibleProcessMode,
 }
 
+#[allow(
+    dead_code,
+    reason = "exact-2.6 product classification remains compatibility-tested after activation"
+)]
 #[derive(Debug)]
 pub(crate) enum NativeV2StorageCandidateProfileError {
     MissingBootSource,
@@ -787,6 +829,54 @@ impl std::error::Error for NativeV2StorageCandidateProfileError {
             | Self::InvalidBootMetadata
             | Self::TransportCapacity
             | Self::NonCanonicalSerial
+            | Self::OptionalDevices
+            | Self::MmdsStateUnavailable
+            | Self::IncompatibleProcessMode => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeV2SerialCandidateProfileError {
+    MissingBootSource,
+    InvalidBootMetadata,
+    StorageProfile(SnapshotV2StorageDeviceGraphCaptureError),
+    SerialProfile(SnapshotV2SerialStateCaptureError),
+    TransportCapacity,
+    OptionalDevices,
+    MmdsStateUnavailable,
+    IncompatibleProcessMode,
+}
+
+impl fmt::Display for NativeV2SerialCandidateProfileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingBootSource => formatter.write_str("boot source is not configured"),
+            Self::InvalidBootMetadata => formatter.write_str("boot metadata is invalid"),
+            Self::StorageProfile(_) => {
+                formatter.write_str("block-and-pmem inventory is unsupported")
+            }
+            Self::SerialProfile(_) => formatter.write_str("serial configuration is unsupported"),
+            Self::TransportCapacity => formatter.write_str("device transport capacity is exceeded"),
+            Self::OptionalDevices => {
+                formatter.write_str("optional device or MMDS state is configured")
+            }
+            Self::MmdsStateUnavailable => formatter.write_str("MMDS state is unavailable"),
+            Self::IncompatibleProcessMode => {
+                formatter.write_str("process boot mode is incompatible")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV2SerialCandidateProfileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::StorageProfile(source) => Some(source),
+            Self::SerialProfile(source) => Some(source),
+            Self::MissingBootSource
+            | Self::InvalidBootMetadata
+            | Self::TransportCapacity
             | Self::OptionalDevices
             | Self::MmdsStateUnavailable
             | Self::IncompatibleProcessMode => None,
@@ -1362,7 +1452,7 @@ pub(crate) enum NativeV1SnapshotPublicationProducerError {
 pub(crate) enum NativeV2SnapshotPublicationError {
     Preflight(VmmActionError),
     CaptureReadyPreflight(SnapshotCaptureReadyPreflightError),
-    Profile(NativeV2StorageCandidateProfileError),
+    Profile(NativeV2SerialCandidateProfileError),
     Resource(GrantClaimError),
     SessionUnavailable,
     ConfigurationUnavailable,
@@ -1387,7 +1477,7 @@ impl fmt::Display for NativeV2SnapshotPublicationError {
             Self::Profile(source) => {
                 write!(
                     formatter,
-                    "native-v2 block-and-pmem profile is unsupported: {source}"
+                    "native-v2 serial profile is unsupported: {source}"
                 )
             }
             Self::Resource(source) => {
@@ -1984,6 +2074,71 @@ impl fmt::Display for NativeV2StorageDestinationLoadError {
 #[cfg(target_os = "macos")]
 impl std::error::Error for NativeV2StorageDestinationLoadError {}
 
+#[cfg(target_os = "macos")]
+pub(crate) struct NativeV2SerialDestinationLoadError {
+    terminal: bool,
+    detail: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeV2SerialDestinationLoadError {
+    const fn new(terminal: bool) -> Self {
+        Self {
+            terminal,
+            detail: None,
+        }
+    }
+
+    fn with_source(terminal: bool, source: &(dyn std::error::Error + 'static)) -> Self {
+        let mut leaf = source;
+        while let Some(next) = leaf.source() {
+            leaf = next;
+        }
+        Self {
+            terminal,
+            detail: Some(leaf.to_string()),
+        }
+    }
+
+    const fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for NativeV2SerialDestinationLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2SerialDestinationLoadError")
+            .field("terminal", &self.terminal)
+            .field("has_detail", &self.detail.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for NativeV2SerialDestinationLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "native-v2 2.7 serial destination transaction failed ({})",
+            if self.terminal {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )?;
+        if let Some(detail) = &self.detail {
+            write!(formatter, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for NativeV2SerialDestinationLoadError {}
+
 #[allow(
     dead_code,
     reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
@@ -2019,6 +2174,10 @@ pub(crate) enum NativeV2SnapshotLoadError {
     },
     #[cfg(target_os = "macos")]
     StorageDestination(NativeV2StorageDestinationLoadError),
+    #[cfg(target_os = "macos")]
+    SerialBundle(SnapshotV2SerialRestoreBundleError),
+    #[cfg(target_os = "macos")]
+    SerialDestination(NativeV2SerialDestinationLoadError),
     AfterResourceAdoption {
         source: Box<NativeV2SnapshotLoadError>,
     },
@@ -2089,6 +2248,12 @@ impl NativeV2SnapshotLoadError {
             | Self::StoragePciPlatformPlan { cleanup_failed, .. } => *cleanup_failed,
             #[cfg(target_os = "macos")]
             Self::StorageDestination(source) => source.is_terminal(),
+            #[cfg(target_os = "macos")]
+            Self::SerialBundle(source) => {
+                source.disposition() == SnapshotRestoreResourceDisposition::Terminal
+            }
+            #[cfg(target_os = "macos")]
+            Self::SerialDestination(source) => source.is_terminal(),
             Self::Restore(source) => source.is_committed() || !source.cleanup_failures().is_empty(),
             Self::RootRestore(source) => source.is_terminal(),
             Self::Preflight(_)
@@ -2196,6 +2361,15 @@ impl fmt::Display for NativeV2SnapshotLoadError {
             }
             #[cfg(target_os = "macos")]
             Self::StorageDestination(source) => source.fmt(formatter),
+            #[cfg(target_os = "macos")]
+            Self::SerialBundle(source) => {
+                write!(
+                    formatter,
+                    "native-v2 2.7 serial resource bundle preparation failed: {source}"
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::SerialDestination(source) => source.fmt(formatter),
             Self::AfterResourceAdoption { source } => {
                 write!(
                     formatter,
@@ -2332,6 +2506,10 @@ impl std::error::Error for NativeV2SnapshotLoadError {
             Self::StoragePciPlatformPlan { source, .. } => Some(source),
             #[cfg(target_os = "macos")]
             Self::StorageDestination(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::SerialBundle(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::SerialDestination(source) => Some(source),
             Self::AfterResourceAdoption { source } => Some(source.as_ref()),
             #[cfg(target_os = "macos")]
             Self::RootResourceCleanup { source, .. } => Some(source.as_ref()),
@@ -5906,7 +6084,8 @@ where
             }
             NativeV2SnapshotArtifactProfile::DeviceGraphV2_4
             | NativeV2SnapshotArtifactProfile::MultiBlockDeviceGraphV2_5
-            | NativeV2SnapshotArtifactProfile::StorageDeviceGraphV2_6 => {
+            | NativeV2SnapshotArtifactProfile::StorageDeviceGraphV2_6
+            | NativeV2SnapshotArtifactProfile::SerialStateV2_7 => {
                 self.starter
                     .preflight_snapshot_v2_root_process(self.pci_enabled)
                     .map_err(NativeV2SnapshotLoadError::Preflight)?;
@@ -6077,7 +6256,7 @@ where
             }
             NativeV2SnapshotArtifactProfile::StorageDeviceGraphV2_6 => {
                 let (candidate, memory) = artifacts
-                    .into_current_v2_candidate()
+                    .into_v2_6_candidate()
                     .map_err(NativeV2SnapshotLoadError::ArtifactState)
                     .map_err(|source| {
                         if resource_adopted {
@@ -6091,6 +6270,45 @@ where
                 let restored = self
                     .starter
                     .load_prepared_snapshot_v2_storage(ProcessSnapshotV2StorageLoadRequest {
+                        controller: &self.controller,
+                        vmnet_authority: self.vmnet_authority,
+                        #[cfg(target_os = "macos")]
+                        contained_restore_authority: self.contained_restore_authority.as_ref(),
+                        pci_enabled: self.pci_enabled,
+                        input,
+                        candidate,
+                        memory,
+                        cancellation: self.snapshot_capture_cancellation.clone(),
+                    })
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let (session, controller_commit) = restored.into_parts();
+                self.started_session = Some(session);
+                Ok(self.controller.commit_snapshot_v2_load(controller_commit))
+            }
+            NativeV2SnapshotArtifactProfile::SerialStateV2_7 => {
+                let (candidate, memory) = artifacts
+                    .into_current_v2_candidate()
+                    .map_err(NativeV2SnapshotLoadError::ArtifactState)
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let restored = self
+                    .starter
+                    .load_prepared_snapshot_v2_serial(ProcessSnapshotV2SerialLoadRequest {
                         controller: &self.controller,
                         vmnet_authority: self.vmnet_authority,
                         #[cfg(target_os = "macos")]
@@ -6964,6 +7182,10 @@ where
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "exact-2.6 product classification remains compatibility-tested after activation"
+    )]
     fn native_v2_storage_candidate_product_profile(
         &self,
     ) -> Result<NativeV2StorageCandidateProductProfile, NativeV2StorageCandidateProfileError> {
@@ -7033,7 +7255,80 @@ where
         })
     }
 
-    /// Publishes one strictly admitted paused source as a native-v2 2.6 pair.
+    fn native_v2_serial_candidate_product_profile(
+        &self,
+    ) -> Result<NativeV2SerialCandidateProductProfile, NativeV2SerialCandidateProfileError> {
+        self.starter
+            .preflight_snapshot_v2_root_process(self.pci_enabled)
+            .map_err(|_| NativeV2SerialCandidateProfileError::IncompatibleProcessMode)?;
+
+        let boot = self
+            .controller
+            .boot_source_config()
+            .ok_or(NativeV2SerialCandidateProfileError::MissingBootSource)?;
+        let kernel = HvfSnapshotV2NativePath::try_new(boot.kernel_image_path().as_os_str())
+            .map_err(|_| NativeV2SerialCandidateProfileError::InvalidBootMetadata)?;
+        let initrd = boot
+            .initrd_path()
+            .map(|path| HvfSnapshotV2NativePath::try_new(path.as_os_str()))
+            .transpose()
+            .map_err(|_| NativeV2SerialCandidateProfileError::InvalidBootMetadata)?;
+        let boot = HvfSnapshotV2BootState::try_new(kernel, initrd, boot.boot_args())
+            .map_err(|_| NativeV2SerialCandidateProfileError::InvalidBootMetadata)?;
+
+        let drives = self.controller.drive_configs();
+        let pmem = self.controller.pmem_configs();
+        let storage_resource_count = drives
+            .len()
+            .checked_add(pmem.len())
+            .ok_or(NativeV2SerialCandidateProfileError::TransportCapacity)?;
+        if storage_resource_count != 0 {
+            SnapshotV2StorageDeviceGraph::preflight_capture_configs(
+                NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                drives,
+                pmem,
+            )
+            .map_err(NativeV2SerialCandidateProfileError::StorageProfile)?;
+        }
+        SnapshotV2SerialState::preflight_capture(
+            self.controller.serial_config(),
+            storage_resource_count,
+        )
+        .map_err(NativeV2SerialCandidateProfileError::SerialProfile)?;
+        let pci_capacity = usize::from(PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1);
+        if self.pci_enabled && storage_resource_count > pci_capacity {
+            return Err(NativeV2SerialCandidateProfileError::TransportCapacity);
+        }
+        if !self.controller.network_interface_configs().is_empty()
+            || self.controller.vsock_config().is_some()
+            || self.controller.balloon_config().is_some()
+            || self.controller.memory_hotplug_config().is_some()
+            || self.controller.entropy_config().is_some()
+        {
+            return Err(NativeV2SerialCandidateProfileError::OptionalDevices);
+        }
+        let has_mmds_state = self
+            .controller
+            .mmds_state_handle()
+            .with(|state| state.config().is_some() || state.data_store_present())
+            .map_err(|_| NativeV2SerialCandidateProfileError::MmdsStateUnavailable)?;
+        if has_mmds_state {
+            return Err(NativeV2SerialCandidateProfileError::OptionalDevices);
+        }
+
+        Ok(NativeV2SerialCandidateProductProfile {
+            input: HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            serial_config: self.controller.serial_config().clone(),
+            storage_configs: CaptureReadyStorageConfigs::new(drives.to_vec(), pmem.to_vec()),
+            expected_transport: if self.pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            },
+        })
+    }
+
+    /// Publishes one strictly admitted paused source as a native-v2 2.7 pair.
     ///
     /// The public create action reaches this seam after request normalization.
     pub(crate) fn publish_native_v2_snapshot(
@@ -7043,30 +7338,18 @@ where
         self.controller
             .preflight_create_snapshot_v2_request(input)
             .map_err(NativeV2SnapshotPublicationError::Preflight)?;
-        let NativeV2StorageCandidateProductProfile {
+        let NativeV2SerialCandidateProductProfile {
             input: capture_input,
             serial_config,
             storage_configs,
             expected_transport,
         } = self
-            .native_v2_storage_candidate_product_profile()
+            .native_v2_serial_candidate_product_profile()
             .map_err(NativeV2SnapshotPublicationError::Profile)?;
         let cancellation = self.snapshot_capture_cancellation.clone();
-        let serial = self
+        let _serial = self
             .preflight_snapshot_capture_ready(cancellation.clone())
             .map_err(SnapshotCaptureReadyPreflightError::into_native_v2)?;
-        let canonical_serial = SerialMmioDevice::discarding()
-            .capture_state()
-            .map_err(|_| {
-                NativeV2SnapshotPublicationError::Profile(
-                    NativeV2StorageCandidateProfileError::NonCanonicalSerial,
-                )
-            })?;
-        if serial.config() != &SerialConfig::default() || serial.device() != &canonical_serial {
-            return Err(NativeV2SnapshotPublicationError::Profile(
-                NativeV2StorageCandidateProfileError::NonCanonicalSerial,
-            ));
-        }
         if self.started_session.is_none() {
             return Err(NativeV2SnapshotPublicationError::SessionUnavailable);
         }
@@ -7410,6 +7693,9 @@ impl HvfInstanceStartExecutor {
             NativeV2SnapshotArtifactProfile::StorageDeviceGraphV2_6 => {
                 NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
             }
+            NativeV2SnapshotArtifactProfile::SerialStateV2_7 => {
+                NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+            }
         };
         let structural = decode_snapshot_v2_state_with_compatibility_version(bytes, version)
             .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
@@ -7428,6 +7714,10 @@ impl HvfInstanceStartExecutor {
             }
             NativeV2SnapshotArtifactProfile::StorageDeviceGraphV2_6 => {
                 decode_hvf_snapshot_v2_storage_state(&structural)
+                    .map_err(NativeV2SnapshotLoadError::Decode)?;
+            }
+            NativeV2SnapshotArtifactProfile::SerialStateV2_7 => {
+                decode_hvf_snapshot_v2_serial_state(&structural)
                     .map_err(NativeV2SnapshotLoadError::Decode)?;
             }
         }
@@ -8099,6 +8389,9 @@ impl PreparedHvfSnapshotV2StorageDestination {
             HvfProcessSession::SnapshotV2(_) => Err(BackendError::InvalidState(
                 "exact-2.6 storage destination has the wrong worker type",
             )),
+            HvfProcessSession::SerialSnapshotV2(_) => Err(BackendError::InvalidState(
+                "exact-2.6 storage destination has a serial wrapper",
+            )),
         };
         drop(self);
         result
@@ -8655,13 +8948,14 @@ impl std::error::Error for HvfSnapshotV2SerialDestinationCleanupError {
 /// outside the worker and is finished only after worker, UART, input, and
 /// active-output teardown.
 #[cfg(target_os = "macos")]
-struct HvfSnapshotV2SerialDestination {
+pub(crate) struct HvfSnapshotV2SerialDestination {
     session: Option<Box<HvfProcessSession>>,
     storage_configs: Option<CaptureReadyStorageConfigs>,
     has_storage: bool,
     serial_config: Option<SerialConfig>,
     serial_output: Option<SharedSerialOutput>,
     restoration: Option<SerialStdioRestoration>,
+    unavailable_diagnostics: (),
 }
 
 #[cfg(target_os = "macos")]
@@ -8715,6 +9009,30 @@ impl HvfSnapshotV2SerialDestination {
             .resume()
     }
 
+    fn boot_mut(&mut self) -> Option<&mut HvfBootRunLoopSupervisor> {
+        self.session
+            .as_deref_mut()
+            .and_then(HvfProcessSession::boot_mut)
+    }
+
+    fn diagnostics(&self) -> &dyn ProcessSessionDiagnostics {
+        match self.session.as_deref() {
+            Some(session) => session.diagnostics(),
+            None => &self.unavailable_diagnostics,
+        }
+    }
+
+    fn diagnostics_mut(&mut self) -> &mut dyn ProcessSessionDiagnostics {
+        match self.session.as_deref_mut() {
+            Some(session) => session.diagnostics_mut(),
+            None => &mut self.unavailable_diagnostics,
+        }
+    }
+
+    fn serial_output_clone(&self) -> Option<SharedSerialOutput> {
+        self.serial_output.clone()
+    }
+
     fn cleanup(&mut self) -> Result<(), HvfSnapshotV2SerialDestinationCleanupError> {
         let session = match self.session.as_deref_mut() {
             Some(HvfProcessSession::Boot(supervisor)) => supervisor
@@ -8728,6 +9046,9 @@ impl HvfSnapshotV2SerialDestination {
                 .err(),
             Some(HvfProcessSession::SnapshotV2(_)) => Some(BackendError::InvalidState(
                 "exact-2.7 destination has the wrong worker type",
+            )),
+            Some(HvfProcessSession::SerialSnapshotV2(_)) => Some(BackendError::InvalidState(
+                "exact-2.7 destination is recursively wrapped",
             )),
             None => None,
         };
@@ -9181,6 +9502,7 @@ fn prepare_hvf_native_v2_serial_destination(
                 serial_config: Some(serial_config),
                 serial_output: Some(serial_output),
                 restoration,
+                unavailable_diagnostics: (),
             })
         })
         .map_err(PrepareHvfSnapshotV2SerialDestinationError::Construction)?;
@@ -10489,6 +10811,119 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     }
 
     #[cfg(target_os = "macos")]
+    fn load_prepared_snapshot_v2_serial(
+        &mut self,
+        request: ProcessSnapshotV2SerialLoadRequest<'_>,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        let ProcessSnapshotV2SerialLoadRequest {
+            controller,
+            vmnet_authority,
+            contained_restore_authority,
+            pci_enabled,
+            input,
+            candidate,
+            memory,
+            cancellation,
+        } = request;
+        self.preflight_snapshot_v2_root_process(pci_enabled)
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+
+        let (bytes, binding, candidate_graph, candidate_serial) = candidate.into_parts();
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            &bytes,
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        )
+        .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
+        let decoded = decode_hvf_snapshot_v2_serial_state(&structural)
+            .map_err(NativeV2SnapshotLoadError::Decode)?;
+        if decoded.platform().memory() != &binding
+            || decoded.device_graph() != candidate_graph.as_ref()
+            || decoded.serial() != &candidate_serial
+        {
+            return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+        }
+        let (platform, graph, serial) = decoded.into_parts();
+        drop(candidate_graph);
+        drop(candidate_serial);
+
+        let expected_transport = if pci_enabled {
+            SnapshotV2DeviceTransportKind::Pci
+        } else {
+            SnapshotV2DeviceTransportKind::Mmio
+        };
+        if graph
+            .as_ref()
+            .is_some_and(|graph| graph.transport_kind() != expected_transport)
+        {
+            return Err(NativeV2SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ));
+        }
+
+        let boot = native_v2_boot_source_config(platform.machine().boot())
+            .map_err(NativeV2SnapshotLoadError::BootMetadata)?;
+        let machine = snapshot_destination_machine_config(
+            platform.machine().machine(),
+            input.track_dirty_pages(),
+        );
+        let bundle = prepare_native_v2_serial_restore_bundle(
+            graph.as_ref(),
+            serial,
+            contained_restore_authority,
+            || cancellation.is_cancelled(),
+        )
+        .map_err(NativeV2SnapshotLoadError::SerialBundle)?;
+        let (packet_io, mmds_metrics) =
+            match ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority) {
+                Ok(prepared) => prepared,
+                Err(source) => {
+                    if bundle.abort().is_err() {
+                        return Err(NativeV2SnapshotLoadError::SerialDestination(
+                            NativeV2SerialDestinationLoadError::new(true),
+                        ));
+                    }
+                    return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                        BackendError::Hypervisor(format!(
+                            "failed to build native-v2 network packet I/O provider: {source}"
+                        )),
+                    ));
+                }
+            };
+
+        let (destination, controller_commit) =
+            prepare_hvf_native_v2_serial_destination(PrepareHvfSnapshotV2SerialDestinationInput {
+                platform,
+                graph,
+                memory,
+                pci_enabled,
+                packet_io,
+                mmds_metrics,
+                vmnet_authority,
+                bundle,
+                machine,
+                boot,
+                resume_requested: input.resume_vm(),
+                cancellation,
+            })
+            .map_err(|source| {
+                let terminal = source.is_terminal();
+                NativeV2SnapshotLoadError::SerialDestination(
+                    NativeV2SerialDestinationLoadError::with_source(terminal, &source),
+                )
+            })?;
+        let serial_output = destination.serial_output_clone().ok_or_else(|| {
+            NativeV2SnapshotLoadError::SerialDestination(NativeV2SerialDestinationLoadError::new(
+                true,
+            ))
+        })?;
+        self.active_serial_output = Some(serial_output);
+        Ok(SnapshotV2LoadSuccess::new(
+            HvfProcessSession::SerialSnapshotV2(Box::new(destination)),
+            controller_commit,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
     fn commit_prepared_snapshot_v2_root_load(
         &mut self,
         completion: ProcessSnapshotV2RootLoadCompletion,
@@ -10544,6 +10979,8 @@ pub(crate) type HvfSnapshotV2RunLoopSupervisor = BootRunLoopSupervisor<ProcessHv
 pub(crate) enum HvfProcessSession {
     Boot(HvfBootRunLoopSupervisor),
     SnapshotV2(HvfSnapshotV2RunLoopSupervisor),
+    #[cfg(target_os = "macos")]
+    SerialSnapshotV2(Box<HvfSnapshotV2SerialDestination>),
 }
 
 impl HvfProcessSession {
@@ -10551,6 +10988,8 @@ impl HvfProcessSession {
         match self {
             Self::Boot(session) => Some(session),
             Self::SnapshotV2(_) => None,
+            #[cfg(target_os = "macos")]
+            Self::SerialSnapshotV2(destination) => destination.boot_mut(),
         }
     }
 
@@ -10558,6 +10997,8 @@ impl HvfProcessSession {
         match self {
             Self::Boot(session) => session,
             Self::SnapshotV2(session) => session,
+            #[cfg(target_os = "macos")]
+            Self::SerialSnapshotV2(destination) => destination.diagnostics(),
         }
     }
 
@@ -10565,6 +11006,8 @@ impl HvfProcessSession {
         match self {
             Self::Boot(session) => session,
             Self::SnapshotV2(session) => session,
+            #[cfg(target_os = "macos")]
+            Self::SerialSnapshotV2(destination) => destination.diagnostics_mut(),
         }
     }
 }
@@ -10576,6 +11019,11 @@ impl fmt::Debug for HvfProcessSession {
             Self::SnapshotV2(session) => {
                 formatter.debug_tuple("SnapshotV2").field(session).finish()
             }
+            #[cfg(target_os = "macos")]
+            Self::SerialSnapshotV2(destination) => formatter
+                .debug_tuple("SerialSnapshotV2")
+                .field(destination)
+                .finish(),
         }
     }
 }
@@ -17501,6 +17949,8 @@ where
         cancellation: NativeV2SnapshotCaptureCancellation,
     ) -> Result<NativeSnapshotPublicationOutcome, Box<NativeV2SnapshotPublicationTransactionError>>
     {
+        preflight_native_v2_serial_capture(&serial_config, &storage_configs)
+            .map_err(native_v2_snapshot_transaction_error_before_staging)?;
         let active_capture = self
             .register_snapshot_capture_raw(cancellation.clone())
             .map_err(|source| {
@@ -17537,14 +17987,26 @@ where
                     ));
                 }
 
-                capture_canonical_native_v2_serial(session, serial_config, &guard)
-                    .map_err(native_v2_snapshot_transaction_error_before_staging)?;
+                let serial = session
+                    .capture_native_v2_serial(serial_config, &guard)
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Serial { source },
+                        )
+                    })?;
+                let serial =
+                    SnapshotV2SerialState::try_from_capture_ready(serial).map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::SerialState { source },
+                        )
+                    })?;
 
                 let result = destination.publish(|writer| {
                     let state = capture_and_recover_native_v2_state(
                         session,
                         input,
-                        NativeV2SnapshotCaptureProfile::Storage {
+                        NativeV2SnapshotCaptureProfile::Serial {
+                            serial,
                             storage_configs,
                             expected_transport,
                         },
@@ -17552,13 +18014,13 @@ where
                         Box::new(writer),
                         &cancellation,
                         |encoded| {
-                            NativeV2StorageSnapshotCandidateState::from_storage_device_graph_v2_6(
-                                encoded,
-                            )
-                            .map(NativeV2StorageSnapshotCandidateState::into_current_artifact_state)
-                            .map_err(|source| {
-                                NativeV2SnapshotCaptureError::CandidateState { source }
-                            })
+                            NativeV2SerialSnapshotCandidateState::from_serial_state_v2_7(encoded)
+                                .map(
+                                    NativeV2SerialSnapshotCandidateState::into_current_artifact_state,
+                                )
+                                .map_err(|source| {
+                                    NativeV2SnapshotCaptureError::CandidateState { source }
+                                })
                         },
                     )
                     .map_err(NativeV2SnapshotPublicationProducerError::Capture)?;
@@ -18810,13 +19272,14 @@ mod tests {
     };
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotPublicationOutcome,
-        NativeV2StorageSnapshotCandidateState, SnapshotArtifactOutputs, SnapshotArtifactPaths,
+        NativeV2SerialSnapshotCandidateState, SnapshotArtifactOutputs, SnapshotArtifactPaths,
         SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_artifact::{
-        NativeSnapshotArtifactFamily, NativeV2SnapshotCandidateState, SnapshotArtifactOutput,
-        SnapshotCommitDurability, load_native_snapshot_artifacts, load_snapshot_artifacts,
+        NativeSnapshotArtifactFamily, NativeV2SnapshotArtifactProfile,
+        NativeV2SnapshotCandidateState, SnapshotArtifactOutput, SnapshotCommitDurability,
+        load_native_snapshot_artifacts, load_snapshot_artifacts,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_commit::SnapshotCommitKind;
@@ -18910,13 +19373,13 @@ mod tests {
         NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
         NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
         NativeV2MultiBlockCandidateProfileError, NativeV2RootCandidateProcessError,
-        NativeV2RootCandidateProfileError, NativeV2SnapshotCaptureCancellation,
-        NativeV2SnapshotCaptureError, NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
-        NativeV2SnapshotLoadError, NativeV2SnapshotMultiBlockCaptureError,
-        NativeV2SnapshotPublicationDestination, NativeV2SnapshotPublicationError,
-        NativeV2SnapshotPublicationProducerError, NativeV2SnapshotPublicationRequest,
-        NativeV2SnapshotRootCaptureError, NativeV2SnapshotStorageCaptureError,
-        NativeV2StorageCandidateProfileError, NetworkPacketIoRunLoopSession,
+        NativeV2RootCandidateProfileError, NativeV2SerialCandidateProfileError,
+        NativeV2SnapshotCaptureCancellation, NativeV2SnapshotCaptureError,
+        NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage, NativeV2SnapshotLoadError,
+        NativeV2SnapshotMultiBlockCaptureError, NativeV2SnapshotPublicationDestination,
+        NativeV2SnapshotPublicationError, NativeV2SnapshotPublicationProducerError,
+        NativeV2SnapshotPublicationRequest, NativeV2SnapshotRootCaptureError,
+        NativeV2SnapshotStorageCaptureError, NetworkPacketIoRunLoopSession,
         NoopProcessNetworkTxPacketSink, ProcessCaptureReadyNetworkError, ProcessHvfBootSession,
         ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
         ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
@@ -18924,13 +19387,13 @@ mod tests {
         ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
         ProcessSnapshotV2MultiBlockLoadRequest, ProcessSnapshotV2MultiBlockLoadSuccess,
         ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
-        ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2StorageLoadRequest,
-        ProcessSnapshotV2StorageLoadSuccess, ProcessVmm, ProcessVmnetAuthority,
-        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
-        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
-        require_native_v1_composite_record, snapshot_destination_machine_config,
-        vsock_capture_error_from_boot_run_loop_command,
+        ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2SerialLoadRequest,
+        ProcessSnapshotV2StorageLoadRequest, ProcessSnapshotV2StorageLoadSuccess, ProcessVmm,
+        ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
+        SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
+        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        native_v2_platform_capture_is_terminal, require_native_v1_composite_record,
+        snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -20052,6 +20515,7 @@ mod tests {
 
     fn publish_fake_native_v2_snapshot(
         session: &mut FakeSession,
+        serial_config: SerialConfig,
         transport: SnapshotV2DeviceTransportKind,
         has_block: bool,
         has_pmem: bool,
@@ -20086,23 +20550,40 @@ mod tests {
                         },
                     )
                 })?;
-                let graph = fake_native_v2_storage_device_graph(transport, has_block, has_pmem)
-                    .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
-                    .expect("fixed fake native-v2 graph should encode");
-                let components = [
-                    SnapshotV2Component::new(
-                        NATIVE_V2_MEMORY_COMPONENT_KEY,
-                        SnapshotV2ComponentDisposition::Semantic,
-                        &memory,
-                    ),
-                    SnapshotV2Component::new(
+                let graph = (has_block || has_pmem).then(|| {
+                    fake_native_v2_storage_device_graph(transport, has_block, has_pmem)
+                        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                        .expect("fixed fake native-v2 graph should encode")
+                });
+                let serial_device = SerialMmioDevice::discarding()
+                    .capture_state()
+                    .expect("fake serial device should capture");
+                let serial = SnapshotV2SerialState::try_from_capture_ready(
+                    CaptureReadySerialState::new(serial_config, serial_device),
+                )
+                .expect("fake serial state should capture")
+                .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+                .expect("fake serial state should encode");
+                let mut components = Vec::with_capacity(3);
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_MEMORY_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    &memory,
+                ));
+                if let Some(graph) = &graph {
+                    components.push(SnapshotV2Component::new(
                         NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
                         SnapshotV2ComponentDisposition::Semantic,
-                        &graph,
-                    ),
-                ];
+                        graph,
+                    ));
+                }
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_SERIAL_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    &serial,
+                ));
                 let encoded = encode_snapshot_v2_state_with_compatibility_version(
-                    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                    NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
                     &[],
                     &components,
                 )
@@ -20113,8 +20594,8 @@ mod tests {
                         },
                     )
                 })?;
-                NativeV2StorageSnapshotCandidateState::from_storage_device_graph_v2_6(encoded)
-                    .map(NativeV2StorageSnapshotCandidateState::into_current_artifact_state)
+                NativeV2SerialSnapshotCandidateState::from_serial_state_v2_7(encoded)
+                    .map(NativeV2SerialSnapshotCandidateState::into_current_artifact_state)
                     .map_err(|source| {
                         NativeV2SnapshotPublicationProducerError::Capture(
                             NativeV2SnapshotCaptureError::CandidateState { source },
@@ -20604,9 +21085,9 @@ mod tests {
                 expected_transport,
                 cancellation: _,
             } = request;
-            assert_eq!(serial_config, SerialConfig::default());
             publish_fake_native_v2_snapshot(
                 session,
+                serial_config,
                 expected_transport,
                 !storage_configs.drives().is_empty(),
                 !storage_configs.pmem().is_empty(),
@@ -20630,9 +21111,9 @@ mod tests {
                 expected_transport,
                 cancellation: _,
             } = request;
-            assert_eq!(serial_config, SerialConfig::default());
             publish_fake_native_v2_snapshot(
                 session,
+                serial_config,
                 expected_transport,
                 !storage_configs.drives().is_empty(),
                 !storage_configs.pmem().is_empty(),
@@ -20989,6 +21470,128 @@ mod tests {
                 }
             };
             Ok(ProcessSnapshotV2StorageLoadSuccess::new(session, commit))
+        }
+
+        fn load_prepared_snapshot_v2_serial(
+            &mut self,
+            request: ProcessSnapshotV2SerialLoadRequest<'_>,
+        ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+            let ProcessSnapshotV2SerialLoadRequest {
+                controller,
+                vmnet_authority,
+                #[cfg(target_os = "macos")]
+                    contained_restore_authority: _,
+                pci_enabled,
+                input,
+                candidate,
+                memory: _,
+                cancellation,
+            } = request;
+            let expected_transport = if pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            };
+            if candidate
+                .device_graph()
+                .is_some_and(|graph| graph.transport_kind() != expected_transport)
+            {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
+            let drive_configs = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::block_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = DriveConfigInput::new(
+                        config.drive_id(),
+                        config.drive_id(),
+                        config.selector(),
+                        config.is_root(),
+                    )
+                    .with_is_read_only(config.is_read_only())
+                    .with_cache_type(config.cache_type())
+                    .with_io_engine(config.io_engine());
+                    if let Some(partuuid) = config.partuuid() {
+                        input = input.with_partuuid(partuuid);
+                    }
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    input.validate()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let pmem_configs = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::pmem_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = PmemConfigInput::new(config.pmem_id(), config.selector())
+                        .with_root_device(config.is_root())
+                        .with_read_only(config.is_read_only());
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    PmemConfig::try_from(input)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let mut serial_input = SerialConfigInput::new();
+            if let Some(selector) = candidate.serial().endpoint_intent().configured_selector() {
+                serial_input = serial_input.with_serial_out_path(selector);
+            }
+            if let Some(rate_limiter) = candidate.serial().rate_limiter() {
+                serial_input = serial_input.with_rate_limiter(rate_limiter);
+            }
+            let serial_config = serial_input
+                .validate()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            if !cancellation.try_seal_commit() {
+                return Err(NativeV2SnapshotLoadError::Cancelled);
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.last_vmnet_authority = Some(vmnet_authority);
+            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            if self.result == FakeSnapshotLoadResult::Terminal {
+                return Err(NativeV2SnapshotLoadError::ProcessTerminal);
+            }
+
+            let boot_source = BootSourceConfigInput::new("/private/restored-vmlinux")
+                .validate()
+                .expect("fake restored boot source should validate");
+            let machine =
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages());
+            let commit = if candidate.device_graph().is_some() {
+                SnapshotV2ControllerCommit::with_storage_and_serial_configs(
+                    machine,
+                    boot_source,
+                    CaptureReadyStorageConfigs::new(drive_configs, pmem_configs),
+                    serial_config,
+                    input.resume_vm(),
+                )
+            } else {
+                SnapshotV2ControllerCommit::with_serial_config(
+                    machine,
+                    boot_source,
+                    serial_config,
+                    input.resume_vm(),
+                )
+            };
+            let session = match self.result {
+                FakeSnapshotLoadResult::ResumeFailure => FakeSession::with_resume_result(
+                    77,
+                    BackendError::Hypervisor("private-resume-sentinel".to_owned()),
+                ),
+                FakeSnapshotLoadResult::Success | FakeSnapshotLoadResult::Terminal => {
+                    FakeSession::new(77)
+                }
+            };
+            Ok(SnapshotV2LoadSuccess::new(session, commit))
         }
     }
 
@@ -24030,6 +24633,7 @@ mod tests {
         let mut session = FakeSession::new(0);
         publish_fake_native_v2_snapshot(
             &mut session,
+            SerialConfig::default(),
             transport,
             true,
             false,
@@ -24262,7 +24866,10 @@ mod tests {
             .into_current_v2_candidate()
             .expect("published PCI pair should retain a current candidate");
         assert_eq!(
-            candidate.device_graph().transport_kind(),
+            candidate
+                .device_graph()
+                .expect("published PCI pair should retain its storage graph")
+                .transport_kind(),
             SnapshotV2DeviceTransportKind::Pci
         );
         directory.assert_no_staging();
@@ -32086,23 +32693,20 @@ mod tests {
                     });
 
                 let loaded = load_native_snapshot_artifacts(&paths)
-                    .expect("public exact-2.6 storage pair should load");
+                    .expect("public exact-2.7 serial-storage pair should load");
                 let (candidate, _) = loaded
                     .into_current_v2_candidate()
                     .expect("public storage pair should retain the exact current candidate");
                 assert_eq!(
                     candidate.version(),
-                    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+                    NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
                 );
-                assert_eq!(candidate.device_graph().transport_kind(), transport);
-                assert_eq!(
-                    candidate.device_graph().block_records().len(),
-                    usize::from(has_block)
-                );
-                assert_eq!(
-                    candidate.device_graph().pmem_records().len(),
-                    usize::from(has_pmem)
-                );
+                let graph = candidate
+                    .device_graph()
+                    .expect("public storage pair should retain its storage graph");
+                assert_eq!(graph.transport_kind(), transport);
+                assert_eq!(graph.block_records().len(), usize::from(has_block));
+                assert_eq!(graph.pmem_records().len(), usize::from(has_pmem));
 
                 let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
                 let calls = starter.calls();
@@ -32365,7 +32969,7 @@ mod tests {
     #[test]
     #[ignore = "requires the signed native_v2_process integration group"]
     fn signed_native_v2_process_publishes_recaptures_and_resumes_private_pair() {
-        use bangbang_hvf::{HvfArm64StableVcpuDisposition, decode_hvf_snapshot_v2_storage_state};
+        use bangbang_hvf::{HvfArm64StableVcpuDisposition, decode_hvf_snapshot_v2_serial_state};
         use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
 
         const ARM64_IMAGE_HEADER_SIZE: usize = 64;
@@ -32431,8 +33035,8 @@ mod tests {
                 .expect("native-v2 load should retain structural bytes"),
         )
         .expect("real process native-v2 state should decode structurally");
-        let first_state = decode_hvf_snapshot_v2_storage_state(&first_structural)
-            .expect("real process native-v2 storage state should cross-validate");
+        let first_state = decode_hvf_snapshot_v2_serial_state(&first_structural)
+            .expect("real process native-v2 serial state should cross-validate");
         let first_platform = first_state.platform();
         assert_eq!(first_platform.topology().members().len(), 2);
         assert!(matches!(
@@ -32443,12 +33047,21 @@ mod tests {
             first_platform.topology().members()[1].disposition(),
             HvfArm64StableVcpuDisposition::Offline
         ));
-        assert_eq!(first_state.device_graph().block_records().len(), 1);
-        assert!(first_state.device_graph().block_records()[0].is_root());
-        assert!(first_state.device_graph().pmem_records().is_empty());
+        let first_graph = first_state
+            .device_graph()
+            .expect("real process native-v2 state should retain storage");
+        assert_eq!(first_graph.block_records().len(), 1);
+        assert!(first_graph.block_records()[0].is_root());
+        assert!(first_graph.pmem_records().is_empty());
         assert_eq!(
-            first_state.device_graph().transport_kind(),
+            first_graph.transport_kind(),
             SnapshotV2DeviceTransportKind::Mmio
+        );
+        assert!(
+            first_state
+                .serial()
+                .endpoint_intent()
+                .is_default_process_stdio()
         );
         drop(first_state);
         drop(first);
@@ -32517,6 +33130,28 @@ mod tests {
         paused_destination
             .handle_action(VmmAction::Pause)
             .expect("restored destination should pause again");
+
+        let recaptured_directory =
+            TempSnapshotDirectory::new("signed-native-v2-restored-recapture");
+        let recaptured_paths = recaptured_directory.paths();
+        assert_eq!(
+            paused_destination.handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                recaptured_paths.state(),
+                recaptured_paths.memory(),
+            ),)),
+            Ok(VmmData::Empty)
+        );
+        let recaptured = load_native_snapshot_artifacts(&recaptured_paths)
+            .expect("restored exact-2.7 destination should publish again");
+        assert_eq!(
+            recaptured
+                .state()
+                .v2_profile()
+                .expect("recaptured destination should retain a closed profile"),
+            NativeV2SnapshotArtifactProfile::SerialStateV2_7
+        );
+        recaptured_directory.assert_no_staging();
         drop(paused_destination);
 
         let authority = snapshot_root_file_grant_authority_for_test(
@@ -33179,6 +33814,9 @@ mod tests {
                 super::HvfProcessSession::SnapshotV2(_) => {
                     panic!("exact-2.6 storage handoff should use the boot supervisor");
                 }
+                super::HvfProcessSession::SerialSnapshotV2(_) => {
+                    panic!("exact-2.6 storage handoff should not use the serial wrapper");
+                }
             }
             drop(session);
         }
@@ -33417,6 +34055,9 @@ mod tests {
                 super::HvfProcessSession::SnapshotV2(_) => {
                     panic!("exact-2.7 serial handoff should use the boot supervisor");
                 }
+                super::HvfProcessSession::SerialSnapshotV2(_) => {
+                    panic!("private exact-2.7 destination should not be recursively wrapped");
+                }
             }
 
             destination
@@ -33430,6 +34071,9 @@ mod tests {
                 super::HvfProcessSession::Boot(supervisor) => supervisor,
                 super::HvfProcessSession::SnapshotV2(_) => {
                     panic!("exact-2.7 serial handoff should retain the boot supervisor")
+                }
+                super::HvfProcessSession::SerialSnapshotV2(_) => {
+                    panic!("private exact-2.7 destination should not be recursively wrapped")
                 }
             };
             supervisor
@@ -33719,6 +34363,9 @@ mod tests {
                 super::HvfProcessSession::SnapshotV2(_) => {
                     panic!("exact-2.7 serial-storage handoff should use the boot supervisor")
                 }
+                super::HvfProcessSession::SerialSnapshotV2(_) => {
+                    panic!("private exact-2.7 destination should not be recursively wrapped")
+                }
             };
             supervisor
                 .pause()
@@ -33859,24 +34506,26 @@ mod tests {
         drive
             .handle_action(VmmAction::Pause)
             .expect("empty-drive source should pause");
-        assert!(matches!(
-            drive.publish_native_v2_snapshot(&drive_input),
-            Err(NativeV2SnapshotPublicationError::Profile(
-                NativeV2StorageCandidateProfileError::StorageProfile(_)
-            ))
-        ));
+        drive
+            .publish_native_v2_snapshot(&drive_input)
+            .expect("serial-only exact-2.7 source should publish without storage");
         assert_eq!(
             drive
                 .started_session
                 .as_ref()
-                .expect("drive rejection should retain the source")
+                .expect("serial-only publication should retain the source")
                 .native_snapshot_publication_count,
-            0
+            1
         );
         assert_eq!(
-            drive.starter.snapshot_storage_preflight_calls, 0,
-            "invalid drive inventory must reject before capture-owner preflight"
+            drive.starter.snapshot_storage_preflight_calls, 1,
+            "serial-only publication should preflight the empty storage owner set"
         );
+        let (candidate, _) = load_native_snapshot_artifacts(&drive_paths)
+            .expect("serial-only pair should load")
+            .into_current_v2_candidate()
+            .expect("serial-only pair should close as exact 2.7");
+        assert!(candidate.device_graph().is_none());
         drive_directory.assert_no_staging();
 
         let mut vhost = configured_vmm(FakeStarter::success(186));
@@ -33936,7 +34585,7 @@ mod tests {
                 optional_paths.memory(),
             )),
             Err(NativeV2SnapshotPublicationError::Profile(
-                NativeV2StorageCandidateProfileError::OptionalDevices
+                NativeV2SerialCandidateProfileError::OptionalDevices
             ))
         ));
         assert_eq!(
@@ -33953,9 +34602,11 @@ mod tests {
             serial_paths.memory(),
         );
         let mut serial = snapshot_profile_vmm(FakeStarter::success(175));
+        let serial_sink = TempFilePath::create("native-v2-process-serial-output");
         serial
             .handle_action(VmmAction::PutSerial(
                 SerialConfigInput::new()
+                    .with_serial_out_path(serial_sink.path().to_string_lossy())
                     .with_rate_limiter(SerialRateLimiterConfig::new(1, None, 1_000)),
             ))
             .expect("custom serial config should store");
@@ -33965,23 +34616,37 @@ mod tests {
         serial
             .handle_action(VmmAction::Pause)
             .expect("custom serial source should pause");
-        assert!(matches!(
-            serial.publish_native_v2_snapshot(&serial_input),
-            Err(NativeV2SnapshotPublicationError::Profile(
-                NativeV2StorageCandidateProfileError::NonCanonicalSerial
-            ))
-        ));
+        serial
+            .publish_native_v2_snapshot(&serial_input)
+            .expect("configured serial state should publish in exact 2.7");
         assert_eq!(
             serial
                 .started_session
                 .as_ref()
-                .expect("serial rejection should retain the source")
+                .expect("serial publication should retain the source")
                 .native_snapshot_publication_count,
-            0
+            1
         );
         assert_eq!(
-            serial.starter.snapshot_storage_preflight_calls, 0,
-            "serial rejection must precede capture-owner preflight"
+            serial.starter.snapshot_storage_preflight_calls, 1,
+            "configured serial publication should preflight every capture owner"
+        );
+        let (candidate, _) = load_native_snapshot_artifacts(&serial_paths)
+            .expect("configured serial snapshot should load")
+            .into_current_v2_candidate()
+            .expect("configured serial snapshot should close as exact 2.7");
+        assert_eq!(
+            candidate.serial().rate_limiter(),
+            Some(SerialRateLimiterConfig::new(1, None, 1_000))
+        );
+        assert_eq!(
+            candidate.serial().endpoint_intent().configured_selector(),
+            Some(
+                serial_sink
+                    .path()
+                    .to_str()
+                    .expect("serial sink path should be UTF-8")
+            )
         );
         serial_directory.assert_no_staging();
 
@@ -33989,25 +34654,22 @@ mod tests {
         let live_serial_paths = live_serial_directory.paths();
         let mut live_serial = paused_native_v2_profile_vmm(FakeStarter::success(189));
         live_serial.starter.snapshot_serial_preflight_canonical = false;
-        assert!(matches!(
-            live_serial.publish_native_v2_snapshot(&SnapshotCreateInput::new(
+        live_serial
+            .publish_native_v2_snapshot(&SnapshotCreateInput::new(
                 SnapshotType::Full,
                 live_serial_paths.state(),
                 live_serial_paths.memory(),
-            )),
-            Err(NativeV2SnapshotPublicationError::Profile(
-                NativeV2StorageCandidateProfileError::NonCanonicalSerial
             ))
-        ));
+            .expect("live serial capture should no longer be rejected as noncanonical");
         assert_eq!(live_serial.starter.snapshot_serial_preflight_calls, 1);
         let live_serial_session = live_serial
             .started_session
             .as_ref()
-            .expect("live serial rejection should retain the source");
-        assert_eq!(live_serial_session.native_snapshot_publication_count, 0);
-        assert_eq!(live_serial_session.native_snapshot_producer_count, 0);
-        assert!(!live_serial_paths.state().exists());
-        assert!(!live_serial_paths.memory().exists());
+            .expect("live serial publication should retain the source");
+        assert_eq!(live_serial_session.native_snapshot_publication_count, 1);
+        assert_eq!(live_serial_session.native_snapshot_producer_count, 1);
+        assert!(live_serial_paths.state().exists());
+        assert!(live_serial_paths.memory().exists());
         live_serial_directory.assert_no_staging();
 
         let unavailable_directory = TempSnapshotDirectory::new("native-v2-process-no-session");
@@ -39175,9 +39837,9 @@ mod tests {
                 "v2-pause",
                 "v2-storage-normalize",
                 "v2-storage-transport",
-                "v2-storage-platform",
-                "v2-storage-compose",
-                "v2-storage-encode",
+                "v2-serial-platform",
+                "v2-serial-compose",
+                "v2-serial-encode",
                 "v2-recover",
                 "v2-published",
                 "aux-drop",
@@ -39221,7 +39883,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn native_v2_supervisor_rejects_noncanonical_uart_before_staging() {
+    fn native_v2_supervisor_publishes_complete_noncanonical_uart_state() {
         let control = FakeRunLoopControl::default();
         let drop_count = Arc::new(AtomicU64::new(0));
         let (max_steps_sender, max_steps_receiver) = mpsc::channel();
@@ -39240,7 +39902,7 @@ mod tests {
         let directory = TempSnapshotDirectory::new("native-v2-noncanonical-uart");
         let paths = directory.paths();
 
-        let error = supervisor
+        let outcome = supervisor
             .publish_native_v2_snapshot(
                 native_v2_test_capture_input(),
                 SerialConfig::default(),
@@ -39249,23 +39911,35 @@ mod tests {
                 &paths,
                 NativeV2SnapshotCaptureCancellation::default(),
             )
-            .expect_err("mutated UART state should fail closed");
-        assert!(matches!(
-            error.producer().map(|producer| producer.source()),
-            Some(NativeV2SnapshotPublicationProducerError::Capture(
-                NativeV2SnapshotCaptureError::NonCanonicalSerial
-            ))
-        ));
+            .expect("mutated UART state should publish as complete exact-2.7 state");
+        assert_eq!(outcome.family(), NativeSnapshotArtifactFamily::V2);
+        let (candidate, _) = load_native_snapshot_artifacts(&paths)
+            .expect("mutated UART pair should load")
+            .into_current_v2_candidate()
+            .expect("mutated UART pair should close as exact 2.7");
+        assert_eq!(candidate.serial().device().receive_bytes(), b"x");
         assert_eq!(
             events
                 .lock()
                 .expect("noncanonical UART events should lock")
                 .as_slice(),
-            ["aux-acquire", "v2-serial", "aux-drop"]
+            [
+                "aux-acquire",
+                "v2-serial",
+                "v2-pause",
+                "v2-storage-normalize",
+                "v2-storage-transport",
+                "v2-serial-platform",
+                "v2-serial-compose",
+                "v2-serial-encode",
+                "v2-recover",
+                "v2-published",
+                "aux-drop",
+            ]
         );
         assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
-        assert!(!paths.state().exists());
-        assert!(!paths.memory().exists());
+        assert!(paths.state().exists());
+        assert!(paths.memory().exists());
         directory.assert_no_staging();
 
         drop(supervisor);

@@ -3898,6 +3898,9 @@ impl PreparedPmemDevice {
             self.guest_range.start().raw_value(),
             self.guest_range.size(),
         );
+        // The rate limiter is live-mutable after this immutable mapping owner
+        // is prepared. Snapshot graph capture validates the controller value
+        // against the live device state; it is not part of backing identity.
         if self.id != config.id()
             || self.backing.is_read_only() != config.read_only()
             || self.mapping.is_read_only() != config.read_only()
@@ -3910,7 +3913,6 @@ impl PreparedPmemDevice {
                 .validate_alignment(VIRTIO_PMEM_ALIGNMENT)
                 .is_err()
             || self.config_space != expected_config_space
-            || self.rate_limiter != config.rate_limiter()
         {
             return Err(PmemSnapshotPersistenceError::ConfigurationMismatch);
         }
@@ -7663,10 +7665,19 @@ mod tests {
             config_space: VirtioPmemConfigSpace::new(range.start().raw_value(), range.size()),
             rate_limiter: config.rate_limiter(),
         };
+        let updated_config = config.updated(
+            &PmemUpdateInput::new(config.id(), config.id())
+                .with_rate_limiter(PmemRateLimiterConfig::new(
+                    None,
+                    Some(PmemTokenBucketConfig::new(2, Some(1), 100)),
+                ))
+                .validate()
+                .expect("live rate-limiter update should validate"),
+        );
 
         let binding = prepared
-            .snapshot_persistence_binding(&config)
-            .expect("writable pmem binding should validate");
+            .snapshot_persistence_binding(&updated_config)
+            .expect("writable pmem binding should survive live rate-limiter updates");
         assert!(!binding.is_read_only());
         assert_eq!(binding.file_len(), 4);
         assert_eq!(binding.mapped_len(), VIRTIO_PMEM_ALIGNMENT);
