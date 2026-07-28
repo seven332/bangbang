@@ -8512,7 +8512,7 @@
     {
       "id": "corpus:device-hotplug",
       "family": "runtime-device-management",
-      "summary": "Implement the complete pinned Developer Preview live-device contract for non-root virtio-block, virtio-pmem, and virtio-net under public all-virtio PCI. Running and Paused PUT/DELETE use one failure-atomic owner inventory, require manual guest rescan/removal, preserve type-scoped IDs and global network-MAC uniqueness, commit live configuration last, and release exact backing, packet-I/O, mapping, metrics, scheduler, dispatcher, BAR, MSI-X, and function ownership before shared capacity is reusable. Default MMIO rejects runtime mutation. Automatic guest notification and persistence of runtime-attached PCI devices remain outside the pinned live corpus and the supported native-v1 profile; current native-v2 independently supports only its exact startup root.",
+      "summary": "Implement the complete pinned Developer Preview live-device contract for non-root virtio-block, virtio-pmem, and virtio-net under public all-virtio PCI. Running and Paused PUT/DELETE use one failure-atomic owner inventory, require manual guest rescan/removal, preserve type-scoped IDs and global network-MAC uniqueness, commit live configuration last, and release exact backing, packet-I/O, mapping, metrics, scheduler, dispatcher, BAR, MSI-X, and function ownership before shared capacity is reusable. Default MMIO rejects runtime mutation. Automatic guest notification remains outside the pinned live corpus, and native-v1 retains no PCI state. Current native-v2 2.6 profile 3 persists startup- or runtime-origin regular-file block and pmem endpoints; network and every other optional device remain excluded.",
       "source_refs": [
         "corpus:device-hotplug"
       ],

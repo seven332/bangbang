@@ -95,10 +95,11 @@ notification, snapshot persistence for optional PCI devices other than pmem,
 external vmnet connectivity certification, and Firecracker's KVM ITS identity
 remain explicit limits.
 Current native-v2 create runs the complete paused live-storage preflight and
-then admits the exact singleton read-only File/Sync root over the process's
-selected MMIO or PCI transport. Load validates and reconstructs that same
-transport before root backing, controller, or VM publication; a destination
-transport mismatch still fails before mutation.
+then admits the exact profile-3 ordered regular-file block-and-pmem graph over
+the process's selected MMIO or PCI transport, with no root or one first
+cross-storage root. Load validates and reconstructs the complete transport,
+placement, and typed backing transaction before controller or VM publication;
+a destination transport mismatch still fails before mutation.
 
 File-backed drives accept an existing regular file or, on macOS, one exact
 block-special descriptor over MMIO and PCI with omitted/default `Sync` or

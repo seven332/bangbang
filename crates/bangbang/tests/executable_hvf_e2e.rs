@@ -12537,6 +12537,11 @@ mod macos_arm64 {
             expected.block_records().len(),
             "{context} record count"
         );
+        assert_eq!(
+            actual.pmem_records().len(),
+            expected.pmem_records().len(),
+            "{context} pmem record count"
+        );
         for (expected, actual) in expected.pmem_records().iter().zip(actual.pmem_records()) {
             assert_eq!(actual.key(), expected.key(), "{context} pmem key");
             assert_eq!(

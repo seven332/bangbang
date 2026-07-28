@@ -1971,7 +1971,7 @@ fn run_snapshot_epoch_paused_death_case(
             // SAFETY: The worker is the one live child of this unreaped launcher.
             assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
             assert_eq!(
-                running.wait("profile-2 worker-first death").code(),
+                running.wait("profile-3 worker-first death").code(),
                 Some(128 + libc::SIGKILL)
             );
         }
@@ -1983,12 +1983,12 @@ fn run_snapshot_epoch_paused_death_case(
             // observes authenticated lifecycle EOF independently.
             assert_eq!(unsafe { libc::kill(launcher, libc::SIGKILL) }, 0);
             assert_eq!(
-                running.wait("profile-2 launcher-first death").signal(),
+                running.wait("profile-3 launcher-first death").signal(),
                 Some(libc::SIGKILL)
             );
             assert!(
                 worker_exit.wait(PROCESS_TIMEOUT),
-                "profile-2 worker should observe launcher death"
+                "profile-3 worker should observe launcher death"
             );
         }
     }
