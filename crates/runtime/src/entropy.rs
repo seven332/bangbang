@@ -160,7 +160,7 @@ impl EntropyTokenBucketConfig {
         TokenBucketConfig::new(self.size, self.one_time_burst, self.refill_time)
     }
 
-    const fn is_enabled(self) -> bool {
+    pub(crate) const fn is_enabled(self) -> bool {
         self.token_bucket_config().is_enabled()
     }
 }

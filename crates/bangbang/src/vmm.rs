@@ -6093,6 +6093,11 @@ where
                     return Err(NativeV2SnapshotLoadError::Cancelled);
                 }
             }
+            NativeV2SnapshotArtifactProfile::EntropyStateV2_8 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
         }
 
         let (state, state_id, memory_id) = prepared.into_parts();
@@ -6332,6 +6337,9 @@ where
                 self.started_session = Some(session);
                 Ok(self.controller.commit_snapshot_v2_load(controller_commit))
             }
+            NativeV2SnapshotArtifactProfile::EntropyStateV2_8 => Err(
+                NativeV2SnapshotLoadError::Preflight(VmmActionError::SnapshotUnsupported),
+            ),
         }
     }
 
@@ -7696,6 +7704,11 @@ impl HvfInstanceStartExecutor {
             NativeV2SnapshotArtifactProfile::SerialStateV2_7 => {
                 NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
             }
+            NativeV2SnapshotArtifactProfile::EntropyStateV2_8 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
         };
         let structural = decode_snapshot_v2_state_with_compatibility_version(bytes, version)
             .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
@@ -7719,6 +7732,11 @@ impl HvfInstanceStartExecutor {
             NativeV2SnapshotArtifactProfile::SerialStateV2_7 => {
                 decode_hvf_snapshot_v2_serial_state(&structural)
                     .map_err(NativeV2SnapshotLoadError::Decode)?;
+            }
+            NativeV2SnapshotArtifactProfile::EntropyStateV2_8 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
             }
         }
         Ok(())

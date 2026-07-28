@@ -13,17 +13,22 @@ use crate::snapshot_device_v2::{
 #[cfg(target_os = "macos")]
 use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 #[cfg(target_os = "macos")]
+use crate::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
+#[cfg(target_os = "macos")]
 use crate::snapshot_format_v2::{
-    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY,
-    NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
-    SnapshotV2ComponentKey, encode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_ENTROPY_COMPONENT_KEY,
+    NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component,
+    SnapshotV2ComponentDisposition, SnapshotV2ComponentKey,
+    encode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory_v2::{
     write_snapshot_v2_memory_image, write_snapshot_v2_memory_image_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
-use crate::snapshot_serial_v2_7::SnapshotV2SerialState;
+use crate::snapshot_serial_v2_7::{
+    NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
+};
 
 #[cfg(target_os = "macos")]
 use std::fs;
@@ -349,6 +354,206 @@ fn current_v2_artifact_boundary_rejects_duplicate_and_nonsemantic_serial_state()
         Err(NativeSnapshotArtifactStateError::CurrentV2Profile(
             NativeV2SnapshotCandidateStateError::InvalidSerialComponent
         ))
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_eight_candidate_classifies_all_optional_storage_entropy_combinations() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact 2.8 memory should encode internally");
+    let storage_payload = fixture_bytes(include_str!(
+        "../snapshot_device_v2_6/fixtures/block-root-mmio.hex"
+    ));
+    let entropy_payload = fixture_bytes(include_str!(
+        "../snapshot_entropy_v2_8/fixtures/inactive-mmio.hex"
+    ));
+    let binding_payload = binding.encode().expect("exact 2.8 binding should encode");
+    let missing_serial_components = [
+        SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &binding_payload,
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_ENTROPY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &entropy_payload,
+        ),
+    ];
+    let missing_serial = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &missing_serial_components,
+    )
+    .expect("missing serial should remain structurally encodable");
+    assert!(matches!(
+        NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(missing_serial),
+        Err(NativeV2SnapshotCandidateStateError::MissingSerialState)
+    ));
+
+    let invalid_serial_components = [
+        SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &binding_payload,
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_SERIAL_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            b"invalid-serial",
+        ),
+    ];
+    let invalid_serial = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &invalid_serial_components,
+    )
+    .expect("invalid nested serial should remain structurally encodable");
+    assert!(matches!(
+        NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(invalid_serial),
+        Err(NativeV2SnapshotCandidateStateError::SerialState(_))
+    ));
+
+    for (with_storage, with_entropy) in [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let entropy_components = if with_entropy {
+            vec![(
+                NATIVE_V2_ENTROPY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                entropy_payload.as_slice(),
+            )]
+        } else {
+            Vec::new()
+        };
+        let bytes = entropy_v2_8_state(
+            &binding,
+            with_storage.then_some(storage_payload.as_slice()),
+            &entropy_components,
+        )
+        .expect("exact 2.8 fixture should encode");
+        assert!(
+            NativeSnapshotArtifactState::from_current_v2(bytes.clone()).is_err(),
+            "exact 2.8 must not gain current publication authority"
+        );
+        assert!(
+            NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone()).is_err(),
+            "public compatible file loading must remain capped at exact 2.7"
+        );
+
+        let candidate =
+            NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(bytes.clone())
+                .expect("exact 2.8 candidate should validate");
+        assert_eq!(
+            candidate.version(),
+            NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
+        );
+        assert_eq!(candidate.memory_binding(), &binding);
+        assert_eq!(candidate.device_graph().is_some(), with_storage);
+        assert_eq!(candidate.entropy().is_some(), with_entropy);
+        assert_eq!(candidate.bytes(), bytes);
+
+        let compatible = candidate.into_compatible_artifact_state();
+        assert_eq!(
+            compatible
+                .v2_profile()
+                .expect("compatible exact 2.8 state should classify"),
+            NativeV2SnapshotArtifactProfile::EntropyStateV2_8
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_eight_candidate_rejects_component_and_nested_version_mismatches() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact 2.8 memory should encode internally");
+    let entropy_payload = fixture_bytes(include_str!(
+        "../snapshot_entropy_v2_8/fixtures/inactive-mmio.hex"
+    ));
+
+    for components in [
+        vec![(
+            SnapshotV2ComponentKey::new(NATIVE_V2_ENTROPY_COMPONENT_KEY.kind(), 1),
+            SnapshotV2ComponentDisposition::Semantic,
+            entropy_payload.as_slice(),
+        )],
+        vec![(
+            NATIVE_V2_ENTROPY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::NonSemantic,
+            entropy_payload.as_slice(),
+        )],
+        vec![
+            (
+                NATIVE_V2_ENTROPY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                entropy_payload.as_slice(),
+            ),
+            (
+                SnapshotV2ComponentKey::new(NATIVE_V2_ENTROPY_COMPONENT_KEY.kind(), 1),
+                SnapshotV2ComponentDisposition::Semantic,
+                entropy_payload.as_slice(),
+            ),
+        ],
+    ] {
+        let bytes = entropy_v2_8_state(&binding, None, &components)
+            .expect("structural exact 2.8 fixture should encode");
+        assert!(matches!(
+            NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(bytes),
+            Err(NativeV2SnapshotCandidateStateError::InvalidEntropyComponent)
+        ));
+    }
+
+    let invalid_payload = [0_u8; 160];
+    let invalid = entropy_v2_8_state(
+        &binding,
+        None,
+        &[(
+            NATIVE_V2_ENTROPY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            invalid_payload.as_slice(),
+        )],
+    )
+    .expect("invalid nested entropy should remain structurally encodable");
+    assert!(matches!(
+        NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(invalid),
+        Err(NativeV2SnapshotCandidateStateError::EntropyState(_))
+    ));
+
+    let wrong_storage = fixture_bytes(include_str!(
+        "../snapshot_device_v2_5/fixtures/root-mmio.hex"
+    ));
+    let wrong_storage = entropy_v2_8_state(&binding, Some(&wrong_storage), &[])
+        .expect("cross-profile storage should remain structurally encodable");
+    assert!(matches!(
+        NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(wrong_storage),
+        Err(NativeV2SnapshotCandidateStateError::StorageDeviceGraph(_))
+    ));
+
+    let mut current_image = Cursor::new(Vec::new());
+    let current_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut current_image,
+        NATIVE_V2_SNAPSHOT_VERSION,
+    )
+    .expect("current memory fixture should encode");
+    let mismatched = entropy_v2_8_state(&current_binding, None, &[])
+        .expect("mismatch should encode structurally");
+    assert!(matches!(
+        NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(mismatched),
+        Err(NativeV2SnapshotCandidateStateError::VersionMismatch { .. })
     ));
 }
 
@@ -2723,6 +2928,54 @@ fn current_v2_state(binding: &SnapshotV2MemoryBinding) -> Result<Vec<u8>, String
     ];
     encode_snapshot_v2_state_with_compatibility_version(
         NATIVE_V2_SNAPSHOT_VERSION,
+        &[],
+        &components,
+    )
+    .map_err(|source| source.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn entropy_v2_8_state(
+    binding: &SnapshotV2MemoryBinding,
+    storage_payload: Option<&[u8]>,
+    entropy_components: &[(
+        SnapshotV2ComponentKey,
+        SnapshotV2ComponentDisposition,
+        &[u8],
+    )],
+) -> Result<Vec<u8>, String> {
+    let binding_payload = binding.encode().map_err(|source| source.to_string())?;
+    let serial_device = SerialMmioDevice::discarding()
+        .capture_state()
+        .map_err(|source| source.to_string())?;
+    let serial_payload = SnapshotV2SerialState::try_from_capture_ready(
+        CaptureReadySerialState::new(SerialConfig::default(), serial_device),
+    )
+    .map_err(|source| source.to_string())?
+    .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+    .map_err(|source| source.to_string())?;
+    let mut components = vec![SnapshotV2Component::new(
+        NATIVE_V2_MEMORY_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &binding_payload,
+    )];
+    if let Some(storage_payload) = storage_payload {
+        components.push(SnapshotV2Component::new(
+            NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            storage_payload,
+        ));
+    }
+    components.push(SnapshotV2Component::new(
+        NATIVE_V2_SERIAL_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &serial_payload,
+    ));
+    for (key, disposition, payload) in entropy_components {
+        components.push(SnapshotV2Component::new(*key, *disposition, payload));
+    }
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
         &[],
         &components,
     )

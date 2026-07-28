@@ -28,6 +28,10 @@ use crate::snapshot_device_v2_6::{
     NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
     SnapshotV2StorageDeviceGraphDecodeError,
 };
+use crate::snapshot_entropy_v2_8::{
+    NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, SnapshotV2EntropyState,
+    SnapshotV2EntropyStateDecodeError,
+};
 #[cfg(target_os = "macos")]
 use crate::snapshot_format::NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES;
 use crate::snapshot_format::{
@@ -35,9 +39,10 @@ use crate::snapshot_format::{
     SnapshotFormatVersion, decode_native_snapshot_state,
 };
 use crate::snapshot_format_v2::{
-    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
-    NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2ComponentDisposition,
-    SnapshotV2DecodeError, decode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_ENTROPY_COMPONENT_KEY,
+    NATIVE_V2_LEGACY_PLATFORM_VERSION, NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION,
+    SnapshotV2ComponentDisposition, SnapshotV2DecodeError,
+    decode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_format_v2::{NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES, decode_snapshot_v2_state};
@@ -92,6 +97,8 @@ pub enum NativeV2SnapshotArtifactProfile {
     StorageDeviceGraphV2_6,
     /// Exact 2.7 serial profile with optional unchanged profile-3 storage.
     SerialStateV2_7,
+    /// Exact 2.8 profile with required serial and optional storage/entropy.
+    EntropyStateV2_8,
 }
 
 /// Validation failure for one owned native snapshot artifact state.
@@ -672,6 +679,113 @@ impl fmt::Debug for NativeV2SerialSnapshotCandidateState {
     }
 }
 
+/// One closed exact native-v2 2.8 entropy candidate.
+///
+/// The required unchanged serial singleton, optional unchanged profile-3
+/// storage graph, optional entropy singleton, and memory binding are all
+/// derived from the same immutable bytes. This compatible value does not
+/// grant current-public publication authority.
+pub struct NativeV2EntropySnapshotCandidateState {
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+}
+
+impl NativeV2EntropySnapshotCandidateState {
+    /// Validates and retains one exact native-v2 2.8 state.
+    pub fn from_entropy_state_v2_8(
+        bytes: Vec<u8>,
+    ) -> Result<Self, NativeV2SnapshotCandidateStateError> {
+        let (binding, device_graph, serial, entropy) = decode_entropy_state_v2_8(&bytes)?;
+        Ok(Self {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+        })
+    }
+
+    /// Returns the exact candidate compatibility version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
+    }
+
+    /// Returns the immutable encoded state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the memory commitment derived from the encoded state.
+    pub const fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.binding
+    }
+
+    /// Returns the optional unchanged profile-3 storage graph.
+    pub const fn device_graph(&self) -> Option<&SnapshotV2StorageDeviceGraph> {
+        self.device_graph.as_ref()
+    }
+
+    /// Returns the required unchanged exact-2.7 serial state.
+    pub const fn serial(&self) -> &SnapshotV2SerialState {
+        &self.serial
+    }
+
+    /// Returns the optional exact-2.8 entropy state.
+    pub const fn entropy(&self) -> Option<&SnapshotV2EntropyState> {
+        self.entropy.as_ref()
+    }
+
+    /// Consumes the candidate into its exact committed components.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<u8>,
+        SnapshotV2MemoryBinding,
+        Option<SnapshotV2StorageDeviceGraph>,
+        SnapshotV2SerialState,
+        Option<SnapshotV2EntropyState>,
+    ) {
+        (
+            self.bytes,
+            self.binding,
+            self.device_graph,
+            self.serial,
+            self.entropy,
+        )
+    }
+
+    /// Consumes this exact 2.8 candidate into compatible artifact state.
+    ///
+    /// Publication still rechecks the exact current 2.7 authority.
+    pub fn into_compatible_artifact_state(self) -> NativeSnapshotArtifactState {
+        let (bytes, binding, _, _, _) = self.into_parts();
+        NativeSnapshotArtifactState {
+            inner: NativeSnapshotArtifactStateInner::V2 {
+                bytes,
+                version: NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                binding,
+            },
+        }
+    }
+}
+
+impl fmt::Debug for NativeV2EntropySnapshotCandidateState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2EntropySnapshotCandidateState")
+            .field("version", &self.version())
+            .field("has_storage", &self.device_graph.is_some())
+            .field("has_entropy", &self.entropy.is_some())
+            .field("state", &REDACTED)
+            .field("memory_binding", &REDACTED)
+            .field("serial", &REDACTED)
+            .finish()
+    }
+}
+
 fn decode_device_graph_v2_4(
     bytes: &[u8],
 ) -> Result<(SnapshotV2MemoryBinding, SnapshotV2DeviceGraph), NativeV2SnapshotCandidateStateError> {
@@ -838,13 +952,108 @@ fn decode_serial_state_v2_7(
     Ok((binding, device_graph, serial))
 }
 
+fn decode_entropy_state_v2_8(
+    bytes: &[u8],
+) -> Result<
+    (
+        SnapshotV2MemoryBinding,
+        Option<SnapshotV2StorageDeviceGraph>,
+        SnapshotV2SerialState,
+        Option<SnapshotV2EntropyState>,
+    ),
+    NativeV2SnapshotCandidateStateError,
+> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        bytes,
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+    )
+    .map_err(NativeV2SnapshotCandidateStateError::Format)?;
+    let version = state.metadata().version();
+    if version != NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION {
+        return Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version });
+    }
+    let binding = decode_snapshot_v2_memory_binding(&state)
+        .map_err(NativeV2SnapshotCandidateStateError::Memory)?;
+    if binding.version() != version {
+        return Err(NativeV2SnapshotCandidateStateError::VersionMismatch {
+            state: version,
+            memory: binding.version(),
+        });
+    }
+
+    let mut graph_components = state
+        .components()
+        .filter(|component| component.key().kind() == NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind());
+    let graph = graph_components.next();
+    if graph_components.next().is_some()
+        || graph.is_some_and(|component| {
+            component.key() != NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY
+                || component.disposition() != SnapshotV2ComponentDisposition::Semantic
+        })
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidDeviceGraphComponent);
+    }
+    let device_graph = graph
+        .map(|component| {
+            SnapshotV2StorageDeviceGraph::decode(
+                NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                component.payload(),
+            )
+            .map_err(NativeV2SnapshotCandidateStateError::StorageDeviceGraph)
+        })
+        .transpose()?;
+
+    let mut serial_components = state
+        .components()
+        .filter(|component| component.key().kind() == NATIVE_V2_SERIAL_COMPONENT_KEY.kind());
+    let serial = serial_components
+        .next()
+        .ok_or(NativeV2SnapshotCandidateStateError::MissingSerialState)?;
+    if serial_components.next().is_some()
+        || serial.key() != NATIVE_V2_SERIAL_COMPONENT_KEY
+        || serial.disposition() != SnapshotV2ComponentDisposition::Semantic
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidSerialComponent);
+    }
+    let serial = SnapshotV2SerialState::decode(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        serial.payload(),
+    )
+    .map_err(NativeV2SnapshotCandidateStateError::SerialState)?;
+
+    let mut entropy_components = state
+        .components()
+        .filter(|component| component.key().kind() == NATIVE_V2_ENTROPY_COMPONENT_KEY.kind());
+    let entropy = entropy_components.next();
+    if entropy_components.next().is_some()
+        || entropy.is_some_and(|component| {
+            component.key() != NATIVE_V2_ENTROPY_COMPONENT_KEY
+                || component.disposition() != SnapshotV2ComponentDisposition::Semantic
+        })
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidEntropyComponent);
+    }
+    let entropy = entropy
+        .map(|component| {
+            SnapshotV2EntropyState::decode(
+                NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                component.payload(),
+            )
+            .map_err(NativeV2SnapshotCandidateStateError::EntropyState)
+        })
+        .transpose()?;
+    Ok((binding, device_graph, serial, entropy))
+}
+
 fn classify_native_v2_profile(
     bytes: &[u8],
     expected_binding: &SnapshotV2MemoryBinding,
 ) -> Result<NativeV2SnapshotArtifactProfile, NativeV2SnapshotCandidateStateError> {
-    let state =
-        decode_snapshot_v2_state_with_compatibility_version(bytes, NATIVE_V2_SNAPSHOT_VERSION)
-            .map_err(NativeV2SnapshotCandidateStateError::Format)?;
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        bytes,
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+    )
+    .map_err(NativeV2SnapshotCandidateStateError::Format)?;
     let version = state.metadata().version();
     let binding = decode_snapshot_v2_memory_binding(&state)
         .map_err(NativeV2SnapshotCandidateStateError::Memory)?;
@@ -914,6 +1123,10 @@ fn classify_native_v2_profile(
                 .map_err(NativeV2SnapshotCandidateStateError::SerialState)?;
             Ok(NativeV2SnapshotArtifactProfile::SerialStateV2_7)
         }
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION => {
+            decode_entropy_state_v2_8(bytes)?;
+            Ok(NativeV2SnapshotArtifactProfile::EntropyStateV2_8)
+        }
         _ => Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version }),
     }
 }
@@ -965,6 +1178,10 @@ pub enum NativeV2SnapshotCandidateStateError {
     InvalidSerialComponent,
     /// The required serial-state payload is invalid.
     SerialState(SnapshotV2SerialStateDecodeError),
+    /// An exact-2.8 entropy component is not one semantic singleton.
+    InvalidEntropyComponent,
+    /// The optional entropy-state payload is invalid.
+    EntropyState(SnapshotV2EntropyStateDecodeError),
 }
 
 impl fmt::Display for NativeV2SnapshotCandidateStateError {
@@ -1021,6 +1238,15 @@ impl fmt::Display for NativeV2SnapshotCandidateStateError {
                     "invalid native-v2 candidate serial state: {source}"
                 )
             }
+            Self::InvalidEntropyComponent => {
+                formatter.write_str("native-v2 candidate entropy component is invalid")
+            }
+            Self::EntropyState(source) => {
+                write!(
+                    formatter,
+                    "invalid native-v2 candidate entropy state: {source}"
+                )
+            }
         }
     }
 }
@@ -1034,12 +1260,14 @@ impl std::error::Error for NativeV2SnapshotCandidateStateError {
             Self::MultiBlockDeviceGraph(source) => Some(source),
             Self::StorageDeviceGraph(source) => Some(source),
             Self::SerialState(source) => Some(source),
+            Self::EntropyState(source) => Some(source),
             Self::UnexpectedVersion { .. }
             | Self::VersionMismatch { .. }
             | Self::MissingDeviceGraph
             | Self::InvalidDeviceGraphComponent
             | Self::MissingSerialState
-            | Self::InvalidSerialComponent => None,
+            | Self::InvalidSerialComponent
+            | Self::InvalidEntropyComponent => None,
         }
     }
 }
