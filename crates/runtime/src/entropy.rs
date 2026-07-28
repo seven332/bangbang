@@ -259,6 +259,13 @@ pub struct EntropyMmioDeviceRegistration {
 }
 
 impl EntropyMmioDeviceRegistration {
+    /// Reconstructs registration metadata for a checked, already retained
+    /// MMIO region without publishing it.
+    #[doc(hidden)]
+    pub const fn from_restored(region: MmioRegion) -> Self {
+        Self { region }
+    }
+
     pub const fn region(&self) -> MmioRegion {
         self.region
     }

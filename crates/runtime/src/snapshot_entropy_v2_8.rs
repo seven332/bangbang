@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use crate::entropy::{
     EntropyConfig, EntropyRateLimiterConfig, EntropyTokenBucketConfig, VIRTIO_RNG_DEVICE_ID,
-    VIRTIO_RNG_QUEUE_SIZE, VirtioRngDevice, VirtioRngDeviceCaptureState, VirtioRngMmioCaptureState,
-    VirtioRngPciCaptureState, VirtioRngQueue, VirtioRngRateLimiter,
-    VirtioRngRateLimiterRestoreState, VirtioRngRetryCaptureState, VirtioRngTokenBucketCaptureState,
-    VirtioRngTokenBucketRestoreState,
+    VIRTIO_RNG_QUEUE_SIZE, VIRTIO_RNG_QUEUE_SIZES, VirtioRngDevice, VirtioRngDeviceCaptureState,
+    VirtioRngMmioCaptureState, VirtioRngMmioHandler, VirtioRngPciCaptureState, VirtioRngQueue,
+    VirtioRngRateLimiter, VirtioRngRateLimiterRestoreState, VirtioRngRetryCaptureState,
+    VirtioRngTokenBucketCaptureState, VirtioRngTokenBucketRestoreState,
 };
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestMemory, GuestMemoryRange};
@@ -625,6 +625,48 @@ impl SnapshotV2EntropyRestorePlan {
             self.transport,
         )
     }
+
+    /// Consumes a checked MMIO plan into one complete inert register handler.
+    ///
+    /// The returned value still owns no dispatcher registration, interrupt
+    /// route, entropy source, metrics, scheduler, notifier, or VM authority.
+    #[doc(hidden)]
+    pub fn into_mmio_handler(
+        self,
+    ) -> Result<PreparedSnapshotV2EntropyMmioHandler, SnapshotV2EntropyMmioHandlerError> {
+        let Self {
+            config,
+            queue_ranges,
+            retry,
+            retry_deadline,
+            transport,
+        } = self;
+        let PreparedSnapshotV2EntropyTransport::Mmio(mmio) = transport else {
+            return Err(SnapshotV2EntropyMmioHandlerError::WrongTransport);
+        };
+        let (region, interrupt_line, device, retained) = mmio.into_parts();
+        let activation_is_active = device.is_activated();
+        let mut handler = VirtioRngMmioHandler::with_activation(
+            VIRTIO_RNG_DEVICE_ID,
+            0,
+            &VIRTIO_RNG_QUEUE_SIZES,
+            device,
+        )
+        .map_err(|_| SnapshotV2EntropyMmioHandlerError::Handler)?;
+        handler
+            .restore_transport_state(&retained, activation_is_active)
+            .map_err(|_| SnapshotV2EntropyMmioHandlerError::Transport)?;
+
+        Ok(PreparedSnapshotV2EntropyMmioHandler {
+            config,
+            queue_ranges,
+            retry,
+            retry_deadline,
+            region,
+            interrupt_line,
+            handler,
+        })
+    }
 }
 
 impl fmt::Debug for SnapshotV2EntropyRestorePlan {
@@ -715,6 +757,120 @@ impl fmt::Debug for PreparedSnapshotV2EntropyMmioTransport {
             .finish()
     }
 }
+
+/// One checked, complete, and still unpublished MMIO entropy handler.
+///
+/// Destination-local source, metrics, scheduler, notifier, interrupt, VM, and
+/// publication owners are intentionally absent.
+#[doc(hidden)]
+pub struct PreparedSnapshotV2EntropyMmioHandler {
+    config: EntropyConfig,
+    queue_ranges: Option<[GuestMemoryRange; 3]>,
+    retry: SnapshotV2EntropyRetryState,
+    retry_deadline: Option<Instant>,
+    region: MmioRegion,
+    interrupt_line: GuestInterruptLine,
+    handler: VirtioRngMmioHandler,
+}
+
+impl PreparedSnapshotV2EntropyMmioHandler {
+    /// Returns the exact public entropy configuration.
+    pub const fn config(&self) -> EntropyConfig {
+        self.config
+    }
+
+    /// Returns the loaded-memory ranges occupied by an active queue.
+    pub const fn queue_ranges(&self) -> Option<[GuestMemoryRange; 3]> {
+        self.queue_ranges
+    }
+
+    /// Returns the retained retry disposition.
+    pub const fn retry(&self) -> SnapshotV2EntropyRetryState {
+        self.retry
+    }
+
+    /// Returns the destination-local retry deadline without scheduling it.
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_deadline
+    }
+
+    /// Returns the exact retained MMIO region.
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    /// Returns the exact retained guest interrupt line.
+    pub const fn interrupt_line(&self) -> GuestInterruptLine {
+        self.interrupt_line
+    }
+
+    /// Returns the fully restored, still-unpublished handler.
+    pub const fn handler(&self) -> &VirtioRngMmioHandler {
+        &self.handler
+    }
+
+    /// Consumes the value into continuation, placement, and inert handler.
+    pub fn into_parts(
+        self,
+    ) -> (
+        EntropyConfig,
+        Option<[GuestMemoryRange; 3]>,
+        SnapshotV2EntropyRetryState,
+        Option<Instant>,
+        MmioRegion,
+        GuestInterruptLine,
+        VirtioRngMmioHandler,
+    ) {
+        (
+            self.config,
+            self.queue_ranges,
+            self.retry,
+            self.retry_deadline,
+            self.region,
+            self.interrupt_line,
+            self.handler,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2EntropyMmioHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2EntropyMmioHandler")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Failure while materializing a checked entropy plan as an MMIO handler.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum SnapshotV2EntropyMmioHandlerError {
+    /// The checked plan selects PCI rather than MMIO.
+    WrongTransport,
+    /// The fixed virtio-rng handler could not be built.
+    Handler,
+    /// The retained common MMIO state could not be applied.
+    Transport,
+}
+
+impl fmt::Debug for SnapshotV2EntropyMmioHandlerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2EntropyMmioHandlerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::WrongTransport => "native-v2 entropy restore plan is not MMIO",
+            Self::Handler => "native-v2 entropy MMIO handler construction failed",
+            Self::Transport => "native-v2 entropy MMIO handler state is invalid",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2EntropyMmioHandlerError {}
 
 /// Checked value-only PCI entropy continuation.
 pub struct PreparedSnapshotV2EntropyPciTransport {

@@ -37,10 +37,11 @@ use bangbang_runtime::boot_timer::{
     BootTimerMmioLayout, BootTimerMmioRegistrationError, register_boot_timer_mmio,
 };
 use bangbang_runtime::entropy::{
-    EntropyConfig, EntropyMmioLayout, VIRTIO_RNG_DEVICE_ID, VIRTIO_RNG_QUEUE_SIZES,
-    VirtioRngDevice, VirtioRngDeviceNotificationError, VirtioRngEntropySource,
-    VirtioRngEntropySourceError, VirtioRngMmioCaptureState, VirtioRngOsEntropySource,
-    VirtioRngPciCaptureError, VirtioRngPciCaptureState, VirtioRngRetryCaptureState,
+    EntropyConfig, EntropyMmioDeviceRegistration, EntropyMmioLayout, VIRTIO_RNG_DEVICE_ID,
+    VIRTIO_RNG_QUEUE_SIZES, VirtioRngDevice, VirtioRngDeviceNotificationError,
+    VirtioRngEntropySource, VirtioRngEntropySourceError, VirtioRngMmioCaptureState,
+    VirtioRngOsEntropySource, VirtioRngPciCaptureError, VirtioRngPciCaptureState,
+    VirtioRngRetryCaptureState,
 };
 use bangbang_runtime::fdt::{
     Arm64FdtCacheHierarchy, Arm64FdtError, Arm64FdtGuestMemoryWrite, Arm64FdtRegion,
@@ -123,7 +124,8 @@ use bangbang_runtime::snapshot_device_v2_6::{
     SnapshotV2StoragePciTransportError,
 };
 use bangbang_runtime::snapshot_entropy_v2_8::{
-    NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, SnapshotV2EntropyState,
+    NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2EntropyMmioHandler,
+    SnapshotV2EntropyMmioHandlerError, SnapshotV2EntropyRestorePlan, SnapshotV2EntropyState,
     SnapshotV2EntropyStateCaptureError,
 };
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
@@ -138,7 +140,7 @@ use bangbang_runtime::startup::{
     Arm64BootBalloonNotificationDispatchError, Arm64BootBalloonNotificationDispatches,
     Arm64BootBlockDevice, Arm64BootBlockNotificationDispatch,
     Arm64BootBlockNotificationDispatchError, Arm64BootBlockNotificationDispatches,
-    Arm64BootBlockWakeupFdsError, Arm64BootEntropyCaptureError,
+    Arm64BootBlockWakeupFdsError, Arm64BootEntropyCaptureError, Arm64BootEntropyDevice,
     Arm64BootEntropyDeviceConfig as RuntimeArm64BootEntropyDeviceConfig,
     Arm64BootEntropyNotificationDispatch, Arm64BootEntropyNotificationDispatchError,
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
@@ -253,11 +255,14 @@ use crate::snapshot_v2_platform::{
     restore_hvf_snapshot_v2_multi_block_mmio_process_platform,
     restore_hvf_snapshot_v2_multi_block_pci_process_platform,
     restore_hvf_snapshot_v2_root_process_platform,
+    restore_hvf_snapshot_v2_serial_entropy_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_only_process_platform,
+    restore_hvf_snapshot_v2_serial_storage_entropy_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_storage_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_storage_pci_process_platform,
     restore_hvf_snapshot_v2_storage_mmio_process_platform,
     restore_hvf_snapshot_v2_storage_pci_process_platform,
+    snapshot_v2_queue_ranges_conflict_with_platform,
 };
 use crate::snapshot_v2_storage_platform::{
     HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioPlatformPlanParts,
@@ -3492,6 +3497,283 @@ impl HvfArm64BootSerialInput {
 enum HvfSnapshotV2StorageProcessShell {
     Default(HvfSnapshotV2DefaultProcessShell),
     Restored(HvfSnapshotV2RestoredSerialShell),
+    RestoredEntropyMmio {
+        shell: HvfSnapshotV2RestoredSerialShell,
+        interrupt_line: GuestInterruptLine,
+    },
+}
+
+enum HvfSnapshotV2SerialProcessShell {
+    SerialOnly {
+        shell: HvfSnapshotV2RestoredSerialShell,
+        process: HvfSnapshotV2SerialOnlyProcessConfig,
+    },
+    EntropyMmio {
+        shell: HvfSnapshotV2RestoredSerialShell,
+        interrupt_line: GuestInterruptLine,
+    },
+}
+
+impl HvfSnapshotV2SerialProcessShell {
+    const fn pci_enabled(&self) -> bool {
+        match self {
+            Self::SerialOnly { process, .. } => process.pci_enabled(),
+            Self::EntropyMmio { .. } => false,
+        }
+    }
+}
+
+/// One complete, still-unpublished exact-2.8 MMIO entropy destination.
+#[doc(hidden)]
+pub struct RestoredHvfSnapshotV2EntropyMmioOwners {
+    session: OwnedHvfArm64BootSession,
+    entropy_config: EntropyConfig,
+    storage_configs: Option<CaptureReadyStorageConfigs>,
+}
+
+impl RestoredHvfSnapshotV2EntropyMmioOwners {
+    /// Returns the complete Paused destination session.
+    pub const fn session(&self) -> &OwnedHvfArm64BootSession {
+        &self.session
+    }
+
+    /// Returns the exact public entropy configuration.
+    pub const fn entropy_config(&self) -> EntropyConfig {
+        self.entropy_config
+    }
+
+    /// Returns restored storage configuration when storage shares the owner.
+    pub const fn storage_configs(&self) -> Option<&CaptureReadyStorageConfigs> {
+        self.storage_configs.as_ref()
+    }
+
+    /// Consumes all restored owners without discarding configuration.
+    pub fn into_parts(
+        self,
+    ) -> (
+        OwnedHvfArm64BootSession,
+        EntropyConfig,
+        Option<CaptureReadyStorageConfigs>,
+    ) {
+        (self.session, self.entropy_config, self.storage_configs)
+    }
+}
+
+impl fmt::Debug for RestoredHvfSnapshotV2EntropyMmioOwners {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoredHvfSnapshotV2EntropyMmioOwners")
+            .field("has_storage", &self.storage_configs.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Stage at which exact-2.8 MMIO entropy owner reconstruction stopped.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2EntropyMmioRestoreStage {
+    Handler,
+    SerialPlatform,
+    StoragePlatform,
+    ResourcePlan,
+    InterruptRoute,
+    Registration,
+    RetryScheduler,
+}
+
+/// Primary exact-2.8 MMIO entropy owner reconstruction failure.
+#[doc(hidden)]
+pub enum HvfSnapshotV2EntropyMmioRestoreFailure {
+    Handler(SnapshotV2EntropyMmioHandlerError),
+    SerialPlatform(Box<HvfSnapshotV2SerialOnlyRestoreError>),
+    StoragePlatform(Box<HvfSnapshotV2StorageMmioRestoreError>),
+    Allocation,
+    ResourcePlan,
+    InterruptRoute(HvfGicSpiSignalError),
+    DispatcherUnavailable,
+    Registration(MmioRegistrationError),
+    RetryScheduler(io::ErrorKind),
+    InjectedRetryScheduler,
+}
+
+impl fmt::Debug for HvfSnapshotV2EntropyMmioRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Handler(_) => "handler",
+            Self::SerialPlatform(_) => "serial-platform",
+            Self::StoragePlatform(_) => "storage-platform",
+            Self::Allocation => "allocation",
+            Self::ResourcePlan => "resource-plan",
+            Self::InterruptRoute(_) => "interrupt-route",
+            Self::DispatcherUnavailable => "dispatcher",
+            Self::Registration(_) => "registration",
+            Self::RetryScheduler(_) => "retry-scheduler",
+            Self::InjectedRetryScheduler => "injected-retry-scheduler",
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2EntropyMmioRestoreFailure")
+            .field("kind", &kind)
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2EntropyMmioRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Handler(_) => "exact-2.8 entropy handler reconstruction failed",
+            Self::SerialPlatform(_) => "serial-only HVF platform reconstruction failed",
+            Self::StoragePlatform(_) => "storage-bearing HVF platform reconstruction failed",
+            Self::Allocation => "exact-2.8 entropy owner allocation failed",
+            Self::ResourcePlan => "exact-2.8 entropy resource plan diverged",
+            Self::InterruptRoute(_) => "exact-2.8 entropy interrupt route is invalid",
+            Self::DispatcherUnavailable => "exact-2.8 entropy MMIO dispatcher is unavailable",
+            Self::Registration(_) => "exact-2.8 entropy MMIO registration failed",
+            Self::RetryScheduler(kind) => {
+                return write!(
+                    formatter,
+                    "exact-2.8 entropy retry scheduler startup failed: {kind:?}"
+                );
+            }
+            Self::InjectedRetryScheduler => {
+                "exact-2.8 entropy retry scheduler certification fault was injected"
+            }
+        })
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2EntropyMmioRestoreFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Handler(source) => Some(source),
+            Self::SerialPlatform(source) => Some(source.as_ref()),
+            Self::StoragePlatform(source) => Some(source.as_ref()),
+            Self::InterruptRoute(source) => Some(source),
+            Self::Registration(source) => Some(source),
+            Self::Allocation
+            | Self::ResourcePlan
+            | Self::DispatcherUnavailable
+            | Self::RetryScheduler(_)
+            | Self::InjectedRetryScheduler => None,
+        }
+    }
+}
+
+/// Redacted exact-2.8 MMIO entropy owner failure and cleanup evidence.
+#[doc(hidden)]
+pub struct HvfSnapshotV2EntropyMmioRestoreError {
+    stage: HvfSnapshotV2EntropyMmioRestoreStage,
+    failure: Box<HvfSnapshotV2EntropyMmioRestoreFailure>,
+    committed: bool,
+    cleanup: Option<Box<HvfArm64BootSessionShutdownError>>,
+}
+
+impl HvfSnapshotV2EntropyMmioRestoreError {
+    fn preflight(
+        stage: HvfSnapshotV2EntropyMmioRestoreStage,
+        failure: HvfSnapshotV2EntropyMmioRestoreFailure,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            committed: false,
+            cleanup: None,
+        }
+    }
+
+    fn serial_platform(source: HvfSnapshotV2SerialOnlyRestoreError) -> Self {
+        Self {
+            stage: HvfSnapshotV2EntropyMmioRestoreStage::SerialPlatform,
+            committed: source.is_terminal(),
+            failure: Box::new(HvfSnapshotV2EntropyMmioRestoreFailure::SerialPlatform(
+                Box::new(source),
+            )),
+            cleanup: None,
+        }
+    }
+
+    fn storage_platform(source: HvfSnapshotV2StorageMmioRestoreError) -> Self {
+        Self {
+            stage: HvfSnapshotV2EntropyMmioRestoreStage::StoragePlatform,
+            committed: source.is_terminal(),
+            failure: Box::new(HvfSnapshotV2EntropyMmioRestoreFailure::StoragePlatform(
+                Box::new(source),
+            )),
+            cleanup: None,
+        }
+    }
+
+    fn after_platform(
+        mut session: OwnedHvfArm64BootSession,
+        stage: HvfSnapshotV2EntropyMmioRestoreStage,
+        failure: HvfSnapshotV2EntropyMmioRestoreFailure,
+    ) -> Self {
+        let cleanup = session.shutdown().err().map(Box::new);
+        Self {
+            stage,
+            failure: Box::new(failure),
+            committed: true,
+            cleanup,
+        }
+    }
+
+    pub const fn stage(&self) -> HvfSnapshotV2EntropyMmioRestoreStage {
+        self.stage
+    }
+
+    /// Returns whether reverse cleanup did not complete.
+    pub fn has_incomplete_cleanup(&self) -> bool {
+        self.cleanup.is_some()
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2EntropyMmioRestoreFailure::SerialPlatform(source)
+                    if source.has_incomplete_cleanup()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2EntropyMmioRestoreFailure::StoragePlatform(source)
+                    if source.has_incomplete_cleanup()
+            )
+    }
+
+    /// Returns whether retry safety cannot be proven.
+    pub fn is_terminal(&self) -> bool {
+        self.committed || self.has_incomplete_cleanup()
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2EntropyMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2EntropyMmioRestoreError")
+            .field("stage", &self.stage)
+            .field("terminal", &self.is_terminal())
+            .field("cleanup_failed", &self.has_incomplete_cleanup())
+            .field("failure", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2EntropyMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.8 MMIO entropy owner reconstruction failed at {:?} ({})",
+            self.stage,
+            if self.is_terminal() {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2EntropyMmioRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.failure.as_ref())
+    }
 }
 
 /// Redacted failure while assembling an exact-2.7 serial-only owner.
@@ -3538,6 +3820,17 @@ impl HvfSnapshotV2SerialOnlyRestoreError {
             scheduler,
             source: source.kind(),
             cleanup,
+        }
+    }
+
+    /// Returns whether reverse cleanup did not complete.
+    pub fn has_incomplete_cleanup(&self) -> bool {
+        match self {
+            Self::MemoryLayout | Self::PciResources(_) => false,
+            Self::Platform(source) => !source.cleanup_failures().is_empty(),
+            Self::PciOwner { cleanup, .. } | Self::RetryScheduler { cleanup, .. } => {
+                cleanup.is_some()
+            }
         }
     }
 
@@ -9817,7 +10110,8 @@ fn hvf_arm64_boot_snapshot_v2_platform_profile(
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
         | NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
         | NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
-        | NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION => {
+        | NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+        | NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION => {
             Some(HvfArm64BootSnapshotV2PlatformProfile::ProductProcess)
         }
         _ => None,
@@ -14124,6 +14418,23 @@ impl OwnedHvfArm64BootSession {
         process: HvfSnapshotV2SerialOnlyProcessConfig,
         serial_input: Option<SerialStdioInput>,
     ) -> Result<Self, HvfSnapshotV2SerialOnlyRestoreError> {
+        Self::restore_snapshot_v2_serial_only_inner(
+            state,
+            memory,
+            HvfSnapshotV2SerialProcessShell::SerialOnly {
+                shell: process_shell,
+                process,
+            },
+            serial_input,
+        )
+    }
+
+    fn restore_snapshot_v2_serial_only_inner(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2SerialProcessShell,
+        serial_input: Option<SerialStdioInput>,
+    ) -> Result<Self, HvfSnapshotV2SerialOnlyRestoreError> {
         let mut ranges = Vec::new();
         ranges
             .try_reserve_exact(memory.regions().len())
@@ -14137,7 +14448,7 @@ impl OwnedHvfArm64BootSession {
             size: usize::try_from(source_fdt.size())
                 .map_err(|_| HvfSnapshotV2SerialOnlyRestoreError::MemoryLayout)?,
         };
-        let pci_enabled = process.pci_enabled();
+        let pci_enabled = process_shell.pci_enabled();
         let (block_device_metrics, pmem_device_metrics, network_interface_metrics) = if pci_enabled
         {
             let block = SharedBlockDeviceMetricsRegistry::from_drive_ids_with_capacity(
@@ -14175,12 +14486,20 @@ impl OwnedHvfArm64BootSession {
                 SharedNetworkInterfaceMetricsRegistry::default(),
             )
         };
-        let platform = restore_hvf_snapshot_v2_serial_only_process_platform(
-            state,
-            memory,
-            process_shell,
-            process,
-        )
+        let platform = match process_shell {
+            HvfSnapshotV2SerialProcessShell::SerialOnly { shell, process } => {
+                restore_hvf_snapshot_v2_serial_only_process_platform(state, memory, shell, process)
+            }
+            HvfSnapshotV2SerialProcessShell::EntropyMmio {
+                shell,
+                interrupt_line,
+            } => restore_hvf_snapshot_v2_serial_entropy_mmio_process_platform(
+                state,
+                memory,
+                shell,
+                interrupt_line,
+            ),
+        }
         .map_err(HvfSnapshotV2SerialOnlyRestoreError::Platform)?;
         let parts = platform.into_parts();
         let machine_config = parts.machine.machine();
@@ -14388,6 +14707,304 @@ impl OwnedHvfArm64BootSession {
             };
 
         Ok(session)
+    }
+
+    /// Reconstructs one exact-2.8 serial plus MMIO entropy destination.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_entropy_mmio(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        entropy: SnapshotV2EntropyRestorePlan,
+    ) -> Result<RestoredHvfSnapshotV2EntropyMmioOwners, HvfSnapshotV2EntropyMmioRestoreError> {
+        Self::restore_snapshot_v2_serial_entropy_mmio_inner(
+            state,
+            memory,
+            process_shell,
+            serial_input,
+            entropy,
+            false,
+        )
+    }
+
+    /// Injects failure after entropy registration for signed rollback
+    /// certification.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_entropy_mmio_with_scheduler_fault(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        entropy: SnapshotV2EntropyRestorePlan,
+    ) -> Result<RestoredHvfSnapshotV2EntropyMmioOwners, HvfSnapshotV2EntropyMmioRestoreError> {
+        Self::restore_snapshot_v2_serial_entropy_mmio_inner(
+            state,
+            memory,
+            process_shell,
+            serial_input,
+            entropy,
+            true,
+        )
+    }
+
+    fn restore_snapshot_v2_serial_entropy_mmio_inner(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        entropy: SnapshotV2EntropyRestorePlan,
+        inject_scheduler_failure: bool,
+    ) -> Result<RestoredHvfSnapshotV2EntropyMmioOwners, HvfSnapshotV2EntropyMmioRestoreError> {
+        if snapshot_v2_queue_ranges_conflict_with_platform(&state, entropy.queue_ranges()) {
+            return Err(HvfSnapshotV2EntropyMmioRestoreError::preflight(
+                HvfSnapshotV2EntropyMmioRestoreStage::ResourcePlan,
+                HvfSnapshotV2EntropyMmioRestoreFailure::ResourcePlan,
+            ));
+        }
+        let entropy = entropy.into_mmio_handler().map_err(|source| {
+            HvfSnapshotV2EntropyMmioRestoreError::preflight(
+                HvfSnapshotV2EntropyMmioRestoreStage::Handler,
+                HvfSnapshotV2EntropyMmioRestoreFailure::Handler(source),
+            )
+        })?;
+        let interrupt_line = entropy.interrupt_line();
+        let session = Self::restore_snapshot_v2_serial_only_inner(
+            state,
+            memory,
+            HvfSnapshotV2SerialProcessShell::EntropyMmio {
+                shell: process_shell,
+                interrupt_line,
+            },
+            serial_input,
+        )
+        .map_err(HvfSnapshotV2EntropyMmioRestoreError::serial_platform)?;
+
+        Self::attach_snapshot_v2_entropy_mmio(session, entropy, None, inject_scheduler_failure)
+    }
+
+    /// Reconstructs one exact-2.8 storage, serial, and MMIO entropy
+    /// destination without publishing it.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_storage_entropy_mmio(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        bundle: PreparedSnapshotV2StorageBundle,
+        storage_plan: HvfSnapshotV2StorageMmioPlatformPlan,
+        entropy: SnapshotV2EntropyRestorePlan,
+    ) -> Result<RestoredHvfSnapshotV2EntropyMmioOwners, HvfSnapshotV2EntropyMmioRestoreError> {
+        if snapshot_v2_queue_ranges_conflict_with_platform(&state, entropy.queue_ranges()) {
+            return Err(HvfSnapshotV2EntropyMmioRestoreError::preflight(
+                HvfSnapshotV2EntropyMmioRestoreStage::ResourcePlan,
+                HvfSnapshotV2EntropyMmioRestoreFailure::ResourcePlan,
+            ));
+        }
+        let entropy = entropy.into_mmio_handler().map_err(|source| {
+            HvfSnapshotV2EntropyMmioRestoreError::preflight(
+                HvfSnapshotV2EntropyMmioRestoreStage::Handler,
+                HvfSnapshotV2EntropyMmioRestoreFailure::Handler(source),
+            )
+        })?;
+        let interrupt_line = entropy.interrupt_line();
+        let restored = Self::restore_snapshot_v2_storage_mmio_inner(
+            state,
+            memory,
+            HvfSnapshotV2StorageProcessShell::RestoredEntropyMmio {
+                shell: process_shell,
+                interrupt_line,
+            },
+            serial_input,
+            bundle,
+            storage_plan,
+            None,
+        )
+        .map_err(HvfSnapshotV2EntropyMmioRestoreError::storage_platform)?;
+        let (session, storage_configs) = restored.into_parts();
+        Self::attach_snapshot_v2_entropy_mmio(session, entropy, Some(storage_configs), false)
+    }
+
+    fn attach_snapshot_v2_entropy_mmio(
+        mut session: OwnedHvfArm64BootSession,
+        entropy: PreparedSnapshotV2EntropyMmioHandler,
+        storage_configs: Option<CaptureReadyStorageConfigs>,
+        inject_scheduler_failure: bool,
+    ) -> Result<RestoredHvfSnapshotV2EntropyMmioOwners, HvfSnapshotV2EntropyMmioRestoreError> {
+        let (config, _queue_ranges, _retry, retry_deadline, region, interrupt_line, handler) =
+            entropy.into_parts();
+        let owner_is_vacant = session.runtime_resources.entropy_device.is_none()
+            && session.runtime_resources.pci_entropy_device.is_none()
+            && session.entropy_interrupt_line.is_none()
+            && session.entropy_retry_wakeup_scheduler.thread.is_none()
+            && session.pci_data_devices.is_none()
+            && !session
+                .block_interrupt_lines
+                .iter()
+                .chain(&session.pmem_interrupt_lines)
+                .chain(&session.network_interrupt_lines)
+                .copied()
+                .chain(session.vsock_interrupt_line)
+                .chain(session.balloon_interrupt_line)
+                .chain(session.memory_hotplug_interrupt_line)
+                .chain(session.serial_interrupt_line)
+                .chain([
+                    session.vmgenid_interrupt_line,
+                    session.vmclock_interrupt_line,
+                ])
+                .any(|retained| retained == interrupt_line);
+        if !owner_is_vacant {
+            return Err(HvfSnapshotV2EntropyMmioRestoreError::after_platform(
+                session,
+                HvfSnapshotV2EntropyMmioRestoreStage::ResourcePlan,
+                HvfSnapshotV2EntropyMmioRestoreFailure::ResourcePlan,
+            ));
+        }
+
+        let signaler = match HvfGicSpiSignaler::from_metadata(&session.gic) {
+            Ok(signaler) => signaler,
+            Err(source) => {
+                return Err(HvfSnapshotV2EntropyMmioRestoreError::after_platform(
+                    session,
+                    HvfSnapshotV2EntropyMmioRestoreStage::InterruptRoute,
+                    HvfSnapshotV2EntropyMmioRestoreFailure::InterruptRoute(source),
+                ));
+            }
+        };
+        if let Err(source) = signaler.validate_line(interrupt_line) {
+            return Err(HvfSnapshotV2EntropyMmioRestoreError::after_platform(
+                session,
+                HvfSnapshotV2EntropyMmioRestoreStage::InterruptRoute,
+                HvfSnapshotV2EntropyMmioRestoreFailure::InterruptRoute(source),
+            ));
+        }
+
+        if session.restored_snapshot_v2_mmio_registrations.is_none() {
+            let mut leases = Vec::new();
+            if leases.try_reserve_exact(1).is_err() {
+                return Err(HvfSnapshotV2EntropyMmioRestoreError::after_platform(
+                    session,
+                    HvfSnapshotV2EntropyMmioRestoreStage::ResourcePlan,
+                    HvfSnapshotV2EntropyMmioRestoreFailure::Allocation,
+                ));
+            }
+            session.restored_snapshot_v2_mmio_registrations =
+                Some(HvfSnapshotV2MultiBlockMmioRegistrations {
+                    owner: MmioRegistrationOwner::new(),
+                    leases,
+                    pmem_ranges: Vec::new(),
+                });
+        } else if session
+            .restored_snapshot_v2_mmio_registrations
+            .as_mut()
+            .is_none_or(|registrations| registrations.leases.try_reserve(1).is_err())
+        {
+            return Err(HvfSnapshotV2EntropyMmioRestoreError::after_platform(
+                session,
+                HvfSnapshotV2EntropyMmioRestoreStage::ResourcePlan,
+                HvfSnapshotV2EntropyMmioRestoreFailure::Allocation,
+            ));
+        }
+
+        let request = [MmioRegionRequest::new(
+            region.range().start(),
+            region.range().size(),
+        )];
+        let registration_result = {
+            match session.restored_snapshot_v2_mmio_registrations.as_ref() {
+                Some(registrations) => match session.mmio_dispatcher.lock() {
+                    Ok(mut dispatcher) => dispatcher
+                        .validate_owned_handler(region.id(), &request)
+                        .and_then(|()| {
+                            dispatcher.register_owned_handler(
+                                &registrations.owner,
+                                region.id(),
+                                &request,
+                                handler,
+                            )
+                        })
+                        .map_err(HvfSnapshotV2EntropyMmioRestoreFailure::Registration),
+                    Err(_) => Err(HvfSnapshotV2EntropyMmioRestoreFailure::DispatcherUnavailable),
+                },
+                None => Err(HvfSnapshotV2EntropyMmioRestoreFailure::ResourcePlan),
+            }
+        };
+        let lease = match registration_result {
+            Ok(lease) => lease,
+            Err(failure) => {
+                return Err(HvfSnapshotV2EntropyMmioRestoreError::after_platform(
+                    session,
+                    HvfSnapshotV2EntropyMmioRestoreStage::Registration,
+                    failure,
+                ));
+            }
+        };
+        let registration_matches = match session.restored_snapshot_v2_mmio_registrations.as_mut() {
+            Some(registrations) => {
+                registrations.leases.push(lease);
+                registrations.leases.last().is_some_and(|lease| {
+                    lease.region_id() == region.id() && lease.regions() == [region]
+                })
+            }
+            None => false,
+        };
+        if !registration_matches {
+            return Err(HvfSnapshotV2EntropyMmioRestoreError::after_platform(
+                session,
+                HvfSnapshotV2EntropyMmioRestoreStage::Registration,
+                HvfSnapshotV2EntropyMmioRestoreFailure::ResourcePlan,
+            ));
+        }
+
+        let fdt_device = Arm64FdtVirtioMmioDevice {
+            region: Arm64FdtRegion {
+                base: region.range().start().raw_value(),
+                size: region.range().size(),
+            },
+            interrupt_line,
+        };
+        session.runtime_resources.entropy_device = Some(Arm64BootEntropyDevice {
+            registration: EntropyMmioDeviceRegistration::from_restored(region),
+            fdt_device,
+        });
+        session.entropy_interrupt_line = Some(interrupt_line);
+        session.entropy_source = VirtioRngOsEntropySource::new();
+        session.entropy_device_metrics = SharedEntropyDeviceMetrics::default();
+        session.entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+
+        if inject_scheduler_failure {
+            return Err(HvfSnapshotV2EntropyMmioRestoreError::after_platform(
+                session,
+                HvfSnapshotV2EntropyMmioRestoreStage::RetryScheduler,
+                HvfSnapshotV2EntropyMmioRestoreFailure::InjectedRetryScheduler,
+            ));
+        }
+        let vcpu_control = session.runner.control();
+        session.entropy_retry_wakeup_scheduler =
+            match HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+                ENTROPY_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+                session.entropy_retry_wakeup.clone(),
+                move || vcpu_control.request_wakeup(),
+            ) {
+                Ok(scheduler) => scheduler,
+                Err(source) => {
+                    return Err(HvfSnapshotV2EntropyMmioRestoreError::after_platform(
+                        session,
+                        HvfSnapshotV2EntropyMmioRestoreStage::RetryScheduler,
+                        HvfSnapshotV2EntropyMmioRestoreFailure::RetryScheduler(source.kind()),
+                    ));
+                }
+            };
+
+        // Deadline publication is intentionally the final graph operation.
+        session
+            .entropy_retry_wakeup_scheduler
+            .schedule_deadline(retry_deadline);
+        Ok(RestoredHvfSnapshotV2EntropyMmioOwners {
+            session,
+            entropy_config: config,
+            storage_configs,
+        })
     }
 
     /// Reconstructs one exact native-v2 root-bearing destination and transfers
@@ -15249,6 +15866,16 @@ impl OwnedHvfArm64BootSession {
                     state, memory, shell, shell_plan,
                 )
             }
+            HvfSnapshotV2StorageProcessShell::RestoredEntropyMmio {
+                shell,
+                interrupt_line,
+            } => restore_hvf_snapshot_v2_serial_storage_entropy_mmio_process_platform(
+                state,
+                memory,
+                shell,
+                shell_plan,
+                interrupt_line,
+            ),
         };
         let mut platform = match restored {
             Ok(platform) => platform,
@@ -15883,6 +16510,15 @@ impl OwnedHvfArm64BootSession {
                 restore_hvf_snapshot_v2_serial_storage_pci_process_platform(
                     state, memory, shell, shell_plan,
                 )
+            }
+            HvfSnapshotV2StorageProcessShell::RestoredEntropyMmio { .. } => {
+                return Err(
+                    HvfSnapshotV2StoragePciRestoreError::with_prepared_bundle_abort(
+                        HvfSnapshotV2StoragePciRestoreStage::ResourcePlan,
+                        HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan,
+                        prepared,
+                    ),
+                );
             }
         };
         let mut platform = match restored {
@@ -18061,6 +18697,7 @@ impl OwnedHvfArm64BootSession {
     fn teardown_restored_snapshot_v2_mmio(
         &mut self,
     ) -> Result<(), HvfSnapshotV2StorageMmioRestoreCleanupFailure> {
+        let had_entropy = self.runtime_resources.entropy_device.is_some();
         let Some(registrations) = self.restored_snapshot_v2_mmio_registrations.as_mut() else {
             return Ok(());
         };
@@ -18099,6 +18736,13 @@ impl OwnedHvfArm64BootSession {
         self.runtime_resources.block_devices.clear();
         self.runtime_resources.pmem_mmio_devices.clear();
         self.runtime_resources.pmem_devices.clear();
+        self.runtime_resources.entropy_device = None;
+        self.entropy_interrupt_line = None;
+        self.entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        self.entropy_source = VirtioRngOsEntropySource::new();
+        if had_entropy {
+            self.entropy_device_metrics = SharedEntropyDeviceMetrics::default();
+        }
         self.restored_snapshot_v2_mmio_registrations = None;
         Ok(())
     }
@@ -37883,6 +38527,7 @@ mod tests {
             super::HvfArm64BootPciDataError::new("secret-resource/path"),
         );
         assert!(!retryable.is_terminal());
+        assert!(!retryable.has_incomplete_cleanup());
         assert!(!format!("{retryable:?}").contains("secret-resource"));
         assert!(!retryable.to_string().contains("secret-resource"));
 
@@ -37891,6 +38536,7 @@ mod tests {
             cleanup: None,
         };
         assert!(committed.is_terminal());
+        assert!(!committed.has_incomplete_cleanup());
         assert!(!format!("{committed:?}").contains("secret-owner"));
         assert!(!committed.to_string().contains("secret-owner"));
 
@@ -37904,10 +38550,50 @@ mod tests {
             )),
         };
         assert!(incomplete.is_terminal());
+        assert!(incomplete.has_incomplete_cleanup());
         let debug = format!("{incomplete:?}");
         assert!(debug.contains("cleanup_failed"));
         assert!(!debug.contains("secret-cleanup"));
         assert!(!incomplete.to_string().contains("secret-cleanup"));
+    }
+
+    #[test]
+    fn native_v2_entropy_mmio_errors_distinguish_commit_from_cleanup_failure() {
+        let retryable = super::HvfSnapshotV2EntropyMmioRestoreError::preflight(
+            super::HvfSnapshotV2EntropyMmioRestoreStage::ResourcePlan,
+            super::HvfSnapshotV2EntropyMmioRestoreFailure::ResourcePlan,
+        );
+        assert!(!retryable.is_terminal());
+        assert!(!retryable.has_incomplete_cleanup());
+
+        let committed = super::HvfSnapshotV2EntropyMmioRestoreError::serial_platform(
+            super::HvfSnapshotV2SerialOnlyRestoreError::PciOwner {
+                source: super::HvfArm64BootPciDataError::new("secret-owner/path"),
+                cleanup: None,
+            },
+        );
+        assert!(committed.is_terminal());
+        assert!(!committed.has_incomplete_cleanup());
+
+        let incomplete = super::HvfSnapshotV2EntropyMmioRestoreError::serial_platform(
+            super::HvfSnapshotV2SerialOnlyRestoreError::RetryScheduler {
+                scheduler: "entropy-retry",
+                source: io::ErrorKind::PermissionDenied,
+                cleanup: Some(Box::new(
+                    super::HvfArm64BootSessionShutdownError::DestroyVm {
+                        source: super::BackendError::Hypervisor(
+                            "secret-entropy-cleanup/path".to_string(),
+                        ),
+                    },
+                )),
+            },
+        );
+        assert!(incomplete.is_terminal());
+        assert!(incomplete.has_incomplete_cleanup());
+        let diagnostics = format!("{incomplete:?} {incomplete}");
+        assert!(diagnostics.contains("<redacted>"));
+        assert!(diagnostics.contains("cleanup_failed"));
+        assert!(!diagnostics.contains("secret-entropy-cleanup"));
     }
 
     #[test]
@@ -38186,13 +38872,14 @@ mod tests {
     }
 
     #[test]
-    fn native_v2_platform_capture_classifies_exact_serial_profile_as_product_process() {
+    fn native_v2_platform_capture_classifies_exact_entropy_profile_as_product_process() {
         use super::{
             HvfArm64BootSnapshotV2PlatformProfile, hvf_arm64_boot_snapshot_v2_platform_profile,
         };
         use bangbang_runtime::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+        use bangbang_runtime::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_format::NATIVE_V1_SNAPSHOT_VERSION;
         use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
         use bangbang_runtime::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
@@ -38206,6 +38893,7 @@ mod tests {
             NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
             NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
             NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+            NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
         ] {
             assert_eq!(
                 hvf_arm64_boot_snapshot_v2_platform_profile(version),

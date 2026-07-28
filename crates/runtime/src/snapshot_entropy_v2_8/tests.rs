@@ -1,6 +1,7 @@
 use super::codec::{self, ReservePolicy};
 use super::*;
 
+use crate::entropy::{EntropyMmioDeviceRegistration, VirtioRngRetryCaptureState};
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
 use crate::mmio::{MmioRegion, MmioRegionId};
@@ -419,6 +420,110 @@ fn active_mmio_restore_plan_retains_pending_notification_and_interrupts() {
     assert_eq!(mmio.retained().pending_notifications(), [true]);
     assert_eq!(mmio.retained().interrupt_status().bits(), 0b11);
     assert!(!mmio.retained().requires_device_config_write_status());
+}
+
+#[test]
+fn inactive_mmio_restore_plan_materializes_exact_unpublished_handler() {
+    let state = inactive_mmio_state();
+    let memory = restore_memory();
+    let now = Instant::now();
+    let prepared = SnapshotV2EntropyRestorePlan::prepare(state.clone(), &memory, now)
+        .expect("inactive MMIO restore plan should prepare")
+        .into_mmio_handler()
+        .expect("inactive MMIO handler should materialize");
+
+    assert_eq!(prepared.config(), state.config());
+    assert_eq!(prepared.queue_ranges(), None);
+    assert_eq!(prepared.retry(), SnapshotV2EntropyRetryState::None);
+    assert_eq!(prepared.retry_deadline(), None);
+    assert_eq!(prepared.region(), mmio_transport().region());
+    assert_eq!(prepared.interrupt_line(), mmio_transport().interrupt_line());
+    assert!(!prepared.handler().is_device_activated());
+    assert_eq!(
+        EntropyMmioDeviceRegistration::from_restored(prepared.region()).region(),
+        prepared.region()
+    );
+
+    let captured = prepared
+        .handler()
+        .capture_entropy_state_at(prepared.config(), &memory, now)
+        .expect("materialized inactive handler should be capture-ready");
+    let recaptured = SnapshotV2EntropyState::try_from_mmio_capture(
+        prepared.config(),
+        VirtioRngRetryCaptureState::None,
+        prepared.region(),
+        prepared.interrupt_line(),
+        &captured,
+    )
+    .expect("materialized inactive handler should retain exact state");
+    assert_eq!(recaptured, state);
+    let debug = format!("{prepared:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("134217728"));
+}
+
+#[test]
+fn active_mmio_restore_plan_materializes_exact_pending_handler() {
+    let mut state = active_pci_state();
+    state.transport = SnapshotV2DeviceTransport::Mmio(mmio_transport());
+    let mut memory = restore_memory();
+    write_pending_queue(&mut memory, ACTIVE_DESCRIPTOR_TABLE, 7, 6);
+    let now = Instant::now();
+    let prepared = SnapshotV2EntropyRestorePlan::prepare(state.clone(), &memory, now)
+        .expect("active MMIO restore plan should prepare")
+        .into_mmio_handler()
+        .expect("active MMIO handler should materialize");
+
+    assert!(prepared.handler().is_device_activated());
+    assert!(prepared.handler().has_pending_rng_queue_work());
+    assert_eq!(
+        prepared
+            .handler()
+            .transport_state()
+            .interrupt_status()
+            .bits(),
+        0b11
+    );
+    assert_eq!(
+        prepared.retry(),
+        SnapshotV2EntropyRetryState::try_after(75_000_000).expect("delayed retry should validate")
+    );
+    assert_eq!(
+        prepared.retry_deadline(),
+        now.checked_add(Duration::from_millis(75))
+    );
+
+    let captured = prepared
+        .handler()
+        .capture_entropy_state_at(prepared.config(), &memory, now)
+        .expect("materialized active handler should be capture-ready");
+    let recaptured = SnapshotV2EntropyState::try_from_mmio_capture(
+        prepared.config(),
+        VirtioRngRetryCaptureState::After {
+            remaining_nanos: 75_000_000,
+        },
+        prepared.region(),
+        prepared.interrupt_line(),
+        &captured,
+    )
+    .expect("materialized active handler should retain exact state");
+    assert_eq!(recaptured, state);
+}
+
+#[test]
+fn pci_restore_plan_rejects_mmio_handler_materialization() {
+    let mut memory = restore_memory();
+    write_pending_queue(&mut memory, ACTIVE_DESCRIPTOR_TABLE, 7, 6);
+    let error = SnapshotV2EntropyRestorePlan::prepare(active_pci_state(), &memory, Instant::now())
+        .expect("active PCI restore plan should prepare")
+        .into_mmio_handler()
+        .expect_err("PCI restore plan must not materialize an MMIO handler");
+
+    assert_eq!(error, SnapshotV2EntropyMmioHandlerError::WrongTransport);
+    assert_eq!(
+        error.to_string(),
+        "native-v2 entropy restore plan is not MMIO"
+    );
 }
 
 #[test]
