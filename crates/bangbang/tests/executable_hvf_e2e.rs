@@ -12213,36 +12213,36 @@ mod macos_arm64 {
             &format!("{case} paused destination metrics"),
         );
 
-        if !rooted {
-            let resumed = BangbangProcess::start_with_extra_args(
+        let resumed = BangbangProcess::start_with_extra_args(
+            &resumed_socket,
+            &format!("{instance_id}-native-v2-epoch-{case}-resumed"),
+            process_args,
+        );
+        configure_snapshot_destination_metrics(
+            &resumed_socket,
+            &resumed_metrics_path,
+            &format!("{case} automatic destination"),
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
                 &resumed_socket,
-                &format!("{instance_id}-native-v2-epoch-{case}-resumed"),
-                process_args,
-            );
-            configure_snapshot_destination_metrics(
-                &resumed_socket,
-                &resumed_metrics_path,
-                &format!("{case} automatic destination"),
-            );
-            assert_no_content_response(
-                &http_json_with_io_timeout(
-                    &resumed_socket,
-                    "PUT",
-                    "/snapshot/load",
-                    &snapshot_root_load_body(&state_path, &memory_path, true),
-                    GUEST_EXECUTION_TIMEOUT,
-                ),
-                "PUT native-v2 epoch automatic destination /snapshot/load",
-            );
-            let resumed_output = resumed.wait_for_exit_with_timeout(
+                "PUT",
+                "/snapshot/load",
+                &snapshot_root_load_body(&state_path, &memory_path, true),
                 GUEST_EXECUTION_TIMEOUT,
-                &format!("{case} automatically resumed native-v2 epoch guest poweroff"),
-            );
-            assert_clean_shutdown(
-                resumed_output,
-                &resumed_socket,
-                &format!("{case} automatically resumed native-v2 epoch destination"),
-            );
+            ),
+            "PUT native-v2 epoch automatic destination /snapshot/load",
+        );
+        let resumed_output = resumed.wait_for_exit_with_timeout(
+            GUEST_EXECUTION_TIMEOUT,
+            &format!("{case} automatically resumed native-v2 epoch guest poweroff"),
+        );
+        assert_clean_shutdown(
+            resumed_output,
+            &resumed_socket,
+            &format!("{case} automatically resumed native-v2 epoch destination"),
+        );
+        if !rooted {
             assert_snapshot_block_epoch(
                 &drive_a_path,
                 SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE,
@@ -12263,22 +12263,22 @@ mod macos_arm64 {
                 true,
                 &format!("{case} automatic destination metrics"),
             );
-            assert_snapshot_pmem_epoch(
-                &writable_pmem_path,
-                SNAPSHOT_PMEM_WRITABLE_DESTINATION_TWO_BYTE,
-                &format!("{case} destination-two writable pmem epoch"),
-            );
-            assert_snapshot_pmem_epoch(
-                &read_only_pmem_path,
-                SNAPSHOT_PMEM_READ_ONLY_BYTE,
-                &format!("{case} destination-two read-only pmem epoch"),
-            );
-            assert_snapshot_pmem_metrics(
-                &resumed_metrics_path,
-                true,
-                &format!("{case} automatic destination metrics"),
-            );
         }
+        assert_snapshot_pmem_epoch(
+            &writable_pmem_path,
+            SNAPSHOT_PMEM_WRITABLE_DESTINATION_TWO_BYTE,
+            &format!("{case} destination-two writable pmem epoch"),
+        );
+        assert_snapshot_pmem_epoch(
+            &read_only_pmem_path,
+            SNAPSHOT_PMEM_READ_ONLY_BYTE,
+            &format!("{case} destination-two read-only pmem epoch"),
+        );
+        assert_snapshot_pmem_metrics(
+            &resumed_metrics_path,
+            true,
+            &format!("{case} automatic destination metrics"),
+        );
 
         assert_eq!(
             fs::read(&state_path).expect("final native-v2 epoch state should read"),

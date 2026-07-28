@@ -1821,85 +1821,79 @@ fn run_native_v2_snapshot_epoch_grant_case(bundle: &Path, enable_pci: bool, root
     );
     assert_eq!(session_entries(), baseline_sessions);
 
-    let final_artifacts = if rooted {
-        next
-    } else {
-        let resumed_fixture =
-            SnapshotEpochInputGrantFixture::new(&format!("{case}-automatic"), next);
-        let mut resumed = spawn_ready_snapshot_epoch_grant_api_launcher(
-            bundle,
-            &resumed_fixture.manifest,
-            &resumed_fixture.api_socket(),
-            resumed_fixture.sensitive_strings(),
-            &format!("snapshot-epoch-{case}-automatic"),
-            enable_pci,
+    let resumed_fixture = SnapshotEpochInputGrantFixture::new(&format!("{case}-automatic"), next);
+    let mut resumed = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &resumed_fixture.manifest,
+        &resumed_fixture.api_socket(),
+        resumed_fixture.sensitive_strings(),
+        &format!("snapshot-epoch-{case}-automatic"),
+        enable_pci,
+    );
+    let final_artifacts = resumed_fixture.replace_source_pathnames();
+    configure_snapshot_epoch_destination_metrics(
+        &resumed,
+        &format!("{case} automatic destination"),
+    );
+    assert_http_status(
+        &http_put(&resumed.socket, "/snapshot/load", &snapshot_load_body(true)),
+        204,
+        "load and automatically resume epoch snapshot",
+    );
+    assert!(
+        resumed
+            .wait(&format!("{case} automatically resumed epoch destination"))
+            .success(),
+        "{case} automatically resumed epoch destination should power off"
+    );
+    if let Some(blocks) = final_artifacts.blocks.as_ref() {
+        assert_snapshot_block_epoch(
+            &blocks.root,
+            SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE,
+            &format!("{case} destination-two primary epoch"),
         );
-        let final_artifacts = resumed_fixture.replace_source_pathnames();
-        configure_snapshot_epoch_destination_metrics(
-            &resumed,
-            &format!("{case} automatic destination"),
+        assert_snapshot_block_epoch(
+            &blocks.data,
+            SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE,
+            &format!("{case} destination-two data epoch"),
         );
-        assert_http_status(
-            &http_put(&resumed.socket, "/snapshot/load", &snapshot_load_body(true)),
-            204,
-            "load and automatically resume epoch snapshot",
+        assert_snapshot_block_epoch(
+            &blocks.audit,
+            SNAPSHOT_BLOCK_AUDIT_BYTE,
+            &format!("{case} destination-two audit epoch"),
         );
-        assert!(
-            resumed
-                .wait(&format!("{case} automatically resumed epoch destination"))
-                .success(),
-            "{case} automatically resumed epoch destination should power off"
-        );
-        if let Some(blocks) = final_artifacts.blocks.as_ref() {
-            assert_snapshot_block_epoch(
-                &blocks.root,
-                SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE,
-                &format!("{case} destination-two primary epoch"),
-            );
-            assert_snapshot_block_epoch(
-                &blocks.data,
-                SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE,
-                &format!("{case} destination-two data epoch"),
-            );
-            assert_snapshot_block_epoch(
-                &blocks.audit,
-                SNAPSHOT_BLOCK_AUDIT_BYTE,
-                &format!("{case} destination-two audit epoch"),
-            );
-            assert_snapshot_block_metrics(
-                &resumed_fixture.opened_metrics,
-                true,
-                &format!("{case} automatic destination metrics"),
-            );
-        }
-        assert_snapshot_pmem_epoch(
-            &final_artifacts.writable_pmem,
-            SNAPSHOT_PMEM_WRITABLE_DESTINATION_TWO_BYTE,
-            &format!("{case} destination-two writable pmem epoch"),
-        );
-        assert_snapshot_pmem_epoch(
-            &final_artifacts.read_only_pmem,
-            SNAPSHOT_PMEM_READ_ONLY_BYTE,
-            &format!("{case} destination-two read-only pmem epoch"),
-        );
-        assert_snapshot_pmem_metrics(
+        assert_snapshot_block_metrics(
             &resumed_fixture.opened_metrics,
             true,
             &format!("{case} automatic destination metrics"),
         );
-        assert_snapshot_pmem_epoch(
-            &resumed_fixture.sources.writable_pmem,
-            SNAPSHOT_PMEM_WRITABLE_REPLACEMENT_BYTE,
-            &format!("{case} automatic writable replacement pathname"),
-        );
-        assert_snapshot_pmem_epoch(
-            &resumed_fixture.sources.read_only_pmem,
-            SNAPSHOT_PMEM_READ_ONLY_REPLACEMENT_BYTE,
-            &format!("{case} automatic read-only replacement pathname"),
-        );
-        assert_eq!(session_entries(), baseline_sessions);
-        final_artifacts
-    };
+    }
+    assert_snapshot_pmem_epoch(
+        &final_artifacts.writable_pmem,
+        SNAPSHOT_PMEM_WRITABLE_DESTINATION_TWO_BYTE,
+        &format!("{case} destination-two writable pmem epoch"),
+    );
+    assert_snapshot_pmem_epoch(
+        &final_artifacts.read_only_pmem,
+        SNAPSHOT_PMEM_READ_ONLY_BYTE,
+        &format!("{case} destination-two read-only pmem epoch"),
+    );
+    assert_snapshot_pmem_metrics(
+        &resumed_fixture.opened_metrics,
+        true,
+        &format!("{case} automatic destination metrics"),
+    );
+    assert_snapshot_pmem_epoch(
+        &resumed_fixture.sources.writable_pmem,
+        SNAPSHOT_PMEM_WRITABLE_REPLACEMENT_BYTE,
+        &format!("{case} automatic writable replacement pathname"),
+    );
+    assert_snapshot_pmem_epoch(
+        &resumed_fixture.sources.read_only_pmem,
+        SNAPSHOT_PMEM_READ_ONLY_REPLACEMENT_BYTE,
+        &format!("{case} automatic read-only replacement pathname"),
+    );
+    assert_eq!(session_entries(), baseline_sessions);
 
     assert_eq!(
         fs::read(&final_artifacts.state).expect("final epoch state should read"),
