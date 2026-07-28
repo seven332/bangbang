@@ -17,6 +17,10 @@ use bangbang_runtime::snapshot_format_v2::{
 use bangbang_runtime::snapshot_memory_v2::{
     decode_snapshot_v2_memory_binding, write_snapshot_v2_memory_image_with_compatibility_version,
 };
+use bangbang_runtime::snapshot_serial_v2_7::{
+    NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
+    SnapshotV2SerialStateDecodeError,
+};
 
 use super::*;
 use crate::snapshot_bundle::tests::fixture as native_v1_fixture;
@@ -34,9 +38,14 @@ const STORAGE_MMIO_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2_6/fixtures/pmem-root-mmio.hex");
 const STORAGE_PCI_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2_6/fixtures/mixed-pmem-root-pci.hex");
+const SERIAL_DEFAULT_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_serial_v2_7/fixtures/default.hex");
+const SERIAL_CONFIGURED_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_serial_v2_7/fixtures/configured.hex");
 const DETERMINISTIC_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.4-fixture-id!";
 const DETERMINISTIC_MULTI_BLOCK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.5-fixture-id!";
 const DETERMINISTIC_STORAGE_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.6-fixture-id!";
+const DETERMINISTIC_SERIAL_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.7-fixture-id!";
 const COMPLETE_STATE_FINGERPRINTS: [(usize, u64); 2] = [
     (4_887, 10_136_861_786_457_474_800),
     (4_983, 7_169_128_621_506_763_529),
@@ -334,6 +343,13 @@ fn deterministic_minor_six_platform_fixture() -> HvfSnapshotV2PlatformState {
     )
 }
 
+fn deterministic_minor_seven_platform_fixture() -> HvfSnapshotV2PlatformState {
+    deterministic_device_graph_platform_fixture(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        DETERMINISTIC_SERIAL_MEMORY_IMAGE_ID,
+    )
+}
+
 fn deterministic_device_graph_platform_fixture(
     version: SnapshotFormatVersion,
     image_id: [u8; 16],
@@ -401,6 +417,30 @@ fn complete_storage_state_fixture(graph_hex: &str) -> HvfSnapshotV2StorageState 
         .expect("complete minor-six fixture should validate")
 }
 
+fn complete_serial_state_fixture(
+    graph_hex: Option<&str>,
+    serial_hex: &str,
+) -> HvfSnapshotV2SerialState {
+    let device_graph = graph_hex.map(|graph_hex| {
+        SnapshotV2StorageDeviceGraph::decode(
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &fixture_bytes(graph_hex),
+        )
+        .expect("immutable profile-3 graph payload should decode")
+    });
+    let serial = SnapshotV2SerialState::decode(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        &fixture_bytes(serial_hex),
+    )
+    .expect("immutable serial payload should decode");
+    HvfSnapshotV2SerialState::try_new(
+        deterministic_minor_seven_platform_fixture(),
+        device_graph,
+        serial,
+    )
+    .expect("complete minor-seven fixture should validate")
+}
+
 fn decode_platform(bytes: &[u8]) -> Result<HvfSnapshotV2PlatformState, HvfSnapshotV2DecodeError> {
     let state = decode_snapshot_v2_state(bytes).expect("mutated fixture should remain structural");
     decode_hvf_snapshot_v2_platform_state(&state)
@@ -413,6 +453,15 @@ fn decode_complete_state(bytes: &[u8]) -> Result<HvfSnapshotV2State, HvfSnapshot
     )
     .expect("mutated fixture should remain structurally compatible");
     decode_hvf_snapshot_v2_state(&state)
+}
+
+fn decode_serial_state(bytes: &[u8]) -> Result<HvfSnapshotV2SerialState, HvfSnapshotV2DecodeError> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        bytes,
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("mutated serial fixture should remain structurally compatible");
+    decode_hvf_snapshot_v2_serial_state(&state)
 }
 
 fn rebuild_components<F>(encoded: &[u8], mut transform: F) -> Vec<u8>
@@ -594,6 +643,69 @@ fn rebuild_storage_without_component(encoded: &[u8], excluded: SnapshotV2Compone
         &components,
     )
     .expect("reduced storage components should re-encode")
+}
+
+fn rebuild_serial_components<F>(encoded: &[u8], mut transform: F) -> Vec<u8>
+where
+    F: FnMut(&mut SnapshotV2ComponentKey, &mut SnapshotV2ComponentDisposition, &mut Vec<u8>),
+{
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        encoded,
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("serial fixture should decode structurally");
+    let mut owned = state
+        .components()
+        .map(|component| {
+            (
+                component.key(),
+                component.disposition(),
+                component.payload().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (key, disposition, payload) in &mut owned {
+        transform(key, disposition, payload);
+    }
+    let components = owned
+        .iter()
+        .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
+        .collect::<Vec<_>>();
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("mutated serial components should re-encode")
+}
+
+fn rebuild_serial_without_component(encoded: &[u8], excluded: SnapshotV2ComponentKey) -> Vec<u8> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        encoded,
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("serial fixture should decode structurally");
+    let owned = state
+        .components()
+        .filter(|component| component.key() != excluded)
+        .map(|component| {
+            (
+                component.key(),
+                component.disposition(),
+                component.payload().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let components = owned
+        .iter()
+        .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
+        .collect::<Vec<_>>();
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("reduced serial components should re-encode")
 }
 
 fn replace_state_checksum(bytes: &mut [u8]) {
@@ -857,6 +969,260 @@ fn current_exact_minor_six_storage_mmio_and_pci_states_round_trip_separately() {
         );
         assert_eq!(graph.transport_kind(), expected_transport);
     }
+}
+
+#[test]
+fn internal_exact_minor_seven_serial_only_mmio_and_pci_states_round_trip() {
+    let cases = [
+        (None, SERIAL_DEFAULT_FIXTURE_HEX, None, 0_usize, 0_usize),
+        (
+            Some(STORAGE_MMIO_GRAPH_FIXTURE_HEX),
+            SERIAL_CONFIGURED_FIXTURE_HEX,
+            Some(SnapshotV2DeviceTransportKind::Mmio),
+            0,
+            1,
+        ),
+        (
+            Some(STORAGE_PCI_GRAPH_FIXTURE_HEX),
+            SERIAL_CONFIGURED_FIXTURE_HEX,
+            Some(SnapshotV2DeviceTransportKind::Pci),
+            1,
+            1,
+        ),
+    ];
+    for (graph_hex, serial_hex, expected_transport, block_count, pmem_count) in cases {
+        let original = complete_serial_state_fixture(graph_hex, serial_hex);
+        let encoded = encode_hvf_snapshot_v2_serial_state(&original)
+            .expect("complete minor-seven serial state should encode");
+        assert!(matches!(
+            decode_snapshot_v2_state(&encoded),
+            Err(SnapshotV2DecodeError::UnsupportedVersion {
+                found,
+                supported,
+            }) if found == NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+                && supported == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        ));
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            &encoded,
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        )
+        .expect("minor-seven serial state should decode structurally");
+        assert_eq!(
+            structural.metadata().version(),
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+        );
+
+        let keys = structural
+            .components()
+            .map(SnapshotV2Component::key)
+            .collect::<Vec<_>>();
+        let mut expected_keys = vec![
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            NATIVE_V2_MACHINE_COMPONENT_KEY,
+            NATIVE_V2_GLOBAL_COMPONENT_KEY,
+            NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
+        ];
+        expected_keys.extend(
+            (0..u32::try_from(original.platform().vcpus().len())
+                .expect("fixture vCPU count should fit"))
+                .map(native_v2_vcpu_component_key),
+        );
+        expected_keys.push(NATIVE_V2_TIME_COMPONENT_KEY);
+        if graph_hex.is_some() {
+            expected_keys.push(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY);
+        }
+        expected_keys.push(NATIVE_V2_SERIAL_COMPONENT_KEY);
+        assert_eq!(keys, expected_keys);
+        assert_eq!(
+            structural
+                .component(NATIVE_V2_SERIAL_COMPONENT_KEY)
+                .expect("minor-seven fixture should contain serial")
+                .payload(),
+            fixture_bytes(serial_hex)
+        );
+        if let Some(graph_hex) = graph_hex {
+            assert_eq!(
+                structural
+                    .component(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)
+                    .expect("storage-bearing fixture should contain a graph")
+                    .payload(),
+                fixture_bytes(graph_hex)
+            );
+        } else {
+            assert!(
+                structural
+                    .component(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)
+                    .is_none()
+            );
+        }
+
+        assert!(matches!(
+            decode_hvf_snapshot_v2_platform_state(&structural),
+            Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+        ));
+        assert!(matches!(
+            decode_hvf_snapshot_v2_state(&structural),
+            Err(HvfSnapshotV2DecodeError::UnsupportedProfile)
+        ));
+        assert!(matches!(
+            decode_hvf_snapshot_v2_multi_block_state(&structural),
+            Err(HvfSnapshotV2DecodeError::UnsupportedProfile)
+        ));
+        assert!(matches!(
+            decode_hvf_snapshot_v2_storage_state(&structural),
+            Err(HvfSnapshotV2DecodeError::UnsupportedProfile)
+        ));
+
+        let decoded = decode_hvf_snapshot_v2_serial_state(&structural)
+            .expect("minor-seven serial composition should decode");
+        assert_eq!(decoded, original);
+        assert_eq!(
+            decoded.device_graph().map(|graph| graph.transport_kind()),
+            expected_transport
+        );
+        assert_eq!(
+            decoded
+                .device_graph()
+                .map_or(0, |graph| graph.block_records().len()),
+            block_count
+        );
+        assert_eq!(
+            decoded
+                .device_graph()
+                .map_or(0, |graph| graph.pmem_records().len()),
+            pmem_count
+        );
+        assert_eq!(
+            encode_hvf_snapshot_v2_serial_state(&decoded)
+                .expect("decoded minor-seven state should re-encode"),
+            encoded
+        );
+        let debug = format!("{decoded:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("serial-log"));
+        let (platform, graph, serial) = decoded.into_parts();
+        assert_eq!(
+            platform.memory().version(),
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+        );
+        assert_eq!(graph.is_some(), expected_transport.is_some());
+        assert_eq!(
+            serial.compatibility_version(),
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+        );
+    }
+}
+
+#[test]
+fn exact_minor_seven_profile_rejects_missing_duplicate_nonsemantic_and_invalid_state() {
+    let original = complete_serial_state_fixture(
+        Some(STORAGE_MMIO_GRAPH_FIXTURE_HEX),
+        SERIAL_CONFIGURED_FIXTURE_HEX,
+    );
+    let encoded = encode_hvf_snapshot_v2_serial_state(&original)
+        .expect("complete minor-seven state should encode");
+
+    let missing = rebuild_serial_without_component(&encoded, NATIVE_V2_SERIAL_COMPONENT_KEY);
+    assert!(matches!(
+        decode_serial_state(&missing),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let wrong_instance = rebuild_serial_components(&encoded, |key, _, _| {
+        if *key == NATIVE_V2_SERIAL_COMPONENT_KEY {
+            *key = SnapshotV2ComponentKey::new(NATIVE_V2_SERIAL_COMPONENT_KEY.kind(), 1);
+        }
+    });
+    assert!(matches!(
+        decode_serial_state(&wrong_instance),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let nonsemantic = rebuild_serial_components(&encoded, |key, disposition, _| {
+        if *key == NATIVE_V2_SERIAL_COMPONENT_KEY {
+            *disposition = SnapshotV2ComponentDisposition::NonSemantic;
+        }
+    });
+    assert!(matches!(
+        decode_serial_state(&nonsemantic),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let structural = decode_snapshot_v2_state_with_compatibility_version(
+        &encoded,
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("serial fixture should decode structurally");
+    let mut owned = structural
+        .components()
+        .map(|component| {
+            (
+                component.key(),
+                component.disposition(),
+                component.payload().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let duplicate_payload = structural
+        .component(NATIVE_V2_SERIAL_COMPONENT_KEY)
+        .expect("serial fixture should contain serial")
+        .payload()
+        .to_vec();
+    owned.push((
+        SnapshotV2ComponentKey::new(NATIVE_V2_SERIAL_COMPONENT_KEY.kind(), 1),
+        SnapshotV2ComponentDisposition::Semantic,
+        duplicate_payload,
+    ));
+    let components = owned
+        .iter()
+        .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
+        .collect::<Vec<_>>();
+    let duplicate = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("duplicate serial instance should encode structurally");
+    assert!(matches!(
+        decode_serial_state(&duplicate),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let invalid_serial = rebuild_serial_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_SERIAL_COMPONENT_KEY {
+            payload[0] ^= 0xff;
+        }
+    });
+    assert!(matches!(
+        decode_serial_state(&invalid_serial),
+        Err(HvfSnapshotV2DecodeError::SerialState(
+            SnapshotV2SerialStateDecodeError::InvalidHeader
+        ))
+    ));
+
+    let invalid_storage = rebuild_serial_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY {
+            payload[10..12].copy_from_slice(&2_u16.to_le_bytes());
+        }
+    });
+    assert!(matches!(
+        decode_serial_state(&invalid_storage),
+        Err(HvfSnapshotV2DecodeError::StorageDeviceGraph(
+            SnapshotV2StorageDeviceGraphDecodeError::UnsupportedProfile
+        ))
+    ));
+
+    let (wrong_platform, graph) =
+        complete_storage_state_fixture(STORAGE_MMIO_GRAPH_FIXTURE_HEX).into_parts();
+    let serial = SnapshotV2SerialState::decode(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        &fixture_bytes(SERIAL_CONFIGURED_FIXTURE_HEX),
+    )
+    .expect("serial fixture should decode");
+    assert_eq!(
+        HvfSnapshotV2SerialState::try_new(wrong_platform, Some(graph), serial),
+        Err(HvfSnapshotV2BuildError::Version)
+    );
 }
 
 #[test]

@@ -141,11 +141,13 @@ pub use snapshot_v2::{
     HvfSnapshotV2BuildError, HvfSnapshotV2DecodeError, HvfSnapshotV2EncodeError,
     HvfSnapshotV2FdtState, HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState,
     HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2PlatformState,
-    HvfSnapshotV2State, HvfSnapshotV2StorageState, HvfSnapshotV2VcpuState,
-    decode_hvf_snapshot_v2_multi_block_state, decode_hvf_snapshot_v2_platform_state,
+    HvfSnapshotV2SerialState, HvfSnapshotV2State, HvfSnapshotV2StorageState,
+    HvfSnapshotV2VcpuState, decode_hvf_snapshot_v2_multi_block_state,
+    decode_hvf_snapshot_v2_platform_state, decode_hvf_snapshot_v2_serial_state,
     decode_hvf_snapshot_v2_state, decode_hvf_snapshot_v2_storage_state,
     encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_platform_state,
-    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
+    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
+    encode_hvf_snapshot_v2_storage_state,
 };
 pub use snapshot_v2_multi_block_platform::{
     HvfSnapshotV2MultiBlockMmioRecordPlan, HvfSnapshotV2MultiBlockPciPlan,

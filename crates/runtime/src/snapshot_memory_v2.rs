@@ -18,13 +18,13 @@ use crate::memory::{
     GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError, GuestMemoryBacking,
     GuestMemoryRange, aarch64,
 };
-use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_format::SnapshotFormatVersion;
 use crate::snapshot_format_v2::{
     NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2Component,
     SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
     encode_snapshot_v2_state,
 };
+use crate::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
 
 /// Fixed magic shared by the v2 state binding and memory-image prefix.
 pub const NATIVE_V2_MEMORY_MAGIC: [u8; 8] = *b"BANGM2A\0";
@@ -1286,9 +1286,8 @@ fn decode_binding(bytes: &[u8]) -> Result<SnapshotV2MemoryBinding, SnapshotV2Mem
 fn validate_memory_version(
     version: SnapshotFormatVersion,
 ) -> Result<(), SnapshotV2MemoryBindingError> {
-    if version.major() == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.major()
-        && (1..=NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor())
-            .contains(&version.minor())
+    if version.major() == NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.major()
+        && (1..=NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.minor()).contains(&version.minor())
     {
         Ok(())
     } else {
