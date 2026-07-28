@@ -242,12 +242,16 @@ use crate::snapshot_v2_multi_block_platform::{
 use crate::snapshot_v2_platform::{
     HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2MultiBlockMmioShellPlan,
     HvfSnapshotV2MultiBlockPciShellPlan, HvfSnapshotV2PlatformRestoreError,
-    HvfSnapshotV2PlatformShutdownError, HvfSnapshotV2RootResourcePlan,
-    HvfSnapshotV2RootTransportPlan, HvfSnapshotV2StorageMmioShellPlan,
+    HvfSnapshotV2PlatformShutdownError, HvfSnapshotV2RestoredSerialShell,
+    HvfSnapshotV2RootResourcePlan, HvfSnapshotV2RootTransportPlan,
+    HvfSnapshotV2SerialOnlyProcessConfig, HvfSnapshotV2StorageMmioShellPlan,
     HvfSnapshotV2StoragePciShellPlan, RestoredHvfSnapshotV2Platform,
     restore_hvf_snapshot_v2_multi_block_mmio_process_platform,
     restore_hvf_snapshot_v2_multi_block_pci_process_platform,
     restore_hvf_snapshot_v2_root_process_platform,
+    restore_hvf_snapshot_v2_serial_only_process_platform,
+    restore_hvf_snapshot_v2_serial_storage_mmio_process_platform,
+    restore_hvf_snapshot_v2_serial_storage_pci_process_platform,
     restore_hvf_snapshot_v2_storage_mmio_process_platform,
     restore_hvf_snapshot_v2_storage_pci_process_platform,
 };
@@ -3478,6 +3482,118 @@ impl HvfArm64BootSerialInput {
 
     fn wakeup_fd(&self) -> Option<RawFd> {
         self.armed.then(|| self.endpoint.as_raw_fd())
+    }
+}
+
+enum HvfSnapshotV2StorageProcessShell {
+    Default(HvfSnapshotV2DefaultProcessShell),
+    Restored(HvfSnapshotV2RestoredSerialShell),
+}
+
+/// Redacted failure while assembling an exact-2.7 serial-only owner.
+#[doc(hidden)]
+pub enum HvfSnapshotV2SerialOnlyRestoreError {
+    /// Loaded guest ranges cannot form the retained runtime layout.
+    MemoryLayout,
+    /// Destination-only PCI owner capacity could not be reserved before
+    /// platform mutation.
+    PciResources(HvfArm64BootPciDataError),
+    /// The unpublished HVF platform could not be reconstructed.
+    Platform(HvfSnapshotV2PlatformRestoreError),
+    /// The product PCI host could not be reconstructed after platform
+    /// mutation.
+    PciOwner {
+        source: HvfArm64BootPciDataError,
+        cleanup: Option<Box<HvfArm64BootSessionShutdownError>>,
+    },
+    /// One product PCI retry scheduler could not be started after platform
+    /// mutation.
+    RetryScheduler {
+        scheduler: &'static str,
+        source: io::ErrorKind,
+        cleanup: Option<Box<HvfArm64BootSessionShutdownError>>,
+    },
+}
+
+impl HvfSnapshotV2SerialOnlyRestoreError {
+    fn pci_owner(mut session: OwnedHvfArm64BootSession, source: HvfArm64BootPciDataError) -> Self {
+        if session.pci_data_devices.is_none() {
+            drop(session.runtime_resources.pci_validation.take());
+        }
+        let cleanup = session.shutdown().err().map(Box::new);
+        Self::PciOwner { source, cleanup }
+    }
+
+    fn retry_scheduler(
+        mut session: OwnedHvfArm64BootSession,
+        scheduler: &'static str,
+        source: io::Error,
+    ) -> Self {
+        let cleanup = session.shutdown().err().map(Box::new);
+        Self::RetryScheduler {
+            scheduler,
+            source: source.kind(),
+            cleanup,
+        }
+    }
+
+    /// Returns whether retry safety cannot be proven.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::MemoryLayout | Self::PciResources(_) => false,
+            Self::Platform(source) => {
+                source.is_committed() || !source.cleanup_failures().is_empty()
+            }
+            Self::PciOwner { .. } | Self::RetryScheduler { .. } => true,
+        }
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2SerialOnlyRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (stage, cleanup_failed) = match self {
+            Self::MemoryLayout => ("memory-layout", false),
+            Self::PciResources(_) => ("pci-resources", false),
+            Self::Platform(_) => ("platform", false),
+            Self::PciOwner { cleanup, .. } => ("pci-owner", cleanup.is_some()),
+            Self::RetryScheduler {
+                scheduler, cleanup, ..
+            } => (*scheduler, cleanup.is_some()),
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2SerialOnlyRestoreError")
+            .field("stage", &stage)
+            .field("terminal", &self.is_terminal())
+            .field("cleanup_failed", &cleanup_failed)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2SerialOnlyRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.7 serial-only owner reconstruction failed ({})",
+            if self.is_terminal() {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2SerialOnlyRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Platform(source) => Some(source),
+            Self::PciResources(source) | Self::PciOwner { source, .. } => Some(source),
+            Self::RetryScheduler { cleanup, .. } => cleanup
+                .as_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+            Self::MemoryLayout => None,
+        }
     }
 }
 
@@ -13937,6 +14053,282 @@ impl OwnedHvfArm64BootSession {
         self.backend.cancel_lazy_page_source_on_drop();
     }
 
+    /// Reconstructs one exact-2.7 serial-only destination without publishing a
+    /// process session or controller.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_only(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        process: HvfSnapshotV2SerialOnlyProcessConfig,
+        serial_input: Option<SerialStdioInput>,
+    ) -> Result<Self, HvfSnapshotV2SerialOnlyRestoreError> {
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(memory.regions().len())
+            .map_err(|_| HvfSnapshotV2SerialOnlyRestoreError::MemoryLayout)?;
+        ranges.extend(memory.regions().iter().map(|region| region.range()));
+        let layout = GuestMemoryLayout::new(ranges)
+            .map_err(|_| HvfSnapshotV2SerialOnlyRestoreError::MemoryLayout)?;
+        let source_fdt = state.machine().fdt();
+        let retained_fdt = Arm64FdtGuestMemoryWrite {
+            address: source_fdt.address(),
+            size: usize::try_from(source_fdt.size())
+                .map_err(|_| HvfSnapshotV2SerialOnlyRestoreError::MemoryLayout)?,
+        };
+        let pci_enabled = process.pci_enabled();
+        let (block_device_metrics, pmem_device_metrics, network_interface_metrics) = if pci_enabled
+        {
+            let block = SharedBlockDeviceMetricsRegistry::from_drive_ids_with_capacity(
+                std::iter::empty::<&str>(),
+                PCI_ENDPOINT_SLOT_COUNT,
+            )
+            .map_err(|source| {
+                HvfSnapshotV2SerialOnlyRestoreError::PciResources(HvfArm64BootPciDataError::new(
+                    format!("failed to reserve restored PCI block metrics inventory: {source}"),
+                ))
+            })?;
+            let pmem = SharedPmemDeviceMetricsRegistry::from_device_ids_with_capacity(
+                std::iter::empty::<&str>(),
+                PCI_ENDPOINT_SLOT_COUNT,
+            )
+            .map_err(|source| {
+                HvfSnapshotV2SerialOnlyRestoreError::PciResources(HvfArm64BootPciDataError::new(
+                    format!("failed to reserve restored PCI pmem metrics inventory: {source}"),
+                ))
+            })?;
+            let network = SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(
+                std::iter::empty::<&str>(),
+                PCI_ENDPOINT_SLOT_COUNT,
+            )
+            .map_err(|source| {
+                HvfSnapshotV2SerialOnlyRestoreError::PciResources(HvfArm64BootPciDataError::new(
+                    format!("failed to reserve restored PCI network metrics inventory: {source}"),
+                ))
+            })?;
+            (block, pmem, network)
+        } else {
+            (
+                SharedBlockDeviceMetricsRegistry::default(),
+                SharedPmemDeviceMetricsRegistry::default(),
+                SharedNetworkInterfaceMetricsRegistry::default(),
+            )
+        };
+        let platform = restore_hvf_snapshot_v2_serial_only_process_platform(
+            state,
+            memory,
+            process_shell,
+            process,
+        )
+        .map_err(HvfSnapshotV2SerialOnlyRestoreError::Platform)?;
+        let parts = platform.into_parts();
+        let machine_config = parts.machine.machine();
+        let cpu_template_application = parts.machine.cpu_template().cloned();
+        let cache_source = crate::vcpu_config::HvfArm64VcpuCacheFdtSource::new(
+            parts.compatibility.identification().id_aa64mmfr2_el1(),
+            parts.compatibility.cache_manifest(),
+        );
+        let gic = parts.compatibility.gic_metadata();
+        let serial_interrupt_line = parts
+            .serial_device
+            .as_ref()
+            .map(|device| device.fdt_device.interrupt_line);
+        let vmgenid_interrupt_line = parts.vmgenid_device.fdt_device.interrupt_line;
+        let vmclock_interrupt_line = parts.vmclock_device.fdt_device.interrupt_line;
+        let runtime_resources = Arm64BootRuntimeResources {
+            machine_config,
+            layout,
+            boot_origin: None,
+            retained_fdt: Some(retained_fdt),
+            rtc_device: Some(parts.rtc_device),
+            serial_device: parts.serial_device,
+            vmgenid_device: parts.vmgenid_device,
+            vmclock_device: parts.vmclock_device,
+            pvtime_state: Arm64BootPvTimeState::restored(parts.pvtime_layout),
+            block_devices: Vec::new(),
+            block_async_runtime: SharedBlockAsyncRuntime::new(),
+            pci_block_devices: Vec::new(),
+            pmem_devices: Vec::new(),
+            pmem_mmio_devices: Vec::new(),
+            network_devices: Vec::new(),
+            pci_network_devices: Vec::new(),
+            vsock_device: None,
+            pci_vsock_device: None,
+            balloon_device: None,
+            pci_balloon_device: None,
+            memory_hotplug_device: None,
+            pci_memory_hotplug_device: None,
+            entropy_device: None,
+            pci_entropy_device: None,
+            pci_validation: None,
+        };
+
+        let mut session = Self {
+            runner: parts.runner,
+            backend: parts.backend,
+            mmio_dispatcher: parts.mmio_dispatcher,
+            runtime_resources,
+            restored_snapshot_v2_mmio_registrations: None,
+            restored_snapshot_v2_pci_pmem_ranges: None,
+            restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
+            restored_snapshot_v2_machine: Some(parts.machine),
+            cpu_template_application,
+            pci_validation_endpoint: None,
+            pci_data_devices: None,
+            cache_source,
+            cache_hierarchy: None,
+            control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
+            run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
+            block_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken::default(),
+            block_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            pmem_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken::default(),
+            pmem_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            network_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken::default(),
+            network_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            entropy_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken::default(),
+            entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            entropy_source: VirtioRngOsEntropySource::new(),
+            block_device_metrics,
+            pmem_device_metrics,
+            balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
+            memory_hotplug_device_metrics: None,
+            network_interface_metrics,
+            vsock_device_metrics: SharedVsockDeviceMetrics::default(),
+            entropy_device_metrics: SharedEntropyDeviceMetrics::default(),
+            gic,
+            block_interrupt_lines: Vec::new(),
+            pmem_interrupt_lines: Vec::new(),
+            network_interrupt_lines: Vec::new(),
+            vsock_interrupt_line: None,
+            balloon_interrupt_line: None,
+            entropy_interrupt_line: None,
+            memory_hotplug_interrupt_line: None,
+            serial_interrupt_line,
+            serial_input: serial_input.map(HvfArm64BootSerialInput::new),
+            vmgenid_interrupt_line,
+            vmclock_interrupt_line,
+            boot_registers: None,
+        };
+        if !pci_enabled {
+            return Ok(session);
+        }
+
+        let dispatcher_owner = Arc::clone(&session.mmio_dispatcher);
+        let validation = {
+            let mut dispatcher = match dispatcher_owner.lock() {
+                Ok(dispatcher) => dispatcher,
+                Err(_) => {
+                    return Err(HvfSnapshotV2SerialOnlyRestoreError::pci_owner(
+                        session,
+                        HvfArm64BootPciDataError::new(
+                            "restored PCI MMIO dispatcher is unavailable",
+                        ),
+                    ));
+                }
+            };
+            match prepare_restored_pci_validation(&mut dispatcher) {
+                Ok(validation) => validation,
+                Err(source) => {
+                    drop(dispatcher);
+                    return Err(HvfSnapshotV2SerialOnlyRestoreError::pci_owner(
+                        session,
+                        HvfArm64BootPciDataError::new(format!(
+                            "failed to prepare restored PCI host: {source}"
+                        )),
+                    ));
+                }
+            }
+        };
+        session.runtime_resources.pci_validation = Some(validation);
+        let pci_data_devices = {
+            let Self {
+                backend,
+                mmio_dispatcher,
+                runtime_resources,
+                block_device_metrics,
+                pmem_device_metrics,
+                network_interface_metrics,
+                ..
+            } = &mut session;
+            prepare_pci_data_devices(
+                backend,
+                runtime_resources,
+                mmio_dispatcher,
+                block_device_metrics,
+                network_interface_metrics,
+                pmem_device_metrics,
+            )
+        };
+        let pci_data_devices = match pci_data_devices {
+            Ok(Some(devices)) => devices,
+            Ok(None) => {
+                return Err(HvfSnapshotV2SerialOnlyRestoreError::pci_owner(
+                    session,
+                    HvfArm64BootPciDataError::new(
+                        "restored product PCI host did not retain data-device ownership",
+                    ),
+                ));
+            }
+            Err(source) => {
+                return Err(HvfSnapshotV2SerialOnlyRestoreError::pci_owner(
+                    session, source,
+                ));
+            }
+        };
+        session.pci_data_devices = Some(pci_data_devices);
+
+        let vcpu_control = session.runner.control();
+        session.block_retry_wakeup_scheduler =
+            match HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+                BLOCK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+                session.block_retry_wakeup.clone(),
+                move || vcpu_control.request_wakeup(),
+            ) {
+                Ok(scheduler) => scheduler,
+                Err(source) => {
+                    return Err(HvfSnapshotV2SerialOnlyRestoreError::retry_scheduler(
+                        session,
+                        "block-retry",
+                        source,
+                    ));
+                }
+            };
+        let vcpu_control = session.runner.control();
+        session.pmem_retry_wakeup_scheduler =
+            match HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+                PMEM_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+                session.pmem_retry_wakeup.clone(),
+                move || vcpu_control.request_wakeup(),
+            ) {
+                Ok(scheduler) => scheduler,
+                Err(source) => {
+                    return Err(HvfSnapshotV2SerialOnlyRestoreError::retry_scheduler(
+                        session,
+                        "pmem-retry",
+                        source,
+                    ));
+                }
+            };
+        let vcpu_control = session.runner.control();
+        session.network_retry_wakeup_scheduler =
+            match HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+                NETWORK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+                session.network_retry_wakeup.clone(),
+                move || vcpu_control.request_wakeup(),
+            ) {
+                Ok(scheduler) => scheduler,
+                Err(source) => {
+                    return Err(HvfSnapshotV2SerialOnlyRestoreError::retry_scheduler(
+                        session,
+                        "network-retry",
+                        source,
+                    ));
+                }
+            };
+
+        Ok(session)
+    }
+
     /// Reconstructs one exact native-v2 root-bearing destination and transfers
     /// it directly from the unpublished platform transaction into the complete
     /// product boot-session owner.
@@ -14579,7 +14971,29 @@ impl OwnedHvfArm64BootSession {
         Self::restore_snapshot_v2_storage_mmio_inner(
             state,
             memory,
-            process_shell,
+            HvfSnapshotV2StorageProcessShell::Default(process_shell),
+            None,
+            bundle,
+            plan,
+            None,
+        )
+    }
+
+    /// Reconstructs one exact-2.7 serial plus profile-3 MMIO owner vector.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_storage_mmio(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        bundle: PreparedSnapshotV2StorageBundle,
+        plan: HvfSnapshotV2StorageMmioPlatformPlan,
+    ) -> Result<RestoredHvfSnapshotV2StorageMmioOwners, HvfSnapshotV2StorageMmioRestoreError> {
+        Self::restore_snapshot_v2_storage_mmio_inner(
+            state,
+            memory,
+            HvfSnapshotV2StorageProcessShell::Restored(process_shell),
+            serial_input,
             bundle,
             plan,
             None,
@@ -14601,7 +15015,8 @@ impl OwnedHvfArm64BootSession {
         Self::restore_snapshot_v2_storage_mmio_inner(
             state,
             memory,
-            process_shell,
+            HvfSnapshotV2StorageProcessShell::Default(process_shell),
+            None,
             bundle,
             plan,
             Some(pmem_index),
@@ -14611,7 +15026,8 @@ impl OwnedHvfArm64BootSession {
     fn restore_snapshot_v2_storage_mmio_inner(
         state: HvfSnapshotV2PlatformState,
         memory: GuestMemory,
-        process_shell: HvfSnapshotV2DefaultProcessShell,
+        process_shell: HvfSnapshotV2StorageProcessShell,
+        serial_input: Option<SerialStdioInput>,
         bundle: PreparedSnapshotV2StorageBundle,
         plan: HvfSnapshotV2StorageMmioPlatformPlan,
         publication_fault_pmem_index: Option<usize>,
@@ -14761,12 +15177,19 @@ impl OwnedHvfArm64BootSession {
             vmgenid_interrupt,
             vmclock_interrupt,
         };
-        let mut platform = match restore_hvf_snapshot_v2_storage_mmio_process_platform(
-            state,
-            memory,
-            process_shell,
-            shell_plan,
-        ) {
+        let restored = match process_shell {
+            HvfSnapshotV2StorageProcessShell::Default(shell) => {
+                restore_hvf_snapshot_v2_storage_mmio_process_platform(
+                    state, memory, shell, shell_plan,
+                )
+            }
+            HvfSnapshotV2StorageProcessShell::Restored(shell) => {
+                restore_hvf_snapshot_v2_serial_storage_mmio_process_platform(
+                    state, memory, shell, shell_plan,
+                )
+            }
+        };
+        let mut platform = match restored {
             Ok(platform) => platform,
             Err(source) => {
                 return Err(HvfSnapshotV2StorageMmioRestoreError::platform(
@@ -15127,7 +15550,7 @@ impl OwnedHvfArm64BootSession {
             entropy_interrupt_line: None,
             memory_hotplug_interrupt_line: None,
             serial_interrupt_line,
-            serial_input: None,
+            serial_input: serial_input.map(HvfArm64BootSerialInput::new),
             vmgenid_interrupt_line,
             vmclock_interrupt_line,
             boot_registers: None,
@@ -15150,7 +15573,29 @@ impl OwnedHvfArm64BootSession {
         Self::restore_snapshot_v2_storage_pci_inner(
             state,
             memory,
-            process_shell,
+            HvfSnapshotV2StorageProcessShell::Default(process_shell),
+            None,
+            bundle,
+            plan,
+            None,
+        )
+    }
+
+    /// Reconstructs one exact-2.7 serial plus profile-3 PCI owner vector.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_storage_pci(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        bundle: PreparedSnapshotV2StorageBundle,
+        plan: HvfSnapshotV2StoragePciPlatformPlan,
+    ) -> Result<RestoredHvfSnapshotV2StoragePciOwners, HvfSnapshotV2StoragePciRestoreError> {
+        Self::restore_snapshot_v2_storage_pci_inner(
+            state,
+            memory,
+            HvfSnapshotV2StorageProcessShell::Restored(process_shell),
+            serial_input,
             bundle,
             plan,
             None,
@@ -15171,7 +15616,8 @@ impl OwnedHvfArm64BootSession {
         Self::restore_snapshot_v2_storage_pci_inner(
             state,
             memory,
-            process_shell,
+            HvfSnapshotV2StorageProcessShell::Default(process_shell),
+            None,
             bundle,
             plan,
             Some(pmem_index),
@@ -15182,7 +15628,8 @@ impl OwnedHvfArm64BootSession {
     fn restore_snapshot_v2_storage_pci_inner(
         state: HvfSnapshotV2PlatformState,
         memory: GuestMemory,
-        process_shell: HvfSnapshotV2DefaultProcessShell,
+        process_shell: HvfSnapshotV2StorageProcessShell,
+        serial_input: Option<SerialStdioInput>,
         bundle: PreparedSnapshotV2StorageBundle,
         plan: HvfSnapshotV2StoragePciPlatformPlan,
         publication_fault_pmem_index: Option<usize>,
@@ -15365,12 +15812,19 @@ impl OwnedHvfArm64BootSession {
             vmgenid_interrupt,
             vmclock_interrupt,
         };
-        let mut platform = match restore_hvf_snapshot_v2_storage_pci_process_platform(
-            state,
-            memory,
-            process_shell,
-            shell_plan,
-        ) {
+        let restored = match process_shell {
+            HvfSnapshotV2StorageProcessShell::Default(shell) => {
+                restore_hvf_snapshot_v2_storage_pci_process_platform(
+                    state, memory, shell, shell_plan,
+                )
+            }
+            HvfSnapshotV2StorageProcessShell::Restored(shell) => {
+                restore_hvf_snapshot_v2_serial_storage_pci_process_platform(
+                    state, memory, shell, shell_plan,
+                )
+            }
+        };
+        let mut platform = match restored {
             Ok(platform) => platform,
             Err(source) => {
                 return Err(HvfSnapshotV2StoragePciRestoreError::platform(
@@ -16115,7 +16569,7 @@ impl OwnedHvfArm64BootSession {
             entropy_interrupt_line: None,
             memory_hotplug_interrupt_line: None,
             serial_interrupt_line,
-            serial_input: None,
+            serial_input: serial_input.map(HvfArm64BootSerialInput::new),
             vmgenid_interrupt_line,
             vmclock_interrupt_line,
             boot_registers: None,
@@ -17988,6 +18442,29 @@ impl OwnedHvfArm64BootSession {
     #[doc(hidden)]
     pub fn pause_for_snapshot_v2_capture(&mut self) -> Result<(), HvfArm64BootVcpuError> {
         self.runner.pause_for_arm64_snapshot_v2_capture()
+    }
+
+    /// Reconcile restored serial intents while the destination is still
+    /// Paused and before any vCPU may execute.
+    ///
+    /// This reuses the normal run-loop ordering without reading host input:
+    /// input-ready is rearmed or acknowledged, a pending receive SPI is
+    /// signaled, and only then is its intent consumed.
+    #[doc(hidden)]
+    pub fn prepare_restored_serial_continuation(
+        &mut self,
+    ) -> Result<(), HvfArm64BootSerialInputDispatchError> {
+        let dispatch = dispatch_serial_input(
+            &mut self.serial_input,
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            &self.gic,
+            false,
+        )?;
+        debug_assert_eq!(dispatch.bytes_read, 0);
+        debug_assert!(!dispatch.backpressured);
+        debug_assert!(!dispatch.detached);
+        Ok(())
     }
 
     /// Return the inner vCPU coordinator to Running after snapshot-v2 capture.
@@ -26025,7 +26502,9 @@ mod tests {
     use bangbang_runtime::rtc::RtcMmioLayout;
     use bangbang_runtime::serial::{
         SERIAL_INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE, SERIAL_INTERRUPT_ENABLE_REGISTER_OFFSET,
-        SERIAL_RECEIVE_FIFO_CAPACITY, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialStdio,
+        SERIAL_INTERRUPT_IDENTIFICATION_NO_INTERRUPT_PENDING, SERIAL_LINE_STATUS_DEFAULT,
+        SERIAL_RECEIVE_FIFO_CAPACITY, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioCaptureState,
+        SerialMmioCaptureStateParts, SerialMmioDevice, SerialMmioState, SerialStdio,
         SharedSerialOutput, SharedSerialOutputBuffer,
     };
     use bangbang_runtime::snapshot_device::SnapshotV1BlockRetryState;
@@ -30063,6 +30542,60 @@ mod tests {
         .expect("serial state should capture");
         assert_eq!(state.receive_bytes(), b"I");
         assert!(!state.receive_interrupt_intent_pending());
+    }
+
+    #[test]
+    fn restored_read_free_continuation_acknowledges_input_ready_without_input() {
+        let (mut runtime, _reset_dispatcher) = boot_runtime_with_serial();
+        let reset_serial = runtime
+            .serial_device
+            .as_ref()
+            .expect("serial device should exist");
+        let restored = SerialMmioCaptureState::try_from_parts(SerialMmioCaptureStateParts {
+            legacy_state: SerialMmioState::new(0, 0, 0, 0x5a, 0, 0),
+            interrupt_identification: SERIAL_INTERRUPT_IDENTIFICATION_NO_INTERRUPT_PENDING,
+            line_status: SERIAL_LINE_STATUS_DEFAULT,
+            modem_status: 0,
+            receive_bytes: Vec::new(),
+            receive_interrupt_intent_pending: false,
+            input_ready_intent_pending: true,
+        })
+        .expect("restored input-ready state should validate");
+        let mut dispatcher = MmioDispatcher::new();
+        let serial = bangbang_runtime::startup::register_arm64_boot_restored_serial_mmio(
+            &mut dispatcher,
+            reset_serial.region.id(),
+            reset_serial.region.range().start(),
+            reset_serial.fdt_device.interrupt_line,
+            SerialMmioDevice::from_capture_state_with_shared_output(
+                reset_serial.output.clone(),
+                restored,
+            ),
+        )
+        .expect("restored serial handler should register");
+        runtime.serial_device = Some(serial);
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+        let serial = runtime
+            .serial_device
+            .as_ref()
+            .expect("restored serial metadata should exist");
+
+        let mut serial_input = None;
+        let dispatch =
+            dispatch_serial_input_with(&mut serial_input, &runtime, &dispatcher, false, |_| {
+                panic!("input-ready acknowledgement must not signal an interrupt")
+            })
+            .expect("read-free continuation should acknowledge input-ready");
+        assert_eq!(dispatch.bytes_read, 0);
+        assert!(!dispatch.rearmed);
+        assert!(!dispatch.interrupt_delivered);
+        let recaptured = capture_serial_state_for_device(
+            serial,
+            &mut dispatcher.lock().expect("dispatcher should lock"),
+        )
+        .expect("continued UART should recapture");
+        assert!(!recaptured.input_ready_intent_pending());
+        assert_eq!(recaptured.legacy_state().scratch(), 0x5a);
     }
 
     fn boot_runtime_with_drives(
@@ -37254,6 +37787,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn native_v2_serial_only_errors_preserve_terminality_and_redact_sources() {
+        let retryable = super::HvfSnapshotV2SerialOnlyRestoreError::PciResources(
+            super::HvfArm64BootPciDataError::new("secret-resource/path"),
+        );
+        assert!(!retryable.is_terminal());
+        assert!(!format!("{retryable:?}").contains("secret-resource"));
+        assert!(!retryable.to_string().contains("secret-resource"));
+
+        let committed = super::HvfSnapshotV2SerialOnlyRestoreError::PciOwner {
+            source: super::HvfArm64BootPciDataError::new("secret-owner/path"),
+            cleanup: None,
+        };
+        assert!(committed.is_terminal());
+        assert!(!format!("{committed:?}").contains("secret-owner"));
+        assert!(!committed.to_string().contains("secret-owner"));
+
+        let incomplete = super::HvfSnapshotV2SerialOnlyRestoreError::RetryScheduler {
+            scheduler: "block-retry",
+            source: io::ErrorKind::PermissionDenied,
+            cleanup: Some(Box::new(
+                super::HvfArm64BootSessionShutdownError::DestroyVm {
+                    source: super::BackendError::Hypervisor("secret-cleanup/path".to_string()),
+                },
+            )),
+        };
+        assert!(incomplete.is_terminal());
+        let debug = format!("{incomplete:?}");
+        assert!(debug.contains("cleanup_failed"));
+        assert!(!debug.contains("secret-cleanup"));
+        assert!(!incomplete.to_string().contains("secret-cleanup"));
     }
 
     #[test]

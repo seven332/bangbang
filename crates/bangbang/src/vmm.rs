@@ -30,27 +30,30 @@ use bangbang_hvf::{
     HvfArm64BootPciNetworkDeviceUpdater, HvfArm64BootPciPmemDeviceUpdater,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialCaptureError, HvfArm64BootSerialDeviceConfig,
-    HvfArm64BootSessionConfig, HvfArm64BootSnapshotV1CaptureStage,
-    HvfArm64BootSnapshotV1DeviceCaptureError, HvfArm64BootSnapshotV1StateCaptureError,
-    HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureInput,
-    HvfArm64BootStorageCaptureError, HvfArm64BootStorageCaptureErrorKind,
-    HvfArm64BootStorageCaptureStage, HvfArm64BootTimerDeviceConfig, HvfArm64BootVcpuError,
-    HvfArm64BootVsockCaptureDisposition, HvfArm64BootVsockCaptureError,
-    HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState, HvfBackend, HvfSnapshotV1Bundle,
-    HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
-    HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfSnapshotV2BootState, HvfSnapshotV2BuildError,
-    HvfSnapshotV2DecodeError, HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2EncodeError,
+    HvfArm64BootSerialInputDispatchError, HvfArm64BootSessionConfig,
+    HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootSnapshotV1DeviceCaptureError,
+    HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootSnapshotV2CaptureError,
+    HvfArm64BootSnapshotV2CaptureInput, HvfArm64BootStorageCaptureError,
+    HvfArm64BootStorageCaptureErrorKind, HvfArm64BootStorageCaptureStage,
+    HvfArm64BootTimerDeviceConfig, HvfArm64BootVcpuError, HvfArm64BootVsockCaptureDisposition,
+    HvfArm64BootVsockCaptureError, HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState,
+    HvfBackend, HvfSnapshotV1Bundle, HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup,
+    HvfSnapshotV1RestoreDisposition, HvfSnapshotV1RestoreError, HvfSnapshotV1State,
+    HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2DecodeError,
+    HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2EncodeError,
     HvfSnapshotV2MultiBlockMmioRestoreError, HvfSnapshotV2MultiBlockPciRestoreError,
     HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockProcessConfig,
     HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2PlatformRestoreError,
-    HvfSnapshotV2PlatformState, HvfSnapshotV2RootProcessConfig, HvfSnapshotV2RootResourcePlan,
-    HvfSnapshotV2RootRestoreError, HvfSnapshotV2SerialState, HvfSnapshotV2State,
-    HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioProcessConfig,
-    HvfSnapshotV2StorageMmioRestoreError, HvfSnapshotV2StoragePciPlatformPlan,
-    HvfSnapshotV2StoragePciRestoreError, HvfSnapshotV2StorageState, HvfVcpuRunControl,
-    HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
-    PrepareHvfSnapshotV1LoadError, PrepareHvfSnapshotV2MultiBlockPlatformPlanError,
-    PrepareHvfSnapshotV2RootPlanError, PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
+    HvfSnapshotV2PlatformState, HvfSnapshotV2RestoredSerialShell, HvfSnapshotV2RootProcessConfig,
+    HvfSnapshotV2RootResourcePlan, HvfSnapshotV2RootRestoreError,
+    HvfSnapshotV2SerialOnlyProcessConfig, HvfSnapshotV2SerialOnlyRestoreError,
+    HvfSnapshotV2SerialState, HvfSnapshotV2State, HvfSnapshotV2StorageMmioPlatformPlan,
+    HvfSnapshotV2StorageMmioProcessConfig, HvfSnapshotV2StorageMmioRestoreError,
+    HvfSnapshotV2StoragePciPlatformPlan, HvfSnapshotV2StoragePciRestoreError,
+    HvfSnapshotV2StorageState, HvfVcpuRunControl, HvfVcpuRunCoordinatorError,
+    HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError,
+    PrepareHvfSnapshotV2MultiBlockPlatformPlanError, PrepareHvfSnapshotV2RootPlanError,
+    PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
     PrepareHvfSnapshotV2StoragePciPlatformPlanError, PreparedHvfArm64BootPciNetworkRemoval,
     PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2Platform,
     decode_hvf_snapshot_v2_multi_block_state, decode_hvf_snapshot_v2_platform_state,
@@ -121,7 +124,8 @@ use bangbang_runtime::pmem::{
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{
     CaptureReadySerialState, SerialConfig, SerialConfigError, SerialConfigInput, SerialMmioDevice,
-    SerialOutputFile, SerialStdio, SharedSerialOutput, SharedSerialOutputBuffer,
+    SerialOutputFile, SerialStdio, SerialStdioRestoration, SerialStdioRestorationError,
+    SharedSerialOutput, SharedSerialOutputBuffer,
 };
 use bangbang_runtime::snapshot::{
     SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackendType, SnapshotV1ControllerCommit,
@@ -156,8 +160,8 @@ use bangbang_runtime::snapshot_device_v2_5::{
     SnapshotV2MultiBlockDeviceGraphCaptureError,
 };
 use bangbang_runtime::snapshot_device_v2_6::{
-    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
-    SnapshotV2StorageDeviceGraphCaptureError,
+    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageCleanupError,
+    SnapshotV2StorageDeviceGraph, SnapshotV2StorageDeviceGraphCaptureError,
 };
 use bangbang_runtime::snapshot_format::{
     NativeSnapshotFormatError, NativeSnapshotState, decode_native_snapshot_state,
@@ -233,6 +237,12 @@ use crate::snapshot_restore_resources::{
     RequestedSnapshotRestoreResources, SnapshotRestoreResourceDisposition,
     SnapshotRestoreResourceError, SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
     SnapshotV2MultiBlockRestoreBundleError, SnapshotV2StorageRestoreBundleError,
+};
+#[cfg(target_os = "macos")]
+use crate::snapshot_serial_restore::{
+    PreparedSnapshotV2SerialDestinationCommitError,
+    PreparedSnapshotV2SerialDestinationConstructionError, PreparedSnapshotV2SerialRestoreBundle,
+    PreparedSnapshotV2SerialRestoreOwners, SnapshotV2SerialStorageAdoptionError,
 };
 #[cfg(target_os = "macos")]
 use crate::vsock_restore::{
@@ -7744,8 +7754,19 @@ impl HvfSnapshotV2RestoreDisposition for HvfSnapshotV2StoragePciRestoreError {
 }
 
 #[cfg(target_os = "macos")]
+impl HvfSnapshotV2RestoreDisposition for HvfSnapshotV2SerialOnlyRestoreError {
+    fn is_terminal(&self) -> bool {
+        self.is_terminal()
+    }
+}
+
+#[cfg(target_os = "macos")]
 enum HvfSnapshotV2ProcessConstructionError<E> {
     Restore(E),
+    SerialContinuation {
+        source: HvfArm64BootSerialInputDispatchError,
+        cleanup: Option<BackendError>,
+    },
     RunReady {
         source: HvfVcpuRunCoordinatorError,
         cleanup: Option<BackendError>,
@@ -7764,7 +7785,9 @@ where
     fn is_terminal(&self) -> bool {
         match self {
             Self::Restore(source) => source.is_terminal(),
-            Self::RunReady { .. } | Self::WorkerStart { .. } => true,
+            Self::SerialContinuation { .. } | Self::RunReady { .. } | Self::WorkerStart { .. } => {
+                true
+            }
         }
     }
 }
@@ -7777,6 +7800,7 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (stage, cleanup_failed) = match self {
             Self::Restore(_) => ("restore", false),
+            Self::SerialContinuation { cleanup, .. } => ("serial-continuation", cleanup.is_some()),
             Self::RunReady { cleanup, .. } => ("run-ready", cleanup.is_some()),
             Self::WorkerStart { cleanup, .. } => ("worker-start", cleanup.is_some()),
         };
@@ -7798,6 +7822,10 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (message, cleanup_failed) = match self {
             Self::Restore(_) => ("native-v2 HVF owner restore failed", false),
+            Self::SerialContinuation { cleanup, .. } => (
+                "native-v2 restored serial continuation failed",
+                cleanup.is_some(),
+            ),
             Self::RunReady { cleanup, .. } => (
                 "native-v2 run coordinator preparation failed",
                 cleanup.is_some(),
@@ -7822,6 +7850,7 @@ where
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Restore(source) => Some(source),
+            Self::SerialContinuation { source, .. } => Some(source),
             Self::RunReady { source, .. } => Some(source),
             Self::WorkerStart { source, .. } => Some(source),
         }
@@ -8427,6 +8456,768 @@ fn prepare_hvf_native_v2_storage_pci_destination(
     let (session, serial_output) = destination.into_parts();
     Ok((session, controller, serial_output))
 }
+
+#[cfg(target_os = "macos")]
+enum HvfSnapshotV2SerialOwnerRestoreError {
+    SerialOnly(HvfSnapshotV2SerialOnlyRestoreError),
+    StorageMmio(HvfSnapshotV2StorageMmioRestoreError),
+    StoragePci(HvfSnapshotV2StoragePciRestoreError),
+}
+
+#[cfg(target_os = "macos")]
+impl HvfSnapshotV2RestoreDisposition for HvfSnapshotV2SerialOwnerRestoreError {
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::SerialOnly(source) => source.is_terminal(),
+            Self::StorageMmio(source) => source.is_terminal(),
+            Self::StoragePci(source) => source.is_terminal(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for HvfSnapshotV2SerialOwnerRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2SerialOwnerRestoreError")
+            .field(
+                "profile",
+                &match self {
+                    Self::SerialOnly(_) => "serial-only",
+                    Self::StorageMmio(_) => "storage-mmio",
+                    Self::StoragePci(_) => "storage-pci",
+                },
+            )
+            .field("terminal", &self.is_terminal())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for HvfSnapshotV2SerialOwnerRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.7 HVF owner reconstruction failed ({})",
+            if self.is_terminal() {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for HvfSnapshotV2SerialOwnerRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SerialOnly(source) => Some(source),
+            Self::StorageMmio(source) => Some(source),
+            Self::StoragePci(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+enum HvfSnapshotV2SerialPlatformPlan {
+    SerialOnly,
+    StorageMmio(HvfSnapshotV2StorageMmioPlatformPlan),
+    StoragePci(HvfSnapshotV2StoragePciPlatformPlan),
+}
+
+#[cfg(target_os = "macos")]
+enum HvfSnapshotV2SerialConstructionError {
+    TransportPolicy {
+        storage_cleanup: Option<SnapshotV2StorageCleanupError>,
+    },
+    StorageAdoption(SnapshotV2SerialStorageAdoptionError),
+    StorageMmioPlan {
+        source: PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
+        storage_cleanup: Option<SnapshotV2StorageCleanupError>,
+    },
+    StoragePciPlan {
+        source: PrepareHvfSnapshotV2StoragePciPlatformPlanError,
+        storage_cleanup: Option<SnapshotV2StorageCleanupError>,
+    },
+    InvalidOwners {
+        storage_cleanup: Option<SnapshotV2StorageCleanupError>,
+    },
+    Process(HvfSnapshotV2ProcessConstructionError<HvfSnapshotV2SerialOwnerRestoreError>),
+}
+
+#[cfg(target_os = "macos")]
+impl HvfSnapshotV2SerialConstructionError {
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::StorageAdoption(source) => source.is_terminal(),
+            Self::StorageMmioPlan {
+                source: PrepareHvfSnapshotV2StorageMmioPlatformPlanError::Allocation,
+                storage_cleanup: None,
+            }
+            | Self::StoragePciPlan {
+                source: PrepareHvfSnapshotV2StoragePciPlatformPlanError::Allocation,
+                storage_cleanup: None,
+            } => false,
+            Self::Process(source) => source.is_terminal(),
+            Self::TransportPolicy { .. }
+            | Self::StorageMmioPlan { .. }
+            | Self::StoragePciPlan { .. }
+            | Self::InvalidOwners { .. } => true,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for HvfSnapshotV2SerialConstructionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2SerialConstructionError")
+            .field(
+                "stage",
+                &match self {
+                    Self::TransportPolicy { .. } => "transport-policy",
+                    Self::StorageAdoption(_) => "storage-adoption",
+                    Self::StorageMmioPlan { .. } => "storage-mmio-plan",
+                    Self::StoragePciPlan { .. } => "storage-pci-plan",
+                    Self::InvalidOwners { .. } => "owners",
+                    Self::Process(_) => "process",
+                },
+            )
+            .field("terminal", &self.is_terminal())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for HvfSnapshotV2SerialConstructionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.7 destination construction failed ({})",
+            if self.is_terminal() {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for HvfSnapshotV2SerialConstructionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TransportPolicy { storage_cleanup } | Self::InvalidOwners { storage_cleanup } => {
+                storage_cleanup
+                    .as_ref()
+                    .map(|source| source as &(dyn std::error::Error + 'static))
+            }
+            Self::StorageAdoption(source) => Some(source),
+            Self::StorageMmioPlan { source, .. } => Some(source),
+            Self::StoragePciPlan { source, .. } => Some(source),
+            Self::Process(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct HvfSnapshotV2SerialDestinationCleanupError {
+    session: Option<BackendError>,
+    restoration: Option<SerialStdioRestorationError>,
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for HvfSnapshotV2SerialDestinationCleanupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("exact-2.7 destination cleanup failed")
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for HvfSnapshotV2SerialDestinationCleanupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.session
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| {
+                self.restoration
+                    .as_ref()
+                    .map(|source| source as &(dyn std::error::Error + 'static))
+            })
+    }
+}
+
+/// Complete exact-2.7 process owner. The stdio restoration receipt remains
+/// outside the worker and is finished only after worker, UART, input, and
+/// active-output teardown.
+#[cfg(target_os = "macos")]
+struct HvfSnapshotV2SerialDestination {
+    session: Option<Box<HvfProcessSession>>,
+    storage_configs: Option<CaptureReadyStorageConfigs>,
+    has_storage: bool,
+    serial_config: Option<SerialConfig>,
+    serial_output: Option<SharedSerialOutput>,
+    restoration: Option<SerialStdioRestoration>,
+}
+
+#[cfg(target_os = "macos")]
+impl HvfSnapshotV2SerialDestination {
+    fn prepare_controller(
+        mut self,
+        machine: bangbang_runtime::machine::MachineConfig,
+        boot: bangbang_runtime::boot::BootSourceConfig,
+        resume_requested: bool,
+    ) -> Result<
+        (Self, SnapshotV2ControllerCommit),
+        (Box<Self>, PreparedHvfSnapshotV2SerialControllerError),
+    > {
+        let Some(serial_config) = self.serial_config.take() else {
+            return Err((
+                Box::new(self),
+                PreparedHvfSnapshotV2SerialControllerError::MissingSerialConfig,
+            ));
+        };
+        let controller = if self.has_storage {
+            let Some(storage_configs) = self.storage_configs.take() else {
+                return Err((
+                    Box::new(self),
+                    PreparedHvfSnapshotV2SerialControllerError::MissingStorageConfigs,
+                ));
+            };
+            SnapshotV2ControllerCommit::with_storage_and_serial_configs(
+                machine,
+                boot,
+                storage_configs,
+                serial_config,
+                resume_requested,
+            )
+        } else {
+            SnapshotV2ControllerCommit::with_serial_config(
+                machine,
+                boot,
+                serial_config,
+                resume_requested,
+            )
+        };
+        Ok((self, controller))
+    }
+
+    fn resume(&mut self) -> Result<(), BackendError> {
+        self.session
+            .as_deref_mut()
+            .ok_or(BackendError::InvalidState(
+                "exact-2.7 destination session is unavailable",
+            ))?
+            .resume()
+    }
+
+    fn cleanup(&mut self) -> Result<(), HvfSnapshotV2SerialDestinationCleanupError> {
+        let session = match self.session.as_deref_mut() {
+            Some(HvfProcessSession::Boot(supervisor)) => supervisor
+                .run_command(|session| {
+                    session
+                        .session
+                        .shutdown()
+                        .map_err(|source| BackendError::Hypervisor(source.to_string()))
+                })
+                .map_err(lifecycle_error_from_boot_run_loop_command)
+                .err(),
+            Some(HvfProcessSession::SnapshotV2(_)) => Some(BackendError::InvalidState(
+                "exact-2.7 destination has the wrong worker type",
+            )),
+            None => None,
+        };
+        {
+            let _session = self.session.take();
+        }
+        {
+            let _serial_output = self.serial_output.take();
+        }
+        let restoration = self
+            .restoration
+            .take()
+            .and_then(|restoration| restoration.finish().err());
+        if session.is_some() || restoration.is_some() {
+            Err(HvfSnapshotV2SerialDestinationCleanupError {
+                session,
+                restoration,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn shutdown(mut self) -> Result<(), HvfSnapshotV2SerialDestinationCleanupError> {
+        self.cleanup()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for HvfSnapshotV2SerialDestination {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for HvfSnapshotV2SerialDestination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2SerialDestination")
+            .field("has_session", &self.session.is_some())
+            .field("has_storage", &self.has_storage)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedHvfSnapshotV2SerialControllerError {
+    MissingSerialConfig,
+    MissingStorageConfigs,
+    Cancelled,
+}
+
+#[cfg(target_os = "macos")]
+impl PreparedHvfSnapshotV2SerialControllerError {
+    const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::MissingSerialConfig | Self::MissingStorageConfigs
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for PreparedHvfSnapshotV2SerialControllerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingSerialConfig => "exact-2.7 serial projection is unavailable",
+            Self::MissingStorageConfigs => "exact-2.7 storage projection is unavailable",
+            Self::Cancelled => "exact-2.7 destination commit was cancelled",
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for PreparedHvfSnapshotV2SerialControllerError {}
+
+#[cfg(target_os = "macos")]
+enum PrepareHvfSnapshotV2SerialDestinationError {
+    Construction(
+        PreparedSnapshotV2SerialDestinationConstructionError<HvfSnapshotV2SerialConstructionError>,
+    ),
+    Commit(
+        PreparedSnapshotV2SerialDestinationCommitError<
+            PreparedHvfSnapshotV2SerialControllerError,
+            HvfSnapshotV2SerialDestinationCleanupError,
+        >,
+    ),
+}
+
+#[cfg(target_os = "macos")]
+impl PrepareHvfSnapshotV2SerialDestinationError {
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::Construction(source) => {
+                source.is_terminal()
+                    || matches!(
+                        source,
+                        PreparedSnapshotV2SerialDestinationConstructionError::Construction {
+                            source,
+                            ..
+                        } if source.is_terminal()
+                    )
+            }
+            Self::Commit(source) => {
+                source.is_terminal()
+                    || matches!(
+                        source,
+                        PreparedSnapshotV2SerialDestinationCommitError::Controller {
+                            source,
+                            ..
+                        } if source.is_terminal()
+                    )
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for PrepareHvfSnapshotV2SerialDestinationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrepareHvfSnapshotV2SerialDestinationError")
+            .field(
+                "stage",
+                &match self {
+                    Self::Construction(_) => "construction",
+                    Self::Commit(_) => "commit",
+                },
+            )
+            .field("terminal", &self.is_terminal())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for PrepareHvfSnapshotV2SerialDestinationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.7 destination transaction failed ({})",
+            if self.is_terminal() {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for PrepareHvfSnapshotV2SerialDestinationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Construction(source) => Some(source),
+            Self::Commit(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct PrepareHvfSnapshotV2SerialDestinationInput {
+    platform: HvfSnapshotV2PlatformState,
+    graph: Option<SnapshotV2StorageDeviceGraph>,
+    memory: GuestMemory,
+    pci_enabled: bool,
+    packet_io: ProcessNetworkPacketIoProvider,
+    mmds_metrics: Option<SharedMmdsMetrics>,
+    vmnet_authority: ProcessVmnetAuthority,
+    bundle: PreparedSnapshotV2SerialRestoreBundle,
+    machine: bangbang_runtime::machine::MachineConfig,
+    boot: bangbang_runtime::boot::BootSourceConfig,
+    resume_requested: bool,
+    cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
+/// Reconstructs and atomically commits one internal exact-2.7 destination.
+///
+/// The restored UART continuation pass runs while both the HVF coordinator and
+/// outer process worker remain Paused.
+#[cfg(target_os = "macos")]
+fn prepare_hvf_native_v2_serial_destination(
+    input: PrepareHvfSnapshotV2SerialDestinationInput,
+) -> Result<
+    (HvfSnapshotV2SerialDestination, SnapshotV2ControllerCommit),
+    PrepareHvfSnapshotV2SerialDestinationError,
+> {
+    let PrepareHvfSnapshotV2SerialDestinationInput {
+        platform,
+        graph,
+        memory,
+        pci_enabled,
+        packet_io,
+        mmds_metrics,
+        vmnet_authority,
+        bundle,
+        machine,
+        boot,
+        resume_requested,
+        cancellation,
+    } = input;
+    let expected_transport = if pci_enabled {
+        SnapshotV2DeviceTransportKind::Pci
+    } else {
+        SnapshotV2DeviceTransportKind::Mmio
+    };
+    let destination = bundle
+        .construct_destination(|owners| {
+            if graph
+                .as_ref()
+                .is_some_and(|graph| graph.transport_kind() != expected_transport)
+            {
+                return Err((
+                    Box::new(owners),
+                    HvfSnapshotV2SerialConstructionError::TransportPolicy {
+                        storage_cleanup: None,
+                    },
+                ));
+            }
+            let (owners, mut storage) = owners
+                .adopt_storage(graph, &memory, Instant::now(), &|| {
+                    cancellation.is_cancelled()
+                })
+                .map_err(|(owners, source)| {
+                    (
+                        owners,
+                        HvfSnapshotV2SerialConstructionError::StorageAdoption(source),
+                    )
+                })?;
+
+            let platform_plan = match storage.as_ref() {
+                None => HvfSnapshotV2SerialPlatformPlan::SerialOnly,
+                Some(prepared)
+                    if prepared.transport_kind() == SnapshotV2DeviceTransportKind::Mmio =>
+                {
+                    let process = HvfSnapshotV2StorageMmioProcessConfig::new(
+                        BlockMmioLayout::new(DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID),
+                        PmemMmioLayout::new(DEFAULT_PMEM_MMIO_BASE, DEFAULT_PMEM_MMIO_REGION_ID),
+                    );
+                    match prepare_hvf_snapshot_v2_storage_mmio_platform_plan(
+                        &platform, prepared, process,
+                    ) {
+                        Ok(plan) => HvfSnapshotV2SerialPlatformPlan::StorageMmio(plan),
+                        Err(source) => {
+                            let storage_cleanup =
+                                storage.take().and_then(|storage| storage.abort().err());
+                            return Err((
+                                Box::new(owners),
+                                HvfSnapshotV2SerialConstructionError::StorageMmioPlan {
+                                    source,
+                                    storage_cleanup,
+                                },
+                            ));
+                        }
+                    }
+                }
+                Some(prepared)
+                    if prepared.transport_kind() == SnapshotV2DeviceTransportKind::Pci =>
+                {
+                    match prepare_hvf_snapshot_v2_storage_pci_platform_plan(&platform, prepared) {
+                        Ok(plan) => HvfSnapshotV2SerialPlatformPlan::StoragePci(plan),
+                        Err(source) => {
+                            let storage_cleanup =
+                                storage.take().and_then(|storage| storage.abort().err());
+                            return Err((
+                                Box::new(owners),
+                                HvfSnapshotV2SerialConstructionError::StoragePciPlan {
+                                    source,
+                                    storage_cleanup,
+                                },
+                            ));
+                        }
+                    }
+                }
+                Some(_) => {
+                    let storage_cleanup = storage.take().and_then(|storage| storage.abort().err());
+                    return Err((
+                        Box::new(owners),
+                        HvfSnapshotV2SerialConstructionError::TransportPolicy { storage_cleanup },
+                    ));
+                }
+            };
+
+            let (blocks, pmems, serial, input, restoration, serial_config) = owners.into_parts();
+            debug_assert!(blocks.is_empty());
+            debug_assert!(pmems.is_empty());
+            let (serial, serial_config) = match (serial, serial_config) {
+                (Some(serial), Some(serial_config)) => (serial, serial_config),
+                (serial, serial_config) => {
+                    let storage_cleanup = storage.take().and_then(|storage| storage.abort().err());
+                    return Err((
+                        Box::new(PreparedSnapshotV2SerialRestoreOwners::from_parts((
+                            blocks,
+                            pmems,
+                            serial,
+                            input,
+                            restoration,
+                            serial_config,
+                        ))),
+                        HvfSnapshotV2SerialConstructionError::InvalidOwners { storage_cleanup },
+                    ));
+                }
+            };
+            let serial_output = serial.output().clone();
+            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial);
+            let restored = match platform_plan {
+                HvfSnapshotV2SerialPlatformPlan::SerialOnly => {
+                    debug_assert!(storage.is_none());
+                    OwnedHvfArm64BootSession::restore_snapshot_v2_serial_only(
+                        platform,
+                        memory,
+                        process_shell,
+                        HvfSnapshotV2SerialOnlyProcessConfig::new(pci_enabled),
+                        input,
+                    )
+                    .map(|session| (session, None))
+                    .map_err(HvfSnapshotV2SerialOwnerRestoreError::SerialOnly)
+                }
+                HvfSnapshotV2SerialPlatformPlan::StorageMmio(plan) => {
+                    let Some(storage) = storage.take() else {
+                        return Err((
+                            Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                                restoration,
+                            )),
+                            HvfSnapshotV2SerialConstructionError::InvalidOwners {
+                                storage_cleanup: None,
+                            },
+                        ));
+                    };
+                    OwnedHvfArm64BootSession::restore_snapshot_v2_serial_storage_mmio(
+                        platform,
+                        memory,
+                        process_shell,
+                        input,
+                        storage,
+                        plan,
+                    )
+                    .map(|owners| {
+                        let (session, configs) = owners.into_parts();
+                        (session, Some(configs))
+                    })
+                    .map_err(HvfSnapshotV2SerialOwnerRestoreError::StorageMmio)
+                }
+                HvfSnapshotV2SerialPlatformPlan::StoragePci(plan) => {
+                    let Some(storage) = storage.take() else {
+                        return Err((
+                            Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                                restoration,
+                            )),
+                            HvfSnapshotV2SerialConstructionError::InvalidOwners {
+                                storage_cleanup: None,
+                            },
+                        ));
+                    };
+                    OwnedHvfArm64BootSession::restore_snapshot_v2_serial_storage_pci(
+                        platform,
+                        memory,
+                        process_shell,
+                        input,
+                        storage,
+                        plan,
+                    )
+                    .map(|owners| {
+                        let (session, configs) = owners.into_parts();
+                        (session, Some(configs))
+                    })
+                    .map_err(HvfSnapshotV2SerialOwnerRestoreError::StoragePci)
+                }
+            };
+            let (mut session, storage_configs) = match restored {
+                Ok(restored) => restored,
+                Err(source) => {
+                    return Err((
+                        Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                            restoration,
+                        )),
+                        HvfSnapshotV2SerialConstructionError::Process(
+                            HvfSnapshotV2ProcessConstructionError::Restore(source),
+                        ),
+                    ));
+                }
+            };
+
+            if let Err(source) = session.prepare_restored_serial_continuation() {
+                let cleanup = session
+                    .shutdown()
+                    .err()
+                    .map(|source| BackendError::Hypervisor(source.to_string()));
+                return Err((
+                    Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                        restoration,
+                    )),
+                    HvfSnapshotV2SerialConstructionError::Process(
+                        HvfSnapshotV2ProcessConstructionError::SerialContinuation {
+                            source,
+                            cleanup,
+                        },
+                    ),
+                ));
+            }
+            if let Err(source) = session.resume_after_snapshot_v2_capture() {
+                let cleanup = session
+                    .shutdown()
+                    .err()
+                    .map(|source| BackendError::Hypervisor(source.to_string()));
+                return Err((
+                    Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                        restoration,
+                    )),
+                    HvfSnapshotV2SerialConstructionError::Process(
+                        HvfSnapshotV2ProcessConstructionError::RunReady { source, cleanup },
+                    ),
+                ));
+            }
+            let process_session = ProcessHvfBootSession::new_with_vmnet_authority(
+                session,
+                packet_io,
+                mmds_metrics,
+                vmnet_authority,
+            );
+            let supervisor = match HvfBootRunLoopSupervisor::start_paused(
+                process_session,
+                default_hvf_boot_run_loop_step_limit(),
+            ) {
+                Ok(supervisor) => supervisor,
+                Err(error) => {
+                    let (source, mut failed_session) = error.into_parts();
+                    let cleanup = failed_session
+                        .session
+                        .shutdown()
+                        .err()
+                        .map(|source| BackendError::Hypervisor(source.to_string()));
+                    return Err((
+                        Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                            restoration,
+                        )),
+                        HvfSnapshotV2SerialConstructionError::Process(
+                            HvfSnapshotV2ProcessConstructionError::WorkerStart { source, cleanup },
+                        ),
+                    ));
+                }
+            };
+            let has_storage = storage_configs.is_some();
+            Ok(HvfSnapshotV2SerialDestination {
+                session: Some(Box::new(HvfProcessSession::Boot(supervisor))),
+                storage_configs,
+                has_storage,
+                serial_config: Some(serial_config),
+                serial_output: Some(serial_output),
+                restoration,
+            })
+        })
+        .map_err(PrepareHvfSnapshotV2SerialDestinationError::Construction)?;
+    let (destination, controller) = destination
+        .commit(
+            |destination| {
+                if !cancellation.try_seal_commit() {
+                    return Err((
+                        Box::new(destination),
+                        PreparedHvfSnapshotV2SerialControllerError::Cancelled,
+                    ));
+                }
+                destination.prepare_controller(machine, boot, resume_requested)
+            },
+            HvfSnapshotV2SerialDestination::shutdown,
+        )
+        .map_err(PrepareHvfSnapshotV2SerialDestinationError::Commit)?;
+    Ok((destination, controller))
+}
+
+#[cfg(target_os = "macos")]
+type HvfNativeV2SerialDestinationPrepare = fn(
+    PrepareHvfSnapshotV2SerialDestinationInput,
+) -> Result<
+    (HvfSnapshotV2SerialDestination, SnapshotV2ControllerCommit),
+    PrepareHvfSnapshotV2SerialDestinationError,
+>;
+
+#[cfg(target_os = "macos")]
+const _: HvfNativeV2SerialDestinationPrepare = prepare_hvf_native_v2_serial_destination;
+
+#[cfg(target_os = "macos")]
+type HvfNativeV2SerialDestinationResume =
+    fn(&mut HvfSnapshotV2SerialDestination) -> Result<(), BackendError>;
+
+#[cfg(target_os = "macos")]
+const _: HvfNativeV2SerialDestinationResume = HvfSnapshotV2SerialDestination::resume;
 
 #[cfg(target_os = "macos")]
 struct PrepareHvfSnapshotV2MultiBlockPciDestinationInput {
@@ -18052,7 +18843,8 @@ mod tests {
         write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
     };
     use bangbang_runtime::snapshot_serial_v2_7::{
-        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialEndpointIntent,
+        SnapshotV2SerialState,
     };
     use bangbang_runtime::startup::{
         Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkInterface,
@@ -32011,6 +32803,31 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_v2_serial_commit_classifies_missing_projection_as_terminal() {
+        let is_terminal = |source: super::PreparedHvfSnapshotV2SerialControllerError| {
+            super::PrepareHvfSnapshotV2SerialDestinationError::Commit(
+                super::PreparedSnapshotV2SerialDestinationCommitError::Controller {
+                    source,
+                    destination_cleanup: None,
+                    completion_abort: None,
+                },
+            )
+            .is_terminal()
+        };
+
+        assert!(is_terminal(
+            super::PreparedHvfSnapshotV2SerialControllerError::MissingSerialConfig
+        ));
+        assert!(is_terminal(
+            super::PreparedHvfSnapshotV2SerialControllerError::MissingStorageConfigs
+        ));
+        assert!(!is_terminal(
+            super::PreparedHvfSnapshotV2SerialControllerError::Cancelled
+        ));
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     #[ignore = "requires the signed native_v2_process integration group"]
@@ -32364,6 +33181,617 @@ mod tests {
                 }
             }
             drop(session);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires the signed native_v2_process integration group"]
+    fn signed_native_v2_serial_destination_reconciles_and_recaptures_private_owner() {
+        const ARM64_IMAGE_HEADER_SIZE: usize = 64;
+        const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
+        const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
+        const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+        const ARM64_BRANCH_TO_SELF: u32 = 0x1400_0000;
+
+        let mut image = vec![0_u8; ARM64_IMAGE_HEADER_SIZE];
+        image[..4].copy_from_slice(&ARM64_BRANCH_TO_SELF.to_le_bytes());
+        image[ARM64_IMAGE_SIZE_OFFSET..ARM64_IMAGE_SIZE_OFFSET + 8]
+            .copy_from_slice(&(ARM64_IMAGE_HEADER_SIZE as u64).to_le_bytes());
+        image[ARM64_IMAGE_MAGIC_OFFSET..ARM64_IMAGE_MAGIC_OFFSET + 4]
+            .copy_from_slice(&ARM64_IMAGE_MAGIC.to_le_bytes());
+
+        for (case, pci_enabled) in [("mmio", false), ("pci", true)] {
+            let kernel = TempFilePath::create_with_bytes(
+                &format!("signed-native-v2-serial-{case}-kernel"),
+                &image,
+            );
+            let sink = TempFilePath::create(&format!("signed-native-v2-serial-{case}-sink"));
+            let mut source_controller = VmmController::new(
+                format!("native-v2-serial-{case}-source"),
+                "0.1.0",
+                "bangbang",
+            );
+            source_controller
+                .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(1, 16)))
+                .expect("serial source machine should configure");
+            source_controller
+                .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                    kernel.path(),
+                )))
+                .expect("serial source boot metadata should configure");
+
+            let source_serial = SharedSerialOutput::from(SharedSerialOutputBuffer::default());
+            let mut source_config = default_hvf_boot_session_config(source_serial);
+            if pci_enabled {
+                source_config = source_config.with_pci_enabled();
+            }
+            let mut source_session =
+                super::OwnedHvfArm64BootSession::new(&source_controller, source_config)
+                    .expect("signed exact-2.7 source should prepare");
+            let restored_layout =
+                GuestMemoryLayout::new(source_session.runtime_resources().layout.ranges().to_vec())
+                    .expect("serial destination layout should validate");
+            let copy_source_memory = || {
+                let mut destination = GuestMemory::allocate(&restored_layout)
+                    .expect("serial destination memory should allocate");
+                let source = source_session
+                    .guest_memory()
+                    .expect("serial source memory should remain mapped");
+                let mut buffer = vec![0_u8; 64 * 1024];
+                for range in restored_layout.ranges() {
+                    let mut copied = 0_u64;
+                    while copied < range.size() {
+                        let count = usize::try_from(
+                            (range.size() - copied).min(
+                                u64::try_from(buffer.len())
+                                    .expect("serial copy buffer length should fit u64"),
+                            ),
+                        )
+                        .expect("serial memory copy length should fit usize");
+                        let address = range
+                            .start()
+                            .checked_add(copied)
+                            .expect("serial memory copy address should fit");
+                        source
+                            .read_slice(&mut buffer[..count], address)
+                            .expect("serial source memory should read");
+                        destination
+                            .write_slice(&buffer[..count], address)
+                            .expect("serial destination memory should write");
+                        copied += u64::try_from(count).expect("serial copy length should fit u64");
+                    }
+                }
+                destination
+            };
+            let cancelled_memory = copy_source_memory();
+            let committed_memory = copy_source_memory();
+
+            source_session
+                .pause_for_snapshot_v2_capture()
+                .expect("serial source topology should pause");
+            let capture_boot = || {
+                HvfSnapshotV2BootState::try_new(
+                    HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+                        .expect("serial source kernel path should validate"),
+                    None,
+                    None,
+                )
+                .expect("serial source boot state should validate")
+            };
+            let mut memory_output = Cursor::new(Vec::new());
+            let platform = source_session
+                .capture_snapshot_v2_serial_platform_with_cancel(
+                    HvfArm64BootSnapshotV2CaptureInput::new(capture_boot()),
+                    &mut memory_output,
+                    |_| false,
+                )
+                .expect("signed exact-2.7 serial platform should capture");
+            source_session
+                .shutdown()
+                .expect("serial source should shut down");
+
+            let machine = snapshot_destination_machine_config(platform.machine().machine(), false);
+            let boot = super::native_v2_boot_source_config(platform.machine().boot())
+                .expect("serial destination boot projection should validate");
+            let sink_selector = sink
+                .path()
+                .to_str()
+                .expect("serial destination path should be UTF-8");
+            let serial_config = SerialConfigInput::new()
+                .with_serial_out_path(sink_selector)
+                .validate()
+                .expect("serial destination output should validate");
+            let captured_device = native_v2_serial_full_receive_interrupt_state();
+            let serial_state = SnapshotV2SerialState::try_new(
+                SnapshotV2SerialEndpointIntent::try_configured_output(sink_selector)
+                    .expect("serial destination endpoint should validate"),
+                None,
+                captured_device.clone(),
+            )
+            .expect("complete serial destination state should validate");
+
+            let cancelled_bundle =
+                crate::snapshot_serial_restore::prepare_native_v2_serial_restore_bundle(
+                    None,
+                    serial_state.clone(),
+                    None,
+                    || false,
+                )
+                .expect("cancelled serial destination bundle should prepare");
+            let (cancelled_packet_io, cancelled_mmds_metrics) =
+                ProcessNetworkPacketIoProvider::from_controller(
+                    &source_controller,
+                    ProcessVmnetAuthority::Direct,
+                )
+                .expect("cancelled serial packet I/O should prepare");
+            let cancellation = NativeV2SnapshotCaptureCancellation::default();
+            cancellation.cancel();
+            let cancelled = super::prepare_hvf_native_v2_serial_destination(
+                super::PrepareHvfSnapshotV2SerialDestinationInput {
+                    platform: platform.clone(),
+                    graph: None,
+                    memory: cancelled_memory,
+                    pci_enabled,
+                    packet_io: cancelled_packet_io,
+                    mmds_metrics: cancelled_mmds_metrics,
+                    vmnet_authority: ProcessVmnetAuthority::Direct,
+                    bundle: cancelled_bundle,
+                    machine,
+                    boot: boot.clone(),
+                    resume_requested: false,
+                    cancellation,
+                },
+            )
+            .expect_err("cancellation should destroy the unpublished serial destination");
+            assert!(!cancelled.is_terminal());
+            assert!(matches!(
+                cancelled,
+                super::PrepareHvfSnapshotV2SerialDestinationError::Commit(_)
+            ));
+
+            let committed_bundle =
+                crate::snapshot_serial_restore::prepare_native_v2_serial_restore_bundle(
+                    None,
+                    serial_state,
+                    None,
+                    || false,
+                )
+                .expect("serial destination bundle should prepare after rollback");
+            let (committed_packet_io, committed_mmds_metrics) =
+                ProcessNetworkPacketIoProvider::from_controller(
+                    &source_controller,
+                    ProcessVmnetAuthority::Direct,
+                )
+                .expect("committed serial packet I/O should prepare");
+            let (mut destination, controller_commit) =
+                super::prepare_hvf_native_v2_serial_destination(
+                    super::PrepareHvfSnapshotV2SerialDestinationInput {
+                        platform,
+                        graph: None,
+                        memory: committed_memory,
+                        pci_enabled,
+                        packet_io: committed_packet_io,
+                        mmds_metrics: committed_mmds_metrics,
+                        vmnet_authority: ProcessVmnetAuthority::Direct,
+                        bundle: committed_bundle,
+                        machine,
+                        boot: boot.clone(),
+                        resume_requested: false,
+                        cancellation: NativeV2SnapshotCaptureCancellation::default(),
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!("private exact-2.7 {case} serial destination should commit: {error:?}")
+                });
+
+            assert!(!destination.has_storage);
+            assert!(!controller_commit.resume_requested());
+            let mut restored_controller = VmmController::new(
+                format!("native-v2-serial-{case}-destination"),
+                "0.1.0",
+                "bangbang",
+            );
+            assert!(!restored_controller.commit_snapshot_v2_load(controller_commit));
+            assert_eq!(restored_controller.machine_config(), machine);
+            assert_eq!(restored_controller.boot_source_config(), Some(&boot));
+            assert_eq!(restored_controller.serial_config(), &serial_config);
+            assert_eq!(
+                restored_controller.instance_info().state,
+                InstanceState::Paused
+            );
+            match destination
+                .session
+                .as_deref()
+                .expect("serial destination worker should exist")
+            {
+                super::HvfProcessSession::Boot(supervisor) => {
+                    assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+                    let restored_pci_enabled = supervisor
+                        .run_command(|session| {
+                            Ok::<_, BackendError>(session.session.uses_pci_data_devices())
+                        })
+                        .expect("serial destination PCI owner should be inspectable");
+                    assert_eq!(restored_pci_enabled, pci_enabled);
+                }
+                super::HvfProcessSession::SnapshotV2(_) => {
+                    panic!("exact-2.7 serial handoff should use the boot supervisor");
+                }
+            }
+
+            destination
+                .resume()
+                .expect("serial destination should explicitly resume");
+            let supervisor = match destination
+                .session
+                .as_deref()
+                .expect("resumed serial destination worker should exist")
+            {
+                super::HvfProcessSession::Boot(supervisor) => supervisor,
+                super::HvfProcessSession::SnapshotV2(_) => {
+                    panic!("exact-2.7 serial handoff should retain the boot supervisor")
+                }
+            };
+            supervisor
+                .pause()
+                .expect("resumed serial destination should pause for recapture");
+            let recaptured = supervisor
+                .capture_native_v2_serial_candidate(
+                    HvfArm64BootSnapshotV2CaptureInput::new(capture_boot()),
+                    serial_config.clone(),
+                    CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                    if pci_enabled {
+                        SnapshotV2DeviceTransportKind::Pci
+                    } else {
+                        SnapshotV2DeviceTransportKind::Mmio
+                    },
+                    Box::new(Cursor::new(Vec::new())),
+                    NativeV2SnapshotCaptureCancellation::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("private exact-2.7 {case} serial destination should recapture: {error}")
+                });
+            let structural = decode_snapshot_v2_state_with_compatibility_version(
+                &recaptured,
+                NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("recaptured exact-2.7 serial state should decode structurally");
+            let recaptured = bangbang_hvf::decode_hvf_snapshot_v2_serial_state(&structural)
+                .expect("recaptured exact-2.7 serial state should cross-validate");
+            assert!(recaptured.device_graph().is_none());
+            assert_eq!(
+                recaptured.serial().endpoint_intent(),
+                &SnapshotV2SerialEndpointIntent::try_configured_output(sink_selector)
+                    .expect("recaptured serial endpoint should validate")
+            );
+            assert_eq!(recaptured.serial().rate_limiter(), None);
+            let recaptured_device = recaptured.serial().device();
+            assert_eq!(
+                recaptured_device.legacy_state(),
+                captured_device.legacy_state()
+            );
+            assert_eq!(
+                recaptured_device.interrupt_identification(),
+                captured_device.interrupt_identification()
+            );
+            assert_eq!(
+                recaptured_device.line_status(),
+                captured_device.line_status()
+            );
+            assert_eq!(
+                recaptured_device.modem_status(),
+                captured_device.modem_status()
+            );
+            assert_eq!(
+                recaptured_device.receive_bytes(),
+                captured_device.receive_bytes()
+            );
+            assert!(!recaptured_device.receive_interrupt_intent_pending());
+            assert!(!recaptured_device.input_ready_intent_pending());
+            assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+            destination
+                .shutdown()
+                .expect("serial destination should release every private owner");
+            assert_eq!(
+                fs::read(sink.path()).expect("serial destination sink should remain readable"),
+                b""
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires the signed native_v2_process integration group"]
+    fn signed_native_v2_serial_storage_destination_preserves_mmio_and_pci_owners() {
+        const ARM64_IMAGE_HEADER_SIZE: usize = 64;
+        const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
+        const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
+        const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+        const ARM64_BRANCH_TO_SELF: u32 = 0x1400_0000;
+
+        let mut image = vec![0_u8; ARM64_IMAGE_HEADER_SIZE];
+        image[..4].copy_from_slice(&ARM64_BRANCH_TO_SELF.to_le_bytes());
+        image[ARM64_IMAGE_SIZE_OFFSET..ARM64_IMAGE_SIZE_OFFSET + 8]
+            .copy_from_slice(&(ARM64_IMAGE_HEADER_SIZE as u64).to_le_bytes());
+        image[ARM64_IMAGE_MAGIC_OFFSET..ARM64_IMAGE_MAGIC_OFFSET + 4]
+            .copy_from_slice(&ARM64_IMAGE_MAGIC.to_le_bytes());
+
+        for (case, pci_enabled) in [("mmio", false), ("pci", true)] {
+            let kernel = TempFilePath::create_with_bytes(
+                &format!("signed-native-v2-serial-storage-{case}-kernel"),
+                &image,
+            );
+            let root = TempFilePath::create_with_bytes(
+                &format!("signed-native-v2-serial-storage-{case}-root"),
+                &[0_u8; 4096],
+            );
+            let sink =
+                TempFilePath::create(&format!("signed-native-v2-serial-storage-{case}-sink"));
+            let mut source_controller = VmmController::new(
+                format!("native-v2-serial-storage-{case}-source"),
+                "0.1.0",
+                "bangbang",
+            );
+            source_controller
+                .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(1, 16)))
+                .expect("serial-storage source machine should configure");
+            source_controller
+                .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                    kernel.path(),
+                )))
+                .expect("serial-storage source boot metadata should configure");
+            source_controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", root.path(), true)
+                        .with_is_read_only(true)
+                        .with_io_engine(DriveIoEngine::Sync),
+                ))
+                .expect("serial-storage source root should configure");
+
+            let source_serial = SharedSerialOutput::from(SharedSerialOutputBuffer::default());
+            let mut source_config = default_hvf_boot_session_config(source_serial);
+            if pci_enabled {
+                source_config = source_config.with_pci_enabled();
+            }
+            let mut source_session =
+                super::OwnedHvfArm64BootSession::new(&source_controller, source_config)
+                    .expect("signed exact-2.7 serial-storage source should prepare");
+            let storage_configs = CaptureReadyStorageConfigs::new(
+                source_controller.drive_configs().to_vec(),
+                Vec::new(),
+            );
+            let capture_guard = source_session
+                .quiesce_limiter_retry_wakeups()
+                .expect("serial-storage retry publishers should quiesce");
+            let graph = source_session
+                .capture_snapshot_v2_storage_device_graph_at(
+                    &storage_configs,
+                    &capture_guard,
+                    Instant::now(),
+                )
+                .expect("serial-storage graph should capture");
+            let expected_graph = graph.clone();
+
+            let restored_layout =
+                GuestMemoryLayout::new(source_session.runtime_resources().layout.ranges().to_vec())
+                    .expect("serial-storage destination layout should validate");
+            let mut destination_memory = GuestMemory::allocate(&restored_layout)
+                .expect("serial-storage destination memory should allocate");
+            let source_memory = source_session
+                .guest_memory()
+                .expect("serial-storage source memory should remain mapped");
+            let mut buffer = vec![0_u8; 64 * 1024];
+            for range in restored_layout.ranges() {
+                let mut copied = 0_u64;
+                while copied < range.size() {
+                    let count = usize::try_from(
+                        (range.size() - copied).min(
+                            u64::try_from(buffer.len())
+                                .expect("serial-storage copy buffer length should fit u64"),
+                        ),
+                    )
+                    .expect("serial-storage memory copy length should fit usize");
+                    let address = range
+                        .start()
+                        .checked_add(copied)
+                        .expect("serial-storage memory copy address should fit");
+                    source_memory
+                        .read_slice(&mut buffer[..count], address)
+                        .expect("serial-storage source memory should read");
+                    destination_memory
+                        .write_slice(&buffer[..count], address)
+                        .expect("serial-storage destination memory should write");
+                    copied +=
+                        u64::try_from(count).expect("serial-storage copy length should fit u64");
+                }
+            }
+
+            source_session
+                .pause_for_snapshot_v2_capture()
+                .expect("serial-storage source topology should pause");
+            let capture_boot = || {
+                HvfSnapshotV2BootState::try_new(
+                    HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+                        .expect("serial-storage source kernel path should validate"),
+                    None,
+                    None,
+                )
+                .expect("serial-storage source boot state should validate")
+            };
+            let mut memory_output = Cursor::new(Vec::new());
+            let platform = source_session
+                .capture_snapshot_v2_serial_platform_with_cancel(
+                    HvfArm64BootSnapshotV2CaptureInput::new(capture_boot()),
+                    &mut memory_output,
+                    |_| false,
+                )
+                .expect("signed exact-2.7 serial-storage platform should capture");
+            drop(capture_guard);
+            source_session
+                .shutdown()
+                .expect("serial-storage source should shut down");
+
+            let machine = snapshot_destination_machine_config(platform.machine().machine(), false);
+            let boot = super::native_v2_boot_source_config(platform.machine().boot())
+                .expect("serial-storage boot projection should validate");
+            let sink_selector = sink
+                .path()
+                .to_str()
+                .expect("serial-storage destination path should be UTF-8");
+            let serial_config = SerialConfigInput::new()
+                .with_serial_out_path(sink_selector)
+                .validate()
+                .expect("serial-storage output should validate");
+            let captured_device = native_v2_serial_full_receive_interrupt_state();
+            let serial_state = SnapshotV2SerialState::try_new(
+                SnapshotV2SerialEndpointIntent::try_configured_output(sink_selector)
+                    .expect("serial-storage endpoint should validate"),
+                None,
+                captured_device.clone(),
+            )
+            .expect("complete serial-storage state should validate");
+            let bundle = crate::snapshot_serial_restore::prepare_native_v2_serial_restore_bundle(
+                Some(&graph),
+                serial_state,
+                None,
+                || false,
+            )
+            .expect("serial-storage destination bundle should prepare");
+            let (packet_io, mmds_metrics) = ProcessNetworkPacketIoProvider::from_controller(
+                &source_controller,
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("serial-storage packet I/O should prepare");
+            let (mut destination, controller_commit) =
+                super::prepare_hvf_native_v2_serial_destination(
+                    super::PrepareHvfSnapshotV2SerialDestinationInput {
+                        platform,
+                        graph: Some(graph),
+                        memory: destination_memory,
+                        pci_enabled,
+                        packet_io,
+                        mmds_metrics,
+                        vmnet_authority: ProcessVmnetAuthority::Direct,
+                        bundle,
+                        machine,
+                        boot: boot.clone(),
+                        resume_requested: false,
+                        cancellation: NativeV2SnapshotCaptureCancellation::default(),
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "private exact-2.7 {case} serial-storage destination should commit: {error:?}"
+                    )
+                });
+
+            assert!(destination.has_storage);
+            assert!(!controller_commit.resume_requested());
+            let mut restored_controller = VmmController::new(
+                format!("native-v2-serial-storage-{case}-destination"),
+                "0.1.0",
+                "bangbang",
+            );
+            assert!(!restored_controller.commit_snapshot_v2_load(controller_commit));
+            assert_eq!(restored_controller.machine_config(), machine);
+            assert_eq!(restored_controller.boot_source_config(), Some(&boot));
+            assert_eq!(
+                restored_controller.drive_configs(),
+                storage_configs.drives()
+            );
+            assert!(restored_controller.pmem_configs().is_empty());
+            assert_eq!(restored_controller.serial_config(), &serial_config);
+            assert_eq!(
+                restored_controller.instance_info().state,
+                InstanceState::Paused
+            );
+
+            destination
+                .resume()
+                .expect("serial-storage destination should explicitly resume");
+            let supervisor = match destination
+                .session
+                .as_deref()
+                .expect("serial-storage destination worker should exist")
+            {
+                super::HvfProcessSession::Boot(supervisor) => supervisor,
+                super::HvfProcessSession::SnapshotV2(_) => {
+                    panic!("exact-2.7 serial-storage handoff should use the boot supervisor")
+                }
+            };
+            supervisor
+                .pause()
+                .expect("serial-storage destination should pause for recapture");
+            let recaptured = supervisor
+                .capture_native_v2_serial_candidate(
+                    HvfArm64BootSnapshotV2CaptureInput::new(capture_boot()),
+                    serial_config.clone(),
+                    storage_configs.clone(),
+                    if pci_enabled {
+                        SnapshotV2DeviceTransportKind::Pci
+                    } else {
+                        SnapshotV2DeviceTransportKind::Mmio
+                    },
+                    Box::new(Cursor::new(Vec::new())),
+                    NativeV2SnapshotCaptureCancellation::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "private exact-2.7 {case} serial-storage destination should recapture: {error}"
+                    )
+                });
+            let structural = decode_snapshot_v2_state_with_compatibility_version(
+                &recaptured,
+                NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("recaptured serial-storage state should decode structurally");
+            let recaptured = bangbang_hvf::decode_hvf_snapshot_v2_serial_state(&structural)
+                .expect("recaptured serial-storage state should cross-validate");
+            assert_eq!(
+                recaptured
+                    .device_graph()
+                    .expect("recaptured storage graph should remain present"),
+                &expected_graph
+            );
+            assert_eq!(
+                recaptured.serial().endpoint_intent(),
+                &SnapshotV2SerialEndpointIntent::try_configured_output(sink_selector)
+                    .expect("recaptured serial-storage endpoint should validate")
+            );
+            assert_eq!(recaptured.serial().rate_limiter(), None);
+            let recaptured_device = recaptured.serial().device();
+            assert_eq!(
+                recaptured_device.legacy_state(),
+                captured_device.legacy_state()
+            );
+            assert_eq!(
+                recaptured_device.interrupt_identification(),
+                captured_device.interrupt_identification()
+            );
+            assert_eq!(
+                recaptured_device.line_status(),
+                captured_device.line_status()
+            );
+            assert_eq!(
+                recaptured_device.modem_status(),
+                captured_device.modem_status()
+            );
+            assert_eq!(
+                recaptured_device.receive_bytes(),
+                captured_device.receive_bytes()
+            );
+            assert!(!recaptured_device.receive_interrupt_intent_pending());
+            assert!(!recaptured_device.input_ready_intent_pending());
+            assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+            destination
+                .shutdown()
+                .expect("serial-storage destination should release every private owner");
+            assert_eq!(
+                fs::read(sink.path()).expect("serial-storage sink should remain readable"),
+                b""
+            );
         }
     }
 
