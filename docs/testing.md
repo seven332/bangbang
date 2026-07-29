@@ -561,17 +561,21 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
 production catalog admits semantic memory kind 1 introduced in minor 1; the
-current `2.8.0` writer additionally admits machine/global/topology kinds 2–4
+current `2.9.0` writer additionally admits machine/global/topology kinds 2–4
 and per-vCPU kind 5 introduced in minor 2, singleton time kind 6 introduced in
 minor 3, optional singleton device-graph kind 7 introduced in minor 4, and
 mandatory singleton serial kind 8 introduced in minor 7, plus optional entropy
-kind 9 introduced in minor 8.
+kind 9 introduced in minor 8 and optional balloon kind 10 introduced in minor
+9.
 Exact `2.4.0` retains device-graph profile 1's singleton root, while `2.5.0`
 uses profile 2's bounded ordered block vector and `2.6.0` uses profile 3's
 bounded ordered block-and-pmem vector. Exact `2.7.0` requires kind 8 and
 optionally composes the unchanged profile-3 graph. Exact `2.8.0` retains those
 rules and optionally appends kind 9 with one exact queue, dual buckets,
-pending/retry state, and MMIO/PCI placement. Exact `2.3.0` remains the
+pending/retry state, and MMIO/PCI placement. Exact `2.9.0` retains those rules
+and optionally appends kind 10 with variable active queue state, latest and
+pending statistics, DONE-normalized hint history, exact PFN accounting, and
+MMIO/PCI placement. Exact `2.3.0` remains the
 legacy device-free platform profile. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
 lengths, all three offsets, CRC and every truncation, feature
@@ -584,7 +588,7 @@ resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
 Native-v2 lazy-memory tests retain exact multi-extent binding and complete
-`2.1.0` compatibility fixtures while proving that new output uses `2.8.0`.
+`2.1.0` compatibility fixtures while proving that new output uses `2.9.0`.
 They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
 binding/header/topology/length mutation, exact admitted-version retention,
 typed state profiles,
@@ -662,7 +666,7 @@ The wrapper builds the `bangbang` binary unit-test harness, locates and signs
 that exact test executable, and runs only the ignored private-seam proof. Its
 minimal two-vCPU guest does not touch serial or optional devices beyond the
 required read-only root. The first test starts and pauses the real
-process-owned HVF supervisor, publishes one current 2.8
+process-owned HVF supervisor, publishes one current 2.9
 serial-plus-profile-3 MMIO-root pair without entropy, resumes and repauses the
 source, publishes a fresh recapture,
 and drops the source. It
@@ -1304,9 +1308,15 @@ all six selected records terminal after exact 2.7
 encoding/endpoint-reconstruction certification. Serial changes additionally
 require the signed default-stdio executable cases and production-bundle
 boundary case.
+The
+[balloon closure ledger](../compat/firecracker/v1.16.0/balloon-contract.md)
+pins all 52 selected records terminal after exact 2.9 kind-10 direct and
+normal-production MMIO/PCI continuation certification. Balloon snapshot
+changes require the focused exact codec/product/memory/failure suites plus both
+signed continuation cases and the complete integration wrapper.
 The checked
 [aggregate remaining-device ledger](../compat/firecracker/v1.16.0/remaining-device-contract.md)
-fixes the union at 85 unique records with an 80-terminal/five-Wave-6 split.
+fixes the union at 85 unique records with an 82-terminal/three-Wave-6 split.
 Its audit test rejects family drift, overlap, stale #1440/#1481 handoffs, wrong
 #1490 URLs, any selected #1491 row, and missing focused or signed evidence.
 
@@ -1327,9 +1337,12 @@ only that record. #1578 then promotes four public native-v2 process/snapshot
 records. #1634 promotes the final two pmem storage composites after native-v2
 2.6 profile-3 certification. #1652 promotes the serial semantic aggregate
 after exact 2.7 direct and normal-production continuation certification. #1665
-activates current native-v2 2.8 with optional entropy, and #1666 promotes the
+activates exact native-v2 2.8 with optional entropy, and #1666 promotes the
 two entropy artifact/restore records after direct and normal-production
-continuation certification. The current overlay is 238/160/3/17.
+continuation certification. #1680 activates current native-v2 2.9 with optional
+balloon, and #1681 promotes the two balloon aggregate records after direct and
+normal-production continuation certification. The current overlay is
+240/158/3/17.
 
 Snapshot paging feasibility, its standalone protocol/client, internal
 lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
@@ -1665,7 +1678,7 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
-- exact external snapshot grants creating current native-v2 2.8
+- exact external snapshot grants creating current native-v2 2.9
   serial-plus-profile-3 rooted three-drive MMIO and PCI pairs without entropy
   into separate output directories, reusing both retained
   directories for a second successful pair, preserving all finals on
@@ -1870,8 +1883,8 @@ punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
 separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
-checks exact `v2.8.0` output for `--snapshot-version`, exact description of
-native-v1, legacy `2.3.0`, `2.4.0`, `2.5.0`, `2.6.0`, and `2.7.0`, and current
+checks exact `v2.9.0` output for `--snapshot-version`, exact description of
+native-v1, legacy `2.3.0`, `2.4.0`, `2.5.0`, `2.6.0`, `2.7.0`, and `2.8.0`, and current
 native-v2 fixtures, plus explicit pinned Firecracker/unknown incompatibility. It also
 covers missing, non-regular,
 oversized, malformed, truncated, trailing/inconsistent-length, corrupt,
@@ -1926,7 +1939,7 @@ pausing, proving the source has already followed live MMIO or PCI root I/O.
 The source UART must remain canonical, while its Linux-consumed FDT bytes are
 captured and CRC-bound without being reparsed as trusted post-boot topology.
 Creation through `/snapshot/create` then verifies the real CLI reports
-`v2.8.0`. Fresh signed processes repeatedly load the same immutable pair: one
+`v2.9.0`. Fresh signed processes repeatedly load the same immutable pair: one
 remains paused until public `PATCH /vm`, and one uses `resume_vm: true`. The
 paused destination is also publicly recaptured and its decoded root graph must
 equal the source graph. After resume Linux reads the known root marker through
@@ -2088,6 +2101,39 @@ selected PCI owner. The guest writes a host-observable marker only after driver
 binding and reporting negotiation are visible. These scenarios prove signed
 guest inflation, deflation, statistics, hinting, reporting, MMIO/PCI capture
 ownership, and cleanup; they do not impose a process-footprint threshold.
+
+Exact native-v2 2.9 continuation is certified separately by
+`signed_executable_certifies_native_v2_balloon_snapshot_continuation` and
+`normal_bundle_certifies_native_v2_balloon_snapshot_continuation_and_containment`.
+Both loop over MMIO and PCI. The source guest inflates exactly 8 MiB/2,048
+4-KiB pages, supplies optional statistics, changes its polling interval from
+one to two seconds, leaves one statistics descriptor pending, completes a
+hinting run at DONE, reports free pages, and captures a byte-stable Full/File
+pair. Decoding asserts exact kind 10, coherent transport and optional-product
+shape, latest values, pending cursor identity, hint normalization, and exact
+accounting.
+
+One fresh destination stays Paused beyond a full interval and proves no
+statistics scheduling, then recaptures the normalized semantic state before
+explicit resume. A second uses automatic resume. Both prove exact API
+continuity, completion of the retained descriptor only after a full
+destination-local interval, a new hint run after DONE, reporting,
+deflate/inflate convergence, fresh destination-only metrics, and an attempted
+best-effort discard without asserting synchronous RSS. The direct test reuses
+the same immutable artifacts; the normal production/App Sandbox test also
+proves exact state/memory/root/data/audit/metrics/socket grants after pathname
+replacement, checksum-malformed rejection, graceful cancellation,
+launcher-first and worker-first death cleanup, recapture, and independent
+session/socket ownership.
+
+The focused exact-2.9 suites additionally pin the 262,144-range and 4-MiB
+component bounds under the 16-MiB state cap, every feature/layout/queue/
+statistics/hint/accounting/transport relationship, all eight optional product
+combinations, destination-unmapped accounting rejection, source recovery after
+over-bound create, fresh owner construction, rollback, and exact 2.3–2.8
+compatibility. Guest PFNs stay 4 KiB even though Darwin host-page reclaim
+normally aligns/coalesces at 16 KiB.
+
 Runtime `PATCH /balloon` target-size updates are covered by unit, API socket,
 and process-session tests that verify stored config updates, active config-space
 generation changes, and config interrupt signaling. Guest-reported statistics
@@ -2096,8 +2142,8 @@ tests. Runtime statistics interval updates are covered by unit, API socket,
 process-session, and signed guest tests. The signed guest observes timer-driven
 polling and exact optional-statistics preservation across a live interval
 change. Linux's statistics notification after `FEATURES_OK` but before
-`DRIVER_OK` is accepted by virtio-MMIO and retained by the balloon handler until
-activation; focused tests cover both admission and deferred dispatch. Hinting
+`DRIVER_OK` is retained until activation over both virtio-MMIO and virtio-PCI;
+focused tests cover both admission and deferred dispatch. Hinting
 queue guest-command acknowledgement, automatic host DONE
 acknowledgement, active/stale range selection, best-effort advice outcomes, and
 inflate/hint metrics are covered by runtime unit and MMIO handler tests.

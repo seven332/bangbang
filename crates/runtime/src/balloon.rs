@@ -11,7 +11,7 @@ use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
 };
-use crate::virtio::VirtioInterruptIntent;
+use crate::virtio::{VirtioInterruptIntent, VirtioQueueNotificationState};
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
@@ -5510,8 +5510,10 @@ impl VirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
         let dispatch = work
             .with_core_mut(|core| {
-                let drained_notifications =
-                    core.queue_notifications.take_pending_queue_notifications();
+                let drained_notifications = take_active_pci_balloon_queue_notifications(
+                    core.device_activated,
+                    &mut core.queue_notifications,
+                );
                 let dispatch = core
                     .activation
                     .dispatch_drained_queue_notifications(memory, drained_notifications);
@@ -5675,6 +5677,17 @@ impl VirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
             .with_core_mut(|core| core.activation.hinting_status())
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
         VirtioPciDeviceOperationError::combine(result, Ok(()))
+    }
+}
+
+fn take_active_pci_balloon_queue_notifications(
+    device_activated: bool,
+    notifications: &mut VirtioQueueNotificationState,
+) -> Vec<usize> {
+    if device_activated {
+        notifications.take_pending_queue_notifications()
+    } else {
+        Vec::new()
     }
 }
 
@@ -12641,6 +12654,36 @@ mod tests {
             0
         );
         assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn pci_balloon_retains_linux_statistics_kick_until_device_activation() {
+        let mut notifications =
+            VirtioQueueNotificationState::new(VIRTIO_BALLOON_MIN_QUEUE_COUNT + 1)
+                .expect("balloon notification table should initialize");
+        notifications
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                queue_index_u32(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("Linux statistics kick should be accepted before DRIVER_OK");
+
+        assert!(
+            take_active_pci_balloon_queue_notifications(false, &mut notifications).is_empty(),
+            "pre-activation polling must not dispatch device work"
+        );
+        assert_eq!(
+            notifications.pending_queue_notifications(),
+            [VIRTIO_BALLOON_STATS_QUEUE_INDEX],
+            "pre-activation polling must retain the Linux statistics kick"
+        );
+        assert_eq!(
+            take_active_pci_balloon_queue_notifications(true, &mut notifications),
+            [VIRTIO_BALLOON_STATS_QUEUE_INDEX],
+            "the retained kick should dispatch immediately after activation"
+        );
+        assert!(notifications.pending_queue_notifications().is_empty());
     }
 
     #[test]

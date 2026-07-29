@@ -8280,11 +8280,65 @@
     {
       "id": "corpus:ballooning",
       "family": "memory-devices",
-      "summary": "Live Firecracker v1.16 balloon configuration, MMIO/PCI queue execution, DEFLATE_ON_OOM negotiation, compact paired PFN accounting, statistics polling and optional-field handling, hinting/reporting, Darwin discard, metrics, failure diagnostics, cleanup, and bounded capture-ready ownership are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains this broad corpus because its complete upstream claim also requires optional-device state encoding, artifact integration, MMIO/PCI restore construction, migration/clone behavior, portability policy, and signed restored-guest outcomes.",
+      "summary": "The applicable pinned Firecracker v1.16 balloon corpus is implemented and verified: strict configuration and APIs, MMIO/PCI queues, DEFLATE_ON_OOM, publication-safe paired 4-KiB PFN accounting, statistics polling and optional fields, hinting/reporting, best-effort Darwin reclaim, metrics, failures, cleanup, exact native-v2 2.9 optional kind-10 serialization, and fresh destination restoration. The exact component is capped at 4 MiB and 262,144 accounting ranges inside the 16-MiB state-file cap. It retains configuration, features, active queue cursors, one pending statistics descriptor, latest statistics, hint history normalized to DONE, and exact accounting while excluding timers, metrics, host reclaim state, handles, and ownership. Direct and normal-production/App Sandbox MMIO/PCI guests certify explicit/automatic resume, a full destination-local interval before retained-stat completion, new hint runs, reporting, post-restore inflate/deflate/API behavior, recapture, immutable independent clones, malformed/canceled/death cleanup, fresh metrics, and containment. Firecracker artifact bytes, broad cross-host execution portability, and synchronous RSS reduction are not claimed.",
       "source_refs": [
         "corpus:ballooning"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "exact native-v2 2.9 balloon capture and public product dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_balloon_platform.rs",
+          "anchor": "exact MMIO and PCI balloon destination placement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fresh balloon timers, metrics, notifier, interrupt, reclaim, and endpoint reconstruction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "queue execution, accounting, polling, hinting, reporting, metrics, capture, and retained pre-activation notification dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_balloon_v2_9.rs",
+          "anchor": "exact native-v2 2.9 balloon state, bounds, validation, and restore plan"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/balloon-contract.md",
+          "anchor": "exact balloon capability and snapshot-continuation ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_balloon_snapshot_continuation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed active balloon snapshot reconstruction over MMIO and PCI"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_balloon_snapshot_continuation_and_containment"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_balloon_v2_9/tests.rs",
+          "anchor": "exact codec, accounting, queue, statistics, hint, transport, and hostile-state fixtures"
+        }
+      ]
     },
     {
       "id": "corpus:block-caching",
@@ -10694,11 +10748,65 @@
     {
       "id": "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
       "family": "memory-devices",
-      "summary": "Live inflate/deflate, DEFLATE_ON_OOM, publication-safe paired PFN accounting, polling and optional statistics, hinting/reporting, best-effort host reclaim, metrics, exact MMIO/PCI owner traversal, detached state validation, failures, and cleanup are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains the aggregate until balloon state is encoded, integrated into artifacts, restored into live owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
+      "summary": "Balloon OOM, statistics, hinting, reporting, state, and restore semantics are implemented and verified. Live inflate/deflate negotiates DEFLATE_ON_OOM and commits exact paired 4-KiB PFN accounting only after used publication; statistics retain optional fields and one pending descriptor; hint capture normalizes an active host command to DONE; reporting and accepted active hint ranges invoke best-effort host-page-aligned Darwin reclaim. Exact native-v2 2.9 kind 10 validates bounded configuration, features, queue cursors, latest statistics, pending work, hint history, accounting, common virtio state, and MMIO/PCI placement, then reconstructs fresh destination-local memory bindings, timers, metrics, notifier/interrupt/dispatcher, reclaim adviser, and cleanup owner. Signed restored Linux guests prove no polling while Paused, one full destination-local interval after resume, new hint runs, reporting, inflate/deflate/API continuity, recapture, immutable clone isolation, fresh metrics, failures, and cleanup. Host pages may differ from 4-KiB guest PFNs, reclaim is best effort, and no synchronous RSS or Firecracker artifact-byte claim is made.",
       "source_refs": [
         "corpus:ballooning"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "balloon candidate capture and failure-atomic public destination transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_balloon_platform.rs",
+          "anchor": "validated balloon transport reconstruction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fresh restored balloon owner construction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "OOM feature, queues, accounting, statistics, hinting, reporting, metrics, and capture semantics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_balloon_v2_9.rs",
+          "anchor": "exact persisted queue, statistics, hint, accounting, and transport state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/balloon-contract.md",
+          "anchor": "live, artifact, fresh-owner, portability, and exclusion evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_balloon_snapshot_continuation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_balloon_snapshot_continuation_and_containment"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pci_balloon_retains_linux_statistics_kick_until_device_activation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_balloon_v2_9/tests.rs",
+          "anchor": "fixed exact-state, product-shape, limit, and hostile decode coverage"
+        }
+      ]
     },
     {
       "id": "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",

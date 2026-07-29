@@ -318,8 +318,8 @@ Native-v2 represents PL031 through fixed MMIO metadata and an explicit
 destination-`SystemTime` fresh-device policy; no mutable alarm state is
 persisted. It also carries bounded PVTime and VMGenID/VMClock clone policies.
 Active unsupported SVE/SME or breakpoint/watchpoint state is rejected rather
-than silently omitted, and optional devices other than pmem, serial, and
-entropy remain outside the accepted profile.
+than silently omitted, and optional devices other than pmem, serial, entropy,
+and balloon remain outside the accepted profile.
 
 The #1481 aggregate preflight traverses balloon, memory-hotplug, entropy,
 serial, and time/identity state in one fixed order before the existing
@@ -328,10 +328,12 @@ paused configuration, publish no artifact, and permit same-session retry after
 complete cleanup. Family values remain private validation objects unless a
 versioned public profile explicitly adopts them. Exact 2.7 now adopts serial
 state but still serializes no host endpoint: destination authority constructs
-a fresh one. Current 2.8 adopts entropy state but creates a fresh destination
+a fresh one. Exact 2.8 adopts entropy state but creates a fresh destination
 OS source, empty metrics, scheduler, notifier, route, and endpoint. Other
 optional-device encoding/restore and broad cross-host portability remain with
-Wave 6 #1490.
+Wave 6 #1490. Current 2.9 adopts balloon state but creates fresh destination
+memory bindings, timer and process clock, empty metrics, reclaim adviser,
+notifier/interrupt/dispatcher, transport endpoint, and cleanup owner.
 
 The frozen native-v1 device profile is untrusted input even when its outer
 state file passed length and CRC checks; CRC detects accidental corruption and
@@ -381,28 +383,33 @@ For native-v2, state family classification, retained File/COW memory binding,
 the live-FDT identity, versioned UART profile, cache/platform state, topology,
 and every time/identity guest destination validate before HVF construction.
 Legacy 2.3 parses its retained bytes as the exact default process FDT. Exact
-2.4 through current 2.8 require a versioned source-product marker instead,
+2.4 through current 2.9 require a versioned source-product marker instead,
 because a booted guest may have consumed or reclaimed those bytes. Exact 2.4
 validates its singleton root; exact 2.5 validates the complete ordered block
 graph; exact 2.6 validates the complete ordered block/pmem configuration,
 runtime/limiter/queue/common-virtio/mapping state, MMIO or PCI transport
 placement, and agreement between machine state, memory, and device graph.
 Exact 2.7 additionally requires complete cross-validated serial state and
-allows that storage graph to be absent. Current 2.8 retains those rules and
+allows that storage graph to be absent. Exact 2.8 retains those rules and
 optionally requires exact entropy queue/limiter/pending/retry/common-virtio/
-transport state cross-bound to memory and the selected product transport. The
+transport state cross-bound to memory and the selected product transport.
+Current 2.9 retains those rules and optionally requires exact balloon
+configuration/queue/statistics/hint/accounting/common-virtio/transport state,
+including mapped canonical PFN ranges. The
 live bytes still must match the retained address, length, and CRC. The memory descriptor
 must remain read-only and close-on-exec; guest
 mappings are private, so destination writes do not mutate the pair. Recorded
 kernel/initrd paths remain inert metadata and are never reopened. Every graph
 selector is likewise inert until destination policy treats it as a direct path
 or resolves the complete keyed vector through exact destination authority.
-Current 2.8 resolves exact drive, pmem, and configured-serial grants as one
+Current 2.9 resolves exact drive, pmem, and configured-serial grants as one
 batch; default serial stdio and entropy source/metrics/scheduler/notifier/
-route/endpoint owners are destination-local and resource-free. The batch
+route/endpoint owners are destination-local and resource-free. Balloon memory,
+timer, metrics, reclaim, notifier/interrupt/dispatcher, endpoint, and cleanup
+owners are likewise destination-local and require no external grant. The batch
 remains provisional through storage/platform construction and commits only
 with Paused session/controller publication. The restorer creates no
-optional-device owner other than pmem, serial, and entropy. Writable external block
+optional-device owner other than pmem, serial, entropy, and balloon. Writable external block
 files and pmem prefixes
 remain shared rather than COW clones and require operator serialization. Each
 fresh pmem mapping owns a volatile zeroed private tail outside the backing
@@ -1301,8 +1308,8 @@ is resource-specific:
   untrusted, preserve redaction, and prevent one process from cleaning up or
   overwriting another process's resources. In contained mode, state
   preinspection is non-consuming and the eventual native-v2 state/memory claim
-  is atomic; current 2.8 then derives every ordered block/pmem request, any
-  configured serial sink, and optional entropy state from decoded state,
+  is atomic; current 2.9 then derives every ordered block/pmem request, any
+  configured serial sink, and optional entropy/balloon state from decoded state,
   resolves the entire typed keyed vector through one exact destination
   authority transaction, and constructs fresh entropy owners. Default serial
   stdio is constructed only from destination descriptors. Missing, extra,
@@ -1340,8 +1347,9 @@ is resource-specific:
   singleton device-graph kind 7 with one read-only File/Sync root, exact
   `2.5.0` retains kind 7 with the bounded profile-2 multi-block graph, and
   exact `2.6.0` selects its bounded profile-3 block/pmem graph. Exact `2.7.0`
-  adds mandatory serial kind 8 and makes kind 7 optional. Current `2.8.0`
-  retains those rules and adds optional entropy kind 9. The
+  adds mandatory serial kind 8 and makes kind 7 optional. Exact `2.8.0`
+  retains those rules and adds optional entropy kind 9. Current `2.9.0`
+  retains those rules and adds optional balloon kind 10. The
   platform decoder verifies that complete directory profile without
   payload-dependent allocation, caps every inner count and length before
   reservation, allocation-free scans the closed optional debug/SME registry,
@@ -1352,9 +1360,16 @@ is resource-specific:
   Entropy state admits one exact queue, external limiter agreement, at most one
   pending descriptor, host-time-free retry intent, and matching MMIO/PCI
   placement; random output, source identity, metrics, and absolute time never
-  enter the format. Every device-graph or configured-serial selector remains
+  enter the format. Balloon state admits exact configuration/features, two
+  through five active queue cursors, at most one pending statistics descriptor,
+  latest optional statistics, DONE-normalized hint history, and canonical
+  host-side inflated-PFN accounting. It caps accounting at 262,144 ranges and
+  the component at 4 MiB under the 16-MiB state cap; every 4-KiB guest PFN must
+  be mapped in adopted destination memory. Timers, deadlines, metrics, reclaim
+  advisers, handles, and cleanup ownership never enter the format. Every
+  device-graph or configured-serial selector remains
   inert during decode; only the destination authority layer may resolve the
-  complete vector after graph, serial, entropy, and memory validation.
+  complete vector after graph, serial, entropy, balloon, and memory validation.
   State/memory inputs stay immutable and File/COW memory is
   private to each destination, but writable external block files and pmem
   prefixes are not copied or authenticated by the snapshot. Repeated
@@ -1374,8 +1389,8 @@ is resource-specific:
   parses the retained FDT shell; exact 2.4 through 2.8 instead require their
   versioned source-product marker and reconstruct singleton-root, complete
   profile-2 block, complete profile-3 block/pmem, exact serial plus optional
-  storage, or current optional entropy semantics from typed state because the
-  guest may have reclaimed those bytes. The
+  storage, optional entropy, or current optional balloon semantics from typed
+  state because the guest may have reclaimed those bytes. The
   guard owns VM, memory, GIC,
   all never-run vCPU owners, CPU replay, global GIC, per-vCPU state, fresh
   PL031, PVTime accounting, VMGenID/VMClock resources, and lifecycle import
@@ -1384,7 +1399,7 @@ is resource-specific:
   failure after the first guest-visible identity write is terminal, while
   earlier partial failure attempts reverse topology/backend cleanup and retains
   value-free primary and cleanup evidence. No control or runnable owner escapes
-  earlier. General devices other than pmem, serial, and entropy,
+  earlier. General devices other than pmem, serial, entropy, and balloon,
   source-process host endpoints, and unsupported VM actions remain outside
   this boundary.
 - Native-v2 lazy memory validates the state binding before opening or adopting
@@ -1986,7 +2001,7 @@ private and volatile. Operators must treat DAX as a guest/filesystem choice and
 profile page faults, page-cache/RSS accounting, huge-page realization,
 eviction, same-backing physical-page sharing, side channels, and throughput on
 the deployed macOS/HVF system. Linux Firecracker measurements are not portable
-security or performance promises. Exact native-v2 2.6 through current 2.8
+security or performance promises. Exact native-v2 2.6 through current 2.9
 profile 3 bind exact file/mapped geometry and direct or contained backing
 authority, then restore the same external prefix through a complete-set
 transaction. Signed direct and
@@ -2066,11 +2081,12 @@ real MMDS exchange without vmnet authority. This evidence does not prove
 interrupt remapping, external vmnet connectivity, or Firecracker's KVM ITS
 behavior. Exact native-v2 2.5 reconstructs the exact GICv2m/MSI-X state for
 every admitted profile-2 PCI block endpoint under the same product capacity.
-Exact native-v2 2.6 through current 2.8 additionally reconstruct every admitted
+Exact native-v2 2.6 through current 2.9 additionally reconstruct every admitted
 profile-3 PCI block and pmem endpoint, including mapping and limiter/retry
 ownership; serial remains a platform MMIO device whose exact 2.7 state is
-composed with that PCI storage graph. Current 2.8 may also reconstruct an exact
-PCI entropy endpoint under the same product capacity.
+composed with that PCI storage graph. Exact 2.8 may also reconstruct an exact
+PCI entropy endpoint, and current 2.9 may reconstruct a variable-queue PCI
+balloon endpoint first in the canonical product order under the same capacity.
 Mismatched, aliased, reordered, or unmodeled MSI-bearing ownership is rejected
 rather than silently omitted. Exact 2.4 retains only its singleton PCI-root
 profile.
@@ -2535,7 +2551,24 @@ ranges against mapped guest memory. Guest config `actual_pages` remains a
 separate captured fact from host paired accounting so an untrusted or transient
 guest mismatch is not promoted to host truth. The detached value retains no
 guest-memory borrow, lock, endpoint, host handle, or wall-clock value. Capture
-readiness does not yet define a serialization or restore contract.
+feeds exact native-v2 2.9 optional kind 10 only after complete source-product
+validation. The codec rejects noncanonical, overlapping, overflowing, or
+destination-unmapped accounting; incompatible feature/layout/queue/pending/
+hint relationships; wrong transport placement; more than 262,144 accounting
+ranges; a component above 4 MiB; and a complete state file above 16 MiB before
+live owner publication.
+
+Restore does not trust source discard success, RSS, host page geometry, timers,
+deadlines, metrics, or owner identity. Guest PFNs remain 4-KiB units; the fresh
+Darwin adviser rounds inward and coalesces to destination host pages, normally
+16 KiB. A captured active hint command is validated and normalized to DONE,
+with history retained but no source acknowledgement or run resumed. A retained
+statistics descriptor receives no source remaining duration and becomes
+eligible only after one full destination-local interval following resume; no
+interval advances while Paused. Memory bindings, timer/process clock, metrics,
+reclaim adviser, notifier/interrupt/dispatcher, endpoint/registry, and cleanup
+ownership are fresh per destination, so immutable repeated loads have no
+cross-destination authority or metric state.
 
 Free-page hinting command descriptors remain limited to 4-byte command
 identifiers stored in active device state. Range descriptors are accepted for
