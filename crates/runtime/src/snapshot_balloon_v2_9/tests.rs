@@ -1,6 +1,12 @@
+use std::sync::Arc;
+
 use crate::balloon::{BalloonConfigInput, VIRTIO_BALLOON_FREE_PAGE_HINT_STOP};
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
+use crate::message_interrupt::{
+    GuestMessage, GuestMessageInterrupt, GuestMessageInterruptRegistry,
+    GuestMessageInterruptSignalError,
+};
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::{
     PCI_BAR64_START, PCI_BUS_ZERO, PCI_FUNCTION_ZERO, PCI_SEGMENT_ZERO, PciBarAddressSpace,
@@ -20,7 +26,8 @@ use crate::virtio::{
 };
 use crate::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
 use crate::virtio_pci::{
-    VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VirtioPciEndpointPhase,
+    VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VirtioPciEndpointError,
+    VirtioPciEndpointPhase,
 };
 
 use super::codec::{ReservePolicy, decode_with_policy, encode_with_policy};
@@ -37,6 +44,38 @@ const RESTORE_QUEUE_STRIDE: u64 = 0x1_0000;
 const AVAILABLE_INDEX_OFFSET: u64 = 2;
 const AVAILABLE_RING_OFFSET: u64 = 4;
 const USED_INDEX_OFFSET: u64 = 2;
+
+#[derive(Debug)]
+struct TestMessageRoute(GuestMessage);
+
+impl GuestMessageInterrupt for TestMessageRoute {
+    fn matches(&self, message: GuestMessage) -> bool {
+        self.0 == message
+    }
+
+    fn signal(&self, message: GuestMessage) -> Result<(), GuestMessageInterruptSignalError> {
+        if self.matches(message) {
+            Ok(())
+        } else {
+            Err(GuestMessageInterruptSignalError::new(
+                "test route rejected an unknown message",
+                false,
+            ))
+        }
+    }
+}
+
+fn balloon_message_registry(route_count: usize) -> GuestMessageInterruptRegistry {
+    let routes: Vec<Arc<dyn GuestMessageInterrupt>> = (0..route_count)
+        .map(|index| {
+            Arc::new(TestMessageRoute(GuestMessage::new(
+                0xfee0_0000,
+                u32::try_from(index).expect("message data should fit"),
+            ))) as Arc<dyn GuestMessageInterrupt>
+        })
+        .collect();
+    GuestMessageInterruptRegistry::new(routes).expect("balloon message registry should validate")
+}
 
 fn config(stats: bool, hinting: bool, reporting: bool) -> BalloonConfig {
     BalloonConfigInput::new(64, true)
@@ -1449,6 +1488,88 @@ fn mmio_handler_materialization_rejects_pci_and_redacts_diagnostics() {
     assert_eq!(error, SnapshotV2BalloonMmioHandlerError::WrongTransport);
     let diagnostics = format!("{error:?} {error}");
     assert!(!diagnostics.contains("2147483648"));
+    assert!(!diagnostics.contains("4276092928"));
+}
+
+#[test]
+fn pci_endpoint_materialization_is_exact_for_every_queue_layout() {
+    for statistics_enabled in [false, true] {
+        for hinting_enabled in [false, true] {
+            for reporting_enabled in [false, true] {
+                let config = config(statistics_enabled, hinting_enabled, reporting_enabled);
+                let queue_count = VirtioBalloonQueueLayout::from_config(config).queue_count();
+                for activated in [false, true] {
+                    let expected = state(config, activated, true, activated && statistics_enabled);
+                    let SnapshotV2DeviceTransport::Pci(expected_pci) = expected.transport() else {
+                        panic!("test state should select PCI");
+                    };
+                    let expected_sbdf = expected_pci.sbdf();
+                    let expected_bar_range = expected_pci.bar_range();
+                    let mut memory = restore_memory(&expected);
+                    initialize_restore_queue_memory(&mut memory, &expected);
+                    let prepared = SnapshotV2BalloonRestorePlan::prepare(expected, &memory)
+                        .expect("PCI balloon restore plan should prepare")
+                        .into_pci_endpoint(
+                            MmioRegionId::new(700),
+                            balloon_message_registry(queue_count + 1),
+                        )
+                        .expect("PCI balloon endpoint should materialize");
+
+                    assert_eq!(prepared.config(), config);
+                    assert_eq!(
+                        prepared.queue_ranges().len(),
+                        if activated { queue_count } else { 0 }
+                    );
+                    assert_eq!(prepared.origin(), StorageDeviceOrigin::Startup);
+                    assert_eq!(prepared.endpoint().sbdf(), expected_sbdf);
+                    assert_eq!(prepared.endpoint().bar_range(), expected_bar_range);
+                    assert_eq!(prepared.endpoint().region_id(), MmioRegionId::new(700));
+
+                    let debug = format!("{prepared:?}");
+                    assert!(debug.contains("<redacted>"));
+                    for sentinel in ["2147483648", "4276092928", "4276092932"] {
+                        assert!(!debug.contains(sentinel));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pci_endpoint_materialization_rejects_wrong_transport_and_route_geometry() {
+    let config = config(true, true, true);
+    let mmio = state(config, false, false, false);
+    let memory = restore_memory(&mmio);
+    let wrong_transport = SnapshotV2BalloonRestorePlan::prepare(mmio, &memory)
+        .expect("MMIO balloon restore plan should prepare")
+        .into_pci_endpoint(MmioRegionId::new(700), balloon_message_registry(6))
+        .expect_err("MMIO plan must not materialize a PCI endpoint");
+    assert!(matches!(
+        wrong_transport,
+        SnapshotV2BalloonPciEndpointError::WrongTransport
+    ));
+    assert_eq!(
+        wrong_transport.to_string(),
+        "native-v2 balloon restore plan is not PCI"
+    );
+
+    let pci = state(config, true, true, true);
+    let mut memory = restore_memory(&pci);
+    initialize_restore_queue_memory(&mut memory, &pci);
+    let route_error = SnapshotV2BalloonRestorePlan::prepare(pci, &memory)
+        .expect("PCI balloon restore plan should prepare")
+        .into_pci_endpoint(MmioRegionId::new(700), balloon_message_registry(5))
+        .expect_err("five routes cannot satisfy a five-queue balloon endpoint");
+    assert!(matches!(
+        route_error,
+        SnapshotV2BalloonPciEndpointError::Endpoint(VirtioPciEndpointError::MessageRouteCount {
+            expected: 6,
+            actual: 5
+        })
+    ));
+    let diagnostics = format!("{route_error:?} {route_error}");
+    assert!(diagnostics.contains("<redacted>"));
     assert!(!diagnostics.contains("4276092928"));
 }
 

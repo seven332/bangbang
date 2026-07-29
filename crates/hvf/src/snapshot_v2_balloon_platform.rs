@@ -466,6 +466,19 @@ pub struct HvfSnapshotV2BalloonPciPlatformPlan {
     vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2BalloonPciPlatformPlanParts {
+    pub(crate) product: HvfSnapshotV2BalloonPreparedProduct,
+    pub(crate) balloon: HvfSnapshotV2BalloonPciEndpointPlan,
+    pub(crate) storage: Option<HvfSnapshotV2StoragePciPlatformPlan>,
+    pub(crate) entropy: Option<HvfSnapshotV2EntropyPciEndpointPlan>,
+    pub(crate) host: Arm64FdtPciHost,
+    pub(crate) msi: HvfGicMsiMetadata,
+    pub(crate) route_demand: usize,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 impl HvfSnapshotV2BalloonPciPlatformPlan {
     /// Returns the closed product shape.
     pub const fn kind(&self) -> HvfSnapshotV2BalloonProductKind {
@@ -520,6 +533,21 @@ impl HvfSnapshotV2BalloonPciPlatformPlan {
     /// Returns the final exact VMClock SPI.
     pub const fn vmclock_interrupt(&self) -> GuestInterruptLine {
         self.vmclock_interrupt
+    }
+
+    pub(crate) fn into_parts(self) -> HvfSnapshotV2BalloonPciPlatformPlanParts {
+        HvfSnapshotV2BalloonPciPlatformPlanParts {
+            product: self.product,
+            balloon: self.balloon,
+            storage: self.storage,
+            entropy: self.entropy,
+            host: self.host,
+            msi: self.msi,
+            route_demand: self.route_demand,
+            serial_interrupt: self.serial_interrupt,
+            vmgenid_interrupt: self.vmgenid_interrupt,
+            vmclock_interrupt: self.vmclock_interrupt,
+        }
     }
 }
 

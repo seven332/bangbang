@@ -25,7 +25,8 @@ use crate::balloon::{
 };
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
-use crate::mmio::MmioRegion;
+use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::{
     PCI_BAR64_SIZE, PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
     PCI_LAST_ENDPOINT_DEVICE, PCI_SEGMENT_ZERO, PciBarAddressSpace, PciBarPrefetchable, PciSbdf,
@@ -52,8 +53,9 @@ use crate::virtio_mmio::{
     VirtioMmioTransportState,
 };
 use crate::virtio_pci::{
-    VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VIRTIO_PCI_MAX_MSIX_VECTORS,
-    VIRTIO_PCI_NO_VECTOR, VirtioPciEndpointPhase, VirtioPciIdentity, VirtioPciTransportState,
+    PreparedVirtioPciEndpoint, VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE,
+    VIRTIO_PCI_MAX_MSIX_VECTORS, VIRTIO_PCI_NO_VECTOR, VirtioPciEndpointError,
+    VirtioPciEndpointPhase, VirtioPciIdentity, VirtioPciTransportState,
 };
 
 mod codec;
@@ -825,6 +827,54 @@ impl SnapshotV2BalloonRestorePlan {
             handler,
         })
     }
+
+    /// Consumes a checked PCI plan into one complete retained endpoint.
+    ///
+    /// The caller supplies one fresh destination message registry and the
+    /// dispatcher region reserved by the destination platform plan. The
+    /// returned value still owns no route resources, dispatcher registration,
+    /// BAR/function lease, metrics, discard adviser, scheduler, or VM
+    /// authority.
+    #[doc(hidden)]
+    pub fn into_pci_endpoint(
+        self,
+        region_id: MmioRegionId,
+        messages: GuestMessageInterruptRegistry,
+    ) -> Result<PreparedSnapshotV2BalloonPciEndpoint, SnapshotV2BalloonPciEndpointError> {
+        let Self {
+            config,
+            config_space,
+            queue_ranges,
+            transport,
+        } = self;
+        let PreparedSnapshotV2BalloonTransport::Pci(pci) = transport else {
+            return Err(SnapshotV2BalloonPciEndpointError::WrongTransport);
+        };
+        let (origin, sbdf, bar_range, identity, device, retained) = pci.into_parts();
+        let activation_is_active = device.is_activated();
+        let queue_sizes = device.queue_layout().queue_sizes();
+        let endpoint = PreparedVirtioPciEndpoint::new(
+            identity,
+            queue_sizes.as_slice(),
+            config_space,
+            device,
+            activation_is_active,
+            false,
+            &retained,
+            sbdf,
+            bar_range,
+            region_id,
+            messages,
+        )
+        .map_err(SnapshotV2BalloonPciEndpointError::Endpoint)?;
+
+        Ok(PreparedSnapshotV2BalloonPciEndpoint {
+            config,
+            queue_ranges,
+            origin,
+            endpoint,
+        })
+    }
 }
 
 impl fmt::Debug for SnapshotV2BalloonRestorePlan {
@@ -1084,6 +1134,105 @@ impl fmt::Debug for PreparedSnapshotV2BalloonPciTransport {
             .debug_struct("PreparedSnapshotV2BalloonPciTransport")
             .field("state", &REDACTED)
             .finish()
+    }
+}
+
+/// One checked exact-2.9 balloon endpoint awaiting destination PCI
+/// publication.
+#[doc(hidden)]
+pub struct PreparedSnapshotV2BalloonPciEndpoint {
+    config: BalloonConfig,
+    queue_ranges: Vec<[GuestMemoryRange; 3]>,
+    origin: StorageDeviceOrigin,
+    endpoint: PreparedVirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice>,
+}
+
+/// Consumed checked balloon continuation and retained PCI endpoint.
+#[doc(hidden)]
+pub type PreparedSnapshotV2BalloonPciEndpointParts = (
+    BalloonConfig,
+    Vec<[GuestMemoryRange; 3]>,
+    StorageDeviceOrigin,
+    PreparedVirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice>,
+);
+
+impl PreparedSnapshotV2BalloonPciEndpoint {
+    /// Returns the exact public balloon configuration.
+    pub const fn config(&self) -> BalloonConfig {
+        self.config
+    }
+
+    /// Returns every loaded-memory range occupied by an active queue.
+    pub fn queue_ranges(&self) -> &[[GuestMemoryRange; 3]] {
+        &self.queue_ranges
+    }
+
+    /// Returns the retained startup/runtime origin.
+    pub const fn origin(&self) -> StorageDeviceOrigin {
+        self.origin
+    }
+
+    /// Returns the complete retained endpoint before publication.
+    pub const fn endpoint(
+        &self,
+    ) -> &PreparedVirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
+        &self.endpoint
+    }
+
+    /// Consumes the checked continuation and retained endpoint.
+    pub fn into_parts(self) -> PreparedSnapshotV2BalloonPciEndpointParts {
+        (self.config, self.queue_ranges, self.origin, self.endpoint)
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2BalloonPciEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2BalloonPciEndpoint")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Failure while binding a checked balloon plan to a destination PCI
+/// registry.
+#[doc(hidden)]
+pub enum SnapshotV2BalloonPciEndpointError {
+    /// The checked plan selects MMIO rather than PCI.
+    WrongTransport,
+    /// The retained endpoint could not be reconstructed exactly.
+    Endpoint(VirtioPciEndpointError),
+}
+
+impl fmt::Debug for SnapshotV2BalloonPciEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::WrongTransport => "wrong-transport",
+            Self::Endpoint(_) => "endpoint",
+        };
+        formatter
+            .debug_struct("SnapshotV2BalloonPciEndpointError")
+            .field("kind", &kind)
+            .field("source", &REDACTED)
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotV2BalloonPciEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::WrongTransport => "native-v2 balloon restore plan is not PCI",
+            Self::Endpoint(_) => "native-v2 balloon PCI endpoint reconstruction failed",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2BalloonPciEndpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WrongTransport => None,
+            Self::Endpoint(source) => Some(source),
+        }
     }
 }
 
