@@ -1,3 +1,4 @@
+use crate::snapshot_balloon_v2_9::NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
@@ -205,7 +206,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn current_writer_and_internal_catalog_close_at_entropy_minor_eight() {
+fn current_writer_stays_at_entropy_eight_while_internal_catalog_reaches_balloon_nine() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -432,19 +433,68 @@ fn current_writer_and_internal_catalog_close_at_entropy_minor_eight() {
         Err(SnapshotV2DecodeError::UnknownSemanticComponent)
     );
 
-    let future = SnapshotFormatVersion::new(2, 9, 0);
+    let balloon = SnapshotV2Component::new(
+        NATIVE_V2_BALLOON_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        b"balloon",
+    );
+    let balloon_state = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &[serial, entropy, balloon],
+    )
+    .expect("exact 2.9 should admit balloon through the explicit seam");
+    let decoded_balloon = decode_snapshot_v2_state_with_compatibility_version(
+        &balloon_state,
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact 2.9 balloon container should decode internally");
+    assert_eq!(
+        decoded_balloon.metadata().version(),
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        decoded_balloon.component(NATIVE_V2_BALLOON_COMPONENT_KEY),
+        Some(balloon)
+    );
+    assert!(matches!(
+        decode_snapshot_v2_state(&balloon_state),
+        Err(SnapshotV2DecodeError::UnsupportedVersion {
+            found: NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_SNAPSHOT_VERSION,
+        })
+    ));
+    assert!(matches!(
+        decode_native_snapshot_state(&balloon_state),
+        Err(NativeSnapshotFormatError::NativeV2(
+            SnapshotV2DecodeError::UnsupportedVersion {
+                found: NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                supported: NATIVE_V2_SNAPSHOT_VERSION,
+            }
+        ))
+    ));
+    let downgraded_balloon = with_u16_field_and_checksum(&balloon_state, VERSION_MINOR_OFFSET, 8);
+    assert_eq!(
+        decode_snapshot_v2_state_with_compatibility_version(
+            &downgraded_balloon,
+            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        ),
+        Err(SnapshotV2DecodeError::UnknownSemanticComponent)
+    );
+
+    let future = SnapshotFormatVersion::new(2, 10, 0);
     assert!(matches!(
         encode_snapshot_v2_state_with_compatibility_version(future, &[], &[]),
         Err(SnapshotV2EncodeError::UnsupportedVersion {
             requested,
-            maximum: NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+            maximum: NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
         }) if requested == future
     ));
     assert_eq!(
         decode_snapshot_v2_state_with_compatibility_version(&EMPTY_V2_FIXTURE, future),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
             found: future,
-            supported: NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
         })
     );
 }

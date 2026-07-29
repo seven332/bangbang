@@ -6370,6 +6370,11 @@ where
                     return Err(NativeV2SnapshotLoadError::Cancelled);
                 }
             }
+            NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
         }
 
         let (state, state_id, memory_id) = prepared.into_parts();
@@ -6648,6 +6653,9 @@ where
                 self.started_session = Some(session);
                 Ok(self.controller.commit_snapshot_v2_load(controller_commit))
             }
+            NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => Err(
+                NativeV2SnapshotLoadError::Preflight(VmmActionError::SnapshotUnsupported),
+            ),
         }
     }
 
@@ -8098,6 +8106,11 @@ impl HvfInstanceStartExecutor {
             NativeV2SnapshotArtifactProfile::EntropyStateV2_8 => {
                 NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
             }
+            NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
         };
         let structural = decode_snapshot_v2_state_with_compatibility_version(bytes, version)
             .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
@@ -8125,6 +8138,11 @@ impl HvfInstanceStartExecutor {
             NativeV2SnapshotArtifactProfile::EntropyStateV2_8 => {
                 decode_hvf_snapshot_v2_entropy_state(&structural)
                     .map_err(NativeV2SnapshotLoadError::Decode)?;
+            }
+            NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
             }
         }
         Ok(())
@@ -20682,15 +20700,16 @@ mod tests {
     };
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotPublicationOutcome,
-        NativeV2EntropySnapshotCandidateState, NativeV2SnapshotArtifactProfile,
-        PreparedNativeSnapshotState, SnapshotArtifactOutputs, SnapshotArtifactPaths,
-        SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
+        NativeV2BalloonSnapshotCandidateState, NativeV2EntropySnapshotCandidateState,
+        NativeV2SnapshotArtifactProfile, PreparedNativeSnapshotState, SnapshotArtifactOutputs,
+        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_artifact::{
         NativeSnapshotArtifactFamily, NativeV2SnapshotCandidateState, SnapshotArtifactOutput,
         SnapshotCommitDurability, load_native_snapshot_artifacts, load_snapshot_artifacts,
     };
+    use bangbang_runtime::snapshot_balloon_v2_9::NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION;
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_commit::SnapshotCommitKind;
     use bangbang_runtime::snapshot_commit::SnapshotCommitRecord;
@@ -27470,6 +27489,75 @@ mod tests {
                 NativeV2SnapshotArtifactProfile::EntropyStateV2_8,
             ),
             Err(NativeV2SnapshotLoadError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn native_v2_process_preflight_rejects_exact_minor_nine_profile_before_hvf_decode() {
+        let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
+            .expect("exact minor-nine fixture range should validate");
+        let layout = GuestMemoryLayout::new(vec![range])
+            .expect("exact minor-nine fixture layout should validate");
+        let memory =
+            GuestMemory::allocate(&layout).expect("exact minor-nine fixture should allocate");
+        let mut image = Cursor::new(Vec::new());
+        let binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+            &memory,
+            &mut image,
+            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+            |_| false,
+        )
+        .expect("exact minor-nine memory should encode internally");
+        let binding = binding
+            .encode()
+            .expect("exact minor-nine binding should encode");
+        let serial_device = SerialMmioDevice::discarding()
+            .capture_state()
+            .expect("fixture serial device should capture");
+        let serial = SnapshotV2SerialState::try_from_capture_ready(CaptureReadySerialState::new(
+            SerialConfig::default(),
+            serial_device,
+        ))
+        .expect("fixture serial state should validate")
+        .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+        .expect("fixture serial state should encode");
+        let components = [
+            SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &binding,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_SERIAL_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &serial,
+            ),
+        ];
+        let encoded = encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+            &[],
+            &components,
+        )
+        .expect("exact minor-nine state should encode internally");
+        let state = NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(encoded)
+            .expect("exact minor-nine candidate should validate")
+            .into_compatible_artifact_state();
+        assert_eq!(
+            state
+                .v2_profile()
+                .expect("exact minor-nine profile should classify"),
+            NativeV2SnapshotArtifactProfile::BalloonStateV2_9
+        );
+        let prepared = PreparedNativeSnapshotState::from_state(state);
+
+        assert!(matches!(
+            HvfInstanceStartExecutor::default().validate_snapshot_v2_artifact_profile(
+                &prepared,
+                NativeV2SnapshotArtifactProfile::BalloonStateV2_9,
+            ),
+            Err(NativeV2SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported
+            ))
         ));
     }
 

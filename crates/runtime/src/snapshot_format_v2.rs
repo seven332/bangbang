@@ -5,6 +5,7 @@ use std::fmt;
 
 use crc64::crc64;
 
+use crate::snapshot_balloon_v2_9::NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_format::{SnapshotArchitecture, SnapshotFormatVersion, SnapshotIntegrity};
@@ -46,7 +47,7 @@ pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVers
 
 /// Newest compatibility version understood through an explicit internal seam.
 const NATIVE_V2_LATEST_KNOWN_COMPATIBILITY_VERSION: SnapshotFormatVersion =
-    NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
+    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION;
 
 /// Exact native-v2 version of the complete legacy device-free platform profile.
 ///
@@ -79,6 +80,13 @@ const _: () = assert!(
         && NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION.minor()
             == NATIVE_V2_SNAPSHOT_VERSION.minor()
         && NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION.patch()
+            == NATIVE_V2_SNAPSHOT_VERSION.patch()
+);
+const _: () = assert!(
+    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
+        && NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION.minor()
+            == NATIVE_V2_SNAPSHOT_VERSION.minor() + 1
+        && NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION.patch()
             == NATIVE_V2_SNAPSHOT_VERSION.patch()
 );
 
@@ -143,6 +151,10 @@ const PRODUCTION_SEMANTIC_COMPONENTS: &[CatalogEntry] = &[
     CatalogEntry {
         id: NATIVE_V2_ENTROPY_COMPONENT_KEY.kind,
         introduced_minor: 8,
+    },
+    CatalogEntry {
+        id: NATIVE_V2_BALLOON_COMPONENT_KEY.kind,
+        introduced_minor: 9,
     },
 ];
 
@@ -240,6 +252,13 @@ pub const NATIVE_V2_SERIAL_COMPONENT_KEY: SnapshotV2ComponentKey =
 /// permits at most one semantic instance-zero component.
 pub const NATIVE_V2_ENTROPY_COMPONENT_KEY: SnapshotV2ComponentKey =
     SnapshotV2ComponentKey::new(9, 0);
+
+/// Canonical identity of the optional singleton native-v2 balloon state.
+///
+/// This semantic component is introduced by exact 2.9. Product-profile code
+/// permits at most one semantic instance-zero component.
+pub const NATIVE_V2_BALLOON_COMPONENT_KEY: SnapshotV2ComponentKey =
+    SnapshotV2ComponentKey::new(10, 0);
 
 impl fmt::Debug for SnapshotV2ComponentKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
