@@ -62,7 +62,7 @@ pub enum HvfSnapshotV2BalloonProductKind {
     SerialBalloonStorageEntropy,
 }
 
-enum HvfSnapshotV2BalloonPreparedProductParts {
+pub(crate) enum HvfSnapshotV2BalloonPreparedProductParts {
     Balloon {
         balloon: SnapshotV2BalloonRestorePlan,
     },
@@ -183,6 +183,10 @@ impl HvfSnapshotV2BalloonPreparedProduct {
                 Some(entropy)
             }
         }
+    }
+
+    pub(crate) fn into_parts(self) -> HvfSnapshotV2BalloonPreparedProductParts {
+        self.parts
     }
 }
 
@@ -374,6 +378,16 @@ pub struct HvfSnapshotV2BalloonMmioPlatformPlan {
     vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2BalloonMmioPlatformPlanParts {
+    pub(crate) product: HvfSnapshotV2BalloonPreparedProduct,
+    pub(crate) balloon: HvfSnapshotV2BalloonMmioEndpointPlan,
+    pub(crate) storage: Option<HvfSnapshotV2StorageMmioPlatformPlan>,
+    pub(crate) entropy: Option<HvfSnapshotV2BalloonEntropyMmioEndpointPlan>,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 impl HvfSnapshotV2BalloonMmioPlatformPlan {
     /// Returns the closed product shape.
     pub const fn kind(&self) -> HvfSnapshotV2BalloonProductKind {
@@ -413,6 +427,18 @@ impl HvfSnapshotV2BalloonMmioPlatformPlan {
     /// Returns the final exact VMClock SPI.
     pub const fn vmclock_interrupt(&self) -> GuestInterruptLine {
         self.vmclock_interrupt
+    }
+
+    pub(crate) fn into_parts(self) -> HvfSnapshotV2BalloonMmioPlatformPlanParts {
+        HvfSnapshotV2BalloonMmioPlatformPlanParts {
+            product: self.product,
+            balloon: self.balloon,
+            storage: self.storage,
+            entropy: self.entropy,
+            serial_interrupt: self.serial_interrupt,
+            vmgenid_interrupt: self.vmgenid_interrupt,
+            vmclock_interrupt: self.vmclock_interrupt,
+        }
     }
 }
 

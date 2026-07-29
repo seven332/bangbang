@@ -452,6 +452,17 @@ pub(crate) struct HvfSnapshotV2StorageMmioShellPlan<'a> {
     pub(crate) vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2BalloonMmioShellPlan<'a> {
+    pub(crate) balloon_interrupt: GuestInterruptLine,
+    pub(crate) command_line: Option<&'a str>,
+    pub(crate) block_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
+    pub(crate) pmem_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
+    pub(crate) entropy_interrupt: Option<GuestInterruptLine>,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 pub(crate) struct HvfSnapshotV2StoragePciShellPlan<'a> {
     pub(crate) command_line: &'a str,
     pub(crate) pci: &'a HvfSnapshotV2StoragePciHostPlan,
@@ -491,6 +502,10 @@ enum HvfSnapshotV2ProcessShellRestore<'a> {
         shell: HvfSnapshotV2ProcessSerialShell,
         plan: HvfSnapshotV2StorageMmioShellPlan<'a>,
         entropy_interrupt: GuestInterruptLine,
+    },
+    BalloonMmio {
+        shell: HvfSnapshotV2ProcessSerialShell,
+        plan: HvfSnapshotV2BalloonMmioShellPlan<'a>,
     },
     StoragePci {
         shell: HvfSnapshotV2ProcessSerialShell,
@@ -1566,6 +1581,22 @@ pub(crate) fn restore_hvf_snapshot_v2_serial_storage_entropy_mmio_process_platfo
             shell: shell.into(),
             plan,
             entropy_interrupt,
+        }),
+    )
+}
+
+pub(crate) fn restore_hvf_snapshot_v2_serial_balloon_mmio_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2RestoredSerialShell,
+    plan: HvfSnapshotV2BalloonMmioShellPlan<'_>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::BalloonMmio {
+            shell: shell.into(),
+            plan,
         }),
     )
 }
@@ -2693,6 +2724,59 @@ fn prepare_process_shell(
                         block_records: plan.block_records,
                         pmem_records: plan.pmem_records,
                     },
+                    true,
+                    false,
+                    Some((
+                        plan.serial_interrupt,
+                        plan.vmgenid_interrupt,
+                        plan.vmclock_interrupt,
+                    )),
+                )
+            }
+            HvfSnapshotV2ProcessShellRestore::BalloonMmio { shell, plan } => {
+                let storage_count = plan.block_records.len() + plan.pmem_records.len();
+                if gic.msi.is_some() || plan.command_line.is_some() != (storage_count != 0) {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                        mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                    });
+                }
+                if allocator
+                    .allocate()
+                    .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                    != plan.balloon_interrupt
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
+                }
+                for record in plan.block_records.iter().chain(plan.pmem_records) {
+                    if allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != record.interrupt_line()
+                    {
+                        return Err(
+                            HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
+                        );
+                    }
+                }
+                if let Some(entropy_interrupt) = plan.entropy_interrupt
+                    && allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != entropy_interrupt
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
+                }
+                let block_plan = match plan.command_line {
+                    Some(command_line) => HvfSnapshotV2ProcessBlockFdtPlan::StorageMmio {
+                        command_line,
+                        block_records: plan.block_records,
+                        pmem_records: plan.pmem_records,
+                    },
+                    None => HvfSnapshotV2ProcessBlockFdtPlan::None,
+                };
+                (
+                    shell,
+                    block_plan,
                     true,
                     false,
                     Some((
@@ -5038,6 +5122,64 @@ pub(crate) mod tests {
                 Some(HvfSnapshotV2ProcessShellRestore::SerialEntropyMmio {
                     shell: restored_serial_shell().into(),
                     entropy_interrupt: wrong_entropy,
+                }),
+                &state,
+                b"authenticated product FDT bytes are not reparsed",
+            ),
+            Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity)
+        ));
+    }
+
+    #[test]
+    fn balloon_mmio_shell_allocates_before_optional_and_fixed_product_interrupts() {
+        let (state, balloon_interrupt, serial_interrupt, vmgenid_interrupt, vmclock_interrupt) =
+            product_entropy_interrupt_platform_fixture(product_process_platform_fixture(), &[]);
+        let shell_plan = HvfSnapshotV2BalloonMmioShellPlan {
+            balloon_interrupt,
+            command_line: None,
+            block_records: &[],
+            pmem_records: &[],
+            entropy_interrupt: None,
+            serial_interrupt,
+            vmgenid_interrupt,
+            vmclock_interrupt,
+        };
+
+        let (_dispatcher, device) = prepare_process_shell(
+            Some(HvfSnapshotV2ProcessShellRestore::BalloonMmio {
+                shell: restored_serial_shell().into(),
+                plan: shell_plan,
+            }),
+            &state,
+            b"authenticated product FDT bytes are not reparsed",
+        )
+        .expect("serial-plus-balloon shell should prepare");
+        assert_eq!(
+            device
+                .expect("restored serial metadata should exist")
+                .fdt_device
+                .interrupt_line,
+            serial_interrupt
+        );
+
+        let wrong_balloon =
+            GuestInterruptLine::new(balloon_interrupt.raw_value().saturating_add(1))
+                .expect("wrong balloon line should validate structurally");
+        let shell_plan = HvfSnapshotV2BalloonMmioShellPlan {
+            balloon_interrupt: wrong_balloon,
+            command_line: None,
+            block_records: &[],
+            pmem_records: &[],
+            entropy_interrupt: None,
+            serial_interrupt,
+            vmgenid_interrupt,
+            vmclock_interrupt,
+        };
+        assert!(matches!(
+            prepare_process_shell(
+                Some(HvfSnapshotV2ProcessShellRestore::BalloonMmio {
+                    shell: restored_serial_shell().into(),
+                    plan: shell_plan,
                 }),
                 &state,
                 b"authenticated product FDT bytes are not reparsed",

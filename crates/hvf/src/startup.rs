@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use bangbang_runtime::balloon::{
     BalloonConfig, BalloonHintingCommandError, BalloonHintingStartInput, BalloonHintingStatus,
-    BalloonHintingStatusError, BalloonMmioLayout, BalloonStats, BalloonStatsError,
-    BalloonStatsUpdateInput, BalloonUpdateError, VIRTIO_BALLOON_DEVICE_ID,
+    BalloonHintingStatusError, BalloonMmioDeviceRegistration, BalloonMmioLayout, BalloonStats,
+    BalloonStatsError, BalloonStatsUpdateInput, BalloonUpdateError, VIRTIO_BALLOON_DEVICE_ID,
     VirtioBalloonConfigSpace, VirtioBalloonDevice, VirtioBalloonDeviceNotificationError,
     VirtioBalloonMmioCaptureState, VirtioBalloonPciCaptureError, VirtioBalloonPciCaptureState,
     VirtioBalloonQueueLayout,
@@ -103,8 +103,8 @@ use bangbang_runtime::serial::{
     SharedSerialOutput, SharedSerialOutputBuffer,
 };
 use bangbang_runtime::snapshot_balloon_v2_9::{
-    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, SnapshotV2BalloonState,
-    SnapshotV2BalloonStateCaptureError,
+    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2BalloonMmioHandler,
+    SnapshotV2BalloonMmioHandlerError, SnapshotV2BalloonState, SnapshotV2BalloonStateCaptureError,
 };
 use bangbang_runtime::snapshot_device::{
     SnapshotV1BlockRetryState, SnapshotV1DeviceState, SnapshotV1PlatformDeviceMetadata,
@@ -142,7 +142,7 @@ use bangbang_runtime::snapshot_memory_v2::{
 };
 use bangbang_runtime::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
 use bangbang_runtime::startup::{
-    ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonNotificationDispatch,
+    ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonDevice, Arm64BootBalloonNotificationDispatch,
     Arm64BootBalloonNotificationDispatchError, Arm64BootBalloonNotificationDispatches,
     Arm64BootBlockDevice, Arm64BootBlockNotificationDispatch,
     Arm64BootBlockNotificationDispatchError, Arm64BootBlockNotificationDispatches,
@@ -247,6 +247,10 @@ use crate::snapshot_v2::{
     HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState, HvfSnapshotV2PlatformState,
     HvfSnapshotV2PvTimeVcpuState, HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
 };
+use crate::snapshot_v2_balloon_platform::{
+    HvfSnapshotV2BalloonMmioPlatformPlan, HvfSnapshotV2BalloonMmioPlatformPlanParts,
+    HvfSnapshotV2BalloonPreparedProductParts,
+};
 use crate::snapshot_v2_entropy_platform::{
     HvfSnapshotV2EntropyPciEndpointPlan, HvfSnapshotV2StorageEntropyPciPlatformPlan,
 };
@@ -255,15 +259,16 @@ use crate::snapshot_v2_multi_block_platform::{
     HvfSnapshotV2MultiBlockTransportPlan,
 };
 use crate::snapshot_v2_platform::{
-    HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2MultiBlockMmioShellPlan,
-    HvfSnapshotV2MultiBlockPciShellPlan, HvfSnapshotV2PlatformRestoreError,
-    HvfSnapshotV2PlatformShutdownError, HvfSnapshotV2RestoredSerialShell,
-    HvfSnapshotV2RootResourcePlan, HvfSnapshotV2RootTransportPlan,
-    HvfSnapshotV2SerialOnlyProcessConfig, HvfSnapshotV2StorageMmioShellPlan,
-    HvfSnapshotV2StoragePciShellPlan, RestoredHvfSnapshotV2Platform,
-    restore_hvf_snapshot_v2_multi_block_mmio_process_platform,
+    HvfSnapshotV2BalloonMmioShellPlan, HvfSnapshotV2DefaultProcessShell,
+    HvfSnapshotV2MultiBlockMmioShellPlan, HvfSnapshotV2MultiBlockPciShellPlan,
+    HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformShutdownError,
+    HvfSnapshotV2RestoredSerialShell, HvfSnapshotV2RootResourcePlan,
+    HvfSnapshotV2RootTransportPlan, HvfSnapshotV2SerialOnlyProcessConfig,
+    HvfSnapshotV2StorageMmioShellPlan, HvfSnapshotV2StoragePciShellPlan,
+    RestoredHvfSnapshotV2Platform, restore_hvf_snapshot_v2_multi_block_mmio_process_platform,
     restore_hvf_snapshot_v2_multi_block_pci_process_platform,
     restore_hvf_snapshot_v2_root_process_platform,
+    restore_hvf_snapshot_v2_serial_balloon_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_entropy_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_only_process_platform,
     restore_hvf_snapshot_v2_serial_storage_entropy_mmio_process_platform,
@@ -3510,6 +3515,10 @@ enum HvfSnapshotV2StorageProcessShell {
         shell: HvfSnapshotV2RestoredSerialShell,
         interrupt_line: GuestInterruptLine,
     },
+    RestoredBalloonMmio {
+        shell: HvfSnapshotV2RestoredSerialShell,
+        interrupts: HvfSnapshotV2BalloonMmioInterruptPlan,
+    },
 }
 
 enum HvfSnapshotV2SerialProcessShell {
@@ -3521,14 +3530,330 @@ enum HvfSnapshotV2SerialProcessShell {
         shell: HvfSnapshotV2RestoredSerialShell,
         interrupt_line: GuestInterruptLine,
     },
+    BalloonMmio {
+        shell: HvfSnapshotV2RestoredSerialShell,
+        interrupts: HvfSnapshotV2BalloonMmioInterruptPlan,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct HvfSnapshotV2BalloonMmioInterruptPlan {
+    balloon: GuestInterruptLine,
+    entropy: Option<GuestInterruptLine>,
+    serial: GuestInterruptLine,
+    vmgenid: GuestInterruptLine,
+    vmclock: GuestInterruptLine,
 }
 
 impl HvfSnapshotV2SerialProcessShell {
     const fn pci_enabled(&self) -> bool {
         match self {
             Self::SerialOnly { process, .. } => process.pci_enabled(),
-            Self::EntropyMmio { .. } => false,
+            Self::EntropyMmio { .. } | Self::BalloonMmio { .. } => false,
         }
+    }
+}
+
+/// One complete, still-unpublished exact-2.9 MMIO balloon product.
+#[doc(hidden)]
+pub struct RestoredHvfSnapshotV2BalloonMmioOwners {
+    session: OwnedHvfArm64BootSession,
+    balloon_config: BalloonConfig,
+    storage_configs: Option<CaptureReadyStorageConfigs>,
+    entropy_config: Option<EntropyConfig>,
+}
+
+impl RestoredHvfSnapshotV2BalloonMmioOwners {
+    /// Returns the complete Paused destination session.
+    pub const fn session(&self) -> &OwnedHvfArm64BootSession {
+        &self.session
+    }
+
+    /// Returns the exact public balloon configuration.
+    pub const fn balloon_config(&self) -> BalloonConfig {
+        self.balloon_config
+    }
+
+    /// Returns restored storage configuration when present.
+    pub const fn storage_configs(&self) -> Option<&CaptureReadyStorageConfigs> {
+        self.storage_configs.as_ref()
+    }
+
+    /// Returns the exact public entropy configuration when present.
+    pub const fn entropy_config(&self) -> Option<EntropyConfig> {
+        self.entropy_config
+    }
+
+    /// Consumes the complete unpublished owner graph.
+    pub fn into_parts(
+        self,
+    ) -> (
+        OwnedHvfArm64BootSession,
+        BalloonConfig,
+        Option<CaptureReadyStorageConfigs>,
+        Option<EntropyConfig>,
+    ) {
+        (
+            self.session,
+            self.balloon_config,
+            self.storage_configs,
+            self.entropy_config,
+        )
+    }
+}
+
+impl fmt::Debug for RestoredHvfSnapshotV2BalloonMmioOwners {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoredHvfSnapshotV2BalloonMmioOwners")
+            .field("has_storage", &self.storage_configs.is_some())
+            .field("has_entropy", &self.entropy_config.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Deterministic exact-2.9 MMIO publication fault used by owner tests.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2BalloonMmioRestoreFault {
+    InterruptSetup,
+    Registration,
+    BalloonInsertion,
+    StoragePublication,
+    EntropyPublication,
+    SessionAssembly,
+}
+
+/// Stage at which exact-2.9 MMIO balloon reconstruction stopped.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2BalloonMmioRestoreStage {
+    Product,
+    BalloonHandler,
+    EntropyHandler,
+    InterruptSetup,
+    Platform,
+    StoragePublication,
+    Registration,
+    BalloonInsertion,
+    EntropyPublication,
+    SessionAssembly,
+}
+
+/// Primary exact-2.9 MMIO balloon reconstruction failure.
+#[doc(hidden)]
+pub enum HvfSnapshotV2BalloonMmioRestoreFailure {
+    Product,
+    BalloonHandler(SnapshotV2BalloonMmioHandlerError),
+    EntropyHandler(SnapshotV2EntropyMmioHandlerError),
+    InterruptSetup(HvfGicSpiSignalError),
+    SerialPlatform(Box<HvfSnapshotV2SerialOnlyRestoreError>),
+    StoragePlatform(Box<HvfSnapshotV2StorageMmioRestoreError>),
+    EntropyPlatform(Box<HvfSnapshotV2EntropyMmioRestoreError>),
+    Allocation,
+    DispatcherUnavailable,
+    Registration(MmioRegistrationError),
+    Injected(HvfSnapshotV2BalloonMmioRestoreFault),
+}
+
+impl fmt::Debug for HvfSnapshotV2BalloonMmioRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Product => "product",
+            Self::BalloonHandler(_) => "balloon-handler",
+            Self::EntropyHandler(_) => "entropy-handler",
+            Self::InterruptSetup(_) => "interrupt-setup",
+            Self::SerialPlatform(_) => "serial-platform",
+            Self::StoragePlatform(_) => "storage-platform",
+            Self::EntropyPlatform(_) => "entropy-platform",
+            Self::Allocation => "allocation",
+            Self::DispatcherUnavailable => "dispatcher",
+            Self::Registration(_) => "registration",
+            Self::Injected(fault) => match fault {
+                HvfSnapshotV2BalloonMmioRestoreFault::InterruptSetup
+                | HvfSnapshotV2BalloonMmioRestoreFault::Registration
+                | HvfSnapshotV2BalloonMmioRestoreFault::BalloonInsertion
+                | HvfSnapshotV2BalloonMmioRestoreFault::StoragePublication
+                | HvfSnapshotV2BalloonMmioRestoreFault::EntropyPublication
+                | HvfSnapshotV2BalloonMmioRestoreFault::SessionAssembly => "injected",
+            },
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2BalloonMmioRestoreFailure")
+            .field("kind", &kind)
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2BalloonMmioRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Product => "exact-2.9 MMIO balloon product plan diverged",
+            Self::BalloonHandler(_) => "exact-2.9 balloon handler reconstruction failed",
+            Self::EntropyHandler(_) => "following entropy handler reconstruction failed",
+            Self::InterruptSetup(_) => "exact-2.9 balloon interrupt setup failed",
+            Self::SerialPlatform(_) => "balloon-bearing serial platform reconstruction failed",
+            Self::StoragePlatform(_) => "balloon-prefixed storage publication failed",
+            Self::EntropyPlatform(_) => "following entropy publication failed",
+            Self::Allocation => "exact-2.9 MMIO balloon owner allocation failed",
+            Self::DispatcherUnavailable => "exact-2.9 balloon MMIO dispatcher is unavailable",
+            Self::Registration(_) => "exact-2.9 balloon MMIO registration failed",
+            Self::Injected(_) => "exact-2.9 balloon owner certification fault was injected",
+        })
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2BalloonMmioRestoreFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BalloonHandler(source) => Some(source),
+            Self::EntropyHandler(source) => Some(source),
+            Self::InterruptSetup(source) => Some(source),
+            Self::SerialPlatform(source) => Some(source.as_ref()),
+            Self::StoragePlatform(source) => Some(source.as_ref()),
+            Self::EntropyPlatform(source) => Some(source.as_ref()),
+            Self::Registration(source) => Some(source),
+            Self::Product | Self::Allocation | Self::DispatcherUnavailable | Self::Injected(_) => {
+                None
+            }
+        }
+    }
+}
+
+/// Redacted exact-2.9 MMIO balloon failure and cleanup evidence.
+#[doc(hidden)]
+pub struct HvfSnapshotV2BalloonMmioRestoreError {
+    stage: HvfSnapshotV2BalloonMmioRestoreStage,
+    failure: Box<HvfSnapshotV2BalloonMmioRestoreFailure>,
+    committed: bool,
+    cleanup: Option<Box<HvfArm64BootSessionShutdownError>>,
+}
+
+impl HvfSnapshotV2BalloonMmioRestoreError {
+    fn preflight(
+        stage: HvfSnapshotV2BalloonMmioRestoreStage,
+        failure: HvfSnapshotV2BalloonMmioRestoreFailure,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            committed: false,
+            cleanup: None,
+        }
+    }
+
+    fn serial_platform(source: HvfSnapshotV2SerialOnlyRestoreError) -> Self {
+        Self::preflight(
+            HvfSnapshotV2BalloonMmioRestoreStage::Platform,
+            HvfSnapshotV2BalloonMmioRestoreFailure::SerialPlatform(Box::new(source)),
+        )
+    }
+
+    fn storage_platform(source: HvfSnapshotV2StorageMmioRestoreError) -> Self {
+        Self::preflight(
+            HvfSnapshotV2BalloonMmioRestoreStage::StoragePublication,
+            HvfSnapshotV2BalloonMmioRestoreFailure::StoragePlatform(Box::new(source)),
+        )
+    }
+
+    fn entropy_platform(source: HvfSnapshotV2EntropyMmioRestoreError) -> Self {
+        Self::preflight(
+            HvfSnapshotV2BalloonMmioRestoreStage::EntropyPublication,
+            HvfSnapshotV2BalloonMmioRestoreFailure::EntropyPlatform(Box::new(source)),
+        )
+    }
+
+    fn after_session(
+        mut session: OwnedHvfArm64BootSession,
+        stage: HvfSnapshotV2BalloonMmioRestoreStage,
+        failure: HvfSnapshotV2BalloonMmioRestoreFailure,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            committed: true,
+            cleanup: session.shutdown().err().map(Box::new),
+        }
+    }
+
+    pub const fn stage(&self) -> HvfSnapshotV2BalloonMmioRestoreStage {
+        self.stage
+    }
+
+    /// Returns whether reverse cleanup did not complete.
+    pub fn has_incomplete_cleanup(&self) -> bool {
+        self.cleanup.is_some()
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2BalloonMmioRestoreFailure::SerialPlatform(source)
+                    if source.has_incomplete_cleanup()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2BalloonMmioRestoreFailure::StoragePlatform(source)
+                    if source.has_incomplete_cleanup()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2BalloonMmioRestoreFailure::EntropyPlatform(source)
+                    if source.has_incomplete_cleanup()
+            )
+    }
+
+    /// Returns whether retry safety cannot be proven.
+    pub fn is_terminal(&self) -> bool {
+        self.committed
+            || self.cleanup.is_some()
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2BalloonMmioRestoreFailure::SerialPlatform(source)
+                    if source.is_terminal()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2BalloonMmioRestoreFailure::StoragePlatform(source)
+                    if source.is_terminal()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2BalloonMmioRestoreFailure::EntropyPlatform(source)
+                    if source.is_terminal()
+            )
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2BalloonMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2BalloonMmioRestoreError")
+            .field("stage", &self.stage)
+            .field("terminal", &self.is_terminal())
+            .field("cleanup_failed", &self.has_incomplete_cleanup())
+            .field("failure", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2BalloonMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.9 MMIO balloon reconstruction failed at {:?} ({})",
+            self.stage,
+            if self.is_terminal() {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2BalloonMmioRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.failure.as_ref())
     }
 }
 
@@ -14271,6 +14596,92 @@ struct HvfSnapshotV2StorageMmioCleanup<'a> {
     failures: Vec<HvfSnapshotV2StorageMmioRestoreCleanupFailure>,
 }
 
+/// Move-only storage publication input whose complete backing, transport,
+/// metrics, retry, lease, and cleanup capacity exists before HVF creation.
+struct PreparedHvfSnapshotV2StorageMmioOwners {
+    layout: GuestMemoryLayout,
+    retained_fdt: Arm64FdtGuestMemoryWrite,
+    bundle: PreparedSnapshotV2StorageMmioBundle,
+    command_line: String,
+    planned_block_records:
+        Vec<crate::snapshot_v2_storage_platform::HvfSnapshotV2StorageMmioRecordPlan>,
+    planned_pmem_records:
+        Vec<crate::snapshot_v2_storage_platform::HvfSnapshotV2StorageMmioRecordPlan>,
+    serial_interrupt: GuestInterruptLine,
+    vmgenid_interrupt: GuestInterruptLine,
+    vmclock_interrupt: GuestInterruptLine,
+    block_count: usize,
+    pmem_count: usize,
+    balloon_count: usize,
+    earliest_block_retry_deadline: Option<Instant>,
+    earliest_pmem_retry_deadline: Option<Instant>,
+    block_device_metrics: SharedBlockDeviceMetricsRegistry,
+    pmem_device_metrics: SharedPmemDeviceMetricsRegistry,
+    block_devices: Vec<Arm64BootBlockDevice>,
+    pmem_devices: Vec<PreparedPmemDevice>,
+    pmem_mmio_devices: Vec<Arm64BootPmemDevice>,
+    pmem_ranges: Vec<GuestMemoryRange>,
+    block_interrupt_lines: Vec<GuestInterruptLine>,
+    pmem_interrupt_lines: Vec<GuestInterruptLine>,
+    registration_owner: MmioRegistrationOwner,
+    registration_leases: Vec<MmioRegistrationLease>,
+    cleanup: Vec<HvfSnapshotV2StorageMmioRestoreCleanupFailure>,
+    balloon: Option<PreparedSnapshotV2BalloonMmioHandler>,
+    publication_fault_pmem_index: Option<usize>,
+    balloon_publication_fault: Option<HvfSnapshotV2BalloonMmioRestoreFault>,
+}
+
+struct HvfSnapshotV2StorageMmioPublicationInput {
+    balloon: Option<PreparedSnapshotV2BalloonMmioHandler>,
+    pmem_fault_index: Option<usize>,
+    balloon_fault: Option<HvfSnapshotV2BalloonMmioRestoreFault>,
+}
+
+impl HvfSnapshotV2StorageMmioPublicationInput {
+    const fn empty() -> Self {
+        Self {
+            balloon: None,
+            pmem_fault_index: None,
+            balloon_fault: None,
+        }
+    }
+
+    fn balloon(
+        balloon: PreparedSnapshotV2BalloonMmioHandler,
+        fault: Option<HvfSnapshotV2BalloonMmioRestoreFault>,
+    ) -> Self {
+        Self {
+            balloon: Some(balloon),
+            pmem_fault_index: None,
+            balloon_fault: fault,
+        }
+    }
+
+    const fn pmem_fault(index: usize) -> Self {
+        Self {
+            balloon: None,
+            pmem_fault_index: Some(index),
+            balloon_fault: None,
+        }
+    }
+}
+
+struct PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix {
+    owner: MmioRegistrationOwner,
+    leases: Vec<MmioRegistrationLease>,
+}
+
+impl PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix {
+    fn try_new() -> Result<Self, TryReserveError> {
+        let mut leases = Vec::new();
+        leases.try_reserve_exact(1)?;
+        Ok(Self {
+            owner: MmioRegistrationOwner::new(),
+            leases,
+        })
+    }
+}
+
 fn failed_snapshot_v2_storage_mmio_after_platform(
     mut platform: RestoredHvfSnapshotV2Platform,
     stage: HvfSnapshotV2StorageMmioRestoreStage,
@@ -14856,6 +15267,23 @@ impl OwnedHvfArm64BootSession {
                 shell,
                 interrupt_line,
             ),
+            HvfSnapshotV2SerialProcessShell::BalloonMmio { shell, interrupts } => {
+                restore_hvf_snapshot_v2_serial_balloon_mmio_process_platform(
+                    state,
+                    memory,
+                    shell,
+                    HvfSnapshotV2BalloonMmioShellPlan {
+                        balloon_interrupt: interrupts.balloon,
+                        command_line: None,
+                        block_records: &[],
+                        pmem_records: &[],
+                        entropy_interrupt: interrupts.entropy,
+                        serial_interrupt: interrupts.serial,
+                        vmgenid_interrupt: interrupts.vmgenid,
+                        vmclock_interrupt: interrupts.vmclock,
+                    },
+                )
+            }
         }
         .map_err(HvfSnapshotV2SerialOnlyRestoreError::Platform)?;
         let parts = platform.into_parts();
@@ -15066,6 +15494,449 @@ impl OwnedHvfArm64BootSession {
         Ok(session)
     }
 
+    /// Reconstructs one closed exact-2.9 serial plus MMIO balloon product
+    /// without publishing a controller or public load path.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_balloon_mmio(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        plan: HvfSnapshotV2BalloonMmioPlatformPlan,
+    ) -> Result<RestoredHvfSnapshotV2BalloonMmioOwners, HvfSnapshotV2BalloonMmioRestoreError> {
+        Self::restore_snapshot_v2_serial_balloon_mmio_inner(
+            state,
+            memory,
+            process_shell,
+            serial_input,
+            plan,
+            None,
+        )
+    }
+
+    /// Reconstructs exact-2.9 MMIO owners with one deterministic publication
+    /// fault for signed rollback certification.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_balloon_mmio_with_fault(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        plan: HvfSnapshotV2BalloonMmioPlatformPlan,
+        fault: HvfSnapshotV2BalloonMmioRestoreFault,
+    ) -> Result<RestoredHvfSnapshotV2BalloonMmioOwners, HvfSnapshotV2BalloonMmioRestoreError> {
+        Self::restore_snapshot_v2_serial_balloon_mmio_inner(
+            state,
+            memory,
+            process_shell,
+            serial_input,
+            plan,
+            Some(fault),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn restore_snapshot_v2_serial_balloon_mmio_inner(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        plan: HvfSnapshotV2BalloonMmioPlatformPlan,
+        fault: Option<HvfSnapshotV2BalloonMmioRestoreFault>,
+    ) -> Result<RestoredHvfSnapshotV2BalloonMmioOwners, HvfSnapshotV2BalloonMmioRestoreError> {
+        let HvfSnapshotV2BalloonMmioPlatformPlanParts {
+            product,
+            balloon: balloon_endpoint,
+            storage: storage_platform,
+            entropy: entropy_endpoint,
+            serial_interrupt,
+            vmgenid_interrupt,
+            vmclock_interrupt,
+        } = plan.into_parts();
+        let (balloon, storage_bundle, entropy) = match product.into_parts() {
+            HvfSnapshotV2BalloonPreparedProductParts::Balloon { balloon } => (balloon, None, None),
+            HvfSnapshotV2BalloonPreparedProductParts::Storage { balloon, storage } => {
+                (balloon, Some(storage), None)
+            }
+            HvfSnapshotV2BalloonPreparedProductParts::Entropy { balloon, entropy } => {
+                (balloon, None, Some(entropy))
+            }
+            HvfSnapshotV2BalloonPreparedProductParts::StorageEntropy {
+                balloon,
+                storage,
+                entropy,
+            } => (balloon, Some(storage), Some(entropy)),
+        };
+        if storage_bundle.is_some() != storage_platform.is_some()
+            || entropy.is_some() != entropy_endpoint.is_some()
+            || fault == Some(HvfSnapshotV2BalloonMmioRestoreFault::StoragePublication)
+                && storage_bundle.is_none()
+            || fault == Some(HvfSnapshotV2BalloonMmioRestoreFault::EntropyPublication)
+                && entropy.is_none()
+        {
+            return Err(HvfSnapshotV2BalloonMmioRestoreError::preflight(
+                HvfSnapshotV2BalloonMmioRestoreStage::Product,
+                HvfSnapshotV2BalloonMmioRestoreFailure::Product,
+            ));
+        }
+
+        let balloon_config = balloon.config();
+        let balloon = balloon.into_mmio_handler().map_err(|source| {
+            HvfSnapshotV2BalloonMmioRestoreError::preflight(
+                HvfSnapshotV2BalloonMmioRestoreStage::BalloonHandler,
+                HvfSnapshotV2BalloonMmioRestoreFailure::BalloonHandler(source),
+            )
+        })?;
+        if balloon.region() != balloon_endpoint.region()
+            || balloon.interrupt_line() != balloon_endpoint.interrupt_line()
+        {
+            return Err(HvfSnapshotV2BalloonMmioRestoreError::preflight(
+                HvfSnapshotV2BalloonMmioRestoreStage::Product,
+                HvfSnapshotV2BalloonMmioRestoreFailure::Product,
+            ));
+        }
+
+        let entropy_config = entropy.as_ref().map(SnapshotV2EntropyRestorePlan::config);
+        let entropy = entropy
+            .map(SnapshotV2EntropyRestorePlan::into_mmio_handler)
+            .transpose()
+            .map_err(|source| {
+                HvfSnapshotV2BalloonMmioRestoreError::preflight(
+                    HvfSnapshotV2BalloonMmioRestoreStage::EntropyHandler,
+                    HvfSnapshotV2BalloonMmioRestoreFailure::EntropyHandler(source),
+                )
+            })?;
+        if entropy
+            .as_ref()
+            .zip(entropy_endpoint)
+            .is_some_and(|(entropy, endpoint)| {
+                entropy.region() != endpoint.region()
+                    || entropy.interrupt_line() != endpoint.interrupt_line()
+            })
+        {
+            return Err(HvfSnapshotV2BalloonMmioRestoreError::preflight(
+                HvfSnapshotV2BalloonMmioRestoreStage::Product,
+                HvfSnapshotV2BalloonMmioRestoreFailure::Product,
+            ));
+        }
+
+        if fault == Some(HvfSnapshotV2BalloonMmioRestoreFault::InterruptSetup) {
+            return Err(HvfSnapshotV2BalloonMmioRestoreError::preflight(
+                HvfSnapshotV2BalloonMmioRestoreStage::InterruptSetup,
+                HvfSnapshotV2BalloonMmioRestoreFailure::Injected(
+                    HvfSnapshotV2BalloonMmioRestoreFault::InterruptSetup,
+                ),
+            ));
+        }
+        let signaler =
+            HvfGicSpiSignaler::from_metadata(&state.global().compatibility().gic_metadata())
+                .map_err(|source| {
+                    HvfSnapshotV2BalloonMmioRestoreError::preflight(
+                        HvfSnapshotV2BalloonMmioRestoreStage::InterruptSetup,
+                        HvfSnapshotV2BalloonMmioRestoreFailure::InterruptSetup(source),
+                    )
+                })?;
+        signaler
+            .validate_line(balloon.interrupt_line())
+            .map_err(|source| {
+                HvfSnapshotV2BalloonMmioRestoreError::preflight(
+                    HvfSnapshotV2BalloonMmioRestoreStage::InterruptSetup,
+                    HvfSnapshotV2BalloonMmioRestoreFailure::InterruptSetup(source),
+                )
+            })?;
+        let standalone_registration = if storage_bundle.is_none() {
+            Some(
+                PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix::try_new().map_err(|_| {
+                    HvfSnapshotV2BalloonMmioRestoreError::preflight(
+                        HvfSnapshotV2BalloonMmioRestoreStage::Registration,
+                        HvfSnapshotV2BalloonMmioRestoreFailure::Allocation,
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let interrupts = HvfSnapshotV2BalloonMmioInterruptPlan {
+            balloon: balloon_endpoint.interrupt_line(),
+            entropy: entropy_endpoint.map(|endpoint| endpoint.interrupt_line()),
+            serial: serial_interrupt,
+            vmgenid: vmgenid_interrupt,
+            vmclock: vmclock_interrupt,
+        };
+        let (mut session, storage_configs) = match (storage_bundle, storage_platform) {
+            (None, None) => {
+                let session = Self::restore_snapshot_v2_serial_only_inner(
+                    state,
+                    memory,
+                    HvfSnapshotV2SerialProcessShell::BalloonMmio {
+                        shell: process_shell,
+                        interrupts,
+                    },
+                    serial_input,
+                )
+                .map_err(HvfSnapshotV2BalloonMmioRestoreError::serial_platform)?;
+                let registration = match standalone_registration {
+                    Some(registration) => registration,
+                    None => {
+                        return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                            session,
+                            HvfSnapshotV2BalloonMmioRestoreStage::Product,
+                            HvfSnapshotV2BalloonMmioRestoreFailure::Product,
+                        ));
+                    }
+                };
+                let session = Self::attach_snapshot_v2_balloon_mmio(
+                    session,
+                    balloon,
+                    registration,
+                    fault.filter(|fault| {
+                        matches!(
+                            fault,
+                            HvfSnapshotV2BalloonMmioRestoreFault::Registration
+                                | HvfSnapshotV2BalloonMmioRestoreFault::BalloonInsertion
+                        )
+                    }),
+                )?;
+                (session, None)
+            }
+            (Some(bundle), Some(storage_plan)) => {
+                let restored = Self::restore_snapshot_v2_storage_mmio_inner(
+                    state,
+                    memory,
+                    HvfSnapshotV2StorageProcessShell::RestoredBalloonMmio {
+                        shell: process_shell,
+                        interrupts,
+                    },
+                    serial_input,
+                    bundle,
+                    storage_plan,
+                    HvfSnapshotV2StorageMmioPublicationInput::balloon(
+                        balloon,
+                        fault.filter(|fault| {
+                            matches!(
+                                fault,
+                                HvfSnapshotV2BalloonMmioRestoreFault::Registration
+                                    | HvfSnapshotV2BalloonMmioRestoreFault::BalloonInsertion
+                                    | HvfSnapshotV2BalloonMmioRestoreFault::StoragePublication
+                            )
+                        }),
+                    ),
+                )
+                .map_err(HvfSnapshotV2BalloonMmioRestoreError::storage_platform)?;
+                let (session, configs) = restored.into_parts();
+                (session, Some(configs))
+            }
+            (None, Some(_)) | (Some(_), None) => {
+                return Err(HvfSnapshotV2BalloonMmioRestoreError::preflight(
+                    HvfSnapshotV2BalloonMmioRestoreStage::Product,
+                    HvfSnapshotV2BalloonMmioRestoreFailure::Product,
+                ));
+            }
+        };
+
+        if session
+            .runtime_resources
+            .balloon_device
+            .as_ref()
+            .is_none_or(|device| {
+                device.registration.region() != balloon_endpoint.region()
+                    || device.fdt_device != balloon_endpoint.fdt_device()
+            })
+            || session.balloon_interrupt_line != Some(balloon_endpoint.interrupt_line())
+        {
+            return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2BalloonMmioRestoreStage::BalloonInsertion,
+                HvfSnapshotV2BalloonMmioRestoreFailure::Product,
+            ));
+        }
+
+        if let Some(entropy) = entropy {
+            let injected = fault == Some(HvfSnapshotV2BalloonMmioRestoreFault::EntropyPublication);
+            let restored = Self::attach_snapshot_v2_entropy_mmio(
+                session,
+                entropy,
+                storage_configs,
+                injected,
+                VirtioRngOsEntropySource::new,
+            )
+            .map_err(HvfSnapshotV2BalloonMmioRestoreError::entropy_platform)?;
+            let (restored_session, restored_entropy_config, restored_storage_configs) =
+                restored.into_parts();
+            session = restored_session;
+            if Some(restored_entropy_config) != entropy_config {
+                return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2BalloonMmioRestoreStage::EntropyPublication,
+                    HvfSnapshotV2BalloonMmioRestoreFailure::Product,
+                ));
+            }
+            if fault == Some(HvfSnapshotV2BalloonMmioRestoreFault::SessionAssembly) {
+                return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2BalloonMmioRestoreStage::SessionAssembly,
+                    HvfSnapshotV2BalloonMmioRestoreFailure::Injected(
+                        HvfSnapshotV2BalloonMmioRestoreFault::SessionAssembly,
+                    ),
+                ));
+            }
+            return Ok(RestoredHvfSnapshotV2BalloonMmioOwners {
+                session,
+                balloon_config,
+                storage_configs: restored_storage_configs,
+                entropy_config,
+            });
+        }
+
+        if fault == Some(HvfSnapshotV2BalloonMmioRestoreFault::SessionAssembly) {
+            return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2BalloonMmioRestoreStage::SessionAssembly,
+                HvfSnapshotV2BalloonMmioRestoreFailure::Injected(
+                    HvfSnapshotV2BalloonMmioRestoreFault::SessionAssembly,
+                ),
+            ));
+        }
+        Ok(RestoredHvfSnapshotV2BalloonMmioOwners {
+            session,
+            balloon_config,
+            storage_configs,
+            entropy_config: None,
+        })
+    }
+
+    fn attach_snapshot_v2_balloon_mmio(
+        mut session: OwnedHvfArm64BootSession,
+        balloon: PreparedSnapshotV2BalloonMmioHandler,
+        registration: PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix,
+        fault: Option<HvfSnapshotV2BalloonMmioRestoreFault>,
+    ) -> Result<OwnedHvfArm64BootSession, HvfSnapshotV2BalloonMmioRestoreError> {
+        let (_config, _queue_ranges, region, interrupt_line, handler) = balloon.into_parts();
+        if session.runtime_resources.balloon_device.is_some()
+            || session.runtime_resources.pci_balloon_device.is_some()
+            || session.balloon_interrupt_line.is_some()
+            || session.pci_data_devices.is_some()
+        {
+            return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2BalloonMmioRestoreStage::BalloonInsertion,
+                HvfSnapshotV2BalloonMmioRestoreFailure::Product,
+            ));
+        }
+        let PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix { owner, leases } = registration;
+        let signaler = match HvfGicSpiSignaler::from_metadata(&session.gic) {
+            Ok(signaler) => signaler,
+            Err(source) => {
+                return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2BalloonMmioRestoreStage::InterruptSetup,
+                    HvfSnapshotV2BalloonMmioRestoreFailure::InterruptSetup(source),
+                ));
+            }
+        };
+        if let Err(source) = signaler.validate_line(interrupt_line) {
+            return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2BalloonMmioRestoreStage::InterruptSetup,
+                HvfSnapshotV2BalloonMmioRestoreFailure::InterruptSetup(source),
+            ));
+        }
+
+        session.restored_snapshot_v2_mmio_registrations =
+            Some(HvfSnapshotV2MultiBlockMmioRegistrations {
+                owner,
+                leases,
+                pmem_ranges: Vec::new(),
+            });
+        if fault == Some(HvfSnapshotV2BalloonMmioRestoreFault::Registration) {
+            return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2BalloonMmioRestoreStage::Registration,
+                HvfSnapshotV2BalloonMmioRestoreFailure::Injected(
+                    HvfSnapshotV2BalloonMmioRestoreFault::Registration,
+                ),
+            ));
+        }
+
+        let request = [MmioRegionRequest::new(
+            region.range().start(),
+            region.range().size(),
+        )];
+        let dispatcher_owner = Arc::clone(&session.mmio_dispatcher);
+        let lease = {
+            let Some(registrations) = session.restored_snapshot_v2_mmio_registrations.as_ref()
+            else {
+                std::process::abort();
+            };
+            let mut dispatcher = match dispatcher_owner.lock() {
+                Ok(dispatcher) => dispatcher,
+                Err(_) => {
+                    return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                        session,
+                        HvfSnapshotV2BalloonMmioRestoreStage::Registration,
+                        HvfSnapshotV2BalloonMmioRestoreFailure::DispatcherUnavailable,
+                    ));
+                }
+            };
+            match dispatcher.register_owned_handler(
+                &registrations.owner,
+                region.id(),
+                &request,
+                handler,
+            ) {
+                Ok(lease) => lease,
+                Err(source) => {
+                    drop(dispatcher);
+                    return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                        session,
+                        HvfSnapshotV2BalloonMmioRestoreStage::Registration,
+                        HvfSnapshotV2BalloonMmioRestoreFailure::Registration(source),
+                    ));
+                }
+            }
+        };
+        let registration_matches = session
+            .restored_snapshot_v2_mmio_registrations
+            .as_mut()
+            .is_some_and(|registrations| {
+                registrations.leases.push(lease);
+                registrations.leases.last().is_some_and(|lease| {
+                    lease.region_id() == region.id() && lease.regions() == [region]
+                })
+            });
+        if !registration_matches {
+            return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2BalloonMmioRestoreStage::Registration,
+                HvfSnapshotV2BalloonMmioRestoreFailure::Product,
+            ));
+        }
+        if fault == Some(HvfSnapshotV2BalloonMmioRestoreFault::BalloonInsertion) {
+            return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2BalloonMmioRestoreStage::BalloonInsertion,
+                HvfSnapshotV2BalloonMmioRestoreFailure::Injected(
+                    HvfSnapshotV2BalloonMmioRestoreFault::BalloonInsertion,
+                ),
+            ));
+        }
+
+        session.runtime_resources.balloon_device = Some(Arm64BootBalloonDevice {
+            registration: BalloonMmioDeviceRegistration::from_restored(region),
+            fdt_device: Arm64FdtVirtioMmioDevice {
+                region: Arm64FdtRegion {
+                    base: region.range().start().raw_value(),
+                    size: region.range().size(),
+                },
+                interrupt_line,
+            },
+        });
+        session.balloon_interrupt_line = Some(interrupt_line);
+        session.balloon_device_metrics = SharedBalloonDeviceMetrics::default();
+        Ok(session)
+    }
+
     /// Reconstructs one exact-2.8 serial plus MMIO entropy destination.
     #[doc(hidden)]
     pub fn restore_snapshot_v2_serial_entropy_mmio(
@@ -15206,7 +16077,7 @@ impl OwnedHvfArm64BootSession {
             serial_input,
             bundle,
             storage_plan,
-            None,
+            HvfSnapshotV2StorageMmioPublicationInput::empty(),
         )
         .map_err(HvfSnapshotV2EntropyMmioRestoreError::storage_platform)?;
         let (session, storage_configs) = restored.into_parts();
@@ -16373,7 +17244,7 @@ impl OwnedHvfArm64BootSession {
             None,
             bundle,
             plan,
-            None,
+            HvfSnapshotV2StorageMmioPublicationInput::empty(),
         )
     }
 
@@ -16394,7 +17265,7 @@ impl OwnedHvfArm64BootSession {
             serial_input,
             bundle,
             plan,
-            None,
+            HvfSnapshotV2StorageMmioPublicationInput::empty(),
         )
     }
 
@@ -16417,7 +17288,7 @@ impl OwnedHvfArm64BootSession {
             None,
             bundle,
             plan,
-            Some(pmem_index),
+            HvfSnapshotV2StorageMmioPublicationInput::pmem_fault(pmem_index),
         )
     }
 
@@ -16428,8 +17299,13 @@ impl OwnedHvfArm64BootSession {
         serial_input: Option<SerialStdioInput>,
         bundle: PreparedSnapshotV2StorageBundle,
         plan: HvfSnapshotV2StorageMmioPlatformPlan,
-        publication_fault_pmem_index: Option<usize>,
+        publication: HvfSnapshotV2StorageMmioPublicationInput,
     ) -> Result<RestoredHvfSnapshotV2StorageMmioOwners, HvfSnapshotV2StorageMmioRestoreError> {
+        let HvfSnapshotV2StorageMmioPublicationInput {
+            balloon,
+            pmem_fault_index: publication_fault_pmem_index,
+            balloon_fault: balloon_publication_fault,
+        } = publication;
         let mut ranges = Vec::new();
         ranges
             .try_reserve_exact(memory.regions().len())
@@ -16488,8 +17364,13 @@ impl OwnedHvfArm64BootSession {
         } = plan;
         let block_count = planned_block_records.len();
         let pmem_count = planned_pmem_records.len();
-        let record_count = block_count.saturating_add(pmem_count);
-        if publication_fault_pmem_index.is_some_and(|index| index >= pmem_count) {
+        let balloon_count = usize::from(balloon.is_some());
+        let record_count = balloon_count
+            .saturating_add(block_count)
+            .saturating_add(pmem_count);
+        if publication_fault_pmem_index.is_some_and(|index| index >= pmem_count)
+            || (balloon_publication_fault.is_some() && balloon.is_none())
+        {
             return Err(
                 HvfSnapshotV2StorageMmioRestoreError::with_prepared_bundle_abort(
                     HvfSnapshotV2StorageMmioRestoreStage::ResourcePlan,
@@ -16567,13 +17448,60 @@ impl OwnedHvfArm64BootSession {
             );
         }
 
-        let shell_plan = HvfSnapshotV2StorageMmioShellPlan {
-            command_line: &command_line,
-            block_records: &planned_block_records,
-            pmem_records: &planned_pmem_records,
+        let prepared_owner = PreparedHvfSnapshotV2StorageMmioOwners {
+            layout,
+            retained_fdt,
+            bundle: prepared,
+            command_line,
+            planned_block_records,
+            planned_pmem_records,
             serial_interrupt,
             vmgenid_interrupt,
             vmclock_interrupt,
+            block_count,
+            pmem_count,
+            balloon_count,
+            earliest_block_retry_deadline,
+            earliest_pmem_retry_deadline,
+            block_device_metrics,
+            pmem_device_metrics,
+            block_devices,
+            pmem_devices,
+            pmem_mmio_devices,
+            pmem_ranges,
+            block_interrupt_lines,
+            pmem_interrupt_lines,
+            registration_owner: MmioRegistrationOwner::new(),
+            registration_leases,
+            cleanup,
+            balloon,
+            publication_fault_pmem_index,
+            balloon_publication_fault,
+        };
+        Self::publish_snapshot_v2_storage_mmio_owner(
+            state,
+            memory,
+            process_shell,
+            serial_input,
+            prepared_owner,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn publish_snapshot_v2_storage_mmio_owner(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2StorageProcessShell,
+        serial_input: Option<SerialStdioInput>,
+        prepared_owner: PreparedHvfSnapshotV2StorageMmioOwners,
+    ) -> Result<RestoredHvfSnapshotV2StorageMmioOwners, HvfSnapshotV2StorageMmioRestoreError> {
+        let shell_plan = HvfSnapshotV2StorageMmioShellPlan {
+            command_line: &prepared_owner.command_line,
+            block_records: &prepared_owner.planned_block_records,
+            pmem_records: &prepared_owner.planned_pmem_records,
+            serial_interrupt: prepared_owner.serial_interrupt,
+            vmgenid_interrupt: prepared_owner.vmgenid_interrupt,
+            vmclock_interrupt: prepared_owner.vmclock_interrupt,
         };
         let restored = match process_shell {
             HvfSnapshotV2StorageProcessShell::Default(shell) => {
@@ -16596,15 +17524,63 @@ impl OwnedHvfArm64BootSession {
                 shell_plan,
                 interrupt_line,
             ),
+            HvfSnapshotV2StorageProcessShell::RestoredBalloonMmio { shell, interrupts } => {
+                restore_hvf_snapshot_v2_serial_balloon_mmio_process_platform(
+                    state,
+                    memory,
+                    shell,
+                    HvfSnapshotV2BalloonMmioShellPlan {
+                        balloon_interrupt: interrupts.balloon,
+                        command_line: Some(&prepared_owner.command_line),
+                        block_records: &prepared_owner.planned_block_records,
+                        pmem_records: &prepared_owner.planned_pmem_records,
+                        entropy_interrupt: interrupts.entropy,
+                        serial_interrupt: interrupts.serial,
+                        vmgenid_interrupt: interrupts.vmgenid,
+                        vmclock_interrupt: interrupts.vmclock,
+                    },
+                )
+            }
         };
         let mut platform = match restored {
             Ok(platform) => platform,
             Err(source) => {
                 return Err(HvfSnapshotV2StorageMmioRestoreError::platform(
-                    source, prepared,
+                    source,
+                    prepared_owner.bundle,
                 ));
             }
         };
+        let PreparedHvfSnapshotV2StorageMmioOwners {
+            layout,
+            retained_fdt,
+            bundle: prepared,
+            command_line: _,
+            planned_block_records,
+            planned_pmem_records,
+            serial_interrupt: _,
+            vmgenid_interrupt: _,
+            vmclock_interrupt: _,
+            block_count,
+            pmem_count,
+            balloon_count,
+            earliest_block_retry_deadline,
+            earliest_pmem_retry_deadline,
+            block_device_metrics,
+            pmem_device_metrics,
+            mut block_devices,
+            mut pmem_devices,
+            mut pmem_mmio_devices,
+            mut pmem_ranges,
+            mut block_interrupt_lines,
+            mut pmem_interrupt_lines,
+            registration_owner,
+            mut registration_leases,
+            cleanup,
+            balloon,
+            publication_fault_pmem_index,
+            balloon_publication_fault,
+        } = prepared_owner;
         let (_root_key, block_bundle, pmem_configs, pmem_records) = prepared.into_parts();
         let mut drive_configs = DriveConfigs::new();
         let mut block_records = Vec::new();
@@ -16624,13 +17600,84 @@ impl OwnedHvfArm64BootSession {
             async_runtime = runtime;
         }
 
-        let registration_owner = MmioRegistrationOwner::new();
+        let mut balloon_device = None;
+        let mut balloon_interrupt_line = None;
         let install_result = (|| {
+            if let Some(balloon) = balloon {
+                if balloon_publication_fault
+                    == Some(HvfSnapshotV2BalloonMmioRestoreFault::Registration)
+                {
+                    return Err((
+                        HvfSnapshotV2StorageMmioRestoreStage::Registration { index: 0 },
+                        HvfSnapshotV2StorageMmioRestoreFailure::InjectedPublication,
+                    ));
+                }
+                let (_config, _queue_ranges, region, interrupt_line, handler) =
+                    balloon.into_parts();
+                let request = [MmioRegionRequest::new(
+                    region.range().start(),
+                    region.range().size(),
+                )];
+                let lease = {
+                    let mut dispatcher = platform.mmio_dispatcher().lock().map_err(|_| {
+                        (
+                            HvfSnapshotV2StorageMmioRestoreStage::Registration { index: 0 },
+                            HvfSnapshotV2StorageMmioRestoreFailure::DispatcherUnavailable,
+                        )
+                    })?;
+                    dispatcher
+                        .register_owned_handler(&registration_owner, region.id(), &request, handler)
+                        .map_err(|source| {
+                            (
+                                HvfSnapshotV2StorageMmioRestoreStage::Registration { index: 0 },
+                                HvfSnapshotV2StorageMmioRestoreFailure::Registration(source),
+                            )
+                        })?
+                };
+                registration_leases.push(lease);
+                if registration_leases.last().is_none_or(|lease| {
+                    lease.region_id() != region.id() || lease.regions() != [region]
+                }) {
+                    return Err((
+                        HvfSnapshotV2StorageMmioRestoreStage::Registration { index: 0 },
+                        HvfSnapshotV2StorageMmioRestoreFailure::ResourcePlan,
+                    ));
+                }
+                if balloon_publication_fault
+                    == Some(HvfSnapshotV2BalloonMmioRestoreFault::BalloonInsertion)
+                {
+                    return Err((
+                        HvfSnapshotV2StorageMmioRestoreStage::Registration { index: 0 },
+                        HvfSnapshotV2StorageMmioRestoreFailure::InjectedPublication,
+                    ));
+                }
+                balloon_device = Some(Arm64BootBalloonDevice {
+                    registration: BalloonMmioDeviceRegistration::from_restored(region),
+                    fdt_device: Arm64FdtVirtioMmioDevice {
+                        region: Arm64FdtRegion {
+                            base: region.range().start().raw_value(),
+                            size: region.range().size(),
+                        },
+                        interrupt_line,
+                    },
+                });
+                balloon_interrupt_line = Some(interrupt_line);
+                if balloon_publication_fault
+                    == Some(HvfSnapshotV2BalloonMmioRestoreFault::StoragePublication)
+                {
+                    return Err((
+                        HvfSnapshotV2StorageMmioRestoreStage::Registration { index: 1 },
+                        HvfSnapshotV2StorageMmioRestoreFailure::InjectedPublication,
+                    ));
+                }
+            }
+
             for (index, (record, planned)) in block_records
                 .into_iter()
                 .zip(planned_block_records)
                 .enumerate()
             {
+                let registration_index = balloon_count.saturating_add(index);
                 let (
                     _key,
                     drive_id,
@@ -16649,7 +17696,9 @@ impl OwnedHvfArm64BootSession {
                 let lease = {
                     let mut dispatcher = platform.mmio_dispatcher().lock().map_err(|_| {
                         (
-                            HvfSnapshotV2StorageMmioRestoreStage::Registration { index },
+                            HvfSnapshotV2StorageMmioRestoreStage::Registration {
+                                index: registration_index,
+                            },
                             HvfSnapshotV2StorageMmioRestoreFailure::DispatcherUnavailable,
                         )
                     })?;
@@ -16657,7 +17706,9 @@ impl OwnedHvfArm64BootSession {
                         .register_owned_handler(&registration_owner, region.id(), &request, handler)
                         .map_err(|source| {
                             (
-                                HvfSnapshotV2StorageMmioRestoreStage::Registration { index },
+                                HvfSnapshotV2StorageMmioRestoreStage::Registration {
+                                    index: registration_index,
+                                },
                                 HvfSnapshotV2StorageMmioRestoreFailure::Registration(source),
                             )
                         })?
@@ -16667,7 +17718,9 @@ impl OwnedHvfArm64BootSession {
                     lease.region_id() != region.id() || lease.regions() != [region]
                 }) {
                     return Err((
-                        HvfSnapshotV2StorageMmioRestoreStage::Registration { index },
+                        HvfSnapshotV2StorageMmioRestoreStage::Registration {
+                            index: registration_index,
+                        },
                         HvfSnapshotV2StorageMmioRestoreFailure::ResourcePlan,
                     ));
                 }
@@ -16685,7 +17738,9 @@ impl OwnedHvfArm64BootSession {
                 .zip(planned_pmem_records)
                 .enumerate()
             {
-                let registration_index = block_count.saturating_add(pmem_index);
+                let registration_index = balloon_count
+                    .saturating_add(block_count)
+                    .saturating_add(pmem_index);
                 let (
                     _key,
                     _is_root_device,
@@ -16901,7 +17956,7 @@ impl OwnedHvfArm64BootSession {
             pci_network_devices: Vec::new(),
             vsock_device: None,
             pci_vsock_device: None,
-            balloon_device: None,
+            balloon_device,
             pci_balloon_device: None,
             memory_hotplug_device: None,
             pci_memory_hotplug_device: None,
@@ -16954,7 +18009,7 @@ impl OwnedHvfArm64BootSession {
             pmem_interrupt_lines,
             network_interrupt_lines: Vec::new(),
             vsock_interrupt_line: None,
-            balloon_interrupt_line: None,
+            balloon_interrupt_line,
             entropy_interrupt_line: None,
             memory_hotplug_interrupt_line: None,
             serial_interrupt_line,
@@ -17231,7 +18286,8 @@ impl OwnedHvfArm64BootSession {
                     state, memory, shell, shell_plan,
                 )
             }
-            HvfSnapshotV2StorageProcessShell::RestoredEntropyMmio { .. } => {
+            HvfSnapshotV2StorageProcessShell::RestoredEntropyMmio { .. }
+            | HvfSnapshotV2StorageProcessShell::RestoredBalloonMmio { .. } => {
                 return Err(
                     HvfSnapshotV2StoragePciRestoreError::with_prepared_bundle_abort(
                         HvfSnapshotV2StoragePciRestoreStage::ResourcePlan,
@@ -19417,6 +20473,7 @@ impl OwnedHvfArm64BootSession {
     fn teardown_restored_snapshot_v2_mmio(
         &mut self,
     ) -> Result<(), HvfSnapshotV2StorageMmioRestoreCleanupFailure> {
+        let had_balloon = self.runtime_resources.balloon_device.is_some();
         let had_entropy = self.runtime_resources.entropy_device.is_some();
         let Some(registrations) = self.restored_snapshot_v2_mmio_registrations.as_mut() else {
             return Ok(());
@@ -19456,12 +20513,17 @@ impl OwnedHvfArm64BootSession {
         self.runtime_resources.block_devices.clear();
         self.runtime_resources.pmem_mmio_devices.clear();
         self.runtime_resources.pmem_devices.clear();
+        self.runtime_resources.balloon_device = None;
+        self.balloon_interrupt_line = None;
         self.runtime_resources.entropy_device = None;
         self.entropy_interrupt_line = None;
         self.entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         self.entropy_source = VirtioRngOsEntropySource::new();
         if had_entropy {
             self.entropy_device_metrics = SharedEntropyDeviceMetrics::default();
+        }
+        if had_balloon {
+            self.balloon_device_metrics = SharedBalloonDeviceMetrics::default();
         }
         self.restored_snapshot_v2_mmio_registrations = None;
         Ok(())
@@ -39324,6 +40386,45 @@ mod tests {
         assert!(debug.contains("cleanup_failed"));
         assert!(!debug.contains("secret-cleanup"));
         assert!(!incomplete.to_string().contains("secret-cleanup"));
+    }
+
+    #[test]
+    fn native_v2_balloon_mmio_errors_distinguish_commit_and_redact_cleanup() {
+        let retryable = super::HvfSnapshotV2BalloonMmioRestoreError::preflight(
+            super::HvfSnapshotV2BalloonMmioRestoreStage::Product,
+            super::HvfSnapshotV2BalloonMmioRestoreFailure::Product,
+        );
+        assert!(!retryable.is_terminal());
+        assert!(!retryable.has_incomplete_cleanup());
+
+        let committed = super::HvfSnapshotV2BalloonMmioRestoreError::serial_platform(
+            super::HvfSnapshotV2SerialOnlyRestoreError::PciOwner {
+                source: super::HvfArm64BootPciDataError::new("secret-balloon-owner/path"),
+                cleanup: None,
+            },
+        );
+        assert!(committed.is_terminal());
+        assert!(!committed.has_incomplete_cleanup());
+
+        let incomplete = super::HvfSnapshotV2BalloonMmioRestoreError::serial_platform(
+            super::HvfSnapshotV2SerialOnlyRestoreError::RetryScheduler {
+                scheduler: "balloon-retry",
+                source: io::ErrorKind::PermissionDenied,
+                cleanup: Some(Box::new(
+                    super::HvfArm64BootSessionShutdownError::DestroyVm {
+                        source: super::BackendError::Hypervisor(
+                            "secret-balloon-cleanup/path".to_string(),
+                        ),
+                    },
+                )),
+            },
+        );
+        assert!(incomplete.is_terminal());
+        assert!(incomplete.has_incomplete_cleanup());
+        let diagnostics = format!("{incomplete:?} {incomplete}");
+        assert!(diagnostics.contains("<redacted>"));
+        assert!(diagnostics.contains("cleanup_failed"));
+        assert!(!diagnostics.contains("secret-balloon"));
     }
 
     #[test]
