@@ -35,6 +35,7 @@ pub mod rtc;
 pub mod serial;
 pub mod snapshot;
 pub mod snapshot_artifact;
+pub mod snapshot_balloon_v2_9;
 pub mod snapshot_commit;
 pub mod snapshot_device;
 pub mod snapshot_device_v2;

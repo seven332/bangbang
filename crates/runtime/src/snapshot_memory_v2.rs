@@ -18,7 +18,7 @@ use crate::memory::{
     GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError, GuestMemoryBacking,
     GuestMemoryRange, aarch64,
 };
-use crate::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
+use crate::snapshot_balloon_v2_9::NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_format::SnapshotFormatVersion;
 use crate::snapshot_format_v2::{
     NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2Component,
@@ -1286,8 +1286,8 @@ fn decode_binding(bytes: &[u8]) -> Result<SnapshotV2MemoryBinding, SnapshotV2Mem
 fn validate_memory_version(
     version: SnapshotFormatVersion,
 ) -> Result<(), SnapshotV2MemoryBindingError> {
-    if version.major() == NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION.major()
-        && (1..=NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION.minor()).contains(&version.minor())
+    if version.major() == NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION.major()
+        && (1..=NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION.minor()).contains(&version.minor())
     {
         Ok(())
     } else {
