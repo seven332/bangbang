@@ -2310,7 +2310,7 @@ mod tests {
     };
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactState,
-        NativeSnapshotPublicationOutcome, NativeV2SerialSnapshotCandidateState,
+        NativeSnapshotPublicationOutcome, NativeV2EntropySnapshotCandidateState,
         SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_native_snapshot_artifacts_with,
         publish_snapshot_artifacts_with,
     };
@@ -2319,6 +2319,7 @@ mod tests {
     use bangbang_runtime::snapshot_device_v2_6::{
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
     };
+    use bangbang_runtime::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
     use bangbang_runtime::snapshot_format_v2::{
         NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY,
         NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
@@ -2341,7 +2342,7 @@ mod tests {
         NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
         NativeV2SnapshotCaptureError, NativeV2SnapshotLoadError, NativeV2SnapshotPublicationError,
         NativeV2SnapshotPublicationProducerError, NativeV2SnapshotPublicationRequest,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessSnapshotV2EntropyLoadRequest,
         ProcessSnapshotV2MultiBlockLoadRequest, ProcessSnapshotV2MultiBlockLoadSuccess,
         ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
         ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2SerialLoadRequest,
@@ -2879,6 +2880,7 @@ mod tests {
             let NativeV2SnapshotPublicationRequest {
                 input: _,
                 serial_config,
+                entropy_config: _,
                 storage_configs: _,
                 expected_transport,
                 cancellation,
@@ -3262,6 +3264,107 @@ mod tests {
                 commit,
             ))
         }
+
+        fn load_prepared_snapshot_v2_entropy(
+            &mut self,
+            request: ProcessSnapshotV2EntropyLoadRequest<'_>,
+        ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+            let ProcessSnapshotV2EntropyLoadRequest {
+                controller: _,
+                vmnet_authority: _,
+                #[cfg(target_os = "macos")]
+                    contained_restore_authority: _,
+                pci_enabled: _,
+                input,
+                candidate,
+                memory: _,
+                cancellation,
+            } = request;
+            if !self.snapshot_operations_succeed {
+                return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                    BackendError::InvalidState("test snapshot load failed"),
+                ));
+            }
+            let boot_source = BootSourceConfigInput::new("/private/fake-api-restored-vmlinux")
+                .validate()
+                .map_err(|_| {
+                    NativeV2SnapshotLoadError::ProcessPreparation(BackendError::InvalidState(
+                        "fake snapshot boot configuration failed",
+                    ))
+                })?;
+            let drives = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::block_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = DriveConfigInput::new(
+                        config.drive_id(),
+                        config.drive_id(),
+                        config.selector(),
+                        config.is_root(),
+                    )
+                    .with_is_read_only(config.is_read_only())
+                    .with_cache_type(config.cache_type())
+                    .with_io_engine(config.io_engine());
+                    if let Some(partuuid) = config.partuuid() {
+                        input = input.with_partuuid(partuuid);
+                    }
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    input.validate()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let pmem = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::pmem_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = PmemConfigInput::new(config.pmem_id(), config.selector())
+                        .with_root_device(config.is_root())
+                        .with_read_only(config.is_read_only());
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    PmemConfig::try_from(input)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let storage_configs = candidate
+                .device_graph()
+                .map(|_| CaptureReadyStorageConfigs::new(drives, pmem));
+            let mut serial_input = SerialConfigInput::new();
+            if let Some(selector) = candidate.serial().endpoint_intent().configured_selector() {
+                serial_input = serial_input.with_serial_out_path(selector);
+            }
+            if let Some(rate_limiter) = candidate.serial().rate_limiter() {
+                serial_input = serial_input.with_rate_limiter(rate_limiter);
+            }
+            let serial_config = serial_input
+                .validate()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let entropy_config = candidate.entropy().map(|state| state.config());
+            if !cancellation.try_seal_commit() {
+                return Err(NativeV2SnapshotLoadError::Cancelled);
+            }
+            let machine =
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages());
+            let commit = SnapshotV2ControllerCommit::with_serial_storage_and_entropy_configs(
+                machine,
+                boot_source,
+                storage_configs,
+                serial_config,
+                entropy_config,
+                input.resume_vm(),
+            );
+            Ok(SnapshotV2LoadSuccess::new(
+                TestSession::without_boot_run_loop_status(),
+                commit,
+            ))
+        }
     }
 
     fn test_controller() -> ProcessVmm<TestInstanceStarter> {
@@ -3396,12 +3499,12 @@ mod tests {
             ),
         ];
         let encoded = encode_snapshot_v2_state_with_compatibility_version(
-            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+            NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
             &[],
             &components,
         )
         .expect("native-v2 fixture state should encode");
-        NativeV2SerialSnapshotCandidateState::from_serial_state_v2_7(encoded)
+        NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(encoded)
             .expect("native-v2 fixture candidate should close")
             .into_current_artifact_state()
     }

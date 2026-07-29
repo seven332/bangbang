@@ -205,7 +205,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn internal_catalog_adds_entropy_at_eight_without_advancing_writer() {
+fn current_writer_and_internal_catalog_close_at_entropy_minor_eight() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -214,7 +214,7 @@ fn internal_catalog_adds_entropy_at_eight_without_advancing_writer() {
     );
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
-        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
     );
     assert_eq!(
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
@@ -236,7 +236,7 @@ fn internal_catalog_adds_entropy_at_eight_without_advancing_writer() {
         NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
         SnapshotFormatVersion::new(2, 8, 0)
     );
-    assert_ne!(
+    assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
         NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
     );
@@ -370,7 +370,7 @@ fn internal_catalog_adds_entropy_at_eight_without_advancing_writer() {
         Some(serial)
     );
     let public_serial =
-        decode_snapshot_v2_state(&serial_state).expect("current public seam should decode 2.7");
+        decode_snapshot_v2_state(&serial_state).expect("retained public reader should decode 2.7");
     assert_eq!(
         public_serial.metadata().version(),
         NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
@@ -413,14 +413,16 @@ fn internal_catalog_adds_entropy_at_eight_without_advancing_writer() {
         decoded_entropy.component(NATIVE_V2_ENTROPY_COMPONENT_KEY),
         Some(entropy)
     );
+    let public_entropy =
+        decode_snapshot_v2_state(&entropy_state).expect("current public seam should decode 2.8");
+    assert_eq!(
+        public_entropy.metadata().version(),
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
+    );
     assert!(matches!(
-        decode_snapshot_v2_state(&entropy_state),
-        Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
-            supported: NATIVE_V2_SNAPSHOT_VERSION,
-        })
+        decode_native_snapshot_state(&entropy_state),
+        Ok(NativeSnapshotState::V2(_))
     ));
-    assert!(decode_native_snapshot_state(&entropy_state).is_err());
     let downgraded_entropy = with_u16_field_and_checksum(&entropy_state, VERSION_MINOR_OFFSET, 7);
     assert_eq!(
         decode_snapshot_v2_state_with_compatibility_version(
@@ -503,11 +505,11 @@ fn version_policy_rejects_major_and_newer_minor_but_accepts_patch() {
         })
     );
 
-    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 8);
+    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 9);
     assert_eq!(
         decode_snapshot_v2_state(&minor),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: SnapshotFormatVersion::new(2, 8, 0),
+            found: SnapshotFormatVersion::new(2, 9, 0),
             supported: NATIVE_V2_SNAPSHOT_VERSION,
         })
     );

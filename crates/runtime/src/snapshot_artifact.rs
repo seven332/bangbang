@@ -203,8 +203,8 @@ impl NativeSnapshotArtifactState {
 
     /// Validates exact current-version native-v2 bytes for publication.
     pub fn from_current_v2(bytes: Vec<u8>) -> Result<Self, NativeSnapshotArtifactStateError> {
-        NativeV2SerialSnapshotCandidateState::from_serial_state_v2_7(bytes)
-            .map(NativeV2SerialSnapshotCandidateState::into_current_artifact_state)
+        NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(bytes)
+            .map(NativeV2EntropySnapshotCandidateState::into_current_artifact_state)
             .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)
     }
 
@@ -336,7 +336,7 @@ impl NativeSnapshotArtifactState {
         };
         if *version == NATIVE_V2_SNAPSHOT_VERSION && binding.version() == NATIVE_V2_SNAPSHOT_VERSION
         {
-            let (actual_binding, _, _) = decode_serial_state_v2_7(bytes)
+            let (actual_binding, _, _, _) = decode_entropy_state_v2_8(bytes)
                 .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
             if &actual_binding == binding {
                 Ok(())
@@ -594,7 +594,7 @@ impl fmt::Debug for NativeV2StorageSnapshotCandidateState {
 /// The required serial singleton and optional unchanged profile-3 storage
 /// graph are derived from the same immutable bytes as the retained memory
 /// commitment. This is the only native-v2 candidate that can enter the
-/// current publication authority.
+/// retained exact-2.7 compatibility authority.
 pub struct NativeV2SerialSnapshotCandidateState {
     bytes: Vec<u8>,
     binding: SnapshotV2MemoryBinding,
@@ -616,7 +616,7 @@ impl NativeV2SerialSnapshotCandidateState {
         })
     }
 
-    /// Returns the exact current compatibility version.
+    /// Returns the exact retained compatibility version.
     pub const fn version(&self) -> SnapshotFormatVersion {
         NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
     }
@@ -653,8 +653,8 @@ impl NativeV2SerialSnapshotCandidateState {
         (self.bytes, self.binding, self.device_graph, self.serial)
     }
 
-    /// Consumes this exact current candidate into artifact authority.
-    pub fn into_current_artifact_state(self) -> NativeSnapshotArtifactState {
+    /// Consumes this exact 2.7 candidate into compatible artifact authority.
+    pub fn into_compatible_artifact_state(self) -> NativeSnapshotArtifactState {
         let (bytes, binding, _, _) = self.into_parts();
         NativeSnapshotArtifactState {
             inner: NativeSnapshotArtifactStateInner::V2 {
@@ -683,8 +683,8 @@ impl fmt::Debug for NativeV2SerialSnapshotCandidateState {
 ///
 /// The required unchanged serial singleton, optional unchanged profile-3
 /// storage graph, optional entropy singleton, and memory binding are all
-/// derived from the same immutable bytes. This compatible value does not
-/// grant current-public publication authority.
+/// derived from the same immutable bytes. This is the only native-v2
+/// candidate that can enter current-public publication authority.
 pub struct NativeV2EntropySnapshotCandidateState {
     bytes: Vec<u8>,
     binding: SnapshotV2MemoryBinding,
@@ -708,7 +708,7 @@ impl NativeV2EntropySnapshotCandidateState {
         })
     }
 
-    /// Returns the exact candidate compatibility version.
+    /// Returns the exact current compatibility version.
     pub const fn version(&self) -> SnapshotFormatVersion {
         NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
     }
@@ -757,10 +757,8 @@ impl NativeV2EntropySnapshotCandidateState {
         )
     }
 
-    /// Consumes this exact 2.8 candidate into compatible artifact state.
-    ///
-    /// Publication still rechecks the exact current 2.7 authority.
-    pub fn into_compatible_artifact_state(self) -> NativeSnapshotArtifactState {
+    /// Consumes this exact current candidate into artifact authority.
+    pub fn into_current_artifact_state(self) -> NativeSnapshotArtifactState {
         let (bytes, binding, _, _, _) = self.into_parts();
         NativeSnapshotArtifactState {
             inner: NativeSnapshotArtifactStateInner::V2 {
@@ -2237,11 +2235,11 @@ impl LoadedNativeSnapshotArtifacts {
         Ok((candidate, memory))
     }
 
-    /// Consumes one exact current 2.7 pair into the serial load handoff.
+    /// Consumes one exact retained 2.7 pair into the serial load handoff.
     ///
     /// The state bytes are neither reopened nor re-encoded, and the already
     /// loaded guest memory remains bound to the candidate derived from them.
-    pub fn into_current_v2_candidate(
+    pub fn into_v2_7_candidate(
         self,
     ) -> Result<(NativeV2SerialSnapshotCandidateState, GuestMemory), NativeSnapshotArtifactStateError>
     {
@@ -2254,6 +2252,30 @@ impl LoadedNativeSnapshotArtifacts {
             }
         })?;
         let candidate = NativeV2SerialSnapshotCandidateState::from_serial_state_v2_7(bytes)
+            .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
+        debug_assert_eq!(candidate.memory_binding(), &binding);
+        Ok((candidate, memory))
+    }
+
+    /// Consumes one exact current 2.8 pair into the entropy load handoff.
+    ///
+    /// The state bytes are neither reopened nor re-encoded, and the already
+    /// loaded guest memory remains bound to the candidate derived from them.
+    pub fn into_current_v2_candidate(
+        self,
+    ) -> Result<
+        (NativeV2EntropySnapshotCandidateState, GuestMemory),
+        NativeSnapshotArtifactStateError,
+    > {
+        let actual = self.family();
+        let (state, memory) = self.into_parts();
+        let (bytes, binding) = state.into_v2_parts().map_err(|_| {
+            NativeSnapshotArtifactStateError::UnexpectedFamily {
+                expected: NativeSnapshotArtifactFamily::V2,
+                actual,
+            }
+        })?;
+        let candidate = NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(bytes)
             .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
         debug_assert_eq!(candidate.memory_binding(), &binding);
         Ok((candidate, memory))
