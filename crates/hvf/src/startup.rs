@@ -102,6 +102,10 @@ use bangbang_runtime::serial::{
     CaptureReadySerialState, SERIAL_RECEIVE_FIFO_CAPACITY, SerialConfig, SerialStdioInput,
     SharedSerialOutput, SharedSerialOutputBuffer,
 };
+use bangbang_runtime::snapshot_balloon_v2_9::{
+    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, SnapshotV2BalloonState,
+    SnapshotV2BalloonStateCaptureError,
+};
 use bangbang_runtime::snapshot_device::{
     SnapshotV1BlockRetryState, SnapshotV1DeviceState, SnapshotV1PlatformDeviceMetadata,
 };
@@ -6598,6 +6602,31 @@ impl HvfArm64BootBalloonCaptureState {
     pub const fn transport(&self) -> &HvfArm64BootBalloonTransportState {
         &self.transport
     }
+
+    /// Converts the detached capture into canonical exact-2.9 balloon state.
+    pub fn try_to_snapshot_v2(
+        &self,
+    ) -> Result<SnapshotV2BalloonState, SnapshotV2BalloonStateCaptureError> {
+        match &self.transport {
+            HvfArm64BootBalloonTransportState::Mmio {
+                region,
+                interrupt_line,
+                state,
+            } => SnapshotV2BalloonState::try_from_mmio_capture(
+                self.config,
+                *region,
+                *interrupt_line,
+                state,
+            ),
+            HvfArm64BootBalloonTransportState::Pci {
+                sbdf,
+                bar_range,
+                state,
+            } => {
+                SnapshotV2BalloonState::try_from_pci_capture(self.config, *sbdf, *bar_range, state)
+            }
+        }
+    }
 }
 
 impl fmt::Debug for HvfArm64BootBalloonCaptureState {
@@ -10396,7 +10425,8 @@ fn hvf_arm64_boot_snapshot_v2_platform_profile(
         | NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
         | NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
         | NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
-        | NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION => {
+        | NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
+        | NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION => {
             Some(HvfArm64BootSnapshotV2PlatformProfile::ProductProcess)
         }
         _ => None,
@@ -11900,6 +11930,33 @@ impl HvfArm64BootSession<'_> {
             input,
             memory_writer,
             NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+            is_cancelled,
+        )
+    }
+
+    /// Captures the unpublished exact native-v2 2.9 balloon platform.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_balloon_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel(
+            input,
+            memory_writer,
+            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
             is_cancelled,
         )
     }
@@ -19829,6 +19886,33 @@ impl OwnedHvfArm64BootSession {
             input,
             memory_writer,
             NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+            is_cancelled,
+        )
+    }
+
+    /// Captures the unpublished exact native-v2 2.9 balloon platform.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_balloon_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: &self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel(
+            input,
+            memory_writer,
+            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
             is_cancelled,
         )
     }
@@ -39580,10 +39664,11 @@ mod tests {
     }
 
     #[test]
-    fn native_v2_platform_capture_classifies_exact_entropy_profile_as_product_process() {
+    fn native_v2_platform_capture_classifies_all_product_profiles() {
         use super::{
             HvfArm64BootSnapshotV2PlatformProfile, hvf_arm64_boot_snapshot_v2_platform_profile,
         };
+        use bangbang_runtime::snapshot_balloon_v2_9::NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
@@ -39602,6 +39687,7 @@ mod tests {
             NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
             NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
             NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
         ] {
             assert_eq!(
                 hvf_arm64_boot_snapshot_v2_platform_profile(version),

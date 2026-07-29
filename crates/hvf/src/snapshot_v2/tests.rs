@@ -3,10 +3,15 @@ use std::io::Cursor;
 use bangbang_runtime::machine::MachineConfigInput;
 use bangbang_runtime::memory::{GuestMemory, aarch64};
 use bangbang_runtime::pci::{PCI_BAR64_START, PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE};
+use bangbang_runtime::snapshot_balloon_v2_9::{
+    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, NATIVE_V2_BALLOON_STATE_HEADER_BYTES,
+    NATIVE_V2_BALLOON_STATE_SECTION_ENTRY_BYTES,
+};
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
 use bangbang_runtime::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_MAX_BYTES;
 use bangbang_runtime::snapshot_device_v2_6::{
-    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
+    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    NATIVE_V2_STORAGE_DEVICE_GRAPH_SECTION_ENTRY_BYTES, SnapshotV2StorageDeviceGraph,
 };
 use bangbang_runtime::snapshot_entropy_v2_8::{
     NATIVE_V2_ENTROPY_STATE_HEADER_BYTES, NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES,
@@ -52,11 +57,16 @@ const ENTROPY_INACTIVE_MMIO_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_entropy_v2_8/fixtures/inactive-mmio.hex");
 const ENTROPY_ACTIVE_PCI_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_entropy_v2_8/fixtures/active-pci.hex");
+const BALLOON_INACTIVE_MMIO_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_balloon_v2_9/fixtures/inactive-mmio.hex");
+const BALLOON_ACTIVE_PCI_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_balloon_v2_9/fixtures/active-pci.hex");
 const DETERMINISTIC_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.4-fixture-id!";
 const DETERMINISTIC_MULTI_BLOCK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.5-fixture-id!";
 const DETERMINISTIC_STORAGE_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.6-fixture-id!";
 const DETERMINISTIC_SERIAL_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.7-fixture-id!";
 const DETERMINISTIC_ENTROPY_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.8-fixture-id!";
+const DETERMINISTIC_BALLOON_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.9-fixture-id!";
 const COMPLETE_STATE_FINGERPRINTS: [(usize, u64); 2] = [
     (4_887, 10_136_861_786_457_474_800),
     (4_983, 7_169_128_621_506_763_529),
@@ -322,7 +332,7 @@ fn encoded_fixture(with_sme: bool) -> Vec<u8> {
 }
 
 pub(crate) fn fixture_bytes(hex: &str) -> Vec<u8> {
-    let hex = hex.trim();
+    let hex = hex.split_ascii_whitespace().collect::<String>();
     assert!(hex.len().is_multiple_of(2));
     hex.as_bytes()
         .chunks_exact(2)
@@ -365,6 +375,13 @@ fn deterministic_minor_eight_platform_fixture() -> HvfSnapshotV2PlatformState {
     deterministic_device_graph_platform_fixture(
         NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
         DETERMINISTIC_ENTROPY_MEMORY_IMAGE_ID,
+    )
+}
+
+fn deterministic_minor_nine_platform_fixture() -> HvfSnapshotV2PlatformState {
+    deterministic_device_graph_platform_fixture(
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        DETERMINISTIC_BALLOON_MEMORY_IMAGE_ID,
     )
 }
 
@@ -504,8 +521,16 @@ fn relocate_entropy_pci_fixture(bytes: &mut [u8]) {
             .expect("transport directory offset should fit"),
     ))
     .expect("transport directory offset should fit usize");
-    bytes[transport_offset + 11] = PCI_LAST_ENDPOINT_DEVICE;
-    let endpoint_index = u64::from(PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE);
+    bytes_set_pci_endpoint(bytes, transport_offset, PCI_LAST_ENDPOINT_DEVICE);
+}
+
+fn bytes_set_pci_endpoint(bytes: &mut [u8], transport_offset: usize, device: u8) {
+    bytes[transport_offset + 11] = device;
+    let endpoint_index = u64::from(
+        device
+            .checked_sub(PCI_FIRST_ENDPOINT_DEVICE)
+            .expect("fixture endpoint should be in the endpoint range"),
+    );
     let bar_start = PCI_BAR64_START
         .checked_add(
             endpoint_index
@@ -514,6 +539,189 @@ fn relocate_entropy_pci_fixture(bytes: &mut [u8]) {
         )
         .expect("fixture BAR address should fit");
     bytes[transport_offset + 16..transport_offset + 24].copy_from_slice(&bar_start.to_le_bytes());
+}
+
+const PRODUCT_STORAGE_QUEUE_BASE: u64 = 0x8004_0000;
+const PRODUCT_ENTROPY_QUEUE_BASE: u64 = 0x8006_0000;
+const PRODUCT_BALLOON_QUEUE_BASE: u64 = 0x8008_0000;
+const PRODUCT_QUEUE_STRIDE: u64 = 0x1_0000;
+const PRODUCT_DRIVER_RING_OFFSET: u64 = 0x2000;
+const PRODUCT_DEVICE_RING_OFFSET: u64 = 0x4000;
+
+fn read_wire_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(
+        bytes[offset..offset + 2]
+            .try_into()
+            .expect("wire u16 should fit"),
+    )
+}
+
+fn read_wire_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("wire u64 should fit"),
+    )
+}
+
+fn write_wire_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn component_section_offset(bytes: &[u8], entry_offset: usize) -> usize {
+    usize::try_from(read_wire_u64(bytes, entry_offset + 8))
+        .expect("component section offset should fit usize")
+}
+
+fn storage_section_offset(bytes: &[u8], entry_offset: usize) -> usize {
+    usize::try_from(read_wire_u64(bytes, entry_offset + 16))
+        .expect("storage section offset should fit usize")
+}
+
+fn relocate_common_queues(bytes: &mut [u8], common_offset: usize, base: u64) {
+    let queue_count = usize::from(read_wire_u16(bytes, common_offset + 26));
+    for index in 0..queue_count {
+        let queue_offset = common_offset + 32 + index * 32;
+        if read_wire_u16(bytes, queue_offset + 2) == 0 {
+            continue;
+        }
+        let queue_base = base
+            .checked_add(
+                u64::try_from(index)
+                    .expect("queue index should fit")
+                    .checked_mul(PRODUCT_QUEUE_STRIDE)
+                    .expect("queue stride should fit"),
+            )
+            .expect("queue base should fit");
+        write_wire_u64(bytes, queue_offset + 8, queue_base);
+        write_wire_u64(
+            bytes,
+            queue_offset + 16,
+            queue_base + PRODUCT_DRIVER_RING_OFFSET,
+        );
+        write_wire_u64(
+            bytes,
+            queue_offset + 24,
+            queue_base + PRODUCT_DEVICE_RING_OFFSET,
+        );
+    }
+}
+
+fn relocate_storage_product_fixture(bytes: &mut [u8], relocate_pci: bool) {
+    let record_count = usize::from(read_wire_u16(bytes, 14));
+    let section_directory = usize::try_from(read_wire_u64(bytes, 48))
+        .expect("storage section directory should fit usize");
+    for record_index in 0..record_count {
+        let common_entry = section_directory
+            + (record_index * 4 + 2) * NATIVE_V2_STORAGE_DEVICE_GRAPH_SECTION_ENTRY_BYTES;
+        let common_offset = storage_section_offset(bytes, common_entry);
+        relocate_common_queues(
+            bytes,
+            common_offset,
+            PRODUCT_STORAGE_QUEUE_BASE
+                + u64::try_from(record_index).expect("record index should fit")
+                    * PRODUCT_QUEUE_STRIDE,
+        );
+
+        if relocate_pci {
+            let transport_entry = section_directory
+                + (record_index * 4 + 3) * NATIVE_V2_STORAGE_DEVICE_GRAPH_SECTION_ENTRY_BYTES;
+            let transport_offset = storage_section_offset(bytes, transport_entry);
+            bytes[transport_offset + 11] = bytes[transport_offset + 11]
+                .checked_add(1)
+                .expect("shifted storage endpoint should fit");
+            let bar_start = read_wire_u64(bytes, transport_offset + 16)
+                .checked_add(VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+                .expect("shifted storage BAR should fit");
+            write_wire_u64(bytes, transport_offset + 16, bar_start);
+        }
+    }
+}
+
+fn relocate_entropy_product_fixture(bytes: &mut [u8], transport: SnapshotV2DeviceTransportKind) {
+    let common_entry =
+        NATIVE_V2_ENTROPY_STATE_HEADER_BYTES + NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES;
+    let common_offset = component_section_offset(bytes, common_entry);
+    relocate_common_queues(bytes, common_offset, PRODUCT_ENTROPY_QUEUE_BASE);
+
+    let transport_entry =
+        NATIVE_V2_ENTROPY_STATE_HEADER_BYTES + 2 * NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES;
+    let transport_offset = component_section_offset(bytes, transport_entry);
+    match transport {
+        SnapshotV2DeviceTransportKind::Mmio => {
+            bytes[transport_offset + 12..transport_offset + 16]
+                .copy_from_slice(&41_u32.to_le_bytes());
+            write_wire_u64(bytes, transport_offset + 16, 101);
+            write_wire_u64(bytes, transport_offset + 24, 0xd001_0000);
+        }
+        SnapshotV2DeviceTransportKind::Pci => relocate_entropy_pci_fixture(bytes),
+    }
+}
+
+fn relocate_balloon_product_fixture(bytes: &mut [u8]) {
+    let common_entry =
+        NATIVE_V2_BALLOON_STATE_HEADER_BYTES + NATIVE_V2_BALLOON_STATE_SECTION_ENTRY_BYTES;
+    let common_offset = component_section_offset(bytes, common_entry);
+    relocate_common_queues(bytes, common_offset, PRODUCT_BALLOON_QUEUE_BASE);
+}
+
+fn product_storage_fixture(
+    transport: SnapshotV2DeviceTransportKind,
+) -> SnapshotV2StorageDeviceGraph {
+    let mut bytes = fixture_bytes(match transport {
+        SnapshotV2DeviceTransportKind::Mmio => STORAGE_MMIO_GRAPH_FIXTURE_HEX,
+        SnapshotV2DeviceTransportKind::Pci => STORAGE_PCI_GRAPH_FIXTURE_HEX,
+    });
+    relocate_storage_product_fixture(&mut bytes, transport == SnapshotV2DeviceTransportKind::Pci);
+    SnapshotV2StorageDeviceGraph::decode(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &bytes,
+    )
+    .expect("relocated storage fixture should decode")
+}
+
+fn product_entropy_fixture(transport: SnapshotV2DeviceTransportKind) -> SnapshotV2EntropyState {
+    let mut bytes = fixture_bytes(match transport {
+        SnapshotV2DeviceTransportKind::Mmio => ENTROPY_INACTIVE_MMIO_FIXTURE_HEX,
+        SnapshotV2DeviceTransportKind::Pci => ENTROPY_ACTIVE_PCI_FIXTURE_HEX,
+    });
+    relocate_entropy_product_fixture(&mut bytes, transport);
+    SnapshotV2EntropyState::decode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, &bytes)
+        .expect("relocated entropy fixture should decode")
+}
+
+fn product_balloon_fixture(transport: SnapshotV2DeviceTransportKind) -> SnapshotV2BalloonState {
+    let mut bytes = fixture_bytes(match transport {
+        SnapshotV2DeviceTransportKind::Mmio => BALLOON_INACTIVE_MMIO_FIXTURE_HEX,
+        SnapshotV2DeviceTransportKind::Pci => BALLOON_ACTIVE_PCI_FIXTURE_HEX,
+    });
+    relocate_balloon_product_fixture(&mut bytes);
+    SnapshotV2BalloonState::decode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, &bytes)
+        .expect("relocated balloon fixture should decode")
+}
+
+fn product_serial_fixture() -> SnapshotV2SerialState {
+    SnapshotV2SerialState::decode(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        &fixture_bytes(SERIAL_CONFIGURED_FIXTURE_HEX),
+    )
+    .expect("serial fixture should decode")
+}
+
+fn complete_balloon_state_fixture(
+    transport: SnapshotV2DeviceTransportKind,
+    has_storage: bool,
+    has_entropy: bool,
+    has_balloon: bool,
+) -> HvfSnapshotV2BalloonState {
+    HvfSnapshotV2BalloonState::try_new(
+        deterministic_minor_nine_platform_fixture(),
+        has_storage.then(|| product_storage_fixture(transport)),
+        product_serial_fixture(),
+        has_entropy.then(|| product_entropy_fixture(transport)),
+        has_balloon.then(|| product_balloon_fixture(transport)),
+    )
+    .expect("complete minor-nine fixture should validate")
 }
 
 fn decode_platform(bytes: &[u8]) -> Result<HvfSnapshotV2PlatformState, HvfSnapshotV2DecodeError> {
@@ -1391,6 +1599,308 @@ fn internal_exact_minor_eight_entropy_compositions_encode_nested_versions_canoni
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("serial-log"));
     }
+}
+
+#[test]
+fn internal_exact_minor_nine_balloon_composes_every_mmio_and_pci_product_canonically() {
+    for transport in [
+        SnapshotV2DeviceTransportKind::Mmio,
+        SnapshotV2DeviceTransportKind::Pci,
+    ] {
+        for mask in 0_u8..8 {
+            let has_storage = mask & 1 != 0;
+            let has_entropy = mask & 2 != 0;
+            let has_balloon = mask & 4 != 0;
+            let original =
+                complete_balloon_state_fixture(transport, has_storage, has_entropy, has_balloon);
+            let encoded = encode_hvf_snapshot_v2_balloon_state(&original)
+                .expect("complete minor-nine balloon state should encode");
+            assert_eq!(
+                encode_hvf_snapshot_v2_balloon_state(&original)
+                    .expect("minor-nine encoding should be deterministic"),
+                encoded
+            );
+
+            let structural = decode_snapshot_v2_state_with_compatibility_version(
+                &encoded,
+                NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("minor-nine balloon composition should decode structurally");
+            let platform = decode_hvf_snapshot_v2_platform_components(
+                &structural,
+                original.platform().vcpus().len(),
+                true,
+            )
+            .expect("minor-nine platform components should decode");
+            assert_eq!(&platform, original.platform());
+
+            let keys = structural
+                .components()
+                .map(SnapshotV2Component::key)
+                .collect::<Vec<_>>();
+            let mut expected_keys = vec![
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                NATIVE_V2_MACHINE_COMPONENT_KEY,
+                NATIVE_V2_GLOBAL_COMPONENT_KEY,
+                NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
+            ];
+            expected_keys.extend(
+                (0..u32::try_from(original.platform().vcpus().len())
+                    .expect("fixture vCPU count should fit"))
+                    .map(native_v2_vcpu_component_key),
+            );
+            expected_keys.push(NATIVE_V2_TIME_COMPONENT_KEY);
+            if has_storage {
+                expected_keys.push(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY);
+            }
+            expected_keys.push(NATIVE_V2_SERIAL_COMPONENT_KEY);
+            if has_entropy {
+                expected_keys.push(NATIVE_V2_ENTROPY_COMPONENT_KEY);
+            }
+            if has_balloon {
+                expected_keys.push(NATIVE_V2_BALLOON_COMPONENT_KEY);
+            }
+            assert_eq!(keys, expected_keys);
+
+            let graph = structural
+                .component(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)
+                .map(|component| {
+                    SnapshotV2StorageDeviceGraph::decode(
+                        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                        component.payload(),
+                    )
+                    .expect("nested exact-2.6 storage graph should decode")
+                });
+            assert_eq!(graph.as_ref(), original.device_graph());
+
+            let serial = SnapshotV2SerialState::decode(
+                NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+                structural
+                    .component(NATIVE_V2_SERIAL_COMPONENT_KEY)
+                    .expect("minor-nine composition should contain serial")
+                    .payload(),
+            )
+            .expect("nested exact-2.7 serial should decode");
+            assert_eq!(&serial, original.serial());
+
+            let entropy = structural
+                .component(NATIVE_V2_ENTROPY_COMPONENT_KEY)
+                .map(|component| {
+                    SnapshotV2EntropyState::decode(
+                        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                        component.payload(),
+                    )
+                    .expect("nested exact-2.8 entropy state should decode")
+                });
+            assert_eq!(entropy.as_ref(), original.entropy());
+
+            let balloon = structural
+                .component(NATIVE_V2_BALLOON_COMPONENT_KEY)
+                .map(|component| {
+                    SnapshotV2BalloonState::decode(
+                        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                        component.payload(),
+                    )
+                    .expect("nested exact-2.9 balloon state should decode")
+                });
+            assert_eq!(balloon.as_ref(), original.balloon());
+
+            let captured_transport = graph
+                .as_ref()
+                .map(SnapshotV2StorageDeviceGraph::transport_kind)
+                .or_else(|| entropy.as_ref().map(|state| state.transport().kind()))
+                .or_else(|| balloon.as_ref().map(|state| state.transport().kind()));
+            assert_eq!(
+                captured_transport,
+                (has_storage || has_entropy || has_balloon).then_some(transport)
+            );
+
+            let debug = format!("{original:?}");
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains("serial-log"));
+        }
+    }
+}
+
+#[test]
+fn exact_minor_nine_composition_rejects_transport_aperture_and_pmem_conflicts() {
+    assert!(matches!(
+        HvfSnapshotV2BalloonState::try_new(
+            deterministic_minor_nine_platform_fixture(),
+            Some(product_storage_fixture(SnapshotV2DeviceTransportKind::Mmio)),
+            product_serial_fixture(),
+            None,
+            Some(product_balloon_fixture(SnapshotV2DeviceTransportKind::Pci)),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+
+    let mut entropy_bytes = fixture_bytes(ENTROPY_ACTIVE_PCI_FIXTURE_HEX);
+    let entropy_common_entry =
+        NATIVE_V2_ENTROPY_STATE_HEADER_BYTES + NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES;
+    let entropy_common_offset = component_section_offset(&entropy_bytes, entropy_common_entry);
+    relocate_common_queues(
+        &mut entropy_bytes,
+        entropy_common_offset,
+        PRODUCT_ENTROPY_QUEUE_BASE,
+    );
+    let colliding_entropy = SnapshotV2EntropyState::decode(
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+        &entropy_bytes,
+    )
+    .expect("PCI entropy with relocated queues should decode");
+    assert!(matches!(
+        HvfSnapshotV2BalloonState::try_new(
+            deterministic_minor_nine_platform_fixture(),
+            None,
+            product_serial_fixture(),
+            Some(colliding_entropy),
+            Some(product_balloon_fixture(SnapshotV2DeviceTransportKind::Pci)),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+
+    let mut aperture_bytes = fixture_bytes(BALLOON_INACTIVE_MMIO_FIXTURE_HEX);
+    let balloon_transport_entry =
+        NATIVE_V2_BALLOON_STATE_HEADER_BYTES + 3 * NATIVE_V2_BALLOON_STATE_SECTION_ENTRY_BYTES;
+    let balloon_transport_offset =
+        component_section_offset(&aperture_bytes, balloon_transport_entry);
+    write_wire_u64(
+        &mut aperture_bytes,
+        balloon_transport_offset + 24,
+        0x8001_0000,
+    );
+    let memory_overlapping_balloon = SnapshotV2BalloonState::decode(
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        &aperture_bytes,
+    )
+    .expect("memory-overlapping MMIO placement should remain a valid device artifact");
+    assert!(matches!(
+        HvfSnapshotV2BalloonState::try_new(
+            deterministic_minor_nine_platform_fixture(),
+            None,
+            product_serial_fixture(),
+            None,
+            Some(memory_overlapping_balloon),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+
+    let graph = product_storage_fixture(SnapshotV2DeviceTransportKind::Mmio);
+    let pmem_start = graph
+        .pmem_records()
+        .first()
+        .expect("storage fixture should contain pmem")
+        .pmem()
+        .guest_range()
+        .start()
+        .raw_value();
+    let mut pmem_bytes = fixture_bytes(BALLOON_INACTIVE_MMIO_FIXTURE_HEX);
+    let balloon_transport_offset = component_section_offset(&pmem_bytes, balloon_transport_entry);
+    write_wire_u64(&mut pmem_bytes, balloon_transport_offset + 24, pmem_start);
+    let pmem_overlapping_balloon =
+        SnapshotV2BalloonState::decode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, &pmem_bytes)
+            .expect("pmem-overlapping MMIO placement should remain a valid device artifact");
+    assert!(matches!(
+        HvfSnapshotV2BalloonState::try_new(
+            deterministic_minor_nine_platform_fixture(),
+            Some(graph),
+            product_serial_fixture(),
+            None,
+            Some(pmem_overlapping_balloon),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+}
+
+#[test]
+fn exact_minor_nine_composition_rejects_queue_platform_and_pci_order_conflicts() {
+    let graph = product_storage_fixture(SnapshotV2DeviceTransportKind::Pci);
+    let mut colliding_queue_bytes = fixture_bytes(BALLOON_ACTIVE_PCI_FIXTURE_HEX);
+    let balloon_common_entry =
+        NATIVE_V2_BALLOON_STATE_HEADER_BYTES + NATIVE_V2_BALLOON_STATE_SECTION_ENTRY_BYTES;
+    let balloon_common_offset =
+        component_section_offset(&colliding_queue_bytes, balloon_common_entry);
+    relocate_common_queues(
+        &mut colliding_queue_bytes,
+        balloon_common_offset,
+        PRODUCT_STORAGE_QUEUE_BASE,
+    );
+    let colliding_queue_balloon = SnapshotV2BalloonState::decode(
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        &colliding_queue_bytes,
+    )
+    .expect("cross-device queue collision should remain a valid balloon artifact");
+    assert!(matches!(
+        HvfSnapshotV2BalloonState::try_new(
+            deterministic_minor_nine_platform_fixture(),
+            Some(graph),
+            product_serial_fixture(),
+            None,
+            Some(colliding_queue_balloon),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+
+    let platform = deterministic_minor_nine_platform_fixture();
+    let vmclock_start = platform.time().vmclock().range().start().raw_value();
+    let mut platform_queue_bytes = fixture_bytes(BALLOON_ACTIVE_PCI_FIXTURE_HEX);
+    let balloon_common_offset =
+        component_section_offset(&platform_queue_bytes, balloon_common_entry);
+    relocate_common_queues(
+        &mut platform_queue_bytes,
+        balloon_common_offset,
+        PRODUCT_BALLOON_QUEUE_BASE,
+    );
+    write_wire_u64(
+        &mut platform_queue_bytes,
+        balloon_common_offset + 32 + 8,
+        vmclock_start,
+    );
+    let platform_queue_balloon = SnapshotV2BalloonState::decode(
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        &platform_queue_bytes,
+    )
+    .expect("platform-overlapping queue should remain a valid device artifact");
+    assert!(matches!(
+        HvfSnapshotV2BalloonState::try_new(
+            platform,
+            None,
+            product_serial_fixture(),
+            None,
+            Some(platform_queue_balloon),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+
+    let graph = product_storage_fixture(SnapshotV2DeviceTransportKind::Pci);
+    let mut ordered_bytes = fixture_bytes(BALLOON_ACTIVE_PCI_FIXTURE_HEX);
+    let balloon_common_offset = component_section_offset(&ordered_bytes, balloon_common_entry);
+    relocate_common_queues(
+        &mut ordered_bytes,
+        balloon_common_offset,
+        PRODUCT_BALLOON_QUEUE_BASE,
+    );
+    let balloon_transport_entry =
+        NATIVE_V2_BALLOON_STATE_HEADER_BYTES + 3 * NATIVE_V2_BALLOON_STATE_SECTION_ENTRY_BYTES;
+    let balloon_transport_offset =
+        component_section_offset(&ordered_bytes, balloon_transport_entry);
+    bytes_set_pci_endpoint(&mut ordered_bytes, balloon_transport_offset, 4);
+    let out_of_order_balloon = SnapshotV2BalloonState::decode(
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        &ordered_bytes,
+    )
+    .expect("out-of-order PCI balloon should remain a valid device artifact");
+    assert!(matches!(
+        HvfSnapshotV2BalloonState::try_new(
+            deterministic_minor_nine_platform_fixture(),
+            Some(graph),
+            product_serial_fixture(),
+            None,
+            Some(out_of_order_balloon),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
 }
 
 #[test]

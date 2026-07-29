@@ -1301,11 +1301,21 @@ fn prepared_root_transport_recaptures_exact_mmio_and_pci_state() {
             ) => {
                 let (_, _, _, region, interrupt_line, handler) = prepared.into_parts();
                 let retained = handler.transport_state();
+                let variable =
+                    capture_mmio_common_for_device_with_queue_count_and_config_status_gate(
+                        &retained,
+                        VIRTIO_BLOCK_DEVICE_ID,
+                        expected_virtio.available_features(),
+                        1,
+                        true,
+                    )
+                    .expect("one-queue MMIO extractor should recapture");
                 assert_eq!(
                     capture_mmio_common(&retained, expected_virtio.available_features())
                         .expect("restored MMIO common state should recapture"),
                     expected_virtio
                 );
+                assert_eq!(variable, expected_virtio);
                 assert_eq!(
                     capture_mmio_transport(region, interrupt_line, &retained)
                         .expect("restored MMIO transport should recapture"),
@@ -1316,11 +1326,19 @@ fn prepared_root_transport_recaptures_exact_mmio_and_pci_state() {
                 PreparedSnapshotV2RootTransport::Pci(prepared),
                 SnapshotV2DeviceTransport::Pci(expected),
             ) => {
+                let variable = capture_pci_common_for_device_with_queue_count(
+                    &prepared.retained,
+                    VIRTIO_BLOCK_DEVICE_ID,
+                    expected_virtio.available_features(),
+                    1,
+                )
+                .expect("one-queue PCI extractor should recapture");
                 assert_eq!(
                     capture_pci_common(&prepared.retained, expected_virtio.available_features())
                         .expect("restored PCI common state should recapture"),
                     expected_virtio
                 );
+                assert_eq!(variable, expected_virtio);
                 assert_eq!(
                     capture_pci_transport(
                         prepared.origin,
@@ -1335,6 +1353,30 @@ fn prepared_root_transport_recaptures_exact_mmio_and_pci_state() {
             _ => panic!("prepared root transport kind changed"),
         }
     }
+}
+
+#[test]
+fn pci_msix_capture_uses_the_explicit_queue_count() {
+    let queue_count = 5;
+    let state = VirtioPciMsixState::from_parts(
+        vec![crate::virtio_pci::VirtioPciMsixTableEntry::default(); queue_count + 1],
+        vec![0],
+        true,
+        false,
+        VIRTIO_PCI_NO_VECTOR,
+        vec![VIRTIO_PCI_NO_VECTOR; queue_count],
+        false,
+    );
+
+    let captured =
+        capture_msix_state(&state, queue_count).expect("five-queue MSI-X state should capture");
+    assert_eq!(captured.entries().len(), queue_count + 1);
+    assert_eq!(captured.pending_words().len(), 1);
+    assert_eq!(captured.queue_vectors().len(), queue_count);
+    assert_eq!(
+        capture_msix_state(&state, 1),
+        Err(SnapshotV2DeviceGraphCaptureError::InvalidPciState)
+    );
 }
 
 #[test]
