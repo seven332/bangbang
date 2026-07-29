@@ -20,9 +20,12 @@ use crate::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_format_v2::{
     NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
     NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY,
-    NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
-    SnapshotV2ComponentKey, encode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component,
+    SnapshotV2ComponentDisposition, SnapshotV2ComponentKey,
+    encode_snapshot_v2_state_with_compatibility_version,
 };
+#[cfg(target_os = "macos")]
+use crate::snapshot_memory_hotplug_v2_10::NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION;
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory_v2::{
     write_snapshot_v2_memory_image, write_snapshot_v2_memory_image_with_compatibility_version,
@@ -759,6 +762,230 @@ fn exact_minor_nine_candidate_rejects_balloon_cardinality_payload_and_version_mi
         .expect("mismatch should encode structurally");
     assert!(matches!(
         NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(mismatched),
+        Err(NativeV2SnapshotCandidateStateError::VersionMismatch { .. })
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_ten_candidate_classifies_all_sixteen_optional_component_products() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact 2.10 memory should encode internally");
+    let storage_payload = fixture_bytes(include_str!(
+        "../snapshot_device_v2_6/fixtures/block-root-mmio.hex"
+    ));
+    let entropy_payload = fixture_bytes(include_str!(
+        "../snapshot_entropy_v2_8/fixtures/inactive-mmio.hex"
+    ));
+    let balloon_payload = fixture_bytes(include_str!(
+        "../snapshot_balloon_v2_9/fixtures/active-pci.hex"
+    ));
+    let memory_hotplug_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex"
+    ));
+
+    let mut product_count = 0;
+    for with_storage in [false, true] {
+        for with_entropy in [false, true] {
+            for with_balloon in [false, true] {
+                for with_memory_hotplug in [false, true] {
+                    let entropy_components = if with_entropy {
+                        vec![(
+                            NATIVE_V2_ENTROPY_COMPONENT_KEY,
+                            SnapshotV2ComponentDisposition::Semantic,
+                            entropy_payload.as_slice(),
+                        )]
+                    } else {
+                        Vec::new()
+                    };
+                    let balloon_components = if with_balloon {
+                        vec![(
+                            NATIVE_V2_BALLOON_COMPONENT_KEY,
+                            SnapshotV2ComponentDisposition::Semantic,
+                            balloon_payload.as_slice(),
+                        )]
+                    } else {
+                        Vec::new()
+                    };
+                    let memory_hotplug_components = if with_memory_hotplug {
+                        vec![(
+                            NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+                            SnapshotV2ComponentDisposition::Semantic,
+                            memory_hotplug_payload.as_slice(),
+                        )]
+                    } else {
+                        Vec::new()
+                    };
+                    let bytes = memory_hotplug_v2_10_state(
+                        &binding,
+                        with_storage.then_some(storage_payload.as_slice()),
+                        &entropy_components,
+                        &balloon_components,
+                        &memory_hotplug_components,
+                    )
+                    .expect("exact 2.10 product should encode");
+
+                    assert!(matches!(
+                        NativeSnapshotArtifactState::from_current_v2(bytes.clone()),
+                        Err(NativeSnapshotArtifactStateError::CurrentV2Profile(_))
+                    ));
+                    assert!(matches!(
+                        NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone()),
+                        Err(NativeSnapshotArtifactStateError::Format(
+                            NativeSnapshotFormatError::NativeV2(
+                                SnapshotV2DecodeError::UnsupportedVersion { .. }
+                            )
+                        ))
+                    ));
+
+                    let candidate =
+                        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
+                            bytes.clone(),
+                        )
+                        .expect("exact 2.10 candidate should validate");
+                    assert_eq!(
+                        candidate.version(),
+                        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+                    );
+                    assert_eq!(candidate.memory_binding(), &binding);
+                    assert_eq!(candidate.device_graph().is_some(), with_storage);
+                    assert_eq!(candidate.entropy().is_some(), with_entropy);
+                    assert_eq!(candidate.balloon().is_some(), with_balloon);
+                    assert_eq!(candidate.memory_hotplug().is_some(), with_memory_hotplug);
+                    assert_eq!(candidate.bytes(), bytes);
+                    let debug = format!("{candidate:?}");
+                    assert!(debug.contains(REDACTED));
+                    assert!(!debug.contains("BANGME2"));
+
+                    let compatible = candidate.into_compatible_artifact_state();
+                    assert_eq!(
+                        compatible
+                            .v2_profile()
+                            .expect("internal exact 2.10 state should classify"),
+                        NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
+                    );
+                    assert!(matches!(
+                        compatible.validate_for_publication(),
+                        Err(NativeSnapshotArtifactStateError::NonCurrentV2Publication {
+                            state: NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                            memory: NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                        })
+                    ));
+                    product_count += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(product_count, 16);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_ten_candidate_rejects_virtio_mem_cardinality_payload_and_version_mismatches() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact 2.10 memory should encode internally");
+    let binding_payload = binding.encode().expect("exact 2.10 binding should encode");
+    let memory_hotplug_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex"
+    ));
+
+    let missing_serial = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &[
+            SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &binding_payload,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &memory_hotplug_payload,
+            ),
+        ],
+    )
+    .expect("missing serial should remain structurally encodable");
+    assert!(matches!(
+        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
+            missing_serial
+        ),
+        Err(NativeV2SnapshotCandidateStateError::MissingSerialState)
+    ));
+
+    for components in [
+        vec![(
+            SnapshotV2ComponentKey::new(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY.kind(), 1),
+            SnapshotV2ComponentDisposition::Semantic,
+            memory_hotplug_payload.as_slice(),
+        )],
+        vec![(
+            NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::NonSemantic,
+            memory_hotplug_payload.as_slice(),
+        )],
+        vec![
+            (
+                NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                memory_hotplug_payload.as_slice(),
+            ),
+            (
+                SnapshotV2ComponentKey::new(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY.kind(), 1),
+                SnapshotV2ComponentDisposition::Semantic,
+                memory_hotplug_payload.as_slice(),
+            ),
+        ],
+    ] {
+        let bytes = memory_hotplug_v2_10_state(&binding, None, &[], &[], &components)
+            .expect("structural exact 2.10 fixture should encode");
+        assert!(matches!(
+            NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(bytes),
+            Err(NativeV2SnapshotCandidateStateError::InvalidMemoryHotplugComponent)
+        ));
+    }
+
+    let invalid_payload = [0_u8; 192];
+    let invalid = memory_hotplug_v2_10_state(
+        &binding,
+        None,
+        &[],
+        &[],
+        &[(
+            NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            invalid_payload.as_slice(),
+        )],
+    )
+    .expect("invalid nested virtio-mem should remain structurally encodable");
+    assert!(matches!(
+        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(invalid),
+        Err(NativeV2SnapshotCandidateStateError::MemoryHotplugState(_))
+    ));
+
+    let mut mismatched_image = Cursor::new(Vec::new());
+    let mismatched_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut mismatched_image,
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact 2.9 memory fixture should encode");
+    let mismatched = memory_hotplug_v2_10_state(&mismatched_binding, None, &[], &[], &[])
+        .expect("mismatch should encode structurally");
+    assert!(matches!(
+        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(mismatched),
         Err(NativeV2SnapshotCandidateStateError::VersionMismatch { .. })
     ));
 }
@@ -3238,6 +3465,70 @@ fn balloon_v2_9_state(
     }
     encode_snapshot_v2_state_with_compatibility_version(
         NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .map_err(|source| source.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn memory_hotplug_v2_10_state(
+    binding: &SnapshotV2MemoryBinding,
+    storage_payload: Option<&[u8]>,
+    entropy_components: &[(
+        SnapshotV2ComponentKey,
+        SnapshotV2ComponentDisposition,
+        &[u8],
+    )],
+    balloon_components: &[(
+        SnapshotV2ComponentKey,
+        SnapshotV2ComponentDisposition,
+        &[u8],
+    )],
+    memory_hotplug_components: &[(
+        SnapshotV2ComponentKey,
+        SnapshotV2ComponentDisposition,
+        &[u8],
+    )],
+) -> Result<Vec<u8>, String> {
+    let binding_payload = binding.encode().map_err(|source| source.to_string())?;
+    let serial_device = SerialMmioDevice::discarding()
+        .capture_state()
+        .map_err(|source| source.to_string())?;
+    let serial_payload = SnapshotV2SerialState::try_from_capture_ready(
+        CaptureReadySerialState::new(SerialConfig::default(), serial_device),
+    )
+    .map_err(|source| source.to_string())?
+    .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+    .map_err(|source| source.to_string())?;
+    let mut components = vec![SnapshotV2Component::new(
+        NATIVE_V2_MEMORY_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &binding_payload,
+    )];
+    if let Some(storage_payload) = storage_payload {
+        components.push(SnapshotV2Component::new(
+            NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            storage_payload,
+        ));
+    }
+    components.push(SnapshotV2Component::new(
+        NATIVE_V2_SERIAL_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &serial_payload,
+    ));
+    for (key, disposition, payload) in entropy_components {
+        components.push(SnapshotV2Component::new(*key, *disposition, payload));
+    }
+    for (key, disposition, payload) in balloon_components {
+        components.push(SnapshotV2Component::new(*key, *disposition, payload));
+    }
+    for (key, disposition, payload) in memory_hotplug_components {
+        components.push(SnapshotV2Component::new(*key, *disposition, payload));
+    }
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
         &[],
         &components,
     )
