@@ -25,6 +25,7 @@ mod snapshot;
 mod snapshot_bundle;
 mod snapshot_restore;
 mod snapshot_v2;
+mod snapshot_v2_balloon_platform;
 mod snapshot_v2_entropy_platform;
 mod snapshot_v2_multi_block_platform;
 mod snapshot_v2_platform;
@@ -151,6 +152,15 @@ pub use snapshot_v2::{
     encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_platform_state,
     encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
     encode_hvf_snapshot_v2_storage_state,
+};
+pub use snapshot_v2_balloon_platform::{
+    HvfSnapshotV2BalloonEntropyMmioEndpointPlan, HvfSnapshotV2BalloonMmioEndpointPlan,
+    HvfSnapshotV2BalloonMmioPlatformPlan, HvfSnapshotV2BalloonMmioProcessConfig,
+    HvfSnapshotV2BalloonPciEndpointPlan, HvfSnapshotV2BalloonPciPlatformPlan,
+    HvfSnapshotV2BalloonPreparedProduct, HvfSnapshotV2BalloonProductKind,
+    PrepareHvfSnapshotV2BalloonPlatformPlanError,
+    prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
 };
 pub use snapshot_v2_entropy_platform::{
     HvfSnapshotV2EntropyPciEndpointPlan, HvfSnapshotV2StorageEntropyPciPlatformPlan,
