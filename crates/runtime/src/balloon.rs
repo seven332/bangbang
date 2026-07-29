@@ -1337,6 +1337,17 @@ impl VirtioBalloonPfnRange {
         }
     }
 
+    pub(crate) fn from_snapshot_parts(
+        start_pfn: u32,
+        page_count: u32,
+    ) -> Result<Self, VirtioBalloonMemoryAccountingRestoreError> {
+        let range = Self::new(start_pfn, page_count);
+        if page_count == 0 || range.end_pfn_exclusive() > u64::from(u32::MAX) + 1 {
+            return Err(VirtioBalloonMemoryAccountingRestoreError::Range);
+        }
+        Ok(range)
+    }
+
     pub const fn start_pfn(self) -> u32 {
         self.start_pfn
     }
@@ -1466,6 +1477,36 @@ impl VirtioBalloonMemoryAccounting {
         self.inflated_page_ranges.is_empty()
     }
 
+    pub(crate) fn from_snapshot_ranges(
+        inflated_page_ranges: Vec<VirtioBalloonPfnRange>,
+        inflated_page_count: u64,
+    ) -> Result<Self, VirtioBalloonMemoryAccountingRestoreError> {
+        let mut previous_end = None;
+        let mut actual_page_count = 0_u64;
+        for range in inflated_page_ranges.iter().copied() {
+            let start = u64::from(range.start_pfn());
+            let end = range.end_pfn_exclusive();
+            if range.page_count() == 0
+                || end <= start
+                || end > u64::from(u32::MAX) + 1
+                || previous_end.is_some_and(|previous| start <= previous)
+            {
+                return Err(VirtioBalloonMemoryAccountingRestoreError::Canonicality);
+            }
+            actual_page_count = actual_page_count
+                .checked_add(u64::from(range.page_count()))
+                .ok_or(VirtioBalloonMemoryAccountingRestoreError::Total)?;
+            previous_end = Some(end);
+        }
+        if actual_page_count != inflated_page_count {
+            return Err(VirtioBalloonMemoryAccountingRestoreError::Total);
+        }
+
+        Ok(Self {
+            inflated_page_ranges,
+        })
+    }
+
     /// Fallibly clones the detached compact PFN accounting state.
     pub fn try_clone(&self) -> Result<Self, TryReserveError> {
         let mut inflated_page_ranges = Vec::new();
@@ -1574,6 +1615,31 @@ impl VirtioBalloonMemoryAccounting {
         Ok(())
     }
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VirtioBalloonMemoryAccountingRestoreError {
+    Range,
+    Canonicality,
+    Total,
+}
+
+impl fmt::Debug for VirtioBalloonMemoryAccountingRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for VirtioBalloonMemoryAccountingRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Range => "restored virtio-balloon PFN range is invalid",
+            Self::Canonicality => "restored virtio-balloon accounting is not canonical",
+            Self::Total => "restored virtio-balloon accounting total is invalid",
+        })
+    }
+}
+
+impl std::error::Error for VirtioBalloonMemoryAccountingRestoreError {}
 
 fn prepare_balloon_accounting(
     accounting: &VirtioBalloonMemoryAccounting,
@@ -2395,6 +2461,55 @@ impl std::error::Error for VirtioBalloonQueueBuildError {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VirtioBalloonQueueRestoreError {
+    QueueNotReady,
+    AvailableRingInvalid,
+    UsedRingInvalid,
+    QueueRangeInvalid,
+    QueueRangesOverlap,
+    UsedCursorMismatch,
+    AvailableCursorOutOfBounds,
+    UnpublishedDescriptorCountMismatch,
+    StatisticsDescriptorMismatch,
+    StatisticsDescriptorDuplicated,
+    ActiveQueueShape,
+}
+
+impl fmt::Debug for VirtioBalloonQueueRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for VirtioBalloonQueueRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::QueueNotReady => "restored virtio-balloon queue is not ready",
+            Self::AvailableRingInvalid => "restored virtio-balloon available ring is invalid",
+            Self::UsedRingInvalid => "restored virtio-balloon used ring is invalid",
+            Self::QueueRangeInvalid => "restored virtio-balloon queue range is invalid",
+            Self::QueueRangesOverlap => "restored virtio-balloon queue ranges overlap",
+            Self::UsedCursorMismatch => "restored virtio-balloon used cursor is invalid",
+            Self::AvailableCursorOutOfBounds => {
+                "restored virtio-balloon available cursor is invalid"
+            }
+            Self::UnpublishedDescriptorCountMismatch => {
+                "restored virtio-balloon unpublished descriptor count is invalid"
+            }
+            Self::StatisticsDescriptorMismatch => {
+                "restored virtio-balloon statistics descriptor is invalid"
+            }
+            Self::StatisticsDescriptorDuplicated => {
+                "restored virtio-balloon statistics descriptor is duplicated"
+            }
+            Self::ActiveQueueShape => "restored virtio-balloon active queue shape is invalid",
+        })
+    }
+}
+
+impl std::error::Error for VirtioBalloonQueueRestoreError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioBalloonQueue {
     available: VirtqueueAvailableRing,
@@ -2425,12 +2540,114 @@ impl VirtioBalloonQueue {
         Ok(Self { available, used })
     }
 
+    pub(crate) fn from_snapshot_state(
+        queue: &VirtioMmioQueueState,
+        next_available: u16,
+        next_used: u16,
+    ) -> Result<Self, VirtioBalloonQueueRestoreError> {
+        if !queue.ready() {
+            return Err(VirtioBalloonQueueRestoreError::QueueNotReady);
+        }
+
+        let available = VirtqueueAvailableRing::with_next_avail(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+            next_available,
+        )
+        .map_err(|_| VirtioBalloonQueueRestoreError::AvailableRingInvalid)?;
+        let used = VirtqueueUsedRing::with_next_used(queue.device_ring(), queue.size(), next_used)
+            .map_err(|_| VirtioBalloonQueueRestoreError::UsedRingInvalid)?;
+
+        Ok(Self { available, used })
+    }
+
     pub const fn available_ring(&self) -> &VirtqueueAvailableRing {
         &self.available
     }
 
     pub const fn used_ring(&self) -> &VirtqueueUsedRing {
         &self.used
+    }
+
+    pub(crate) fn validate_snapshot_state(
+        &self,
+        memory: &GuestMemory,
+        statistics_pending_descriptor_head: Option<u16>,
+    ) -> Result<(), VirtioBalloonQueueRestoreError> {
+        self.available
+            .validate_mapped(memory)
+            .map_err(|_| VirtioBalloonQueueRestoreError::AvailableRingInvalid)?;
+        self.used
+            .validate_mapped(memory)
+            .map_err(|_| VirtioBalloonQueueRestoreError::UsedRingInvalid)?;
+        let descriptor_range = self
+            .available
+            .descriptor_table_range()
+            .map_err(|_| VirtioBalloonQueueRestoreError::QueueRangeInvalid)?;
+        let available_range = self
+            .available
+            .available_ring_range()
+            .map_err(|_| VirtioBalloonQueueRestoreError::QueueRangeInvalid)?;
+        let used_range = self
+            .used
+            .used_ring_range()
+            .map_err(|_| VirtioBalloonQueueRestoreError::QueueRangeInvalid)?;
+        if descriptor_range.overlaps(available_range)
+            || descriptor_range.overlaps(used_range)
+            || available_range.overlaps(used_range)
+        {
+            return Err(VirtioBalloonQueueRestoreError::QueueRangesOverlap);
+        }
+
+        let used_index = self
+            .used
+            .used_index(memory)
+            .map_err(|_| VirtioBalloonQueueRestoreError::UsedRingInvalid)?;
+        if used_index != self.used.next_used() {
+            return Err(VirtioBalloonQueueRestoreError::UsedCursorMismatch);
+        }
+        let available_index = self
+            .available
+            .available_index(memory)
+            .map_err(|_| VirtioBalloonQueueRestoreError::AvailableRingInvalid)?;
+        if available_index.wrapping_sub(self.available.next_avail()) > self.available.queue_size() {
+            return Err(VirtioBalloonQueueRestoreError::AvailableCursorOutOfBounds);
+        }
+
+        let unpublished = self
+            .available
+            .next_avail()
+            .wrapping_sub(self.used.next_used());
+        if unpublished != u16::from(statistics_pending_descriptor_head.is_some()) {
+            return Err(VirtioBalloonQueueRestoreError::UnpublishedDescriptorCountMismatch);
+        }
+
+        let Some(statistics_pending_descriptor_head) = statistics_pending_descriptor_head else {
+            return Ok(());
+        };
+        let pending_available_index = self.available.next_avail().wrapping_sub(1);
+        let pending_head = self
+            .available
+            .descriptor_head_at_available_index(memory, pending_available_index)
+            .map_err(|_| VirtioBalloonQueueRestoreError::AvailableRingInvalid)?;
+        if pending_head != statistics_pending_descriptor_head {
+            return Err(VirtioBalloonQueueRestoreError::StatisticsDescriptorMismatch);
+        }
+
+        let mut available_entry = self.available.next_avail();
+        while available_entry != available_index {
+            let head = self
+                .available
+                .descriptor_head_at_available_index(memory, available_entry)
+                .map_err(|_| VirtioBalloonQueueRestoreError::AvailableRingInvalid)?;
+            if head == statistics_pending_descriptor_head {
+                return Err(VirtioBalloonQueueRestoreError::StatisticsDescriptorDuplicated);
+            }
+            available_entry = available_entry.wrapping_add(1);
+        }
+
+        Ok(())
     }
 
     fn capture_state(
@@ -3883,6 +4100,30 @@ impl VirtioBalloonActiveQueues {
         })
     }
 
+    pub(crate) fn from_snapshot_parts(
+        layout: VirtioBalloonQueueLayout,
+        inflate: VirtioBalloonQueue,
+        deflate: VirtioBalloonQueue,
+        statistics: Option<VirtioBalloonQueue>,
+        free_page_hinting: Option<VirtioBalloonQueue>,
+        free_page_reporting: Option<VirtioBalloonQueue>,
+    ) -> Result<Self, VirtioBalloonQueueRestoreError> {
+        if statistics.is_some() != layout.statistics().is_some()
+            || free_page_hinting.is_some() != layout.free_page_hinting().is_some()
+            || free_page_reporting.is_some() != layout.free_page_reporting().is_some()
+        {
+            return Err(VirtioBalloonQueueRestoreError::ActiveQueueShape);
+        }
+
+        Ok(Self {
+            inflate,
+            deflate,
+            statistics,
+            free_page_hinting,
+            free_page_reporting,
+        })
+    }
+
     pub const fn inflate(&self) -> &VirtioBalloonQueue {
         &self.inflate
     }
@@ -4304,6 +4545,33 @@ impl std::error::Error for VirtioBalloonPciCaptureError {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VirtioBalloonDeviceRestoreError {
+    QueueShape,
+    Statistics,
+    Hinting,
+    Accounting,
+}
+
+impl fmt::Debug for VirtioBalloonDeviceRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for VirtioBalloonDeviceRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::QueueShape => "restored virtio-balloon queue shape is invalid",
+            Self::Statistics => "restored virtio-balloon statistics state is invalid",
+            Self::Hinting => "restored virtio-balloon hinting state is invalid",
+            Self::Accounting => "restored virtio-balloon accounting state is invalid",
+        })
+    }
+}
+
+impl std::error::Error for VirtioBalloonDeviceRestoreError {}
+
 #[derive(Debug)]
 pub struct VirtioBalloonDevice {
     queue_layout: VirtioBalloonQueueLayout,
@@ -4346,6 +4614,72 @@ impl VirtioBalloonDevice {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_snapshot_parts(
+        queue_layout: VirtioBalloonQueueLayout,
+        active_queues: Option<VirtioBalloonActiveQueues>,
+        memory_accounting: VirtioBalloonMemoryAccounting,
+        stats_polling_interval_s: u16,
+        statistics: BalloonOptionalStats,
+        statistics_pending_descriptor_head: Option<u16>,
+        hinting_host_cmd: u32,
+        hinting_guest_cmd: Option<u32>,
+        hinting_last_cmd: u32,
+        hinting_acknowledge_on_stop: bool,
+    ) -> Result<Self, VirtioBalloonDeviceRestoreError> {
+        if active_queues
+            .as_ref()
+            .is_some_and(|active| active.queue_count() != queue_layout.queue_count())
+        {
+            return Err(VirtioBalloonDeviceRestoreError::QueueShape);
+        }
+
+        let statistics_enabled = queue_layout.statistics().is_some();
+        if statistics_enabled != (stats_polling_interval_s > 0)
+            || (!statistics_enabled
+                && (!statistics.is_empty() || statistics_pending_descriptor_head.is_some()))
+            || active_queues.is_none() && !statistics.is_empty()
+            || statistics_pending_descriptor_head.is_some()
+                && active_queues
+                    .as_ref()
+                    .and_then(VirtioBalloonActiveQueues::statistics)
+                    .is_none()
+        {
+            return Err(VirtioBalloonDeviceRestoreError::Statistics);
+        }
+
+        if active_queues.is_none() && !memory_accounting.is_empty() {
+            return Err(VirtioBalloonDeviceRestoreError::Accounting);
+        }
+
+        if queue_layout.free_page_hinting().is_none() {
+            if hinting_host_cmd != VIRTIO_BALLOON_FREE_PAGE_HINT_STOP
+                || hinting_guest_cmd.is_some()
+                || hinting_last_cmd != VIRTIO_BALLOON_FREE_PAGE_HINT_STOP
+                || !hinting_acknowledge_on_stop
+            {
+                return Err(VirtioBalloonDeviceRestoreError::Hinting);
+            }
+        } else if hinting_host_cmd != VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+            || hinting_last_cmd == VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+        {
+            return Err(VirtioBalloonDeviceRestoreError::Hinting);
+        }
+
+        Ok(Self {
+            queue_layout,
+            active_queues,
+            memory_accounting,
+            stats_polling_interval_s,
+            statistics,
+            statistics_pending_descriptor_head,
+            hinting_host_cmd,
+            hinting_guest_cmd,
+            hinting_last_cmd,
+            hinting_acknowledge_on_stop,
+        })
+    }
+
     pub const fn queue_layout(&self) -> VirtioBalloonQueueLayout {
         self.queue_layout
     }
@@ -4368,6 +4702,16 @@ impl VirtioBalloonDevice {
 
     pub const fn statistics(&self) -> BalloonOptionalStats {
         self.statistics
+    }
+
+    /// Returns the statistics descriptor consumed but not yet returned.
+    pub const fn statistics_pending_descriptor_head(&self) -> Option<u16> {
+        self.statistics_pending_descriptor_head
+    }
+
+    /// Returns the last allocated host free-page-hinting command identifier.
+    pub const fn hinting_last_cmd(&self) -> u32 {
+        self.hinting_last_cmd
     }
 
     pub const fn stats_polling_interval_s(&self) -> u16 {
@@ -7954,6 +8298,106 @@ mod tests {
             ]
         );
         assert_eq!(accounting.inflated_page_count(), u64::from(u32::MAX) + 1);
+    }
+
+    #[test]
+    fn restored_memory_accounting_rechecks_ranges_canonicality_and_total() {
+        assert_eq!(
+            VirtioBalloonPfnRange::from_snapshot_parts(1, 0).unwrap_err(),
+            VirtioBalloonMemoryAccountingRestoreError::Range
+        );
+        assert_eq!(
+            VirtioBalloonPfnRange::from_snapshot_parts(u32::MAX, 2).unwrap_err(),
+            VirtioBalloonMemoryAccountingRestoreError::Range
+        );
+
+        let first = VirtioBalloonPfnRange::from_snapshot_parts(1, 2)
+            .expect("first restored range should validate");
+        let second = VirtioBalloonPfnRange::from_snapshot_parts(4, 1)
+            .expect("second restored range should validate");
+        let restored = VirtioBalloonMemoryAccounting::from_snapshot_ranges(vec![first, second], 3)
+            .expect("canonical restored accounting should validate");
+        assert_eq!(restored.inflated_page_ranges(), &[first, second]);
+        assert_eq!(restored.inflated_page_count(), 3);
+
+        let adjacent = VirtioBalloonPfnRange::from_snapshot_parts(3, 1)
+            .expect("adjacent restored range should validate individually");
+        assert_eq!(
+            VirtioBalloonMemoryAccounting::from_snapshot_ranges(vec![first, adjacent], 3)
+                .unwrap_err(),
+            VirtioBalloonMemoryAccountingRestoreError::Canonicality
+        );
+        assert_eq!(
+            VirtioBalloonMemoryAccounting::from_snapshot_ranges(vec![first, second], 4)
+                .unwrap_err(),
+            VirtioBalloonMemoryAccountingRestoreError::Total
+        );
+    }
+
+    #[test]
+    fn restored_device_constructor_rechecks_inactive_statistics_accounting_and_hinting() {
+        let layout =
+            VirtioBalloonQueueLayout::from_config(balloon_config(64, true, 5, false, false));
+        let mut statistics = BalloonOptionalStats::new();
+        assert!(statistics.record_stat(VirtioBalloonStat::new(VIRTIO_BALLOON_S_SWAP_IN, 1,)));
+        assert_eq!(
+            VirtioBalloonDevice::from_snapshot_parts(
+                layout,
+                None,
+                VirtioBalloonMemoryAccounting::new(),
+                5,
+                statistics,
+                None,
+                VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                None,
+                VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                true,
+            )
+            .unwrap_err(),
+            VirtioBalloonDeviceRestoreError::Statistics
+        );
+
+        let accounting = VirtioBalloonMemoryAccounting::from_snapshot_ranges(
+            vec![
+                VirtioBalloonPfnRange::from_snapshot_parts(1, 1)
+                    .expect("restored accounting range should validate"),
+            ],
+            1,
+        )
+        .expect("restored accounting should validate");
+        assert_eq!(
+            VirtioBalloonDevice::from_snapshot_parts(
+                layout,
+                None,
+                accounting,
+                5,
+                BalloonOptionalStats::new(),
+                None,
+                VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                None,
+                VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                true,
+            )
+            .unwrap_err(),
+            VirtioBalloonDeviceRestoreError::Accounting
+        );
+
+        assert_eq!(
+            VirtioBalloonDevice::from_snapshot_parts(
+                layout,
+                None,
+                VirtioBalloonMemoryAccounting::new(),
+                5,
+                BalloonOptionalStats::new(),
+                None,
+                VIRTIO_BALLOON_FREE_PAGE_HINT_DONE,
+                None,
+                VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                true,
+            )
+            .unwrap_err(),
+            VirtioBalloonDeviceRestoreError::Hinting
+        );
     }
 
     #[test]

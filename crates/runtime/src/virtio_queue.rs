@@ -488,6 +488,22 @@ impl VirtqueueAvailableRing {
         read_available_ring_u16(memory, self.available_ring, self.queue_size, address)
     }
 
+    pub(crate) fn descriptor_head_at_available_index(
+        &self,
+        memory: &GuestMemory,
+        available_index: u16,
+    ) -> Result<u16, VirtqueueAvailableRingError> {
+        validate_available_ring_range(memory, self.available_ring, self.queue_size)?;
+
+        // Match the normal pop ordering point before observing a ring entry.
+        fence(Ordering::Acquire);
+
+        let ring_index = available_index % self.queue_size;
+        let head_address =
+            available_ring_entry_address(self.available_ring, self.queue_size, ring_index)?;
+        read_available_ring_u16(memory, self.available_ring, self.queue_size, head_address)
+    }
+
     pub fn used_event(&self, memory: &GuestMemory) -> Result<u16, VirtqueueAvailableRingError> {
         validate_available_ring_range(memory, self.available_ring, self.queue_size)?;
 

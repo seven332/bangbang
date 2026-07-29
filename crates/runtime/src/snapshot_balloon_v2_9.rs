@@ -11,23 +11,33 @@ use std::fmt;
 use crate::balloon::{
     BalloonConfig, BalloonOptionalStats, VIRTIO_BALLOON_DEVICE_ID,
     VIRTIO_BALLOON_FREE_PAGE_HINT_DONE, VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
-    VIRTIO_BALLOON_QUEUE_SIZE, VirtioBalloonConfigSpace, VirtioBalloonDeviceCaptureState,
-    VirtioBalloonMmioCaptureState, VirtioBalloonPciCaptureState, VirtioBalloonQueueCaptureState,
-    VirtioBalloonQueueLayout, available_features, mib_to_4k_pages,
+    VIRTIO_BALLOON_PAGE_SIZE, VIRTIO_BALLOON_QUEUE_SIZE, VIRTIO_BALLOON_S_ALLOC_STALL,
+    VIRTIO_BALLOON_S_ASYNC_RECLAIM, VIRTIO_BALLOON_S_ASYNC_SCAN, VIRTIO_BALLOON_S_AVAIL,
+    VIRTIO_BALLOON_S_CACHES, VIRTIO_BALLOON_S_DIRECT_RECLAIM, VIRTIO_BALLOON_S_DIRECT_SCAN,
+    VIRTIO_BALLOON_S_HTLB_PGALLOC, VIRTIO_BALLOON_S_HTLB_PGFAIL, VIRTIO_BALLOON_S_MAJFLT,
+    VIRTIO_BALLOON_S_MEMFREE, VIRTIO_BALLOON_S_MEMTOT, VIRTIO_BALLOON_S_MINFLT,
+    VIRTIO_BALLOON_S_OOM_KILL, VIRTIO_BALLOON_S_SWAP_IN, VIRTIO_BALLOON_S_SWAP_OUT,
+    VirtioBalloonActiveQueues, VirtioBalloonConfigSpace, VirtioBalloonDevice,
+    VirtioBalloonDeviceCaptureState, VirtioBalloonMemoryAccounting, VirtioBalloonMmioCaptureState,
+    VirtioBalloonPciCaptureState, VirtioBalloonPfnRange, VirtioBalloonQueue,
+    VirtioBalloonQueueCaptureState, VirtioBalloonQueueConfig, VirtioBalloonQueueLayout,
+    VirtioBalloonStat, available_features, mib_to_4k_pages,
 };
 use crate::interrupt::GuestInterruptLine;
-use crate::memory::GuestMemoryRange;
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
 use crate::mmio::MmioRegion;
 use crate::pci::{
     PCI_BAR64_SIZE, PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
     PCI_LAST_ENDPOINT_DEVICE, PCI_SEGMENT_ZERO, PciBarAddressSpace, PciBarPrefetchable, PciSbdf,
 };
 use crate::snapshot_device_v2::{
-    SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport, SnapshotV2InterruptIntent,
-    SnapshotV2PciDeviceState, SnapshotV2PciMsixState, SnapshotV2VirtioQueueState,
-    SnapshotV2VirtioState, capture_mmio_common_for_device_with_queue_count_and_config_status_gate,
+    SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
+    SnapshotV2InterruptIntent, SnapshotV2PciDeviceState, SnapshotV2PciMsixState,
+    SnapshotV2VirtioQueueState, SnapshotV2VirtioState,
+    capture_mmio_common_for_device_with_queue_count_and_config_status_gate,
     capture_mmio_transport_parts, capture_pci_common_for_device_with_queue_count,
-    capture_pci_transport_parts_with_queue_count,
+    capture_pci_transport_parts_with_queue_count, range_is_wholly_contained,
+    restore_mmio_transport_state_for_device_with_config_status_gate,
 };
 use crate::snapshot_device_v2_5::queue_ranges;
 use crate::snapshot_format::SnapshotFormatVersion;
@@ -35,12 +45,15 @@ use crate::storage_capture::StorageDeviceOrigin;
 use crate::virtio::{
     VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET,
     VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FAILED,
-    VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT,
+    VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT, VirtioDeviceType,
 };
-use crate::virtio_mmio::{VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_VERSION_1_FEATURE};
+use crate::virtio_mmio::{
+    VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioQueueState,
+    VirtioMmioTransportState,
+};
 use crate::virtio_pci::{
     VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VIRTIO_PCI_MAX_MSIX_VECTORS,
-    VIRTIO_PCI_NO_VECTOR, VirtioPciEndpointPhase,
+    VIRTIO_PCI_NO_VECTOR, VirtioPciEndpointPhase, VirtioPciIdentity, VirtioPciTransportState,
 };
 
 mod codec;
@@ -687,6 +700,615 @@ impl fmt::Debug for SnapshotV2BalloonState {
             .field("state", &REDACTED)
             .finish()
     }
+}
+
+/// Complete exact-2.9 balloon continuation validated against adopted memory.
+///
+/// The plan contains only detached runtime and transport values. It owns no
+/// timer, notifier, interrupt route, dispatcher, PCI endpoint, metrics,
+/// reclaim adviser, thread, platform VM, or publication authority.
+pub struct SnapshotV2BalloonRestorePlan {
+    config: BalloonConfig,
+    config_space: VirtioBalloonConfigSpace,
+    queue_ranges: Vec<[GuestMemoryRange; 3]>,
+    transport: PreparedSnapshotV2BalloonTransport,
+}
+
+impl SnapshotV2BalloonRestorePlan {
+    /// Validates and reconstructs one decoded balloon continuation.
+    pub fn prepare(
+        state: SnapshotV2BalloonState,
+        memory: &GuestMemory,
+    ) -> Result<Self, SnapshotV2BalloonRestorePlanError> {
+        prepare_balloon_restore_plan(state, memory, BalloonRestoreReservePolicy::System)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_with_queue_range_allocation_failure(
+        state: SnapshotV2BalloonState,
+        memory: &GuestMemory,
+    ) -> Result<Self, SnapshotV2BalloonRestorePlanError> {
+        prepare_balloon_restore_plan(state, memory, BalloonRestoreReservePolicy::FailQueueRanges)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_with_accounting_allocation_failure(
+        state: SnapshotV2BalloonState,
+        memory: &GuestMemory,
+    ) -> Result<Self, SnapshotV2BalloonRestorePlanError> {
+        prepare_balloon_restore_plan(state, memory, BalloonRestoreReservePolicy::FailAccounting)
+    }
+
+    /// Returns the exact external balloon configuration.
+    pub const fn config(&self) -> BalloonConfig {
+        self.config
+    }
+
+    /// Returns guest-visible configuration after destination normalization.
+    pub const fn config_space(&self) -> VirtioBalloonConfigSpace {
+        self.config_space
+    }
+
+    /// Returns all loaded-memory ranges occupied by active queues.
+    pub fn queue_ranges(&self) -> &[[GuestMemoryRange; 3]] {
+        &self.queue_ranges
+    }
+
+    /// Returns the selected transport kind.
+    pub const fn transport_kind(&self) -> SnapshotV2DeviceTransportKind {
+        self.transport.kind()
+    }
+
+    /// Returns the checked detached transport.
+    pub const fn transport(&self) -> &PreparedSnapshotV2BalloonTransport {
+        &self.transport
+    }
+
+    /// Consumes the plan into configuration, ranges, and detached transport.
+    pub fn into_parts(
+        self,
+    ) -> (
+        BalloonConfig,
+        VirtioBalloonConfigSpace,
+        Vec<[GuestMemoryRange; 3]>,
+        PreparedSnapshotV2BalloonTransport,
+    ) {
+        (
+            self.config,
+            self.config_space,
+            self.queue_ranges,
+            self.transport,
+        )
+    }
+}
+
+impl fmt::Debug for SnapshotV2BalloonRestorePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotV2BalloonRestorePlan")
+            .field("transport", &self.transport_kind())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// One checked detached MMIO or PCI balloon transport.
+pub enum PreparedSnapshotV2BalloonTransport {
+    /// Value-only virtio-mmio continuation.
+    Mmio(Box<PreparedSnapshotV2BalloonMmioTransport>),
+    /// Value-only virtio-pci continuation.
+    Pci(Box<PreparedSnapshotV2BalloonPciTransport>),
+}
+
+impl PreparedSnapshotV2BalloonTransport {
+    /// Returns the selected transport kind.
+    pub const fn kind(&self) -> SnapshotV2DeviceTransportKind {
+        match self {
+            Self::Mmio(_) => SnapshotV2DeviceTransportKind::Mmio,
+            Self::Pci(_) => SnapshotV2DeviceTransportKind::Pci,
+        }
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2BalloonTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2BalloonTransport")
+            .field("kind", &self.kind())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Checked value-only MMIO balloon continuation.
+pub struct PreparedSnapshotV2BalloonMmioTransport {
+    region: MmioRegion,
+    interrupt_line: GuestInterruptLine,
+    device: VirtioBalloonDevice,
+    retained: VirtioMmioTransportState,
+}
+
+impl PreparedSnapshotV2BalloonMmioTransport {
+    /// Returns the exact retained MMIO region.
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    /// Returns the exact retained guest interrupt line.
+    pub const fn interrupt_line(&self) -> GuestInterruptLine {
+        self.interrupt_line
+    }
+
+    /// Returns the detached balloon device.
+    pub const fn device(&self) -> &VirtioBalloonDevice {
+        &self.device
+    }
+
+    /// Returns detached MMIO register, queue, and interrupt state.
+    pub const fn retained(&self) -> &VirtioMmioTransportState {
+        &self.retained
+    }
+
+    /// Consumes the value into placement, device, and retained transport.
+    pub fn into_parts(
+        self,
+    ) -> (
+        MmioRegion,
+        GuestInterruptLine,
+        VirtioBalloonDevice,
+        VirtioMmioTransportState,
+    ) {
+        (self.region, self.interrupt_line, self.device, self.retained)
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2BalloonMmioTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2BalloonMmioTransport")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Checked value-only PCI balloon continuation.
+pub struct PreparedSnapshotV2BalloonPciTransport {
+    origin: StorageDeviceOrigin,
+    sbdf: PciSbdf,
+    bar_range: GuestMemoryRange,
+    identity: VirtioPciIdentity,
+    device: VirtioBalloonDevice,
+    retained: VirtioPciTransportState,
+}
+
+impl PreparedSnapshotV2BalloonPciTransport {
+    /// Returns the retained startup/runtime origin.
+    pub const fn origin(&self) -> StorageDeviceOrigin {
+        self.origin
+    }
+
+    /// Returns the exact retained PCI function.
+    pub const fn sbdf(&self) -> PciSbdf {
+        self.sbdf
+    }
+
+    /// Returns the exact retained capability BAR.
+    pub const fn bar_range(&self) -> GuestMemoryRange {
+        self.bar_range
+    }
+
+    /// Returns the fixed balloon PCI identity.
+    pub const fn identity(&self) -> VirtioPciIdentity {
+        self.identity
+    }
+
+    /// Returns the detached balloon device.
+    pub const fn device(&self) -> &VirtioBalloonDevice {
+        &self.device
+    }
+
+    /// Returns detached PCI configuration, queue, and MSI-X state.
+    pub const fn retained(&self) -> &VirtioPciTransportState {
+        &self.retained
+    }
+
+    /// Consumes placement, identity, device, and retained transport.
+    pub fn into_parts(
+        self,
+    ) -> (
+        StorageDeviceOrigin,
+        PciSbdf,
+        GuestMemoryRange,
+        VirtioPciIdentity,
+        VirtioBalloonDevice,
+        VirtioPciTransportState,
+    ) {
+        (
+            self.origin,
+            self.sbdf,
+            self.bar_range,
+            self.identity,
+            self.device,
+            self.retained,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2BalloonPciTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2BalloonPciTransport")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Failure while proving decoded balloon state against destination memory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2BalloonRestorePlanError {
+    /// The decoded typed state no longer satisfies the exact profile.
+    InvalidState,
+    /// A bounded restore inventory could not be allocated.
+    Allocation,
+    /// A queue range is not wholly contained by adopted guest memory.
+    QueueMemory,
+    /// Queue cursors, rings, or retained statistics work are inconsistent.
+    QueueContinuation,
+    /// A retained inflated-PFN range is not fully mapped.
+    AccountingMemory,
+    /// Exact host inflated-PFN accounting could not be reconstructed.
+    Accounting,
+    /// Detached balloon device continuation could not be reconstructed.
+    Device,
+    /// The fixed balloon virtio identity cannot be represented.
+    DeviceType,
+    /// Detached MMIO retained state reconstruction failed.
+    MmioTransport,
+    /// Detached PCI retained state reconstruction failed.
+    PciTransport,
+}
+
+impl fmt::Debug for SnapshotV2BalloonRestorePlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2BalloonRestorePlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidState => "native-v2 balloon restore state is invalid",
+            Self::Allocation => "native-v2 balloon restore allocation failed",
+            Self::QueueMemory => "native-v2 balloon restore queue memory is invalid",
+            Self::QueueContinuation => "native-v2 balloon restore queue continuation is invalid",
+            Self::AccountingMemory => "native-v2 balloon restore accounting memory is invalid",
+            Self::Accounting => "native-v2 balloon restore accounting state is invalid",
+            Self::Device => "native-v2 balloon restore device state is invalid",
+            Self::DeviceType => "native-v2 balloon restore device identity is invalid",
+            Self::MmioTransport => "native-v2 balloon MMIO retained state is invalid",
+            Self::PciTransport => "native-v2 balloon PCI retained state is invalid",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2BalloonRestorePlanError {}
+
+#[derive(Clone, Copy)]
+enum BalloonRestoreReservePolicy {
+    System,
+    #[cfg(test)]
+    FailQueueRanges,
+    #[cfg(test)]
+    FailAccounting,
+}
+
+impl BalloonRestoreReservePolicy {
+    fn reserve_queue_ranges(
+        self,
+        ranges: &mut Vec<[GuestMemoryRange; 3]>,
+        count: usize,
+    ) -> Result<(), SnapshotV2BalloonRestorePlanError> {
+        #[cfg(test)]
+        if matches!(self, Self::FailQueueRanges) {
+            return Err(SnapshotV2BalloonRestorePlanError::Allocation);
+        }
+        ranges
+            .try_reserve_exact(count)
+            .map_err(|_| SnapshotV2BalloonRestorePlanError::Allocation)
+    }
+
+    fn reserve_accounting(
+        self,
+        ranges: &mut Vec<VirtioBalloonPfnRange>,
+        count: usize,
+    ) -> Result<(), SnapshotV2BalloonRestorePlanError> {
+        #[cfg(test)]
+        if matches!(self, Self::FailAccounting) {
+            return Err(SnapshotV2BalloonRestorePlanError::Allocation);
+        }
+        ranges
+            .try_reserve_exact(count)
+            .map_err(|_| SnapshotV2BalloonRestorePlanError::Allocation)
+    }
+}
+
+fn prepare_balloon_restore_plan(
+    state: SnapshotV2BalloonState,
+    memory: &GuestMemory,
+    reserve_policy: BalloonRestoreReservePolicy,
+) -> Result<SnapshotV2BalloonRestorePlan, SnapshotV2BalloonRestorePlanError> {
+    validate_balloon_state(&state).map_err(|_| SnapshotV2BalloonRestorePlanError::InvalidState)?;
+
+    let queue_layout = VirtioBalloonQueueLayout::from_config(state.config);
+    let mut restored_queue_ranges = Vec::new();
+    reserve_policy.reserve_queue_ranges(&mut restored_queue_ranges, state.virtio.queues().len())?;
+    for queue in state.virtio.queues() {
+        let Some(ranges) =
+            queue_ranges(queue).map_err(|_| SnapshotV2BalloonRestorePlanError::InvalidState)?
+        else {
+            continue;
+        };
+        if ranges
+            .iter()
+            .copied()
+            .any(|range| !range_is_wholly_contained(memory, range))
+        {
+            return Err(SnapshotV2BalloonRestorePlanError::QueueMemory);
+        }
+        restored_queue_ranges.push(ranges);
+    }
+
+    for range in state.accounting.ranges().iter().copied() {
+        let range = balloon_accounting_guest_range(range)?;
+        memory
+            .validate_mapped_range(range)
+            .map_err(|_| SnapshotV2BalloonRestorePlanError::AccountingMemory)?;
+    }
+
+    let SnapshotV2BalloonState {
+        config,
+        mut config_space,
+        continuation,
+        accounting,
+        virtio,
+        transport,
+    } = state;
+    let SnapshotV2BalloonContinuationState {
+        active_queues,
+        stats_polling_interval_s,
+        statistics,
+        statistics_pending_descriptor_head,
+        hinting,
+    } = continuation;
+
+    let mut accounting_ranges = Vec::new();
+    reserve_policy.reserve_accounting(&mut accounting_ranges, accounting.ranges.len())?;
+    for range in accounting.ranges {
+        accounting_ranges.push(
+            VirtioBalloonPfnRange::from_snapshot_parts(range.start_pfn(), range.page_count())
+                .map_err(|_| SnapshotV2BalloonRestorePlanError::Accounting)?,
+        );
+    }
+    let accounting = VirtioBalloonMemoryAccounting::from_snapshot_ranges(
+        accounting_ranges,
+        accounting.inflated_page_count,
+    )
+    .map_err(|_| SnapshotV2BalloonRestorePlanError::Accounting)?;
+
+    let active_queues = active_queues
+        .map(|active| {
+            restore_balloon_active_queues(
+                queue_layout,
+                active,
+                statistics_pending_descriptor_head,
+                &virtio,
+                memory,
+            )
+        })
+        .transpose()?;
+    let statistics = restore_balloon_statistics(statistics);
+
+    let hinting_host_cmd = if config.free_page_hinting() {
+        config_space = config_space.with_free_page_hint_cmd_id(VIRTIO_BALLOON_FREE_PAGE_HINT_DONE);
+        VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+    } else {
+        VIRTIO_BALLOON_FREE_PAGE_HINT_STOP
+    };
+    let device = VirtioBalloonDevice::from_snapshot_parts(
+        queue_layout,
+        active_queues,
+        accounting,
+        stats_polling_interval_s,
+        statistics,
+        statistics_pending_descriptor_head,
+        hinting_host_cmd,
+        hinting.guest_cmd(),
+        hinting.last_cmd(),
+        hinting.acknowledge_on_stop(),
+    )
+    .map_err(|_| SnapshotV2BalloonRestorePlanError::Device)?;
+
+    let transport = match transport {
+        SnapshotV2DeviceTransport::Mmio(mmio) => {
+            let retained = restore_mmio_transport_state_for_device_with_config_status_gate(
+                VIRTIO_BALLOON_DEVICE_ID,
+                &virtio,
+                &mmio,
+                true,
+            )
+            .map_err(|_| SnapshotV2BalloonRestorePlanError::MmioTransport)?;
+            PreparedSnapshotV2BalloonTransport::Mmio(Box::new(
+                PreparedSnapshotV2BalloonMmioTransport {
+                    region: mmio.region(),
+                    interrupt_line: mmio.interrupt_line(),
+                    device,
+                    retained,
+                },
+            ))
+        }
+        SnapshotV2DeviceTransport::Pci(pci) => {
+            let device_type = VirtioDeviceType::new(VIRTIO_BALLOON_DEVICE_ID)
+                .map_err(|_| SnapshotV2BalloonRestorePlanError::DeviceType)?;
+            let identity = VirtioPciIdentity::new(device_type, virtio.available_features())
+                .with_config_generation(virtio.config_generation());
+            let retained =
+                VirtioPciTransportState::from_snapshot_v2_parts(identity, &virtio, &pci, false)
+                    .map_err(|_| SnapshotV2BalloonRestorePlanError::PciTransport)?;
+            PreparedSnapshotV2BalloonTransport::Pci(Box::new(
+                PreparedSnapshotV2BalloonPciTransport {
+                    origin: pci.origin(),
+                    sbdf: pci.sbdf(),
+                    bar_range: pci.bar_range(),
+                    identity,
+                    device,
+                    retained,
+                },
+            ))
+        }
+    };
+
+    Ok(SnapshotV2BalloonRestorePlan {
+        config,
+        config_space,
+        queue_ranges: restored_queue_ranges,
+        transport,
+    })
+}
+
+fn balloon_accounting_guest_range(
+    range: SnapshotV2BalloonPfnRange,
+) -> Result<GuestMemoryRange, SnapshotV2BalloonRestorePlanError> {
+    let start = u64::from(range.start_pfn())
+        .checked_mul(VIRTIO_BALLOON_PAGE_SIZE)
+        .ok_or(SnapshotV2BalloonRestorePlanError::Accounting)?;
+    let size = u64::from(range.page_count())
+        .checked_mul(VIRTIO_BALLOON_PAGE_SIZE)
+        .ok_or(SnapshotV2BalloonRestorePlanError::Accounting)?;
+    GuestMemoryRange::new(GuestAddress::new(start), size)
+        .map_err(|_| SnapshotV2BalloonRestorePlanError::Accounting)
+}
+
+fn restore_balloon_active_queues(
+    layout: VirtioBalloonQueueLayout,
+    active: SnapshotV2BalloonActiveQueuesState,
+    statistics_pending_descriptor_head: Option<u16>,
+    virtio: &SnapshotV2VirtioState,
+    memory: &GuestMemory,
+) -> Result<VirtioBalloonActiveQueues, SnapshotV2BalloonRestorePlanError> {
+    let inflate = restore_balloon_queue(layout.inflate(), active.inflate(), None, virtio, memory)?;
+    let deflate = restore_balloon_queue(layout.deflate(), active.deflate(), None, virtio, memory)?;
+    let statistics = restore_optional_balloon_queue(
+        layout.statistics(),
+        active.statistics(),
+        statistics_pending_descriptor_head,
+        virtio,
+        memory,
+    )?;
+    let free_page_hinting = restore_optional_balloon_queue(
+        layout.free_page_hinting(),
+        active.free_page_hinting(),
+        None,
+        virtio,
+        memory,
+    )?;
+    let free_page_reporting = restore_optional_balloon_queue(
+        layout.free_page_reporting(),
+        active.free_page_reporting(),
+        None,
+        virtio,
+        memory,
+    )?;
+
+    VirtioBalloonActiveQueues::from_snapshot_parts(
+        layout,
+        inflate,
+        deflate,
+        statistics,
+        free_page_hinting,
+        free_page_reporting,
+    )
+    .map_err(|_| SnapshotV2BalloonRestorePlanError::QueueContinuation)
+}
+
+fn restore_optional_balloon_queue(
+    config: Option<VirtioBalloonQueueConfig>,
+    cursor: Option<SnapshotV2BalloonQueueState>,
+    statistics_pending_descriptor_head: Option<u16>,
+    virtio: &SnapshotV2VirtioState,
+    memory: &GuestMemory,
+) -> Result<Option<VirtioBalloonQueue>, SnapshotV2BalloonRestorePlanError> {
+    match (config, cursor) {
+        (Some(config), Some(cursor)) => restore_balloon_queue(
+            config,
+            cursor,
+            statistics_pending_descriptor_head,
+            virtio,
+            memory,
+        )
+        .map(Some),
+        (None, None) => Ok(None),
+        _ => Err(SnapshotV2BalloonRestorePlanError::QueueContinuation),
+    }
+}
+
+fn restore_balloon_queue(
+    config: VirtioBalloonQueueConfig,
+    cursor: SnapshotV2BalloonQueueState,
+    statistics_pending_descriptor_head: Option<u16>,
+    virtio: &SnapshotV2VirtioState,
+    memory: &GuestMemory,
+) -> Result<VirtioBalloonQueue, SnapshotV2BalloonRestorePlanError> {
+    let queue = virtio
+        .queues()
+        .get(config.index())
+        .ok_or(SnapshotV2BalloonRestorePlanError::QueueContinuation)?;
+    let queue = VirtioMmioQueueState::from_parts(
+        queue.max_size(),
+        queue.size(),
+        queue.ready(),
+        queue.descriptor_table(),
+        queue.driver_ring(),
+        queue.device_ring(),
+    );
+    let queue = VirtioBalloonQueue::from_snapshot_state(
+        &queue,
+        cursor.next_available(),
+        cursor.next_used(),
+    )
+    .map_err(|_| SnapshotV2BalloonRestorePlanError::QueueContinuation)?;
+    queue
+        .validate_snapshot_state(memory, statistics_pending_descriptor_head)
+        .map_err(|_| SnapshotV2BalloonRestorePlanError::QueueContinuation)?;
+    Ok(queue)
+}
+
+fn restore_balloon_statistics(statistics: SnapshotV2BalloonStatistics) -> BalloonOptionalStats {
+    let tags = [
+        VIRTIO_BALLOON_S_SWAP_IN,
+        VIRTIO_BALLOON_S_SWAP_OUT,
+        VIRTIO_BALLOON_S_MAJFLT,
+        VIRTIO_BALLOON_S_MINFLT,
+        VIRTIO_BALLOON_S_MEMFREE,
+        VIRTIO_BALLOON_S_MEMTOT,
+        VIRTIO_BALLOON_S_AVAIL,
+        VIRTIO_BALLOON_S_CACHES,
+        VIRTIO_BALLOON_S_HTLB_PGALLOC,
+        VIRTIO_BALLOON_S_HTLB_PGFAIL,
+        VIRTIO_BALLOON_S_OOM_KILL,
+        VIRTIO_BALLOON_S_ALLOC_STALL,
+        VIRTIO_BALLOON_S_ASYNC_SCAN,
+        VIRTIO_BALLOON_S_DIRECT_SCAN,
+        VIRTIO_BALLOON_S_ASYNC_RECLAIM,
+        VIRTIO_BALLOON_S_DIRECT_RECLAIM,
+    ];
+    let mut restored = BalloonOptionalStats::new();
+    for (tag, value) in tags.into_iter().zip(*statistics.values()) {
+        if let Some(value) = value {
+            let recorded = restored.record_stat(VirtioBalloonStat::new(tag, value));
+            debug_assert!(recorded);
+        }
+    }
+    restored
 }
 
 fn preflight_balloon_capture(
