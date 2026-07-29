@@ -2174,6 +2174,25 @@ pub(crate) fn capture_mmio_common_for_device_with_config_status_gate(
     expected_features: u64,
     expected_device_config_write_status: bool,
 ) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
+    let common = capture_mmio_common_for_device_with_queue_count_and_config_status_gate(
+        state,
+        expected_device_id,
+        expected_features,
+        1,
+        expected_device_config_write_status,
+    )?;
+    validate_virtio_state(&common, expected_features)
+        .map_err(|_| SnapshotV2DeviceGraphCaptureError::InvalidVirtioState)?;
+    Ok(common)
+}
+
+pub(crate) fn capture_mmio_common_for_device_with_queue_count_and_config_status_gate(
+    state: &VirtioMmioTransportState,
+    expected_device_id: u32,
+    expected_features: u64,
+    expected_queue_count: usize,
+    expected_device_config_write_status: bool,
+) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
     if state.requires_device_config_write_status() != expected_device_config_write_status {
         return Err(SnapshotV2DeviceGraphCaptureError::InvalidMmioState);
     }
@@ -2194,13 +2213,16 @@ pub(crate) fn capture_mmio_common_for_device_with_config_status_gate(
         intents.push(SnapshotV2InterruptIntent::Configuration);
     }
     capture_common_state(
-        *state.device_registers(),
+        CommonStateCapture {
+            registers: *state.device_registers(),
+            activated: state.is_device_activated(),
+            intents,
+            expected_device_id,
+            expected_features,
+            expected_queue_count,
+        },
         state.queues(),
         state.pending_notifications(),
-        state.is_device_activated(),
-        intents,
-        expected_device_id,
-        expected_features,
     )
 }
 
@@ -2216,11 +2238,31 @@ pub(crate) fn capture_pci_common_for_device(
     expected_device_id: u32,
     expected_features: u64,
 ) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
+    let common = capture_pci_common_for_device_with_queue_count(
+        state,
+        expected_device_id,
+        expected_features,
+        1,
+    )?;
+    validate_virtio_state(&common, expected_features)
+        .map_err(|_| SnapshotV2DeviceGraphCaptureError::InvalidVirtioState)?;
+    Ok(common)
+}
+
+pub(crate) fn capture_pci_common_for_device_with_queue_count(
+    state: &VirtioPciTransportState,
+    expected_device_id: u32,
+    expected_features: u64,
+    expected_queue_count: usize,
+) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
     if state.requires_device_config_write_status() {
         return Err(SnapshotV2DeviceGraphCaptureError::InvalidPciState);
     }
     let queue_count = state.queues().queue_count();
-    if queue_count != 1 || state.interrupt_intents().len() > 2 {
+    if queue_count != expected_queue_count
+        || expected_queue_count == 0
+        || state.interrupt_intents().len() > expected_queue_count.saturating_add(1)
+    {
         return Err(SnapshotV2DeviceGraphCaptureError::InvalidVirtioState);
     }
     let mut queues = Vec::new();
@@ -2237,7 +2279,7 @@ pub(crate) fn capture_pci_common_for_device(
         queues.push(*queue);
     }
     let pending_indices = state.queue_notifications().pending_queue_notifications();
-    if pending_indices.len() > 1 {
+    if pending_indices.len() > expected_queue_count {
         return Err(SnapshotV2DeviceGraphCaptureError::InvalidVirtioState);
     }
     let mut pending = Vec::new();
@@ -2249,6 +2291,13 @@ pub(crate) fn capture_pci_common_for_device(
             u16::try_from(index)
                 .map_err(|_| SnapshotV2DeviceGraphCaptureError::InvalidVirtioState)?,
         );
+    }
+    pending.sort_unstable();
+    if pending
+        .windows(2)
+        .any(|window| matches!(window, [first, second] if first == second))
+    {
+        return Err(SnapshotV2DeviceGraphCaptureError::InvalidVirtioState);
     }
 
     let mut intents = Vec::new();
@@ -2271,26 +2320,39 @@ pub(crate) fn capture_pci_common_for_device(
         return Err(SnapshotV2DeviceGraphCaptureError::InvalidVirtioState);
     }
     capture_common_state_from_owned_queues(
-        *state.device_registers(),
+        CommonStateCapture {
+            registers: *state.device_registers(),
+            activated: state.is_device_activated(),
+            intents,
+            expected_device_id,
+            expected_features,
+            expected_queue_count,
+        },
         queues,
         pending,
-        state.is_device_activated(),
-        intents,
-        expected_device_id,
-        expected_features,
     )
 }
 
-fn capture_common_state(
+struct CommonStateCapture {
     registers: VirtioMmioDeviceRegisters,
-    queues: &[VirtioMmioQueueState],
-    pending_notifications: &[bool],
     activated: bool,
     intents: Vec<SnapshotV2InterruptIntent>,
     expected_device_id: u32,
     expected_features: u64,
+    expected_queue_count: usize,
+}
+
+fn capture_common_state(
+    capture: CommonStateCapture,
+    queues: &[VirtioMmioQueueState],
+    pending_notifications: &[bool],
 ) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
-    if queues.len() != 1 || pending_notifications.len() != 1 || intents.len() > 2 {
+    let expected_queue_count = capture.expected_queue_count;
+    if expected_queue_count == 0
+        || queues.len() != expected_queue_count
+        || pending_notifications.len() != expected_queue_count
+        || capture.intents.len() > expected_queue_count.saturating_add(1)
+    {
         return Err(SnapshotV2DeviceGraphCaptureError::InvalidVirtioState);
     }
     let mut owned_queues = Vec::new();
@@ -2312,27 +2374,44 @@ fn capture_common_state(
             );
         }
     }
-    capture_common_state_from_owned_queues(
+    capture_common_state_from_owned_queues(capture, owned_queues, pending)
+}
+
+fn capture_common_state_from_owned_queues(
+    capture: CommonStateCapture,
+    queues: Vec<VirtioMmioQueueState>,
+    pending_notifications: Vec<u16>,
+) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
+    let CommonStateCapture {
         registers,
-        owned_queues,
-        pending,
         activated,
         intents,
         expected_device_id,
         expected_features,
-    )
-}
-
-fn capture_common_state_from_owned_queues(
-    registers: VirtioMmioDeviceRegisters,
-    queues: Vec<VirtioMmioQueueState>,
-    pending_notifications: Vec<u16>,
-    activated: bool,
-    intents: Vec<SnapshotV2InterruptIntent>,
-    expected_device_id: u32,
-    expected_features: u64,
-) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
-    if queues.len() != 1 || pending_notifications.len() > 1 || intents.len() > 2 {
+        expected_queue_count,
+    } = capture;
+    if expected_queue_count == 0
+        || queues.len() != expected_queue_count
+        || pending_notifications.len() > expected_queue_count
+        || intents.len() > expected_queue_count.saturating_add(1)
+        || pending_notifications
+            .iter()
+            .copied()
+            .any(|index| usize::from(index) >= expected_queue_count)
+        || !pending_notifications
+            .windows(2)
+            .all(|window| matches!(window, [first, second] if first < second))
+        || intents.iter().any(|intent| {
+            matches!(
+                intent,
+                SnapshotV2InterruptIntent::Queue { queue_index }
+                    if usize::from(*queue_index) >= expected_queue_count
+            )
+        })
+        || !intents
+            .windows(2)
+            .all(|window| matches!(window, [first, second] if first < second))
+    {
         return Err(SnapshotV2DeviceGraphCaptureError::InvalidVirtioState);
     }
     if registers.device_id() != expected_device_id
@@ -2365,8 +2444,6 @@ fn capture_common_state_from_owned_queues(
         pending_notifications,
         interrupt_intents: intents,
     };
-    validate_virtio_state(&state, expected_features)
-        .map_err(|_| SnapshotV2DeviceGraphCaptureError::InvalidVirtioState)?;
     Ok(state)
 }
 
@@ -2375,16 +2452,24 @@ pub(crate) fn capture_mmio_transport(
     interrupt_line: GuestInterruptLine,
     state: &VirtioMmioTransportState,
 ) -> Result<SnapshotV2MmioDeviceState, SnapshotV2DeviceGraphCaptureError> {
+    let mmio = capture_mmio_transport_parts(region, interrupt_line, state);
+    validate_mmio_state(&mmio).map_err(|_| SnapshotV2DeviceGraphCaptureError::InvalidMmioState)?;
+    Ok(mmio)
+}
+
+pub(crate) fn capture_mmio_transport_parts(
+    region: MmioRegion,
+    interrupt_line: GuestInterruptLine,
+    state: &VirtioMmioTransportState,
+) -> SnapshotV2MmioDeviceState {
     let registers = state.device_registers();
-    let mmio = SnapshotV2MmioDeviceState {
+    SnapshotV2MmioDeviceState {
         device_feature_select: registers.device_features_select(),
         driver_feature_select: registers.driver_features_select(),
         queue_select: state.queue_select(),
         region,
         interrupt_line,
-    };
-    validate_mmio_state(&mmio).map_err(|_| SnapshotV2DeviceGraphCaptureError::InvalidMmioState)?;
-    Ok(mmio)
+    }
 }
 
 fn capture_pci_transport(
@@ -2404,6 +2489,16 @@ pub(crate) fn capture_pci_transport_parts(
     bar_range: GuestMemoryRange,
     state: &VirtioPciTransportState,
 ) -> Result<SnapshotV2PciDeviceState, SnapshotV2DeviceGraphCaptureError> {
+    capture_pci_transport_parts_with_queue_count(origin, sbdf, bar_range, state, 1)
+}
+
+pub(crate) fn capture_pci_transport_parts_with_queue_count(
+    origin: StorageDeviceOrigin,
+    sbdf: PciSbdf,
+    bar_range: GuestMemoryRange,
+    state: &VirtioPciTransportState,
+    queue_count: usize,
+) -> Result<SnapshotV2PciDeviceState, SnapshotV2DeviceGraphCaptureError> {
     let guest_state = state
         .checked_configuration_guest_state(bar_range)
         .map_err(|_| SnapshotV2DeviceGraphCaptureError::InvalidPciState)?;
@@ -2418,7 +2513,7 @@ pub(crate) fn capture_pci_transport_parts(
             pending: probe.pending(),
         });
     }
-    let msix = capture_msix_state(state.msix_state())?;
+    let msix = capture_msix_state(state.msix_state(), queue_count)?;
     let pci = SnapshotV2PciDeviceState {
         phase: state.phase(),
         origin,
@@ -2533,10 +2628,16 @@ fn capture_pci_writable_bytes(
 
 fn capture_msix_state(
     state: &VirtioPciMsixState,
+    queue_count: usize,
 ) -> Result<SnapshotV2PciMsixState, SnapshotV2DeviceGraphCaptureError> {
-    if state.entries().len() != 2
-        || state.pending_words().len() != 1
-        || state.queue_vectors().len() != 1
+    let entry_count = queue_count
+        .checked_add(1)
+        .ok_or(SnapshotV2DeviceGraphCaptureError::InvalidPciState)?;
+    let pending_word_count = entry_count.div_ceil(u64::BITS as usize);
+    if queue_count == 0
+        || state.entries().len() != entry_count
+        || state.pending_words().len() != pending_word_count
+        || state.queue_vectors().len() != queue_count
     {
         return Err(SnapshotV2DeviceGraphCaptureError::InvalidPciState);
     }

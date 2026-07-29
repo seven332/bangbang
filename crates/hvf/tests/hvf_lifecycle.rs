@@ -10359,9 +10359,13 @@ fn capture_ready_network_traverses_signed_mmio_and_pci_owners() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn capture_ready_balloon_traverses_signed_mmio_and_pci_owners() {
+    use std::io::Cursor;
+
     use bangbang_hvf::{
         HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonDeviceConfig,
-        HvfArm64BootBalloonTransportState, HvfArm64BootSessionConfig, OwnedHvfArm64BootSession,
+        HvfArm64BootBalloonTransportState, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BootState, HvfSnapshotV2NativePath,
+        OwnedHvfArm64BootSession,
     };
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::balloon::{BalloonConfigInput, BalloonMmioLayout, available_features};
@@ -10371,6 +10375,7 @@ fn capture_ready_balloon_traverses_signed_mmio_and_pci_owners() {
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::snapshot_balloon_v2_9::NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION;
     use bangbang_runtime::vsock::VsockMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
@@ -10433,6 +10438,14 @@ fn capture_ready_balloon_traverses_signed_mmio_and_pci_owners() {
         available_features(balloon_config)
     );
     assert!(state.device().active_queues().is_none());
+    let mmio_snapshot = mmio_first
+        .try_to_snapshot_v2()
+        .expect("signed MMIO balloon capture should convert to exact 2.9");
+    assert_eq!(mmio_snapshot.config(), balloon_config);
+    assert_eq!(
+        mmio_snapshot.virtio().queues().len(),
+        state.device().queue_layout().queue_count()
+    );
     assert_eq!(mmio_first, mmio_second);
     assert!(!format!("{mmio_first:?}").contains("40008000"));
     assert!(matches!(
@@ -10476,8 +10489,47 @@ fn capture_ready_balloon_traverses_signed_mmio_and_pci_owners() {
         available_features(balloon_config)
     );
     assert!(state.device().active_queues().is_none());
+    assert!(
+        !state.transport().requires_device_config_write_status(),
+        "PCI balloon should retain the infallible device-config write contract"
+    );
+    assert_eq!(
+        state.transport().msix_vector_count(),
+        state.device().queue_layout().queue_count() + 1,
+        "PCI balloon should allocate one MSI-X vector per queue plus configuration"
+    );
+    let pci_snapshot = pci
+        .try_to_snapshot_v2()
+        .expect("signed PCI balloon capture should convert to exact 2.9");
+    assert_eq!(pci_snapshot.config(), balloon_config);
+    assert_eq!(
+        pci_snapshot.virtio().queues().len(),
+        state.device().queue_layout().queue_count()
+    );
     assert!(!format!("{pci:?}").contains("40008000"));
     drop(pci_guard);
+    pci_session
+        .pause_for_snapshot_v2_capture()
+        .expect("signed PCI balloon source should pause");
+    let boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+            .expect("balloon kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("balloon boot metadata should validate");
+    let mut memory_writer = Cursor::new(Vec::new());
+    let platform = pci_session
+        .capture_snapshot_v2_balloon_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            &mut memory_writer,
+            |_| false,
+        )
+        .expect("signed exact-2.9 balloon platform should capture");
+    assert_eq!(
+        platform.memory().version(),
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
+    );
     pci_session
         .shutdown()
         .expect("signed PCI balloon session should shut down");

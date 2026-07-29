@@ -6115,7 +6115,7 @@ mod tests {
     use std::io;
     use std::ptr::NonNull;
 
-    use crate::interrupt::DeviceInterruptKind;
+    use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::memory::{
         GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking,
         GuestMemoryDiscardFailureKind, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange,
@@ -6124,11 +6124,19 @@ mod tests {
         BalloonDeviceMetrics, BalloonDiscardMetrics, BalloonFreePageReportMetrics,
         SharedBalloonDeviceMetrics,
     };
-    use crate::mmio::{MmioAccessBytes, MmioDispatchOutcome, MmioOperation, MmioRegionId};
+    use crate::mmio::{
+        MmioAccessBytes, MmioDispatchOutcome, MmioOperation, MmioRegion, MmioRegionId,
+    };
+    use crate::snapshot_balloon_v2_9::{
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        NATIVE_V2_BALLOON_STATE_MAX_ACCOUNTING_RANGES, SnapshotV2BalloonState,
+        SnapshotV2BalloonStateCaptureError,
+    };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
-        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VirtioMmioDeviceActivation, VirtioMmioDeviceRegisters,
+        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioDeviceActivation, VirtioMmioDeviceRegisters,
         VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterHandlerError,
     };
     use crate::virtio_queue::{
@@ -6866,6 +6874,33 @@ mod tests {
 
     fn activate_handler(handler: &mut VirtioBalloonMmioHandler) {
         set_handler_queue_config_status(handler);
+        for queue_index in 0..handler.queue_registers().queue_count() {
+            configure_handler_queue(handler, queue_index_u32(queue_index));
+        }
+        handler
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("driver-ok status should write");
+    }
+
+    fn activate_handler_with_version_1(handler: &mut VirtioBalloonMmioHandler) {
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("acknowledge status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("driver status should write");
+        handler
+            .write_register(VirtioMmioRegister::DriverFeaturesSel, 1)
+            .expect("driver feature page should select");
+        handler
+            .write_register(VirtioMmioRegister::DriverFeatures, 1)
+            .expect("virtio 1 feature should negotiate");
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("features-ok status should write");
         for queue_index in 0..handler.queue_registers().queue_count() {
             configure_handler_queue(handler, queue_index_u32(queue_index));
         }
@@ -11339,7 +11374,7 @@ mod tests {
             .dispatcher_mut()
             .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
             .expect("balloon handler should be registered");
-        activate_handler(handler);
+        activate_handler_with_version_1(handler);
         handler
             .write_register(
                 VirtioMmioRegister::QueueNotify,
@@ -11365,7 +11400,7 @@ mod tests {
         let state = captured.device();
 
         assert_eq!(state.available_features(), available_features(config));
-        assert_eq!(state.negotiated_features(), 0);
+        assert_eq!(state.negotiated_features(), VIRTIO_MMIO_VERSION_1_FEATURE);
         assert_eq!(state.config_space().num_pages(), 64 * 256);
         assert_eq!(state.config_space().actual_pages(), 0);
         assert_eq!(state.queue_layout(), layout);
@@ -11401,6 +11436,145 @@ mod tests {
         assert_eq!(
             format!("{captured:?}"),
             "VirtioBalloonMmioCaptureState { state: \"<redacted>\" }"
+        );
+
+        let snapshot = SnapshotV2BalloonState::try_from_mmio_capture(
+            config,
+            MmioRegion::new(
+                TEST_BALLOON_MMIO_REGION_ID,
+                TEST_BALLOON_MMIO_BASE,
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .expect("balloon MMIO region should validate"),
+            GuestInterruptLine::new(48).expect("guest interrupt should validate"),
+            &captured,
+        )
+        .expect("captured balloon state should convert");
+        assert_eq!(
+            snapshot.compatibility_version(),
+            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
+        );
+        assert_eq!(snapshot.config(), config);
+        assert_eq!(snapshot.virtio().queues().len(), layout.queue_count());
+        assert_eq!(
+            snapshot.accounting().inflated_page_count(),
+            state.memory_accounting().inflated_page_count()
+        );
+        let encoded = snapshot
+            .encode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION)
+            .expect("captured balloon state should encode");
+        assert_eq!(
+            SnapshotV2BalloonState::decode(
+                NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                &encoded,
+            )
+            .expect("captured balloon state should decode"),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn inactive_balloon_mmio_capture_converts_every_two_through_five_queue_layout() {
+        let memory = pfn_descriptor_memory();
+        for config in [
+            balloon_config(64, true, 0, false, false),
+            balloon_config(64, true, 1, false, false),
+            balloon_config(64, true, 1, true, false),
+            balloon_config(64, true, 1, true, true),
+        ] {
+            let expected_layout = VirtioBalloonQueueLayout::from_config(config);
+            let mut device = balloon_mmio_device(config);
+            let handler = device
+                .dispatcher_mut()
+                .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+                .expect("balloon handler should be registered");
+            let captured = handler
+                .capture_balloon_state(config, &memory)
+                .expect("inactive balloon should be capture-ready");
+            let snapshot = SnapshotV2BalloonState::try_from_mmio_capture(
+                config,
+                MmioRegion::new(
+                    TEST_BALLOON_MMIO_REGION_ID,
+                    TEST_BALLOON_MMIO_BASE,
+                    VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+                )
+                .expect("balloon MMIO region should validate"),
+                GuestInterruptLine::new(48).expect("guest interrupt should validate"),
+                &captured,
+            )
+            .expect("inactive captured balloon should convert");
+
+            assert_eq!(
+                snapshot.virtio().queues().len(),
+                expected_layout.queue_count()
+            );
+            assert!(!snapshot.virtio().is_activated());
+            assert_eq!(snapshot.config(), config);
+            let encoded = snapshot
+                .encode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION)
+                .expect("inactive captured balloon should encode");
+            assert_eq!(
+                SnapshotV2BalloonState::decode(
+                    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                    &encoded,
+                )
+                .expect("inactive captured balloon should decode"),
+                snapshot
+            );
+        }
+    }
+
+    #[test]
+    fn balloon_snapshot_capture_rejects_accounting_overflow_before_artifact_allocation() {
+        let memory = pfn_descriptor_memory();
+        let config = balloon_config(64, true, 0, false, false);
+        let mut device = balloon_mmio_device(config);
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+        let captured = handler
+            .capture_balloon_state(config, &memory)
+            .expect("inactive balloon should be capture-ready");
+        let region = MmioRegion::new(
+            TEST_BALLOON_MMIO_REGION_ID,
+            TEST_BALLOON_MMIO_BASE,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("balloon MMIO region should validate");
+        let interrupt_line = GuestInterruptLine::new(48).expect("guest interrupt should validate");
+
+        let mut over_limit = captured.clone();
+        over_limit.device.memory_accounting.inflated_page_ranges = (0
+            ..=NATIVE_V2_BALLOON_STATE_MAX_ACCOUNTING_RANGES)
+            .map(|index| {
+                VirtioBalloonPfnRange::new(
+                    u32::try_from(index * 2).expect("test PFN should fit"),
+                    1,
+                )
+            })
+            .collect();
+        assert_eq!(
+            SnapshotV2BalloonState::try_from_mmio_capture(
+                config,
+                region,
+                interrupt_line,
+                &over_limit,
+            ),
+            Err(SnapshotV2BalloonStateCaptureError::AccountingLimit)
+        );
+
+        let mut allocation = captured;
+        allocation.device.memory_accounting.inflated_page_ranges =
+            vec![VirtioBalloonPfnRange::new(2, 1)];
+        assert_eq!(
+            SnapshotV2BalloonState::try_from_mmio_capture_with_accounting_allocation_failure(
+                config,
+                region,
+                interrupt_line,
+                &allocation,
+            ),
+            Err(SnapshotV2BalloonStateCaptureError::Allocation)
         );
     }
 

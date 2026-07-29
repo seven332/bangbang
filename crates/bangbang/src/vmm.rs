@@ -39,8 +39,8 @@ use bangbang_hvf::{
     HvfArm64BootVsockCaptureError, HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState,
     HvfBackend, HvfSnapshotV1Bundle, HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup,
     HvfSnapshotV1RestoreDisposition, HvfSnapshotV1RestoreError, HvfSnapshotV1State,
-    HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2DecodeError,
-    HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2EncodeError,
+    HvfSnapshotV2BalloonState, HvfSnapshotV2BootState, HvfSnapshotV2BuildError,
+    HvfSnapshotV2DecodeError, HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2EncodeError,
     HvfSnapshotV2EntropyMmioRestoreError, HvfSnapshotV2EntropyPciEndpointPlan,
     HvfSnapshotV2EntropyPciRestoreError, HvfSnapshotV2EntropyState,
     HvfSnapshotV2MultiBlockMmioRestoreError, HvfSnapshotV2MultiBlockPciRestoreError,
@@ -62,10 +62,11 @@ use bangbang_hvf::{
     decode_hvf_snapshot_v2_entropy_state, decode_hvf_snapshot_v2_multi_block_state,
     decode_hvf_snapshot_v2_platform_state, decode_hvf_snapshot_v2_serial_state,
     decode_hvf_snapshot_v2_state, decode_hvf_snapshot_v2_storage_state,
-    encode_hvf_snapshot_v2_entropy_state, encode_hvf_snapshot_v2_multi_block_state,
-    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
-    encode_hvf_snapshot_v2_storage_state, prepare_hvf_snapshot_v2_multi_block_platform_plan,
-    prepare_hvf_snapshot_v2_root_plan, prepare_hvf_snapshot_v2_serial_entropy_pci_platform_plan,
+    encode_hvf_snapshot_v2_balloon_state, encode_hvf_snapshot_v2_entropy_state,
+    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_serial_state,
+    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
+    prepare_hvf_snapshot_v2_multi_block_platform_plan, prepare_hvf_snapshot_v2_root_plan,
+    prepare_hvf_snapshot_v2_serial_entropy_pci_platform_plan,
     prepare_hvf_snapshot_v2_storage_entropy_mmio_platform_plan,
     prepare_hvf_snapshot_v2_storage_entropy_pci_platform_plan,
     prepare_hvf_snapshot_v2_storage_mmio_platform_plan,
@@ -143,18 +144,21 @@ use bangbang_runtime::snapshot_artifact::SnapshotStagingTracker;
 use bangbang_runtime::snapshot_artifact::{
     LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactFamily, NativeSnapshotArtifactState,
     NativeSnapshotArtifactStateError, NativeSnapshotPublicationOutcome,
-    NativeV2EntropySnapshotCandidateState, NativeV2MultiBlockSnapshotCandidateState,
-    NativeV2SerialSnapshotCandidateState, NativeV2SnapshotArtifactProfile,
-    NativeV2SnapshotCandidateState, NativeV2SnapshotCandidateStateError,
-    NativeV2StorageSnapshotCandidateState, PreparedNativeSnapshotState, SnapshotArtifactLoadError,
-    SnapshotArtifactOutput, SnapshotArtifactOutputs, SnapshotArtifactPaths,
-    SnapshotCommitDurability, SnapshotMemoryStagingWriter, SnapshotPublicationOutcome,
-    SnapshotPublicationTransactionError, load_prepared_native_snapshot_memory_file,
-    load_prepared_native_snapshot_memory_path, load_snapshot_artifacts,
-    prepare_native_snapshot_state_file, prepare_native_snapshot_state_path,
-    prepare_snapshot_state_file, prepare_snapshot_state_path,
+    NativeV2BalloonSnapshotCandidateState, NativeV2EntropySnapshotCandidateState,
+    NativeV2MultiBlockSnapshotCandidateState, NativeV2SerialSnapshotCandidateState,
+    NativeV2SnapshotArtifactProfile, NativeV2SnapshotCandidateState,
+    NativeV2SnapshotCandidateStateError, NativeV2StorageSnapshotCandidateState,
+    PreparedNativeSnapshotState, SnapshotArtifactLoadError, SnapshotArtifactOutput,
+    SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotCommitDurability,
+    SnapshotMemoryStagingWriter, SnapshotPublicationOutcome, SnapshotPublicationTransactionError,
+    load_prepared_native_snapshot_memory_file, load_prepared_native_snapshot_memory_path,
+    load_snapshot_artifacts, prepare_native_snapshot_state_file,
+    prepare_native_snapshot_state_path, prepare_snapshot_state_file, prepare_snapshot_state_path,
     publish_native_snapshot_artifacts_to_with, publish_native_snapshot_artifacts_with,
     publish_snapshot_artifacts_to_with, publish_snapshot_artifacts_with,
+};
+use bangbang_runtime::snapshot_balloon_v2_9::{
+    SnapshotV2BalloonState, SnapshotV2BalloonStateCaptureError,
 };
 use bangbang_runtime::snapshot_commit::{SnapshotCommitKind, SnapshotCommitRecord};
 use bangbang_runtime::snapshot_device::SnapshotV1DeviceState;
@@ -736,6 +740,13 @@ enum NativeV2SnapshotCaptureProfile {
         storage_configs: CaptureReadyStorageConfigs,
         expected_transport: SnapshotV2DeviceTransportKind,
     },
+    Balloon {
+        serial: SnapshotV2SerialState,
+        balloon_config: Option<BalloonConfig>,
+        entropy_config: Option<EntropyConfig>,
+        storage_configs: CaptureReadyStorageConfigs,
+        expected_transport: SnapshotV2DeviceTransportKind,
+    },
 }
 
 struct NativeV2RootCandidateProductProfile {
@@ -1069,6 +1080,7 @@ impl std::error::Error for NativeV2RootCandidateProcessError {
 pub(crate) enum NativeV2SnapshotCaptureStage {
     Source,
     TopologyPause,
+    Balloon,
     Device(HvfArm64BootStorageCaptureStage),
     Memory(SnapshotV2MemoryIoStage),
     Encode,
@@ -1081,6 +1093,7 @@ impl fmt::Display for NativeV2SnapshotCaptureStage {
         match self {
             Self::Source => formatter.write_str("source admission"),
             Self::TopologyPause => formatter.write_str("topology pause"),
+            Self::Balloon => formatter.write_str("balloon capture"),
             Self::Device(stage) => write!(formatter, "device/{stage:?}"),
             Self::Memory(stage) => write!(formatter, "memory/{stage}"),
             Self::Encode => formatter.write_str("state encode"),
@@ -1120,6 +1133,9 @@ pub(crate) enum NativeV2SnapshotCaptureError {
     },
     Entropy {
         source: NativeV2SnapshotEntropyCaptureError,
+    },
+    Balloon {
+        source: NativeV2SnapshotBalloonCaptureError,
     },
     TopologyPause {
         source: HvfArm64BootVcpuError,
@@ -1161,6 +1177,7 @@ impl NativeV2SnapshotCaptureError {
             | Self::TransportCapacity
             | Self::NonCanonicalSerial
             | Self::Entropy { .. }
+            | Self::Balloon { .. }
             | Self::Encode { .. }
             | Self::Compose { .. }
             | Self::CandidateState { .. }
@@ -1371,6 +1388,45 @@ impl std::error::Error for NativeV2SnapshotEntropyCaptureError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum NativeV2SnapshotBalloonCaptureError {
+    Live {
+        source: HvfArm64BootBalloonCaptureError,
+    },
+    State {
+        source: SnapshotV2BalloonStateCaptureError,
+    },
+    Transport {
+        expected: SnapshotV2DeviceTransportKind,
+        actual: SnapshotV2DeviceTransportKind,
+    },
+}
+
+impl fmt::Display for NativeV2SnapshotBalloonCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Live { source } => write!(formatter, "balloon owner capture failed: {source}"),
+            Self::State { source } => {
+                write!(formatter, "captured balloon state is invalid: {source}")
+            }
+            Self::Transport { expected, actual } => write!(
+                formatter,
+                "captured balloon transport {actual:?} does not match product transport {expected:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NativeV2SnapshotBalloonCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Live { source } => Some(source),
+            Self::State { source } => Some(source),
+            Self::Transport { .. } => None,
+        }
+    }
+}
+
 fn native_v2_platform_capture_is_terminal(source: &HvfArm64BootSnapshotV2CaptureError) -> bool {
     match source {
         HvfArm64BootSnapshotV2CaptureError::Topology { .. }
@@ -1435,6 +1491,9 @@ impl fmt::Display for NativeV2SnapshotCaptureError {
             Self::Entropy { source } => {
                 write!(formatter, "native-v2 entropy capture failed: {source}")
             }
+            Self::Balloon { source } => {
+                write!(formatter, "native-v2 balloon capture failed: {source}")
+            }
             Self::TopologyPause { source } => {
                 write!(formatter, "native-v2 topology pause failed: {source}")
             }
@@ -1475,6 +1534,7 @@ impl std::error::Error for NativeV2SnapshotCaptureError {
             Self::MultiBlock { source } => Some(source),
             Self::Storage { source } => Some(source),
             Self::Entropy { source } => Some(source),
+            Self::Balloon { source } => Some(source),
             Self::TopologyPause { source } => Some(source),
             Self::Platform { source } => Some(source),
             Self::Encode { source } => Some(source),
@@ -12328,6 +12388,17 @@ struct NativeV2EntropyCandidateCaptureRequest {
     cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
+struct NativeV2BalloonCandidateCaptureRequest {
+    input: HvfArm64BootSnapshotV2CaptureInput,
+    serial_config: SerialConfig,
+    balloon_config: Option<BalloonConfig>,
+    entropy_config: Option<EntropyConfig>,
+    storage_configs: CaptureReadyStorageConfigs,
+    expected_transport: SnapshotV2DeviceTransportKind,
+    output: BoxedNativeV2SnapshotMemoryOutput,
+    cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
 impl SnapshotCaptureCancellation {
     fn begin_operation(&self) -> bool {
         if self.state.shutdown_requested.load(Ordering::Acquire) {
@@ -12526,6 +12597,7 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     type StorageState: Send + 'static;
     type SerialState: Send + 'static;
     type EntropyState: Send + 'static;
+    type BalloonState: Send + 'static;
 
     fn capture_native_v2_serial(
         &self,
@@ -12540,6 +12612,14 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
         guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
         now: Instant,
     ) -> Result<Option<SnapshotV2EntropyState>, NativeV2SnapshotEntropyCaptureError>;
+
+    fn capture_native_v2_balloon(
+        &self,
+        config: Option<BalloonConfig>,
+        expected_transport: SnapshotV2DeviceTransportKind,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        now: Instant,
+    ) -> Result<Option<SnapshotV2BalloonState>, NativeV2SnapshotBalloonCaptureError>;
 
     fn pause_native_v2_topology(&mut self) -> Result<(), HvfArm64BootVcpuError>;
 
@@ -12605,6 +12685,13 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
         cancellation: &NativeV2SnapshotCaptureCancellation,
     ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError>;
 
+    fn capture_native_v2_balloon_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError>;
+
     fn compose_native_v2_root(
         &self,
         platform: Self::PlatformState,
@@ -12661,6 +12748,20 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     fn encode_native_v2_entropy(
         &self,
         state: &Self::EntropyState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
+
+    fn compose_native_v2_balloon(
+        &self,
+        platform: Self::PlatformState,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+    ) -> Result<Self::BalloonState, HvfSnapshotV2BuildError>;
+
+    fn encode_native_v2_balloon(
+        &self,
+        state: &Self::BalloonState,
     ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
 
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError>;
@@ -13102,6 +13203,7 @@ where
     type StorageState = HvfSnapshotV2StorageState;
     type SerialState = HvfSnapshotV2SerialState;
     type EntropyState = HvfSnapshotV2EntropyState;
+    type BalloonState = HvfSnapshotV2BalloonState;
 
     fn capture_native_v2_serial(
         &self,
@@ -13128,6 +13230,31 @@ where
             let actual = state.transport().kind();
             if actual != expected_transport {
                 return Err(NativeV2SnapshotEntropyCaptureError::Transport {
+                    expected: expected_transport,
+                    actual,
+                });
+            }
+        }
+        Ok(state)
+    }
+
+    fn capture_native_v2_balloon(
+        &self,
+        config: Option<BalloonConfig>,
+        expected_transport: SnapshotV2DeviceTransportKind,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        _now: Instant,
+    ) -> Result<Option<SnapshotV2BalloonState>, NativeV2SnapshotBalloonCaptureError> {
+        let state = self
+            .capture_ready_balloon_state(config, guard)
+            .map_err(|source| NativeV2SnapshotBalloonCaptureError::Live { source })?
+            .map(|captured| captured.try_to_snapshot_v2())
+            .transpose()
+            .map_err(|source| NativeV2SnapshotBalloonCaptureError::State { source })?;
+        if let Some(state) = &state {
+            let actual = state.transport().kind();
+            if actual != expected_transport {
+                return Err(NativeV2SnapshotBalloonCaptureError::Transport {
                     expected: expected_transport,
                     actual,
                 });
@@ -13333,6 +13460,18 @@ where
             })
     }
 
+    fn capture_native_v2_balloon_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        self.session
+            .capture_snapshot_v2_balloon_platform_with_cancel(input, output, |_| {
+                cancellation.is_cancelled()
+            })
+    }
+
     fn compose_native_v2_root(
         &self,
         platform: Self::PlatformState,
@@ -13409,6 +13548,24 @@ where
         state: &Self::EntropyState,
     ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
         encode_hvf_snapshot_v2_entropy_state(state)
+    }
+
+    fn compose_native_v2_balloon(
+        &self,
+        platform: Self::PlatformState,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+    ) -> Result<Self::BalloonState, HvfSnapshotV2BuildError> {
+        HvfSnapshotV2BalloonState::try_new(platform, graph, serial, entropy, balloon)
+    }
+
+    fn encode_native_v2_balloon(
+        &self,
+        state: &Self::BalloonState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+        encode_hvf_snapshot_v2_balloon_state(state)
     }
 
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
@@ -18683,6 +18840,30 @@ fn preflight_native_v2_entropy_capture(
     Ok(())
 }
 
+fn preflight_native_v2_balloon_capture(
+    serial_config: &SerialConfig,
+    balloon_config: Option<BalloonConfig>,
+    entropy_config: Option<EntropyConfig>,
+    storage_configs: &CaptureReadyStorageConfigs,
+    expected_transport: SnapshotV2DeviceTransportKind,
+) -> Result<(), NativeV2SnapshotCaptureError> {
+    preflight_native_v2_serial_capture(serial_config, storage_configs)?;
+    let storage_count = storage_configs
+        .drives()
+        .len()
+        .checked_add(storage_configs.pmem().len())
+        .ok_or(NativeV2SnapshotCaptureError::TransportCapacity)?;
+    let endpoint_count = storage_count
+        .checked_add(usize::from(balloon_config.is_some()))
+        .and_then(|count| count.checked_add(usize::from(entropy_config.is_some())))
+        .ok_or(NativeV2SnapshotCaptureError::TransportCapacity)?;
+    let pci_capacity = usize::from(PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1);
+    if expected_transport == SnapshotV2DeviceTransportKind::Pci && endpoint_count > pci_capacity {
+        return Err(NativeV2SnapshotCaptureError::TransportCapacity);
+    }
+    Ok(())
+}
+
 fn capture_canonical_native_v2_serial<S>(
     session: &S,
     serial_config: SerialConfig,
@@ -18957,6 +19138,75 @@ where
                     .map_err(|source| NativeV2SnapshotCaptureError::Compose { source })?;
                 session
                     .encode_native_v2_entropy(&state)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Encode { source })?
+            }
+            NativeV2SnapshotCaptureProfile::Balloon {
+                serial,
+                balloon_config,
+                entropy_config,
+                storage_configs,
+                expected_transport,
+            } => {
+                let now = Instant::now();
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Balloon,
+                    ));
+                }
+                let balloon = session
+                    .capture_native_v2_balloon(balloon_config, expected_transport, guard, now)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Balloon { source })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Balloon,
+                    ));
+                }
+                let graph =
+                    if storage_configs.drives().is_empty() && storage_configs.pmem().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            session
+                                .capture_native_v2_storage(
+                                    &storage_configs,
+                                    expected_transport,
+                                    guard,
+                                    now,
+                                    cancellation,
+                                )
+                                .map_err(|source| match source {
+                                    NativeV2SnapshotStorageCaptureError::Cancelled { stage } => {
+                                        native_v2_snapshot_cancelled(
+                                            NativeV2SnapshotCaptureStage::Device(stage),
+                                        )
+                                    }
+                                    source => NativeV2SnapshotCaptureError::Storage { source },
+                                })?,
+                        )
+                    };
+                let entropy = session
+                    .capture_native_v2_entropy(entropy_config, expected_transport, guard, now)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Entropy { source })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Memory(
+                            SnapshotV2MemoryIoStage::InitialPosition,
+                        ),
+                    ));
+                }
+                let platform = session
+                    .capture_native_v2_balloon_platform(input, &mut output, cancellation)
+                    .map_err(native_v2_platform_capture_error)?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Encode,
+                    ));
+                }
+                let state = session
+                    .compose_native_v2_balloon(platform, graph, serial, entropy, balloon)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Compose { source })?;
+                session
+                    .encode_native_v2_balloon(&state)
                     .map_err(|source| NativeV2SnapshotCaptureError::Encode { source })?
             }
         };
@@ -19346,6 +19596,137 @@ where
         .map_err(native_v2_snapshot_publication_error_from_boot_run_loop_command)
     }
 
+    fn capture_native_v2_balloon_candidate(
+        &self,
+        request: NativeV2BalloonCandidateCaptureRequest,
+    ) -> Result<
+        NativeV2BalloonSnapshotCandidateState,
+        Box<NativeV2SnapshotPublicationTransactionError>,
+    > {
+        let NativeV2BalloonCandidateCaptureRequest {
+            input,
+            serial_config,
+            balloon_config,
+            entropy_config,
+            storage_configs,
+            expected_transport,
+            output,
+            cancellation,
+        } = request;
+        preflight_native_v2_balloon_capture(
+            &serial_config,
+            balloon_config,
+            entropy_config,
+            &storage_configs,
+            expected_transport,
+        )
+        .map_err(native_v2_snapshot_transaction_error_before_staging)?;
+        let active_capture = self
+            .register_snapshot_capture_raw(cancellation.clone())
+            .map_err(|source| {
+                native_v2_snapshot_transaction_error_before_staging(
+                    NativeV2SnapshotCaptureError::Supervisor { source },
+                )
+            })?;
+        if !cancellation.begin_operation() {
+            return Err(native_v2_snapshot_transaction_error_before_staging(
+                native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Source),
+            ));
+        }
+        let completion_cancellation = cancellation.clone();
+        let preserve_terminal_result = Arc::new(AtomicBool::new(false));
+        let completion_terminal_result = Arc::clone(&preserve_terminal_result);
+        let terminal_status = Arc::clone(&self.status);
+        let terminal_admission = Arc::clone(&self.admission);
+        let terminal_pause_gate = Arc::clone(&self.pause_gate);
+
+        self.run_snapshot_quiesced_preserving_result_if(
+            move |session| {
+                let _active_capture = active_capture;
+                let guard = session
+                    .quiesce_snapshot_auxiliary_work()
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Auxiliary { source },
+                        )
+                    })?;
+                if cancellation.is_cancelled() {
+                    drop(guard);
+                    return Err(native_v2_snapshot_transaction_error_before_staging(
+                        native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Source),
+                    ));
+                }
+                let serial = session
+                    .capture_native_v2_serial(serial_config, &guard)
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Serial { source },
+                        )
+                    })?;
+                let serial =
+                    SnapshotV2SerialState::try_from_capture_ready(serial).map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::SerialState { source },
+                        )
+                    })?;
+
+                let result = capture_and_recover_native_v2_state(
+                    session,
+                    input,
+                    NativeV2SnapshotCaptureProfile::Balloon {
+                        serial,
+                        balloon_config,
+                        entropy_config,
+                        storage_configs,
+                        expected_transport,
+                    },
+                    &guard,
+                    output,
+                    &cancellation,
+                    |encoded| {
+                        NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(encoded)
+                            .map_err(|source| NativeV2SnapshotCaptureError::CandidateState {
+                                source,
+                            })
+                    },
+                )
+                .map_err(native_v2_snapshot_transaction_error_before_staging)
+                .and_then(|state| {
+                    if cancellation.is_cancelled() || !cancellation.try_seal_commit() {
+                        Err(native_v2_snapshot_transaction_error_before_staging(
+                            native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::CommitSeal),
+                        ))
+                    } else {
+                        session.native_v2_candidate_commit_sealed();
+                        Ok(state)
+                    }
+                });
+
+                let terminal_capture = result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.producer())
+                    .is_some_and(|producer| producer.source().is_terminal());
+                if terminal_capture {
+                    preserve_terminal_result.store(true, Ordering::Release);
+                    terminal_status.record(BootRunLoopWorkerStatus::Failed(
+                        "terminal native-v2 capture failure".to_string(),
+                    ));
+                    terminal_admission.shutdown();
+                    terminal_pause_gate.shutdown();
+                    let _ = session.run_loop_control().request_stop();
+                }
+                drop(guard);
+                result
+            },
+            move || {
+                completion_cancellation.is_commit_sealed()
+                    || completion_terminal_result.load(Ordering::Acquire)
+            },
+        )
+        .map_err(native_v2_snapshot_publication_error_from_boot_run_loop_command)
+    }
+
     fn publish_native_v2_snapshot_to_destination(
         &self,
         request: NativeV2SnapshotPublicationRequest,
@@ -19521,6 +19902,17 @@ type HvfNativeV2EntropyCandidateCapture = fn(
 
 const _: HvfNativeV2EntropyCandidateCapture =
     HvfBootRunLoopSupervisor::capture_native_v2_entropy_candidate;
+
+type HvfNativeV2BalloonCandidateCapture = fn(
+    &HvfBootRunLoopSupervisor,
+    NativeV2BalloonCandidateCaptureRequest,
+) -> Result<
+    NativeV2BalloonSnapshotCandidateState,
+    Box<NativeV2SnapshotPublicationTransactionError>,
+>;
+
+const _: HvfNativeV2BalloonCandidateCapture =
+    HvfBootRunLoopSupervisor::capture_native_v2_balloon_candidate;
 
 fn native_v1_snapshot_cancelled(
     stage: NativeV1SnapshotCaptureStage,
@@ -20709,7 +21101,10 @@ mod tests {
         NativeSnapshotArtifactFamily, NativeV2SnapshotCandidateState, SnapshotArtifactOutput,
         SnapshotCommitDurability, load_native_snapshot_artifacts, load_snapshot_artifacts,
     };
-    use bangbang_runtime::snapshot_balloon_v2_9::NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION;
+    use bangbang_runtime::snapshot_balloon_v2_9::{
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, SnapshotV2BalloonState,
+        SnapshotV2BalloonStateCaptureError,
+    };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_commit::SnapshotCommitKind;
     use bangbang_runtime::snapshot_commit::SnapshotCommitRecord;
@@ -20728,10 +21123,10 @@ mod tests {
         SnapshotV2EntropyStateCaptureError,
     };
     use bangbang_runtime::snapshot_format_v2::{
-        NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_ENTROPY_COMPONENT_KEY,
-        NATIVE_V2_LEGACY_PLATFORM_VERSION, NATIVE_V2_MEMORY_COMPONENT_KEY,
-        NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
-        decode_snapshot_v2_state_with_compatibility_version,
+        NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+        NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
+        NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component,
+        SnapshotV2ComponentDisposition, decode_snapshot_v2_state_with_compatibility_version,
         encode_snapshot_v2_state_with_compatibility_version,
     };
     use bangbang_runtime::snapshot_memory::{SnapshotMemoryBinding, write_snapshot_memory_image};
@@ -20806,9 +21201,10 @@ mod tests {
         NativeV1SnapshotCaptureError, NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage,
         NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
         NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
-        NativeV2EntropyCandidateCaptureRequest, NativeV2EntropyCandidateProfileError,
-        NativeV2MultiBlockCandidateProfileError, NativeV2RootCandidateProcessError,
-        NativeV2RootCandidateProfileError, NativeV2SerialCandidateProfileError,
+        NativeV2BalloonCandidateCaptureRequest, NativeV2EntropyCandidateCaptureRequest,
+        NativeV2EntropyCandidateProfileError, NativeV2MultiBlockCandidateProfileError,
+        NativeV2RootCandidateProcessError, NativeV2RootCandidateProfileError,
+        NativeV2SerialCandidateProfileError, NativeV2SnapshotBalloonCaptureError,
         NativeV2SnapshotCaptureCancellation, NativeV2SnapshotCaptureError,
         NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
         NativeV2SnapshotEntropyCaptureError, NativeV2SnapshotLoadError,
@@ -23538,6 +23934,15 @@ mod tests {
         entropy: Option<SnapshotV2EntropyState>,
     }
 
+    #[derive(Debug)]
+    struct FakeNativeV2BalloonState {
+        binding: SnapshotV2MemoryBinding,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FakeNativeV2RootFailure {
         Inventory,
@@ -23658,11 +24063,15 @@ mod tests {
         native_v2_serial_state: Option<bangbang_runtime::serial::SerialMmioCaptureState>,
         native_v2_serial_wrong_owner: bool,
         native_v2_entropy_state: Option<SnapshotV2EntropyState>,
+        native_v2_balloon_state: Option<SnapshotV2BalloonState>,
         native_v2_pause_error: bool,
         native_v2_recovery_error: bool,
         native_v2_root_transport: Option<SnapshotV2DeviceTransportKind>,
         native_v2_root_failure: Option<FakeNativeV2RootFailure>,
         native_v2_invalid_candidate_state: bool,
+        native_v2_balloon_encode_error: bool,
+        native_v2_cancel_after_pause: Option<NativeV2SnapshotCaptureCancellation>,
+        native_v2_cancel_during_balloon: Option<NativeV2SnapshotCaptureCancellation>,
         native_v2_cancel_during_recovery: Option<NativeV2SnapshotCaptureCancellation>,
         native_v2_topology_generation: u64,
         native_v2_generation_events: Arc<Mutex<Vec<(&'static str, u64)>>>,
@@ -23726,11 +24135,15 @@ mod tests {
                 native_v2_serial_state: None,
                 native_v2_serial_wrong_owner: false,
                 native_v2_entropy_state: None,
+                native_v2_balloon_state: None,
                 native_v2_pause_error: false,
                 native_v2_recovery_error: false,
                 native_v2_root_transport: Some(SnapshotV2DeviceTransportKind::Mmio),
                 native_v2_root_failure: None,
                 native_v2_invalid_candidate_state: false,
+                native_v2_balloon_encode_error: false,
+                native_v2_cancel_after_pause: None,
+                native_v2_cancel_during_balloon: None,
                 native_v2_cancel_during_recovery: None,
                 native_v2_topology_generation: 0,
                 native_v2_generation_events: Arc::default(),
@@ -23838,6 +24251,11 @@ mod tests {
             self
         }
 
+        fn with_native_v2_balloon_state(mut self, state: SnapshotV2BalloonState) -> Self {
+            self.native_v2_balloon_state = Some(state);
+            self
+        }
+
         #[cfg(target_os = "macos")]
         const fn with_native_v2_pause_error(mut self) -> Self {
             self.native_v2_pause_error = true;
@@ -23865,6 +24283,30 @@ mod tests {
 
         fn with_native_v2_invalid_candidate_state(mut self) -> Self {
             self.native_v2_invalid_candidate_state = true;
+            self
+        }
+
+        #[cfg(target_os = "macos")]
+        const fn with_native_v2_balloon_encode_error(mut self) -> Self {
+            self.native_v2_balloon_encode_error = true;
+            self
+        }
+
+        #[cfg(target_os = "macos")]
+        fn with_native_v2_cancel_after_pause(
+            mut self,
+            cancellation: NativeV2SnapshotCaptureCancellation,
+        ) -> Self {
+            self.native_v2_cancel_after_pause = Some(cancellation);
+            self
+        }
+
+        #[cfg(target_os = "macos")]
+        fn with_native_v2_cancel_during_balloon(
+            mut self,
+            cancellation: NativeV2SnapshotCaptureCancellation,
+        ) -> Self {
+            self.native_v2_cancel_during_balloon = Some(cancellation);
             self
         }
 
@@ -24479,6 +24921,7 @@ mod tests {
         type StorageState = FakeNativeV2StorageState;
         type SerialState = FakeNativeV2SerialState;
         type EntropyState = FakeNativeV2EntropyState;
+        type BalloonState = FakeNativeV2BalloonState;
 
         fn capture_native_v2_serial(
             &self,
@@ -24542,6 +24985,42 @@ mod tests {
             Ok(state)
         }
 
+        fn capture_native_v2_balloon(
+            &self,
+            config: Option<BalloonConfig>,
+            expected_transport: SnapshotV2DeviceTransportKind,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+            now: Instant,
+        ) -> Result<Option<SnapshotV2BalloonState>, NativeV2SnapshotBalloonCaptureError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-balloon");
+            self.native_v2_capture_instants
+                .lock()
+                .expect("fake native-v2 capture instants should lock")
+                .push(("balloon", now));
+            let state = self.native_v2_balloon_state.clone();
+            if state.as_ref().map(SnapshotV2BalloonState::config) != config {
+                return Err(NativeV2SnapshotBalloonCaptureError::State {
+                    source: SnapshotV2BalloonStateCaptureError::Device,
+                });
+            }
+            if let Some(state) = &state {
+                let actual = state.transport().kind();
+                if actual != expected_transport {
+                    return Err(NativeV2SnapshotBalloonCaptureError::Transport {
+                        expected: expected_transport,
+                        actual,
+                    });
+                }
+            }
+            if let Some(cancellation) = &self.native_v2_cancel_during_balloon {
+                cancellation.cancel();
+            }
+            Ok(state)
+        }
+
         fn pause_native_v2_topology(&mut self) -> Result<(), HvfArm64BootVcpuError> {
             self.native_snapshot_events
                 .lock()
@@ -24560,6 +25039,9 @@ mod tests {
                     .lock()
                     .expect("fake native-v2 generations should lock")
                     .push(("pause", self.native_v2_topology_generation));
+                if let Some(cancellation) = &self.native_v2_cancel_after_pause {
+                    cancellation.cancel();
+                }
                 Ok(())
             }
         }
@@ -24882,6 +25364,41 @@ mod tests {
                 memory,
                 output,
                 NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                |_| cancellation.is_cancelled(),
+            )
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
+            if let Some(cancel) = &self.native_snapshot_cancel_before_seal {
+                cancel.cancel();
+            }
+            Ok(binding)
+        }
+
+        fn capture_native_v2_balloon_platform(
+            &mut self,
+            _input: HvfArm64BootSnapshotV2CaptureInput,
+            output: &mut super::BoxedNativeV2SnapshotMemoryOutput,
+            cancellation: &NativeV2SnapshotCaptureCancellation,
+        ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+            assert!(
+                !self.native_snapshot_panic,
+                "fake native-v2 snapshot capture panic"
+            );
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-balloon-platform");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("platform", self.native_v2_topology_generation));
+            let memory = self
+                .native_snapshot_memory
+                .as_ref()
+                .expect("fake native-v2 memory should be configured");
+            let binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+                memory,
+                output,
+                NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
                 |_| cancellation.is_cancelled(),
             )
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
@@ -25248,6 +25765,122 @@ mod tests {
             }
             encode_snapshot_v2_state_with_compatibility_version(
                 NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                &[],
+                &components,
+            )
+            .map_err(HvfSnapshotV2EncodeError::Container)
+        }
+
+        fn compose_native_v2_balloon(
+            &self,
+            platform: Self::PlatformState,
+            graph: Option<SnapshotV2StorageDeviceGraph>,
+            serial: SnapshotV2SerialState,
+            entropy: Option<SnapshotV2EntropyState>,
+            balloon: Option<SnapshotV2BalloonState>,
+        ) -> Result<Self::BalloonState, HvfSnapshotV2BuildError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-balloon-compose");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("compose", self.native_v2_topology_generation));
+            Ok(FakeNativeV2BalloonState {
+                binding: platform,
+                graph,
+                serial,
+                entropy,
+                balloon,
+            })
+        }
+
+        fn encode_native_v2_balloon(
+            &self,
+            state: &Self::BalloonState,
+        ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-balloon-encode");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("encode", self.native_v2_topology_generation));
+            if self.native_v2_balloon_encode_error {
+                return Err(HvfSnapshotV2EncodeError::LengthOverflow);
+            }
+            let memory = state
+                .binding
+                .encode()
+                .map_err(HvfSnapshotV2EncodeError::Memory)?;
+            let graph = state
+                .graph
+                .as_ref()
+                .map(|graph| {
+                    graph
+                        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::StorageDeviceGraph)
+                })
+                .transpose()?;
+            let serial = state
+                .serial
+                .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+                .map_err(HvfSnapshotV2EncodeError::SerialState)?;
+            let entropy = state
+                .entropy
+                .as_ref()
+                .map(|entropy| {
+                    entropy
+                        .encode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::EntropyState)
+                })
+                .transpose()?;
+            let balloon = state
+                .balloon
+                .as_ref()
+                .map(|balloon| {
+                    balloon
+                        .encode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::BalloonState)
+                })
+                .transpose()?;
+            let mut components = vec![SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &memory,
+            )];
+            if let Some(graph) = graph.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    graph,
+                ));
+            }
+            if !self.native_v2_invalid_candidate_state {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_SERIAL_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    &serial,
+                ));
+            }
+            if let Some(entropy) = entropy.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_ENTROPY_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    entropy,
+                ));
+            }
+            if let Some(balloon) = balloon.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_BALLOON_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    balloon,
+                ));
+            }
+            encode_snapshot_v2_state_with_compatibility_version(
+                NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
                 &[],
                 &components,
             )
@@ -26270,6 +26903,25 @@ mod tests {
             &fixture_hex_bytes(hex),
         )
         .expect("fake native-v2 entropy fixture should decode")
+    }
+
+    fn fake_native_v2_balloon_state(
+        transport: SnapshotV2DeviceTransportKind,
+    ) -> SnapshotV2BalloonState {
+        let hex = match transport {
+            SnapshotV2DeviceTransportKind::Mmio => {
+                include_str!("../../runtime/src/snapshot_balloon_v2_9/fixtures/inactive-mmio.hex")
+            }
+            SnapshotV2DeviceTransportKind::Pci => {
+                include_str!("../../runtime/src/snapshot_balloon_v2_9/fixtures/active-pci.hex")
+            }
+        };
+        let hex = hex.split_whitespace().collect::<String>();
+        SnapshotV2BalloonState::decode(
+            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+            &fixture_hex_bytes(&hex),
+        )
+        .expect("fake native-v2 balloon fixture should decode")
     }
 
     fn fixture_hex_bytes(hex: &str) -> Vec<u8> {
@@ -41192,6 +41844,466 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn native_v2_balloon_candidate_captures_all_products_in_source_order() {
+        for transport in [
+            SnapshotV2DeviceTransportKind::Mmio,
+            SnapshotV2DeviceTransportKind::Pci,
+        ] {
+            for (has_storage, has_entropy, has_balloon) in [
+                (false, false, false),
+                (true, false, false),
+                (false, true, false),
+                (true, true, false),
+                (false, false, true),
+                (true, false, true),
+                (false, true, true),
+                (true, true, true),
+            ] {
+                let control = FakeRunLoopControl::default();
+                let drop_count = Arc::new(AtomicU64::new(0));
+                let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+                let entropy = has_entropy.then(|| fake_native_v2_entropy_state(transport));
+                let entropy_config = entropy.as_ref().map(SnapshotV2EntropyState::config);
+                let balloon = has_balloon.then(|| fake_native_v2_balloon_state(transport));
+                let balloon_config = balloon.as_ref().map(SnapshotV2BalloonState::config);
+                let mut session =
+                    FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+                        .with_native_snapshot_memory(1)
+                        .with_native_v2_root_transport(transport)
+                        .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                        .with_wait_for_stop(false)
+                        .with_wait_for_wakeup(true);
+                if let Some(entropy) = entropy {
+                    session = session.with_native_v2_entropy_state(entropy);
+                }
+                if let Some(balloon) = balloon {
+                    session = session.with_native_v2_balloon_state(balloon);
+                }
+                let events = session.native_snapshot_events();
+                let capture_instants = session.native_v2_capture_instants();
+                let supervisor =
+                    BootRunLoopSupervisor::start(session, NonZeroUsize::new(87).expect("non-zero"))
+                        .expect("balloon candidate supervisor should start");
+                assert_eq!(max_steps_receiver.recv().expect("worker should start"), 87);
+                supervisor
+                    .pause()
+                    .expect("balloon candidate source should pause");
+
+                let candidate = supervisor
+                    .capture_native_v2_balloon_candidate(
+                        NativeV2BalloonCandidateCaptureRequest {
+                            input: native_v2_test_capture_input(),
+                            serial_config: SerialConfig::default(),
+                            balloon_config,
+                            entropy_config,
+                            storage_configs: if has_storage {
+                                native_v2_storage_configs(1)
+                            } else {
+                                CaptureReadyStorageConfigs::new(Vec::new(), Vec::new())
+                            },
+                            expected_transport: transport,
+                            output: Box::new(Cursor::new(Vec::new())),
+                            cancellation: NativeV2SnapshotCaptureCancellation::default(),
+                        },
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{transport:?} storage={has_storage} entropy={has_entropy} balloon={has_balloon} candidate failed: {error}"
+                        )
+                    });
+
+                assert_eq!(
+                    candidate.version(),
+                    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
+                );
+                assert_eq!(candidate.device_graph().is_some(), has_storage);
+                assert_eq!(candidate.entropy().is_some(), has_entropy);
+                assert_eq!(candidate.balloon().is_some(), has_balloon);
+                if let Some(graph) = candidate.device_graph() {
+                    assert_eq!(graph.transport_kind(), transport);
+                }
+                if let Some(entropy) = candidate.entropy() {
+                    assert_eq!(entropy.transport().kind(), transport);
+                    assert_eq!(Some(entropy.config()), entropy_config);
+                }
+                if let Some(balloon) = candidate.balloon() {
+                    assert_eq!(balloon.transport().kind(), transport);
+                    assert_eq!(Some(balloon.config()), balloon_config);
+                }
+                assert_eq!(
+                    decode_snapshot_v2_state_with_compatibility_version(
+                        candidate.bytes(),
+                        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                    )
+                    .expect("exact-2.9 candidate should decode structurally")
+                    .metadata()
+                    .component_count(),
+                    2 + u32::from(has_storage) + u32::from(has_entropy) + u32::from(has_balloon)
+                );
+                let events = events.lock().expect("balloon candidate events should lock");
+                assert!(events.starts_with(&[
+                    "aux-acquire",
+                    "v2-serial",
+                    "v2-pause",
+                    "v2-balloon",
+                ]));
+                let balloon_position = events
+                    .iter()
+                    .position(|event| *event == "v2-balloon")
+                    .expect("balloon capture event should exist");
+                let entropy_position = events
+                    .iter()
+                    .position(|event| *event == "v2-entropy")
+                    .expect("entropy capture event should exist");
+                if has_storage {
+                    let storage_position = events
+                        .iter()
+                        .position(|event| *event == "v2-storage-normalize")
+                        .expect("storage capture event should exist");
+                    assert!(balloon_position < storage_position);
+                    assert!(storage_position < entropy_position);
+                } else {
+                    assert!(balloon_position < entropy_position);
+                }
+                assert!(events.ends_with(&[
+                    "v2-balloon-platform",
+                    "v2-balloon-compose",
+                    "v2-balloon-encode",
+                    "v2-recover",
+                    "v2-candidate-sealed",
+                    "aux-drop",
+                ]));
+                let capture_instants = capture_instants
+                    .lock()
+                    .expect("balloon capture instants should lock");
+                let expected_products = if has_storage {
+                    vec!["balloon", "storage", "entropy"]
+                } else {
+                    vec!["balloon", "entropy"]
+                };
+                assert_eq!(
+                    capture_instants
+                        .iter()
+                        .map(|(product, _)| *product)
+                        .collect::<Vec<_>>(),
+                    expected_products
+                );
+                assert!(
+                    capture_instants
+                        .iter()
+                        .all(|(_, instant)| *instant == capture_instants[0].1)
+                );
+                assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+                drop(capture_instants);
+                drop(events);
+                drop(supervisor);
+                assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_balloon_cancellation_before_and_after_capture_recovers_for_retry() {
+        for (case, cancel_after_pause, step_limit) in
+            [("before", true, 88_usize), ("after", false, 89_usize)]
+        {
+            let transport = SnapshotV2DeviceTransportKind::Mmio;
+            let balloon = fake_native_v2_balloon_state(transport);
+            let balloon_config = balloon.config();
+            let entropy = fake_native_v2_entropy_state(transport);
+            let entropy_config = entropy.config();
+            let cancellation = NativeV2SnapshotCaptureCancellation::default();
+            let control = FakeRunLoopControl::default();
+            let drop_count = Arc::new(AtomicU64::new(0));
+            let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+            let session =
+                FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+                    .with_native_snapshot_memory(1)
+                    .with_native_v2_root_transport(transport)
+                    .with_native_v2_balloon_state(balloon)
+                    .with_native_v2_entropy_state(entropy)
+                    .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                    .with_wait_for_stop(false)
+                    .with_wait_for_wakeup(true);
+            let session = if cancel_after_pause {
+                session.with_native_v2_cancel_after_pause(cancellation.clone())
+            } else {
+                session.with_native_v2_cancel_during_balloon(cancellation.clone())
+            };
+            let events = session.native_snapshot_events();
+            let capture_instants = session.native_v2_capture_instants();
+            let auxiliary = session.snapshot_auxiliary_quiescence();
+            let supervisor = BootRunLoopSupervisor::start(
+                session,
+                NonZeroUsize::new(step_limit).expect("non-zero"),
+            )
+            .unwrap_or_else(|error| panic!("{case} cancellation supervisor should start: {error}"));
+            assert_eq!(
+                max_steps_receiver.recv().expect("worker should start"),
+                step_limit
+            );
+            supervisor
+                .pause()
+                .unwrap_or_else(|error| panic!("{case} cancellation source should pause: {error}"));
+
+            let (output, _) = SharedSnapshotMemoryOutput::new(Arc::clone(&events));
+            let error = supervisor
+                .capture_native_v2_balloon_candidate(NativeV2BalloonCandidateCaptureRequest {
+                    input: native_v2_test_capture_input(),
+                    serial_config: SerialConfig::default(),
+                    balloon_config: Some(balloon_config),
+                    entropy_config: Some(entropy_config),
+                    storage_configs: native_v2_storage_configs(1),
+                    expected_transport: transport,
+                    output: Box::new(output),
+                    cancellation,
+                })
+                .unwrap_err();
+            assert!(matches!(
+                error.producer().map(|producer| producer.source()),
+                Some(NativeV2SnapshotPublicationProducerError::Capture(
+                    NativeV2SnapshotCaptureError::Cancelled {
+                        stage: NativeV2SnapshotCaptureStage::Balloon,
+                    }
+                ))
+            ));
+
+            let events_after_failure = events
+                .lock()
+                .expect("balloon cancellation events should lock")
+                .clone();
+            assert!(events_after_failure.starts_with(&["aux-acquire", "v2-serial", "v2-pause",]));
+            assert_eq!(
+                events_after_failure.contains(&"v2-balloon"),
+                !cancel_after_pause
+            );
+            assert!(!events_after_failure.contains(&"v2-storage-normalize"));
+            assert!(!events_after_failure.contains(&"v2-entropy"));
+            assert!(!events_after_failure.contains(&"v2-balloon-platform"));
+            assert!(events_after_failure.ends_with(&["v2-writer-drop", "v2-recover", "aux-drop",]));
+            assert_eq!(
+                capture_instants
+                    .lock()
+                    .expect("balloon cancellation instants should lock")
+                    .iter()
+                    .map(|(product, _)| *product)
+                    .collect::<Vec<_>>(),
+                if cancel_after_pause {
+                    Vec::<&str>::new()
+                } else {
+                    vec!["balloon"]
+                }
+            );
+            assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+            supervisor
+                .capture_native_v2_balloon_candidate(NativeV2BalloonCandidateCaptureRequest {
+                    input: native_v2_test_capture_input(),
+                    serial_config: SerialConfig::default(),
+                    balloon_config: Some(balloon_config),
+                    entropy_config: Some(entropy_config),
+                    storage_configs: native_v2_storage_configs(1),
+                    expected_transport: transport,
+                    output: Box::new(Cursor::new(Vec::new())),
+                    cancellation: NativeV2SnapshotCaptureCancellation::default(),
+                })
+                .unwrap_or_else(|error| {
+                    panic!("{case} recovered balloon source should accept a fresh capture: {error}")
+                });
+            assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 2);
+            assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 2);
+            assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+            drop(supervisor);
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_balloon_failures_drop_output_recover_and_preserve_typed_errors() {
+        let transport = SnapshotV2DeviceTransportKind::Mmio;
+        let balloon = fake_native_v2_balloon_state(transport);
+        let balloon_config = balloon.config();
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_v2_root_transport(transport)
+            .with_native_v2_balloon_state(balloon)
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let auxiliary = session.snapshot_auxiliary_quiescence();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(90).expect("non-zero"))
+                .expect("balloon failure supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 90);
+        supervisor
+            .pause()
+            .expect("balloon failure source should pause");
+
+        let (mismatch_output, _) = SharedSnapshotMemoryOutput::new(Arc::clone(&events));
+        let error = supervisor
+            .capture_native_v2_balloon_candidate(NativeV2BalloonCandidateCaptureRequest {
+                input: native_v2_test_capture_input(),
+                serial_config: SerialConfig::default(),
+                balloon_config: None,
+                entropy_config: None,
+                storage_configs: CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                expected_transport: transport,
+                output: Box::new(mismatch_output),
+                cancellation: NativeV2SnapshotCaptureCancellation::default(),
+            })
+            .expect_err("balloon configuration disagreement should fail closed");
+        assert!(matches!(
+            error.producer().map(|producer| producer.source()),
+            Some(NativeV2SnapshotPublicationProducerError::Capture(
+                NativeV2SnapshotCaptureError::Balloon {
+                    source: NativeV2SnapshotBalloonCaptureError::State {
+                        source: SnapshotV2BalloonStateCaptureError::Device,
+                    },
+                }
+            ))
+        ));
+        assert!(
+            events
+                .lock()
+                .expect("balloon mismatch events should lock")
+                .ends_with(&["v2-balloon", "v2-writer-drop", "v2-recover", "aux-drop"])
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        events
+            .lock()
+            .expect("balloon events should lock for reset")
+            .clear();
+        let error = supervisor
+            .capture_native_v2_balloon_candidate(NativeV2BalloonCandidateCaptureRequest {
+                input: native_v2_test_capture_input(),
+                serial_config: SerialConfig::default(),
+                balloon_config: Some(balloon_config),
+                entropy_config: None,
+                storage_configs: CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                expected_transport: transport,
+                output: Box::new(SharedSnapshotMemoryOutput::failing(Arc::clone(&events))),
+                cancellation: NativeV2SnapshotCaptureCancellation::default(),
+            })
+            .expect_err("balloon memory output failure should fail closed");
+        assert!(matches!(
+            error.producer().map(|producer| producer.source()),
+            Some(NativeV2SnapshotPublicationProducerError::Capture(
+                NativeV2SnapshotCaptureError::Platform {
+                    source: HvfArm64BootSnapshotV2CaptureError::MemoryImage {
+                        source:
+                            bangbang_runtime::snapshot_memory_v2::SnapshotV2MemoryWriteError::Io {
+                                kind: std::io::ErrorKind::WriteZero,
+                                ..
+                            },
+                    },
+                }
+            ))
+        ));
+        assert!(
+            events
+                .lock()
+                .expect("balloon output events should lock")
+                .ends_with(&[
+                    "v2-balloon-platform",
+                    "v2-writer-drop",
+                    "v2-recover",
+                    "aux-drop",
+                ])
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        supervisor
+            .capture_native_v2_balloon_candidate(NativeV2BalloonCandidateCaptureRequest {
+                input: native_v2_test_capture_input(),
+                serial_config: SerialConfig::default(),
+                balloon_config: Some(balloon_config),
+                entropy_config: None,
+                storage_configs: CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                expected_transport: transport,
+                output: Box::new(Cursor::new(Vec::new())),
+                cancellation: NativeV2SnapshotCaptureCancellation::default(),
+            })
+            .expect("recovered balloon source should remain reusable");
+        assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 3);
+        assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 3);
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+
+        for (case, encode_error, step_limit) in [
+            ("encode", true, 91_usize),
+            ("candidate-closure", false, 92_usize),
+        ] {
+            let control = FakeRunLoopControl::default();
+            let drops = Arc::new(AtomicU64::new(0));
+            let (sender, receiver) = mpsc::channel();
+            let session = FakeRunLoopSession::new(control, Arc::clone(&drops), sender)
+                .with_native_snapshot_memory(1)
+                .with_native_v2_root_transport(transport)
+                .with_native_v2_balloon_state(fake_native_v2_balloon_state(transport))
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+            let session = if encode_error {
+                session.with_native_v2_balloon_encode_error()
+            } else {
+                session.with_native_v2_invalid_candidate_state()
+            };
+            let events = session.native_snapshot_events();
+            let supervisor = BootRunLoopSupervisor::start(
+                session,
+                NonZeroUsize::new(step_limit).expect("non-zero"),
+            )
+            .unwrap_or_else(|error| panic!("{case} supervisor should start: {error}"));
+            assert_eq!(receiver.recv().expect("worker should start"), step_limit);
+            supervisor
+                .pause()
+                .unwrap_or_else(|error| panic!("{case} source should pause: {error}"));
+            let (output, _) = SharedSnapshotMemoryOutput::new(Arc::clone(&events));
+            let error = supervisor
+                .capture_native_v2_balloon_candidate(NativeV2BalloonCandidateCaptureRequest {
+                    input: native_v2_test_capture_input(),
+                    serial_config: SerialConfig::default(),
+                    balloon_config: Some(balloon_config),
+                    entropy_config: None,
+                    storage_configs: CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                    expected_transport: transport,
+                    output: Box::new(output),
+                    cancellation: NativeV2SnapshotCaptureCancellation::default(),
+                })
+                .unwrap_err();
+            match error.producer().map(|producer| producer.source()) {
+                Some(NativeV2SnapshotPublicationProducerError::Capture(
+                    NativeV2SnapshotCaptureError::Encode {
+                        source: HvfSnapshotV2EncodeError::LengthOverflow,
+                    },
+                )) if encode_error => {}
+                Some(NativeV2SnapshotPublicationProducerError::Capture(
+                    NativeV2SnapshotCaptureError::CandidateState { .. },
+                )) if !encode_error => {}
+                other => panic!("{case} retained the wrong failure: {other:?}"),
+            }
+            assert!(
+                events
+                    .lock()
+                    .expect("balloon terminal events should lock")
+                    .ends_with(&["v2-writer-drop", "v2-recover", "aux-drop"])
+            );
+            assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+            drop(supervisor);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn native_v2_entropy_capture_failures_recover_release_guards_and_remain_reusable() {
         let transport = SnapshotV2DeviceTransportKind::Mmio;
         let entropy = fake_native_v2_entropy_state(transport);
@@ -41347,6 +42459,61 @@ mod tests {
             ),
             Err(NativeV2SnapshotCaptureError::TransportCapacity)
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_balloon_capture_preflight_enforces_the_31_30_29_pci_edges() {
+        let balloon = fake_native_v2_balloon_state(SnapshotV2DeviceTransportKind::Mmio).config();
+        let entropy = EntropyConfig::new();
+
+        for (storage_count, balloon_config, entropy_config) in [
+            (31, None, None),
+            (30, Some(balloon), None),
+            (30, None, Some(entropy)),
+            (29, Some(balloon), Some(entropy)),
+        ] {
+            super::preflight_native_v2_balloon_capture(
+                &SerialConfig::default(),
+                balloon_config,
+                entropy_config,
+                &native_v2_storage_configs(storage_count),
+                SnapshotV2DeviceTransportKind::Pci,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{storage_count} storage endpoints with balloon={} entropy={} should fit: {error}",
+                    balloon_config.is_some(),
+                    entropy_config.is_some(),
+                )
+            });
+        }
+
+        for (storage_count, balloon_config, entropy_config) in [
+            (31, Some(balloon), None),
+            (31, None, Some(entropy)),
+            (30, Some(balloon), Some(entropy)),
+        ] {
+            assert!(matches!(
+                super::preflight_native_v2_balloon_capture(
+                    &SerialConfig::default(),
+                    balloon_config,
+                    entropy_config,
+                    &native_v2_storage_configs(storage_count),
+                    SnapshotV2DeviceTransportKind::Pci,
+                ),
+                Err(NativeV2SnapshotCaptureError::TransportCapacity)
+            ));
+        }
+
+        super::preflight_native_v2_balloon_capture(
+            &SerialConfig::default(),
+            Some(balloon),
+            Some(entropy),
+            &native_v2_storage_configs(31),
+            SnapshotV2DeviceTransportKind::Mmio,
+        )
+        .expect("MMIO capture should not consume PCI endpoint capacity");
     }
 
     #[cfg(target_os = "macos")]

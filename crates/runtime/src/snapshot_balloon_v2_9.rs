@@ -9,17 +9,25 @@
 use std::fmt;
 
 use crate::balloon::{
-    BalloonConfig, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE, VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
-    VIRTIO_BALLOON_QUEUE_SIZE, VirtioBalloonConfigSpace, VirtioBalloonQueueLayout,
-    available_features, mib_to_4k_pages,
+    BalloonConfig, BalloonOptionalStats, VIRTIO_BALLOON_DEVICE_ID,
+    VIRTIO_BALLOON_FREE_PAGE_HINT_DONE, VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+    VIRTIO_BALLOON_QUEUE_SIZE, VirtioBalloonConfigSpace, VirtioBalloonDeviceCaptureState,
+    VirtioBalloonMmioCaptureState, VirtioBalloonPciCaptureState, VirtioBalloonQueueCaptureState,
+    VirtioBalloonQueueLayout, available_features, mib_to_4k_pages,
 };
+use crate::interrupt::GuestInterruptLine;
+use crate::memory::GuestMemoryRange;
+use crate::mmio::MmioRegion;
 use crate::pci::{
     PCI_BAR64_SIZE, PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
-    PCI_LAST_ENDPOINT_DEVICE, PCI_SEGMENT_ZERO, PciBarAddressSpace, PciBarPrefetchable,
+    PCI_LAST_ENDPOINT_DEVICE, PCI_SEGMENT_ZERO, PciBarAddressSpace, PciBarPrefetchable, PciSbdf,
 };
 use crate::snapshot_device_v2::{
-    SnapshotV2DeviceTransport, SnapshotV2InterruptIntent, SnapshotV2PciDeviceState,
-    SnapshotV2PciMsixState, SnapshotV2VirtioQueueState, SnapshotV2VirtioState,
+    SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport, SnapshotV2InterruptIntent,
+    SnapshotV2PciDeviceState, SnapshotV2PciMsixState, SnapshotV2VirtioQueueState,
+    SnapshotV2VirtioState, capture_mmio_common_for_device_with_queue_count_and_config_status_gate,
+    capture_mmio_transport_parts, capture_pci_common_for_device_with_queue_count,
+    capture_pci_transport_parts_with_queue_count,
 };
 use crate::snapshot_device_v2_5::queue_ranges;
 use crate::snapshot_format::SnapshotFormatVersion;
@@ -504,6 +512,100 @@ pub struct SnapshotV2BalloonState {
 }
 
 impl SnapshotV2BalloonState {
+    /// Converts one checked MMIO live capture without retaining source
+    /// ownership.
+    pub fn try_from_mmio_capture(
+        config: BalloonConfig,
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+        captured: &VirtioBalloonMmioCaptureState,
+    ) -> Result<Self, SnapshotV2BalloonStateCaptureError> {
+        preflight_balloon_capture(captured.device())?;
+        let queue_count = captured.device().queue_layout().queue_count();
+        let virtio = capture_mmio_common_for_device_with_queue_count_and_config_status_gate(
+            captured.transport(),
+            VIRTIO_BALLOON_DEVICE_ID,
+            available_features(config),
+            queue_count,
+            true,
+        )
+        .map_err(capture_common_error)?;
+        let transport = SnapshotV2DeviceTransport::Mmio(capture_mmio_transport_parts(
+            region,
+            interrupt_line,
+            captured.transport(),
+        ));
+        capture_balloon_state(
+            config,
+            captured.device(),
+            virtio,
+            transport,
+            reserve_balloon_capture_ranges,
+        )
+    }
+
+    /// Converts one checked startup-origin PCI live capture without retaining
+    /// source ownership.
+    pub fn try_from_pci_capture(
+        config: BalloonConfig,
+        sbdf: PciSbdf,
+        bar_range: GuestMemoryRange,
+        captured: &VirtioBalloonPciCaptureState,
+    ) -> Result<Self, SnapshotV2BalloonStateCaptureError> {
+        preflight_balloon_capture(captured.device())?;
+        let queue_count = captured.device().queue_layout().queue_count();
+        let virtio = capture_pci_common_for_device_with_queue_count(
+            captured.transport(),
+            VIRTIO_BALLOON_DEVICE_ID,
+            available_features(config),
+            queue_count,
+        )
+        .map_err(capture_common_error)?;
+        let transport = capture_pci_transport_parts_with_queue_count(
+            StorageDeviceOrigin::Startup,
+            sbdf,
+            bar_range,
+            captured.transport(),
+            queue_count,
+        )
+        .map(SnapshotV2DeviceTransport::Pci)
+        .map_err(capture_common_error)?;
+        capture_balloon_state(
+            config,
+            captured.device(),
+            virtio,
+            transport,
+            reserve_balloon_capture_ranges,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_from_mmio_capture_with_accounting_allocation_failure(
+        config: BalloonConfig,
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+        captured: &VirtioBalloonMmioCaptureState,
+    ) -> Result<Self, SnapshotV2BalloonStateCaptureError> {
+        preflight_balloon_capture(captured.device())?;
+        let queue_count = captured.device().queue_layout().queue_count();
+        let virtio = capture_mmio_common_for_device_with_queue_count_and_config_status_gate(
+            captured.transport(),
+            VIRTIO_BALLOON_DEVICE_ID,
+            available_features(config),
+            queue_count,
+            true,
+        )
+        .map_err(capture_common_error)?;
+        let transport = SnapshotV2DeviceTransport::Mmio(capture_mmio_transport_parts(
+            region,
+            interrupt_line,
+            captured.transport(),
+        ));
+        capture_balloon_state(config, captured.device(), virtio, transport, |_, _| {
+            Err(SnapshotV2BalloonStateCaptureError::Allocation)
+        })
+    }
+
     /// Constructs and fully validates one detached balloon artifact value.
     pub fn try_new(
         config: BalloonConfig,
@@ -523,6 +625,11 @@ impl SnapshotV2BalloonState {
         };
         validate_balloon_state(&state)?;
         Ok(state)
+    }
+
+    /// Returns the exact compatibility context of this value.
+    pub const fn compatibility_version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
     }
 
     /// Returns the external balloon configuration.
@@ -579,6 +686,233 @@ impl fmt::Debug for SnapshotV2BalloonState {
             .field("version", &NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION)
             .field("state", &REDACTED)
             .finish()
+    }
+}
+
+fn preflight_balloon_capture(
+    device: &VirtioBalloonDeviceCaptureState,
+) -> Result<(), SnapshotV2BalloonStateCaptureError> {
+    if device.memory_accounting().inflated_page_ranges().len()
+        > NATIVE_V2_BALLOON_STATE_MAX_ACCOUNTING_RANGES
+    {
+        return Err(SnapshotV2BalloonStateCaptureError::AccountingLimit);
+    }
+    Ok(())
+}
+
+fn capture_balloon_state(
+    config: BalloonConfig,
+    device: &VirtioBalloonDeviceCaptureState,
+    virtio: SnapshotV2VirtioState,
+    transport: SnapshotV2DeviceTransport,
+    reserve_ranges: impl FnOnce(
+        &mut Vec<SnapshotV2BalloonPfnRange>,
+        usize,
+    ) -> Result<(), SnapshotV2BalloonStateCaptureError>,
+) -> Result<SnapshotV2BalloonState, SnapshotV2BalloonStateCaptureError> {
+    if device.queue_layout() != VirtioBalloonQueueLayout::from_config(config)
+        || device.available_features() != virtio.available_features()
+        || device.negotiated_features() != virtio.driver_features()
+        || device.active_queues().is_some() != virtio.is_activated()
+    {
+        return Err(SnapshotV2BalloonStateCaptureError::Device);
+    }
+
+    let active_queues = device
+        .active_queues()
+        .map(|active| {
+            SnapshotV2BalloonActiveQueuesState::try_new(
+                config,
+                capture_balloon_queue(active.inflate())?,
+                capture_balloon_queue(active.deflate())?,
+                active.statistics().map(capture_balloon_queue).transpose()?,
+                active
+                    .free_page_hinting()
+                    .map(capture_balloon_queue)
+                    .transpose()?,
+                active
+                    .free_page_reporting()
+                    .map(capture_balloon_queue)
+                    .transpose()?,
+            )
+            .map_err(|_| SnapshotV2BalloonStateCaptureError::Queue)
+        })
+        .transpose()?;
+    let hinting = device.hinting();
+    let continuation = SnapshotV2BalloonContinuationState::new(
+        active_queues,
+        device.stats_polling_interval_s(),
+        capture_balloon_statistics(device.statistics()),
+        device.statistics_pending_descriptor_head(),
+        SnapshotV2BalloonHintState::new(
+            hinting.host_cmd(),
+            hinting.guest_cmd(),
+            hinting.last_cmd(),
+            hinting.acknowledge_on_stop(),
+        ),
+    );
+
+    let captured_ranges = device.memory_accounting().inflated_page_ranges();
+    let mut ranges = Vec::new();
+    reserve_ranges(&mut ranges, captured_ranges.len())?;
+    for captured in captured_ranges {
+        ranges.push(
+            SnapshotV2BalloonPfnRange::try_new(captured.start_pfn(), captured.page_count())
+                .map_err(|_| SnapshotV2BalloonStateCaptureError::Accounting)?,
+        );
+    }
+    let accounting = SnapshotV2BalloonAccountingState::try_new(
+        ranges,
+        device.memory_accounting().inflated_page_count(),
+    )
+    .map_err(|_| SnapshotV2BalloonStateCaptureError::Accounting)?;
+
+    SnapshotV2BalloonState::try_new(
+        config,
+        device.config_space(),
+        continuation,
+        accounting,
+        virtio,
+        transport,
+    )
+    .map_err(capture_build_error)
+}
+
+fn reserve_balloon_capture_ranges(
+    ranges: &mut Vec<SnapshotV2BalloonPfnRange>,
+    count: usize,
+) -> Result<(), SnapshotV2BalloonStateCaptureError> {
+    ranges
+        .try_reserve_exact(count)
+        .map_err(|_| SnapshotV2BalloonStateCaptureError::Allocation)
+}
+
+fn capture_balloon_queue(
+    captured: VirtioBalloonQueueCaptureState,
+) -> Result<SnapshotV2BalloonQueueState, SnapshotV2BalloonStateCaptureError> {
+    SnapshotV2BalloonQueueState::try_new(
+        captured.next_available(),
+        captured.next_used(),
+        VIRTIO_BALLOON_QUEUE_SIZE,
+    )
+    .map_err(|_| SnapshotV2BalloonStateCaptureError::Queue)
+}
+
+fn capture_balloon_statistics(captured: BalloonOptionalStats) -> SnapshotV2BalloonStatistics {
+    SnapshotV2BalloonStatistics::new([
+        captured.swap_in(),
+        captured.swap_out(),
+        captured.major_faults(),
+        captured.minor_faults(),
+        captured.free_memory(),
+        captured.total_memory(),
+        captured.available_memory(),
+        captured.disk_caches(),
+        captured.hugetlb_allocations(),
+        captured.hugetlb_failures(),
+        captured.oom_kill(),
+        captured.alloc_stall(),
+        captured.async_scan(),
+        captured.direct_scan(),
+        captured.async_reclaim(),
+        captured.direct_reclaim(),
+    ])
+}
+
+fn capture_common_error(
+    source: SnapshotV2DeviceGraphCaptureError,
+) -> SnapshotV2BalloonStateCaptureError {
+    if source == SnapshotV2DeviceGraphCaptureError::Allocation {
+        SnapshotV2BalloonStateCaptureError::Allocation
+    } else {
+        SnapshotV2BalloonStateCaptureError::Common { source }
+    }
+}
+
+fn capture_build_error(
+    source: SnapshotV2BalloonStateBuildError,
+) -> SnapshotV2BalloonStateCaptureError {
+    match source {
+        SnapshotV2BalloonStateBuildError::Configuration
+        | SnapshotV2BalloonStateBuildError::Virtio => SnapshotV2BalloonStateCaptureError::Device,
+        SnapshotV2BalloonStateBuildError::Queue => SnapshotV2BalloonStateCaptureError::Queue,
+        SnapshotV2BalloonStateBuildError::Statistics => {
+            SnapshotV2BalloonStateCaptureError::Statistics
+        }
+        SnapshotV2BalloonStateBuildError::Hinting => SnapshotV2BalloonStateCaptureError::Hinting,
+        SnapshotV2BalloonStateBuildError::Accounting => {
+            SnapshotV2BalloonStateCaptureError::Accounting
+        }
+        source => SnapshotV2BalloonStateCaptureError::Build { source },
+    }
+}
+
+/// Failure while converting one trusted live capture into exact-2.9 state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2BalloonStateCaptureError {
+    /// The canonical live accounting inventory exceeds the exact profile.
+    AccountingLimit,
+    /// A bounded detached artifact collection could not be allocated.
+    Allocation,
+    /// Repeated device, configuration, and transport state disagree.
+    Device,
+    /// Active queue cursors or shape are inconsistent.
+    Queue,
+    /// Captured latest statistics or pending work are inconsistent.
+    Statistics,
+    /// Captured free-page-hint continuation is inconsistent.
+    Hinting,
+    /// Canonical live PFN accounting is inconsistent.
+    Accounting,
+    /// Common virtio or transport capture failed.
+    Common {
+        /// Redacted common capture category.
+        source: SnapshotV2DeviceGraphCaptureError,
+    },
+    /// Complete converted state failed its final semantic gate.
+    Build {
+        /// Redacted exact-2.9 build category.
+        source: SnapshotV2BalloonStateBuildError,
+    },
+}
+
+impl fmt::Debug for SnapshotV2BalloonStateCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2BalloonStateCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AccountingLimit => {
+                "native-v2 captured balloon accounting exceeds the range limit"
+            }
+            Self::Allocation => "native-v2 captured balloon state allocation failed",
+            Self::Device => "native-v2 captured balloon device state is inconsistent",
+            Self::Queue => "native-v2 captured balloon queue state is invalid",
+            Self::Statistics => "native-v2 captured balloon statistics state is invalid",
+            Self::Hinting => "native-v2 captured balloon hint state is invalid",
+            Self::Accounting => "native-v2 captured balloon accounting state is invalid",
+            Self::Common { .. } => "native-v2 captured balloon transport state is invalid",
+            Self::Build { .. } => "native-v2 captured balloon state is invalid",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2BalloonStateCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Common { source } => Some(source),
+            Self::Build { source } => Some(source),
+            Self::AccountingLimit
+            | Self::Allocation
+            | Self::Device
+            | Self::Queue
+            | Self::Statistics
+            | Self::Hinting
+            | Self::Accounting => None,
+        }
     }
 }
 
