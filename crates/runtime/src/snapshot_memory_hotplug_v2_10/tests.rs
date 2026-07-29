@@ -215,6 +215,35 @@ fn active_pci_state() -> SnapshotV2MemoryHotplugState {
     .expect("active PCI state should validate")
 }
 
+fn active_mmio_state() -> SnapshotV2MemoryHotplugState {
+    let ranges = [(0, 1), (7, 2), (127, 1)];
+    SnapshotV2MemoryHotplugState::try_new(
+        base_config(),
+        base_config_space(4),
+        Some(
+            SnapshotV2MemoryHotplugQueueState::try_new(7, 7)
+                .expect("equal active cursors should validate"),
+        ),
+        bitmap_with_ranges(&ranges),
+        active_virtio(),
+        SnapshotV2DeviceTransport::Mmio(mmio_transport()),
+    )
+    .expect("active MMIO state should validate")
+}
+
+fn inactive_pci_state() -> SnapshotV2MemoryHotplugState {
+    let ranges = [(1, 2), (5, 3)];
+    SnapshotV2MemoryHotplugState::try_new(
+        base_config(),
+        base_config_space(5),
+        None,
+        bitmap_with_ranges(&ranges),
+        inactive_virtio(),
+        SnapshotV2DeviceTransport::Pci(pci_transport()),
+    )
+    .expect("inactive PCI state should validate")
+}
+
 fn section_offset(bytes: &[u8], index: usize) -> usize {
     let entry = DIRECTORY_OFFSET + index * DIRECTORY_ENTRY_BYTES;
     usize::try_from(u64::from_le_bytes(
@@ -295,6 +324,27 @@ fn inactive_mmio_and_active_pci_round_trip_canonically() {
                 .expect("decoded state should re-encode"),
             encoded
         );
+    }
+}
+
+#[test]
+fn activation_and_transport_products_round_trip_independently() {
+    for state in [active_mmio_state(), inactive_pci_state()] {
+        let encoded = state
+            .encode(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION)
+            .expect("cross-product state should encode");
+        let decoded = SnapshotV2MemoryHotplugState::decode(
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            &encoded,
+        )
+        .expect("cross-product state should decode");
+
+        assert_eq!(decoded, state);
+        assert_eq!(
+            decoded.active_queue().is_some(),
+            decoded.virtio().is_activated()
+        );
+        assert_eq!(decoded.transport().kind(), state.transport().kind());
     }
 }
 
@@ -514,6 +564,28 @@ fn local_geometry_and_common_virtio_hostile_fields_fail_closed() {
         mutated[PAYLOAD_OFFSET + offset] = 1;
         local_mutations.push(mutated);
     }
+    let overflowing_total_mib = (u64::MAX / MIB / 128 + 1) * 128;
+    for (offset, value) in [
+        (0, overflowing_total_mib),
+        (8, 4),
+        (16, 64),
+        (
+            40,
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value() - 128 * MIB,
+        ),
+        (40, VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value() + 1),
+        (40, aarch64::DRAM_MEM_START + aarch64::DRAM_MEM_MAX_SIZE),
+        (56, 130 * MIB),
+        (56, 1152 * MIB),
+        (64, MIB),
+        (64, 1026 * MIB),
+        (72, 129 * MIB),
+        (72, 1026 * MIB),
+    ] {
+        let mut mutated = active.clone();
+        replace_u64(&mut mutated, PAYLOAD_OFFSET + offset, value);
+        local_mutations.push(mutated);
+    }
     let mut inactive_cursor_tag = active.clone();
     inactive_cursor_tag[PAYLOAD_OFFSET + 80] = 0;
     local_mutations.push(inactive_cursor_tag);
@@ -676,6 +748,90 @@ fn largest_legal_aperture_retains_alternating_bitmap_without_range_allocation() 
 }
 
 #[test]
+fn empty_full_usable_and_largest_contiguous_bitmaps_round_trip() {
+    let empty = SnapshotV2MemoryHotplugState::try_new(
+        base_config(),
+        base_config_space(0),
+        None,
+        bitmap_with_ranges(&[]),
+        inactive_virtio(),
+        SnapshotV2DeviceTransport::Mmio(mmio_transport()),
+    )
+    .expect("empty bitmap should validate");
+    assert_eq!(empty.plugged_ranges().len(), 0);
+
+    let mut full_usable_bitmap = bitmap_with_ranges(&[]);
+    full_usable_bitmap[..16].fill(u8::MAX);
+    let full_usable = SnapshotV2MemoryHotplugState::try_new(
+        base_config(),
+        base_config_space(128),
+        None,
+        full_usable_bitmap,
+        inactive_virtio(),
+        SnapshotV2DeviceTransport::Mmio(mmio_transport()),
+    )
+    .expect("full usable bitmap should validate");
+    assert_eq!(
+        full_usable.plugged_ranges().collect::<Vec<_>>(),
+        vec![SnapshotV2MemoryHotplugPluggedRange {
+            start_block: 0,
+            block_count: 128,
+        }]
+    );
+
+    for state in [empty, full_usable] {
+        let encoded = state
+            .encode(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION)
+            .expect("boundary bitmap should encode");
+        assert_eq!(
+            SnapshotV2MemoryHotplugState::decode(
+                NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                &encoded,
+            )
+            .expect("boundary bitmap should decode"),
+            state
+        );
+    }
+
+    let total_size = aarch64::DRAM_MEM_START + aarch64::DRAM_MEM_MAX_SIZE
+        - VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value();
+    let block_count = total_size / (2 * MIB);
+    let largest = SnapshotV2MemoryHotplugState::try_new(
+        config(total_size / MIB, 2, 128),
+        VirtioMemConfigSpace::new(
+            2 * MIB,
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value(),
+            total_size,
+        )
+        .with_usable_region_size(total_size)
+        .with_plugged_size(total_size),
+        None,
+        vec![u8::MAX; usize::try_from(block_count / 8).expect("largest bitmap should fit usize")],
+        inactive_virtio(),
+        SnapshotV2DeviceTransport::Mmio(mmio_transport()),
+    )
+    .expect("largest contiguous bitmap should validate");
+    assert_eq!(
+        largest.plugged_ranges().collect::<Vec<_>>(),
+        vec![SnapshotV2MemoryHotplugPluggedRange {
+            start_block: 0,
+            block_count,
+        }]
+    );
+    let encoded = largest
+        .encode(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION)
+        .expect("largest contiguous bitmap should encode");
+    assert_eq!(
+        SnapshotV2MemoryHotplugState::decode(
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            &encoded,
+        )
+        .expect("largest contiguous bitmap should decode"),
+        largest
+    );
+}
+
+#[test]
 fn bitmap_padding_is_canonical_and_checked_before_allocation() {
     let one_block_config = config(128, 128, 128);
     let one_block_space = VirtioMemConfigSpace::new(
@@ -781,8 +937,13 @@ fn every_encode_and_decode_reservation_failure_is_deterministic() {
 fn exact_version_and_redaction_boundaries_are_closed() {
     let state = inactive_mmio_state();
     let earlier = SnapshotFormatVersion::new(2, 9, 0);
+    let future = SnapshotFormatVersion::new(2, 11, 0);
     assert!(matches!(
         state.encode(earlier),
+        Err(SnapshotV2MemoryHotplugStateEncodeError::UnsupportedVersion)
+    ));
+    assert!(matches!(
+        state.encode(future),
         Err(SnapshotV2MemoryHotplugStateEncodeError::UnsupportedVersion)
     ));
     let encoded = state
@@ -790,6 +951,10 @@ fn exact_version_and_redaction_boundaries_are_closed() {
         .expect("state should encode");
     assert!(matches!(
         SnapshotV2MemoryHotplugState::decode(earlier, &encoded),
+        Err(SnapshotV2MemoryHotplugStateDecodeError::UnsupportedVersion)
+    ));
+    assert!(matches!(
+        SnapshotV2MemoryHotplugState::decode(future, &encoded),
         Err(SnapshotV2MemoryHotplugStateDecodeError::UnsupportedVersion)
     ));
 
@@ -802,4 +967,28 @@ fn exact_version_and_redaction_boundaries_are_closed() {
     );
     assert!(!format!("{error:?}").contains("536870912"));
     assert!(!error.to_string().contains("536870912"));
+    assert!(format!("{:?}", state.plugged_ranges()).contains(REDACTED));
+    assert!(
+        format!(
+            "{:?}",
+            state
+                .plugged_ranges()
+                .next()
+                .expect("fixture should contain a range")
+        )
+        .contains(REDACTED)
+    );
+    assert!(
+        format!(
+            "{:?}",
+            SnapshotV2MemoryHotplugQueueState::try_new(7, 7)
+                .expect("equal cursors should validate")
+        )
+        .contains(REDACTED)
+    );
+    let capture_error = SnapshotV2MemoryHotplugStateCaptureError::Build {
+        source: SnapshotV2MemoryHotplugStateBuildError::Geometry,
+    };
+    assert!(!format!("{capture_error:?}").contains("536870912"));
+    assert!(!capture_error.to_string().contains("536870912"));
 }
