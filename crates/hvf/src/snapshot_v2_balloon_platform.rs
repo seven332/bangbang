@@ -1004,13 +1004,15 @@ fn prepare_entropy_mmio_endpoint(
         return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::TransportPolicy);
     };
     let expected_region = mmio_region(layout.region_id(), layout.address())?;
-    if transport.region() != expected_region
-        || mmio_region_conflicts_with_platform(
-            platform,
-            expected_region,
-            &platform.global().compatibility().gic_metadata(),
-        )
-        .map_err(|_| PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?
+    if transport.region() != expected_region {
+        return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan);
+    }
+    if mmio_region_conflicts_with_platform(
+        platform,
+        expected_region,
+        &platform.global().compatibility().gic_metadata(),
+    )
+    .map_err(|_| PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?
         || queue_ranges_conflict_with_platform(platform, entropy.queue_ranges())
             .map_err(|_| PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?
     {
