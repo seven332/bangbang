@@ -12893,16 +12893,9 @@ fn restores_signed_balloon_first_mmio_owner_graph_and_rolls_back_faults() {
     use bangbang_runtime::serial::{
         SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
     };
-    use bangbang_runtime::snapshot_balloon_v2_9::{
-        SnapshotV2BalloonRestorePlan, SnapshotV2BalloonState,
-    };
-    use bangbang_runtime::snapshot_device_v2::{
-        SnapshotV2DeviceTransport, SnapshotV2MmioDeviceState,
-    };
-    use bangbang_runtime::snapshot_device_v2_6::{
-        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
-        SnapshotV2StorageRestorePlan,
-    };
+    use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonRestorePlan;
+    use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransport;
+    use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageRestorePlan;
     use bangbang_runtime::snapshot_entropy_v2_8::SnapshotV2EntropyRestorePlan;
     use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
     use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
@@ -13017,57 +13010,10 @@ fn restores_signed_balloon_first_mmio_owner_graph_and_rolls_back_faults() {
     else {
         panic!("balloon storage source should use MMIO");
     };
-    assert_eq!(source_storage_mmio.interrupt_line().raw_value(), 32);
-    assert_eq!(source_balloon_mmio.interrupt_line().raw_value(), 33);
-
-    // Current public construction still allocates storage before balloon.
-    // Exact-2.9 restoration deliberately consumes the Firecracker-shaped
-    // balloon-first artifact order, so the signed fixture re-encodes only
-    // these two retained SPIs before constructing the closed artifact.
-    let balloon = SnapshotV2BalloonState::try_new(
-        source_balloon.config(),
-        source_balloon.config_space(),
-        *source_balloon.continuation(),
-        source_balloon.accounting().clone(),
-        source_balloon.virtio().clone(),
-        SnapshotV2DeviceTransport::Mmio(SnapshotV2MmioDeviceState::from_parts(
-            source_balloon_mmio.device_feature_select(),
-            source_balloon_mmio.driver_feature_select(),
-            source_balloon_mmio.queue_select(),
-            source_balloon_mmio.region(),
-            source_storage_mmio.interrupt_line(),
-        )),
-    )
-    .expect("balloon-first retained balloon state should validate");
-    let mut graph_bytes = source_graph
-        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
-        .expect("storage graph should encode for checked fixture relocation");
-    let directory = usize::try_from(u64::from_le_bytes(
-        graph_bytes[48..56]
-            .try_into()
-            .expect("storage directory offset should exist"),
-    ))
-    .expect("storage directory offset should fit");
-    let transport_entry = directory
-        .checked_add(3 * 32)
-        .expect("storage transport entry should fit");
-    let transport_offset = usize::try_from(u64::from_le_bytes(
-        graph_bytes[transport_entry + 16..transport_entry + 24]
-            .try_into()
-            .expect("storage transport payload offset should exist"),
-    ))
-    .expect("storage transport payload offset should fit");
-    graph_bytes[transport_offset + 12..transport_offset + 16].copy_from_slice(
-        &source_balloon_mmio
-            .interrupt_line()
-            .raw_value()
-            .to_le_bytes(),
-    );
-    let graph = SnapshotV2StorageDeviceGraph::decode(
-        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-        &graph_bytes,
-    )
-    .expect("balloon-prefixed storage graph should decode");
+    assert_eq!(source_balloon_mmio.interrupt_line().raw_value(), 32);
+    assert_eq!(source_storage_mmio.interrupt_line().raw_value(), 33);
+    let balloon = source_balloon;
+    let graph = source_graph;
 
     source
         .pause_for_snapshot_v2_capture()

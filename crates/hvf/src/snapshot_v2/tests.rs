@@ -758,6 +758,17 @@ fn decode_entropy_state(
     decode_hvf_snapshot_v2_entropy_state(&state)
 }
 
+fn decode_balloon_state(
+    bytes: &[u8],
+) -> Result<HvfSnapshotV2BalloonState, HvfSnapshotV2DecodeError> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        bytes,
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("mutated balloon fixture should remain structurally compatible");
+    decode_hvf_snapshot_v2_balloon_state(&state)
+}
+
 fn rebuild_components<F>(encoded: &[u8], mut transform: F) -> Vec<u8>
 where
     F: FnMut(&mut SnapshotV2ComponentKey, &mut SnapshotV2ComponentDisposition, &mut Vec<u8>),
@@ -1063,6 +1074,69 @@ fn rebuild_entropy_without_component(encoded: &[u8], excluded: SnapshotV2Compone
         &components,
     )
     .expect("reduced entropy components should re-encode")
+}
+
+fn rebuild_balloon_components<F>(encoded: &[u8], mut transform: F) -> Vec<u8>
+where
+    F: FnMut(&mut SnapshotV2ComponentKey, &mut SnapshotV2ComponentDisposition, &mut Vec<u8>),
+{
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        encoded,
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("balloon fixture should decode structurally");
+    let mut owned = state
+        .components()
+        .map(|component| {
+            (
+                component.key(),
+                component.disposition(),
+                component.payload().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (key, disposition, payload) in &mut owned {
+        transform(key, disposition, payload);
+    }
+    let components = owned
+        .iter()
+        .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
+        .collect::<Vec<_>>();
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("mutated balloon components should re-encode")
+}
+
+fn rebuild_balloon_without_component(encoded: &[u8], excluded: SnapshotV2ComponentKey) -> Vec<u8> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        encoded,
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("balloon fixture should decode structurally");
+    let owned = state
+        .components()
+        .filter(|component| component.key() != excluded)
+        .map(|component| {
+            (
+                component.key(),
+                component.disposition(),
+                component.payload().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let components = owned
+        .iter()
+        .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
+        .collect::<Vec<_>>();
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("reduced balloon components should re-encode")
 }
 
 fn replace_state_checksum(bytes: &mut [u8]) {
@@ -1602,7 +1676,7 @@ fn internal_exact_minor_eight_entropy_compositions_encode_nested_versions_canoni
 }
 
 #[test]
-fn internal_exact_minor_nine_balloon_composes_every_mmio_and_pci_product_canonically() {
+fn exact_minor_nine_balloon_round_trips_every_mmio_and_pci_product_canonically() {
     for transport in [
         SnapshotV2DeviceTransportKind::Mmio,
         SnapshotV2DeviceTransportKind::Pci,
@@ -1626,6 +1700,14 @@ fn internal_exact_minor_nine_balloon_composes_every_mmio_and_pci_product_canonic
                 NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
             )
             .expect("minor-nine balloon composition should decode structurally");
+            let decoded = decode_hvf_snapshot_v2_balloon_state(&structural)
+                .expect("minor-nine balloon composition should decode independently");
+            assert_eq!(decoded, original);
+            assert_eq!(
+                encode_hvf_snapshot_v2_balloon_state(&decoded)
+                    .expect("decoded minor-nine composition should re-encode"),
+                encoded
+            );
             let platform = decode_hvf_snapshot_v2_platform_components(
                 &structural,
                 original.platform().vcpus().len(),
@@ -1720,6 +1802,70 @@ fn internal_exact_minor_nine_balloon_composes_every_mmio_and_pci_product_canonic
             assert!(!debug.contains("serial-log"));
         }
     }
+}
+
+#[test]
+fn exact_minor_nine_decoder_rejects_malformed_profile_and_nested_balloon() {
+    let original =
+        complete_balloon_state_fixture(SnapshotV2DeviceTransportKind::Pci, true, true, true);
+    let encoded = encode_hvf_snapshot_v2_balloon_state(&original)
+        .expect("complete minor-nine state should encode");
+
+    let missing_serial =
+        rebuild_balloon_without_component(&encoded, NATIVE_V2_SERIAL_COMPONENT_KEY);
+    assert!(matches!(
+        decode_balloon_state(&missing_serial),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let wrong_instance = rebuild_balloon_components(&encoded, |key, _, _| {
+        if *key == NATIVE_V2_BALLOON_COMPONENT_KEY {
+            *key = SnapshotV2ComponentKey::new(NATIVE_V2_BALLOON_COMPONENT_KEY.kind(), 1);
+        }
+    });
+    assert!(matches!(
+        decode_balloon_state(&wrong_instance),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let nonsemantic = rebuild_balloon_components(&encoded, |key, disposition, _| {
+        if *key == NATIVE_V2_ENTROPY_COMPONENT_KEY {
+            *disposition = SnapshotV2ComponentDisposition::NonSemantic;
+        }
+    });
+    assert!(matches!(
+        decode_balloon_state(&nonsemantic),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let invalid_balloon = rebuild_balloon_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_BALLOON_COMPONENT_KEY {
+            payload[0] ^= 0xff;
+        }
+    });
+    assert!(matches!(
+        decode_balloon_state(&invalid_balloon),
+        Err(HvfSnapshotV2DecodeError::BalloonState(
+            SnapshotV2BalloonStateDecodeError::InvalidMagic
+        ))
+    ));
+
+    let entropy_state = encode_hvf_snapshot_v2_entropy_state(&complete_entropy_state_fixture(
+        None,
+        SERIAL_DEFAULT_FIXTURE_HEX,
+        None,
+        false,
+    ))
+    .expect("minor-eight entropy state should encode");
+    let structural = decode_snapshot_v2_state_with_compatibility_version(
+        &entropy_state,
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("minor-eight entropy state should decode structurally");
+    assert!(matches!(
+        decode_hvf_snapshot_v2_balloon_state(&structural),
+        Err(HvfSnapshotV2DecodeError::UnsupportedProfile)
+    ));
 }
 
 #[test]

@@ -30047,6 +30047,19 @@ fn allocate_interrupt_lines(
         .try_reserve_exact(request.block_device_count)
         .map_err(|source| HvfArm64BootSessionError::InterruptLineStorage { source })?;
 
+    // Exact-2.9 products place balloon before optional storage and entropy.
+    // With no balloon configured, every earlier profile keeps its prior order.
+    let balloon = if request.balloon_configured {
+        Some(allocator.allocate().map_err(|source| {
+            HvfArm64BootSessionError::AllocateInterruptLine {
+                purpose: HvfArm64BootInterruptLinePurpose::BalloonDevice,
+                source,
+            }
+        })?)
+    } else {
+        None
+    };
+
     for _ in 0..request.block_device_count {
         block.push(allocator.allocate().map_err(|source| {
             HvfArm64BootSessionError::AllocateInterruptLine {
@@ -30087,17 +30100,6 @@ fn allocate_interrupt_lines(
         Some(allocator.allocate().map_err(|source| {
             HvfArm64BootSessionError::AllocateInterruptLine {
                 purpose: HvfArm64BootInterruptLinePurpose::VsockDevice,
-                source,
-            }
-        })?)
-    } else {
-        None
-    };
-
-    let balloon = if request.balloon_configured {
-        Some(allocator.allocate().map_err(|source| {
-            HvfArm64BootSessionError::AllocateInterruptLine {
-                purpose: HvfArm64BootInterruptLinePurpose::BalloonDevice,
                 source,
             }
         })?)
@@ -41312,11 +41314,11 @@ mod tests {
         )
         .expect("interrupt lines should allocate");
 
-        assert_eq!(line_values(&lines.block), vec![32, 33]);
-        assert_eq!(line_values(&lines.pmem), vec![34, 35]);
-        assert_eq!(line_values(&lines.network), vec![36, 37]);
-        assert_eq!(lines.vsock.map(|line| line.raw_value()), Some(38));
-        assert_eq!(lines.balloon.map(|line| line.raw_value()), Some(39));
+        assert_eq!(lines.balloon.map(|line| line.raw_value()), Some(32));
+        assert_eq!(line_values(&lines.block), vec![33, 34]);
+        assert_eq!(line_values(&lines.pmem), vec![35, 36]);
+        assert_eq!(line_values(&lines.network), vec![37, 38]);
+        assert_eq!(lines.vsock.map(|line| line.raw_value()), Some(39));
         assert_eq!(lines.entropy.map(|line| line.raw_value()), Some(40));
         assert_eq!(lines.memory_hotplug.map(|line| line.raw_value()), Some(41));
         assert_eq!(lines.serial.map(|line| line.raw_value()), Some(42));
@@ -41429,9 +41431,9 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_lines_report_balloon_exhaustion_with_purpose() {
-        let err = allocate_interrupt_lines(
-            &gic_with_spi_range(32, 3),
+    fn interrupt_lines_allocate_balloon_before_other_devices() {
+        let lines = allocate_interrupt_lines(
+            &gic_with_spi_range(32, 6),
             HvfArm64BootInterruptRequest {
                 block_device_count: 1,
                 network_device_count: 1,
@@ -41440,15 +41442,14 @@ mod tests {
                 ..HvfArm64BootInterruptRequest::default()
             },
         )
-        .expect_err("balloon allocation should exhaust range");
+        .expect("balloon-first allocation should fit");
 
-        assert!(matches!(
-            err,
-            HvfArm64BootSessionError::AllocateInterruptLine {
-                purpose: HvfArm64BootInterruptLinePurpose::BalloonDevice,
-                ..
-            }
-        ));
+        assert_eq!(lines.balloon.map(GuestInterruptLine::raw_value), Some(32));
+        assert_eq!(line_values(&lines.block), vec![33]);
+        assert_eq!(line_values(&lines.network), vec![34]);
+        assert_eq!(lines.vsock.map(GuestInterruptLine::raw_value), Some(35));
+        assert_eq!(lines.vmgenid.raw_value(), 36);
+        assert_eq!(lines.vmclock.raw_value(), 37);
     }
 
     #[test]

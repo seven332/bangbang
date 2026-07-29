@@ -4,6 +4,7 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::balloon::BalloonConfig;
 use crate::block::{DriveConfig, DriveConfigs};
 use crate::boot::BootSourceConfig;
 use crate::entropy::EntropyConfig;
@@ -69,6 +70,7 @@ pub struct SnapshotV2ControllerCommit {
     pmem_configs: PmemConfigs,
     serial_config: SerialConfig,
     entropy_config: Option<EntropyConfig>,
+    balloon_config: Option<BalloonConfig>,
     resume_requested: bool,
 }
 
@@ -86,6 +88,7 @@ impl SnapshotV2ControllerCommit {
             pmem_configs: PmemConfigs::new(),
             serial_config: SerialConfig::default(),
             entropy_config: None,
+            balloon_config: None,
             resume_requested,
         }
     }
@@ -105,6 +108,7 @@ impl SnapshotV2ControllerCommit {
             pmem_configs: PmemConfigs::new(),
             serial_config: SerialConfig::default(),
             entropy_config: None,
+            balloon_config: None,
             resume_requested,
         })
     }
@@ -125,6 +129,7 @@ impl SnapshotV2ControllerCommit {
             pmem_configs: PmemConfigs::new(),
             serial_config: SerialConfig::default(),
             entropy_config: None,
+            balloon_config: None,
             resume_requested,
         }
     }
@@ -146,6 +151,7 @@ impl SnapshotV2ControllerCommit {
             pmem_configs: PmemConfigs::from_validated(pmem_configs),
             serial_config: SerialConfig::default(),
             entropy_config: None,
+            balloon_config: None,
             resume_requested,
         }
     }
@@ -165,6 +171,7 @@ impl SnapshotV2ControllerCommit {
             pmem_configs: PmemConfigs::new(),
             serial_config,
             entropy_config: None,
+            balloon_config: None,
             resume_requested,
         }
     }
@@ -187,6 +194,7 @@ impl SnapshotV2ControllerCommit {
             pmem_configs: PmemConfigs::from_validated(pmem_configs),
             serial_config,
             entropy_config: None,
+            balloon_config: None,
             resume_requested,
         }
     }
@@ -212,6 +220,34 @@ impl SnapshotV2ControllerCommit {
             pmem_configs: PmemConfigs::from_validated(pmem_configs),
             serial_config,
             entropy_config,
+            balloon_config: None,
+            resume_requested,
+        }
+    }
+
+    /// Retains exact-2.9 serial, optional storage, entropy, and balloon
+    /// configuration as one atomic destination controller value.
+    #[doc(hidden)]
+    pub fn with_serial_storage_entropy_and_balloon_configs(
+        machine_config: MachineConfig,
+        boot_source_config: BootSourceConfig,
+        storage_configs: Option<CaptureReadyStorageConfigs>,
+        serial_config: SerialConfig,
+        entropy_config: Option<EntropyConfig>,
+        balloon_config: Option<BalloonConfig>,
+        resume_requested: bool,
+    ) -> Self {
+        let (drive_configs, pmem_configs) = storage_configs
+            .map(CaptureReadyStorageConfigs::into_parts)
+            .unwrap_or_default();
+        Self {
+            machine_config,
+            boot_source_config,
+            drive_configs: DriveConfigs::from_validated(drive_configs),
+            pmem_configs: PmemConfigs::from_validated(pmem_configs),
+            serial_config,
+            entropy_config,
+            balloon_config,
             resume_requested,
         }
     }
@@ -229,6 +265,7 @@ impl SnapshotV2ControllerCommit {
         PmemConfigs,
         SerialConfig,
         Option<EntropyConfig>,
+        Option<BalloonConfig>,
         bool,
     ) {
         (
@@ -238,6 +275,7 @@ impl SnapshotV2ControllerCommit {
             self.pmem_configs,
             self.serial_config,
             self.entropy_config,
+            self.balloon_config,
             self.resume_requested,
         )
     }
