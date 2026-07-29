@@ -208,6 +208,8 @@ pub fn prepare_hvf_snapshot_v2_serial_entropy_pci_platform_plan(
         None,
         entropy,
         0,
+        0,
+        None,
         &mut SystemEntropyPciPlatformPlanReserve,
     )
 }
@@ -229,13 +231,37 @@ pub fn prepare_hvf_snapshot_v2_storage_entropy_pci_platform_plan(
         platform,
         Some((bundle, &storage)),
         entropy,
+        0,
         preceding_endpoint_count,
+        None,
         &mut SystemEntropyPciPlatformPlanReserve,
     )?;
     Ok(HvfSnapshotV2StorageEntropyPciPlatformPlan {
         storage,
         entropy: entropy_plan,
     })
+}
+
+pub(crate) fn prepare_hvf_snapshot_v2_entropy_pci_platform_plan_with_prefix(
+    platform: &HvfSnapshotV2PlatformState,
+    storage: Option<(
+        &PreparedSnapshotV2StorageBundle,
+        &HvfSnapshotV2StoragePciPlatformPlan,
+    )>,
+    entropy: &SnapshotV2EntropyRestorePlan,
+    storage_start_slot: usize,
+    preceding_endpoint_count: usize,
+    exact_msi_interrupt_count: u32,
+) -> Result<HvfSnapshotV2EntropyPciEndpointPlan, PrepareHvfSnapshotV2EntropyPciPlatformPlanError> {
+    prepare_entropy_pci_endpoint_plan(
+        platform,
+        storage,
+        entropy,
+        storage_start_slot,
+        preceding_endpoint_count,
+        Some(exact_msi_interrupt_count),
+        &mut SystemEntropyPciPlatformPlanReserve,
+    )
 }
 
 fn prepare_entropy_pci_endpoint_plan(
@@ -245,7 +271,9 @@ fn prepare_entropy_pci_endpoint_plan(
         &HvfSnapshotV2StoragePciPlatformPlan,
     )>,
     entropy: &SnapshotV2EntropyRestorePlan,
+    storage_start_slot: usize,
     preceding_endpoint_count: usize,
+    exact_msi_interrupt_count: Option<u32>,
     reserve: &mut impl EntropyPciPlatformPlanReserve,
 ) -> Result<HvfSnapshotV2EntropyPciEndpointPlan, PrepareHvfSnapshotV2EntropyPciPlatformPlanError> {
     if !platform.machine().fdt().is_product_process_profile()
@@ -280,9 +308,14 @@ fn prepare_entropy_pci_endpoint_plan(
         .map_err(|_| PrepareHvfSnapshotV2EntropyPciPlatformPlanError::ResourcePlan)?;
     let expected_entropy_msi = pci_entropy_restore_gic_msi_configuration()
         .map_err(|_| PrepareHvfSnapshotV2EntropyPciPlatformPlanError::ResourcePlan)?;
-    if msi.interrupt_range.count != expected_msi.interrupt_count().get()
-        && msi.interrupt_range.count != expected_entropy_msi.interrupt_count().get()
-    {
+    let msi_profile_matches = exact_msi_interrupt_count.map_or_else(
+        || {
+            msi.interrupt_range.count == expected_msi.interrupt_count().get()
+                || msi.interrupt_range.count == expected_entropy_msi.interrupt_count().get()
+        },
+        |expected| msi.interrupt_range.count == expected,
+    );
+    if !msi_profile_matches {
         return Err(PrepareHvfSnapshotV2EntropyPciPlatformPlanError::ResourcePlan);
     }
     let address_plan = Arm64PciAddressPlan::firecracker_v1_16()
@@ -321,7 +354,13 @@ fn prepare_entropy_pci_endpoint_plan(
     if let Some((bundle, storage_plan)) = storage {
         if storage_plan.pci().host() != Arm64FdtPciHost::from_address_plan(address_plan)
             || storage_plan.pci().msi() != msi
-            || !validate_storage_prefix(bundle, storage_plan, address_plan, &mut active_routes)
+            || !validate_storage_prefix(
+                bundle,
+                storage_plan,
+                address_plan,
+                storage_start_slot,
+                &mut active_routes,
+            )
         {
             return Err(PrepareHvfSnapshotV2EntropyPciPlatformPlanError::ResourcePlan);
         }
@@ -329,9 +368,10 @@ fn prepare_entropy_pci_endpoint_plan(
             return Err(PrepareHvfSnapshotV2EntropyPciPlatformPlanError::QueueConflict);
         }
     }
-    if !register_active_retained_routes(
+    if !register_active_retained_pci_routes(
         entropy_transport.retained().msix_state(),
         msi,
+        VIRTIO_RNG_QUEUE_SIZES.len(),
         route_count,
         &mut active_routes,
     ) {
@@ -352,6 +392,7 @@ fn validate_storage_prefix(
     bundle: &PreparedSnapshotV2StorageBundle,
     plan: &HvfSnapshotV2StoragePciPlatformPlan,
     address_plan: Arm64PciAddressPlan,
+    storage_start_slot: usize,
     active_routes: &mut Vec<(u64, u32)>,
 ) -> bool {
     let block_records = bundle
@@ -380,7 +421,10 @@ fn validate_storage_prefix(
         )
         .enumerate()
         .all(|(index, (transport, planned))| {
-            let Some(placement) = snapshot_v2_pci_endpoint_placement(address_plan, index) else {
+            let Some(slot) = storage_start_slot.checked_add(index) else {
+                return false;
+            };
+            let Some(placement) = snapshot_v2_pci_endpoint_placement(address_plan, slot) else {
                 return false;
             };
             let SnapshotV2DeviceTransport::Pci(captured) = transport else {
@@ -430,9 +474,10 @@ fn entropy_queue_conflicts_with_storage(
     })
 }
 
-fn register_active_retained_routes(
+pub(crate) fn register_active_retained_pci_routes(
     state: &VirtioPciMsixState,
     msi: crate::gic::HvfGicMsiMetadata,
+    queue_count: usize,
     route_count: usize,
     active_routes: &mut Vec<(u64, u32)>,
 ) -> bool {
@@ -450,13 +495,19 @@ fn register_active_retained_routes(
     else {
         return false;
     };
+    let pending_mask = match route_count {
+        0 => return false,
+        count if count < u64::BITS as usize => (1_u64 << count) - 1,
+        count if count == u64::BITS as usize => u64::MAX,
+        _ => return false,
+    };
     if state.vector_count() != route_count
         || state.pending_words().len() != 1
-        || state.queue_vectors().len() != VIRTIO_RNG_QUEUE_SIZES.len()
+        || state.queue_vectors().len() != queue_count
         || state
             .pending_words()
             .first()
-            .is_none_or(|pending| pending & !((1_u64 << route_count) - 1) != 0)
+            .is_none_or(|pending| pending & !pending_mask != 0)
         || !valid_vector(state.config_vector(), route_count)
         || !state
             .queue_vectors()
@@ -525,13 +576,16 @@ impl EntropyPciPlatformPlanReserve for SystemEntropyPciPlatformPlanReserve {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Instant;
 
+    use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
+    use bangbang_runtime::mmio::MmioRegion;
     use bangbang_runtime::pci::Arm64PciAddressPlan;
+    use bangbang_runtime::snapshot_device_v2::SnapshotV2MmioDeviceState;
     use bangbang_runtime::snapshot_entropy_v2_8::{
         NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, NATIVE_V2_ENTROPY_STATE_HEADER_BYTES,
         NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES, SnapshotV2EntropyState,
@@ -627,7 +681,12 @@ mod tests {
         memory
     }
 
-    fn entropy_state_at(index: usize, first_message_data: u32) -> SnapshotV2EntropyState {
+    fn entropy_state_at(
+        index: usize,
+        first_message_data: u32,
+        active_routes: bool,
+        referenced_routes: bool,
+    ) -> SnapshotV2EntropyState {
         let mut bytes = fixture_bytes(ACTIVE_PCI_HEX);
         let common_directory_entry =
             NATIVE_V2_ENTROPY_STATE_HEADER_BYTES + NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES;
@@ -666,17 +725,87 @@ mod tests {
             .copy_from_slice(&placement.bar_range.start().raw_value().to_le_bytes());
         bytes[transport_offset + 104..transport_offset + 108]
             .copy_from_slice(&first_message_data.to_le_bytes());
+        if !active_routes {
+            bytes[transport_offset + 108..transport_offset + 112]
+                .copy_from_slice(&1_u32.to_le_bytes());
+            bytes[transport_offset + 124..transport_offset + 128]
+                .copy_from_slice(&1_u32.to_le_bytes());
+        }
+        if !referenced_routes {
+            bytes[transport_offset + 68..transport_offset + 70]
+                .copy_from_slice(&u16::MAX.to_le_bytes());
+            bytes[transport_offset + 128..transport_offset + 136].fill(0);
+            bytes[transport_offset + 136..transport_offset + 138]
+                .copy_from_slice(&u16::MAX.to_le_bytes());
+        }
         SnapshotV2EntropyState::decode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, &bytes)
             .expect("relocated entropy fixture should decode")
     }
 
-    fn entropy_plan_at(index: usize, first_message_data: u32) -> SnapshotV2EntropyRestorePlan {
+    pub(crate) fn entropy_plan_at(
+        index: usize,
+        first_message_data: u32,
+    ) -> SnapshotV2EntropyRestorePlan {
+        entropy_plan_at_with_routes(index, first_message_data, true)
+    }
+
+    pub(crate) fn entropy_plan_at_with_routes(
+        index: usize,
+        first_message_data: u32,
+        active_routes: bool,
+    ) -> SnapshotV2EntropyRestorePlan {
         SnapshotV2EntropyRestorePlan::prepare(
-            entropy_state_at(index, first_message_data),
+            entropy_state_at(index, first_message_data, active_routes, true),
             &restore_memory(true),
             Instant::now(),
         )
         .expect("entropy restore plan should prepare")
+    }
+
+    pub(crate) fn entropy_plan_at_with_unreferenced_routes(
+        index: usize,
+        first_message_data: u32,
+    ) -> SnapshotV2EntropyRestorePlan {
+        SnapshotV2EntropyRestorePlan::prepare(
+            entropy_state_at(index, first_message_data, true, false),
+            &restore_memory(true),
+            Instant::now(),
+        )
+        .expect("unreferenced entropy restore plan should prepare")
+    }
+
+    pub(crate) fn entropy_mmio_plan_at(
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+    ) -> SnapshotV2EntropyRestorePlan {
+        let state = SnapshotV2EntropyState::decode(
+            NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+            &fixture_bytes(INACTIVE_MMIO_HEX),
+        )
+        .expect("MMIO entropy fixture should decode");
+        let (config, active_queue, limiter, retry, pending, virtio, transport) = state.into_parts();
+        let SnapshotV2DeviceTransport::Mmio(captured) = transport else {
+            panic!("MMIO entropy fixture should retain MMIO transport");
+        };
+        let transport = SnapshotV2DeviceTransport::Mmio(SnapshotV2MmioDeviceState::from_parts(
+            captured.device_feature_select(),
+            captured.driver_feature_select(),
+            captured.queue_select(),
+            region,
+            interrupt_line,
+        ));
+        let state = SnapshotV2EntropyState::try_new(
+            config,
+            active_queue,
+            limiter,
+            retry,
+            pending,
+            virtio,
+            transport,
+        )
+        .expect("relined MMIO entropy state should validate");
+        SnapshotV2EntropyRestorePlan::prepare(state, &restore_memory(false), Instant::now())
+            .expect("relined MMIO entropy plan should prepare")
     }
 
     fn with_msi_interrupt_count(
@@ -826,7 +955,9 @@ mod tests {
             &platform,
             None,
             &last_entropy,
+            0,
             PCI_ENDPOINT_SLOT_COUNT - 1,
+            None,
             &mut SystemEntropyPciPlatformPlanReserve,
         )
         .expect("30 preceding storage endpoints should leave one entropy slot");
@@ -841,7 +972,9 @@ mod tests {
                 &platform,
                 None,
                 &entropy,
+                0,
                 PCI_ENDPOINT_SLOT_COUNT,
+                None,
                 &mut SystemEntropyPciPlatformPlanReserve,
             ),
             Err(PrepareHvfSnapshotV2EntropyPciPlatformPlanError::PciCapacity {
@@ -861,7 +994,15 @@ mod tests {
             }
         }
         assert!(matches!(
-            prepare_entropy_pci_endpoint_plan(&platform, None, &entropy, 0, &mut FailingReserve,),
+            prepare_entropy_pci_endpoint_plan(
+                &platform,
+                None,
+                &entropy,
+                0,
+                0,
+                None,
+                &mut FailingReserve,
+            ),
             Err(PrepareHvfSnapshotV2EntropyPciPlatformPlanError::Allocation)
         ));
     }
