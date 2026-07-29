@@ -1,16 +1,15 @@
 # Firecracker v1.16.0 entropy closure contract
 
-This ledger is the checked closure record for #1475, the third delivery slice
-of #1440 under #1348. It covers exactly seven directly owned Firecracker
-v1.16.0 entropy identities. Five API operation, path, property, and schema
-identities are `implemented-and-verified`. Exactly `corpus:entropy` and
-`semantic.device:entropy-queues-limits-metrics-and-state` remain
-`audit-required` because their complete upstream claims include optional-device
-snapshot serialization and restore, which Wave 6 owns.
+This ledger began as the checked live-device closure for #1475, the third
+delivery slice of #1440 under #1348. #1666 completes its exact native-v2 2.8
+snapshot continuation and containment gate. It covers exactly seven directly
+owned Firecracker v1.16.0 entropy identities, and all seven are now
+`implemented-and-verified`.
 
 The generated source manifest remains 381 identities, the overlay retains 37
-local semantic identities and 418 total records, and this reconciliation moves
-the global disposition counts from 181/217/3/17 to 186/212/3/17.
+local semantic identities and 418 total records. The original live closure
+moved the global counts from 181/217/3/17 to 186/212/3/17; #1666 promotes the
+two retained aggregates from 236/162/3/17 to 238/160/3/17.
 
 ## Evidence keys
 
@@ -21,20 +20,29 @@ the global disposition counts from 181/217/3/17 to 186/212/3/17.
 - **Runtime** — one-queue virtio-rng parsing, host randomness, request capping,
   dual token buckets, retry retention, publication-safe limiter accounting,
   metrics, and detached MMIO/PCI capture state in
-  `crates/runtime/src/entropy.rs`; selected-owner traversal in
-  `crates/runtime/src/startup.rs`.
-- **HVF** — exact MMIO/PCI owner, transport-placement, quiescence-guard, and
-  retry-scheduler reconciliation in `crates/hvf/src/startup.rs`.
+  `crates/runtime/src/entropy.rs`; exact queue/limiter/pending/retry encoding
+  and restore planning in `crates/runtime/src/snapshot_entropy_v2_8.rs`.
+- **HVF** — exact MMIO/PCI placement in
+  `crates/hvf/src/snapshot_v2_entropy_platform.rs` and fresh OS source,
+  scheduler, notifier, route, endpoint, quiescence-guard, and retry
+  reconstruction in `crates/hvf/src/startup.rs`.
 - **Focused validation** — route/model/controller tests in
   `crates/api/src/http.rs` and `crates/bangbang/src/{api_server,vmm}.rs`, plus
   queue, source, limiter, retry, failure-order, metric, capture-invariant, and
   redaction tests in `crates/runtime/src/{entropy,metrics}.rs`.
 - **Signed owner validation** —
-  `crates/hvf/tests/hvf_lifecycle.rs::capture_ready_entropy_traverses_signed_mmio_and_pci_owners`.
+  `crates/hvf/tests/hvf_lifecycle.rs` covers capture-ready traversal, exact
+  MMIO/PCI retry restoration, deterministic fresh-source factory counts,
+  recapture, rollback, and teardown.
 - **Signed public validation** —
-  `crates/bangbang/tests/executable_hvf_e2e.rs` proves throttled repeated
-  `/dev/hwrng` reads, pause/capture-ready traversal/resume, metrics, and clean
-  shutdown through both MMIO and product PCI.
+  `crates/bangbang/tests/executable_hvf_e2e.rs::signed_executable_certifies_native_v2_entropy_snapshot_continuation`
+  proves fresh-process `/dev/hwrng` continuation from a retained request over
+  both transports and both product shapes.
+- **Signed contained validation** —
+  `crates/launcher/tests/production_bundle_e2e.rs::normal_bundle_certifies_native_v2_entropy_snapshot_continuation_and_containment`
+  proves the same exact state through the normal launcher/App Sandbox worker,
+  typed grants, pathname replacement, recapture, malformed input,
+  cancellation, both death orders, and exact cleanup.
 
 ## Exact seven-record ledger
 
@@ -45,10 +53,10 @@ the global disposition counts from 181/217/3/17 to 186/212/3/17.
 | `api-property:EntropyDevice.rate_limiter` | implemented and verified | Optional bandwidth and operations buckets preserve exact size, one-time burst, and refill time; absent or empty limiting remains unconfigured. Runtime limiting retains one throttled descriptor, schedules the earliest retry, and preserves exact bucket state at capture. Focused and signed throttling validation. |
 | `api-property:FullVmConfiguration.entropy` | implemented and verified | Nullable committed entropy configuration appears exactly in `/vm/config` and changes only after a successful preboot transaction. API/controller and signed configuration validation. |
 | `api-schema:EntropyDevice` | implemented and verified | Complete strict optional-`rate_limiter` schema with unknown-field/type rejection, exact configuration projection, and selected MMIO/PCI startup execution. API/model and signed validation. |
-| `corpus:entropy` | audit required | All applicable live API/device behavior, host randomness, limiting, retry, metrics, exact owner traversal, and detached state are implemented. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** owns optional-device state encoding, artifact integration, restore construction, migration/clone behavior, portability policy, and signed restored-guest outcomes. |
-| `semantic.device:entropy-queues-limits-metrics-and-state` | audit required | Live queue processing, the 64-KiB request cap, host entropy failures, dual-bucket limiting, retry wakeups, metrics, MMIO/PCI ownership, capture-ready state, failure ordering, redaction, and cleanup are implemented. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** owns serialized/restored entropy state and aggregate artifact/portability certification. |
+| `corpus:entropy` | implemented and verified | Strict live behavior plus exact native-v2 2.8 serialization/restoration are complete. Required serial, optional unchanged profile-3 storage, and optional entropy compose over matching MMIO or PCI; signed direct and contained guests prove retained-request continuation, explicit/automatic resume, recapture, immutable clones, fresh destination ownership and metrics, hostile lifecycle cleanup, and redaction. |
+| `semantic.device:entropy-queues-limits-metrics-and-state` | implemented and verified | Live queue processing, the 64-KiB request cap, host entropy failures, dual-bucket limiting, retry wakeups, metrics, MMIO/PCI ownership, failure ordering, redaction, and cleanup now compose with exact persisted queue/limiter/pending/retry state. Every destination constructs fresh source/scheduler/notifier/route/endpoint owners and completes the retained request without another guest kick. |
 
-## Observable live, metrics, and capture-ready contract
+## Observable live, metrics, and exact 2.8 contract
 
 - Every writable request is capped at 64 KiB and filled from the host operating
   system entropy source. Source failure completes the descriptor with zero
@@ -70,26 +78,33 @@ the global disposition counts from 181/217/3/17 to 186/212/3/17.
   descriptor, and a host-time-free retry disposition. Capture rejects feature,
   activation, queue, mapping, cursor, external-limiter, pending-descriptor, and
   scheduler disagreement. No random bytes, guest-memory borrow, lock, endpoint,
-  host handle, or `Instant` escapes.
+  host handle, metric value, or `Instant` escapes. Exact native-v2 2.8 encodes
+  this state after required kind 8 serial and optional unchanged kind 7
+  profile-3 storage.
 - A paused process-supervisor transaction quiesces the entropy retry publisher
   and requires exactly one configured MMIO or PCI owner. MMIO captures under
   dispatcher ownership; PCI captures device and canonical transport under one
   endpoint lock. The result retains MMIO region/IRQ or PCI SBDF/BAR placement.
-  Native-v1 creation performs this preflight before optional-profile rejection
-  and artifact publication but intentionally writes no entropy bytes yet.
-- Signed Linux guests prove the same marker-gated protocol over both transports:
-  a first `/dev/hwrng` read, host-controlled continuation, observable limiter
-  throttling, paused capture-ready traversal, resume, repeated nonempty reads,
-  retry metrics, and clean shutdown.
+  Native-v1 creation still performs this preflight before optional-profile
+  rejection and writes no entropy component; exact 2.3 through 2.7 readers
+  retain their historical profiles unchanged.
+- On load, retained guest queue, limiter buckets, pending descriptor, retry
+  intent, and transport placement bind to the immutable state/memory pair.
+  The destination creates a fresh host OS source, empty metrics set, scheduler,
+  notifier, route, endpoint, and host-clock-relative deadline. Delayed retry
+  completes the already outstanding Linux request without another queue kick.
+- Signed Linux guests prove the same marker-gated protocol over both transports
+  and both entropy-only-relative-to-serial and storage-plus-entropy products:
+  a first nonempty `/dev/hwrng` read, observable dual-bucket throttling, source
+  termination, fresh explicit and automatic destinations, restored nonempty
+  completion, retry metrics, recapture, immutable clones, and clean shutdown.
 
-## Explicit Wave 6 handoff
+## Explicit compatibility boundary
 
-This closure intentionally creates no entropy byte encoding or compatibility
-version. Wave 6 must integrate the detached value into an optional-device
-artifact, define versioning and validation, reconstruct MMIO/PCI live owners,
-restore exact queue/limiter/pending-retry state against a fresh host clock,
-re-establish the scheduler, reconcile external configuration, and prove
-restored Linux entropy reads and limiting behavior. Only after those outcomes
-may the two retained aggregate records become terminal. Firecracker artifact
-compatibility, cross-host token-clock identity, preservation of random bytes,
-and deterministic entropy output are not implied by this live closure.
+Exact 2.8 is bangbang-native. It does not serialize random output, the host
+source or its identity, metrics, scheduler/notifier handles, route objects,
+endpoint ownership, or absolute host time. The deterministic source factory is
+test evidence only and adds no artifact or public API field. Firecracker
+artifact-byte compatibility, deterministic entropy output, native-v2
+Uffd/Diff/editing, external authentication or encryption, and broad cross-host
+token-clock or OS-source portability are not claimed.

@@ -150,6 +150,7 @@ dependencies = [
 name = "bangbang-launcher"
 version = "0.1.0"
 dependencies = [
+ "bangbang-hvf",
  "bangbang-pager",
  "bangbang-runtime",
  "bangbang-session",

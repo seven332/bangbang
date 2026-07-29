@@ -178,9 +178,10 @@ automatic guest PCI notification, PCI state in native-v1 snapshots, pmem dirty
 tracking, externally certified vmnet connectivity, or Firecracker's KVM
 eventfd, timerfd, and interrupt-controller implementation identities. Later
 storage work adds vhost-user block and portable Async, while exact native-v2
-2.6 and current 2.7 profile 3 persist startup- or runtime-origin regular-file
-block and pmem endpoints; current 2.7 additionally carries the required
-platform-MMIO serial component. Network and every optional-device snapshot
-profile other than serial and pmem still reject before artifact mutation.
+2.6 through current 2.8 profile 3 persist startup- or runtime-origin
+regular-file block and pmem endpoints; exact 2.7 adds the required
+platform-MMIO serial component, and current 2.8 may add entropy on the selected
+MMIO or PCI transport. Network and every optional-device snapshot profile
+other than serial, pmem, and entropy still reject before artifact mutation.
 Apple-approved production vmnet credentials and real external connectivity
 remain #1351/#1378 work.

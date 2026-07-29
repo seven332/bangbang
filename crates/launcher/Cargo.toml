@@ -16,6 +16,7 @@ signal-hook = "0.3"
 bangbang-pager = { path = "../pager" }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
+bangbang-hvf = { path = "../hvf" }
 bangbang-runtime = { path = "../runtime" }
 
 [[bin]]

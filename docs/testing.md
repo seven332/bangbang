@@ -561,14 +561,17 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
 production catalog admits semantic memory kind 1 introduced in minor 1; the
-current `2.7.0` writer additionally admits machine/global/topology kinds 2–4
+current `2.8.0` writer additionally admits machine/global/topology kinds 2–4
 and per-vCPU kind 5 introduced in minor 2, singleton time kind 6 introduced in
 minor 3, optional singleton device-graph kind 7 introduced in minor 4, and
-mandatory singleton serial kind 8 introduced in minor 7.
+mandatory singleton serial kind 8 introduced in minor 7, plus optional entropy
+kind 9 introduced in minor 8.
 Exact `2.4.0` retains device-graph profile 1's singleton root, while `2.5.0`
 uses profile 2's bounded ordered block vector and `2.6.0` uses profile 3's
 bounded ordered block-and-pmem vector. Exact `2.7.0` requires kind 8 and
-optionally composes the unchanged profile-3 graph. Exact `2.3.0` remains the
+optionally composes the unchanged profile-3 graph. Exact `2.8.0` retains those
+rules and optionally appends kind 9 with one exact queue, dual buckets,
+pending/retry state, and MMIO/PCI placement. Exact `2.3.0` remains the
 legacy device-free platform profile. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
 lengths, all three offsets, CRC and every truncation, feature
@@ -581,7 +584,7 @@ resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
 Native-v2 lazy-memory tests retain exact multi-extent binding and complete
-`2.1.0` compatibility fixtures while proving that new output uses `2.7.0`.
+`2.1.0` compatibility fixtures while proving that new output uses `2.8.0`.
 They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
 binding/header/topology/length mutation, exact admitted-version retention,
 typed state profiles,
@@ -659,8 +662,9 @@ The wrapper builds the `bangbang` binary unit-test harness, locates and signs
 that exact test executable, and runs only the ignored private-seam proof. Its
 minimal two-vCPU guest does not touch serial or optional devices beyond the
 required read-only root. The first test starts and pauses the real
-process-owned HVF supervisor, publishes one current 2.7 serial-plus-profile-3
-MMIO-root pair, resumes and repauses the source, publishes a fresh recapture,
+process-owned HVF supervisor, publishes one current 2.8
+serial-plus-profile-3 MMIO-root pair without entropy, resumes and repauses the
+source, publishes a fresh recapture,
 and drops the source. It
 restores the first immutable pair into one fresh normal process initially
 `Paused`, proves the exact root configuration plus fresh destination
@@ -756,6 +760,35 @@ recapture, immutable pair reuse, default FIFO/pipe stdio, direct configured
 regular-file/FIFO replacement, contained write-only output grants, TX, EOF,
 redaction, and teardown. Destination terminal raw-mode/restoration remains a
 focused test because the signed harness supplies pipes rather than a PTY.
+
+### Native-v2 2.8 entropy certification matrix
+
+Exact 2.8 retains the complete 2.7 serial and optional profile-3 storage
+boundaries and adds one optional entropy singleton. These anchors certify its
+codec, public process transaction, fresh destination ownership, and
+host/guest-visible continuation:
+
+| Requirement | Exact anchors |
+| --- | --- |
+| Canonical bytes, exact optionality/version/placement, queue and dual-bucket state, pending/retry invariants, every fixed field and hostile length/count/value, allocation, and redaction | `inactive_mmio_and_active_pci_round_trip_canonically`, `exact_outer_version_is_required`, `header_directory_and_complete_bounds_fail_closed`, `local_presence_retry_and_cursor_mutations_fail_closed`, `local_bucket_presence_and_pending_matrix_fails_closed`, `common_virtio_hostile_fields_fail_closed`, `mmio_and_pci_transport_hostile_fields_fail_closed`, `allocation_failures_return_no_partial_value`, `diagnostics_redact_entropy_values_and_placement` |
+| Product graph selection, cross-graph rejection, public create/load staging, resource transaction failures, rollback/reuse, and current-version routing | `internal_exact_minor_eight_entropy_compositions_encode_nested_versions_canonically`, `exact_minor_eight_composition_rejects_transport_and_placement_conflicts`, `exact_minor_eight_decoder_rejects_malformed_profile_and_nested_entropy`, `native_v2_process_preflight_routes_exact_minor_eight_profile_to_hvf_decode`, `native_v2_entropy_candidate_profile_admits_all_products_and_both_transports`, `native_v2_entropy_capture_failures_recover_release_guards_and_remain_reusable`, `public_native_v2_process_publication_is_loadable_and_repeatable` |
+| Signed fresh MMIO/PCI source, scheduler, notifier, route, endpoint, limiter, metrics, reconstruction, and recapture | `restores_signed_serial_entropy_mmio_owners_with_exact_retry_semantics`, `restores_signed_serial_entropy_pci_owners_with_exact_retry_semantics`, `restores_signed_storage_serial_entropy_mmio_owner_graph`, `restores_signed_storage_serial_entropy_pci_owner_graph` |
+| Direct signed public continuation | `signed_executable_certifies_native_v2_entropy_snapshot_continuation` |
+| Normal production/App Sandbox continuation and containment | `normal_bundle_certifies_native_v2_entropy_snapshot_continuation_and_containment` |
+
+The deterministic `/snapshot-entropy-init` guest binds `virtio_rng`, consumes
+one exact 64-byte `/dev/hwrng` prefix, publishes readiness, and leaves a second
+64-byte read retained behind the one-operation and byte limiters. The source is
+then terminated. A fresh destination must decode the exact pending
+queue/limiter/retry state and complete that read after refill without another
+guest kick. The matrix covers entropy-only and profile-3 storage-plus-entropy
+graphs over MMIO and PCI, explicit and automatic resume, paused recapture,
+immutable pair reuse, exact fresh entropy source construction, fresh
+scheduler/notifier/route/endpoint and metrics owners, source-path replacement,
+malformed-state rejection, graceful cancellation, both launcher/worker death
+orders, redaction, and staging/session/socket cleanup. It does not claim
+persisted host randomness, migration of an OS entropy descriptor, bit-identical
+random output, or Firecracker snapshot compatibility.
 
 Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
 record, preserve kind-1 bytes exactly, and pin kind 2's exact nested binding,
@@ -1261,19 +1294,21 @@ closures, that checkpoint of the 418-record overlay contains 191
 `implemented-and-verified`, 207 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. The
 [entropy closure ledger](../compat/firecracker/v1.16.0/entropy-contract.md)
-pins five terminal API leaves and exactly two Wave 6 optional-device
-serialization/restore handoffs. When changing entropy code or evidence, run
-the focused runtime tests, both signed MMIO/PCI lifecycle cases, the capability
-validator, and the ordinary workspace gates. The
+now pins all seven selected entropy records terminal: five API/live leaves plus
+the exact 2.8 optional-device serialization and restored-device aggregate.
+When changing entropy code or evidence, run the focused runtime tests, both
+signed MMIO/PCI lifecycle cases, the direct and production continuation cases,
+the capability validator, and the ordinary workspace gates. The
 [serial closure ledger](../compat/firecracker/v1.16.0/serial-contract.md) pins
-five terminal API leaves and exactly one Wave 6 optional-device
-encoding/endpoint-reconstruction handoff. Serial changes additionally require
-the signed default-stdio executable cases and production-bundle boundary case.
+all six selected records terminal after exact 2.7
+encoding/endpoint-reconstruction certification. Serial changes additionally
+require the signed default-stdio executable cases and production-bundle
+boundary case.
 The checked
 [aggregate remaining-device ledger](../compat/firecracker/v1.16.0/remaining-device-contract.md)
-then fixes the union at 85 unique records with a 77-terminal/eight-Wave-6
-split. Its audit test rejects family drift, overlap, stale #1440/#1481 handoffs,
-wrong #1490 URLs, any selected #1491 row, and missing focused or signed evidence.
+fixes the union at 85 unique records with an 80-terminal/five-Wave-6 split.
+Its audit test rejects family drift, overlap, stale #1440/#1481 handoffs, wrong
+#1490 URLs, any selected #1491 row, and missing focused or signed evidence.
 
 At the checked network/MMDS closure checkpoint, the overlay contained 220
 `implemented-and-verified`, 178 `audit-required`, three
@@ -1291,8 +1326,10 @@ removal-generation, exact entitlement, and full-matrix evidence and promotes
 only that record. #1578 then promotes four public native-v2 process/snapshot
 records. #1634 promotes the final two pmem storage composites after native-v2
 2.6 profile-3 certification. #1652 promotes the serial semantic aggregate
-after exact 2.7 direct and normal-production continuation certification. The
-current overlay is 236/162/3/17.
+after exact 2.7 direct and normal-production continuation certification. #1665
+activates current native-v2 2.8 with optional entropy, and #1666 promotes the
+two entropy artifact/restore records after direct and normal-production
+continuation certification. The current overlay is 238/160/3/17.
 
 Snapshot paging feasibility, its standalone protocol/client, internal
 lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
@@ -1628,9 +1665,9 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
-- exact external snapshot grants creating native-v2 2.7
-  serial-plus-profile-3 rooted three-drive MMIO and PCI pairs into separate
-  output directories, reusing both retained
+- exact external snapshot grants creating current native-v2 2.8
+  serial-plus-profile-3 rooted three-drive MMIO and PCI pairs without entropy
+  into separate output directories, reusing both retained
   directories for a second successful pair, preserving all finals on
   collision, and keeping same-GrantId concurrent source workers in their own
   directories; granted early description and two fresh complete-set
@@ -1663,6 +1700,15 @@ may skip execution. On supported Apple Silicon it proves:
   fresh write-only serial grants after pathname replacement, verifies
   destination-only metrics and immutable artifacts, redacts every private
   selector, and restores the session namespace after launcher/worker teardown;
+- `normal_bundle_certifies_native_v2_entropy_snapshot_continuation_and_containment`,
+  which runs entropy-only and profile-3 storage-plus-entropy graphs over MMIO
+  and PCI. It replaces every source pathname after launcher adoption, restores
+  exact pending queue/dual-limiter/retry state through fresh destination
+  entropy, scheduler, notifier, route, endpoint, and metrics owners, completes
+  the retained second `/dev/hwrng` read without another guest kick, recaptures,
+  reuses immutable artifacts through explicit and automatic resume, rejects a
+  checksum-malformed entropy state, and proves graceful cancellation
+  plus worker-first and launcher-first staging/session/socket cleanup;
 - a feature-gated root-plus-vsock restore-resource probe that uses the real
   coherent contained-session authority, exact typed take/adopt/commit, reverse
   reservation abort and reuse, and all nine deterministic cancellation points;
@@ -1824,8 +1870,8 @@ punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
 separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
-checks exact `v2.7.0` output for `--snapshot-version`, exact description of
-native-v1, legacy `2.3.0`, `2.4.0`, `2.5.0`, and `2.6.0`, and current
+checks exact `v2.8.0` output for `--snapshot-version`, exact description of
+native-v1, legacy `2.3.0`, `2.4.0`, `2.5.0`, `2.6.0`, and `2.7.0`, and current
 native-v2 fixtures, plus explicit pinned Firecracker/unknown incompatibility. It also
 covers missing, non-regular,
 oversized, malformed, truncated, trailing/inconsistent-length, corrupt,
@@ -1880,7 +1926,7 @@ pausing, proving the source has already followed live MMIO or PCI root I/O.
 The source UART must remain canonical, while its Linux-consumed FDT bytes are
 captured and CRC-bound without being reparsed as trusted post-boot topology.
 Creation through `/snapshot/create` then verifies the real CLI reports
-`v2.7.0`. Fresh signed processes repeatedly load the same immutable pair: one
+`v2.8.0`. Fresh signed processes repeatedly load the same immutable pair: one
 remains paused until public `PATCH /vm`, and one uses `resume_vm: true`. The
 paused destination is also publicly recaptured and its decoded root graph must
 equal the source graph. After resume Linux reads the known root marker through
@@ -1956,6 +2002,21 @@ renames source regular-file/FIFO output endpoints and creates fresh destination
 endpoints at the persisted selector; restored TX must reach only the
 destination endpoint.
 
+Run the exact-2.8 entropy continuation matrix with:
+
+```sh
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  signed_executable_certifies_native_v2_entropy_snapshot_continuation \
+  --exact
+```
+
+Its `/snapshot-entropy-init` guest consumes one 64-byte entropy prefix and
+retains a second read behind both limiter buckets before capture. MMIO/PCI
+entropy-only and storage-plus-entropy destinations reconstruct fresh owners,
+complete the retained read without a new guest kick, recapture, resume
+explicitly or automatically, expose fresh metrics, and preserve the immutable
+pair after source termination.
+
 The
 tiny-initrd scenarios write `BANGBANG_BLOCK_WRITE_OK` to scratch block backing
 files and include API/config-file coverage for configured serial output files.
@@ -2009,8 +2070,9 @@ capture-ready optional-profile rejection with no artifacts, resume, shrink and
 deflate, detach stdin at EOF while the API remains live, and repeat a short
 session with the same socket/control-resource names. This proves live and
 capture-ready coexistence only. Exact serial encoding/restore is certified by
-the dedicated 2.7 matrix above; this aggregate case does not by itself prove
-the other optional-device encodings or PVTime clone portability.
+the dedicated 2.7 matrix above and exact entropy encoding/restore by the
+dedicated 2.8 matrix. This aggregate case does not by itself prove balloon,
+virtio-mem, network, or PVTime encoding/clone portability.
 It also includes a direct-rootfs balloon scenario that configures `/balloon`,
 enables free-page reporting, checks that the guest bound a virtio-balloon driver
 and negotiated reporting feature bit 5, observes periodic optional statistics,
@@ -2454,10 +2516,12 @@ interrupts, public time-state restoration outside the focused native-v2
 profile, cross-host clock portability, or broader RTC-adjacent behavior beyond
 the checked PL031/VMGenID/VMClock/PVTime contract is supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
-Entropy and network optional-device encoding, restore, migration/clone, and
-cross-host policy remain the exact Wave 6 #1490 handoff; the network producer
-intentionally requests a fresh lossy destination rather than serializing peer
-packets, callbacks, active protocol sessions, or source clock deadlines.
+Network optional-device encoding, restore, migration/clone, and cross-host
+policy remain the exact Wave 6 #1490 handoff. Entropy is terminal only for the
+exact native-v2 2.8 contract and evidence above; it does not claim Firecracker
+artifacts or broad portability. The network producer intentionally requests a
+fresh lossy destination rather than serializing peer packets, callbacks, active
+protocol sessions, or source clock deadlines.
 
 For vsock specifically, this evidence validates the **implemented supported live MMIO-or-PCI startup/Unix-socket subset**:
 dynamic 64-KiB credit windows with wrapping

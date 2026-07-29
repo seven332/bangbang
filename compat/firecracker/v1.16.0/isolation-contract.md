@@ -528,17 +528,23 @@ execution proves:
   reuse for a second pair, same-GrantId concurrent-session isolation, bounded
   early description, and two fresh descriptor-bound state/memory/root restores
   with explicit and automatic resume through guest `SYSTEM_OFF`; and
-- exact native-v2 2.6/current 2.7 profile-3 rooted pmem-only and rootless mixed-storage
-  create/load over MMIO and PCI, with exact read-only/read-write
+- exact native-v2 2.6 through current 2.8 profile-3 rooted pmem-only and
+  rootless mixed-storage create/load over MMIO and PCI, with exact read-only/read-write
   `PmemBacking` grants, source-path replacement resistance, complete-set
   cross-class alias rejection, immutable state/memory reuse, shared writable
   prefix epochs, fresh zero private tails, redaction, and session/grant
   cleanup; and
-- current native-v2 2.7 serial-only and configured-output create/load with
+- exact native-v2 2.7 serial-only and configured-output create/load with
   exact `SerialSink`/`WriteOnly` grants, source-path replacement resistance,
   fresh destination ownership and metrics, restored UART/RX/pending-interrupt
   progress, storage composition, explicit/automatic resume, recapture,
   redaction, and session/grant cleanup; and
+- current native-v2 2.8 entropy-only and storage-plus-entropy create/load over
+  MMIO and PCI with exact pending queue/dual-limiter/retry state, fresh entropy
+  source/scheduler/notifier/route/endpoint/metrics owners, source-path
+  replacement resistance, explicit/automatic resume, recapture,
+  checksum-malformed state rejection, graceful cancellation, redaction,
+  and both launcher/worker death-order staging/session/socket cleanup; and
 - worker-first death after a durably recorded snapshot staging inode, with the
   launcher removing the exact inode or preserving a same-name replacement while
   clearing the private record and session namespace.

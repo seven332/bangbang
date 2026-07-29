@@ -300,6 +300,14 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_NATIVE_V2_ROOT_SNAPSHOT_BOOT_ARGS: &str = "console=null reboot=k panic=0 quiet loglevel=1 root=/dev/vda ro rootwait init=/bangbang-direct-rootfs-init bangbang.native-v2-root-snapshot=1";
     const SNAPSHOT_BLOCK_BOOT_ARGS: &str =
         "console=null reboot=k panic=1 quiet loglevel=1 rdinit=/snapshot-block-init";
+    const SNAPSHOT_ENTROPY_BOOT_ARGS: &str =
+        "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rdinit=/snapshot-entropy-init";
+    const SNAPSHOT_ENTROPY_READY_MARKER: &str = "BANGBANG_SNAPSHOT_ENTROPY_READY";
+    const SNAPSHOT_ENTROPY_SUCCESS_MARKER: &str = "BANGBANG_SNAPSHOT_ENTROPY_OK";
+    const SNAPSHOT_ENTROPY_FAILURE_MARKER: &str = "BANGBANG_SNAPSHOT_ENTROPY_FAIL";
+    const SNAPSHOT_ENTROPY_READ_BYTES: u64 = 64;
+    const SNAPSHOT_ENTROPY_REFILL_MS: u64 = 3_000;
+    const SNAPSHOT_ENTROPY_TIMEOUT: Duration = Duration::from_secs(60);
     const SNAPSHOT_BLOCK_SECTOR_SIZE: usize = 512;
     const SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE: u8 = 0x11;
     const SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE: u8 = 0x12;
@@ -4915,6 +4923,401 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             &format!("bangbang entropy lifecycle {transport}"),
+        );
+    }
+
+    #[test]
+    fn signed_executable_certifies_native_v2_entropy_snapshot_continuation() {
+        for enable_pci in [false, true] {
+            for with_storage in [false, true] {
+                run_signed_entropy_snapshot_continuation(enable_pci, with_storage);
+            }
+        }
+    }
+
+    fn run_signed_entropy_snapshot_continuation(enable_pci: bool, with_storage: bool) {
+        let transport = if enable_pci { "pci" } else { "mmio" };
+        let product = if with_storage {
+            "storage-entropy"
+        } else {
+            "entropy-only"
+        };
+        let case = format!("{transport}-{product}");
+        let test_dir = TestDir::new();
+        let source_socket = test_dir.path().join("es");
+        let paused_socket = test_dir.path().join("ep");
+        let resumed_socket = test_dir.path().join("er");
+        let state_path = test_dir.path().join(format!("{case}.state"));
+        let memory_path = test_dir.path().join(format!("{case}.memory"));
+        let source_metrics = test_dir.path().join(format!("{case}-source.metrics"));
+        let paused_metrics = test_dir.path().join(format!("{case}-paused.metrics"));
+        let resumed_metrics = test_dir.path().join(format!("{case}-resumed.metrics"));
+        let storage_path = test_dir.path().join(format!("{case}-data.img"));
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let process_args: &[&str] = if enable_pci { &["--enable-pci"] } else { &[] };
+        if with_storage {
+            fs::write(&storage_path, vec![0_u8; 4096])
+                .expect("entropy snapshot storage backing should write");
+        }
+
+        let mut source = BangbangProcess::start_with_extra_args(
+            &source_socket,
+            &format!("{}-entropy-{case}-source", test_dir.instance_id()),
+            process_args,
+        );
+        configure_and_start_entropy_snapshot_source(
+            &source_socket,
+            &kernel_path,
+            &initrd_path,
+            &source_metrics,
+            with_storage.then_some(storage_path.as_path()),
+            &case,
+        );
+        if let Err(error) =
+            source.wait_for_stdout_marker(SNAPSHOT_ENTROPY_READY_MARKER, SNAPSHOT_ENTROPY_TIMEOUT)
+        {
+            let output = source.force_stop_and_collect();
+            panic!(
+                "{case} entropy source should complete its initial nonempty read: {error}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert!(
+            wait_for_entropy_metric_since(
+                &source_socket,
+                &source_metrics,
+                0,
+                "entropy_rate_limiter_throttled",
+                1,
+                SNAPSHOT_ENTROPY_TIMEOUT,
+            )
+            .expect("entropy source should retain one throttled descriptor")
+                >= 1
+        );
+        assert!(
+            entropy_metric_total_since(&source_metrics, 0, "entropy_bytes")
+                >= SNAPSHOT_ENTROPY_READ_BYTES,
+            "{case} source metrics should prove one completed nonempty request"
+        );
+        assert_no_content_response(
+            &http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            &format!("PATCH {case} entropy source Paused"),
+        );
+        let paused_state = http_get(&source_socket, "/");
+        assert_response_contains(
+            &paused_state,
+            r#""state":"Paused""#,
+            &format!("GET {case} entropy source Paused"),
+        );
+        create_entropy_snapshot(
+            &source_socket,
+            &state_path,
+            &memory_path,
+            &format!("{case} source"),
+        );
+        assert_pending_entropy_snapshot(&state_path, enable_pci, with_storage, &case);
+        let state_before = fs::read(&state_path).expect("entropy snapshot state should read");
+        let memory_before = fs::read(&memory_path).expect("entropy snapshot memory should read");
+        assert_no_snapshot_staging(test_dir.path());
+        assert_clean_shutdown(
+            source.terminate(),
+            &source_socket,
+            &format!("{case} entropy snapshot source"),
+        );
+
+        run_entropy_snapshot_destination(
+            test_dir.path(),
+            &paused_socket,
+            &paused_metrics,
+            &state_path,
+            &memory_path,
+            process_args,
+            enable_pci,
+            with_storage,
+            false,
+            true,
+            &format!("{case}-explicit"),
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("explicit destination state should remain readable"),
+            state_before,
+            "{case} explicit load must not mutate state"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("explicit destination memory should remain readable"),
+            memory_before,
+            "{case} explicit load must not mutate memory"
+        );
+
+        run_entropy_snapshot_destination(
+            test_dir.path(),
+            &resumed_socket,
+            &resumed_metrics,
+            &state_path,
+            &memory_path,
+            process_args,
+            enable_pci,
+            with_storage,
+            true,
+            false,
+            &format!("{case}-automatic"),
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("automatic destination state should remain readable"),
+            state_before,
+            "{case} repeated load must not mutate state"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("automatic destination memory should remain readable"),
+            memory_before,
+            "{case} repeated load must not mutate memory"
+        );
+        assert_no_snapshot_staging(test_dir.path());
+    }
+
+    fn configure_and_start_entropy_snapshot_source(
+        socket: &Path,
+        kernel: &Path,
+        initrd: &Path,
+        metrics: &Path,
+        storage: Option<&Path>,
+        context: &str,
+    ) {
+        for (path, body, request) in [
+            (
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#.to_owned(),
+                "machine config",
+            ),
+            (
+                "/entropy",
+                format!(
+                    r#"{{"rate_limiter":{{"bandwidth":{{"size":{SNAPSHOT_ENTROPY_READ_BYTES},"refill_time":{SNAPSHOT_ENTROPY_REFILL_MS}}},"ops":{{"size":1,"refill_time":{SNAPSHOT_ENTROPY_REFILL_MS}}}}}}}"#
+                ),
+                "entropy config",
+            ),
+            (
+                "/metrics",
+                format!(r#"{{"metrics_path":{}}}"#, json_string(path_text(metrics))),
+                "metrics",
+            ),
+            (
+                "/boot-source",
+                format!(
+                    r#"{{"kernel_image_path":{},"initrd_path":{},"boot_args":{}}}"#,
+                    json_string(path_text(kernel)),
+                    json_string(path_text(initrd)),
+                    json_string(SNAPSHOT_ENTROPY_BOOT_ARGS)
+                ),
+                "boot source",
+            ),
+        ] {
+            assert_no_content_response(
+                &http_put_json(socket, path, &body),
+                &format!("PUT {context} entropy snapshot {request}"),
+            );
+        }
+        if let Some(storage) = storage {
+            assert_no_content_response(
+                &http_put_json(
+                    socket,
+                    "/drives/data",
+                    &format!(
+                        r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"}}"#,
+                        json_string(path_text(storage))
+                    ),
+                ),
+                &format!("PUT {context} entropy snapshot storage"),
+            );
+        }
+        assert_no_content_response(
+            &http_put_json(socket, "/actions", r#"{"action_type":"InstanceStart"}"#),
+            &format!("PUT {context} entropy snapshot InstanceStart"),
+        );
+    }
+
+    fn create_entropy_snapshot(socket: &Path, state: &Path, memory: &Path, context: &str) {
+        let response = http_json_with_io_timeout(
+            socket,
+            "PUT",
+            "/snapshot/create",
+            &format!(
+                r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+                json_string(path_text(state)),
+                json_string(path_text(memory))
+            ),
+            SNAPSHOT_ENTROPY_TIMEOUT,
+        );
+        assert_no_content_response(&response, &format!("PUT {context} /snapshot/create"));
+        assert!(state.is_file(), "{context} state should publish");
+        assert!(memory.is_file(), "{context} memory should publish");
+    }
+
+    fn assert_pending_entropy_snapshot(
+        state_path: &Path,
+        enable_pci: bool,
+        with_storage: bool,
+        context: &str,
+    ) {
+        let bytes = fs::read(state_path).unwrap_or_else(|error| {
+            panic!(
+                "{context} entropy state {} should read: {error}",
+                state_path.display()
+            )
+        });
+        let structural =
+            decode_snapshot_v2_state(&bytes).expect("entropy state should decode structurally");
+        let state = decode_hvf_snapshot_v2_entropy_state(&structural)
+            .expect("entropy state should decode as exact native-v2 2.8");
+        assert_eq!(
+            state.device_graph().is_some(),
+            with_storage,
+            "{context} storage presence should remain exact"
+        );
+        let entropy = state
+            .entropy()
+            .expect("certification artifact should contain entropy");
+        let expected_transport = if enable_pci {
+            SnapshotV2DeviceTransportKind::Pci
+        } else {
+            SnapshotV2DeviceTransportKind::Mmio
+        };
+        assert_eq!(
+            entropy.transport().kind(),
+            expected_transport,
+            "{context} entropy transport should remain exact"
+        );
+        if let Some(graph) = state.device_graph() {
+            assert_eq!(
+                graph.transport_kind(),
+                expected_transport,
+                "{context} storage and entropy must share one transport"
+            );
+            assert_eq!(
+                graph.block_records().len(),
+                1,
+                "{context} storage-bearing product should retain one block"
+            );
+        }
+        let queue = entropy
+            .active_queue()
+            .expect("pending entropy artifact should retain one active queue");
+        assert_eq!(
+            queue.outstanding(),
+            1,
+            "{context} should retain exactly one outstanding entropy descriptor"
+        );
+        assert!(
+            entropy.limiter().bandwidth().is_some(),
+            "{context} should retain bandwidth bucket continuation"
+        );
+        assert!(
+            entropy.limiter().ops().is_some(),
+            "{context} should retain operations bucket continuation"
+        );
+        assert!(
+            entropy.has_pending_work(),
+            "{context} should retain rate-limited work"
+        );
+        assert!(
+            entropy.retry().has_retry(),
+            "{context} should retain destination-relative retry intent"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_entropy_snapshot_destination(
+        test_root: &Path,
+        socket: &Path,
+        metrics: &Path,
+        state: &Path,
+        memory: &Path,
+        process_args: &[&str],
+        enable_pci: bool,
+        with_storage: bool,
+        resume_vm: bool,
+        recapture: bool,
+        context: &str,
+    ) {
+        let destination = BangbangProcess::start_with_extra_args(socket, context, process_args);
+        configure_snapshot_destination_metrics(socket, metrics, context);
+        assert!(
+            fs::read(metrics).unwrap_or_default().is_empty(),
+            "{context} metrics must start fresh before load"
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                socket,
+                "PUT",
+                "/snapshot/load",
+                &snapshot_root_load_body(state, memory, resume_vm),
+                SNAPSHOT_ENTROPY_TIMEOUT,
+            ),
+            &format!("PUT {context} /snapshot/load"),
+        );
+        if !resume_vm {
+            let info = http_get(socket, "/");
+            assert_response_contains(
+                &info,
+                r#""state":"Paused""#,
+                &format!("GET {context} Paused"),
+            );
+            assert_response_contains(
+                &info,
+                &format!(r#""id":"{context}""#),
+                &format!("GET {context} destination identity"),
+            );
+            if recapture {
+                let recaptured_state = test_root.join(format!("{context}.recaptured.state"));
+                let recaptured_memory = test_root.join(format!("{context}.recaptured.memory"));
+                create_entropy_snapshot(
+                    socket,
+                    &recaptured_state,
+                    &recaptured_memory,
+                    &format!("{context} recapture"),
+                );
+                assert_pending_entropy_snapshot(
+                    &recaptured_state,
+                    enable_pci,
+                    with_storage,
+                    &format!("{context} recapture"),
+                );
+            }
+            assert_no_content_response(
+                &http_json(socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+                &format!("PATCH {context} Resumed"),
+            );
+        }
+        let output = destination.wait_for_exit_with_timeout(
+            SNAPSHOT_ENTROPY_TIMEOUT,
+            &format!("{context} restored entropy guest poweroff"),
+        );
+        assert!(
+            output.stdout.contains(SNAPSHOT_ENTROPY_SUCCESS_MARKER),
+            "{context} restored guest should complete its retained read; stdout:\n{}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains(SNAPSHOT_ENTROPY_FAILURE_MARKER),
+            "{context} restored guest should not report entropy failure; stdout:\n{}",
+            output.stdout
+        );
+        assert_clean_shutdown(output, socket, context);
+        assert!(
+            entropy_metric_total_since(metrics, 0, "entropy_bytes") >= SNAPSHOT_ENTROPY_READ_BYTES,
+            "{context} should report only newly completed destination entropy bytes; metrics:\n{}",
+            fs::read_to_string(metrics).unwrap_or_default()
+        );
+        assert!(
+            entropy_metric_total_since(metrics, 0, "rate_limiter_event_count") >= 1,
+            "{context} should report restored retry activity; metrics:\n{}",
+            fs::read_to_string(metrics).unwrap_or_default()
+        );
+        assert_eq!(
+            entropy_metric_total_since(metrics, 0, "host_rng_fails"),
+            0,
+            "{context} real destination entropy source should succeed"
         );
     }
 

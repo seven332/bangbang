@@ -545,8 +545,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 236);
-    assert_eq!(count(Disposition::AuditRequired), 162);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 238);
+    assert_eq!(count(Disposition::AuditRequired), 160);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -770,8 +770,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 236);
-    assert_eq!(count(Disposition::AuditRequired), 162);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 238);
+    assert_eq!(count(Disposition::AuditRequired), 160);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -982,8 +982,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 236);
-    assert_eq!(count(Disposition::AuditRequired), 162);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 238);
+    assert_eq!(count(Disposition::AuditRequired), 160);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -1183,17 +1183,16 @@ fn delivery_closure_policy_is_stable() {
         "corpus:memory-hotplug",
         "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
     ];
-    const ENTROPY_TERMINAL: [&str; 5] = [
+    const ENTROPY_TERMINAL: [&str; 7] = [
         "api-operation:PUT /entropy",
         "api-path:/entropy",
         "api-property:EntropyDevice.rate_limiter",
         "api-property:FullVmConfiguration.entropy",
         "api-schema:EntropyDevice",
-    ];
-    const ENTROPY_WAVE_6: [&str; 2] = [
         "corpus:entropy",
         "semantic.device:entropy-queues-limits-metrics-and-state",
     ];
+    const ENTROPY_WAVE_6: [&str; 0] = [];
     const SERIAL_TERMINAL: [&str; 6] = [
         "api-operation:PUT /serial",
         "api-path:/serial",
@@ -1250,8 +1249,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 236);
-    assert_eq!(count(Disposition::AuditRequired), 162);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 238);
+    assert_eq!(count(Disposition::AuditRequired), 160);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -1624,8 +1623,8 @@ fn delivery_closure_policy_is_stable() {
         .chain(ENTROPY_WAVE_6)
         .chain(TIME_IDENTITY_WAVE_6)
         .collect::<BTreeSet<_>>();
-    assert_eq!(remaining_terminal_ids.len(), 78);
-    assert_eq!(remaining_wave_6_ids.len(), 7);
+    assert_eq!(remaining_terminal_ids.len(), 80);
+    assert_eq!(remaining_wave_6_ids.len(), 5);
     assert!(remaining_terminal_ids.is_disjoint(&remaining_wave_6_ids));
     assert_eq!(
         remaining_terminal_ids
