@@ -7,7 +7,7 @@ v1.16.0 storage identities, and all 40 are `implemented-and-verified`.
 
 The generated source manifest remains 381 identities, the overlay retains 37
 local semantic identities and 418 total records, and the current global
-disposition counts are 236/162/3/17.
+disposition counts are 238/160/3/17.
 
 ## Evidence keys
 
@@ -42,9 +42,10 @@ proves terminal vhost-backend death and process cleanup. The production branch
 proves exact grant and child authority, pathname-replacement resistance,
 frontend/session/helper cleanup, redaction, and unchanged entitlements.
 
-The exact native-v2 2.6 and current 2.7 profile-3 matrices additionally run
-rooted pmem-only and rootless mixed block/pmem cells over MMIO and PCI; current
-2.7 composes that unchanged storage graph with the required serial component.
+The exact native-v2 2.6 through current 2.8 profile-3 matrices additionally run
+rooted pmem-only and rootless mixed block/pmem cells over MMIO and PCI; exact
+2.7 composes that unchanged storage graph with the required serial component,
+and current 2.8 may add entropy on the matching transport.
 They reuse one immutable state/memory pair in fresh destinations and prove
 exact external writable prefix epochs, read-only peer protection, zero private
 aligned tails on each fresh mapping, limiter/retry continuation, recapture,
@@ -91,7 +92,7 @@ direct or exact contained backing authority, and cleanup.
 | `corpus:block-io-engine` | implemented and verified | Bounded portable Async executor with generation-safe completion plus Sync default and explicit native-v1 boundary. | Executor/queue/lifecycle tests and signed Sync/Async families; both aggregate modes. |
 | `corpus:block-vhost-user` | implemented and verified | Complete applicable frontend protocol, shared-memory aperture, MMIO/PCI lifecycle, CONFIG, runtime reuse, contained brokerage, death, and snapshot rejection. | Focused protocol/broker tests; Direct aggregate terminal branch; Contained aggregate orderly branch. |
 | `corpus:patch-block` | implemented and verified | Cooperative failure-atomic file/Async refresh, incremental limiter update, and ID-only existing-stream vhost CONFIG refresh. | Focused update/rollback tests; concurrent and paused aggregate phases in both modes. |
-| `corpus:pmem` | implemented and verified | Complete applicable live API, mapping, root, protection, flush, limiter, capture-ready state, hotplug/reuse, containment, and exact native-v2 2.6/current 2.7 profile-3 serialization/restore. | Focused mapping/authority/fault tests; Direct and Contained aggregates; Direct and Contained snapshot aggregates. |
+| `corpus:pmem` | implemented and verified | Complete applicable live API, mapping, root, protection, flush, limiter, capture-ready state, hotplug/reuse, containment, and exact native-v2 2.6 through current 2.8 profile-3 serialization/restore. | Focused mapping/authority/fault tests; Direct and Contained aggregates; Direct and Contained snapshot aggregates. |
 | `semantic.storage:block-sync-async-vhost-and-limits` | implemented and verified | Complete applicable block aggregate across Sync, portable Async, vhost, cache/flush, limiting, replacement, shared aperture, PCI lifecycle, failure, and cleanup. | Focused owner/resource tests; Direct aggregate; Contained aggregate. |
 | `semantic.storage:pmem-root-mapping-flush-and-state` | implemented and verified | Exact live and profile-3 root/mapping/protection/flush/limiter/state/runtime/restore/cleanup behavior over MMIO or PCI. | Profile-3 complete-set, alias, cardinality, geometry, cancellation, rollback, completion, and cleanup tests; Direct and Contained snapshot aggregates. |
 

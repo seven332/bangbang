@@ -15025,6 +15025,29 @@ impl OwnedHvfArm64BootSession {
             serial_input,
             entropy,
             false,
+            VirtioRngOsEntropySource::new,
+        )
+    }
+
+    /// Reconstructs MMIO entropy while exposing one deterministic source
+    /// construction seam for signed ownership certification.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_entropy_mmio_with_source_factory(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        entropy: SnapshotV2EntropyRestorePlan,
+        source_factory: impl FnOnce() -> VirtioRngOsEntropySource,
+    ) -> Result<RestoredHvfSnapshotV2EntropyMmioOwners, HvfSnapshotV2EntropyMmioRestoreError> {
+        Self::restore_snapshot_v2_serial_entropy_mmio_inner(
+            state,
+            memory,
+            process_shell,
+            serial_input,
+            entropy,
+            false,
+            source_factory,
         )
     }
 
@@ -15045,6 +15068,7 @@ impl OwnedHvfArm64BootSession {
             serial_input,
             entropy,
             true,
+            VirtioRngOsEntropySource::new,
         )
     }
 
@@ -15055,6 +15079,7 @@ impl OwnedHvfArm64BootSession {
         serial_input: Option<SerialStdioInput>,
         entropy: SnapshotV2EntropyRestorePlan,
         inject_scheduler_failure: bool,
+        source_factory: impl FnOnce() -> VirtioRngOsEntropySource,
     ) -> Result<RestoredHvfSnapshotV2EntropyMmioOwners, HvfSnapshotV2EntropyMmioRestoreError> {
         if snapshot_v2_queue_ranges_conflict_with_platform(&state, entropy.queue_ranges()) {
             return Err(HvfSnapshotV2EntropyMmioRestoreError::preflight(
@@ -15080,7 +15105,13 @@ impl OwnedHvfArm64BootSession {
         )
         .map_err(HvfSnapshotV2EntropyMmioRestoreError::serial_platform)?;
 
-        Self::attach_snapshot_v2_entropy_mmio(session, entropy, None, inject_scheduler_failure)
+        Self::attach_snapshot_v2_entropy_mmio(
+            session,
+            entropy,
+            None,
+            inject_scheduler_failure,
+            source_factory,
+        )
     }
 
     /// Reconstructs one exact-2.8 storage, serial, and MMIO entropy
@@ -15122,7 +15153,13 @@ impl OwnedHvfArm64BootSession {
         )
         .map_err(HvfSnapshotV2EntropyMmioRestoreError::storage_platform)?;
         let (session, storage_configs) = restored.into_parts();
-        Self::attach_snapshot_v2_entropy_mmio(session, entropy, Some(storage_configs), false)
+        Self::attach_snapshot_v2_entropy_mmio(
+            session,
+            entropy,
+            Some(storage_configs),
+            false,
+            VirtioRngOsEntropySource::new,
+        )
     }
 
     fn attach_snapshot_v2_entropy_mmio(
@@ -15130,6 +15167,7 @@ impl OwnedHvfArm64BootSession {
         entropy: PreparedSnapshotV2EntropyMmioHandler,
         storage_configs: Option<CaptureReadyStorageConfigs>,
         inject_scheduler_failure: bool,
+        source_factory: impl FnOnce() -> VirtioRngOsEntropySource,
     ) -> Result<RestoredHvfSnapshotV2EntropyMmioOwners, HvfSnapshotV2EntropyMmioRestoreError> {
         let (config, _queue_ranges, _retry, retry_deadline, region, interrupt_line, handler) =
             entropy.into_parts();
@@ -15268,7 +15306,7 @@ impl OwnedHvfArm64BootSession {
             fdt_device,
         });
         session.entropy_interrupt_line = Some(interrupt_line);
-        session.entropy_source = VirtioRngOsEntropySource::new();
+        session.entropy_source = source_factory();
         session.entropy_device_metrics = SharedEntropyDeviceMetrics::default();
         session.entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
 
@@ -15325,6 +15363,31 @@ impl OwnedHvfArm64BootSession {
             endpoint_plan,
             entropy,
             false,
+            VirtioRngOsEntropySource::new,
+        )
+    }
+
+    /// Reconstructs PCI entropy while exposing one deterministic source
+    /// construction seam for signed ownership certification.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_entropy_pci_with_source_factory(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        endpoint_plan: HvfSnapshotV2EntropyPciEndpointPlan,
+        entropy: SnapshotV2EntropyRestorePlan,
+        source_factory: impl FnOnce() -> VirtioRngOsEntropySource,
+    ) -> Result<RestoredHvfSnapshotV2EntropyPciOwners, HvfSnapshotV2EntropyPciRestoreError> {
+        Self::restore_snapshot_v2_serial_entropy_pci_inner(
+            state,
+            memory,
+            process_shell,
+            serial_input,
+            endpoint_plan,
+            entropy,
+            false,
+            source_factory,
         )
     }
 
@@ -15347,6 +15410,7 @@ impl OwnedHvfArm64BootSession {
             endpoint_plan,
             entropy,
             true,
+            VirtioRngOsEntropySource::new,
         )
     }
 
@@ -15359,6 +15423,7 @@ impl OwnedHvfArm64BootSession {
         endpoint_plan: HvfSnapshotV2EntropyPciEndpointPlan,
         entropy: SnapshotV2EntropyRestorePlan,
         inject_scheduler_failure: bool,
+        source_factory: impl FnOnce() -> VirtioRngOsEntropySource,
     ) -> Result<RestoredHvfSnapshotV2EntropyPciOwners, HvfSnapshotV2EntropyPciRestoreError> {
         if !snapshot_v2_entropy_pci_plan_matches(&entropy, endpoint_plan) {
             return Err(HvfSnapshotV2EntropyPciRestoreError::preflight(
@@ -15384,6 +15449,7 @@ impl OwnedHvfArm64BootSession {
             entropy,
             None,
             inject_scheduler_failure,
+            source_factory,
         )
     }
 
@@ -15423,6 +15489,7 @@ impl OwnedHvfArm64BootSession {
             entropy,
             Some(storage_configs),
             false,
+            VirtioRngOsEntropySource::new,
         )
     }
 
@@ -15432,6 +15499,7 @@ impl OwnedHvfArm64BootSession {
         entropy: SnapshotV2EntropyRestorePlan,
         storage_configs: Option<CaptureReadyStorageConfigs>,
         inject_scheduler_failure: bool,
+        source_factory: impl FnOnce() -> VirtioRngOsEntropySource,
     ) -> Result<RestoredHvfSnapshotV2EntropyPciOwners, HvfSnapshotV2EntropyPciRestoreError> {
         let owner_is_vacant = session.runtime_resources.entropy_device.is_none()
             && session.runtime_resources.pci_entropy_device.is_none()
@@ -15564,7 +15632,7 @@ impl OwnedHvfArm64BootSession {
             ));
         }
 
-        session.entropy_source = VirtioRngOsEntropySource::new();
+        session.entropy_source = source_factory();
         session.entropy_device_metrics = SharedEntropyDeviceMetrics::default();
         session.entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         if inject_scheduler_failure {

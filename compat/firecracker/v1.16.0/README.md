@@ -50,7 +50,7 @@ claims mechanically visible.
   ledger, completed by #1634's pmem snapshot certification. It pins the exact
   40-record family with 40 terminal outcomes, field-specific implementation
   evidence, and signed direct/production live plus exact native-v2 2.6/current
-  2.7 create/load/cleanup proof.
+  2.8 create/load/cleanup proof.
 - [`balloon-contract.md`](balloon-contract.md) is the #1473 balloon ledger. It
   pins all 52 records, promotes the 50 complete API/path/property/schema leaves,
   records publication-safe paired PFN accounting and coherent MMIO/PCI
@@ -62,14 +62,15 @@ claims mechanically visible.
   shared-aperture/HVF/dirty capture ownership, and hands exactly two
   serialization/restore aggregates to Wave 6.
 - [`entropy-contract.md`](entropy-contract.md) is the #1475 virtio-rng ledger.
-  It pins all seven records, promotes the five complete
-  API/path/property/schema leaves, records dual-bucket retry and exact
-  MMIO/PCI capture-ready ownership, and hands exactly two
-  serialization/restore aggregates to Wave 6.
+  #1666 completes its snapshot gate. It pins all seven records as terminal and
+  records dual-bucket retry, exact MMIO/PCI queue/limiter/pending state,
+  native-v2 2.8 encoding, fresh destination owners, immutable clones, and
+  signed direct plus normal-production/App Sandbox continuation.
 - [`serial-contract.md`](serial-contract.md) is the #1479/#1652 serial stdio
   and snapshot ledger. It pins all six records as terminal, records default
   stdout, configured-output stdin exclusion, bounded terminal/FIFO/pipe RX,
-  exact MMIO capture ownership, current native-v2 2.7 encoding, fresh endpoint
+  exact MMIO capture ownership, native-v2 2.7 encoding retained by current
+  2.8, fresh endpoint
   reconstruction, signed serial-only and storage-bearing continuation, clone
   loads, recapture, redaction, and cleanup.
 - [`time-identity-contract.md`](time-identity-contract.md) is the
@@ -83,9 +84,10 @@ claims mechanically visible.
   cross-host portability certification.
 - [`remaining-device-contract.md`](remaining-device-contract.md) is the #1481
   checked aggregate ledger. It joins the exact 52 balloon, 19 memory-hotplug,
-  seven entropy, six serial, and one time/identity records; pins the current 78
-  terminal and seven Wave 6 outcomes; and binds focused, signed MMIO/PCI,
-  production serial-isolation, and exact 2.7 restored-serial evidence.
+  seven entropy, six serial, and one time/identity records; pins the current 80
+  terminal and five Wave 6 outcomes; and binds focused, signed MMIO/PCI,
+  production serial/entropy isolation, exact 2.7 restored-serial evidence, and
+  exact 2.8 restored-entropy evidence.
 - [`network-mmds-contract.md`](network-mmds-contract.md) is the #1496 checked
   aggregate network/MMDS ledger. It pins an exact 35-record set, promotes 31
   complete live/capture-ready outcomes, and retains four explicit #1378,
@@ -454,17 +456,18 @@ used-ring failure prevents publication. Detached MMIO/PCI state validates
 feature negotiation, activation, exact queue geometry/ranges/cursors, external
 limiter configuration, redacted bucket state, the pending descriptor, and
 host-time-free retry agreement with the quiesced HVF scheduler. The
-capture-ready preflight retained by current public native-v2 create traverses
-this state before optional-profile rejection without claiming an encoding.
+capture-ready preflight retained by the public native-v2 create at that
+checkpoint traversed this state before optional-profile rejection without
+claiming an encoding.
 Signed Linux guests prove marker-gated first and
 repeated `/dev/hwrng` reads, real throttling, pause/capture/resume, retry
 metrics, and cleanup over both selected transports. The checked
-[`entropy-contract.md`](entropy-contract.md) promotes all five API
+[`entropy-contract.md`](entropy-contract.md) promoted all five API
 operation/path/property/schema leaves. Exactly `corpus:entropy` and
-`semantic.device:entropy-queues-limits-metrics-and-state` remain
-`audit-required`; Wave 6 owns encoding, artifact integration, restore,
-migration/clone behavior, portability, and signed restored-guest outcomes. At
-that checkpoint the overlay was 186 `implemented-and-verified`, 212
+`semantic.device:entropy-queues-limits-metrics-and-state` remained
+`audit-required` at that checkpoint; Wave 6 then owned encoding, artifact
+integration, restore, migration/clone behavior, portability, and signed
+restored-guest outcomes. The overlay was 186 `implemented-and-verified`, 212
 `audit-required`, three `missing-platform-feasible`, and 17
 `proven-platform-impossible` records.
 
@@ -631,15 +634,23 @@ and normal-production matrix. Exact `2.4.0` and device-free `2.3.0` remain
 loadable. #1634 advanced the writer at that checkpoint to `2.6.0` profile 3 with ordered
 regular-file block and pmem devices, exact complete-set authority, and signed
 rooted/rootless × MMIO/PCI persistence certification. Exact block-only
-`2.5.0` remains loadable. #1651 then activates current `2.7.0` with one required
+`2.5.0` remains loadable. #1651 then activated `2.7.0` with one required
 complete serial component and optional unchanged profile-3 storage. #1652
 certifies fresh default/configured endpoint authority, complete UART/RX/pending
 work continuation, serial-only and MMIO/PCI-storage-bearing restore, repeated
 clone loads, recapture, containment, redaction, and cleanup; it promotes the
-final serial semantic. Other optional devices/MMDS, Diff, tools, Firecracker
+final serial semantic. #1665 advances the current writer to `2.8.0` with
+optional exact entropy queue/limiter/pending/retry state over the selected
+MMIO or PCI transport. #1666 certifies fresh OS source, metrics, scheduler,
+notifier, route, and endpoint reconstruction; retained-request continuation
+without another guest kick; entropy-only and storage-plus-entropy products;
+explicit/automatic resume; recapture; immutable same-process and fresh-process
+clones; production App Sandbox containment; malformed/cancellation/death
+cleanup; and exact 2.3–2.7 reader retention. It promotes exactly the two
+entropy aggregates. Other optional devices/MMDS, Diff, tools, Firecracker
 interoperability, and broad portability remain audited. The current aggregate
-selector is 78 terminal and seven `audit-required`, and the current overlay is
-236/162/3/17.
+selector is 80 terminal and five `audit-required`, and the current overlay is
+238/160/3/17.
 
 ## Commands
 

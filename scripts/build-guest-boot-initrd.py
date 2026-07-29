@@ -42,6 +42,11 @@ VIRTIO_PCI_RNG_ENTROPY_BYTE = 0xA5
 VIRTIO_PCI_RNG_READ_SIZE = 32
 VIRTIO_PCI_RNG_PROC_BUFFER_SIZE = 2048
 VIRTIO_PCI_RNG_YIELD_COUNT = 64
+SNAPSHOT_ENTROPY_READY_MARKER = b"BANGBANG_SNAPSHOT_ENTROPY_READY\n"
+SNAPSHOT_ENTROPY_SUCCESS_MARKER = b"BANGBANG_SNAPSHOT_ENTROPY_OK\n"
+SNAPSHOT_ENTROPY_FAILURE_MARKER = b"BANGBANG_SNAPSHOT_ENTROPY_FAIL\n"
+SNAPSHOT_ENTROPY_READ_SIZE = 64
+SNAPSHOT_ENTROPY_RESTORED_READ_COUNT = 1
 SERIAL_RX_INPUT = b"BANGBANG_SERIAL_RX_" + (b"A" * 80) + b"_END\n"
 SERIAL_RX_READY_MARKER = b"BANGBANG_SERIAL_RX_READY\n"
 SERIAL_RX_SUCCESS_MARKER = b"BANGBANG_SERIAL_RX_OK\n"
@@ -1790,6 +1795,166 @@ def build_pci_rng_init_elf() -> bytes:
     return build_guest_elf(code, data)
 
 
+def build_snapshot_entropy_init_code(addresses: dict[str, int]) -> bytes:
+    code = Aarch64CodeBuilder()
+    emit_mount(
+        code,
+        addresses["devtmpfs"],
+        addresses["dev"],
+        addresses["devtmpfs"],
+        "failure",
+    )
+    emit_mount(
+        code,
+        addresses["sysfs"],
+        addresses["sys"],
+        addresses["sysfs"],
+        "failure",
+    )
+
+    emit_open_and_read(
+        code,
+        addresses["rng_current_path"],
+        addresses["rng_current_buffer"],
+        32,
+        "failure",
+    )
+    code.emit(mov_imm_64(20, addresses["rng_current_buffer"]))
+    for expected in VIRTIO_PCI_RNG_EXPECTED_DRIVER:
+        code.emit(
+            b"".join(
+                (
+                    ldrb_u32(21, 20),
+                    movz_64(22, expected),
+                    cmp_reg_32(21, 22),
+                )
+            )
+        )
+        code.branch_cond("failure", AARCH64_COND_NE)
+        code.emit(add_imm_64(20, 20, 1))
+
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, AT_FDCWD_U64),
+                mov_imm_64(1, addresses["hwrng_path"]),
+                movz_64(2, 0),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_OPENAT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_MI)
+    code.emit(mov_reg_64(19, 0))
+
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                mov_imm_64(1, addresses["entropy_buffer"]),
+                movz_64(2, SNAPSHOT_ENTROPY_READ_SIZE),
+                movz_64(8, LINUX_AARCH64_SYSCALL_READ),
+                svc_0(),
+                cmp_imm_64(0, SNAPSHOT_ENTROPY_READ_SIZE),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["ready_marker"],
+            len(SNAPSHOT_ENTROPY_READY_MARKER),
+        )
+    )
+
+    code.emit(movz_64(20, SNAPSHOT_ENTROPY_RESTORED_READ_COUNT))
+    code.label("read_after_ready")
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                mov_imm_64(1, addresses["entropy_buffer"]),
+                movz_64(2, SNAPSHOT_ENTROPY_READ_SIZE),
+                movz_64(8, LINUX_AARCH64_SYSCALL_READ),
+                svc_0(),
+                cmp_imm_64(0, SNAPSHOT_ENTROPY_READ_SIZE),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                sub_imm_64(20, 20, 1),
+                cmp_imm_64(20, 0),
+            )
+        )
+    )
+    code.branch_cond("read_after_ready", AARCH64_COND_NE)
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["success_marker"],
+            len(SNAPSHOT_ENTROPY_SUCCESS_MARKER),
+        )
+    )
+    emit_snapshot_block_poweroff(code)
+
+    code.label("failure")
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["failure_marker"],
+            len(SNAPSHOT_ENTROPY_FAILURE_MARKER),
+        )
+    )
+    emit_snapshot_block_poweroff(code)
+    return code.build()
+
+
+def snapshot_entropy_init_data() -> list[tuple[str, bytes]]:
+    return [
+        ("devtmpfs", DEV_TMPFS_NAME),
+        ("dev", DEV_PATH),
+        ("sysfs", SYS_FS_NAME),
+        ("sys", SYS_PATH),
+        ("rng_current_path", VIRTIO_PCI_RNG_CURRENT_PATH),
+        ("hwrng_path", VIRTIO_PCI_RNG_DEVICE_PATH),
+        ("ready_marker", SNAPSHOT_ENTROPY_READY_MARKER),
+        ("success_marker", SNAPSHOT_ENTROPY_SUCCESS_MARKER),
+        ("failure_marker", SNAPSHOT_ENTROPY_FAILURE_MARKER),
+        ("rng_current_buffer", bytes(32)),
+        ("entropy_buffer", bytes(SNAPSHOT_ENTROPY_READ_SIZE)),
+    ]
+
+
+def snapshot_entropy_init_addresses(code_size: int) -> dict[str, int]:
+    addresses: dict[str, int] = {}
+    data_offset = ELF_CODE_OFFSET + code_size
+    for name, data in snapshot_entropy_init_data():
+        addresses[name] = ELF_BASE_VADDR + data_offset
+        data_offset += len(data)
+    return addresses
+
+
+def build_snapshot_entropy_init_elf() -> bytes:
+    placeholder_addresses = {
+        name: ELF_BASE_VADDR for name, _data in snapshot_entropy_init_data()
+    }
+    code_size = len(build_snapshot_entropy_init_code(placeholder_addresses))
+    addresses = snapshot_entropy_init_addresses(code_size)
+    code = build_snapshot_entropy_init_code(addresses)
+    if len(code) != code_size:
+        raise RuntimeError(
+            "guest snapshot entropy init code size changed after address assignment"
+        )
+    data = b"".join(data for _name, data in snapshot_entropy_init_data())
+    return build_guest_elf(code, data)
+
+
 def smp_init_data() -> list[tuple[str, bytes]]:
     return [
         ("affinity_mask", struct.pack("<Q", 1 << 1)),
@@ -2532,6 +2697,7 @@ def build_initrd() -> bytes:
     snapshot_block_init = build_snapshot_block_init_elf()
     serial_rx_init = build_serial_rx_init_elf()
     pci_rng_init = build_pci_rng_init_elf()
+    snapshot_entropy_init = build_snapshot_entropy_init_elf()
     smp_init = build_smp_init_elf()
     smp_progress_init = build_smp_progress_init_elf()
     smp_hotplug_init = build_smp_hotplug_init_elf()
@@ -2606,7 +2772,13 @@ def build_initrd() -> bytes:
                 mode=S_IFREG | 0o755,
                 data=snapshot_block_init,
             ),
-            cpio_entry(name="TRAILER!!!", ino=16, mode=0, nlink=1),
+            cpio_entry(
+                name="snapshot-entropy-init",
+                ino=16,
+                mode=S_IFREG | 0o755,
+                data=snapshot_entropy_init,
+            ),
+            cpio_entry(name="TRAILER!!!", ino=17, mode=0, nlink=1),
         )
     )
     return pad512(archive)
@@ -2970,6 +3142,67 @@ def validate_snapshot_block_init_entry(
         )
 
 
+def validate_snapshot_entropy_init_entry(
+    entries: dict[str, dict[str, object]],
+) -> None:
+    entry = required_entry(entries, "snapshot-entropy-init")
+    if file_type(entry["mode"]) != S_IFREG:
+        raise RuntimeError(
+            "guest initrd snapshot-entropy-init entry is not a regular file"
+        )
+    payload = bytes(entry["payload"])
+    if not payload.startswith(b"\x7fELF"):
+        raise RuntimeError(
+            "guest initrd snapshot-entropy-init payload is not an ELF file"
+        )
+    for marker in (
+        SNAPSHOT_ENTROPY_READY_MARKER,
+        SNAPSHOT_ENTROPY_SUCCESS_MARKER,
+        SNAPSHOT_ENTROPY_FAILURE_MARKER,
+    ):
+        if marker not in payload:
+            raise RuntimeError(
+                f"guest initrd snapshot-entropy-init payload does not contain {marker!r}"
+            )
+    for guest_path in (
+        DEV_TMPFS_NAME,
+        DEV_PATH,
+        SYS_FS_NAME,
+        SYS_PATH,
+        VIRTIO_PCI_RNG_CURRENT_PATH,
+        VIRTIO_PCI_RNG_DEVICE_PATH,
+    ):
+        if guest_path not in payload:
+            raise RuntimeError(
+                "guest initrd snapshot-entropy-init payload does not contain "
+                f"{guest_path!r}"
+            )
+    for syscall, description in (
+        (LINUX_AARCH64_SYSCALL_MOUNT, "mount"),
+        (LINUX_AARCH64_SYSCALL_OPENAT, "openat"),
+        (LINUX_AARCH64_SYSCALL_READ, "read"),
+        (LINUX_AARCH64_SYSCALL_WRITE, "write"),
+        (LINUX_AARCH64_SYSCALL_REBOOT, "reboot"),
+    ):
+        if movz_64(8, syscall) not in payload:
+            raise RuntimeError(
+                "guest initrd snapshot-entropy-init payload does not load "
+                f"{description}"
+            )
+    if movz_64(2, SNAPSHOT_ENTROPY_READ_SIZE) not in payload:
+        raise RuntimeError(
+            "guest initrd snapshot-entropy-init payload omits the exact read size"
+        )
+    if movz_64(20, SNAPSHOT_ENTROPY_RESTORED_READ_COUNT) not in payload:
+        raise RuntimeError(
+            "guest initrd snapshot-entropy-init payload omits restored read count"
+        )
+    if svc_0() not in payload:
+        raise RuntimeError(
+            "guest initrd snapshot-entropy-init payload does not contain SVC #0"
+        )
+
+
 def validate_initrd(data: bytes) -> None:
     if not data:
         raise RuntimeError("guest initrd is empty")
@@ -2995,6 +3228,7 @@ def validate_initrd(data: bytes) -> None:
         "pci-rng-init",
         "serial-rx-init",
         "snapshot-block-init",
+        "snapshot-entropy-init",
         CPIO_TRAILER,
     ]
     if names != expected_names:
@@ -3121,6 +3355,7 @@ def validate_initrd(data: bytes) -> None:
     validate_smp_hotplug_init_entry(entries)
     validate_serial_rx_init_entry(entries)
     validate_snapshot_block_init_entry(entries)
+    validate_snapshot_entropy_init_entry(entries)
 
 
 def default_output_path() -> Path:

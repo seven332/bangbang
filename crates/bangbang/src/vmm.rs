@@ -34637,6 +34637,50 @@ mod tests {
                         destination.controller.entropy_config().is_some(),
                         has_entropy
                     );
+                    if has_entropy {
+                        let peer_starter =
+                            FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+                        let peer_calls = peer_starter.calls();
+                        let mut peer = ProcessVmm::with_starter(
+                            format!("native-v2-{product}-{transport:?}-same-process-peer"),
+                            "0.1.0",
+                            "bangbang",
+                            peer_starter,
+                        );
+                        peer.pci_enabled = pci_enabled;
+                        peer.handle_action(VmmAction::LoadSnapshot(
+                            SnapshotLoadInput::new(
+                                paths.state(),
+                                SnapshotMemoryBackend::new(
+                                    paths.memory(),
+                                    SnapshotMemoryBackendType::File,
+                                ),
+                            )
+                            .with_resume_vm(true),
+                        ))
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{product} {transport:?} same-process peer load should succeed: {error}"
+                            )
+                        });
+                        assert_eq!(peer_calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(peer.instance_info().state, InstanceState::Running);
+                        assert_eq!(
+                            destination.instance_info().state,
+                            InstanceState::Paused,
+                            "peer load must not change the first destination"
+                        );
+                        assert_eq!(peer.drive_configs(), destination.drive_configs());
+                        assert_eq!(
+                            peer.controller.pmem_configs(),
+                            destination.controller.pmem_configs()
+                        );
+                        assert_eq!(
+                            peer.controller.entropy_config(),
+                            destination.controller.entropy_config()
+                        );
+                    }
                     directory.assert_no_staging();
                 }
             }

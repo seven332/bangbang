@@ -8565,11 +8565,65 @@
     {
       "id": "corpus:entropy",
       "family": "remaining-devices",
-      "summary": "Strict entropy API/configuration, live MMIO/PCI ownership, bounded host-random queue processing, dual-bucket limiting, retained retry wakeups, metrics, failure ordering, cleanup, and detached capture-ready state are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains this aggregate until entropy state is encoded, integrated into artifacts, restored into exact transport/queue/limiter/retry owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
+      "summary": "The applicable pinned entropy corpus is implemented and verified: strict configuration, live MMIO/PCI ownership, one bounded host-random queue, dual-bucket limiting, retained retry wakeups, metrics, failure ordering, cleanup, exact native-v2 2.8 serialization, and fresh destination restoration. Exact 2.8 composes required serial, optional unchanged profile-3 storage, and optional entropy while retaining queue, limiter, pending descriptor, retry, and transport state; every destination constructs a fresh OS entropy source, metrics set, scheduler, notifier, route, and endpoint. Signed direct and normal-production/App Sandbox MMIO/PCI matrices certify entropy-only and storage-plus-entropy Linux /dev/hwrng continuation, explicit/automatic resume, recapture, immutable repeated clones, malformed/canceled/death cleanup, pathname replacement resistance, and destination-local metrics. Random output, source handles, host time, and metrics are never serialized; no Firecracker artifact-byte or broad cross-host portability claim is made.",
       "source_refs": [
         "corpus:entropy"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "exact native-v2 2.8 entropy capture, public product dispatch, and failure-atomic load"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_entropy_platform.rs",
+          "anchor": "exact MMIO and PCI entropy destination placement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fresh entropy source, scheduler, notifier, route, and endpoint reconstruction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "bounded queue processing, dual-bucket retry, metrics, and detached capture"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_entropy_v2_8.rs",
+          "anchor": "exact native-v2 2.8 entropy state and restore plan"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/entropy-contract.md",
+          "anchor": "exact entropy capability and snapshot-continuation ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_entropy_snapshot_continuation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "restores_signed_serial_entropy_mmio_owners_with_exact_retry_semantics and restores_signed_serial_entropy_pci_owners_with_exact_retry_semantics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_entropy_snapshot_continuation_and_containment"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_entropy_v2_8/tests.rs",
+          "anchor": "exact codec, limiter, pending descriptor, retry, and hostile-state fixtures"
+        }
+      ]
     },
     {
       "id": "corpus:formal-verification",
@@ -10281,11 +10335,70 @@
     {
       "id": "semantic.device:entropy-queues-limits-metrics-and-state",
       "family": "remaining-devices",
-      "summary": "Live entropy configuration, one-queue processing, the 64-KiB cap, host randomness failures, dual-bucket limiting, scheduler retry, metrics, MMIO/PCI placement, failure-atomic accounting, detached capture, and cleanup are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains this semantic aggregate solely for optional-device state encoding, artifact integration, live restore construction, migration/clone and portability outcomes, and signed restored-guest certification; those missing outcomes must not be inferred from capture-ready state.",
+      "summary": "Entropy queue, limiter, metrics, and state semantics are implemented and verified for live startup plus exact native-v2 2.8 Full/File continuation. One writable queue enforces the 64-KiB request cap, host-source failure ordering, dual token buckets, one retained descriptor, retry without a second guest kick, failure-atomic accounting, and seven destination-local metrics over MMIO or PCI. Exact 2.8 retains negotiated/activated queue geometry and cursors, both bucket states, pending work, retry intent, and transport placement while reconstructing a fresh OS source, empty metrics, scheduler, notifier, route, and endpoint per destination. Deterministic construction seams and signed restored Linux /dev/hwrng reads certify independent same-process and fresh-process clones without pointer or random-byte comparison. Random output, source identity, metrics, and host clock state are excluded from artifacts, and Firecracker artifact bytes plus broad cross-host portability are not claimed.",
       "source_refs": [
         "corpus:entropy"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "native-v2 entropy candidate capture and public destination transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_entropy_platform.rs",
+          "anchor": "validated MMIO and PCI entropy transport reconstruction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fresh restored entropy owner construction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "queue, limit, retry, metric, and capture semantics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_entropy_v2_8.rs",
+          "anchor": "exact persisted queue, limiter, pending, retry, and transport state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/entropy-contract.md",
+          "anchor": "queue, limiter, retry, fresh-owner, and exclusion evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public_native_v2_create_and_load_routes_all_products_over_mmio_and_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_entropy_snapshot_continuation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed entropy restore retry semantics and fresh source factory counts"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_entropy_snapshot_continuation_and_containment"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_entropy_v2_8/tests.rs",
+          "anchor": "fixed exact-state fixtures and hostile decode coverage"
+        }
+      ]
     },
     {
       "id": "semantic.device:rtc-vmclock-vmgenid-and-pvtime",

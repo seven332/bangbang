@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use bangbang_hvf::decode_hvf_snapshot_v2_entropy_state;
 use bangbang_launcher::{
     JailerIsolationArgument, LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME,
     OUTER_BUNDLE_NAME, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
@@ -37,6 +38,8 @@ use bangbang_pager::{
     PagerError, PagerFrameKind, PagerTransport, PeerSession, ReferencePeer,
     ReferencePeerTermination,
 };
+use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
+use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
 use bangbang_session::{
     BLOCK_CONTROL_BROKER_FD, Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY,
     SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId, VHOST_USER_BROKER_FD, WorkerPolicy,
@@ -208,6 +211,13 @@ const SNAPSHOT_REPEAT_MEMORY_CHILD: &str = "memory-repeat-1368.snap";
 const SNAPSHOT_ROOT_BOOT_ARGS: &str = "console=null reboot=k panic=0 quiet loglevel=1 root=/dev/vda ro rootwait init=/bangbang-direct-rootfs-init bangbang.native-v2-root-snapshot=1";
 const SNAPSHOT_BLOCK_BOOT_ARGS: &str =
     "console=null reboot=k panic=1 quiet loglevel=1 rdinit=/snapshot-block-init";
+const SNAPSHOT_ENTROPY_BOOT_ARGS: &str =
+    "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rdinit=/snapshot-entropy-init";
+const SNAPSHOT_ENTROPY_READY_MARKER: &str = "BANGBANG_SNAPSHOT_ENTROPY_READY";
+const SNAPSHOT_ENTROPY_SUCCESS_MARKER: &str = "BANGBANG_SNAPSHOT_ENTROPY_OK";
+const SNAPSHOT_ENTROPY_FAILURE_MARKER: &str = "BANGBANG_SNAPSHOT_ENTROPY_FAIL";
+const SNAPSHOT_ENTROPY_READ_BYTES: u64 = 64;
+const SNAPSHOT_ENTROPY_REFILL_MS: u64 = 3_000;
 const SNAPSHOT_BLOCK_SECTOR_SIZE: usize = 512;
 const SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE: u8 = 0x11;
 const SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE: u8 = 0x12;
@@ -1651,6 +1661,530 @@ fn run_production_configured_serial_snapshot_continuation(bundle: &Path, enable_
         .expect("opened configured serial drive should read"),
         drive_before
     );
+}
+
+#[test]
+fn normal_bundle_certifies_native_v2_entropy_snapshot_continuation_and_containment() {
+    let bundle = production_bundle();
+    let baseline_sessions = session_entries();
+    for enable_pci in [false, true] {
+        for with_storage in [false, true] {
+            run_production_entropy_snapshot_continuation(
+                &bundle,
+                enable_pci,
+                with_storage,
+                &baseline_sessions,
+            );
+        }
+    }
+    assert_eq!(
+        session_entries(),
+        baseline_sessions,
+        "entropy snapshot launcher and worker teardown must restore the session namespace"
+    );
+}
+
+fn run_production_entropy_snapshot_continuation(
+    bundle: &Path,
+    enable_pci: bool,
+    with_storage: bool,
+    baseline_sessions: &[PathBuf],
+) {
+    let transport = if enable_pci { "pci" } else { "mmio" };
+    let product = if with_storage {
+        "storage-entropy"
+    } else {
+        "entropy-only"
+    };
+    let case = format!("{transport}-{product}");
+    let source_fixture = SerialSnapshotSourceGrantFixture::new_entropy(&case, with_storage);
+    let source_sensitive = source_fixture.sensitive_strings();
+    let mut source = spawn_ready_serial_snapshot_grant_api_launcher_with_granted_socket(
+        bundle,
+        &source_fixture.manifest,
+        &source_fixture.api_socket(),
+        &format!("entropy-snapshot-{case}-source"),
+        enable_pci,
+    );
+    source_fixture.replace_source_pathnames();
+    configure_and_start_entropy_snapshot_grant_source(&source.socket, with_storage, &case);
+    source
+        .wait_for_stdout_marker(SNAPSHOT_ENTROPY_READY_MARKER, PROCESS_TIMEOUT)
+        .unwrap_or_else(|error| {
+            panic!("production {case} entropy source should become ready: {error}")
+        });
+    wait_for_production_entropy_metric(
+        &source.socket,
+        &source_fixture.opened_metrics,
+        "entropy_rate_limiter_throttled",
+        1,
+        &format!("production {case} source throttle"),
+    );
+    assert!(
+        production_entropy_metric_total(&source_fixture.opened_metrics, "entropy_bytes")
+            >= SNAPSHOT_ENTROPY_READ_BYTES,
+        "production {case} source should complete one nonempty entropy request"
+    );
+    assert_http_status(
+        &http_request(&source.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        &format!("pause production {case} entropy source"),
+    );
+    assert_http_status(
+        &http_put(&source.socket, "/snapshot/create", &snapshot_create_body()),
+        204,
+        &format!("create production {case} entropy snapshot"),
+    );
+    let artifacts = source_fixture.artifacts();
+    assert!(artifacts.state.is_file(), "{case} state should publish");
+    assert!(artifacts.memory.is_file(), "{case} memory should publish");
+    assert_production_pending_entropy_snapshot(&artifacts.state, enable_pci, with_storage, &case);
+    assert_no_snapshot_staging(&source_fixture.state_directory);
+    assert_no_snapshot_staging(&source_fixture.memory_directory);
+    let state_before = fs::read(&artifacts.state).expect("production entropy state should read");
+    let memory_before = fs::read(&artifacts.memory).expect("production entropy memory should read");
+
+    let source_pid = i32::try_from(source.child.id()).expect("launcher PID should fit");
+    // SAFETY: The unreaped source launcher owns this PID.
+    assert_eq!(unsafe { libc::kill(source_pid, libc::SIGTERM) }, 0);
+    let (source_status, source_stdout, source_stderr) =
+        source.wait(&format!("production {case} entropy snapshot source"));
+    assert!(
+        source_status.success(),
+        "production {case} entropy source should stop cleanly: {source_status:?}\nstdout:\n{source_stdout}\nstderr:\n{source_stderr}"
+    );
+    assert!(source_stdout.contains(SNAPSHOT_ENTROPY_READY_MARKER));
+    assert!(!source_stdout.contains(SNAPSHOT_ENTROPY_SUCCESS_MARKER));
+    assert_serial_snapshot_output_redacted(
+        &source_stdout,
+        &source_stderr,
+        &source_sensitive,
+        &format!("production {case} entropy source"),
+    );
+    assert!(!source.socket.exists());
+    assert_eq!(session_entries(), baseline_sessions);
+
+    let mut current = artifacts;
+    if !enable_pci && !with_storage {
+        run_production_entropy_malformed_state_case(bundle, &current, baseline_sessions);
+        for shutdown in [
+            EntropySnapshotShutdown::GracefulCancellation,
+            EntropySnapshotShutdown::WorkerFirst,
+            EntropySnapshotShutdown::LauncherFirst,
+        ] {
+            current = run_production_entropy_paused_shutdown_case(
+                bundle,
+                current,
+                shutdown,
+                baseline_sessions,
+            );
+        }
+    }
+
+    let paused_fixture =
+        SerialSnapshotInputGrantFixture::new_entropy(&format!("{case}-paused"), current, true);
+    let paused_sensitive = paused_fixture.sensitive_strings();
+    let mut paused = spawn_ready_serial_snapshot_grant_api_launcher_with_granted_socket(
+        bundle,
+        &paused_fixture.manifest,
+        &paused_fixture.api_socket(),
+        &format!("entropy-snapshot-{case}-paused"),
+        enable_pci,
+    );
+    let next = paused_fixture.replace_source_pathnames();
+    configure_serial_snapshot_grant_destination_metrics(&paused.socket);
+    assert!(
+        fs::read(&paused_fixture.opened_metrics)
+            .expect("opened paused entropy metrics should read")
+            .is_empty(),
+        "{case} paused destination metrics should start empty"
+    );
+    assert_http_status(
+        &http_put(&paused.socket, "/snapshot/load", &snapshot_load_body(false)),
+        204,
+        &format!("load production {case} entropy snapshot paused"),
+    );
+    assert!(
+        http_get(&paused.socket, "/").contains(r#""state":"Paused""#),
+        "production {case} entropy destination should remain Paused"
+    );
+    assert_production_entropy_config(&paused.socket, with_storage, &case);
+    assert_http_status(
+        &http_put(&paused.socket, "/snapshot/create", &snapshot_create_body()),
+        204,
+        &format!("recapture production {case} entropy destination"),
+    );
+    let recaptured = paused_fixture.recaptured_artifacts();
+    assert!(
+        recaptured.state.is_file(),
+        "production {case} recaptured entropy state should publish"
+    );
+    assert!(
+        recaptured.memory.is_file(),
+        "production {case} recaptured entropy memory should publish"
+    );
+    assert_production_pending_entropy_snapshot(
+        &recaptured.state,
+        enable_pci,
+        with_storage,
+        &format!("{case} recapture"),
+    );
+    let recaptured_state =
+        fs::read(&recaptured.state).expect("recaptured production entropy state should read");
+    let recaptured_memory =
+        fs::read(&recaptured.memory).expect("recaptured production entropy memory should read");
+    assert_http_status(
+        &http_put(&paused.socket, "/snapshot/create", &snapshot_create_body()),
+        400,
+        &format!("reject production {case} entropy recapture collision"),
+    );
+    assert_eq!(
+        fs::read(&recaptured.state).expect("colliding entropy recapture state should read"),
+        recaptured_state,
+        "production {case} recapture collision must not clobber state"
+    );
+    assert_eq!(
+        fs::read(&recaptured.memory).expect("colliding entropy recapture memory should read"),
+        recaptured_memory,
+        "production {case} recapture collision must not clobber memory"
+    );
+    paused_fixture.assert_no_recapture_staging();
+    assert_http_status(
+        &http_request(&paused.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        &format!("resume production {case} entropy destination"),
+    );
+    let (paused_status, paused_stdout, paused_stderr) = paused.wait(&format!(
+        "production {case} explicitly resumed entropy guest"
+    ));
+    assert!(
+        paused_status.success(),
+        "production {case} explicit entropy destination should exit cleanly: {paused_status:?}\nstdout:\n{paused_stdout}\nstderr:\n{paused_stderr}"
+    );
+    assert!(paused_stdout.contains(SNAPSHOT_ENTROPY_SUCCESS_MARKER));
+    assert!(!paused_stdout.contains(SNAPSHOT_ENTROPY_FAILURE_MARKER));
+    assert_serial_snapshot_output_redacted(
+        &paused_stdout,
+        &paused_stderr,
+        &paused_sensitive,
+        &format!("production {case} explicit entropy destination"),
+    );
+    assert_production_destination_entropy_metrics(
+        &paused_fixture.opened_metrics,
+        &format!("production {case} explicit entropy destination"),
+    );
+    assert_eq!(
+        fs::read(&paused_fixture.metrics).expect("replacement paused entropy metrics should read"),
+        b"replacement metrics must remain unused\n"
+    );
+    assert!(!paused.socket.exists());
+    assert_eq!(session_entries(), baseline_sessions);
+
+    let resumed_fixture =
+        SerialSnapshotInputGrantFixture::new_entropy(&format!("{case}-automatic"), next, false);
+    let resumed_sensitive = resumed_fixture.sensitive_strings();
+    let mut resumed = spawn_ready_serial_snapshot_grant_api_launcher_with_granted_socket(
+        bundle,
+        &resumed_fixture.manifest,
+        &resumed_fixture.api_socket(),
+        &format!("entropy-snapshot-{case}-automatic"),
+        enable_pci,
+    );
+    let final_artifacts = resumed_fixture.replace_source_pathnames();
+    configure_serial_snapshot_grant_destination_metrics(&resumed.socket);
+    assert!(
+        fs::read(&resumed_fixture.opened_metrics)
+            .expect("opened automatic entropy metrics should read")
+            .is_empty(),
+        "{case} automatic destination metrics should start empty"
+    );
+    assert_http_status(
+        &http_put(&resumed.socket, "/snapshot/load", &snapshot_load_body(true)),
+        204,
+        &format!("load and resume production {case} entropy snapshot"),
+    );
+    let (resumed_status, resumed_stdout, resumed_stderr) = resumed.wait(&format!(
+        "production {case} automatically resumed entropy guest"
+    ));
+    assert!(
+        resumed_status.success(),
+        "production {case} automatic entropy destination should exit cleanly: {resumed_status:?}\nstdout:\n{resumed_stdout}\nstderr:\n{resumed_stderr}"
+    );
+    assert!(resumed_stdout.contains(SNAPSHOT_ENTROPY_SUCCESS_MARKER));
+    assert!(!resumed_stdout.contains(SNAPSHOT_ENTROPY_FAILURE_MARKER));
+    assert_serial_snapshot_output_redacted(
+        &resumed_stdout,
+        &resumed_stderr,
+        &resumed_sensitive,
+        &format!("production {case} automatic entropy destination"),
+    );
+    assert_production_destination_entropy_metrics(
+        &resumed_fixture.opened_metrics,
+        &format!("production {case} automatic entropy destination"),
+    );
+    assert_eq!(
+        fs::read(&resumed_fixture.metrics)
+            .expect("replacement automatic entropy metrics should read"),
+        b"replacement metrics must remain unused\n"
+    );
+    assert!(!resumed.socket.exists());
+    assert_eq!(session_entries(), baseline_sessions);
+    assert_eq!(
+        fs::read(&final_artifacts.state).expect("final entropy state should read"),
+        state_before,
+        "{case} repeated contained loads must not mutate state"
+    );
+    assert_eq!(
+        fs::read(&final_artifacts.memory).expect("final entropy memory should read"),
+        memory_before,
+        "{case} repeated contained loads must not mutate memory"
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EntropySnapshotShutdown {
+    GracefulCancellation,
+    WorkerFirst,
+    LauncherFirst,
+}
+
+fn run_production_entropy_malformed_state_case(
+    bundle: &Path,
+    artifacts: &SerialSnapshotGrantArtifacts,
+    baseline_sessions: &[PathBuf],
+) {
+    assert!(
+        artifacts.drive.is_none(),
+        "representative malformed entropy case should remain entropy-only"
+    );
+    let original_state =
+        fs::read(&artifacts.state).expect("original entropy state should read before corruption");
+    let original_memory =
+        fs::read(&artifacts.memory).expect("original entropy memory should read before corruption");
+    let malformed_root = TestDir::new("entropy-snapshot-malformed");
+    let canonical_malformed_root = fs::canonicalize(malformed_root.path())
+        .expect("malformed entropy fixture root should canonicalize");
+    let malformed_state = canonical_malformed_root.join("malformed-state.snap");
+    let malformed_memory = canonical_malformed_root.join("malformed-memory.snap");
+    fs::write(&malformed_state, &original_state)
+        .expect("malformed entropy state fixture should write");
+    fs::write(&malformed_memory, &original_memory)
+        .expect("malformed entropy memory fixture should write");
+    let mut malformed_bytes =
+        fs::read(&malformed_state).expect("malformed entropy state fixture should read");
+    let last = malformed_bytes
+        .len()
+        .checked_sub(1)
+        .expect("native-v2 entropy state must be nonempty");
+    malformed_bytes[last] ^= 0x80;
+    fs::write(&malformed_state, malformed_bytes)
+        .expect("malformed entropy checksum fixture should write");
+
+    let fixture = SerialSnapshotInputGrantFixture::new_entropy(
+        "entropy-malformed",
+        SerialSnapshotGrantArtifacts {
+            state: malformed_state,
+            memory: malformed_memory,
+            drive: None,
+        },
+        false,
+    );
+    let sensitive = fixture.sensitive_strings();
+    let mut running = spawn_ready_serial_snapshot_grant_api_launcher_with_granted_socket(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        "entropy-snapshot-malformed",
+        false,
+    );
+    let opened = fixture.replace_source_pathnames();
+    configure_serial_snapshot_grant_destination_metrics(&running.socket);
+    let response = http_put(
+        &running.socket,
+        "/snapshot/load",
+        &snapshot_load_body(false),
+    );
+    assert_http_status(
+        &response,
+        400,
+        "reject malformed production entropy snapshot",
+    );
+    for private in &sensitive {
+        assert!(
+            !response.contains(private),
+            "malformed entropy restore fault must redact private grant data"
+        );
+    }
+    assert!(
+        http_get(&running.socket, "/").contains(r#""state":"Not started""#),
+        "malformed entropy restore must not publish a VM"
+    );
+    assert!(
+        fs::read(&fixture.opened_metrics)
+            .expect("malformed entropy destination metrics should read")
+            .is_empty(),
+        "malformed entropy restore must not publish destination metrics"
+    );
+    let launcher = i32::try_from(running.child.id()).expect("launcher PID should fit");
+    // SAFETY: The unreaped malformed-case launcher owns this exact PID.
+    assert_eq!(unsafe { libc::kill(launcher, libc::SIGTERM) }, 0);
+    let (status, stdout, stderr) = running.wait("malformed entropy snapshot destination");
+    assert!(
+        status.success(),
+        "malformed entropy destination should cancel cleanly: {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_serial_snapshot_output_redacted(
+        &stdout,
+        &stderr,
+        &sensitive,
+        "malformed entropy snapshot destination",
+    );
+    assert!(!running.socket.exists());
+    assert_eq!(session_entries(), baseline_sessions);
+    assert_ne!(
+        fs::read(&opened.state).expect("opened malformed entropy state should read"),
+        original_state,
+        "malformed fixture must differ from the valid entropy state"
+    );
+    assert_eq!(
+        fs::read(&artifacts.state).expect("valid entropy state should survive malformed load"),
+        original_state
+    );
+    assert_eq!(
+        fs::read(&artifacts.memory).expect("valid entropy memory should survive malformed load"),
+        original_memory
+    );
+}
+
+fn run_production_entropy_paused_shutdown_case(
+    bundle: &Path,
+    artifacts: SerialSnapshotGrantArtifacts,
+    shutdown: EntropySnapshotShutdown,
+    baseline_sessions: &[PathBuf],
+) -> SerialSnapshotGrantArtifacts {
+    assert!(
+        artifacts.drive.is_none(),
+        "representative entropy shutdown case should remain entropy-only"
+    );
+    let name = match shutdown {
+        EntropySnapshotShutdown::GracefulCancellation => "cancellation",
+        EntropySnapshotShutdown::WorkerFirst => "worker-first",
+        EntropySnapshotShutdown::LauncherFirst => "launcher-first",
+    };
+    let fixture =
+        SerialSnapshotInputGrantFixture::new_entropy(&format!("entropy-{name}"), artifacts, false);
+    let sensitive = fixture.sensitive_strings();
+    let mut running = spawn_ready_serial_snapshot_grant_api_launcher_with_granted_socket(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        &format!("entropy-snapshot-{name}"),
+        false,
+    );
+    let opened = fixture.replace_source_pathnames();
+    configure_serial_snapshot_grant_destination_metrics(&running.socket);
+    assert!(
+        fs::read(&fixture.opened_metrics)
+            .expect("shutdown-case entropy metrics should read")
+            .is_empty(),
+        "fresh {name} entropy destination metrics should start empty"
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/snapshot/load",
+            &snapshot_load_body(false),
+        ),
+        204,
+        &format!("load production entropy snapshot before {name}"),
+    );
+    assert!(
+        http_get(&running.socket, "/").contains(r#""state":"Paused""#),
+        "entropy destination should remain Paused before {name}"
+    );
+    assert_production_entropy_config(&running.socket, false, name);
+    for field in [
+        "entropy_bytes",
+        "rate_limiter_event_count",
+        "host_rng_fails",
+    ] {
+        assert_eq!(
+            production_entropy_metric_total(&fixture.opened_metrics, field),
+            0,
+            "Paused {name} entropy destination must start with zero entropy.{field}"
+        );
+    }
+    let state_before = fs::read(&opened.state).expect("shutdown-case entropy state should read");
+    let memory_before = fs::read(&opened.memory).expect("shutdown-case entropy memory should read");
+    assert_eq!(session_entries().len(), baseline_sessions.len() + 1);
+
+    let (status, stdout, stderr) = match shutdown {
+        EntropySnapshotShutdown::GracefulCancellation => {
+            let launcher =
+                i32::try_from(running.child.id()).expect("entropy launcher PID should fit");
+            // SAFETY: The unreaped launcher owns this exact PID.
+            assert_eq!(unsafe { libc::kill(launcher, libc::SIGTERM) }, 0);
+            running.wait("Paused entropy restoration cancellation")
+        }
+        EntropySnapshotShutdown::WorkerFirst => {
+            let worker = only_worker_pid(&running.child);
+            // SAFETY: The worker is the sole live child of the unreaped launcher.
+            assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+            running.wait("Paused entropy worker-first death")
+        }
+        EntropySnapshotShutdown::LauncherFirst => {
+            let worker = only_worker_pid(&running.child);
+            let worker_exit = ProcessExitWatch::new(worker);
+            let launcher =
+                i32::try_from(running.child.id()).expect("entropy launcher PID should fit");
+            // SAFETY: The unreaped launcher owns this PID and its worker
+            // independently observes authenticated lifecycle EOF.
+            assert_eq!(unsafe { libc::kill(launcher, libc::SIGKILL) }, 0);
+            let result = running.wait("Paused entropy launcher-first death");
+            assert!(
+                worker_exit.wait(PROCESS_TIMEOUT),
+                "entropy worker should observe launcher death"
+            );
+            result
+        }
+    };
+    match shutdown {
+        EntropySnapshotShutdown::GracefulCancellation => {
+            assert!(status.success(), "entropy cancellation should be graceful");
+        }
+        EntropySnapshotShutdown::WorkerFirst => {
+            assert_eq!(status.code(), Some(128 + libc::SIGKILL));
+        }
+        EntropySnapshotShutdown::LauncherFirst => {
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+        }
+    }
+    assert_serial_snapshot_output_redacted(
+        &stdout,
+        &stderr,
+        &sensitive,
+        &format!("production entropy {name} destination"),
+    );
+    assert!(
+        !running.socket.exists(),
+        "production entropy {name} destination should remove its API socket"
+    );
+    assert_eq!(session_entries(), baseline_sessions);
+    assert_eq!(
+        fs::read(&opened.state).expect("shutdown-case entropy state should remain"),
+        state_before,
+        "entropy {name} must preserve immutable state"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("shutdown-case entropy memory should remain"),
+        memory_before,
+        "entropy {name} must preserve immutable memory"
+    );
+    assert_eq!(
+        fs::read(&fixture.metrics).expect("shutdown-case replacement metrics should read"),
+        b"replacement metrics must remain unused\n"
+    );
+    opened
 }
 
 fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
@@ -7482,32 +8016,53 @@ struct SerialSnapshotGrantArtifacts {
 #[derive(Debug)]
 struct SerialSnapshotSourceGrantFixture {
     _root: TestDir,
+    _socket_root: Option<TestDir>,
     manifest: PathBuf,
     kernel: PathBuf,
+    initrd: Option<PathBuf>,
     metrics: PathBuf,
     drive: Option<PathBuf>,
     serial: Option<PathBuf>,
     state_directory: PathBuf,
     memory_directory: PathBuf,
     opened_kernel: PathBuf,
+    opened_initrd: Option<PathBuf>,
     opened_metrics: PathBuf,
     opened_drive: Option<PathBuf>,
     opened_serial: Option<PathBuf>,
+    api_directory: Option<PathBuf>,
 }
 
 impl SerialSnapshotSourceGrantFixture {
     fn new(case: &str, with_storage: bool, configured_output: bool) -> Self {
+        Self::new_with_guest(case, with_storage, configured_output, false)
+    }
+
+    fn new_entropy(case: &str, with_storage: bool) -> Self {
+        Self::new_with_guest(case, with_storage, false, true)
+    }
+
+    fn new_with_guest(
+        case: &str,
+        with_storage: bool,
+        configured_output: bool,
+        entropy_guest: bool,
+    ) -> Self {
         let root = TestDir::new(&format!("serial-snapshot-source-{case}"));
         let canonical_root =
             fs::canonicalize(root.path()).expect("serial snapshot source root should canonicalize");
         let manifest = canonical_root.join("grant-manifest.json");
         let kernel = canonical_root.join("serial-snapshot.image");
+        let initrd = entropy_guest.then(|| canonical_root.join("entropy-snapshot-initrd.cpio"));
         let metrics = canonical_root.join("serial-snapshot.metrics");
         let drive = with_storage.then(|| canonical_root.join("serial-snapshot.drive"));
         let serial = configured_output.then(|| canonical_root.join("serial-snapshot.out"));
         let state_directory = canonical_root.join("state-output");
         let memory_directory = canonical_root.join("memory-output");
         let opened_kernel = canonical_root.join("opened-serial-snapshot.image");
+        let opened_initrd = initrd
+            .as_ref()
+            .map(|_| canonical_root.join("opened-entropy-snapshot-initrd.cpio"));
         let opened_metrics = canonical_root.join("opened-serial-snapshot.metrics");
         let opened_drive = drive
             .as_ref()
@@ -7515,22 +8070,46 @@ impl SerialSnapshotSourceGrantFixture {
         let opened_serial = serial
             .as_ref()
             .map(|_| canonical_root.join("opened-serial-snapshot.out"));
+        let socket_root = entropy_guest.then(|| {
+            let socket_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+            let root = TestDir(
+                PathBuf::from("/private/tmp")
+                    .join(format!("bbes-{}-{socket_id}", std::process::id())),
+            );
+            fs::create_dir(root.path()).expect("short entropy source socket root should create");
+            root
+        });
+        let api_directory = socket_root.as_ref().map(|root| root.path().join("a"));
 
-        fs::write(
-            &kernel,
-            if configured_output {
-                snapshot_serial::configured_output_guest_image()
-            } else {
-                snapshot_serial::default_stdio_guest_image()
-            },
-        )
-        .expect("serial snapshot guest image should write");
+        if entropy_guest {
+            hard_link_or_copy_fixture(&guest_kernel(), &kernel, "entropy snapshot guest kernel");
+            hard_link_or_copy_fixture(
+                &guest_initrd(),
+                initrd
+                    .as_ref()
+                    .expect("entropy snapshot guest should have an initrd"),
+                "entropy snapshot guest initrd",
+            );
+        } else {
+            fs::write(
+                &kernel,
+                if configured_output {
+                    snapshot_serial::configured_output_guest_image()
+                } else {
+                    snapshot_serial::default_stdio_guest_image()
+                },
+            )
+            .expect("serial snapshot guest image should write");
+        }
         fs::write(&metrics, b"").expect("serial snapshot metrics should write");
         if let Some(drive) = drive.as_ref() {
             create_sized_file(drive, 4096);
         }
         if let Some(serial) = serial.as_ref() {
             fs::write(serial, b"").expect("serial snapshot output should write");
+        }
+        if let Some(directory) = api_directory.as_ref() {
+            fs::create_dir(directory).expect("entropy API socket directory should create");
         }
         fs::create_dir(&state_directory).expect("serial state output directory should create");
         fs::create_dir(&memory_directory).expect("serial memory output directory should create");
@@ -7561,6 +8140,14 @@ impl SerialSnapshotSourceGrantFixture {
                 "source": path_text(&memory_directory),
             }),
         ];
+        if let Some(initrd) = initrd.as_ref() {
+            grants.push(serde_json::json!({
+                "id": SNAPSHOT_INITRD_ID,
+                "role": "initrd-image",
+                "access": "read-only",
+                "source": path_text(initrd),
+            }));
+        }
         if let Some(drive) = drive.as_ref() {
             grants.push(serde_json::json!({
                 "id": SNAPSHOT_DATA_ID,
@@ -7577,6 +8164,14 @@ impl SerialSnapshotSourceGrantFixture {
                 "source": path_text(serial),
             }));
         }
+        if let Some(directory) = api_directory.as_ref() {
+            grants.push(serde_json::json!({
+                "id": API_SOCKET_DIRECTORY_ID,
+                "role": "api-socket-directory",
+                "access": "create-children",
+                "source": path_text(directory),
+            }));
+        }
         let manifest_json = serde_json::json!({"version": 1, "grants": grants});
         fs::write(
             &manifest,
@@ -7587,17 +8182,21 @@ impl SerialSnapshotSourceGrantFixture {
 
         Self {
             _root: root,
+            _socket_root: socket_root,
             manifest,
             kernel,
+            initrd,
             metrics,
             drive,
             serial,
             state_directory,
             memory_directory,
             opened_kernel,
+            opened_initrd,
             opened_metrics,
             opened_drive,
             opened_serial,
+            api_directory,
         }
     }
 
@@ -7610,6 +8209,11 @@ impl SerialSnapshotSourceGrantFixture {
         }
         fs::write(&self.kernel, b"replacement kernel must not boot")
             .expect("replacement serial snapshot kernel should write");
+        if let (Some(source), Some(opened)) = (&self.initrd, &self.opened_initrd) {
+            fs::rename(source, opened).expect("opened entropy snapshot initrd should move");
+            fs::write(source, b"replacement initrd must not boot")
+                .expect("replacement entropy snapshot initrd should write");
+        }
         fs::write(&self.metrics, b"replacement metrics must remain unused\n")
             .expect("replacement serial snapshot metrics should write");
         if let (Some(source), Some(opened)) = (&self.drive, &self.opened_drive) {
@@ -7630,6 +8234,13 @@ impl SerialSnapshotSourceGrantFixture {
             memory: self.memory_directory.join(SNAPSHOT_MEMORY_CHILD),
             drive: self.opened_drive.clone(),
         }
+    }
+
+    fn api_socket(&self) -> PathBuf {
+        self.api_directory
+            .as_ref()
+            .expect("entropy source should grant an API socket directory")
+            .join(API_SOCKET_CHILD)
     }
 
     fn sensitive_strings(&self) -> Vec<String> {
@@ -7677,6 +8288,31 @@ impl SerialSnapshotSourceGrantFixture {
                 .map(str::to_owned),
             );
         }
+        if let (Some(source), Some(opened)) = (&self.initrd, &self.opened_initrd) {
+            sensitive.extend(
+                [
+                    path_text(source),
+                    path_text(opened),
+                    SNAPSHOT_INITRD_ID,
+                    SNAPSHOT_INITRD_REF,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        if let Some(directory) = self.api_directory.as_ref() {
+            sensitive.extend(
+                [
+                    path_text(directory),
+                    path_text(&directory.join(API_SOCKET_CHILD)),
+                    API_SOCKET_DIRECTORY_ID,
+                    API_SOCKET_REF,
+                    API_SOCKET_CHILD,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
         sensitive
     }
 }
@@ -7684,6 +8320,7 @@ impl SerialSnapshotSourceGrantFixture {
 #[derive(Debug)]
 struct SerialSnapshotInputGrantFixture {
     _root: TestDir,
+    _socket_root: Option<TestDir>,
     manifest: PathBuf,
     sources: SerialSnapshotGrantArtifacts,
     opened: SerialSnapshotGrantArtifacts,
@@ -7691,10 +8328,31 @@ struct SerialSnapshotInputGrantFixture {
     opened_metrics: PathBuf,
     serial: Option<PathBuf>,
     opened_serial: Option<PathBuf>,
+    state_directory: Option<PathBuf>,
+    memory_directory: Option<PathBuf>,
+    api_directory: Option<PathBuf>,
 }
 
 impl SerialSnapshotInputGrantFixture {
     fn new(case: &str, sources: SerialSnapshotGrantArtifacts, configured_output: bool) -> Self {
+        Self::new_internal(case, sources, configured_output, false, false)
+    }
+
+    fn new_entropy(
+        case: &str,
+        sources: SerialSnapshotGrantArtifacts,
+        with_recapture: bool,
+    ) -> Self {
+        Self::new_internal(case, sources, false, with_recapture, true)
+    }
+
+    fn new_internal(
+        case: &str,
+        sources: SerialSnapshotGrantArtifacts,
+        configured_output: bool,
+        with_recapture: bool,
+        with_api_socket: bool,
+    ) -> Self {
         let root = TestDir::new(&format!("serial-snapshot-input-{case}"));
         let canonical_root =
             fs::canonicalize(root.path()).expect("serial snapshot input root should canonicalize");
@@ -7705,9 +8363,33 @@ impl SerialSnapshotInputGrantFixture {
         let opened_serial = serial
             .as_ref()
             .map(|_| canonical_root.join("opened-serial-snapshot.out"));
+        let state_directory =
+            with_recapture.then(|| canonical_root.join("recaptured-state-output"));
+        let memory_directory =
+            with_recapture.then(|| canonical_root.join("recaptured-memory-output"));
+        let socket_root = with_api_socket.then(|| {
+            let socket_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+            let root = TestDir(
+                PathBuf::from("/private/tmp")
+                    .join(format!("bbed-{}-{socket_id}", std::process::id())),
+            );
+            fs::create_dir(root.path())
+                .expect("short entropy destination socket root should create");
+            root
+        });
+        let api_directory = socket_root.as_ref().map(|root| root.path().join("a"));
         fs::write(&metrics, b"").expect("serial destination metrics should write");
         if let Some(serial) = serial.as_ref() {
             fs::write(serial, b"").expect("serial destination output should write");
+        }
+        if let Some(directory) = state_directory.as_ref() {
+            fs::create_dir(directory).expect("serial recapture state directory should create");
+        }
+        if let Some(directory) = memory_directory.as_ref() {
+            fs::create_dir(directory).expect("serial recapture memory directory should create");
+        }
+        if let Some(directory) = api_directory.as_ref() {
+            fs::create_dir(directory).expect("serial destination API directory should create");
         }
         let opened = SerialSnapshotGrantArtifacts {
             state: replacement_opened_path(&sources.state, case),
@@ -7753,6 +8435,30 @@ impl SerialSnapshotInputGrantFixture {
                 "source": path_text(serial),
             }));
         }
+        if let Some(directory) = state_directory.as_ref() {
+            grants.push(serde_json::json!({
+                "id": SNAPSHOT_STATE_OUTPUT_ID,
+                "role": "snapshot-output-directory",
+                "access": "create-children",
+                "source": path_text(directory),
+            }));
+        }
+        if let Some(directory) = memory_directory.as_ref() {
+            grants.push(serde_json::json!({
+                "id": SNAPSHOT_MEMORY_OUTPUT_ID,
+                "role": "snapshot-output-directory",
+                "access": "create-children",
+                "source": path_text(directory),
+            }));
+        }
+        if let Some(directory) = api_directory.as_ref() {
+            grants.push(serde_json::json!({
+                "id": API_SOCKET_DIRECTORY_ID,
+                "role": "api-socket-directory",
+                "access": "create-children",
+                "source": path_text(directory),
+            }));
+        }
         let manifest_json = serde_json::json!({"version": 1, "grants": grants});
         fs::write(
             &manifest,
@@ -7762,6 +8468,7 @@ impl SerialSnapshotInputGrantFixture {
         .expect("serial snapshot input manifest should write");
         Self {
             _root: root,
+            _socket_root: socket_root,
             manifest,
             sources,
             opened,
@@ -7769,6 +8476,9 @@ impl SerialSnapshotInputGrantFixture {
             opened_metrics,
             serial,
             opened_serial,
+            state_directory,
+            memory_directory,
+            api_directory,
         }
     }
 
@@ -7797,6 +8507,42 @@ impl SerialSnapshotInputGrantFixture {
                 .expect("replacement serial destination output should write");
         }
         self.opened.clone()
+    }
+
+    fn recaptured_artifacts(&self) -> SerialSnapshotGrantArtifacts {
+        SerialSnapshotGrantArtifacts {
+            state: self
+                .state_directory
+                .as_ref()
+                .expect("serial recapture state directory should exist")
+                .join(SNAPSHOT_STATE_CHILD),
+            memory: self
+                .memory_directory
+                .as_ref()
+                .expect("serial recapture memory directory should exist")
+                .join(SNAPSHOT_MEMORY_CHILD),
+            drive: self.opened.drive.clone(),
+        }
+    }
+
+    fn api_socket(&self) -> PathBuf {
+        self.api_directory
+            .as_ref()
+            .expect("entropy destination should grant an API socket directory")
+            .join(API_SOCKET_CHILD)
+    }
+
+    fn assert_no_recapture_staging(&self) {
+        assert_no_snapshot_staging(
+            self.state_directory
+                .as_ref()
+                .expect("serial recapture state directory should exist"),
+        );
+        assert_no_snapshot_staging(
+            self.memory_directory
+                .as_ref()
+                .expect("serial recapture memory directory should exist"),
+        );
     }
 
     fn sensitive_strings(&self) -> Vec<String> {
@@ -7837,6 +8583,35 @@ impl SerialSnapshotInputGrantFixture {
                     path_text(opened),
                     SNAPSHOT_SERIAL_SINK_ID,
                     SNAPSHOT_SERIAL_SINK_REF,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        if let (Some(state), Some(memory)) = (&self.state_directory, &self.memory_directory) {
+            sensitive.extend(
+                [
+                    path_text(state),
+                    path_text(memory),
+                    SNAPSHOT_STATE_OUTPUT_ID,
+                    SNAPSHOT_MEMORY_OUTPUT_ID,
+                    SNAPSHOT_STATE_OUTPUT_REF,
+                    SNAPSHOT_MEMORY_OUTPUT_REF,
+                    SNAPSHOT_STATE_CHILD,
+                    SNAPSHOT_MEMORY_CHILD,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        if let Some(directory) = self.api_directory.as_ref() {
+            sensitive.extend(
+                [
+                    path_text(directory),
+                    path_text(&directory.join(API_SOCKET_CHILD)),
+                    API_SOCKET_DIRECTORY_ID,
+                    API_SOCKET_REF,
+                    API_SOCKET_CHILD,
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -11192,6 +11967,61 @@ fn spawn_ready_serial_snapshot_grant_api_launcher(
     }
 }
 
+fn spawn_ready_serial_snapshot_grant_api_launcher_with_granted_socket(
+    bundle: &Path,
+    manifest: &Path,
+    socket: &Path,
+    name: &str,
+    enable_pci: bool,
+) -> RunningSerialApiLauncher {
+    initialize_worker_container(bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let mut command = Command::new(launcher(bundle));
+    command.arg(GRANT_MANIFEST_OPTION).arg(manifest).arg("--");
+    if enable_pci {
+        command.arg("--enable-pci");
+    }
+    let mut child = command
+        .args(["--api-sock", API_SOCKET_REF])
+        .args(["--id", &format!("{name}-{test_id}")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("granted serial snapshot launcher should start");
+    let stdin = child
+        .stdin
+        .take()
+        .expect("granted serial snapshot launcher stdin should be piped");
+    let (ready, stdout_reader, stdout) =
+        read_stdout_until_line_shared(&mut child, "status: API server listening");
+    let stderr_reader = read_stream(
+        child
+            .stderr
+            .take()
+            .expect("granted serial snapshot launcher stderr should be piped"),
+    );
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "granted serial snapshot launcher should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    RunningSerialApiLauncher {
+        child,
+        stdin: Some(stdin),
+        socket: socket.to_path_buf(),
+        stdout_reader: Some(stdout_reader),
+        stdout,
+        stderr_reader: Some(stderr_reader),
+        completed: false,
+    }
+}
+
 impl Drop for RunningApiLauncher {
     fn drop(&mut self) {
         if !self.completed {
@@ -11755,6 +12585,210 @@ fn configure_serial_snapshot_grant_destination_metrics(socket: &Path) {
         ),
         204,
         "PUT production serial snapshot destination metrics",
+    );
+}
+
+fn configure_and_start_entropy_snapshot_grant_source(
+    socket: &Path,
+    with_storage: bool,
+    context: &str,
+) {
+    for (path, body, request) in [
+        (
+            "/machine-config",
+            serde_json::json!({
+                "vcpu_count": 1,
+                "mem_size_mib": 256,
+            }),
+            "machine config",
+        ),
+        (
+            "/entropy",
+            serde_json::json!({
+                "rate_limiter": {
+                    "bandwidth": {
+                        "size": SNAPSHOT_ENTROPY_READ_BYTES,
+                        "refill_time": SNAPSHOT_ENTROPY_REFILL_MS,
+                    },
+                    "ops": {
+                        "size": 1,
+                        "refill_time": SNAPSHOT_ENTROPY_REFILL_MS,
+                    },
+                },
+            }),
+            "entropy config",
+        ),
+        (
+            "/metrics",
+            serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}),
+            "metrics",
+        ),
+        (
+            "/boot-source",
+            serde_json::json!({
+                "kernel_image_path": SNAPSHOT_KERNEL_REF,
+                "initrd_path": SNAPSHOT_INITRD_REF,
+                "boot_args": SNAPSHOT_ENTROPY_BOOT_ARGS,
+            }),
+            "boot source",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                socket,
+                path,
+                &serde_json::to_string(&body)
+                    .expect("production entropy snapshot request should serialize"),
+            ),
+            204,
+            &format!("PUT production {context} entropy snapshot {request}"),
+        );
+    }
+    if with_storage {
+        assert_http_status(
+            &http_put(
+                socket,
+                "/drives/data",
+                &serde_json::json!({
+                    "drive_id": "data",
+                    "path_on_host": SNAPSHOT_DATA_REF,
+                    "is_root_device": false,
+                    "is_read_only": false,
+                    "cache_type": "Writeback",
+                    "io_engine": "Sync",
+                })
+                .to_string(),
+            ),
+            204,
+            &format!("PUT production {context} entropy snapshot storage"),
+        );
+    }
+    assert_http_status(
+        &http_put(socket, "/actions", r#"{"action_type":"InstanceStart"}"#),
+        204,
+        &format!("start production {context} entropy snapshot source"),
+    );
+}
+
+fn wait_for_production_entropy_metric(
+    socket: &Path,
+    metrics: &Path,
+    field: &str,
+    expected: u64,
+    context: &str,
+) {
+    let deadline = Instant::now()
+        .checked_add(PROCESS_TIMEOUT)
+        .expect("production entropy metric deadline should fit");
+    loop {
+        assert_http_status(
+            &http_put(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+            204,
+            &format!("FlushMetrics while waiting for {context}"),
+        );
+        let observed = production_entropy_metric_total(metrics, field);
+        if observed >= expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{context} should reach entropy.{field} >= {expected}; observed={observed}; metrics:\n{}",
+            fs::read_to_string(metrics).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn production_entropy_metric_total(path: &Path, field: &str) -> u64 {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("entropy")?
+                .get(field)?
+                .as_u64()
+        })
+        .fold(0, u64::saturating_add)
+}
+
+fn assert_production_destination_entropy_metrics(metrics: &Path, context: &str) {
+    let output = fs::read_to_string(metrics).unwrap_or_default();
+    assert!(
+        production_entropy_metric_total(metrics, "entropy_bytes") >= SNAPSHOT_ENTROPY_READ_BYTES,
+        "{context} should report restored entropy bytes; metrics:\n{output}"
+    );
+    assert!(
+        production_entropy_metric_total(metrics, "rate_limiter_event_count") >= 1,
+        "{context} should report restored retry activity; metrics:\n{output}"
+    );
+    assert_eq!(
+        production_entropy_metric_total(metrics, "host_rng_fails"),
+        0,
+        "{context} should use a successful fresh OS entropy source"
+    );
+}
+
+fn assert_production_pending_entropy_snapshot(
+    state_path: &Path,
+    enable_pci: bool,
+    with_storage: bool,
+    context: &str,
+) {
+    let bytes = fs::read(state_path).unwrap_or_else(|error| {
+        panic!(
+            "production {context} entropy state {} should read: {error}",
+            state_path.display()
+        )
+    });
+    let structural =
+        decode_snapshot_v2_state(&bytes).expect("production entropy state should decode");
+    let state = decode_hvf_snapshot_v2_entropy_state(&structural)
+        .expect("production entropy state should be exact native-v2 2.8");
+    assert_eq!(
+        state.device_graph().is_some(),
+        with_storage,
+        "production {context} storage presence should remain exact"
+    );
+    let entropy = state
+        .entropy()
+        .expect("production certification artifact should contain entropy");
+    let transport = if enable_pci {
+        SnapshotV2DeviceTransportKind::Pci
+    } else {
+        SnapshotV2DeviceTransportKind::Mmio
+    };
+    assert_eq!(entropy.transport().kind(), transport);
+    if let Some(graph) = state.device_graph() {
+        assert_eq!(graph.transport_kind(), transport);
+        assert_eq!(graph.block_records().len(), 1);
+    }
+    assert_eq!(
+        entropy
+            .active_queue()
+            .expect("production entropy queue should be active")
+            .outstanding(),
+        1,
+        "production {context} should retain one outstanding descriptor"
+    );
+    assert!(entropy.limiter().bandwidth().is_some());
+    assert!(entropy.limiter().ops().is_some());
+    assert!(entropy.has_pending_work());
+    assert!(entropy.retry().has_retry());
+}
+
+fn assert_production_entropy_config(socket: &Path, with_storage: bool, context: &str) {
+    let config = http_get(socket, "/vm/config");
+    assert_http_status(&config, 200, "read production entropy snapshot config");
+    assert!(
+        config.contains(r#""entropy":{"rate_limiter":"#),
+        "production {context} restored config should contain entropy; response:\n{config}"
+    );
+    assert_eq!(
+        config.matches(r#""drive_id":"#).count(),
+        usize::from(with_storage),
+        "production {context} restored storage shape should remain exact"
     );
 }
 

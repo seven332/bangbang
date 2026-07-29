@@ -11577,6 +11577,10 @@ fn capture_ready_entropy_traverses_signed_mmio_and_pci_owners() {
 #[test]
 fn restores_signed_serial_entropy_mmio_owners_with_exact_retry_semantics() {
     use std::io::Cursor;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Instant;
 
     use bangbang_hvf::{
@@ -11590,6 +11594,7 @@ fn restores_signed_serial_entropy_mmio_owners_with_exact_retry_semantics() {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::entropy::{
         EntropyConfigInput, EntropyMmioLayout, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
+        VirtioRngOsEntropySource,
     };
     use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryLayout};
     use bangbang_runtime::mmio::MmioRegionId;
@@ -11811,11 +11816,15 @@ fn restores_signed_serial_entropy_mmio_owners_with_exact_retry_semantics() {
     assert!(diagnostics.contains("<redacted>"));
     assert!(!diagnostics.contains("1073770496"));
 
-    for (name, expected) in [
+    let source_constructions = Arc::new(AtomicUsize::new(0));
+    for (index, (name, expected)) in [
         ("none", inactive),
         ("delayed", delayed),
         ("immediate", immediate),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let restore_now = Instant::now();
         let plan = SnapshotV2EntropyRestorePlan::prepare(
             expected.clone(),
@@ -11823,14 +11832,25 @@ fn restores_signed_serial_entropy_mmio_owners_with_exact_retry_semantics() {
             restore_now,
         )
         .unwrap_or_else(|error| panic!("{name} entropy plan should prepare: {error:?}"));
-        let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_serial_entropy_mmio(
-            platform.clone(),
-            destination_memories.remove(0),
-            restored_shell(),
-            None,
-            plan,
-        )
-        .unwrap_or_else(|error| panic!("{name} entropy owners should restore: {error:?}"));
+        let construction_counter = Arc::clone(&source_constructions);
+        let owners =
+            OwnedHvfArm64BootSession::restore_snapshot_v2_serial_entropy_mmio_with_source_factory(
+                platform.clone(),
+                destination_memories.remove(0),
+                restored_shell(),
+                None,
+                plan,
+                move || {
+                    construction_counter.fetch_add(1, Ordering::SeqCst);
+                    VirtioRngOsEntropySource::new()
+                },
+            )
+            .unwrap_or_else(|error| panic!("{name} entropy owners should restore: {error:?}"));
+        assert_eq!(
+            source_constructions.load(Ordering::SeqCst),
+            index + 1,
+            "{name} destination should construct exactly one fresh entropy source"
+        );
         assert_eq!(owners.entropy_config(), entropy_config);
         assert!(owners.storage_configs().is_none());
         assert!(
@@ -11890,6 +11910,10 @@ fn restores_signed_serial_entropy_mmio_owners_with_exact_retry_semantics() {
 #[test]
 fn restores_signed_serial_entropy_pci_owners_with_exact_retry_semantics() {
     use std::io::Cursor;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Instant;
 
     use bangbang_hvf::{
@@ -11905,6 +11929,7 @@ fn restores_signed_serial_entropy_pci_owners_with_exact_retry_semantics() {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::entropy::{
         EntropyConfigInput, EntropyMmioLayout, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
+        VirtioRngOsEntropySource,
     };
     use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryLayout};
     use bangbang_runtime::mmio::MmioRegionId;
@@ -12131,11 +12156,15 @@ fn restores_signed_serial_entropy_pci_owners_with_exact_retry_semantics() {
     assert!(diagnostics.contains("<redacted>"));
     assert!(!diagnostics.contains(&entropy_base.raw_value().to_string()));
 
-    for (name, expected) in [
+    let source_constructions = Arc::new(AtomicUsize::new(0));
+    for (index, (name, expected)) in [
         ("none", inactive),
         ("delayed", delayed),
         ("immediate", immediate),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let restore_now = Instant::now();
         let restore_plan = SnapshotV2EntropyRestorePlan::prepare(
             expected.clone(),
@@ -12148,15 +12177,26 @@ fn restores_signed_serial_entropy_pci_owners_with_exact_retry_semantics() {
                 .unwrap_or_else(|error| {
                     panic!("{name} PCI entropy platform plan should prepare: {error:?}")
                 });
-        let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_serial_entropy_pci(
-            platform.clone(),
-            destination_memories.remove(0),
-            restored_shell(),
-            None,
-            endpoint_plan,
-            restore_plan,
-        )
-        .unwrap_or_else(|error| panic!("{name} PCI entropy owners should restore: {error:?}"));
+        let construction_counter = Arc::clone(&source_constructions);
+        let owners =
+            OwnedHvfArm64BootSession::restore_snapshot_v2_serial_entropy_pci_with_source_factory(
+                platform.clone(),
+                destination_memories.remove(0),
+                restored_shell(),
+                None,
+                endpoint_plan,
+                restore_plan,
+                move || {
+                    construction_counter.fetch_add(1, Ordering::SeqCst);
+                    VirtioRngOsEntropySource::new()
+                },
+            )
+            .unwrap_or_else(|error| panic!("{name} PCI entropy owners should restore: {error:?}"));
+        assert_eq!(
+            source_constructions.load(Ordering::SeqCst),
+            index + 1,
+            "{name} PCI destination should construct exactly one fresh entropy source"
+        );
         assert_eq!(owners.entropy_config(), entropy_config);
         assert!(owners.storage_configs().is_none());
         assert!(

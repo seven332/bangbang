@@ -7,15 +7,16 @@ replacing their row-specific semantic contracts. The selector contains exactly
 one time/identity aggregate.
 
 The original #1481 checkpoint had 77 terminal rows and eight Wave 6 handoffs.
-The exact 2.7 serial closure in #1652 now makes 78 rows
-`implemented-and-verified`; seven rows remain `audit-required` because their
+The exact 2.7 serial closure in #1652 made 78 rows terminal, and #1666's exact
+2.8 entropy snapshot certification now makes 80 rows
+`implemented-and-verified`; five rows remain `audit-required` because their
 remaining optional-device or public-production snapshot composition,
 clone/migration portability, and terminal certification belong to
 [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). The
 repository-wide observability, tools, and specification work belongs to
 [Wave 7 #1491](https://github.com/seven332/bangbang/issues/1491), but zero rows
 in this 85-record selector are handed to Wave 7. Global inventory totals remain
-236 implemented, 162 audit-required, three missing-platform-feasible, and 17
+238 implemented, 160 audit-required, three missing-platform-feasible, and 17
 proven-platform-impossible.
 
 ## Evidence keys
@@ -61,17 +62,23 @@ proven-platform-impossible.
   also `AGG-SIGNED`.
 - `E-IMPL` — `crates/api/src/http.rs`,
   `crates/bangbang/src/{api_server,vmm}.rs`,
-  `crates/runtime/src/entropy.rs`, and
-  `crates/{runtime,hvf}/src/startup.rs`.
+  `crates/runtime/src/{entropy,snapshot_entropy_v2_8}.rs`,
+  `crates/hvf/src/{snapshot_v2_entropy_platform,startup}.rs`, and
+  exact native-v2 2.8 artifact composition in `crates/hvf/src/snapshot_v2.rs`.
 - `E-FOCUSED` —
   `entropy_notification_signal_dispatch_signals_queued_request`,
   `entropy_retry_capture_maps_none_immediate_and_delayed_state`, and
-  `limiter_retry_session_quiescence_rolls_back_when_entropy_is_stopped`;
-  also `AGG-FOCUSED`.
+  `limiter_retry_session_quiescence_rolls_back_when_entropy_is_stopped`,
+  plus fixed exact-2.8 codec fixtures, hostile queue/limiter/retry/transport
+  mutations, public product routing, fresh-source factory counts, and
+  rollback/recapture tests; also `AGG-FOCUSED`.
 - `E-SIGNED` —
   `capture_ready_entropy_traverses_signed_mmio_and_pci_owners`,
   `signed_executable_captures_throttled_entropy_lifecycle_over_mmio`, and
-  `signed_executable_captures_throttled_entropy_lifecycle_over_product_pci`;
+  `signed_executable_captures_throttled_entropy_lifecycle_over_product_pci`,
+  plus
+  `signed_executable_certifies_native_v2_entropy_snapshot_continuation` and
+  `normal_bundle_certifies_native_v2_entropy_snapshot_continuation_and_containment`;
   also `AGG-SIGNED`.
 - `S-IMPL` — `crates/api/src/http.rs`,
   `crates/bangbang/src/{api_server,vmm}.rs`,
@@ -118,10 +125,12 @@ proven-platform-impossible.
   [#1490](https://github.com/seven332/bangbang/issues/1490): encode and restore
   virtio-mem geometry, requested/plugged blocks, mapping/accounting state,
   clone/migration policy, portability, and signed restored-guest behavior.
-- `W6-ENTROPY` — exact owner
-  [#1490](https://github.com/seven332/bangbang/issues/1490): encode and restore
-  queues, limiter buckets, retained retry timing, fresh scheduler ownership,
-  clone/migration policy, portability, and signed restored-guest reads.
+- `ENTROPY-SNAPSHOT` — completed by
+  [#1666](https://github.com/seven332/bangbang/issues/1666): exact 2.8
+  queue/limiter/pending/retry encoding, fresh OS source and scheduler/notifier/
+  route/endpoint ownership, immutable same-process and fresh-process clones,
+  direct and contained MMIO/PCI entropy-only and storage-bearing
+  certification, and signed restored-guest reads.
 - `SERIAL-SNAPSHOT` — completed by
   [#1652](https://github.com/seven332/bangbang/issues/1652): exact 2.7
   UART/RX/pending-intent encoding, fresh authorized endpoint reconstruction,
@@ -216,8 +225,8 @@ proven-platform-impossible.
 | `api-property:EntropyDevice.rate_limiter` | [entropy](entropy-contract.md) | `implemented-and-verified` | `E-IMPL` | `E-FOCUSED` | `E-SIGNED` | `terminal` |
 | `api-property:FullVmConfiguration.entropy` | [entropy](entropy-contract.md) | `implemented-and-verified` | `E-IMPL` | `E-FOCUSED` | `E-SIGNED` | `terminal` |
 | `api-schema:EntropyDevice` | [entropy](entropy-contract.md) | `implemented-and-verified` | `E-IMPL` | `E-FOCUSED` | `E-SIGNED` | `terminal` |
-| `corpus:entropy` | [entropy](entropy-contract.md) | `audit-required` | `E-IMPL` | `E-FOCUSED` | `E-SIGNED` | `W6-ENTROPY` |
-| `semantic.device:entropy-queues-limits-metrics-and-state` | [entropy](entropy-contract.md) | `audit-required` | `E-IMPL` | `E-FOCUSED` | `E-SIGNED` | `W6-ENTROPY` |
+| `corpus:entropy` | [entropy](entropy-contract.md) | `implemented-and-verified` | `E-IMPL` | `E-FOCUSED` | `E-SIGNED` | `terminal` |
+| `semantic.device:entropy-queues-limits-metrics-and-state` | [entropy](entropy-contract.md) | `implemented-and-verified` | `E-IMPL` | `E-FOCUSED` | `E-SIGNED` | `terminal` |
 | `api-operation:PUT /serial` | [serial](serial-contract.md) | `implemented-and-verified` | `S-IMPL` | `S-FOCUSED` | `S-SIGNED + PRODUCTION-SERIAL` | `terminal` |
 | `api-path:/serial` | [serial](serial-contract.md) | `implemented-and-verified` | `S-IMPL` | `S-FOCUSED` | `S-SIGNED + PRODUCTION-SERIAL` | `terminal` |
 | `api-property:SerialDevice.rate_limiter` | [serial](serial-contract.md) | `implemented-and-verified` | `S-IMPL` | `S-FOCUSED` | `S-SIGNED + PRODUCTION-SERIAL` | `terminal` |
@@ -240,9 +249,13 @@ two launcher/App-Sandbox-worker sessions remain isolated and leave no steady
 helper, socket, or session root after independent EOF and termination.
 
 Capture-ready values remain private validated live state except where a
-family-specific terminal ledger now binds them to a public artifact profile.
-Exact native-v2 2.7 serial state and its fresh endpoints are implemented and
-signed; the remaining optional-device rows are not implied by that closure.
+family-specific terminal ledger binds them to a public artifact profile.
+Current exact native-v2 2.8 composes required serial, optional unchanged
+profile-3 storage, and optional entropy. Serial endpoints and entropy
+source/metrics/scheduler/notifier/route/endpoint owners are fresh per
+destination; retained entropy queue/limiter/pending/retry state is implemented
+and signed. The five remaining optional-device rows are not implied by that
+closure.
 This contract still does not claim Firecracker artifact compatibility,
 arbitrary cross-host time-source portability, or Wave 7 aggregate
 observability. #1529 separately proves the focused native-v2 PVTime/identity
