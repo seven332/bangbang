@@ -10573,14 +10573,17 @@ fn activate_balloon_capture_queues_with_pending_inflate(
     session: &mut bangbang_hvf::OwnedHvfArm64BootSession,
     transport_base: bangbang_runtime::memory::GuestAddress,
     config: bangbang_runtime::balloon::BalloonConfig,
+    pci: bool,
 ) {
     use bangbang_runtime::balloon::{
         VIRTIO_BALLOON_QUEUE_SIZE, VirtioBalloonQueueLayout, available_features,
     };
-    use bangbang_runtime::virtio_mmio::{
+    use bangbang_runtime::virtio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
-        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioRegister,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
     };
+    use bangbang_runtime::virtio_mmio::VirtioMmioRegister;
+    use bangbang_runtime::virtio_pci::VIRTIO_PCI_NOTIFICATION_OFFSET;
 
     let queue_count = VirtioBalloonQueueLayout::from_config(config).queue_count();
     let dispatcher = session.mmio_dispatcher();
@@ -10629,41 +10632,129 @@ fn activate_balloon_capture_queues_with_pending_inflate(
     let mut dispatcher = dispatcher
         .lock()
         .expect("signed balloon MMIO dispatcher should not be poisoned");
-    let write = |dispatcher: &mut bangbang_runtime::mmio::MmioDispatcher,
-                 register: VirtioMmioRegister,
-                 value: u32| {
-        write_entropy_capture_mmio(
-            dispatcher,
-            transport_base
-                .checked_add(register.offset())
-                .expect("balloon transport address should not overflow"),
-            &value.to_le_bytes(),
+    let write =
+        |dispatcher: &mut bangbang_runtime::mmio::MmioDispatcher, offset: u64, data: &[u8]| {
+            write_entropy_capture_mmio(
+                dispatcher,
+                transport_base
+                    .checked_add(offset)
+                    .expect("balloon transport address should not overflow"),
+                data,
+            );
+        };
+    let features = available_features(config);
+    let features_ok = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    if pci {
+        for status in [
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        ] {
+            write(
+                &mut dispatcher,
+                0x14,
+                &[u8::try_from(status).expect("virtio status should fit u8")],
+            );
+        }
+        for selector in [0_u32, 1] {
+            write(&mut dispatcher, 0x08, &selector.to_le_bytes());
+            write(
+                &mut dispatcher,
+                0x0c,
+                &u32::try_from((features >> (selector * 32)) & u64::from(u32::MAX))
+                    .expect("one feature word should fit")
+                    .to_le_bytes(),
+            );
+        }
+        write(
+            &mut dispatcher,
+            0x14,
+            &[u8::try_from(features_ok).expect("virtio status should fit u8")],
         );
-    };
+        for (index, (descriptor, available, used)) in BALLOON_CAPTURE_QUEUE_RINGS
+            .iter()
+            .take(queue_count)
+            .enumerate()
+        {
+            write(
+                &mut dispatcher,
+                0x16,
+                &u16::try_from(index)
+                    .expect("balloon queue index should fit")
+                    .to_le_bytes(),
+            );
+            write(
+                &mut dispatcher,
+                0x18,
+                &VIRTIO_BALLOON_QUEUE_SIZE.to_le_bytes(),
+            );
+            write(
+                &mut dispatcher,
+                0x20,
+                &u32::try_from(descriptor.raw_value())
+                    .expect("balloon descriptor address should fit")
+                    .to_le_bytes(),
+            );
+            write(
+                &mut dispatcher,
+                0x28,
+                &u32::try_from(available.raw_value())
+                    .expect("balloon available address should fit")
+                    .to_le_bytes(),
+            );
+            write(
+                &mut dispatcher,
+                0x30,
+                &u32::try_from(used.raw_value())
+                    .expect("balloon used address should fit")
+                    .to_le_bytes(),
+            );
+            write(&mut dispatcher, 0x1c, &1_u16.to_le_bytes());
+        }
+        write(
+            &mut dispatcher,
+            0x14,
+            &[u8::try_from(features_ok | VIRTIO_DEVICE_STATUS_DRIVER_OK)
+                .expect("virtio status should fit u8")],
+        );
+        write(
+            &mut dispatcher,
+            VIRTIO_PCI_NOTIFICATION_OFFSET,
+            &0_u16.to_le_bytes(),
+        );
+        return;
+    }
+
     for status in [
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
     ] {
-        write(&mut dispatcher, VirtioMmioRegister::Status, status);
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::Status.offset(),
+            &status.to_le_bytes(),
+        );
     }
-    let features = available_features(config);
     for selector in [0_u32, 1] {
         write(
             &mut dispatcher,
-            VirtioMmioRegister::DriverFeaturesSel,
-            selector,
+            VirtioMmioRegister::DriverFeaturesSel.offset(),
+            &selector.to_le_bytes(),
         );
         write(
             &mut dispatcher,
-            VirtioMmioRegister::DriverFeatures,
-            u32::try_from((features >> (selector * 32)) & u64::from(u32::MAX))
-                .expect("one feature word should fit"),
+            VirtioMmioRegister::DriverFeatures.offset(),
+            &u32::try_from((features >> (selector * 32)) & u64::from(u32::MAX))
+                .expect("one feature word should fit")
+                .to_le_bytes(),
         );
     }
-    let features_ok = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
-        | VIRTIO_DEVICE_STATUS_DRIVER
-        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
-    write(&mut dispatcher, VirtioMmioRegister::Status, features_ok);
+    write(
+        &mut dispatcher,
+        VirtioMmioRegister::Status.offset(),
+        &features_ok.to_le_bytes(),
+    );
     for (index, (descriptor, available, used)) in BALLOON_CAPTURE_QUEUE_RINGS
         .iter()
         .take(queue_count)
@@ -10671,8 +10762,10 @@ fn activate_balloon_capture_queues_with_pending_inflate(
     {
         write(
             &mut dispatcher,
-            VirtioMmioRegister::QueueSel,
-            u32::try_from(index).expect("balloon queue index should fit"),
+            VirtioMmioRegister::QueueSel.offset(),
+            &u32::try_from(index)
+                .expect("balloon queue index should fit")
+                .to_le_bytes(),
         );
         for (register, value) in [
             (
@@ -10694,15 +10787,19 @@ fn activate_balloon_capture_queues_with_pending_inflate(
             ),
             (VirtioMmioRegister::QueueReady, 1),
         ] {
-            write(&mut dispatcher, register, value);
+            write(&mut dispatcher, register.offset(), &value.to_le_bytes());
         }
     }
     write(
         &mut dispatcher,
-        VirtioMmioRegister::Status,
-        features_ok | VIRTIO_DEVICE_STATUS_DRIVER_OK,
+        VirtioMmioRegister::Status.offset(),
+        &(features_ok | VIRTIO_DEVICE_STATUS_DRIVER_OK).to_le_bytes(),
     );
-    write(&mut dispatcher, VirtioMmioRegister::QueueNotify, 0);
+    write(
+        &mut dispatcher,
+        VirtioMmioRegister::QueueNotify.offset(),
+        &0_u32.to_le_bytes(),
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -12878,6 +12975,7 @@ fn restores_signed_balloon_first_mmio_owner_graph_and_rolls_back_faults() {
         &mut source,
         balloon_layout.address(),
         balloon_config,
+        false,
     );
 
     let source_configs =
@@ -13473,6 +13571,672 @@ fn restores_repeated_signed_inactive_balloon_only_mmio_owner_graphs() {
             .shutdown()
             .expect("isolated balloon-only destination should shut down");
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn restores_repeated_signed_inactive_balloon_only_pci_owner_graphs() {
+    use std::io::Cursor;
+
+    use bangbang_hvf::{
+        HvfArm64BootBalloonDeviceConfig, HvfArm64BootPciDataDeviceKind,
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BalloonPreparedProduct,
+        HvfSnapshotV2BalloonState, HvfSnapshotV2BootState, HvfSnapshotV2NativePath,
+        HvfSnapshotV2RestoredSerialShell, OwnedHvfArm64BootSession,
+        prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::balloon::{
+        BalloonConfigInput, BalloonMmioLayout, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE,
+    };
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonRestorePlan;
+    use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransport;
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::virtio_pci::VirtioPciEndpointPhase;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("restore-inactive-balloon-pci-kernel", &image)
+        .expect("inactive PCI balloon kernel should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("inactive PCI balloon boot source should configure");
+    controller
+        .handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(8, true)
+                .with_stats_polling_interval_s(1)
+                .with_free_page_hinting(true)
+                .with_free_page_reporting(true),
+        ))
+        .expect("inactive five-queue PCI balloon should configure");
+    let balloon_config = controller
+        .balloon_config()
+        .expect("inactive PCI balloon configuration should exist");
+
+    let balloon_layout =
+        BalloonMmioLayout::new(GuestAddress::new(0x4000_8000), MmioRegionId::new(4000));
+    let session_config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
+    )
+    .with_balloon_device(HvfArm64BootBalloonDeviceConfig::new(balloon_layout))
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+    ))
+    .with_pci_enabled();
+    let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+        .expect("signed inactive PCI balloon source should prepare");
+    let guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("inactive PCI balloon publishers should quiesce");
+    let balloon = source
+        .capture_ready_balloon_state(Some(balloon_config), &guard)
+        .expect("inactive PCI balloon owner should capture")
+        .expect("configured inactive PCI balloon should exist")
+        .try_to_snapshot_v2()
+        .expect("inactive PCI balloon capture should convert");
+    let serial = SnapshotV2SerialState::try_from_capture_ready(
+        source
+            .capture_ready_serial_state(controller.serial_config().clone(), &guard)
+            .expect("inactive PCI balloon serial should capture"),
+    )
+    .expect("inactive PCI balloon serial capture should convert");
+    drop(guard);
+    assert!(!balloon.virtio().is_activated());
+    assert_eq!(balloon.virtio().queues().len(), 5);
+    let SnapshotV2DeviceTransport::Pci(expected_pci) = balloon.transport() else {
+        panic!("inactive balloon source should use PCI");
+    };
+    assert_eq!(expected_pci.sbdf().device(), 1);
+
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("inactive PCI balloon source should pause");
+    let boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+            .expect("inactive PCI balloon kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("inactive PCI balloon boot metadata should validate");
+    let mut memory_writer = Cursor::new(Vec::new());
+    let platform = source
+        .capture_snapshot_v2_balloon_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            &mut memory_writer,
+            |_| false,
+        )
+        .expect("inactive exact-2.9 PCI balloon platform should capture");
+    HvfSnapshotV2BalloonState::try_new(
+        platform.clone(),
+        None,
+        serial.clone(),
+        None,
+        Some(balloon.clone()),
+    )
+    .expect("balloon-only exact-2.9 PCI product should compose");
+
+    let destination_memories = [
+        copy_signed_session_guest_memory(&source),
+        copy_signed_session_guest_memory(&source),
+    ];
+    source
+        .shutdown()
+        .expect("signed inactive PCI balloon source should shut down");
+
+    let prepare_plan = |memory: &GuestMemory| {
+        let balloon_plan = SnapshotV2BalloonRestorePlan::prepare(balloon.clone(), memory)
+            .expect("inactive PCI balloon restore plan should prepare");
+        prepare_hvf_snapshot_v2_balloon_pci_platform_plan(
+            &platform,
+            HvfSnapshotV2BalloonPreparedProduct::serial_balloon(balloon_plan),
+        )
+        .expect("balloon-only PCI platform plan should prepare")
+    };
+    let restored_shell = || {
+        HvfSnapshotV2RestoredSerialShell::new(
+            SerialMmioDevice::from_capture_state_with_shared_output(
+                SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                serial.device().clone(),
+            ),
+        )
+    };
+
+    for destination in destination_memories {
+        let plan = prepare_plan(&destination);
+        let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_serial_balloon_pci(
+            platform.clone(),
+            destination,
+            restored_shell(),
+            None,
+            plan,
+        )
+        .expect("isolated inactive PCI balloon owner graph should restore");
+        assert_eq!(owners.balloon_config(), balloon_config);
+        assert!(owners.storage_configs().is_none());
+        assert!(owners.entropy_config().is_none());
+        assert!(
+            owners
+                .session()
+                .shared_balloon_device_metrics()
+                .snapshot()
+                .is_empty()
+        );
+        let diagnostics = owners
+            .session()
+            .pci_data_device_diagnostics()
+            .expect("inactive PCI balloon manager should exist")
+            .expect("inactive PCI balloon diagnostics should inspect");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].kind, HvfArm64BootPciDataDeviceKind::Balloon);
+        assert_eq!(
+            diagnostics[0].transport.phase,
+            VirtioPciEndpointPhase::Active
+        );
+        assert!(!diagnostics[0].transport.device_activated);
+        assert_eq!(diagnostics[0].queue_deliveries, 0);
+
+        let (mut restored, returned_balloon, storage_configs, entropy_config) = owners.into_parts();
+        assert!(storage_configs.is_none());
+        assert!(entropy_config.is_none());
+        assert!(restored.uses_pci_data_devices());
+        assert!(restored.runtime_resources().balloon_device.is_none());
+        let guard = restored
+            .quiesce_limiter_retry_wakeups()
+            .expect("inactive PCI balloon publishers should quiesce");
+        let recaptured = restored
+            .capture_ready_balloon_state(Some(returned_balloon), &guard)
+            .expect("inactive PCI balloon owner should recapture")
+            .expect("inactive PCI balloon device should remain present")
+            .try_to_snapshot_v2()
+            .expect("inactive PCI balloon recapture should convert");
+        assert!(!recaptured.virtio().is_activated());
+        assert_eq!(recaptured.config(), balloon.config());
+        assert_eq!(
+            recaptured.config_space().num_pages(),
+            balloon.config_space().num_pages()
+        );
+        assert_eq!(
+            recaptured.config_space().actual_pages(),
+            balloon.config_space().actual_pages()
+        );
+        assert_eq!(
+            recaptured.config_space().free_page_hint_cmd_id(),
+            VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+        );
+        assert_eq!(recaptured.virtio(), balloon.virtio());
+        assert_eq!(recaptured.accounting(), balloon.accounting());
+        assert_eq!(recaptured.transport(), balloon.transport());
+        assert_eq!(
+            recaptured.continuation().active_queues(),
+            balloon.continuation().active_queues()
+        );
+        assert_eq!(
+            recaptured.continuation().stats_polling_interval_s(),
+            balloon.continuation().stats_polling_interval_s()
+        );
+        assert_eq!(
+            recaptured.continuation().statistics(),
+            balloon.continuation().statistics()
+        );
+        assert_eq!(
+            recaptured
+                .continuation()
+                .statistics_pending_descriptor_head(),
+            balloon.continuation().statistics_pending_descriptor_head()
+        );
+        let restored_hint = recaptured.continuation().hinting();
+        let source_hint = balloon.continuation().hinting();
+        assert_eq!(restored_hint.host_cmd(), VIRTIO_BALLOON_FREE_PAGE_HINT_DONE);
+        assert_eq!(restored_hint.guest_cmd(), source_hint.guest_cmd());
+        assert_eq!(restored_hint.last_cmd(), source_hint.last_cmd());
+        assert_eq!(
+            restored_hint.acknowledge_on_stop(),
+            source_hint.acknowledge_on_stop()
+        );
+        drop(guard);
+        restored
+            .shutdown()
+            .expect("isolated inactive PCI balloon destination should shut down");
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn restores_signed_balloon_first_pci_owner_graph_and_rolls_back_faults() {
+    use std::io::Cursor;
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig,
+        HvfArm64BootPciDataDeviceKind, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BalloonPciRestoreFault,
+        HvfSnapshotV2BalloonPreparedProduct, HvfSnapshotV2BalloonState, HvfSnapshotV2BootState,
+        HvfSnapshotV2NativePath, HvfSnapshotV2RestoredSerialShell, OwnedHvfArm64BootSession,
+        prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::balloon::{
+        BalloonConfigInput, BalloonMmioLayout, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE,
+    };
+    use bangbang_runtime::block::{
+        BlockFileBacking, BlockMmioLayout, DriveConfigInput, DriveIoEngine,
+    };
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::entropy::{EntropyConfigInput, EntropyMmioLayout};
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonRestorePlan;
+    use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransport;
+    use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageRestorePlan;
+    use bangbang_runtime::snapshot_entropy_v2_8::SnapshotV2EntropyRestorePlan;
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
+    use bangbang_runtime::virtio_pci::VirtioPciEndpointPhase;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("restore-balloon-pci-kernel", &image)
+        .expect("balloon PCI restore kernel should create");
+    let root = TempFile::new_len("restore-balloon-pci-root", 4096)
+        .expect("balloon PCI restore root should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("balloon PCI restore boot source should configure");
+    controller
+        .handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", root.path(), true)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("balloon PCI restore root should configure");
+    controller
+        .handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(8, true)
+                .with_stats_polling_interval_s(1)
+                .with_free_page_hinting(true)
+                .with_free_page_reporting(true),
+        ))
+        .expect("five-queue PCI balloon should configure");
+    controller
+        .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+        .expect("following PCI entropy should configure");
+    let balloon_config = controller
+        .balloon_config()
+        .expect("PCI balloon configuration should exist");
+    let entropy_config = controller
+        .entropy_config()
+        .expect("PCI entropy configuration should exist");
+    let block_layout = BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
+    let pmem_layout = PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500));
+    let balloon_layout =
+        BalloonMmioLayout::new(GuestAddress::new(0x4000_8000), MmioRegionId::new(4000));
+    let entropy_layout =
+        EntropyMmioLayout::new(GuestAddress::new(0x4000_7000), MmioRegionId::new(3001));
+    let session_config = HvfArm64BootSessionConfig::new(
+        block_layout,
+        pmem_layout,
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
+    )
+    .with_balloon_device(HvfArm64BootBalloonDeviceConfig::new(balloon_layout))
+    .with_entropy_device(HvfArm64BootEntropyDeviceConfig::new(entropy_layout))
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+    ))
+    .with_pci_enabled();
+    let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+        .expect("signed PCI balloon source should prepare");
+    let inactive_guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("inactive PCI balloon publishers should quiesce");
+    let inactive_balloon = source
+        .capture_ready_balloon_state(Some(balloon_config), &inactive_guard)
+        .expect("inactive PCI balloon should capture")
+        .expect("configured PCI balloon should exist");
+    let balloon_bar_base = match inactive_balloon.transport() {
+        bangbang_hvf::HvfArm64BootBalloonTransportState::Pci { bar_range, .. } => bar_range.start(),
+        bangbang_hvf::HvfArm64BootBalloonTransportState::Mmio { .. } => {
+            panic!("PCI-enabled balloon source should own a PCI endpoint")
+        }
+    };
+    drop(inactive_guard);
+    activate_balloon_capture_queues_with_pending_inflate(
+        &mut source,
+        balloon_bar_base,
+        balloon_config,
+        true,
+    );
+
+    let source_configs =
+        CaptureReadyStorageConfigs::new(controller.drive_configs().to_vec(), Vec::new());
+    let guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("PCI balloon source publishers should quiesce");
+    let capture_now = Instant::now();
+    let graph = source
+        .capture_snapshot_v2_storage_device_graph_at(&source_configs, &guard, capture_now)
+        .expect("PCI balloon storage graph should capture");
+    let balloon = source
+        .capture_ready_balloon_state(Some(balloon_config), &guard)
+        .expect("active PCI balloon owner should capture")
+        .expect("configured PCI balloon should exist")
+        .try_to_snapshot_v2()
+        .expect("active PCI balloon capture should convert");
+    let entropy = source
+        .capture_ready_entropy_state_at(Some(entropy_config), &guard, capture_now)
+        .expect("following PCI entropy should capture")
+        .expect("configured PCI entropy should exist")
+        .try_to_snapshot_v2()
+        .expect("following PCI entropy capture should convert");
+    let serial = SnapshotV2SerialState::try_from_capture_ready(
+        source
+            .capture_ready_serial_state(controller.serial_config().clone(), &guard)
+            .expect("PCI balloon product serial should capture"),
+    )
+    .expect("PCI balloon serial capture should convert");
+    drop(guard);
+    assert!(balloon.virtio().is_activated());
+    assert_eq!(balloon.virtio().queues().len(), 5);
+    assert!(balloon.virtio().pending_notifications().contains(&0));
+    let SnapshotV2DeviceTransport::Pci(balloon_pci) = balloon.transport() else {
+        panic!("active balloon source should retain PCI transport");
+    };
+    let SnapshotV2DeviceTransport::Pci(storage_pci) = graph.block_records()[0].transport() else {
+        panic!("following storage source should retain PCI transport");
+    };
+    let SnapshotV2DeviceTransport::Pci(entropy_pci) = entropy.transport() else {
+        panic!("following entropy source should retain PCI transport");
+    };
+    assert_eq!(balloon_pci.sbdf().device(), 1);
+    assert_eq!(storage_pci.sbdf().device(), 2);
+    assert_eq!(entropy_pci.sbdf().device(), 3);
+
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("PCI balloon source should pause");
+    let boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+            .expect("PCI balloon kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("PCI balloon boot metadata should validate");
+    let mut memory_writer = Cursor::new(Vec::new());
+    let platform = source
+        .capture_snapshot_v2_balloon_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            &mut memory_writer,
+            |_| false,
+        )
+        .expect("exact-2.9 PCI balloon platform should capture");
+    HvfSnapshotV2BalloonState::try_new(
+        platform.clone(),
+        Some(graph.clone()),
+        serial.clone(),
+        Some(entropy.clone()),
+        Some(balloon.clone()),
+    )
+    .expect("all-optional exact-2.9 PCI product should compose");
+
+    let mut destination_memories = Vec::new();
+    destination_memories
+        .try_reserve_exact(9)
+        .expect("PCI balloon destination inventory should reserve");
+    for _ in 0..9 {
+        destination_memories.push(copy_signed_session_guest_memory(&source));
+    }
+    source
+        .shutdown()
+        .expect("signed PCI balloon source should shut down");
+
+    let prepare_plan = |memory: &GuestMemory| {
+        let now = Instant::now();
+        let balloon_plan = SnapshotV2BalloonRestorePlan::prepare(balloon.clone(), memory)
+            .expect("active PCI balloon restore plan should prepare");
+        let entropy_plan = SnapshotV2EntropyRestorePlan::prepare(entropy.clone(), memory, now)
+            .expect("following PCI entropy restore plan should prepare");
+        let backing = BlockFileBacking::open_snapshot(
+            std::path::Path::new(graph.block_records()[0].config().selector()),
+            graph.block_records()[0].config().is_read_only(),
+        )
+        .expect("PCI balloon storage backing should reopen")
+        .0;
+        let bundle = SnapshotV2StorageRestorePlan::prepare(graph.clone(), memory, now)
+            .expect("PCI balloon storage restore plan should prepare")
+            .prepare_backings(vec![backing], Vec::new(), || false)
+            .expect("PCI balloon storage backing bundle should prepare");
+        prepare_hvf_snapshot_v2_balloon_pci_platform_plan(
+            &platform,
+            HvfSnapshotV2BalloonPreparedProduct::serial_balloon_storage_entropy(
+                balloon_plan,
+                bundle,
+                entropy_plan,
+            ),
+        )
+        .unwrap_or_else(|error| {
+            let source = std::error::Error::source(&error);
+            panic!(
+                "all-optional PCI balloon platform plan should prepare: {error:?}, source={source:?}"
+            )
+        })
+    };
+    let restored_shell = || {
+        HvfSnapshotV2RestoredSerialShell::new(
+            SerialMmioDevice::from_capture_state_with_shared_output(
+                SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                serial.device().clone(),
+            ),
+        )
+    };
+
+    for fault in [
+        HvfSnapshotV2BalloonPciRestoreFault::RegistryCreation,
+        HvfSnapshotV2BalloonPciRestoreFault::RegistryRelease,
+        HvfSnapshotV2BalloonPciRestoreFault::EndpointPreparation,
+        HvfSnapshotV2BalloonPciRestoreFault::BalloonPublication,
+        HvfSnapshotV2BalloonPciRestoreFault::StoragePublication,
+        HvfSnapshotV2BalloonPciRestoreFault::EntropyPublication,
+        HvfSnapshotV2BalloonPciRestoreFault::ManagerInsertion,
+        HvfSnapshotV2BalloonPciRestoreFault::SessionAssembly,
+    ] {
+        let destination = destination_memories.remove(0);
+        let plan = prepare_plan(&destination);
+        let error = OwnedHvfArm64BootSession::restore_snapshot_v2_serial_balloon_pci_with_fault(
+            platform.clone(),
+            destination,
+            restored_shell(),
+            None,
+            plan,
+            fault,
+        )
+        .expect_err("injected PCI balloon owner fault should reject");
+        assert!(
+            !error.has_incomplete_cleanup(),
+            "{fault:?} should roll back cleanly: {error:?}"
+        );
+        let diagnostics = format!("{error:?} {error}");
+        assert!(diagnostics.contains("<redacted>"));
+        assert!(!diagnostics.contains(&balloon_bar_base.raw_value().to_string()));
+    }
+
+    let destination = destination_memories.remove(0);
+    let plan = prepare_plan(&destination);
+    let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_serial_balloon_pci(
+        platform,
+        destination,
+        restored_shell(),
+        None,
+        plan,
+    )
+    .unwrap_or_else(|error| panic!("balloon-first PCI owners should restore: {error:?}"));
+    assert_eq!(owners.balloon_config(), balloon_config);
+    assert_eq!(owners.entropy_config(), Some(entropy_config));
+    assert_eq!(
+        owners
+            .storage_configs()
+            .expect("restored PCI storage configs should exist"),
+        &source_configs
+    );
+    assert!(
+        owners
+            .session()
+            .shared_balloon_device_metrics()
+            .snapshot()
+            .is_empty()
+    );
+    let diagnostics = owners
+        .session()
+        .pci_data_device_diagnostics()
+        .expect("PCI balloon manager should exist")
+        .expect("PCI balloon diagnostics should inspect");
+    assert_eq!(diagnostics.len(), 3);
+    assert_eq!(diagnostics[0].kind, HvfArm64BootPciDataDeviceKind::Balloon);
+    assert_eq!(diagnostics[1].kind, HvfArm64BootPciDataDeviceKind::Block);
+    assert_eq!(diagnostics[2].kind, HvfArm64BootPciDataDeviceKind::Entropy);
+    assert!(diagnostics.iter().all(|entry| {
+        entry.transport.phase == VirtioPciEndpointPhase::Active && entry.queue_deliveries == 0
+    }));
+
+    let (mut restored, returned_balloon, storage_configs, returned_entropy) = owners.into_parts();
+    let storage_configs = storage_configs.expect("restored PCI storage configs should be retained");
+    assert_eq!(returned_balloon, balloon_config);
+    assert_eq!(returned_entropy, Some(entropy_config));
+    assert!(restored.uses_pci_data_devices());
+    assert!(restored.runtime_resources().block_devices.is_empty());
+    assert!(restored.runtime_resources().balloon_device.is_none());
+    assert!(restored.runtime_resources().entropy_device.is_none());
+
+    let guard = restored
+        .quiesce_limiter_retry_wakeups()
+        .expect("restored PCI balloon publishers should quiesce");
+    let recaptured_balloon = restored
+        .capture_ready_balloon_state(Some(returned_balloon), &guard)
+        .expect("restored PCI balloon should capture")
+        .expect("restored PCI balloon should exist")
+        .try_to_snapshot_v2()
+        .expect("restored PCI balloon recapture should convert");
+    assert_eq!(recaptured_balloon.config(), balloon.config());
+    assert_eq!(
+        recaptured_balloon.config_space().num_pages(),
+        balloon.config_space().num_pages()
+    );
+    assert_eq!(
+        recaptured_balloon.config_space().actual_pages(),
+        balloon.config_space().actual_pages()
+    );
+    assert_eq!(
+        recaptured_balloon.config_space().free_page_hint_cmd_id(),
+        VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+    );
+    assert_eq!(recaptured_balloon.accounting(), balloon.accounting());
+    assert_eq!(recaptured_balloon.virtio(), balloon.virtio());
+    assert_eq!(recaptured_balloon.transport(), balloon.transport());
+    assert_eq!(
+        recaptured_balloon.continuation().active_queues(),
+        balloon.continuation().active_queues()
+    );
+    assert_eq!(
+        recaptured_balloon.continuation().stats_polling_interval_s(),
+        balloon.continuation().stats_polling_interval_s()
+    );
+    assert_eq!(
+        recaptured_balloon.continuation().statistics(),
+        balloon.continuation().statistics()
+    );
+    assert_eq!(
+        recaptured_balloon
+            .continuation()
+            .statistics_pending_descriptor_head(),
+        balloon.continuation().statistics_pending_descriptor_head()
+    );
+    let restored_hint = recaptured_balloon.continuation().hinting();
+    let source_hint = balloon.continuation().hinting();
+    assert_eq!(restored_hint.host_cmd(), VIRTIO_BALLOON_FREE_PAGE_HINT_DONE);
+    assert_eq!(restored_hint.guest_cmd(), source_hint.guest_cmd());
+    assert_eq!(restored_hint.last_cmd(), source_hint.last_cmd());
+    assert_eq!(
+        restored_hint.acknowledge_on_stop(),
+        source_hint.acknowledge_on_stop()
+    );
+    let recaptured_graph = restored
+        .capture_snapshot_v2_storage_device_graph_at(&storage_configs, &guard, capture_now)
+        .expect("following PCI storage graph should recapture");
+    assert_eq!(recaptured_graph, graph);
+    let recaptured_entropy = restored
+        .capture_ready_entropy_state_at(Some(entropy_config), &guard, capture_now)
+        .expect("following PCI entropy should recapture")
+        .expect("following PCI entropy should exist")
+        .try_to_snapshot_v2()
+        .expect("following PCI entropy recapture should convert");
+    assert_eq!(recaptured_entropy, entropy);
+    drop(guard);
+
+    restored
+        .dispatch_balloon_queue_notifications_and_signal_interrupts()
+        .expect("restored pending PCI inflate notification should dispatch");
+    let guard = restored
+        .quiesce_limiter_retry_wakeups()
+        .expect("post-dispatch PCI balloon publishers should quiesce");
+    let updated = restored
+        .capture_ready_balloon_state(Some(returned_balloon), &guard)
+        .expect("updated PCI balloon should capture")
+        .expect("updated PCI balloon should exist")
+        .try_to_snapshot_v2()
+        .expect("updated PCI balloon recapture should convert");
+    assert!(updated.virtio().pending_notifications().is_empty());
+    assert_eq!(updated.accounting().inflated_page_count(), 1);
+    assert!(
+        !restored
+            .shared_balloon_device_metrics()
+            .snapshot()
+            .is_empty()
+    );
+    drop(guard);
+    restored
+        .shutdown()
+        .expect("restored balloon-first PCI destination should shut down");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
