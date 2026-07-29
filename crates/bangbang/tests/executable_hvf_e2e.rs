@@ -29,7 +29,7 @@ mod macos_arm64 {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use bangbang_hvf::decode_hvf_snapshot_v2_entropy_state;
+    use bangbang_hvf::decode_hvf_snapshot_v2_balloon_state;
     use bangbang_runtime::block::{DriveCacheType, DriveIoEngine};
     use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
     use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
@@ -2006,6 +2006,7 @@ mod macos_arm64 {
             "paused serial stdio capture preflight",
             false,
             false,
+            false,
         );
         let captured_stdout = bangbang.stdout_snapshot();
         assert!(!captured_stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
@@ -3573,10 +3574,13 @@ mod macos_arm64 {
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
             "pause before balloon capture-ready preflight",
         );
-        assert_capture_ready_snapshot_rejected_without_artifacts(
+        assert_capture_ready_snapshot_succeeds(
             &socket_path,
             test_dir.path(),
             "paused MMIO balloon capture-ready preflight",
+            true,
+            false,
+            true,
         );
         assert_no_content_response(
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
@@ -4888,6 +4892,7 @@ mod macos_arm64 {
             &format!("paused {transport} entropy capture-ready preflight"),
             true,
             true,
+            false,
         );
         assert_no_content_response(
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
@@ -5168,8 +5173,8 @@ mod macos_arm64 {
         });
         let structural =
             decode_snapshot_v2_state(&bytes).expect("entropy state should decode structurally");
-        let state = decode_hvf_snapshot_v2_entropy_state(&structural)
-            .expect("entropy state should decode as exact native-v2 2.8");
+        let state = decode_hvf_snapshot_v2_balloon_state(&structural)
+            .expect("entropy state should decode as exact native-v2 2.9");
         assert_eq!(
             state.device_graph().is_some(),
             with_storage,
@@ -5178,6 +5183,10 @@ mod macos_arm64 {
         let entropy = state
             .entropy()
             .expect("certification artifact should contain entropy");
+        assert!(
+            state.balloon().is_none(),
+            "{context} entropy certification artifact should not add balloon state"
+        );
         let expected_transport = if enable_pci {
             SnapshotV2DeviceTransportKind::Pci
         } else {
@@ -7151,6 +7160,7 @@ mod macos_arm64 {
             "paused dynamic PCI Async storage preflight",
             true,
             false,
+            false,
         );
         write_block_marker_at(
             &control_backing_path,
@@ -8192,6 +8202,7 @@ mod macos_arm64 {
             "paused dynamic PCI pmem storage preflight",
             true,
             false,
+            false,
         );
         write_block_marker_at(
             &control_backing_path,
@@ -8416,6 +8427,7 @@ mod macos_arm64 {
             test_dir.path(),
             "paused direct pmem storage preflight",
             true,
+            false,
             false,
         );
         assert_no_content_response(
@@ -12179,7 +12191,7 @@ mod macos_arm64 {
         let bytes = fs::read(path).expect("configured serial snapshot state should read");
         let structural = decode_snapshot_v2_state(&bytes)
             .expect("configured serial snapshot state should decode");
-        let decoded = decode_hvf_snapshot_v2_entropy_state(&structural)
+        let decoded = decode_hvf_snapshot_v2_balloon_state(&structural)
             .expect("configured serial snapshot state should decode semantically");
         assert!(decoded.device_graph().is_none());
         assert_eq!(
@@ -12231,7 +12243,7 @@ mod macos_arm64 {
         let bytes = fs::read(path).expect("serial snapshot state should read");
         let structural =
             decode_snapshot_v2_state(&bytes).expect("serial snapshot state should decode");
-        let decoded = decode_hvf_snapshot_v2_entropy_state(&structural)
+        let decoded = decode_hvf_snapshot_v2_balloon_state(&structural)
             .expect("serial snapshot state should decode semantically");
         assert!(
             decoded
@@ -12419,7 +12431,7 @@ mod macos_arm64 {
             "native-v2 description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.8.0");
+        assert_eq!(described.stdout.trim(), "v2.9.0");
 
         let collision = http_json_with_io_timeout(
             &source_socket,
@@ -12942,7 +12954,7 @@ mod macos_arm64 {
             "{transport} native-v2 root description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.8.0");
+        assert_eq!(described.stdout.trim(), "v2.9.0");
         let source_output = source.terminate();
         assert_clean_shutdown(
             source_output,
@@ -14056,7 +14068,7 @@ mod macos_arm64 {
         });
         let structural =
             decode_snapshot_v2_state(&bytes).expect("native-v2 state should decode structurally");
-        decode_hvf_snapshot_v2_entropy_state(&structural)
+        decode_hvf_snapshot_v2_balloon_state(&structural)
             .expect("native-v2 state should decode semantically")
             .device_graph()
             .expect("storage-bearing native-v2 state should contain a device graph")
@@ -14319,6 +14331,7 @@ mod macos_arm64 {
         context: &str,
         expect_storage: bool,
         expect_entropy: bool,
+        expect_balloon: bool,
     ) {
         let state_path = directory.join("capture-ready.state");
         let memory_path = directory.join("capture-ready.memory");
@@ -14340,8 +14353,8 @@ mod macos_arm64 {
         let bytes = fs::read(&state_path).expect("capture-ready state should read");
         let structural =
             decode_snapshot_v2_state(&bytes).expect("capture-ready state should be exact current");
-        let state = decode_hvf_snapshot_v2_entropy_state(&structural)
-            .expect("capture-ready state should use the exact-2.8 entropy profile");
+        let state = decode_hvf_snapshot_v2_balloon_state(&structural)
+            .expect("capture-ready state should use the exact-2.9 balloon profile");
         assert_eq!(
             state.device_graph().is_some(),
             expect_storage,
@@ -14351,6 +14364,11 @@ mod macos_arm64 {
             state.entropy().is_some(),
             expect_entropy,
             "{context} entropy profile presence should match"
+        );
+        assert_eq!(
+            state.balloon().is_some(),
+            expect_balloon,
+            "{context} balloon profile presence should match"
         );
         assert_no_snapshot_staging(directory);
     }

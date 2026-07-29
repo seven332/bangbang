@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use bangbang_hvf::decode_hvf_snapshot_v2_entropy_state;
+use bangbang_hvf::decode_hvf_snapshot_v2_balloon_state;
 use bangbang_launcher::{
     JailerIsolationArgument, LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME,
     OUTER_BUNDLE_NAME, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
@@ -2315,7 +2315,7 @@ fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
     assert_output_success(&describe_output, "granted snapshot description");
     assert_eq!(
         String::from_utf8_lossy(&describe_output.stdout).trim(),
-        "v2.8.0"
+        "v2.9.0"
     );
     assert_snapshot_output_redacted(&describe_output, &describe.sensitive_strings());
 
@@ -12744,8 +12744,8 @@ fn assert_production_pending_entropy_snapshot(
     });
     let structural =
         decode_snapshot_v2_state(&bytes).expect("production entropy state should decode");
-    let state = decode_hvf_snapshot_v2_entropy_state(&structural)
-        .expect("production entropy state should be exact native-v2 2.8");
+    let state = decode_hvf_snapshot_v2_balloon_state(&structural)
+        .expect("production entropy state should be exact native-v2 2.9");
     assert_eq!(
         state.device_graph().is_some(),
         with_storage,
@@ -12754,6 +12754,10 @@ fn assert_production_pending_entropy_snapshot(
     let entropy = state
         .entropy()
         .expect("production certification artifact should contain entropy");
+    assert!(
+        state.balloon().is_none(),
+        "production entropy certification artifact should not add balloon state"
+    );
     let transport = if enable_pci {
         SnapshotV2DeviceTransportKind::Pci
     } else {

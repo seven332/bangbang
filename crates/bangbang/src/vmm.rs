@@ -39,6 +39,9 @@ use bangbang_hvf::{
     HvfArm64BootVsockCaptureError, HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState,
     HvfBackend, HvfSnapshotV1Bundle, HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup,
     HvfSnapshotV1RestoreDisposition, HvfSnapshotV1RestoreError, HvfSnapshotV1State,
+    HvfSnapshotV2BalloonMmioPlatformPlan, HvfSnapshotV2BalloonMmioProcessConfig,
+    HvfSnapshotV2BalloonMmioRestoreError, HvfSnapshotV2BalloonPciPlatformPlan,
+    HvfSnapshotV2BalloonPciRestoreError, HvfSnapshotV2BalloonPreparedProduct,
     HvfSnapshotV2BalloonState, HvfSnapshotV2BootState, HvfSnapshotV2BuildError,
     HvfSnapshotV2DecodeError, HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2EncodeError,
     HvfSnapshotV2EntropyMmioRestoreError, HvfSnapshotV2EntropyPciEndpointPlan,
@@ -54,17 +57,20 @@ use bangbang_hvf::{
     HvfSnapshotV2StorageMmioRestoreError, HvfSnapshotV2StoragePciPlatformPlan,
     HvfSnapshotV2StoragePciRestoreError, HvfSnapshotV2StorageState, HvfVcpuRunControl,
     HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
-    PrepareHvfSnapshotV1LoadError, PrepareHvfSnapshotV2EntropyPciPlatformPlanError,
+    PrepareHvfSnapshotV1LoadError, PrepareHvfSnapshotV2BalloonPlatformPlanError,
+    PrepareHvfSnapshotV2EntropyPciPlatformPlanError,
     PrepareHvfSnapshotV2MultiBlockPlatformPlanError, PrepareHvfSnapshotV2RootPlanError,
     PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
     PrepareHvfSnapshotV2StoragePciPlatformPlanError, PreparedHvfArm64BootPciNetworkRemoval,
     PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2Platform,
-    decode_hvf_snapshot_v2_entropy_state, decode_hvf_snapshot_v2_multi_block_state,
-    decode_hvf_snapshot_v2_platform_state, decode_hvf_snapshot_v2_serial_state,
-    decode_hvf_snapshot_v2_state, decode_hvf_snapshot_v2_storage_state,
-    encode_hvf_snapshot_v2_balloon_state, encode_hvf_snapshot_v2_entropy_state,
-    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_serial_state,
-    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
+    decode_hvf_snapshot_v2_balloon_state, decode_hvf_snapshot_v2_entropy_state,
+    decode_hvf_snapshot_v2_multi_block_state, decode_hvf_snapshot_v2_platform_state,
+    decode_hvf_snapshot_v2_serial_state, decode_hvf_snapshot_v2_state,
+    decode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_balloon_state,
+    encode_hvf_snapshot_v2_entropy_state, encode_hvf_snapshot_v2_multi_block_state,
+    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
+    encode_hvf_snapshot_v2_storage_state, prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
     prepare_hvf_snapshot_v2_multi_block_platform_plan, prepare_hvf_snapshot_v2_root_plan,
     prepare_hvf_snapshot_v2_serial_entropy_pci_platform_plan,
     prepare_hvf_snapshot_v2_storage_entropy_mmio_platform_plan,
@@ -158,7 +164,8 @@ use bangbang_runtime::snapshot_artifact::{
     publish_snapshot_artifacts_to_with, publish_snapshot_artifacts_with,
 };
 use bangbang_runtime::snapshot_balloon_v2_9::{
-    SnapshotV2BalloonState, SnapshotV2BalloonStateCaptureError,
+    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, SnapshotV2BalloonRestorePlan,
+    SnapshotV2BalloonRestorePlanError, SnapshotV2BalloonState, SnapshotV2BalloonStateCaptureError,
 };
 use bangbang_runtime::snapshot_commit::{SnapshotCommitKind, SnapshotCommitRecord};
 use bangbang_runtime::snapshot_device::SnapshotV1DeviceState;
@@ -349,6 +356,7 @@ pub(crate) struct NativeV2SnapshotPublicationRequest {
     pub(crate) input: HvfArm64BootSnapshotV2CaptureInput,
     pub(crate) serial_config: SerialConfig,
     pub(crate) entropy_config: Option<EntropyConfig>,
+    pub(crate) balloon_config: Option<BalloonConfig>,
     pub(crate) storage_configs: CaptureReadyStorageConfigs,
     pub(crate) expected_transport: SnapshotV2DeviceTransportKind,
     pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
@@ -359,6 +367,7 @@ impl NativeV2SnapshotPublicationRequest {
         input: HvfArm64BootSnapshotV2CaptureInput,
         serial_config: SerialConfig,
         entropy_config: Option<EntropyConfig>,
+        balloon_config: Option<BalloonConfig>,
         storage_configs: CaptureReadyStorageConfigs,
         expected_transport: SnapshotV2DeviceTransportKind,
         cancellation: NativeV2SnapshotCaptureCancellation,
@@ -367,6 +376,7 @@ impl NativeV2SnapshotPublicationRequest {
             input,
             serial_config,
             entropy_config,
+            balloon_config,
             storage_configs,
             expected_transport,
             cancellation,
@@ -430,6 +440,18 @@ pub(crate) struct ProcessSnapshotV2EntropyLoadRequest<'a> {
     pub(crate) pci_enabled: bool,
     pub(crate) input: &'a SnapshotLoadInput,
     pub(crate) candidate: NativeV2EntropySnapshotCandidateState,
+    pub(crate) memory: GuestMemory,
+    pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
+pub(crate) struct ProcessSnapshotV2BalloonLoadRequest<'a> {
+    pub(crate) controller: &'a VmmController,
+    pub(crate) vmnet_authority: ProcessVmnetAuthority,
+    #[cfg(target_os = "macos")]
+    pub(crate) contained_restore_authority: Option<&'a ContainedSnapshotRestoreAuthority>,
+    pub(crate) pci_enabled: bool,
+    pub(crate) input: &'a SnapshotLoadInput,
+    pub(crate) candidate: NativeV2BalloonSnapshotCandidateState,
     pub(crate) memory: GuestMemory,
     pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
 }
@@ -646,6 +668,15 @@ pub(crate) trait InstanceStartExecutor {
         ))
     }
 
+    fn load_prepared_snapshot_v2_balloon(
+        &mut self,
+        _request: ProcessSnapshotV2BalloonLoadRequest<'_>,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        Err(NativeV2SnapshotLoadError::ProcessPreparation(
+            BackendError::InvalidState("native-v2 balloon snapshot loading is unavailable"),
+        ))
+    }
+
     fn commit_prepared_snapshot_v2_root_load(
         &mut self,
         _completion: ProcessSnapshotV2RootLoadCompletion,
@@ -791,12 +822,21 @@ struct NativeV2SerialCandidateProductProfile {
 
 #[allow(
     dead_code,
-    reason = "exact-2.8 capture remains an internal candidate seam until activation"
+    reason = "exact-2.8 product classification remains compatibility-tested after activation"
 )]
 struct NativeV2EntropyCandidateProductProfile {
     input: HvfArm64BootSnapshotV2CaptureInput,
     serial_config: SerialConfig,
     entropy_config: Option<EntropyConfig>,
+    storage_configs: CaptureReadyStorageConfigs,
+    expected_transport: SnapshotV2DeviceTransportKind,
+}
+
+struct NativeV2BalloonCandidateProductProfile {
+    input: HvfArm64BootSnapshotV2CaptureInput,
+    serial_config: SerialConfig,
+    entropy_config: Option<EntropyConfig>,
+    balloon_config: Option<BalloonConfig>,
     storage_configs: CaptureReadyStorageConfigs,
     expected_transport: SnapshotV2DeviceTransportKind,
 }
@@ -959,6 +999,7 @@ impl std::error::Error for NativeV2SerialCandidateProfileError {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) enum NativeV2EntropyCandidateProfileError {
     MissingBootSource,
     InvalidBootMetadata,
@@ -970,6 +1011,7 @@ pub(crate) enum NativeV2EntropyCandidateProfileError {
     IncompatibleProcessMode,
 }
 
+#[cfg(test)]
 impl fmt::Display for NativeV2EntropyCandidateProfileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -991,7 +1033,56 @@ impl fmt::Display for NativeV2EntropyCandidateProfileError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for NativeV2EntropyCandidateProfileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::StorageProfile(source) => Some(source),
+            Self::SerialProfile(source) => Some(source),
+            Self::MissingBootSource
+            | Self::InvalidBootMetadata
+            | Self::TransportCapacity
+            | Self::OptionalDevices
+            | Self::MmdsStateUnavailable
+            | Self::IncompatibleProcessMode => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeV2BalloonCandidateProfileError {
+    MissingBootSource,
+    InvalidBootMetadata,
+    StorageProfile(SnapshotV2StorageDeviceGraphCaptureError),
+    SerialProfile(SnapshotV2SerialStateCaptureError),
+    TransportCapacity,
+    OptionalDevices,
+    MmdsStateUnavailable,
+    IncompatibleProcessMode,
+}
+
+impl fmt::Display for NativeV2BalloonCandidateProfileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingBootSource => formatter.write_str("boot source is not configured"),
+            Self::InvalidBootMetadata => formatter.write_str("boot metadata is invalid"),
+            Self::StorageProfile(_) => {
+                formatter.write_str("block-and-pmem inventory is unsupported")
+            }
+            Self::SerialProfile(_) => formatter.write_str("serial configuration is unsupported"),
+            Self::TransportCapacity => formatter.write_str("device transport capacity is exceeded"),
+            Self::OptionalDevices => {
+                formatter.write_str("optional device or MMDS state is configured")
+            }
+            Self::MmdsStateUnavailable => formatter.write_str("MMDS state is unavailable"),
+            Self::IncompatibleProcessMode => {
+                formatter.write_str("process boot mode is incompatible")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV2BalloonCandidateProfileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::StorageProfile(source) => Some(source),
@@ -1678,7 +1769,7 @@ pub(crate) enum NativeV1SnapshotPublicationProducerError {
 pub(crate) enum NativeV2SnapshotPublicationError {
     Preflight(VmmActionError),
     CaptureReadyPreflight(SnapshotCaptureReadyPreflightError),
-    Profile(NativeV2EntropyCandidateProfileError),
+    Profile(NativeV2BalloonCandidateProfileError),
     Resource(GrantClaimError),
     SessionUnavailable,
     ConfigurationUnavailable,
@@ -1703,7 +1794,7 @@ impl fmt::Display for NativeV2SnapshotPublicationError {
             Self::Profile(source) => {
                 write!(
                     formatter,
-                    "native-v2 entropy profile is unsupported: {source}"
+                    "native-v2 balloon profile is unsupported: {source}"
                 )
             }
             Self::Resource(source) => {
@@ -2439,6 +2530,80 @@ impl fmt::Display for NativeV2EntropyDestinationLoadError {
 #[cfg(target_os = "macos")]
 impl std::error::Error for NativeV2EntropyDestinationLoadError {}
 
+#[cfg(target_os = "macos")]
+pub(crate) struct NativeV2BalloonDestinationLoadError {
+    transport: SnapshotV2DeviceTransportKind,
+    terminal: bool,
+    detail: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeV2BalloonDestinationLoadError {
+    const fn new(transport: SnapshotV2DeviceTransportKind, terminal: bool) -> Self {
+        Self {
+            transport,
+            terminal,
+            detail: None,
+        }
+    }
+
+    fn with_source(
+        transport: SnapshotV2DeviceTransportKind,
+        terminal: bool,
+        source: &(dyn std::error::Error + 'static),
+    ) -> Self {
+        let mut leaf = source;
+        while let Some(next) = leaf.source() {
+            leaf = next;
+        }
+        Self {
+            transport,
+            terminal,
+            detail: Some(leaf.to_string()),
+        }
+    }
+
+    const fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for NativeV2BalloonDestinationLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2BalloonDestinationLoadError")
+            .field("transport", &self.transport)
+            .field("terminal", &self.terminal)
+            .field("has_detail", &self.detail.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for NativeV2BalloonDestinationLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "native-v2 2.9 {:?} destination transaction failed ({})",
+            self.transport,
+            if self.terminal {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )?;
+        if let Some(detail) = &self.detail {
+            write!(formatter, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for NativeV2BalloonDestinationLoadError {}
+
 #[allow(
     dead_code,
     reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
@@ -2484,6 +2649,12 @@ pub(crate) enum NativeV2SnapshotLoadError {
     EntropyBundle(SnapshotV2SerialRestoreBundleError),
     #[cfg(target_os = "macos")]
     EntropyDestination(NativeV2EntropyDestinationLoadError),
+    #[cfg(target_os = "macos")]
+    BalloonPlan(SnapshotV2BalloonRestorePlanError),
+    #[cfg(target_os = "macos")]
+    BalloonBundle(SnapshotV2SerialRestoreBundleError),
+    #[cfg(target_os = "macos")]
+    BalloonDestination(NativeV2BalloonDestinationLoadError),
     AfterResourceAdoption {
         source: Box<NativeV2SnapshotLoadError>,
     },
@@ -2566,6 +2737,12 @@ impl NativeV2SnapshotLoadError {
             }
             #[cfg(target_os = "macos")]
             Self::EntropyDestination(source) => source.is_terminal(),
+            #[cfg(target_os = "macos")]
+            Self::BalloonBundle(source) => {
+                source.disposition() == SnapshotRestoreResourceDisposition::Terminal
+            }
+            #[cfg(target_os = "macos")]
+            Self::BalloonDestination(source) => source.is_terminal(),
             Self::Restore(source) => source.is_committed() || !source.cleanup_failures().is_empty(),
             Self::RootRestore(source) => source.is_terminal(),
             Self::Preflight(_)
@@ -2588,7 +2765,7 @@ impl NativeV2SnapshotLoadError {
             #[cfg(target_os = "macos")]
             Self::RootBacking(_) => false,
             #[cfg(target_os = "macos")]
-            Self::EntropyPlan(_) => false,
+            Self::EntropyPlan(_) | Self::BalloonPlan(_) => false,
             #[cfg(target_os = "macos")]
             Self::RestoreResources(source) => {
                 source.disposition() == SnapshotRestoreResourceDisposition::Terminal
@@ -2700,6 +2877,22 @@ impl fmt::Display for NativeV2SnapshotLoadError {
             }
             #[cfg(target_os = "macos")]
             Self::EntropyDestination(source) => source.fmt(formatter),
+            #[cfg(target_os = "macos")]
+            Self::BalloonPlan(source) => {
+                write!(
+                    formatter,
+                    "native-v2 2.9 balloon continuation preparation failed: {source}"
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::BalloonBundle(source) => {
+                write!(
+                    formatter,
+                    "native-v2 2.9 serial resource bundle preparation failed: {source}"
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::BalloonDestination(source) => source.fmt(formatter),
             Self::AfterResourceAdoption { source } => {
                 write!(
                     formatter,
@@ -2846,6 +3039,12 @@ impl std::error::Error for NativeV2SnapshotLoadError {
             Self::EntropyBundle(source) => Some(source),
             #[cfg(target_os = "macos")]
             Self::EntropyDestination(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::BalloonPlan(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::BalloonBundle(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::BalloonDestination(source) => Some(source),
             Self::AfterResourceAdoption { source } => Some(source.as_ref()),
             #[cfg(target_os = "macos")]
             Self::RootResourceCleanup { source, .. } => Some(source.as_ref()),
@@ -6422,18 +6621,14 @@ where
             | NativeV2SnapshotArtifactProfile::MultiBlockDeviceGraphV2_5
             | NativeV2SnapshotArtifactProfile::StorageDeviceGraphV2_6
             | NativeV2SnapshotArtifactProfile::SerialStateV2_7
-            | NativeV2SnapshotArtifactProfile::EntropyStateV2_8 => {
+            | NativeV2SnapshotArtifactProfile::EntropyStateV2_8
+            | NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => {
                 self.starter
                     .preflight_snapshot_v2_root_process(self.pci_enabled)
                     .map_err(NativeV2SnapshotLoadError::Preflight)?;
                 if !self.snapshot_capture_cancellation.begin_operation() {
                     return Err(NativeV2SnapshotLoadError::Cancelled);
                 }
-            }
-            NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => {
-                return Err(NativeV2SnapshotLoadError::Preflight(
-                    VmmActionError::SnapshotUnsupported,
-                ));
             }
         }
 
@@ -6676,7 +6871,7 @@ where
             }
             NativeV2SnapshotArtifactProfile::EntropyStateV2_8 => {
                 let (candidate, memory) = artifacts
-                    .into_current_v2_candidate()
+                    .into_v2_8_candidate()
                     .map_err(NativeV2SnapshotLoadError::ArtifactState)
                     .map_err(|source| {
                         if resource_adopted {
@@ -6713,9 +6908,45 @@ where
                 self.started_session = Some(session);
                 Ok(self.controller.commit_snapshot_v2_load(controller_commit))
             }
-            NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => Err(
-                NativeV2SnapshotLoadError::Preflight(VmmActionError::SnapshotUnsupported),
-            ),
+            NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => {
+                let (candidate, memory) = artifacts
+                    .into_current_v2_candidate()
+                    .map_err(NativeV2SnapshotLoadError::ArtifactState)
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let restored = self
+                    .starter
+                    .load_prepared_snapshot_v2_balloon(ProcessSnapshotV2BalloonLoadRequest {
+                        controller: &self.controller,
+                        vmnet_authority: self.vmnet_authority,
+                        #[cfg(target_os = "macos")]
+                        contained_restore_authority: self.contained_restore_authority.as_ref(),
+                        pci_enabled: self.pci_enabled,
+                        input,
+                        candidate,
+                        memory,
+                        cancellation: self.snapshot_capture_cancellation.clone(),
+                    })
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let (session, controller_commit) = restored.into_parts();
+                self.started_session = Some(session);
+                Ok(self.controller.commit_snapshot_v2_load(controller_commit))
+            }
         }
     }
 
@@ -7716,6 +7947,7 @@ where
         })
     }
 
+    #[cfg(test)]
     fn native_v2_entropy_candidate_product_profile(
         &self,
     ) -> Result<NativeV2EntropyCandidateProductProfile, NativeV2EntropyCandidateProfileError> {
@@ -7793,7 +8025,86 @@ where
         })
     }
 
-    /// Publishes one strictly admitted paused source as a native-v2 2.8 pair.
+    fn native_v2_balloon_candidate_product_profile(
+        &self,
+    ) -> Result<NativeV2BalloonCandidateProductProfile, NativeV2BalloonCandidateProfileError> {
+        self.starter
+            .preflight_snapshot_v2_root_process(self.pci_enabled)
+            .map_err(|_| NativeV2BalloonCandidateProfileError::IncompatibleProcessMode)?;
+
+        let boot = self
+            .controller
+            .boot_source_config()
+            .ok_or(NativeV2BalloonCandidateProfileError::MissingBootSource)?;
+        let kernel = HvfSnapshotV2NativePath::try_new(boot.kernel_image_path().as_os_str())
+            .map_err(|_| NativeV2BalloonCandidateProfileError::InvalidBootMetadata)?;
+        let initrd = boot
+            .initrd_path()
+            .map(|path| HvfSnapshotV2NativePath::try_new(path.as_os_str()))
+            .transpose()
+            .map_err(|_| NativeV2BalloonCandidateProfileError::InvalidBootMetadata)?;
+        let boot = HvfSnapshotV2BootState::try_new(kernel, initrd, boot.boot_args())
+            .map_err(|_| NativeV2BalloonCandidateProfileError::InvalidBootMetadata)?;
+
+        let drives = self.controller.drive_configs();
+        let pmem = self.controller.pmem_configs();
+        let storage_resource_count = drives
+            .len()
+            .checked_add(pmem.len())
+            .ok_or(NativeV2BalloonCandidateProfileError::TransportCapacity)?;
+        if storage_resource_count != 0 {
+            SnapshotV2StorageDeviceGraph::preflight_capture_configs(
+                NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                drives,
+                pmem,
+            )
+            .map_err(NativeV2BalloonCandidateProfileError::StorageProfile)?;
+        }
+        SnapshotV2SerialState::preflight_capture(
+            self.controller.serial_config(),
+            storage_resource_count,
+        )
+        .map_err(NativeV2BalloonCandidateProfileError::SerialProfile)?;
+        let entropy_config = self.controller.entropy_config();
+        let balloon_config = self.controller.balloon_config();
+        let endpoint_count = storage_resource_count
+            .checked_add(usize::from(entropy_config.is_some()))
+            .and_then(|count| count.checked_add(usize::from(balloon_config.is_some())))
+            .ok_or(NativeV2BalloonCandidateProfileError::TransportCapacity)?;
+        let pci_capacity = usize::from(PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1);
+        if self.pci_enabled && endpoint_count > pci_capacity {
+            return Err(NativeV2BalloonCandidateProfileError::TransportCapacity);
+        }
+        if !self.controller.network_interface_configs().is_empty()
+            || self.controller.vsock_config().is_some()
+            || self.controller.memory_hotplug_config().is_some()
+        {
+            return Err(NativeV2BalloonCandidateProfileError::OptionalDevices);
+        }
+        let has_mmds_state = self
+            .controller
+            .mmds_state_handle()
+            .with(|state| state.config().is_some() || state.data_store_present())
+            .map_err(|_| NativeV2BalloonCandidateProfileError::MmdsStateUnavailable)?;
+        if has_mmds_state {
+            return Err(NativeV2BalloonCandidateProfileError::OptionalDevices);
+        }
+
+        Ok(NativeV2BalloonCandidateProductProfile {
+            input: HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            serial_config: self.controller.serial_config().clone(),
+            entropy_config,
+            balloon_config,
+            storage_configs: CaptureReadyStorageConfigs::new(drives.to_vec(), pmem.to_vec()),
+            expected_transport: if self.pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            },
+        })
+    }
+
+    /// Publishes one strictly admitted paused source as a native-v2 2.9 pair.
     ///
     /// The public create action reaches this seam after request normalization.
     pub(crate) fn publish_native_v2_snapshot(
@@ -7803,14 +8114,15 @@ where
         self.controller
             .preflight_create_snapshot_v2_request(input)
             .map_err(NativeV2SnapshotPublicationError::Preflight)?;
-        let NativeV2EntropyCandidateProductProfile {
+        let NativeV2BalloonCandidateProductProfile {
             input: capture_input,
             serial_config,
             entropy_config,
+            balloon_config,
             storage_configs,
             expected_transport,
         } = self
-            .native_v2_entropy_candidate_product_profile()
+            .native_v2_balloon_candidate_product_profile()
             .map_err(NativeV2SnapshotPublicationError::Profile)?;
         let cancellation = self.snapshot_capture_cancellation.clone();
         let _serial = self
@@ -7832,6 +8144,7 @@ where
             capture_input,
             serial_config,
             entropy_config,
+            balloon_config,
             storage_configs,
             expected_transport,
             cancellation,
@@ -8167,9 +8480,7 @@ impl HvfInstanceStartExecutor {
                 NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
             }
             NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => {
-                return Err(NativeV2SnapshotLoadError::Preflight(
-                    VmmActionError::SnapshotUnsupported,
-                ));
+                NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
             }
         };
         let structural = decode_snapshot_v2_state_with_compatibility_version(bytes, version)
@@ -8200,9 +8511,8 @@ impl HvfInstanceStartExecutor {
                     .map_err(NativeV2SnapshotLoadError::Decode)?;
             }
             NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => {
-                return Err(NativeV2SnapshotLoadError::Preflight(
-                    VmmActionError::SnapshotUnsupported,
-                ));
+                decode_hvf_snapshot_v2_balloon_state(&structural)
+                    .map_err(NativeV2SnapshotLoadError::Decode)?;
             }
         }
         Ok(())
@@ -9241,6 +9551,8 @@ enum HvfSnapshotV2SerialOwnerRestoreError {
     StoragePci(HvfSnapshotV2StoragePciRestoreError),
     EntropyMmio(HvfSnapshotV2EntropyMmioRestoreError),
     EntropyPci(HvfSnapshotV2EntropyPciRestoreError),
+    BalloonMmio(HvfSnapshotV2BalloonMmioRestoreError),
+    BalloonPci(HvfSnapshotV2BalloonPciRestoreError),
 }
 
 #[cfg(target_os = "macos")]
@@ -9252,6 +9564,8 @@ impl HvfSnapshotV2RestoreDisposition for HvfSnapshotV2SerialOwnerRestoreError {
             Self::StoragePci(source) => source.is_terminal(),
             Self::EntropyMmio(source) => source.is_terminal(),
             Self::EntropyPci(source) => source.is_terminal(),
+            Self::BalloonMmio(source) => source.is_terminal(),
+            Self::BalloonPci(source) => source.is_terminal(),
         }
     }
 }
@@ -9269,6 +9583,8 @@ impl fmt::Debug for HvfSnapshotV2SerialOwnerRestoreError {
                     Self::StoragePci(_) => "storage-pci",
                     Self::EntropyMmio(_) => "entropy-mmio",
                     Self::EntropyPci(_) => "entropy-pci",
+                    Self::BalloonMmio(_) => "balloon-mmio",
+                    Self::BalloonPci(_) => "balloon-pci",
                 },
             )
             .field("terminal", &self.is_terminal())
@@ -9301,6 +9617,8 @@ impl std::error::Error for HvfSnapshotV2SerialOwnerRestoreError {
             Self::StoragePci(source) => Some(source),
             Self::EntropyMmio(source) => Some(source),
             Self::EntropyPci(source) => Some(source),
+            Self::BalloonMmio(source) => Some(source),
+            Self::BalloonPci(source) => Some(source),
         }
     }
 }
@@ -9324,6 +9642,12 @@ enum HvfSnapshotV2EntropyPlatformPlan {
 }
 
 #[cfg(target_os = "macos")]
+enum HvfSnapshotV2BalloonPlatformPlan {
+    Mmio(HvfSnapshotV2BalloonMmioPlatformPlan),
+    Pci(HvfSnapshotV2BalloonPciPlatformPlan),
+}
+
+#[cfg(target_os = "macos")]
 enum HvfSnapshotV2SerialConstructionError {
     TransportPolicy {
         storage_cleanup: Option<SnapshotV2StorageCleanupError>,
@@ -9341,6 +9665,7 @@ enum HvfSnapshotV2SerialConstructionError {
         source: PrepareHvfSnapshotV2EntropyPciPlatformPlanError,
         storage_cleanup: Option<SnapshotV2StorageCleanupError>,
     },
+    BalloonPlan(PrepareHvfSnapshotV2BalloonPlatformPlanError),
     InvalidOwners {
         storage_cleanup: Option<SnapshotV2StorageCleanupError>,
     },
@@ -9363,12 +9688,14 @@ impl HvfSnapshotV2SerialConstructionError {
             | Self::EntropyPciPlan {
                 source: PrepareHvfSnapshotV2EntropyPciPlatformPlanError::Allocation,
                 storage_cleanup: None,
-            } => false,
+            }
+            | Self::BalloonPlan(PrepareHvfSnapshotV2BalloonPlatformPlanError::Allocation) => false,
             Self::Process(source) => source.is_terminal(),
             Self::TransportPolicy { .. }
             | Self::StorageMmioPlan { .. }
             | Self::StoragePciPlan { .. }
             | Self::EntropyPciPlan { .. }
+            | Self::BalloonPlan(_)
             | Self::InvalidOwners { .. } => true,
         }
     }
@@ -9387,6 +9714,7 @@ impl fmt::Debug for HvfSnapshotV2SerialConstructionError {
                     Self::StorageMmioPlan { .. } => "storage-mmio-plan",
                     Self::StoragePciPlan { .. } => "storage-pci-plan",
                     Self::EntropyPciPlan { .. } => "entropy-pci-plan",
+                    Self::BalloonPlan(_) => "balloon-plan",
                     Self::InvalidOwners { .. } => "owners",
                     Self::Process(_) => "process",
                 },
@@ -9425,6 +9753,7 @@ impl std::error::Error for HvfSnapshotV2SerialConstructionError {
             Self::StorageMmioPlan { source, .. } => Some(source),
             Self::StoragePciPlan { source, .. } => Some(source),
             Self::EntropyPciPlan { source, .. } => Some(source),
+            Self::BalloonPlan(source) => Some(source),
             Self::Process(source) => Some(source),
         }
     }
@@ -9462,8 +9791,12 @@ impl std::error::Error for HvfSnapshotV2SerialDestinationCleanupError {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HvfSnapshotV2SerialControllerProfile {
     RetainedV2_7,
-    CurrentV2_8 {
+    RetainedV2_8 {
         entropy_config: Option<EntropyConfig>,
+    },
+    CurrentV2_9 {
+        entropy_config: Option<EntropyConfig>,
+        balloon_config: Option<BalloonConfig>,
     },
 }
 
@@ -9476,15 +9809,29 @@ impl fmt::Debug for HvfSnapshotV2SerialControllerProfile {
                 "version",
                 &match self {
                     Self::RetainedV2_7 => "2.7",
-                    Self::CurrentV2_8 { .. } => "2.8",
+                    Self::RetainedV2_8 { .. } => "2.8",
+                    Self::CurrentV2_9 { .. } => "2.9",
                 },
             )
             .field(
                 "has_entropy",
                 &matches!(
                     self,
-                    Self::CurrentV2_8 {
+                    Self::RetainedV2_8 {
                         entropy_config: Some(_)
+                    } | Self::CurrentV2_9 {
+                        entropy_config: Some(_),
+                        ..
+                    }
+                ),
+            )
+            .field(
+                "has_balloon",
+                &matches!(
+                    self,
+                    Self::CurrentV2_9 {
+                        balloon_config: Some(_),
+                        ..
                     }
                 ),
             )
@@ -9492,7 +9839,7 @@ impl fmt::Debug for HvfSnapshotV2SerialControllerProfile {
     }
 }
 
-/// Complete exact-2.7 or exact-2.8 serial-bearing process owner. The stdio
+/// Complete exact-2.7, exact-2.8, or exact-2.9 serial-bearing process owner. The stdio
 /// restoration receipt remains outside the worker and is finished only after
 /// worker, UART, input, and active-output teardown.
 #[cfg(target_os = "macos")]
@@ -9554,7 +9901,7 @@ impl HvfSnapshotV2SerialDestination {
                     )
                 }
             }
-            HvfSnapshotV2SerialControllerProfile::CurrentV2_8 { entropy_config } => {
+            HvfSnapshotV2SerialControllerProfile::RetainedV2_8 { entropy_config } => {
                 SnapshotV2ControllerCommit::with_serial_storage_and_entropy_configs(
                     machine,
                     boot,
@@ -9564,6 +9911,18 @@ impl HvfSnapshotV2SerialDestination {
                     resume_requested,
                 )
             }
+            HvfSnapshotV2SerialControllerProfile::CurrentV2_9 {
+                entropy_config,
+                balloon_config,
+            } => SnapshotV2ControllerCommit::with_serial_storage_entropy_and_balloon_configs(
+                machine,
+                boot,
+                storage_configs,
+                serial_config,
+                entropy_config,
+                balloon_config,
+                resume_requested,
+            ),
         };
         Ok((self, controller))
     }
@@ -10097,6 +10456,13 @@ fn prepare_hvf_native_v2_serial_destination(
 type PrepareHvfSnapshotV2EntropyDestinationError = PrepareHvfSnapshotV2SerialDestinationError;
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum HvfSnapshotV2EntropyControllerVersion {
+    RetainedV2_8,
+    CurrentV2_9,
+}
+
+#[cfg(target_os = "macos")]
 struct PrepareHvfSnapshotV2EntropyDestinationInput {
     platform: HvfSnapshotV2PlatformState,
     graph: Option<SnapshotV2StorageDeviceGraph>,
@@ -10111,12 +10477,14 @@ struct PrepareHvfSnapshotV2EntropyDestinationInput {
     machine: bangbang_runtime::machine::MachineConfig,
     boot: bangbang_runtime::boot::BootSourceConfig,
     resume_requested: bool,
+    controller_version: HvfSnapshotV2EntropyControllerVersion,
     cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
-/// Reconstructs and atomically commits one exact-2.8 serial-bearing
-/// destination. Entropy absence and presence share the same endpoint,
-/// external-resource, process, controller, and cleanup transaction.
+/// Reconstructs and atomically commits one exact-2.8 or balloon-absent
+/// exact-2.9 serial-bearing destination. Entropy absence and presence share
+/// the same endpoint, external-resource, process, controller, and cleanup
+/// transaction.
 #[cfg(target_os = "macos")]
 fn prepare_hvf_native_v2_entropy_destination(
     input: PrepareHvfSnapshotV2EntropyDestinationInput,
@@ -10138,6 +10506,7 @@ fn prepare_hvf_native_v2_entropy_destination(
         machine,
         boot,
         resume_requested,
+        controller_version,
         cancellation,
     } = input;
     let expected_transport = if pci_enabled {
@@ -10577,8 +10946,302 @@ fn prepare_hvf_native_v2_entropy_destination(
                 storage_configs,
                 has_storage,
                 serial_config: Some(serial_config),
-                controller_profile: HvfSnapshotV2SerialControllerProfile::CurrentV2_8 {
+                controller_profile: match controller_version {
+                    HvfSnapshotV2EntropyControllerVersion::RetainedV2_8 => {
+                        HvfSnapshotV2SerialControllerProfile::RetainedV2_8 { entropy_config }
+                    }
+                    HvfSnapshotV2EntropyControllerVersion::CurrentV2_9 => {
+                        HvfSnapshotV2SerialControllerProfile::CurrentV2_9 {
+                            entropy_config,
+                            balloon_config: None,
+                        }
+                    }
+                },
+                serial_output: Some(serial_output),
+                restoration,
+                unavailable_diagnostics: (),
+            })
+        })
+        .map_err(PrepareHvfSnapshotV2SerialDestinationError::Construction)?;
+    let (destination, controller) = destination
+        .commit(
+            |destination| {
+                if !cancellation.try_seal_commit() {
+                    return Err((
+                        Box::new(destination),
+                        PreparedHvfSnapshotV2SerialControllerError::Cancelled,
+                    ));
+                }
+                destination.prepare_controller(machine, boot, resume_requested)
+            },
+            HvfSnapshotV2SerialDestination::shutdown,
+        )
+        .map_err(PrepareHvfSnapshotV2SerialDestinationError::Commit)?;
+    Ok((destination, controller))
+}
+
+#[cfg(target_os = "macos")]
+type PrepareHvfSnapshotV2BalloonDestinationError = PrepareHvfSnapshotV2SerialDestinationError;
+
+#[cfg(target_os = "macos")]
+struct PrepareHvfSnapshotV2BalloonDestinationInput {
+    platform: HvfSnapshotV2PlatformState,
+    graph: Option<SnapshotV2StorageDeviceGraph>,
+    entropy: Option<SnapshotV2EntropyRestorePlan>,
+    balloon: SnapshotV2BalloonRestorePlan,
+    memory: GuestMemory,
+    pci_enabled: bool,
+    now: Instant,
+    packet_io: ProcessNetworkPacketIoProvider,
+    mmds_metrics: Option<SharedMmdsMetrics>,
+    vmnet_authority: ProcessVmnetAuthority,
+    bundle: PreparedSnapshotV2SerialRestoreBundle,
+    machine: bangbang_runtime::machine::MachineConfig,
+    boot: bangbang_runtime::boot::BootSourceConfig,
+    resume_requested: bool,
+    cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
+/// Reconstructs and atomically commits one exact-2.9 balloon-bearing
+/// destination. Every detached component is closed into one MMIO or PCI
+/// product before the first live owner is constructed.
+#[cfg(target_os = "macos")]
+fn prepare_hvf_native_v2_balloon_destination(
+    input: PrepareHvfSnapshotV2BalloonDestinationInput,
+) -> Result<
+    (HvfSnapshotV2SerialDestination, SnapshotV2ControllerCommit),
+    PrepareHvfSnapshotV2BalloonDestinationError,
+> {
+    let PrepareHvfSnapshotV2BalloonDestinationInput {
+        platform,
+        graph,
+        entropy,
+        balloon,
+        memory,
+        pci_enabled,
+        now,
+        packet_io,
+        mmds_metrics,
+        vmnet_authority,
+        bundle,
+        machine,
+        boot,
+        resume_requested,
+        cancellation,
+    } = input;
+    let expected_transport = if pci_enabled {
+        SnapshotV2DeviceTransportKind::Pci
+    } else {
+        SnapshotV2DeviceTransportKind::Mmio
+    };
+    let destination = bundle
+        .construct_destination(|owners| {
+            if graph
+                .as_ref()
+                .is_some_and(|graph| graph.transport_kind() != expected_transport)
+                || entropy
+                    .as_ref()
+                    .is_some_and(|entropy| entropy.transport_kind() != expected_transport)
+                || balloon.transport_kind() != expected_transport
+            {
+                return Err((
+                    Box::new(owners),
+                    HvfSnapshotV2SerialConstructionError::TransportPolicy {
+                        storage_cleanup: None,
+                    },
+                ));
+            }
+            let (owners, storage) = owners
+                .adopt_storage(graph, &memory, now, &|| cancellation.is_cancelled())
+                .map_err(|(owners, source)| {
+                    (
+                        owners,
+                        HvfSnapshotV2SerialConstructionError::StorageAdoption(source),
+                    )
+                })?;
+
+            let product = match (storage, entropy) {
+                (None, None) => HvfSnapshotV2BalloonPreparedProduct::serial_balloon(balloon),
+                (Some(storage), None) => {
+                    HvfSnapshotV2BalloonPreparedProduct::serial_balloon_storage(balloon, storage)
+                }
+                (None, Some(entropy)) => {
+                    HvfSnapshotV2BalloonPreparedProduct::serial_balloon_entropy(balloon, entropy)
+                }
+                (Some(storage), Some(entropy)) => {
+                    HvfSnapshotV2BalloonPreparedProduct::serial_balloon_storage_entropy(
+                        balloon, storage, entropy,
+                    )
+                }
+            };
+            let platform_plan = if pci_enabled {
+                match prepare_hvf_snapshot_v2_balloon_pci_platform_plan(&platform, product) {
+                    Ok(plan) => HvfSnapshotV2BalloonPlatformPlan::Pci(plan),
+                    Err(source) => {
+                        return Err((
+                            Box::new(owners),
+                            HvfSnapshotV2SerialConstructionError::BalloonPlan(source),
+                        ));
+                    }
+                }
+            } else {
+                let process = HvfSnapshotV2BalloonMmioProcessConfig::new(
+                    BalloonMmioLayout::new(
+                        DEFAULT_BALLOON_MMIO_BASE,
+                        DEFAULT_BALLOON_MMIO_REGION_ID,
+                    ),
+                    HvfSnapshotV2StorageMmioProcessConfig::new(
+                        BlockMmioLayout::new(DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID),
+                        PmemMmioLayout::new(DEFAULT_PMEM_MMIO_BASE, DEFAULT_PMEM_MMIO_REGION_ID),
+                    ),
+                    EntropyMmioLayout::new(
+                        DEFAULT_ENTROPY_MMIO_BASE,
+                        DEFAULT_ENTROPY_MMIO_REGION_ID,
+                    ),
+                );
+                match prepare_hvf_snapshot_v2_balloon_mmio_platform_plan(
+                    &platform, product, process,
+                ) {
+                    Ok(plan) => HvfSnapshotV2BalloonPlatformPlan::Mmio(plan),
+                    Err(source) => {
+                        return Err((
+                            Box::new(owners),
+                            HvfSnapshotV2SerialConstructionError::BalloonPlan(source),
+                        ));
+                    }
+                }
+            };
+
+            let (blocks, pmems, serial, input, restoration, serial_config) = owners.into_parts();
+            debug_assert!(blocks.is_empty());
+            debug_assert!(pmems.is_empty());
+            let (serial, serial_config) = match (serial, serial_config) {
+                (Some(serial), Some(serial_config)) => (serial, serial_config),
+                (serial, serial_config) => {
+                    drop(platform_plan);
+                    return Err((
+                        Box::new(PreparedSnapshotV2SerialRestoreOwners::from_parts((
+                            blocks,
+                            pmems,
+                            serial,
+                            input,
+                            restoration,
+                            serial_config,
+                        ))),
+                        HvfSnapshotV2SerialConstructionError::InvalidOwners {
+                            storage_cleanup: None,
+                        },
+                    ));
+                }
+            };
+            let serial_output = serial.output().clone();
+            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial);
+            let restored = match platform_plan {
+                HvfSnapshotV2BalloonPlatformPlan::Mmio(plan) => {
+                    OwnedHvfArm64BootSession::restore_snapshot_v2_serial_balloon_mmio(
+                        platform,
+                        memory,
+                        process_shell,
+                        input,
+                        plan,
+                    )
+                    .map(|owners| owners.into_parts())
+                    .map_err(HvfSnapshotV2SerialOwnerRestoreError::BalloonMmio)
+                }
+                HvfSnapshotV2BalloonPlatformPlan::Pci(plan) => {
+                    OwnedHvfArm64BootSession::restore_snapshot_v2_serial_balloon_pci(
+                        platform,
+                        memory,
+                        process_shell,
+                        input,
+                        plan,
+                    )
+                    .map(|owners| owners.into_parts())
+                    .map_err(HvfSnapshotV2SerialOwnerRestoreError::BalloonPci)
+                }
+            };
+            let (mut session, balloon_config, storage_configs, entropy_config) = match restored {
+                Ok(restored) => restored,
+                Err(source) => {
+                    return Err((
+                        Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                            restoration,
+                        )),
+                        HvfSnapshotV2SerialConstructionError::Process(
+                            HvfSnapshotV2ProcessConstructionError::Restore(source),
+                        ),
+                    ));
+                }
+            };
+
+            if let Err(source) = session.prepare_restored_serial_continuation() {
+                let cleanup = session
+                    .shutdown()
+                    .err()
+                    .map(|source| BackendError::Hypervisor(source.to_string()));
+                return Err((
+                    Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                        restoration,
+                    )),
+                    HvfSnapshotV2SerialConstructionError::Process(
+                        HvfSnapshotV2ProcessConstructionError::SerialContinuation {
+                            source,
+                            cleanup,
+                        },
+                    ),
+                ));
+            }
+            if let Err(source) = session.resume_after_snapshot_v2_capture() {
+                let cleanup = session
+                    .shutdown()
+                    .err()
+                    .map(|source| BackendError::Hypervisor(source.to_string()));
+                return Err((
+                    Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                        restoration,
+                    )),
+                    HvfSnapshotV2SerialConstructionError::Process(
+                        HvfSnapshotV2ProcessConstructionError::RunReady { source, cleanup },
+                    ),
+                ));
+            }
+            let process_session = ProcessHvfBootSession::new_with_vmnet_authority(
+                session,
+                packet_io,
+                mmds_metrics,
+                vmnet_authority,
+            );
+            let supervisor = match HvfBootRunLoopSupervisor::start_paused(
+                process_session,
+                default_hvf_boot_run_loop_step_limit(),
+            ) {
+                Ok(supervisor) => supervisor,
+                Err(error) => {
+                    let (source, mut failed_session) = error.into_parts();
+                    let cleanup = failed_session
+                        .session
+                        .shutdown()
+                        .err()
+                        .map(|source| BackendError::Hypervisor(source.to_string()));
+                    return Err((
+                        Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                            restoration,
+                        )),
+                        HvfSnapshotV2SerialConstructionError::Process(
+                            HvfSnapshotV2ProcessConstructionError::WorkerStart { source, cleanup },
+                        ),
+                    ));
+                }
+            };
+            let has_storage = storage_configs.is_some();
+            Ok(HvfSnapshotV2SerialDestination {
+                session: Some(Box::new(HvfProcessSession::Boot(supervisor))),
+                storage_configs,
+                has_storage,
+                serial_config: Some(serial_config),
+                controller_profile: HvfSnapshotV2SerialControllerProfile::CurrentV2_9 {
                     entropy_config,
+                    balloon_config: Some(balloon_config),
                 },
                 serial_output: Some(serial_output),
                 restoration,
@@ -12081,6 +12744,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 machine,
                 boot,
                 resume_requested: input.resume_vm(),
+                controller_version: HvfSnapshotV2EntropyControllerVersion::RetainedV2_8,
                 cancellation,
             },
         )
@@ -12096,6 +12760,175 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         })?;
         let serial_output = destination.serial_output_clone().ok_or_else(|| {
             NativeV2SnapshotLoadError::EntropyDestination(NativeV2EntropyDestinationLoadError::new(
+                expected_transport,
+                true,
+            ))
+        })?;
+        self.active_serial_output = Some(serial_output);
+        Ok(SnapshotV2LoadSuccess::new(
+            HvfProcessSession::SerialSnapshotV2(Box::new(destination)),
+            controller_commit,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_prepared_snapshot_v2_balloon(
+        &mut self,
+        request: ProcessSnapshotV2BalloonLoadRequest<'_>,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        let ProcessSnapshotV2BalloonLoadRequest {
+            controller,
+            vmnet_authority,
+            contained_restore_authority,
+            pci_enabled,
+            input,
+            candidate,
+            memory,
+            cancellation,
+        } = request;
+        self.preflight_snapshot_v2_root_process(pci_enabled)
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+
+        let (
+            bytes,
+            binding,
+            candidate_graph,
+            candidate_serial,
+            candidate_entropy,
+            candidate_balloon,
+        ) = candidate.into_parts();
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            &bytes,
+            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        )
+        .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
+        let decoded = decode_hvf_snapshot_v2_balloon_state(&structural)
+            .map_err(NativeV2SnapshotLoadError::Decode)?;
+        if decoded.platform().memory() != &binding
+            || decoded.device_graph() != candidate_graph.as_ref()
+            || decoded.serial() != &candidate_serial
+            || decoded.entropy() != candidate_entropy.as_ref()
+            || decoded.balloon() != candidate_balloon.as_ref()
+        {
+            return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+        }
+        let (platform, graph, serial, entropy, balloon) = decoded.into_parts();
+        drop(candidate_graph);
+        drop(candidate_serial);
+        drop(candidate_entropy);
+        drop(candidate_balloon);
+
+        let expected_transport = if pci_enabled {
+            SnapshotV2DeviceTransportKind::Pci
+        } else {
+            SnapshotV2DeviceTransportKind::Mmio
+        };
+        if graph
+            .as_ref()
+            .is_some_and(|graph| graph.transport_kind() != expected_transport)
+            || entropy
+                .as_ref()
+                .is_some_and(|state| state.transport().kind() != expected_transport)
+            || balloon
+                .as_ref()
+                .is_some_and(|state| state.transport().kind() != expected_transport)
+        {
+            return Err(NativeV2SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ));
+        }
+
+        let boot = native_v2_boot_source_config(platform.machine().boot())
+            .map_err(NativeV2SnapshotLoadError::BootMetadata)?;
+        let machine = snapshot_destination_machine_config(
+            platform.machine().machine(),
+            input.track_dirty_pages(),
+        );
+        let now = Instant::now();
+        let entropy = entropy
+            .map(|state| SnapshotV2EntropyRestorePlan::prepare(state, &memory, now))
+            .transpose()
+            .map_err(NativeV2SnapshotLoadError::EntropyPlan)?;
+        let balloon = balloon
+            .map(|state| SnapshotV2BalloonRestorePlan::prepare(state, &memory))
+            .transpose()
+            .map_err(NativeV2SnapshotLoadError::BalloonPlan)?;
+        let bundle = prepare_native_v2_serial_restore_bundle(
+            graph.as_ref(),
+            serial,
+            contained_restore_authority,
+            || cancellation.is_cancelled(),
+        )
+        .map_err(NativeV2SnapshotLoadError::BalloonBundle)?;
+        let (packet_io, mmds_metrics) =
+            match ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority) {
+                Ok(prepared) => prepared,
+                Err(source) => {
+                    if bundle.abort().is_err() {
+                        return Err(NativeV2SnapshotLoadError::BalloonDestination(
+                            NativeV2BalloonDestinationLoadError::new(expected_transport, true),
+                        ));
+                    }
+                    return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                        BackendError::Hypervisor(format!(
+                            "failed to build native-v2 network packet I/O provider: {source}"
+                        )),
+                    ));
+                }
+            };
+
+        let result = match balloon {
+            Some(balloon) => prepare_hvf_native_v2_balloon_destination(
+                PrepareHvfSnapshotV2BalloonDestinationInput {
+                    platform,
+                    graph,
+                    entropy,
+                    balloon,
+                    memory,
+                    pci_enabled,
+                    now,
+                    packet_io,
+                    mmds_metrics,
+                    vmnet_authority,
+                    bundle,
+                    machine,
+                    boot,
+                    resume_requested: input.resume_vm(),
+                    cancellation,
+                },
+            ),
+            None => prepare_hvf_native_v2_entropy_destination(
+                PrepareHvfSnapshotV2EntropyDestinationInput {
+                    platform,
+                    graph,
+                    entropy,
+                    memory,
+                    pci_enabled,
+                    now,
+                    packet_io,
+                    mmds_metrics,
+                    vmnet_authority,
+                    bundle,
+                    machine,
+                    boot,
+                    resume_requested: input.resume_vm(),
+                    controller_version: HvfSnapshotV2EntropyControllerVersion::CurrentV2_9,
+                    cancellation,
+                },
+            ),
+        };
+        let (destination, controller_commit) = result.map_err(|source| {
+            let terminal = source.is_terminal();
+            NativeV2SnapshotLoadError::BalloonDestination(
+                NativeV2BalloonDestinationLoadError::with_source(
+                    expected_transport,
+                    terminal,
+                    &source,
+                ),
+            )
+        })?;
+        let serial_output = destination.serial_output_clone().ok_or_else(|| {
+            NativeV2SnapshotLoadError::BalloonDestination(NativeV2BalloonDestinationLoadError::new(
                 expected_transport,
                 true,
             ))
@@ -19737,12 +20570,14 @@ where
             input,
             serial_config,
             entropy_config,
+            balloon_config,
             storage_configs,
             expected_transport,
             cancellation,
         } = request;
-        preflight_native_v2_entropy_capture(
+        preflight_native_v2_balloon_capture(
             &serial_config,
+            balloon_config,
             entropy_config,
             &storage_configs,
             expected_transport,
@@ -19802,8 +20637,9 @@ where
                     let state = capture_and_recover_native_v2_state(
                         session,
                         input,
-                        NativeV2SnapshotCaptureProfile::Entropy {
+                        NativeV2SnapshotCaptureProfile::Balloon {
                             serial,
+                            balloon_config,
                             entropy_config,
                             storage_configs,
                             expected_transport,
@@ -19812,9 +20648,9 @@ where
                         Box::new(writer),
                         &cancellation,
                         |encoded| {
-                            NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(encoded)
+                            NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(encoded)
                                 .map(
-                                    NativeV2EntropySnapshotCandidateState::into_current_artifact_state,
+                                    NativeV2BalloonSnapshotCandidateState::into_current_artifact_state,
                                 )
                                 .map_err(|source| {
                                     NativeV2SnapshotCaptureError::CandidateState { source }
@@ -21174,6 +22010,8 @@ mod tests {
         VmnetStatus, VmnetWritePacket,
     };
     #[cfg(target_os = "macos")]
+    use crate::periodic_metrics::PeriodicBalloonStatisticsScheduler;
+    #[cfg(target_os = "macos")]
     use crate::vhost_user_block::{VhostUserBlockBackend, VhostUserBlockBackendOptions};
 
     use super::{
@@ -21201,12 +22039,12 @@ mod tests {
         NativeV1SnapshotCaptureError, NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage,
         NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
         NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
-        NativeV2BalloonCandidateCaptureRequest, NativeV2EntropyCandidateCaptureRequest,
-        NativeV2EntropyCandidateProfileError, NativeV2MultiBlockCandidateProfileError,
-        NativeV2RootCandidateProcessError, NativeV2RootCandidateProfileError,
-        NativeV2SerialCandidateProfileError, NativeV2SnapshotBalloonCaptureError,
-        NativeV2SnapshotCaptureCancellation, NativeV2SnapshotCaptureError,
-        NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
+        NativeV2BalloonCandidateCaptureRequest, NativeV2BalloonCandidateProfileError,
+        NativeV2EntropyCandidateCaptureRequest, NativeV2EntropyCandidateProfileError,
+        NativeV2MultiBlockCandidateProfileError, NativeV2RootCandidateProcessError,
+        NativeV2RootCandidateProfileError, NativeV2SerialCandidateProfileError,
+        NativeV2SnapshotBalloonCaptureError, NativeV2SnapshotCaptureCancellation,
+        NativeV2SnapshotCaptureError, NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
         NativeV2SnapshotEntropyCaptureError, NativeV2SnapshotLoadError,
         NativeV2SnapshotMultiBlockCaptureError, NativeV2SnapshotPublicationDestination,
         NativeV2SnapshotPublicationError, NativeV2SnapshotPublicationProducerError,
@@ -21217,16 +22055,16 @@ mod tests {
         ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
         ProcessNetworkPacketIoRegistryError, ProcessNetworkPacketIoStopError,
         ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
-        ProcessSnapshotV2EntropyLoadRequest, ProcessSnapshotV2MultiBlockLoadRequest,
-        ProcessSnapshotV2MultiBlockLoadSuccess, ProcessSnapshotV2RootLoadCompletion,
-        ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess,
-        ProcessSnapshotV2SerialLoadRequest, ProcessSnapshotV2StorageLoadRequest,
-        ProcessSnapshotV2StorageLoadSuccess, ProcessVmm, ProcessVmnetAuthority,
-        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
-        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
-        require_native_v1_composite_record, snapshot_destination_machine_config,
-        vsock_capture_error_from_boot_run_loop_command,
+        ProcessSnapshotV2BalloonLoadRequest, ProcessSnapshotV2EntropyLoadRequest,
+        ProcessSnapshotV2MultiBlockLoadRequest, ProcessSnapshotV2MultiBlockLoadSuccess,
+        ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
+        ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2SerialLoadRequest,
+        ProcessSnapshotV2StorageLoadRequest, ProcessSnapshotV2StorageLoadSuccess, ProcessVmm,
+        ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
+        SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
+        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        native_v2_platform_capture_is_terminal, require_native_v1_composite_record,
+        snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -22348,13 +23186,20 @@ mod tests {
 
     fn publish_fake_native_v2_snapshot(
         session: &mut FakeSession,
-        serial_config: SerialConfig,
-        entropy_config: Option<EntropyConfig>,
-        transport: SnapshotV2DeviceTransportKind,
-        has_block: bool,
-        has_pmem: bool,
+        request: NativeV2SnapshotPublicationRequest,
         destination: NativeV2SnapshotPublicationDestination,
     ) -> Result<NativeSnapshotPublicationOutcome, NativeV2SnapshotPublicationError> {
+        let NativeV2SnapshotPublicationRequest {
+            input: _,
+            serial_config,
+            entropy_config,
+            balloon_config,
+            storage_configs,
+            expected_transport: transport,
+            cancellation: _,
+        } = request;
+        let has_block = !storage_configs.drives().is_empty();
+        let has_pmem = !storage_configs.pmem().is_empty();
         session.native_snapshot_publication_count += 1;
         let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
             .expect("fake v2 publication memory range should validate");
@@ -22428,8 +23273,20 @@ mod tests {
                         entropy,
                     ));
                 }
+                let balloon = balloon_config.map(|_| {
+                    fake_native_v2_balloon_state(transport)
+                        .encode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION)
+                        .expect("fake balloon state should encode")
+                });
+                if let Some(balloon) = &balloon {
+                    components.push(SnapshotV2Component::new(
+                        NATIVE_V2_BALLOON_COMPONENT_KEY,
+                        SnapshotV2ComponentDisposition::Semantic,
+                        balloon,
+                    ));
+                }
                 let encoded = encode_snapshot_v2_state_with_compatibility_version(
-                    NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
                     &[],
                     &components,
                 )
@@ -22440,8 +23297,8 @@ mod tests {
                         },
                     )
                 })?;
-                NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(encoded)
-                    .map(NativeV2EntropySnapshotCandidateState::into_current_artifact_state)
+                NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(encoded)
+                    .map(NativeV2BalloonSnapshotCandidateState::into_current_artifact_state)
                     .map_err(|source| {
                         NativeV2SnapshotPublicationProducerError::Capture(
                             NativeV2SnapshotCaptureError::CandidateState { source },
@@ -22924,21 +23781,9 @@ mod tests {
             if self.snapshot_publication_failure {
                 return Err(NativeV2SnapshotPublicationError::ConfigurationUnavailable);
             }
-            let NativeV2SnapshotPublicationRequest {
-                input: _,
-                serial_config,
-                entropy_config,
-                storage_configs,
-                expected_transport,
-                cancellation: _,
-            } = request;
             publish_fake_native_v2_snapshot(
                 session,
-                serial_config,
-                entropy_config,
-                expected_transport,
-                !storage_configs.drives().is_empty(),
-                !storage_configs.pmem().is_empty(),
+                request,
                 NativeV2SnapshotPublicationDestination::Paths(paths.clone()),
             )
         }
@@ -22952,21 +23797,9 @@ mod tests {
             if self.snapshot_publication_failure {
                 return Err(NativeV2SnapshotPublicationError::ConfigurationUnavailable);
             }
-            let NativeV2SnapshotPublicationRequest {
-                input: _,
-                serial_config,
-                entropy_config,
-                storage_configs,
-                expected_transport,
-                cancellation: _,
-            } = request;
             publish_fake_native_v2_snapshot(
                 session,
-                serial_config,
-                entropy_config,
-                expected_transport,
-                !storage_configs.drives().is_empty(),
-                !storage_configs.pmem().is_empty(),
+                request,
                 NativeV2SnapshotPublicationDestination::Outputs(outputs),
             )
         }
@@ -23553,6 +24386,133 @@ mod tests {
                 entropy_config,
                 input.resume_vm(),
             );
+            let session = match self.result {
+                FakeSnapshotLoadResult::ResumeFailure => FakeSession::with_resume_result(
+                    77,
+                    BackendError::Hypervisor("private-resume-sentinel".to_owned()),
+                ),
+                FakeSnapshotLoadResult::Success | FakeSnapshotLoadResult::Terminal => {
+                    FakeSession::new(77)
+                }
+            };
+            Ok(SnapshotV2LoadSuccess::new(session, commit))
+        }
+
+        fn load_prepared_snapshot_v2_balloon(
+            &mut self,
+            request: ProcessSnapshotV2BalloonLoadRequest<'_>,
+        ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+            let ProcessSnapshotV2BalloonLoadRequest {
+                controller,
+                vmnet_authority,
+                #[cfg(target_os = "macos")]
+                    contained_restore_authority: _,
+                pci_enabled,
+                input,
+                candidate,
+                memory: _,
+                cancellation,
+            } = request;
+            let expected_transport = if pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            };
+            if candidate
+                .device_graph()
+                .is_some_and(|graph| graph.transport_kind() != expected_transport)
+                || candidate
+                    .entropy()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+                || candidate
+                    .balloon()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+            {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
+            let drive_configs = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::block_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = DriveConfigInput::new(
+                        config.drive_id(),
+                        config.drive_id(),
+                        config.selector(),
+                        config.is_root(),
+                    )
+                    .with_is_read_only(config.is_read_only())
+                    .with_cache_type(config.cache_type())
+                    .with_io_engine(config.io_engine());
+                    if let Some(partuuid) = config.partuuid() {
+                        input = input.with_partuuid(partuuid);
+                    }
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    input.validate()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let pmem_configs = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::pmem_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = PmemConfigInput::new(config.pmem_id(), config.selector())
+                        .with_root_device(config.is_root())
+                        .with_read_only(config.is_read_only());
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    PmemConfig::try_from(input)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let storage_configs = candidate
+                .device_graph()
+                .map(|_| CaptureReadyStorageConfigs::new(drive_configs, pmem_configs));
+            let mut serial_input = SerialConfigInput::new();
+            if let Some(selector) = candidate.serial().endpoint_intent().configured_selector() {
+                serial_input = serial_input.with_serial_out_path(selector);
+            }
+            if let Some(rate_limiter) = candidate.serial().rate_limiter() {
+                serial_input = serial_input.with_rate_limiter(rate_limiter);
+            }
+            let serial_config = serial_input
+                .validate()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let entropy_config = candidate.entropy().map(SnapshotV2EntropyState::config);
+            let balloon_config = candidate.balloon().map(SnapshotV2BalloonState::config);
+            if !cancellation.try_seal_commit() {
+                return Err(NativeV2SnapshotLoadError::Cancelled);
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.last_vmnet_authority = Some(vmnet_authority);
+            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            if self.result == FakeSnapshotLoadResult::Terminal {
+                return Err(NativeV2SnapshotLoadError::ProcessTerminal);
+            }
+
+            let boot_source = BootSourceConfigInput::new("/private/restored-vmlinux")
+                .validate()
+                .expect("fake restored boot source should validate");
+            let machine =
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages());
+            let commit =
+                SnapshotV2ControllerCommit::with_serial_storage_entropy_and_balloon_configs(
+                    machine,
+                    boot_source,
+                    storage_configs,
+                    serial_config,
+                    entropy_config,
+                    balloon_config,
+                    input.resume_vm(),
+                );
             let session = match self.result {
                 FakeSnapshotLoadResult::ResumeFailure => FakeSession::with_resume_result(
                     77,
@@ -26810,6 +27770,24 @@ mod tests {
         assert!(!diagnostics.contains("entropy-candidate-vmlinux"));
     }
 
+    fn assert_native_v2_balloon_candidate_profile_rejected(
+        mutate: impl FnOnce(&mut ProcessVmm<HvfInstanceStartExecutor>),
+        expected: NativeV2BalloonCandidateProfileError,
+    ) {
+        let mut vmm = native_v2_entropy_candidate_profile_vmm(false);
+        mutate(&mut vmm);
+        let error = match vmm.native_v2_balloon_candidate_product_profile() {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported balloon candidate profile should fail closed"),
+        };
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected)
+        );
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains("entropy-candidate-vmlinux"));
+    }
+
     fn fake_native_v2_device_graph(
         transport: SnapshotV2DeviceTransportKind,
     ) -> SnapshotV2DeviceGraph {
@@ -26969,6 +27947,7 @@ mod tests {
             native_v2_test_capture_input(),
             SerialConfig::default(),
             entropy_config,
+            None,
             storage_configs,
             expected_transport,
             cancellation,
@@ -27122,14 +28101,53 @@ mod tests {
         let mut session = FakeSession::new(0);
         publish_fake_native_v2_snapshot(
             &mut session,
-            SerialConfig::default(),
-            None,
-            transport,
-            true,
-            false,
+            NativeV2SnapshotPublicationRequest::new(
+                native_v2_test_capture_input(),
+                SerialConfig::default(),
+                None,
+                None,
+                native_v2_root_storage_configs(),
+                transport,
+                NativeV2SnapshotCaptureCancellation::default(),
+            ),
             NativeV2SnapshotPublicationDestination::Paths(paths.clone()),
         )
         .expect("native-v2 load fixture should publish");
+        let input = SnapshotLoadInput::new(
+            paths.state().to_path_buf(),
+            SnapshotMemoryBackend::new(
+                paths.memory().to_path_buf(),
+                SnapshotMemoryBackendType::File,
+            ),
+        )
+        .with_resume_vm(resume_vm);
+        (directory, input)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_v2_balloon_snapshot_load_fixture(
+        name: &str,
+        resume_vm: bool,
+        transport: SnapshotV2DeviceTransportKind,
+    ) -> (TempSnapshotDirectory, SnapshotLoadInput) {
+        let directory = TempSnapshotDirectory::new(name);
+        let paths = directory.paths();
+        let mut session = FakeSession::new(0);
+        let balloon_config = fake_native_v2_balloon_state(transport).config();
+        publish_fake_native_v2_snapshot(
+            &mut session,
+            NativeV2SnapshotPublicationRequest::new(
+                native_v2_test_capture_input(),
+                SerialConfig::default(),
+                None,
+                Some(balloon_config),
+                native_v2_root_storage_configs(),
+                transport,
+                NativeV2SnapshotCaptureCancellation::default(),
+            ),
+            NativeV2SnapshotPublicationDestination::Paths(paths.clone()),
+        )
+        .expect("native-v2 balloon load fixture should publish");
         let input = SnapshotLoadInput::new(
             paths.state().to_path_buf(),
             SnapshotMemoryBackend::new(
@@ -27615,6 +28633,103 @@ mod tests {
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
             "{\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restored_balloon_statistics_scheduler_starts_only_after_each_running_epoch() {
+        let transport = SnapshotV2DeviceTransportKind::Pci;
+        let interval = Duration::from_secs(5);
+        let scheduler_epoch = Instant::now();
+        let mut scheduler = PeriodicBalloonStatisticsScheduler::new(scheduler_epoch, None);
+        let (paused_snapshot, paused_load) =
+            native_v2_balloon_snapshot_load_fixture("balloon-scheduler-paused", false, transport);
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let mut paused = ProcessVmm::with_starter("paused", "0.1.0", "bangbang", starter);
+        paused.pci_enabled = true;
+
+        paused
+            .handle_action(VmmAction::LoadSnapshot(paused_load))
+            .expect("paused balloon destination should commit");
+        assert_eq!(paused.instance_info().state, InstanceState::Paused);
+        assert_eq!(
+            paused
+                .controller
+                .balloon_config()
+                .expect("restored balloon configuration should publish")
+                .stats_polling_interval_s(),
+            5
+        );
+        assert_eq!(paused.balloon_statistics_update_interval(), None);
+        assert_eq!(scheduler.poll_timeout_ms(scheduler_epoch, None), None);
+
+        paused
+            .handle_action(VmmAction::Resume)
+            .expect("paused balloon destination should resume");
+        let first_running_epoch = scheduler_epoch
+            .checked_add(Duration::from_secs(1))
+            .expect("scheduler epoch should advance");
+        assert_eq!(
+            scheduler.poll_timeout_ms(
+                first_running_epoch,
+                paused.balloon_statistics_update_interval()
+            ),
+            Some(5_000)
+        );
+        assert!(!scheduler.is_due(
+            first_running_epoch,
+            paused.balloon_statistics_update_interval()
+        ));
+
+        paused
+            .handle_action(VmmAction::Pause)
+            .expect("restored balloon destination should pause");
+        let paused_epoch = first_running_epoch
+            .checked_add(Duration::from_secs(1))
+            .expect("paused epoch should advance");
+        assert_eq!(
+            scheduler.poll_timeout_ms(paused_epoch, paused.balloon_statistics_update_interval()),
+            None
+        );
+        paused
+            .handle_action(VmmAction::Resume)
+            .expect("restored balloon destination should resume again");
+        let second_running_epoch = paused_epoch
+            .checked_add(Duration::from_secs(1))
+            .expect("second running epoch should advance");
+        assert_eq!(
+            scheduler.poll_timeout_ms(
+                second_running_epoch,
+                paused.balloon_statistics_update_interval()
+            ),
+            Some(5_000)
+        );
+        paused_snapshot.assert_no_staging();
+
+        let (resumed_snapshot, resumed_load) = native_v2_balloon_snapshot_load_fixture(
+            "balloon-scheduler-auto-resume",
+            true,
+            transport,
+        );
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let mut resumed = ProcessVmm::with_starter("resumed", "0.1.0", "bangbang", starter);
+        resumed.pci_enabled = true;
+        let auto_epoch = second_running_epoch
+            .checked_add(interval)
+            .expect("automatic-resume epoch should advance");
+        let mut auto_scheduler = PeriodicBalloonStatisticsScheduler::new(auto_epoch, None);
+
+        resumed
+            .handle_action(VmmAction::LoadSnapshot(resumed_load))
+            .expect("automatic balloon resume should succeed");
+        assert_eq!(resumed.instance_info().state, InstanceState::Running);
+        assert_eq!(
+            auto_scheduler
+                .poll_timeout_ms(auto_epoch, resumed.balloon_statistics_update_interval()),
+            Some(5_000)
+        );
+        assert!(!auto_scheduler.is_due(auto_epoch, resumed.balloon_statistics_update_interval()));
+        resumed_snapshot.assert_no_staging();
     }
 
     #[cfg(target_os = "macos")]
@@ -28132,7 +29247,7 @@ mod tests {
         .expect("exact minor-eight state should encode internally");
         let state = NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(encoded)
             .expect("exact minor-eight candidate should validate")
-            .into_current_artifact_state();
+            .into_compatible_artifact_state();
         let prepared = PreparedNativeSnapshotState::from_state(state);
 
         assert!(matches!(
@@ -28145,7 +29260,7 @@ mod tests {
     }
 
     #[test]
-    fn native_v2_process_preflight_rejects_exact_minor_nine_profile_before_hvf_decode() {
+    fn native_v2_process_preflight_routes_exact_minor_nine_profile_to_hvf_decode() {
         let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
             .expect("exact minor-nine fixture range should validate");
         let layout = GuestMemoryLayout::new(vec![range])
@@ -28159,7 +29274,7 @@ mod tests {
             NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
             |_| false,
         )
-        .expect("exact minor-nine memory should encode internally");
+        .expect("exact minor-nine memory should encode");
         let binding = binding
             .encode()
             .expect("exact minor-nine binding should encode");
@@ -28190,10 +29305,10 @@ mod tests {
             &[],
             &components,
         )
-        .expect("exact minor-nine state should encode internally");
+        .expect("exact minor-nine state should encode");
         let state = NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(encoded)
             .expect("exact minor-nine candidate should validate")
-            .into_compatible_artifact_state();
+            .into_current_artifact_state();
         assert_eq!(
             state
                 .v2_profile()
@@ -28207,9 +29322,7 @@ mod tests {
                 &prepared,
                 NativeV2SnapshotArtifactProfile::BalloonStateV2_9,
             ),
-            Err(NativeV2SnapshotLoadError::Preflight(
-                VmmActionError::SnapshotUnsupported
-            ))
+            Err(NativeV2SnapshotLoadError::Decode(_))
         ));
     }
 
@@ -35265,130 +36378,153 @@ mod tests {
             ("mixed", true, true),
         ] {
             for has_entropy in [false, true] {
-                for (transport, pci_enabled) in [
-                    (SnapshotV2DeviceTransportKind::Mmio, false),
-                    (SnapshotV2DeviceTransportKind::Pci, true),
-                ] {
-                    let product = if has_entropy {
-                        format!("{case}-entropy")
-                    } else {
-                        case.to_owned()
-                    };
-                    let directory =
-                        TempSnapshotDirectory::new(&format!("native-v2-{product}-{transport:?}"));
-                    let paths = directory.paths();
-                    let mut source = configured_vmm(FakeStarter::success(190));
-                    source.pci_enabled = pci_enabled;
-                    let block_is_root = has_block && !pci_enabled;
-                    let pmem_is_root = has_pmem && (has_block || !pci_enabled) && !block_is_root;
-                    if has_block {
-                        source
-                            .handle_action(VmmAction::PutDrive(
-                                DriveConfigInput::new(
-                                    "rootfs",
-                                    "rootfs",
-                                    "/private/rootfs.ext4",
-                                    block_is_root,
-                                )
-                                .with_is_read_only(true)
-                                .with_io_engine(DriveIoEngine::Sync),
-                            ))
-                            .expect("public storage block should configure");
-                    }
-                    if has_pmem {
-                        source
-                            .handle_action(VmmAction::PutPmem(
-                                PmemConfigInput::new("pmem0", "/private/pmem0.img")
-                                    .with_root_device(pmem_is_root),
-                            ))
-                            .expect("public storage pmem should configure");
-                    }
-                    if has_entropy {
-                        source
-                            .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
-                            .expect("public entropy should configure");
-                    }
-                    source
-                        .handle_action(VmmAction::InstanceStart)
-                        .expect("public exact-2.8 source should start");
-                    source
-                        .handle_action(VmmAction::Pause)
-                        .expect("public exact-2.8 source should pause");
-                    source
-                        .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
-                            SnapshotType::Full,
-                            paths.state(),
-                            paths.memory(),
-                        )))
-                        .unwrap_or_else(|error| {
-                            panic!("{product} {transport:?} public create should succeed: {error}")
-                        });
-
-                    let loaded = load_native_snapshot_artifacts(&paths)
-                        .expect("public exact-2.8 entropy-profile pair should load");
-                    let (candidate, _) = loaded
-                        .into_current_v2_candidate()
-                        .expect("public pair should retain the exact current candidate");
-                    assert_eq!(
-                        candidate.version(),
-                        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
-                    );
-                    assert_eq!(candidate.entropy().is_some(), has_entropy);
-                    if let Some(entropy) = candidate.entropy() {
-                        assert_eq!(entropy.transport().kind(), transport);
-                    }
-                    match candidate.device_graph() {
-                        Some(graph) => {
-                            assert_eq!(graph.transport_kind(), transport);
-                            assert_eq!(graph.block_records().len(), usize::from(has_block));
-                            assert_eq!(graph.pmem_records().len(), usize::from(has_pmem));
+                for has_balloon in [false, true] {
+                    for (transport, pci_enabled) in [
+                        (SnapshotV2DeviceTransportKind::Mmio, false),
+                        (SnapshotV2DeviceTransportKind::Pci, true),
+                    ] {
+                        let product = match (has_entropy, has_balloon) {
+                            (false, false) => case.to_owned(),
+                            (true, false) => format!("{case}-entropy"),
+                            (false, true) => format!("{case}-balloon"),
+                            (true, true) => format!("{case}-entropy-balloon"),
+                        };
+                        let directory = TempSnapshotDirectory::new(&format!(
+                            "native-v2-{product}-{transport:?}"
+                        ));
+                        let paths = directory.paths();
+                        let mut source = configured_vmm(FakeStarter::success(190));
+                        source.pci_enabled = pci_enabled;
+                        let block_is_root = has_block && !pci_enabled;
+                        let pmem_is_root =
+                            has_pmem && (has_block || !pci_enabled) && !block_is_root;
+                        if has_block {
+                            source
+                                .handle_action(VmmAction::PutDrive(
+                                    DriveConfigInput::new(
+                                        "rootfs",
+                                        "rootfs",
+                                        "/private/rootfs.ext4",
+                                        block_is_root,
+                                    )
+                                    .with_is_read_only(true)
+                                    .with_io_engine(DriveIoEngine::Sync),
+                                ))
+                                .expect("public storage block should configure");
                         }
-                        None => assert!(!has_block && !has_pmem),
-                    }
-
-                    let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
-                    let calls = starter.calls();
-                    let mut destination = ProcessVmm::with_starter(
-                        format!("native-v2-{product}-{transport:?}-destination"),
-                        "0.1.0",
-                        "bangbang",
-                        starter,
-                    );
-                    destination.pci_enabled = pci_enabled;
-                    destination
-                        .handle_action(VmmAction::LoadSnapshot(SnapshotLoadInput::new(
-                            paths.state(),
-                            SnapshotMemoryBackend::new(
+                        if has_pmem {
+                            source
+                                .handle_action(VmmAction::PutPmem(
+                                    PmemConfigInput::new("pmem0", "/private/pmem0.img")
+                                        .with_root_device(pmem_is_root),
+                                ))
+                                .expect("public storage pmem should configure");
+                        }
+                        if has_entropy {
+                            source
+                                .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+                                .expect("public entropy should configure");
+                        }
+                        if has_balloon {
+                            source
+                                .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(
+                                    64, false,
+                                )))
+                                .expect("public balloon should configure");
+                        }
+                        source
+                            .handle_action(VmmAction::InstanceStart)
+                            .expect("public exact-2.9 source should start");
+                        source
+                            .handle_action(VmmAction::Pause)
+                            .expect("public exact-2.9 source should pause");
+                        source
+                            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                                SnapshotType::Full,
+                                paths.state(),
                                 paths.memory(),
-                                SnapshotMemoryBackendType::File,
-                            ),
-                        )))
-                        .unwrap_or_else(|error| {
-                            panic!("{product} {transport:?} public load should succeed: {error}")
-                        });
-                    assert_eq!(calls.load(Ordering::SeqCst), 1);
-                    assert_eq!(destination.instance_info().state, InstanceState::Paused);
-                    assert_eq!(destination.drive_configs().len(), usize::from(has_block));
-                    assert_eq!(
-                        destination.controller.pmem_configs().len(),
-                        usize::from(has_pmem)
-                    );
-                    assert_eq!(
-                        destination.controller.entropy_config().is_some(),
-                        has_entropy
-                    );
-                    if has_entropy {
-                        let peer_starter =
-                            FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
-                        let peer_calls = peer_starter.calls();
-                        let mut peer = ProcessVmm::with_starter(
-                            format!("native-v2-{product}-{transport:?}-same-process-peer"),
+                            )))
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "{product} {transport:?} public create should succeed: {error}"
+                                )
+                            });
+
+                        let loaded = load_native_snapshot_artifacts(&paths)
+                            .expect("public exact-2.9 balloon-profile pair should load");
+                        let (candidate, _) = loaded
+                            .into_current_v2_candidate()
+                            .expect("public pair should retain the exact current candidate");
+                        assert_eq!(
+                            candidate.version(),
+                            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
+                        );
+                        assert_eq!(candidate.entropy().is_some(), has_entropy);
+                        if let Some(entropy) = candidate.entropy() {
+                            assert_eq!(entropy.transport().kind(), transport);
+                        }
+                        assert_eq!(candidate.balloon().is_some(), has_balloon);
+                        if let Some(balloon) = candidate.balloon() {
+                            assert_eq!(balloon.transport().kind(), transport);
+                        }
+                        match candidate.device_graph() {
+                            Some(graph) => {
+                                assert_eq!(graph.transport_kind(), transport);
+                                assert_eq!(graph.block_records().len(), usize::from(has_block));
+                                assert_eq!(graph.pmem_records().len(), usize::from(has_pmem));
+                            }
+                            None => assert!(!has_block && !has_pmem),
+                        }
+
+                        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+                        let calls = starter.calls();
+                        let mut destination = ProcessVmm::with_starter(
+                            format!("native-v2-{product}-{transport:?}-destination"),
                             "0.1.0",
                             "bangbang",
-                            peer_starter,
+                            starter,
                         );
-                        peer.pci_enabled = pci_enabled;
-                        peer.handle_action(VmmAction::LoadSnapshot(
+                        destination.pci_enabled = pci_enabled;
+                        destination
+                            .handle_action(VmmAction::LoadSnapshot(SnapshotLoadInput::new(
+                                paths.state(),
+                                SnapshotMemoryBackend::new(
+                                    paths.memory(),
+                                    SnapshotMemoryBackendType::File,
+                                ),
+                            )))
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "{product} {transport:?} public load should succeed: {error}"
+                                )
+                            });
+                        assert_eq!(calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(destination.instance_info().state, InstanceState::Paused);
+                        assert_eq!(destination.drive_configs().len(), usize::from(has_block));
+                        assert_eq!(
+                            destination.controller.pmem_configs().len(),
+                            usize::from(has_pmem)
+                        );
+                        assert_eq!(
+                            destination.controller.entropy_config().is_some(),
+                            has_entropy
+                        );
+                        assert_eq!(
+                            destination.controller.balloon_config().is_some(),
+                            has_balloon
+                        );
+                        if has_entropy || has_balloon {
+                            let peer_starter =
+                                FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+                            let peer_calls = peer_starter.calls();
+                            let mut peer = ProcessVmm::with_starter(
+                                format!("native-v2-{product}-{transport:?}-same-process-peer"),
+                                "0.1.0",
+                                "bangbang",
+                                peer_starter,
+                            );
+                            peer.pci_enabled = pci_enabled;
+                            peer.handle_action(VmmAction::LoadSnapshot(
                             SnapshotLoadInput::new(
                                 paths.state(),
                                 SnapshotMemoryBackend::new(
@@ -35403,25 +36539,30 @@ mod tests {
                                 "{product} {transport:?} same-process peer load should succeed: {error}"
                             )
                         });
-                        assert_eq!(peer_calls.load(Ordering::SeqCst), 1);
-                        assert_eq!(calls.load(Ordering::SeqCst), 1);
-                        assert_eq!(peer.instance_info().state, InstanceState::Running);
-                        assert_eq!(
-                            destination.instance_info().state,
-                            InstanceState::Paused,
-                            "peer load must not change the first destination"
-                        );
-                        assert_eq!(peer.drive_configs(), destination.drive_configs());
-                        assert_eq!(
-                            peer.controller.pmem_configs(),
-                            destination.controller.pmem_configs()
-                        );
-                        assert_eq!(
-                            peer.controller.entropy_config(),
-                            destination.controller.entropy_config()
-                        );
+                            assert_eq!(peer_calls.load(Ordering::SeqCst), 1);
+                            assert_eq!(calls.load(Ordering::SeqCst), 1);
+                            assert_eq!(peer.instance_info().state, InstanceState::Running);
+                            assert_eq!(
+                                destination.instance_info().state,
+                                InstanceState::Paused,
+                                "peer load must not change the first destination"
+                            );
+                            assert_eq!(peer.drive_configs(), destination.drive_configs());
+                            assert_eq!(
+                                peer.controller.pmem_configs(),
+                                destination.controller.pmem_configs()
+                            );
+                            assert_eq!(
+                                peer.controller.entropy_config(),
+                                destination.controller.entropy_config()
+                            );
+                            assert_eq!(
+                                peer.controller.balloon_config(),
+                                destination.controller.balloon_config()
+                            );
+                        }
+                        directory.assert_no_staging();
                     }
-                    directory.assert_no_staging();
                 }
             }
         }
@@ -35659,7 +36800,7 @@ mod tests {
     #[test]
     #[ignore = "requires the signed native_v2_process integration group"]
     fn signed_native_v2_process_publishes_recaptures_and_resumes_private_pair() {
-        use bangbang_hvf::{HvfArm64StableVcpuDisposition, decode_hvf_snapshot_v2_entropy_state};
+        use bangbang_hvf::{HvfArm64StableVcpuDisposition, decode_hvf_snapshot_v2_balloon_state};
         use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
 
         const ARM64_IMAGE_HEADER_SIZE: usize = 64;
@@ -35699,6 +36840,10 @@ mod tests {
                 .with_io_engine(DriveIoEngine::Sync),
         ))
         .expect("native-v2 root should configure");
+        vmm.handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(4, true).with_stats_polling_interval_s(5),
+        ))
+        .expect("native-v2 balloon should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("real native-v2 process source should start");
         vmm.handle_action(VmmAction::Pause)
@@ -35725,7 +36870,7 @@ mod tests {
                 .expect("native-v2 load should retain structural bytes"),
         )
         .expect("real process native-v2 state should decode structurally");
-        let first_state = decode_hvf_snapshot_v2_entropy_state(&first_structural)
+        let first_state = decode_hvf_snapshot_v2_balloon_state(&first_structural)
             .expect("real process native-v2 serial state should cross-validate");
         let first_platform = first_state.platform();
         assert_eq!(first_platform.topology().members().len(), 2);
@@ -35757,6 +36902,14 @@ mod tests {
             first_state.entropy().is_none(),
             "disabled entropy must remain absent from the current profile"
         );
+        let first_balloon = first_state
+            .balloon()
+            .expect("configured balloon must remain present in the current profile");
+        assert_eq!(
+            first_balloon.transport().kind(),
+            SnapshotV2DeviceTransportKind::Mmio
+        );
+        assert_eq!(first_balloon.config().stats_polling_interval_s(), 5);
         drop(first_state);
         drop(first);
         first_directory.assert_no_staging();
@@ -35811,6 +36964,18 @@ mod tests {
         assert_eq!(paused_destination.drive_configs()[0].drive_id(), "root");
         assert_eq!(
             paused_destination
+                .controller
+                .balloon_config()
+                .expect("restored paused destination should publish balloon configuration")
+                .stats_polling_interval_s(),
+            5
+        );
+        assert_eq!(
+            paused_destination.balloon_statistics_update_interval(),
+            None
+        );
+        assert_eq!(
+            paused_destination
                 .starter
                 .active_serial_output
                 .as_ref()
@@ -35821,6 +36986,10 @@ mod tests {
         paused_destination
             .handle_action(VmmAction::Resume)
             .expect("restored paused destination should resume");
+        assert_eq!(
+            paused_destination.balloon_statistics_update_interval(),
+            Some(Duration::from_secs(5))
+        );
         paused_destination
             .handle_action(VmmAction::Pause)
             .expect("restored destination should pause again");
@@ -35837,13 +37006,13 @@ mod tests {
             Ok(VmmData::Empty)
         );
         let recaptured = load_native_snapshot_artifacts(&recaptured_paths)
-            .expect("restored exact-2.8 destination should publish again");
+            .expect("restored exact-2.9 destination should publish again");
         assert_eq!(
             recaptured
                 .state()
                 .v2_profile()
                 .expect("recaptured destination should retain a closed profile"),
-            NativeV2SnapshotArtifactProfile::EntropyStateV2_8
+            NativeV2SnapshotArtifactProfile::BalloonStateV2_9
         );
         recaptured_directory.assert_no_staging();
         drop(paused_destination);
@@ -35890,6 +37059,10 @@ mod tests {
         assert_eq!(
             resumed_destination.instance_info().state,
             InstanceState::Running
+        );
+        assert_eq!(
+            resumed_destination.balloon_statistics_update_interval(),
+            Some(Duration::from_secs(5))
         );
         resumed_destination
             .handle_action(VmmAction::Pause)
@@ -37272,20 +38445,22 @@ mod tests {
         optional
             .handle_action(VmmAction::Pause)
             .expect("optional-device source should pause");
-        assert!(matches!(
-            optional.publish_native_v2_snapshot(&SnapshotCreateInput::new(
+        optional
+            .publish_native_v2_snapshot(&SnapshotCreateInput::new(
                 SnapshotType::Full,
                 optional_paths.state(),
                 optional_paths.memory(),
-            )),
-            Err(NativeV2SnapshotPublicationError::Profile(
-                NativeV2EntropyCandidateProfileError::OptionalDevices
             ))
-        ));
+            .expect("balloon source should publish as exact 2.9");
         assert_eq!(
-            optional.starter.snapshot_storage_preflight_calls, 0,
-            "optional-device rejection must precede capture-owner preflight"
+            optional.starter.snapshot_storage_preflight_calls, 1,
+            "balloon publication should preflight the storage owner set"
         );
+        let (candidate, _) = load_native_snapshot_artifacts(&optional_paths)
+            .expect("balloon publication should load")
+            .into_current_v2_candidate()
+            .expect("balloon publication should close as exact 2.9");
+        assert!(candidate.balloon().is_some());
         optional_directory.assert_no_staging();
 
         let serial_directory = TempSnapshotDirectory::new("native-v2-process-serial");
@@ -41484,6 +42659,102 @@ mod tests {
     }
 
     #[test]
+    fn native_v2_balloon_candidate_profile_admits_all_products_and_both_transports() {
+        for pci_enabled in [false, true] {
+            for has_storage in [false, true] {
+                for has_entropy in [false, true] {
+                    for has_balloon in [false, true] {
+                        let mut vmm = native_v2_entropy_candidate_profile_vmm(pci_enabled);
+                        if has_storage {
+                            vmm.handle_action(VmmAction::PutDrive(
+                                DriveConfigInput::new(
+                                    "rootfs",
+                                    "rootfs",
+                                    "/private/balloon-candidate-rootfs.ext4",
+                                    true,
+                                )
+                                .with_is_read_only(true)
+                                .with_io_engine(DriveIoEngine::Sync),
+                            ))
+                            .expect("balloon candidate storage should configure");
+                        }
+                        if has_entropy {
+                            vmm.handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+                                .expect("balloon candidate entropy should configure");
+                        }
+                        if has_balloon {
+                            vmm.handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(
+                                64, false,
+                            )))
+                            .expect("balloon candidate device should configure");
+                        }
+
+                        let profile = vmm
+                            .native_v2_balloon_candidate_product_profile()
+                            .expect("supported balloon candidate profile should classify");
+                        assert_eq!(
+                            profile.expected_transport,
+                            if pci_enabled {
+                                SnapshotV2DeviceTransportKind::Pci
+                            } else {
+                                SnapshotV2DeviceTransportKind::Mmio
+                            }
+                        );
+                        assert_eq!(
+                            !profile.storage_configs.drives().is_empty()
+                                || !profile.storage_configs.pmem().is_empty(),
+                            has_storage
+                        );
+                        assert_eq!(profile.entropy_config.is_some(), has_entropy);
+                        assert_eq!(profile.balloon_config.is_some(), has_balloon);
+                        assert_eq!(profile.serial_config, SerialConfig::default());
+                        assert!(format!("{:?}", profile.input).contains("<redacted>"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_v2_balloon_candidate_profile_rejects_every_excluded_optional_family() {
+        assert_native_v2_balloon_candidate_profile_rejected(
+            |vmm| {
+                vmm.handle_action(VmmAction::PutNetworkInterface(
+                    NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
+                ))
+                .expect("network should configure");
+            },
+            NativeV2BalloonCandidateProfileError::OptionalDevices,
+        );
+        assert_native_v2_balloon_candidate_profile_rejected(
+            |vmm| {
+                vmm.handle_action(VmmAction::PutVsock(VsockConfigInput::new(
+                    42,
+                    "/private/balloon-candidate-vsock.sock",
+                )))
+                .expect("vsock should configure");
+            },
+            NativeV2BalloonCandidateProfileError::OptionalDevices,
+        );
+        assert_native_v2_balloon_candidate_profile_rejected(
+            |vmm| {
+                vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+                    .expect("memory hotplug should configure");
+            },
+            NativeV2BalloonCandidateProfileError::OptionalDevices,
+        );
+        assert_native_v2_balloon_candidate_profile_rejected(
+            |vmm| {
+                vmm.handle_action(VmmAction::PutMmds(MmdsContentInput::new(
+                    serde_json::json!({"private": "balloon-candidate-metadata"}),
+                )))
+                .expect("MMDS state should configure");
+            },
+            NativeV2BalloonCandidateProfileError::OptionalDevices,
+        );
+    }
+
+    #[test]
     fn public_exact_minor_seven_profile_still_rejects_configured_entropy() {
         let mut vmm = native_v2_entropy_candidate_profile_vmm(false);
         vmm.handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
@@ -43435,12 +44706,13 @@ mod tests {
                 "aux-acquire",
                 "v2-serial",
                 "v2-pause",
+                "v2-balloon",
                 "v2-storage-normalize",
                 "v2-storage-transport",
                 "v2-entropy",
-                "v2-entropy-platform",
-                "v2-entropy-compose",
-                "v2-entropy-encode",
+                "v2-balloon-platform",
+                "v2-balloon-compose",
+                "v2-balloon-encode",
                 "v2-recover",
                 "v2-published",
                 "aux-drop",
@@ -43514,12 +44786,12 @@ mod tests {
                 ),
                 &paths,
             )
-            .expect("mutated UART state should publish as complete exact-2.8 state");
+            .expect("mutated UART state should publish as complete exact-2.9 state");
         assert_eq!(outcome.family(), NativeSnapshotArtifactFamily::V2);
         let (candidate, _) = load_native_snapshot_artifacts(&paths)
             .expect("mutated UART pair should load")
             .into_current_v2_candidate()
-            .expect("mutated UART pair should close as exact 2.8");
+            .expect("mutated UART pair should close as exact 2.9");
         assert_eq!(candidate.serial().device().receive_bytes(), b"x");
         assert_eq!(
             events
@@ -43530,12 +44802,13 @@ mod tests {
                 "aux-acquire",
                 "v2-serial",
                 "v2-pause",
+                "v2-balloon",
                 "v2-storage-normalize",
                 "v2-storage-transport",
                 "v2-entropy",
-                "v2-entropy-platform",
-                "v2-entropy-compose",
-                "v2-entropy-encode",
+                "v2-balloon-platform",
+                "v2-balloon-compose",
+                "v2-balloon-encode",
                 "v2-recover",
                 "v2-published",
                 "aux-drop",

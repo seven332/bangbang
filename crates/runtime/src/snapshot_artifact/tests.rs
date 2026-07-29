@@ -134,8 +134,8 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
     assert_eq!(
         state
             .v2_profile()
-            .expect("current state should classify as exact entropy profile"),
-        NativeV2SnapshotArtifactProfile::EntropyStateV2_8
+            .expect("current state should classify as exact balloon profile"),
+        NativeV2SnapshotArtifactProfile::BalloonStateV2_9
     );
     assert!(state.v1_record().is_none());
     let debug = format!("{state:?}");
@@ -440,14 +440,10 @@ fn exact_minor_eight_candidate_classifies_all_optional_storage_entropy_combinati
             &entropy_components,
         )
         .expect("exact 2.8 fixture should encode");
-        let current = NativeSnapshotArtifactState::from_current_v2(bytes.clone())
-            .expect("exact 2.8 should have current publication authority");
-        assert_eq!(
-            current
-                .v2_profile()
-                .expect("current exact 2.8 state should classify"),
-            NativeV2SnapshotArtifactProfile::EntropyStateV2_8
-        );
+        assert!(matches!(
+            NativeSnapshotArtifactState::from_current_v2(bytes.clone()),
+            Err(NativeSnapshotArtifactStateError::CurrentV2Profile(_))
+        ));
         let compatible = NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone())
             .expect("public compatible file loading should admit exact 2.8");
         assert_eq!(
@@ -469,7 +465,7 @@ fn exact_minor_eight_candidate_classifies_all_optional_storage_entropy_combinati
         assert_eq!(candidate.entropy().is_some(), with_entropy);
         assert_eq!(candidate.bytes(), bytes);
 
-        let compatible = candidate.into_current_artifact_state();
+        let compatible = candidate.into_compatible_artifact_state();
         assert_eq!(
             compatible
                 .v2_profile()
@@ -617,14 +613,22 @@ fn exact_minor_nine_candidate_classifies_all_optional_component_combinations_and
                 )
                 .expect("exact 2.9 fixture should encode");
 
-                assert!(matches!(
-                    NativeSnapshotArtifactState::from_current_v2(bytes.clone()),
-                    Err(NativeSnapshotArtifactStateError::CurrentV2Profile(_))
-                ));
-                assert!(matches!(
-                    NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone()),
-                    Err(NativeSnapshotArtifactStateError::Format(_))
-                ));
+                let current = NativeSnapshotArtifactState::from_current_v2(bytes.clone())
+                    .expect("exact 2.9 should have current publication authority");
+                assert_eq!(
+                    current
+                        .v2_profile()
+                        .expect("current exact 2.9 state should classify"),
+                    NativeV2SnapshotArtifactProfile::BalloonStateV2_9
+                );
+                let compatible = NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone())
+                    .expect("public compatible file loading should admit exact 2.9");
+                assert_eq!(
+                    compatible
+                        .v2_profile()
+                        .expect("compatible exact 2.9 state should classify"),
+                    NativeV2SnapshotArtifactProfile::BalloonStateV2_9
+                );
 
                 let candidate =
                     NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(bytes.clone())
@@ -642,20 +646,16 @@ fn exact_minor_nine_candidate_classifies_all_optional_component_combinations_and
                 assert!(debug.contains(REDACTED));
                 assert!(!debug.contains("BANGBL2"));
 
-                let compatible = candidate.into_compatible_artifact_state();
+                let compatible = candidate.into_current_artifact_state();
                 assert_eq!(
                     compatible
                         .v2_profile()
-                        .expect("internal exact 2.9 state should classify"),
+                        .expect("current exact 2.9 state should classify"),
                     NativeV2SnapshotArtifactProfile::BalloonStateV2_9
                 );
-                assert!(matches!(
-                    compatible.validate_for_publication(),
-                    Err(NativeSnapshotArtifactStateError::NonCurrentV2Publication {
-                        state: NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
-                        memory: NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
-                    })
-                ));
+                compatible
+                    .validate_for_publication()
+                    .expect("exact 2.9 candidate should retain publication authority");
             }
         }
     }

@@ -149,7 +149,7 @@ fn canonical_binding_state_and_image_round_trip() {
 }
 
 #[test]
-fn explicit_minor_four_six_seven_eight_and_internal_nine_memory_images_round_trip() {
+fn explicit_minor_four_six_seven_eight_and_current_nine_memory_images_round_trip() {
     let memory = test_memory();
     let mut output = Cursor::new(Vec::new());
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
@@ -349,21 +349,19 @@ fn explicit_minor_four_six_seven_eight_and_internal_nine_memory_images_round_tri
             &[],
             &[component],
         )
-        .expect("minor-nine memory state should encode internally");
-    assert!(matches!(
-        decode_snapshot_v2_state(&state_bytes),
-        Err(
-            crate::snapshot_format_v2::SnapshotV2DecodeError::UnsupportedVersion {
-                found: NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
-                supported: NATIVE_V2_SNAPSHOT_VERSION,
-            }
-        )
-    ));
+        .expect("minor-nine memory state should encode");
+    assert_eq!(
+        decode_snapshot_v2_state(&state_bytes)
+            .expect("current minor-nine memory state should decode ordinarily")
+            .metadata()
+            .version(),
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
+    );
     let state = crate::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version(
         &state_bytes,
         NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
     )
-    .expect("minor-nine memory state should decode internally");
+    .expect("minor-nine memory state should decode compatibly");
     assert_eq!(
         decode_snapshot_v2_memory_binding(&state).expect("minor-nine memory binding should decode"),
         binding

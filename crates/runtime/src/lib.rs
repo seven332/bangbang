@@ -1544,6 +1544,7 @@ impl VmmController {
             pmem_configs,
             serial_config,
             entropy_config,
+            balloon_config,
             resume_requested,
         ) = commit.into_parts();
         self.machine_config = machine_config;
@@ -1553,6 +1554,7 @@ impl VmmController {
         self.pmem_configs = pmem_configs;
         self.serial_config = serial_config;
         self.entropy_config = entropy_config;
+        self.balloon_config = balloon_config;
         self.snapshot_load_history_fresh = false;
         self.instance_info.state = InstanceState::Paused;
         resume_requested
@@ -3633,6 +3635,9 @@ mod tests {
         controller
             .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
             .expect("stale entropy fixture should configure");
+        controller
+            .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(32, false)))
+            .expect("stale balloon fixture should configure");
 
         let machine = MachineConfigInput::new(2, 256)
             .validate()
@@ -3672,6 +3677,7 @@ mod tests {
         assert_eq!(controller.drive_configs(), &[drive]);
         assert_eq!(controller.serial_config(), &serial);
         assert_eq!(controller.entropy_config(), Some(entropy));
+        assert_eq!(controller.balloon_config(), None);
 
         let serial_only = SerialConfigInput::new()
             .with_rate_limiter(SerialRateLimiterConfig::new(32, None, 500))
@@ -3691,6 +3697,77 @@ mod tests {
         assert!(controller.pmem_configs().is_empty());
         assert_eq!(controller.serial_config(), &serial_only);
         assert_eq!(controller.entropy_config(), None);
+        assert_eq!(controller.balloon_config(), None);
+    }
+
+    #[test]
+    fn private_native_v2_balloon_commit_atomically_publishes_and_clears_all_configs() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let machine = MachineConfigInput::new(2, 256)
+            .validate()
+            .expect("restored machine fixture should validate");
+        let boot = BootSourceConfigInput::new("/inert/source/kernel")
+            .validate()
+            .expect("inert boot metadata should validate");
+        let drive = drive_input("restored", "/private/restored.img", true)
+            .validate()
+            .expect("restored drive fixture should validate");
+        let serial = SerialConfigInput::new()
+            .with_serial_out_path("serial-grant")
+            .validate()
+            .expect("restored serial fixture should validate");
+        let entropy = EntropyConfigInput::new()
+            .validate()
+            .expect("restored entropy fixture should validate");
+        let balloon: BalloonConfig = BalloonConfigInput::new(64, false)
+            .with_stats_polling_interval_s(30)
+            .with_free_page_hinting(true)
+            .into();
+        let commit = SnapshotV2ControllerCommit::with_serial_storage_entropy_and_balloon_configs(
+            machine,
+            boot.clone(),
+            Some(CaptureReadyStorageConfigs::new(
+                vec![drive.clone()],
+                Vec::new(),
+            )),
+            serial.clone(),
+            Some(entropy),
+            Some(balloon),
+            true,
+        );
+        let diagnostics = format!("{commit:?}");
+        assert!(diagnostics.contains("<redacted>"));
+        assert!(!diagnostics.contains("/inert/source/kernel"));
+        assert!(!diagnostics.contains("/private/restored.img"));
+        assert!(!diagnostics.contains("serial-grant"));
+
+        assert!(controller.commit_snapshot_v2_load(commit));
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
+        assert_eq!(controller.drive_configs(), &[drive]);
+        assert_eq!(controller.serial_config(), &serial);
+        assert_eq!(controller.entropy_config(), Some(entropy));
+        assert_eq!(controller.balloon_config(), Some(balloon));
+
+        let serial_only = SerialConfigInput::new()
+            .with_rate_limiter(SerialRateLimiterConfig::new(32, None, 500))
+            .validate()
+            .expect("serial-only fixture should validate");
+        let commit = SnapshotV2ControllerCommit::with_serial_storage_entropy_and_balloon_configs(
+            machine,
+            boot,
+            None,
+            serial_only.clone(),
+            None,
+            None,
+            false,
+        );
+
+        assert!(!controller.commit_snapshot_v2_load(commit));
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.pmem_configs().is_empty());
+        assert_eq!(controller.serial_config(), &serial_only);
+        assert_eq!(controller.entropy_config(), None);
+        assert_eq!(controller.balloon_config(), None);
     }
 
     #[test]
