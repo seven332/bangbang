@@ -14666,6 +14666,22 @@ impl HvfSnapshotV2StorageMmioPublicationInput {
     }
 }
 
+struct PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix {
+    owner: MmioRegistrationOwner,
+    leases: Vec<MmioRegistrationLease>,
+}
+
+impl PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix {
+    fn try_new() -> Result<Self, TryReserveError> {
+        let mut leases = Vec::new();
+        leases.try_reserve_exact(1)?;
+        Ok(Self {
+            owner: MmioRegistrationOwner::new(),
+            leases,
+        })
+    }
+}
+
 fn failed_snapshot_v2_storage_mmio_after_platform(
     mut platform: RestoredHvfSnapshotV2Platform,
     stage: HvfSnapshotV2StorageMmioRestoreStage,
@@ -15628,6 +15644,18 @@ impl OwnedHvfArm64BootSession {
                     HvfSnapshotV2BalloonMmioRestoreFailure::InterruptSetup(source),
                 )
             })?;
+        let standalone_registration = if storage_bundle.is_none() {
+            Some(
+                PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix::try_new().map_err(|_| {
+                    HvfSnapshotV2BalloonMmioRestoreError::preflight(
+                        HvfSnapshotV2BalloonMmioRestoreStage::Registration,
+                        HvfSnapshotV2BalloonMmioRestoreFailure::Allocation,
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
 
         let interrupts = HvfSnapshotV2BalloonMmioInterruptPlan {
             balloon: balloon_endpoint.interrupt_line(),
@@ -15648,9 +15676,20 @@ impl OwnedHvfArm64BootSession {
                     serial_input,
                 )
                 .map_err(HvfSnapshotV2BalloonMmioRestoreError::serial_platform)?;
+                let registration = match standalone_registration {
+                    Some(registration) => registration,
+                    None => {
+                        return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
+                            session,
+                            HvfSnapshotV2BalloonMmioRestoreStage::Product,
+                            HvfSnapshotV2BalloonMmioRestoreFailure::Product,
+                        ));
+                    }
+                };
                 let session = Self::attach_snapshot_v2_balloon_mmio(
                     session,
                     balloon,
+                    registration,
                     fault.filter(|fault| {
                         matches!(
                             fault,
@@ -15770,6 +15809,7 @@ impl OwnedHvfArm64BootSession {
     fn attach_snapshot_v2_balloon_mmio(
         mut session: OwnedHvfArm64BootSession,
         balloon: PreparedSnapshotV2BalloonMmioHandler,
+        registration: PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix,
         fault: Option<HvfSnapshotV2BalloonMmioRestoreFault>,
     ) -> Result<OwnedHvfArm64BootSession, HvfSnapshotV2BalloonMmioRestoreError> {
         let (_config, _queue_ranges, region, interrupt_line, handler) = balloon.into_parts();
@@ -15784,6 +15824,7 @@ impl OwnedHvfArm64BootSession {
                 HvfSnapshotV2BalloonMmioRestoreFailure::Product,
             ));
         }
+        let PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix { owner, leases } = registration;
         let signaler = match HvfGicSpiSignaler::from_metadata(&session.gic) {
             Ok(signaler) => signaler,
             Err(source) => {
@@ -15802,17 +15843,9 @@ impl OwnedHvfArm64BootSession {
             ));
         }
 
-        let mut leases = Vec::new();
-        if leases.try_reserve_exact(1).is_err() {
-            return Err(HvfSnapshotV2BalloonMmioRestoreError::after_session(
-                session,
-                HvfSnapshotV2BalloonMmioRestoreStage::Registration,
-                HvfSnapshotV2BalloonMmioRestoreFailure::Allocation,
-            ));
-        }
         session.restored_snapshot_v2_mmio_registrations =
             Some(HvfSnapshotV2MultiBlockMmioRegistrations {
-                owner: MmioRegistrationOwner::new(),
+                owner,
                 leases,
                 pmem_ranges: Vec::new(),
             });
