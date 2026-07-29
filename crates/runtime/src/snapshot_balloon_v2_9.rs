@@ -19,9 +19,9 @@ use crate::balloon::{
     VIRTIO_BALLOON_S_OOM_KILL, VIRTIO_BALLOON_S_SWAP_IN, VIRTIO_BALLOON_S_SWAP_OUT,
     VirtioBalloonActiveQueues, VirtioBalloonConfigSpace, VirtioBalloonDevice,
     VirtioBalloonDeviceCaptureState, VirtioBalloonMemoryAccounting, VirtioBalloonMmioCaptureState,
-    VirtioBalloonPciCaptureState, VirtioBalloonPfnRange, VirtioBalloonQueue,
-    VirtioBalloonQueueCaptureState, VirtioBalloonQueueConfig, VirtioBalloonQueueLayout,
-    VirtioBalloonStat, available_features, mib_to_4k_pages,
+    VirtioBalloonMmioHandler, VirtioBalloonPciCaptureState, VirtioBalloonPfnRange,
+    VirtioBalloonQueue, VirtioBalloonQueueCaptureState, VirtioBalloonQueueConfig,
+    VirtioBalloonQueueLayout, VirtioBalloonStat, available_features, mib_to_4k_pages,
 };
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
@@ -780,6 +780,51 @@ impl SnapshotV2BalloonRestorePlan {
             self.transport,
         )
     }
+
+    /// Consumes a checked MMIO plan into one complete inert register handler.
+    ///
+    /// The returned value still owns no dispatcher registration, interrupt
+    /// route, metrics, discard adviser, scheduler, notifier, or VM authority.
+    #[doc(hidden)]
+    pub fn into_mmio_handler(
+        self,
+    ) -> Result<PreparedSnapshotV2BalloonMmioHandler, SnapshotV2BalloonMmioHandlerError> {
+        let Self {
+            config,
+            config_space,
+            queue_ranges,
+            transport,
+        } = self;
+        let PreparedSnapshotV2BalloonTransport::Mmio(mmio) = transport else {
+            return Err(SnapshotV2BalloonMmioHandlerError::WrongTransport);
+        };
+        let (region, interrupt_line, device, retained) = mmio.into_parts();
+        let activation_is_active = device.is_activated();
+        let queue_sizes = device.queue_layout().queue_sizes();
+        let registers = *retained.device_registers();
+        let mut handler =
+            VirtioBalloonMmioHandler::with_vendor_id_and_config_generation_and_device_config_and_activation(
+                registers.device_id(),
+                registers.vendor_id(),
+                registers.device_features(),
+                registers.config_generation(),
+                queue_sizes.as_slice(),
+                config_space,
+                device,
+            )
+            .map_err(|_| SnapshotV2BalloonMmioHandlerError::Handler)?;
+        handler
+            .restore_transport_state(&retained, activation_is_active)
+            .map_err(|_| SnapshotV2BalloonMmioHandlerError::Transport)?;
+
+        Ok(PreparedSnapshotV2BalloonMmioHandler {
+            config,
+            queue_ranges,
+            region,
+            interrupt_line,
+            handler,
+        })
+    }
 }
 
 impl fmt::Debug for SnapshotV2BalloonRestorePlan {
@@ -870,6 +915,105 @@ impl fmt::Debug for PreparedSnapshotV2BalloonMmioTransport {
             .finish()
     }
 }
+
+/// One checked, complete, and still unpublished MMIO balloon handler.
+///
+/// Destination-local dispatcher, interrupt, metrics, discard, process
+/// scheduler, VM, and cleanup owners are intentionally absent.
+#[doc(hidden)]
+pub struct PreparedSnapshotV2BalloonMmioHandler {
+    config: BalloonConfig,
+    queue_ranges: Vec<[GuestMemoryRange; 3]>,
+    region: MmioRegion,
+    interrupt_line: GuestInterruptLine,
+    handler: VirtioBalloonMmioHandler,
+}
+
+impl PreparedSnapshotV2BalloonMmioHandler {
+    /// Returns the exact public balloon configuration.
+    pub const fn config(&self) -> BalloonConfig {
+        self.config
+    }
+
+    /// Returns every loaded-memory range occupied by an active queue.
+    pub fn queue_ranges(&self) -> &[[GuestMemoryRange; 3]] {
+        &self.queue_ranges
+    }
+
+    /// Returns the exact retained MMIO region.
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    /// Returns the exact retained guest interrupt line.
+    pub const fn interrupt_line(&self) -> GuestInterruptLine {
+        self.interrupt_line
+    }
+
+    /// Returns the fully restored, still-unpublished handler.
+    pub const fn handler(&self) -> &VirtioBalloonMmioHandler {
+        &self.handler
+    }
+
+    /// Consumes the value into configuration, queue ranges, placement, and
+    /// inert handler.
+    pub fn into_parts(
+        self,
+    ) -> (
+        BalloonConfig,
+        Vec<[GuestMemoryRange; 3]>,
+        MmioRegion,
+        GuestInterruptLine,
+        VirtioBalloonMmioHandler,
+    ) {
+        (
+            self.config,
+            self.queue_ranges,
+            self.region,
+            self.interrupt_line,
+            self.handler,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2BalloonMmioHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2BalloonMmioHandler")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Failure while materializing a checked balloon plan as an MMIO handler.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum SnapshotV2BalloonMmioHandlerError {
+    /// The checked plan selects PCI rather than MMIO.
+    WrongTransport,
+    /// The exact variable-queue handler could not be built.
+    Handler,
+    /// The retained common MMIO state could not be applied.
+    Transport,
+}
+
+impl fmt::Debug for SnapshotV2BalloonMmioHandlerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2BalloonMmioHandlerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::WrongTransport => "native-v2 balloon restore plan is not MMIO",
+            Self::Handler => "native-v2 balloon MMIO handler construction failed",
+            Self::Transport => "native-v2 balloon MMIO handler state is invalid",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2BalloonMmioHandlerError {}
 
 /// Checked value-only PCI balloon continuation.
 pub struct PreparedSnapshotV2BalloonPciTransport {

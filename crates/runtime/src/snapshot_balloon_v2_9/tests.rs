@@ -1375,6 +1375,84 @@ fn restore_plan_reconstructs_every_queue_layout_and_transport() {
 }
 
 #[test]
+fn mmio_handler_materialization_is_exact_for_every_queue_layout() {
+    for statistics_enabled in [false, true] {
+        for hinting_enabled in [false, true] {
+            for reporting_enabled in [false, true] {
+                let config = config(statistics_enabled, hinting_enabled, reporting_enabled);
+                for activated in [false, true] {
+                    let expected = state(config, activated, false, activated && statistics_enabled);
+                    let SnapshotV2DeviceTransport::Mmio(expected_mmio) = expected.transport()
+                    else {
+                        panic!("test state should select MMIO");
+                    };
+                    let expected_region = expected_mmio.region();
+                    let expected_interrupt_line = expected_mmio.interrupt_line();
+                    let mut memory = restore_memory(&expected);
+                    initialize_restore_queue_memory(&mut memory, &expected);
+                    let prepared = SnapshotV2BalloonRestorePlan::prepare(expected, &memory)
+                        .expect("MMIO balloon restore plan should prepare")
+                        .into_mmio_handler()
+                        .expect("MMIO balloon handler should materialize");
+
+                    assert_eq!(prepared.config(), config);
+                    assert_eq!(
+                        prepared.queue_ranges().len(),
+                        if activated {
+                            VirtioBalloonQueueLayout::from_config(config).queue_count()
+                        } else {
+                            0
+                        }
+                    );
+                    assert_eq!(prepared.region(), expected_region);
+                    assert_eq!(prepared.interrupt_line(), expected_interrupt_line);
+
+                    let first_capture = prepared
+                        .handler()
+                        .capture_balloon_state(config, &memory)
+                        .expect("materialized handler should recapture");
+                    let normalized = SnapshotV2BalloonState::try_from_mmio_capture(
+                        config,
+                        prepared.region(),
+                        prepared.interrupt_line(),
+                        &first_capture,
+                    )
+                    .expect("materialized handler capture should convert");
+                    let second = SnapshotV2BalloonRestorePlan::prepare(normalized, &memory)
+                        .expect("recaptured MMIO balloon should prepare")
+                        .into_mmio_handler()
+                        .expect("recaptured MMIO handler should materialize");
+                    assert_eq!(
+                        second
+                            .handler()
+                            .capture_balloon_state(config, &memory)
+                            .expect("second materialized handler should recapture"),
+                        first_capture
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mmio_handler_materialization_rejects_pci_and_redacts_diagnostics() {
+    let config = config(true, true, true);
+    let expected = state(config, true, true, true);
+    let mut memory = restore_memory(&expected);
+    initialize_restore_queue_memory(&mut memory, &expected);
+    let error = SnapshotV2BalloonRestorePlan::prepare(expected, &memory)
+        .expect("PCI balloon restore plan should prepare")
+        .into_mmio_handler()
+        .expect_err("PCI balloon plan must not materialize an MMIO handler");
+
+    assert_eq!(error, SnapshotV2BalloonMmioHandlerError::WrongTransport);
+    let diagnostics = format!("{error:?} {error}");
+    assert!(!diagnostics.contains("2147483648"));
+    assert!(!diagnostics.contains("4276092928"));
+}
+
+#[test]
 fn restore_plan_normalizes_enabled_hinting_after_retaining_checked_history() {
     let config = config(false, true, false);
     let mut expected = state(config, true, false, false);

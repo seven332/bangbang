@@ -10536,6 +10536,217 @@ fn capture_ready_balloon_traverses_signed_mmio_and_pci_owners() {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const BALLOON_CAPTURE_QUEUE_RINGS: [(
+    bangbang_runtime::memory::GuestAddress,
+    bangbang_runtime::memory::GuestAddress,
+    bangbang_runtime::memory::GuestAddress,
+); 5] = [
+    (
+        bangbang_runtime::memory::GuestAddress::new(0x8100_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8101_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8102_0000),
+    ),
+    (
+        bangbang_runtime::memory::GuestAddress::new(0x8103_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8104_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8105_0000),
+    ),
+    (
+        bangbang_runtime::memory::GuestAddress::new(0x8106_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8107_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8108_0000),
+    ),
+    (
+        bangbang_runtime::memory::GuestAddress::new(0x8109_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x810a_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x810b_0000),
+    ),
+    (
+        bangbang_runtime::memory::GuestAddress::new(0x810c_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x810d_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x810e_0000),
+    ),
+];
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn activate_balloon_capture_queues_with_pending_inflate(
+    session: &mut bangbang_hvf::OwnedHvfArm64BootSession,
+    transport_base: bangbang_runtime::memory::GuestAddress,
+    config: bangbang_runtime::balloon::BalloonConfig,
+) {
+    use bangbang_runtime::balloon::{
+        VIRTIO_BALLOON_QUEUE_SIZE, VirtioBalloonQueueLayout, available_features,
+    };
+    use bangbang_runtime::virtio_mmio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioRegister,
+    };
+
+    let queue_count = VirtioBalloonQueueLayout::from_config(config).queue_count();
+    let dispatcher = session.mmio_dispatcher();
+    let memory = session
+        .guest_memory_mut()
+        .expect("signed balloon guest memory should remain mapped");
+    for (descriptor, available, used) in BALLOON_CAPTURE_QUEUE_RINGS.iter().take(queue_count) {
+        memory
+            .write_slice(&[0; 16], *descriptor)
+            .expect("balloon descriptor should reset");
+        memory
+            .write_slice(&[0; 4], *available)
+            .expect("balloon available ring should reset");
+        memory
+            .write_slice(&[0; 4], *used)
+            .expect("balloon used ring should reset");
+    }
+    let pfn_payload = bangbang_runtime::memory::GuestAddress::new(0x8110_0000);
+    memory
+        .write_slice(
+            &pfn_payload.raw_value().to_le_bytes(),
+            BALLOON_CAPTURE_QUEUE_RINGS[0].0,
+        )
+        .expect("inflate descriptor address should write");
+    memory
+        .write_slice(
+            &4_u32.to_le_bytes(),
+            BALLOON_CAPTURE_QUEUE_RINGS[0]
+                .0
+                .checked_add(8)
+                .expect("inflate descriptor length address should fit"),
+        )
+        .expect("inflate descriptor length should write");
+    memory
+        .write_slice(&0x82000_u32.to_le_bytes(), pfn_payload)
+        .expect("inflate PFN should write");
+    memory
+        .write_slice(
+            &1_u16.to_le_bytes(),
+            BALLOON_CAPTURE_QUEUE_RINGS[0]
+                .1
+                .checked_add(2)
+                .expect("inflate available index address should fit"),
+        )
+        .expect("inflate available index should write");
+    let mut dispatcher = dispatcher
+        .lock()
+        .expect("signed balloon MMIO dispatcher should not be poisoned");
+    let write = |dispatcher: &mut bangbang_runtime::mmio::MmioDispatcher,
+                 register: VirtioMmioRegister,
+                 value: u32| {
+        write_entropy_capture_mmio(
+            dispatcher,
+            transport_base
+                .checked_add(register.offset())
+                .expect("balloon transport address should not overflow"),
+            &value.to_le_bytes(),
+        );
+    };
+    for status in [
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+    ] {
+        write(&mut dispatcher, VirtioMmioRegister::Status, status);
+    }
+    let features = available_features(config);
+    for selector in [0_u32, 1] {
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::DriverFeaturesSel,
+            selector,
+        );
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::DriverFeatures,
+            u32::try_from((features >> (selector * 32)) & u64::from(u32::MAX))
+                .expect("one feature word should fit"),
+        );
+    }
+    let features_ok = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    write(&mut dispatcher, VirtioMmioRegister::Status, features_ok);
+    for (index, (descriptor, available, used)) in BALLOON_CAPTURE_QUEUE_RINGS
+        .iter()
+        .take(queue_count)
+        .enumerate()
+    {
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::QueueSel,
+            u32::try_from(index).expect("balloon queue index should fit"),
+        );
+        for (register, value) in [
+            (
+                VirtioMmioRegister::QueueNum,
+                u32::from(VIRTIO_BALLOON_QUEUE_SIZE),
+            ),
+            (
+                VirtioMmioRegister::QueueDescLow,
+                u32::try_from(descriptor.raw_value())
+                    .expect("balloon descriptor address should fit"),
+            ),
+            (
+                VirtioMmioRegister::QueueDriverLow,
+                u32::try_from(available.raw_value()).expect("balloon available address should fit"),
+            ),
+            (
+                VirtioMmioRegister::QueueDeviceLow,
+                u32::try_from(used.raw_value()).expect("balloon used address should fit"),
+            ),
+            (VirtioMmioRegister::QueueReady, 1),
+        ] {
+            write(&mut dispatcher, register, value);
+        }
+    }
+    write(
+        &mut dispatcher,
+        VirtioMmioRegister::Status,
+        features_ok | VIRTIO_DEVICE_STATUS_DRIVER_OK,
+    );
+    write(&mut dispatcher, VirtioMmioRegister::QueueNotify, 0);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn copy_signed_session_guest_memory(
+    session: &bangbang_hvf::OwnedHvfArm64BootSession,
+) -> bangbang_runtime::memory::GuestMemory {
+    use bangbang_runtime::memory::{GuestMemory, GuestMemoryLayout};
+
+    let layout = GuestMemoryLayout::new(session.runtime_resources().layout.ranges().to_vec())
+        .expect("destination guest-memory layout should validate");
+    let mut destination =
+        GuestMemory::allocate(&layout).expect("destination guest memory should allocate");
+    let source = session
+        .guest_memory()
+        .expect("source guest memory should remain mapped");
+    let mut buffer = vec![0_u8; 64 * 1024];
+    for range in layout.ranges() {
+        let mut copied = 0_u64;
+        while copied < range.size() {
+            let count = usize::try_from(
+                (range.size() - copied)
+                    .min(u64::try_from(buffer.len()).expect("copy buffer length should fit")),
+            )
+            .expect("guest-memory copy count should fit");
+            let address = range
+                .start()
+                .checked_add(copied)
+                .expect("guest-memory copy address should fit");
+            let chunk = buffer
+                .get_mut(..count)
+                .expect("copy count should stay within the fixed buffer");
+            source
+                .read_slice(&mut *chunk, address)
+                .expect("source guest-memory bytes should read");
+            destination
+                .write_slice(chunk, address)
+                .expect("destination guest-memory bytes should write");
+            copied += u64::try_from(count).expect("copy count should fit");
+        }
+    }
+    destination
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ENTROPY_CAPTURE_QUEUE_SIZE: u16 = 8;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ENTROPY_CAPTURE_DESCRIPTOR_TABLE: bangbang_runtime::memory::GuestAddress =
@@ -12552,6 +12763,716 @@ fn restores_signed_storage_serial_entropy_mmio_owner_graph() {
     restored
         .shutdown()
         .expect("restored storage entropy destination should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn restores_signed_balloon_first_mmio_owner_graph_and_rolls_back_faults() {
+    use std::io::Cursor;
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig,
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BalloonMmioProcessConfig,
+        HvfSnapshotV2BalloonMmioRestoreFault, HvfSnapshotV2BalloonPreparedProduct,
+        HvfSnapshotV2BalloonState, HvfSnapshotV2BootState, HvfSnapshotV2NativePath,
+        HvfSnapshotV2RestoredSerialShell, HvfSnapshotV2StorageMmioProcessConfig,
+        OwnedHvfArm64BootSession, prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::balloon::{
+        BalloonConfigInput, BalloonMmioLayout, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE,
+    };
+    use bangbang_runtime::block::{
+        BlockFileBacking, BlockMmioLayout, DriveConfigInput, DriveIoEngine,
+    };
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::entropy::{EntropyConfigInput, EntropyMmioLayout};
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot_balloon_v2_9::{
+        SnapshotV2BalloonRestorePlan, SnapshotV2BalloonState,
+    };
+    use bangbang_runtime::snapshot_device_v2::{
+        SnapshotV2DeviceTransport, SnapshotV2MmioDeviceState,
+    };
+    use bangbang_runtime::snapshot_device_v2_6::{
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
+        SnapshotV2StorageRestorePlan,
+    };
+    use bangbang_runtime::snapshot_entropy_v2_8::SnapshotV2EntropyRestorePlan;
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("restore-balloon-mmio-kernel", &image)
+        .expect("balloon restore kernel should create");
+    let root = TempFile::new_len("restore-balloon-mmio-root", 4096)
+        .expect("balloon restore root should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("balloon restore boot source should configure");
+    controller
+        .handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", root.path(), true)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("balloon restore root should configure");
+    controller
+        .handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(8, true)
+                .with_stats_polling_interval_s(1)
+                .with_free_page_hinting(true)
+                .with_free_page_reporting(true),
+        ))
+        .expect("five-queue balloon should configure");
+    controller
+        .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+        .expect("following entropy should configure");
+    let balloon_config = controller
+        .balloon_config()
+        .expect("balloon configuration should exist");
+    let entropy_config = controller
+        .entropy_config()
+        .expect("entropy configuration should exist");
+    let block_layout = BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
+    let pmem_layout = PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500));
+    let balloon_layout =
+        BalloonMmioLayout::new(GuestAddress::new(0x4000_8000), MmioRegionId::new(4000));
+    let entropy_layout =
+        EntropyMmioLayout::new(GuestAddress::new(0x4000_7000), MmioRegionId::new(3001));
+    let session_config = HvfArm64BootSessionConfig::new(
+        block_layout,
+        pmem_layout,
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
+    )
+    .with_balloon_device(HvfArm64BootBalloonDeviceConfig::new(balloon_layout))
+    .with_entropy_device(HvfArm64BootEntropyDeviceConfig::new(entropy_layout))
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+    ));
+    let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+        .expect("signed balloon source should prepare");
+    activate_balloon_capture_queues_with_pending_inflate(
+        &mut source,
+        balloon_layout.address(),
+        balloon_config,
+    );
+
+    let source_configs =
+        CaptureReadyStorageConfigs::new(controller.drive_configs().to_vec(), Vec::new());
+    let guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("balloon source publishers should quiesce");
+    let capture_now = Instant::now();
+    let source_graph = source
+        .capture_snapshot_v2_storage_device_graph_at(&source_configs, &guard, capture_now)
+        .expect("balloon storage graph should capture");
+    let source_balloon = source
+        .capture_ready_balloon_state(Some(balloon_config), &guard)
+        .expect("active balloon owner should capture")
+        .expect("configured balloon should exist")
+        .try_to_snapshot_v2()
+        .expect("active balloon capture should convert");
+    let entropy = source
+        .capture_ready_entropy_state_at(Some(entropy_config), &guard, capture_now)
+        .expect("following entropy should capture")
+        .expect("configured entropy should exist")
+        .try_to_snapshot_v2()
+        .expect("following entropy capture should convert");
+    let serial = SnapshotV2SerialState::try_from_capture_ready(
+        source
+            .capture_ready_serial_state(controller.serial_config().clone(), &guard)
+            .expect("balloon product serial should capture"),
+    )
+    .expect("balloon product serial capture should convert");
+    drop(guard);
+    assert!(source_balloon.virtio().is_activated());
+    assert_eq!(source_balloon.virtio().queues().len(), 5);
+    assert!(source_balloon.virtio().pending_notifications().contains(&0));
+    let SnapshotV2DeviceTransport::Mmio(source_balloon_mmio) = source_balloon.transport() else {
+        panic!("balloon restore source should use MMIO");
+    };
+    let SnapshotV2DeviceTransport::Mmio(source_storage_mmio) =
+        source_graph.block_records()[0].transport()
+    else {
+        panic!("balloon storage source should use MMIO");
+    };
+    assert_eq!(source_storage_mmio.interrupt_line().raw_value(), 32);
+    assert_eq!(source_balloon_mmio.interrupt_line().raw_value(), 33);
+
+    // Current public construction still allocates storage before balloon.
+    // Exact-2.9 restoration deliberately consumes the Firecracker-shaped
+    // balloon-first artifact order, so the signed fixture re-encodes only
+    // these two retained SPIs before constructing the closed artifact.
+    let balloon = SnapshotV2BalloonState::try_new(
+        source_balloon.config(),
+        source_balloon.config_space(),
+        *source_balloon.continuation(),
+        source_balloon.accounting().clone(),
+        source_balloon.virtio().clone(),
+        SnapshotV2DeviceTransport::Mmio(SnapshotV2MmioDeviceState::from_parts(
+            source_balloon_mmio.device_feature_select(),
+            source_balloon_mmio.driver_feature_select(),
+            source_balloon_mmio.queue_select(),
+            source_balloon_mmio.region(),
+            source_storage_mmio.interrupt_line(),
+        )),
+    )
+    .expect("balloon-first retained balloon state should validate");
+    let mut graph_bytes = source_graph
+        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+        .expect("storage graph should encode for checked fixture relocation");
+    let directory = usize::try_from(u64::from_le_bytes(
+        graph_bytes[48..56]
+            .try_into()
+            .expect("storage directory offset should exist"),
+    ))
+    .expect("storage directory offset should fit");
+    let transport_entry = directory
+        .checked_add(3 * 32)
+        .expect("storage transport entry should fit");
+    let transport_offset = usize::try_from(u64::from_le_bytes(
+        graph_bytes[transport_entry + 16..transport_entry + 24]
+            .try_into()
+            .expect("storage transport payload offset should exist"),
+    ))
+    .expect("storage transport payload offset should fit");
+    graph_bytes[transport_offset + 12..transport_offset + 16].copy_from_slice(
+        &source_balloon_mmio
+            .interrupt_line()
+            .raw_value()
+            .to_le_bytes(),
+    );
+    let graph = SnapshotV2StorageDeviceGraph::decode(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &graph_bytes,
+    )
+    .expect("balloon-prefixed storage graph should decode");
+
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("balloon source should pause");
+    let boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+            .expect("balloon kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("balloon boot metadata should validate");
+    let mut memory_writer = Cursor::new(Vec::new());
+    let platform = source
+        .capture_snapshot_v2_balloon_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            &mut memory_writer,
+            |_| false,
+        )
+        .expect("exact-2.9 balloon platform should capture");
+    HvfSnapshotV2BalloonState::try_new(
+        platform.clone(),
+        Some(graph.clone()),
+        serial.clone(),
+        Some(entropy.clone()),
+        Some(balloon.clone()),
+    )
+    .expect("all-optional exact-2.9 product should compose");
+
+    let mut destination_memories = Vec::new();
+    destination_memories
+        .try_reserve_exact(7)
+        .expect("balloon destination inventory should reserve");
+    for _ in 0..7 {
+        destination_memories.push(copy_signed_session_guest_memory(&source));
+    }
+    source
+        .shutdown()
+        .expect("signed balloon source should shut down");
+
+    let process = HvfSnapshotV2BalloonMmioProcessConfig::new(
+        balloon_layout,
+        HvfSnapshotV2StorageMmioProcessConfig::new(block_layout, pmem_layout),
+        entropy_layout,
+    );
+    let prepare_plan = |memory: &GuestMemory| {
+        let now = Instant::now();
+        let balloon_plan = SnapshotV2BalloonRestorePlan::prepare(balloon.clone(), memory)
+            .expect("active balloon restore plan should prepare");
+        let entropy_plan = SnapshotV2EntropyRestorePlan::prepare(entropy.clone(), memory, now)
+            .expect("following entropy restore plan should prepare");
+        let backing = BlockFileBacking::open_snapshot(
+            std::path::Path::new(graph.block_records()[0].config().selector()),
+            graph.block_records()[0].config().is_read_only(),
+        )
+        .expect("balloon storage backing should reopen")
+        .0;
+        let bundle = SnapshotV2StorageRestorePlan::prepare(graph.clone(), memory, now)
+            .expect("balloon storage restore plan should prepare")
+            .prepare_backings(vec![backing], Vec::new(), || false)
+            .expect("balloon storage backing bundle should prepare");
+        prepare_hvf_snapshot_v2_balloon_mmio_platform_plan(
+            &platform,
+            HvfSnapshotV2BalloonPreparedProduct::serial_balloon_storage_entropy(
+                balloon_plan,
+                bundle,
+                entropy_plan,
+            ),
+            process,
+        )
+        .unwrap_or_else(|error| {
+            let source = std::error::Error::source(&error);
+            panic!(
+                "all-optional balloon platform plan should prepare: {error:?}, source={source:?}"
+            )
+        })
+    };
+    let restored_shell = || {
+        HvfSnapshotV2RestoredSerialShell::new(
+            SerialMmioDevice::from_capture_state_with_shared_output(
+                SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                serial.device().clone(),
+            ),
+        )
+    };
+
+    for fault in [
+        HvfSnapshotV2BalloonMmioRestoreFault::InterruptSetup,
+        HvfSnapshotV2BalloonMmioRestoreFault::Registration,
+        HvfSnapshotV2BalloonMmioRestoreFault::BalloonInsertion,
+        HvfSnapshotV2BalloonMmioRestoreFault::StoragePublication,
+        HvfSnapshotV2BalloonMmioRestoreFault::EntropyPublication,
+        HvfSnapshotV2BalloonMmioRestoreFault::SessionAssembly,
+    ] {
+        let destination = destination_memories.remove(0);
+        let plan = prepare_plan(&destination);
+        let error = OwnedHvfArm64BootSession::restore_snapshot_v2_serial_balloon_mmio_with_fault(
+            platform.clone(),
+            destination,
+            restored_shell(),
+            None,
+            plan,
+            fault,
+        )
+        .expect_err("injected balloon owner fault should reject");
+        assert!(
+            !error.has_incomplete_cleanup(),
+            "{fault:?} should roll back cleanly: {error:?}"
+        );
+        let diagnostics = format!("{error:?} {error}");
+        assert!(diagnostics.contains("<redacted>"));
+        assert!(!diagnostics.contains("1073774592"));
+    }
+
+    let destination = destination_memories.remove(0);
+    let plan = prepare_plan(&destination);
+    let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_serial_balloon_mmio(
+        platform,
+        destination,
+        restored_shell(),
+        None,
+        plan,
+    )
+    .unwrap_or_else(|error| panic!("balloon-first owners should restore: {error:?}"));
+    assert_eq!(owners.balloon_config(), balloon_config);
+    assert_eq!(owners.entropy_config(), Some(entropy_config));
+    assert_eq!(
+        owners
+            .storage_configs()
+            .expect("restored storage configs should exist"),
+        &source_configs
+    );
+    assert!(
+        owners
+            .session()
+            .shared_balloon_device_metrics()
+            .snapshot()
+            .is_empty()
+    );
+    let (mut restored, returned_balloon, storage_configs, returned_entropy) = owners.into_parts();
+    let storage_configs = storage_configs.expect("restored storage configs should be retained");
+    assert_eq!(returned_balloon, balloon_config);
+    assert_eq!(returned_entropy, Some(entropy_config));
+    assert_eq!(restored.runtime_resources().block_devices.len(), 1);
+    assert!(restored.runtime_resources().balloon_device.is_some());
+    assert!(restored.runtime_resources().entropy_device.is_some());
+
+    let guard = restored
+        .quiesce_limiter_retry_wakeups()
+        .expect("restored balloon publishers should quiesce");
+    let recaptured_balloon = restored
+        .capture_ready_balloon_state(Some(returned_balloon), &guard)
+        .expect("restored balloon should capture")
+        .expect("restored balloon should exist")
+        .try_to_snapshot_v2()
+        .expect("restored balloon recapture should convert");
+    assert_eq!(recaptured_balloon.config(), balloon.config());
+    assert_eq!(
+        recaptured_balloon.config_space().num_pages(),
+        balloon.config_space().num_pages()
+    );
+    assert_eq!(
+        recaptured_balloon.config_space().actual_pages(),
+        balloon.config_space().actual_pages()
+    );
+    assert_eq!(
+        recaptured_balloon.config_space().free_page_hint_cmd_id(),
+        VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+    );
+    assert_eq!(recaptured_balloon.accounting(), balloon.accounting());
+    assert_eq!(recaptured_balloon.virtio(), balloon.virtio());
+    assert_eq!(recaptured_balloon.transport(), balloon.transport());
+    assert_eq!(
+        recaptured_balloon.continuation().active_queues(),
+        balloon.continuation().active_queues()
+    );
+    assert_eq!(
+        recaptured_balloon.continuation().stats_polling_interval_s(),
+        balloon.continuation().stats_polling_interval_s()
+    );
+    assert_eq!(
+        recaptured_balloon.continuation().statistics(),
+        balloon.continuation().statistics()
+    );
+    assert_eq!(
+        recaptured_balloon
+            .continuation()
+            .statistics_pending_descriptor_head(),
+        balloon.continuation().statistics_pending_descriptor_head()
+    );
+    let restored_hint = recaptured_balloon.continuation().hinting();
+    let source_hint = balloon.continuation().hinting();
+    assert_eq!(restored_hint.host_cmd(), VIRTIO_BALLOON_FREE_PAGE_HINT_DONE);
+    assert_eq!(restored_hint.guest_cmd(), source_hint.guest_cmd());
+    assert_eq!(restored_hint.last_cmd(), source_hint.last_cmd());
+    assert_eq!(
+        restored_hint.acknowledge_on_stop(),
+        source_hint.acknowledge_on_stop()
+    );
+    let recaptured_graph = restored
+        .capture_snapshot_v2_storage_device_graph_at(&storage_configs, &guard, capture_now)
+        .expect("following storage graph should recapture");
+    assert_eq!(recaptured_graph, graph);
+    let recaptured_entropy = restored
+        .capture_ready_entropy_state_at(Some(entropy_config), &guard, capture_now)
+        .expect("following entropy should recapture")
+        .expect("following entropy should exist")
+        .try_to_snapshot_v2()
+        .expect("following entropy recapture should convert");
+    assert_eq!(recaptured_entropy, entropy);
+    drop(guard);
+
+    restored
+        .dispatch_balloon_queue_notifications_and_signal_interrupts()
+        .expect("restored pending inflate notification should dispatch");
+    let guard = restored
+        .quiesce_limiter_retry_wakeups()
+        .expect("post-dispatch balloon publishers should quiesce");
+    let updated = restored
+        .capture_ready_balloon_state(Some(returned_balloon), &guard)
+        .expect("updated balloon should capture")
+        .expect("updated balloon should exist")
+        .try_to_snapshot_v2()
+        .expect("updated balloon recapture should convert");
+    assert!(updated.virtio().pending_notifications().is_empty());
+    assert_eq!(updated.accounting().inflated_page_count(), 1);
+    assert!(
+        !restored
+            .shared_balloon_device_metrics()
+            .snapshot()
+            .is_empty()
+    );
+    drop(guard);
+    restored
+        .shutdown()
+        .expect("restored balloon-first destination should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn restores_repeated_signed_inactive_balloon_only_mmio_owner_graphs() {
+    use std::io::Cursor;
+
+    use bangbang_hvf::{
+        HvfArm64BootBalloonDeviceConfig, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BalloonMmioProcessConfig,
+        HvfSnapshotV2BalloonMmioRestoreFault, HvfSnapshotV2BalloonPreparedProduct,
+        HvfSnapshotV2BalloonState, HvfSnapshotV2BootState, HvfSnapshotV2NativePath,
+        HvfSnapshotV2RestoredSerialShell, HvfSnapshotV2StorageMmioProcessConfig,
+        OwnedHvfArm64BootSession, prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::balloon::{
+        BalloonConfigInput, BalloonMmioLayout, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE,
+    };
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::entropy::EntropyMmioLayout;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonRestorePlan;
+    use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransport;
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("restore-inactive-balloon-mmio-kernel", &image)
+        .expect("inactive balloon kernel should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("inactive balloon boot source should configure");
+    controller
+        .handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(8, true)
+                .with_stats_polling_interval_s(1)
+                .with_free_page_hinting(true)
+                .with_free_page_reporting(true),
+        ))
+        .expect("inactive five-queue balloon should configure");
+    let balloon_config = controller
+        .balloon_config()
+        .expect("inactive balloon configuration should exist");
+
+    let block_layout = BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
+    let pmem_layout = PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500));
+    let balloon_layout =
+        BalloonMmioLayout::new(GuestAddress::new(0x4000_8000), MmioRegionId::new(4000));
+    let entropy_layout =
+        EntropyMmioLayout::new(GuestAddress::new(0x4000_7000), MmioRegionId::new(3001));
+    let session_config = HvfArm64BootSessionConfig::new(
+        block_layout,
+        pmem_layout,
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
+    )
+    .with_balloon_device(HvfArm64BootBalloonDeviceConfig::new(balloon_layout))
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+    ));
+    let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+        .expect("signed inactive balloon source should prepare");
+    let guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("inactive balloon publishers should quiesce");
+    let balloon = source
+        .capture_ready_balloon_state(Some(balloon_config), &guard)
+        .expect("inactive balloon owner should capture")
+        .expect("configured inactive balloon should exist")
+        .try_to_snapshot_v2()
+        .expect("inactive balloon capture should convert");
+    let serial = SnapshotV2SerialState::try_from_capture_ready(
+        source
+            .capture_ready_serial_state(controller.serial_config().clone(), &guard)
+            .expect("inactive balloon serial should capture"),
+    )
+    .expect("inactive balloon serial capture should convert");
+    drop(guard);
+    assert!(!balloon.virtio().is_activated());
+    assert_eq!(balloon.virtio().queues().len(), 5);
+    let SnapshotV2DeviceTransport::Mmio(expected_mmio) = balloon.transport() else {
+        panic!("inactive balloon source should use MMIO");
+    };
+
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("inactive balloon source should pause");
+    let boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+            .expect("inactive balloon kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("inactive balloon boot metadata should validate");
+    let mut memory_writer = Cursor::new(Vec::new());
+    let platform = source
+        .capture_snapshot_v2_balloon_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            &mut memory_writer,
+            |_| false,
+        )
+        .expect("inactive exact-2.9 balloon platform should capture");
+    HvfSnapshotV2BalloonState::try_new(
+        platform.clone(),
+        None,
+        serial.clone(),
+        None,
+        Some(balloon.clone()),
+    )
+    .expect("balloon-only exact-2.9 product should compose");
+
+    let mut destination_memories = Vec::new();
+    destination_memories
+        .try_reserve_exact(5)
+        .expect("inactive balloon destination inventory should reserve");
+    for _ in 0..5 {
+        destination_memories.push(copy_signed_session_guest_memory(&source));
+    }
+    source
+        .shutdown()
+        .expect("signed inactive balloon source should shut down");
+
+    let process = HvfSnapshotV2BalloonMmioProcessConfig::new(
+        balloon_layout,
+        HvfSnapshotV2StorageMmioProcessConfig::new(block_layout, pmem_layout),
+        entropy_layout,
+    );
+    let prepare_plan = |memory: &GuestMemory| {
+        let balloon_plan = SnapshotV2BalloonRestorePlan::prepare(balloon.clone(), memory)
+            .expect("inactive balloon restore plan should prepare");
+        prepare_hvf_snapshot_v2_balloon_mmio_platform_plan(
+            &platform,
+            HvfSnapshotV2BalloonPreparedProduct::serial_balloon(balloon_plan),
+            process,
+        )
+        .expect("balloon-only platform plan should prepare")
+    };
+    let restored_shell = || {
+        HvfSnapshotV2RestoredSerialShell::new(
+            SerialMmioDevice::from_capture_state_with_shared_output(
+                SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                serial.device().clone(),
+            ),
+        )
+    };
+
+    for fault in [
+        HvfSnapshotV2BalloonMmioRestoreFault::Registration,
+        HvfSnapshotV2BalloonMmioRestoreFault::BalloonInsertion,
+        HvfSnapshotV2BalloonMmioRestoreFault::SessionAssembly,
+    ] {
+        let destination = destination_memories.remove(0);
+        let plan = prepare_plan(&destination);
+        let error = OwnedHvfArm64BootSession::restore_snapshot_v2_serial_balloon_mmio_with_fault(
+            platform.clone(),
+            destination,
+            restored_shell(),
+            None,
+            plan,
+            fault,
+        )
+        .expect_err("injected balloon-only owner fault should reject");
+        assert!(
+            !error.has_incomplete_cleanup(),
+            "{fault:?} should roll back cleanly: {error:?}"
+        );
+    }
+
+    for destination in destination_memories {
+        let plan = prepare_plan(&destination);
+        let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_serial_balloon_mmio(
+            platform.clone(),
+            destination,
+            restored_shell(),
+            None,
+            plan,
+        )
+        .expect("isolated balloon-only owner graph should restore");
+        assert_eq!(owners.balloon_config(), balloon_config);
+        assert!(owners.storage_configs().is_none());
+        assert!(owners.entropy_config().is_none());
+        assert!(
+            owners
+                .session()
+                .shared_balloon_device_metrics()
+                .snapshot()
+                .is_empty()
+        );
+
+        let (mut restored, returned_balloon, storage_configs, entropy_config) = owners.into_parts();
+        assert!(storage_configs.is_none());
+        assert!(entropy_config.is_none());
+        assert!(restored.runtime_resources().balloon_device.is_some());
+        assert!(restored.runtime_resources().block_devices.is_empty());
+        assert!(restored.runtime_resources().entropy_device.is_none());
+        let guard = restored
+            .quiesce_limiter_retry_wakeups()
+            .expect("balloon-only publishers should quiesce");
+        let recaptured = restored
+            .capture_ready_balloon_state(Some(returned_balloon), &guard)
+            .expect("balloon-only owner should recapture")
+            .expect("balloon-only device should remain present")
+            .try_to_snapshot_v2()
+            .expect("balloon-only recapture should convert");
+        assert!(!recaptured.virtio().is_activated());
+        assert_eq!(recaptured.virtio(), balloon.virtio());
+        assert_eq!(
+            recaptured.continuation().active_queues(),
+            balloon.continuation().active_queues()
+        );
+        assert_eq!(
+            recaptured.continuation().stats_polling_interval_s(),
+            balloon.continuation().stats_polling_interval_s()
+        );
+        assert_eq!(
+            recaptured.continuation().statistics(),
+            balloon.continuation().statistics()
+        );
+        assert_eq!(
+            recaptured
+                .continuation()
+                .statistics_pending_descriptor_head(),
+            balloon.continuation().statistics_pending_descriptor_head()
+        );
+        let restored_hint = recaptured.continuation().hinting();
+        let source_hint = balloon.continuation().hinting();
+        assert_eq!(restored_hint.host_cmd(), VIRTIO_BALLOON_FREE_PAGE_HINT_DONE);
+        assert_eq!(restored_hint.guest_cmd(), source_hint.guest_cmd());
+        assert_eq!(restored_hint.last_cmd(), source_hint.last_cmd());
+        assert_eq!(
+            restored_hint.acknowledge_on_stop(),
+            source_hint.acknowledge_on_stop()
+        );
+        assert_eq!(recaptured.accounting(), balloon.accounting());
+        assert_eq!(recaptured.transport(), balloon.transport());
+        let SnapshotV2DeviceTransport::Mmio(recaptured_mmio) = recaptured.transport() else {
+            panic!("recaptured inactive balloon should use MMIO");
+        };
+        assert_eq!(recaptured_mmio.region(), expected_mmio.region());
+        assert_eq!(
+            recaptured_mmio.interrupt_line(),
+            expected_mmio.interrupt_line()
+        );
+        drop(guard);
+        restored
+            .shutdown()
+            .expect("isolated balloon-only destination should shut down");
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
