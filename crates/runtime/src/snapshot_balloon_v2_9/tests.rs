@@ -1,6 +1,6 @@
 use crate::balloon::{BalloonConfigInput, VIRTIO_BALLOON_FREE_PAGE_HINT_STOP};
 use crate::interrupt::GuestInterruptLine;
-use crate::memory::{GuestAddress, GuestMemoryRange};
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::{
     PCI_BAR64_START, PCI_BUS_ZERO, PCI_FUNCTION_ZERO, PCI_SEGMENT_ZERO, PciBarAddressSpace,
@@ -16,7 +16,7 @@ use crate::snapshot_device_v2::{
 use crate::storage_capture::StorageDeviceOrigin;
 use crate::virtio::{
     VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK,
-    VIRTIO_DEVICE_STATUS_FEATURES_OK,
+    VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioInterruptIntent,
 };
 use crate::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
 use crate::virtio_pci::{
@@ -31,6 +31,12 @@ const DIRECTORY_ENTRY_BYTES: usize = 32;
 const DIRECTORY_PAYLOAD_OFFSET: usize = 8;
 const DIRECTORY_LENGTH_OFFSET: usize = 16;
 const PAYLOAD_OFFSET: usize = 192;
+const RESTORE_LOW_MEMORY_SIZE: u64 = 0x10_0000;
+const RESTORE_QUEUE_MEMORY_START: u64 = 0x8000_0000;
+const RESTORE_QUEUE_STRIDE: u64 = 0x1_0000;
+const AVAILABLE_INDEX_OFFSET: u64 = 2;
+const AVAILABLE_RING_OFFSET: u64 = 4;
+const USED_INDEX_OFFSET: u64 = 2;
 
 fn config(stats: bool, hinting: bool, reporting: bool) -> BalloonConfig {
     BalloonConfigInput::new(64, true)
@@ -284,6 +290,176 @@ fn state(
         },
     )
     .expect("test state should validate")
+}
+
+fn restore_memory(state: &SnapshotV2BalloonState) -> GuestMemory {
+    let mut ranges = vec![
+        GuestMemoryRange::new(GuestAddress::new(0), RESTORE_LOW_MEMORY_SIZE)
+            .expect("low restore memory should validate"),
+    ];
+    if state.virtio().is_activated() {
+        ranges.push(
+            GuestMemoryRange::new(
+                GuestAddress::new(RESTORE_QUEUE_MEMORY_START),
+                u64::try_from(state.virtio().queues().len()).expect("queue count should fit")
+                    * RESTORE_QUEUE_STRIDE,
+            )
+            .expect("queue restore memory should validate"),
+        );
+    }
+    let layout = GuestMemoryLayout::new(ranges).expect("restore memory layout should validate");
+    GuestMemory::allocate(&layout).expect("restore memory should allocate")
+}
+
+fn queue_only_restore_memory(state: &SnapshotV2BalloonState) -> GuestMemory {
+    let queue_size = u64::try_from(state.virtio().queues().len()).expect("queue count should fit")
+        * RESTORE_QUEUE_STRIDE;
+    let layout = GuestMemoryLayout::new(vec![
+        GuestMemoryRange::new(GuestAddress::new(RESTORE_QUEUE_MEMORY_START), queue_size)
+            .expect("queue restore memory should validate"),
+    ])
+    .expect("queue-only restore layout should validate");
+    GuestMemory::allocate(&layout).expect("queue-only restore memory should allocate")
+}
+
+fn initialize_restore_queue_memory(memory: &mut GuestMemory, state: &SnapshotV2BalloonState) {
+    let Some(active) = state.continuation().active_queues() else {
+        return;
+    };
+    let layout = VirtioBalloonQueueLayout::from_config(state.config());
+    for (index, queue) in state.virtio().queues().iter().enumerate() {
+        let cursor = active
+            .cursor_for_layout(layout, index)
+            .expect("active queue should have retained cursors");
+        write_memory_u16(
+            memory,
+            queue
+                .driver_ring()
+                .checked_add(AVAILABLE_INDEX_OFFSET)
+                .expect("available index address should fit"),
+            cursor.next_available(),
+        );
+        write_memory_u16(
+            memory,
+            queue
+                .device_ring()
+                .checked_add(USED_INDEX_OFFSET)
+                .expect("used index address should fit"),
+            cursor.next_used(),
+        );
+    }
+
+    if let Some(pending_head) = state.continuation().statistics_pending_descriptor_head() {
+        let statistics = layout
+            .statistics()
+            .expect("pending statistics require a statistics queue");
+        let cursor = active
+            .statistics()
+            .expect("pending statistics require active statistics cursors");
+        let queue = state
+            .virtio()
+            .queues()
+            .get(statistics.index())
+            .expect("statistics queue should exist");
+        let ring_index = cursor.next_available().wrapping_sub(1) % queue.size();
+        write_memory_u16(
+            memory,
+            queue
+                .driver_ring()
+                .checked_add(AVAILABLE_RING_OFFSET + u64::from(ring_index) * 2)
+                .expect("pending statistics entry should fit"),
+            pending_head,
+        );
+    }
+}
+
+fn write_memory_u16(memory: &mut GuestMemory, address: GuestAddress, value: u16) {
+    memory
+        .write_slice(&value.to_le_bytes(), address)
+        .expect("u16 restore fixture write should succeed");
+}
+
+fn restore_memory_bytes(memory: &GuestMemory) -> Vec<u8> {
+    let total = memory
+        .regions()
+        .iter()
+        .map(|region| {
+            usize::try_from(region.range().size()).expect("test memory region size should fit")
+        })
+        .sum();
+    let mut bytes = Vec::with_capacity(total);
+    for region in memory.regions() {
+        let start = bytes.len();
+        bytes.resize(
+            start
+                + usize::try_from(region.range().size())
+                    .expect("test memory region size should fit"),
+            0,
+        );
+        memory
+            .read_slice(&mut bytes[start..], region.range().start())
+            .expect("restore fixture memory should read");
+    }
+    bytes
+}
+
+fn prepared_device(plan: &SnapshotV2BalloonRestorePlan) -> &VirtioBalloonDevice {
+    match plan.transport() {
+        PreparedSnapshotV2BalloonTransport::Mmio(mmio) => mmio.device(),
+        PreparedSnapshotV2BalloonTransport::Pci(pci) => pci.device(),
+    }
+}
+
+fn assert_restored_queue_cursors(
+    device: &VirtioBalloonDevice,
+    expected: SnapshotV2BalloonActiveQueuesState,
+) {
+    let active = device
+        .active_queues()
+        .expect("expected active restored queues");
+    let pairs = [
+        (Some(active.inflate()), Some(expected.inflate())),
+        (Some(active.deflate()), Some(expected.deflate())),
+        (active.statistics(), expected.statistics()),
+        (active.free_page_hinting(), expected.free_page_hinting()),
+        (active.free_page_reporting(), expected.free_page_reporting()),
+    ];
+    for (actual, expected) in pairs {
+        match (actual, expected) {
+            (Some(actual), Some(expected)) => {
+                assert_eq!(
+                    actual.available_ring().next_avail(),
+                    expected.next_available()
+                );
+                assert_eq!(actual.used_ring().next_used(), expected.next_used());
+            }
+            (None, None) => {}
+            _ => panic!("restored active queue shape should match"),
+        }
+    }
+}
+
+fn assert_restored_device_registers(
+    actual: &crate::virtio_mmio::VirtioMmioDeviceRegisters,
+    expected: &SnapshotV2VirtioState,
+) {
+    assert_eq!(actual.device_id(), VIRTIO_BALLOON_DEVICE_ID);
+    assert_eq!(actual.device_features(), expected.available_features());
+    assert_eq!(actual.driver_features(), expected.driver_features());
+    assert_eq!(actual.config_generation(), expected.config_generation());
+    assert_eq!(actual.status(), expected.status());
+}
+
+fn assert_restored_queue_state(
+    actual: &VirtioMmioQueueState,
+    expected: &SnapshotV2VirtioQueueState,
+) {
+    assert_eq!(actual.max_size(), expected.max_size());
+    assert_eq!(actual.size(), expected.size());
+    assert_eq!(actual.ready(), expected.ready());
+    assert_eq!(actual.descriptor_table(), expected.descriptor_table());
+    assert_eq!(actual.driver_ring(), expected.driver_ring());
+    assert_eq!(actual.device_ring(), expected.device_ring());
 }
 
 #[test]
@@ -885,6 +1061,604 @@ fn allocation_failures_are_deterministic_and_redacted() {
         assert!(!display.contains("2147483648"));
         assert!(!debug.contains("2147483648"));
     }
+}
+
+#[test]
+fn restore_plan_reconstructs_every_queue_layout_and_transport() {
+    for statistics_enabled in [false, true] {
+        for hinting_enabled in [false, true] {
+            for reporting_enabled in [false, true] {
+                let config = config(statistics_enabled, hinting_enabled, reporting_enabled);
+                for pci in [false, true] {
+                    for activated in [false, true] {
+                        let expected =
+                            state(config, activated, pci, activated && statistics_enabled);
+                        let mut memory = restore_memory(&expected);
+                        initialize_restore_queue_memory(&mut memory, &expected);
+                        let plan = SnapshotV2BalloonRestorePlan::prepare(expected.clone(), &memory)
+                            .expect("valid balloon restore state should prepare");
+
+                        assert_eq!(plan.config(), config);
+                        assert_eq!(
+                            plan.config_space().num_pages(),
+                            mib_to_4k_pages(config.amount_mib())
+                                .expect("test page count should fit")
+                        );
+                        assert_eq!(
+                            plan.config_space().actual_pages(),
+                            if activated { 17 } else { 0 }
+                        );
+                        assert_eq!(
+                            plan.config_space().free_page_hint_cmd_id(),
+                            if hinting_enabled {
+                                VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+                            } else {
+                                VIRTIO_BALLOON_FREE_PAGE_HINT_STOP
+                            }
+                        );
+                        assert_eq!(
+                            plan.queue_ranges().len(),
+                            if activated {
+                                VirtioBalloonQueueLayout::from_config(config).queue_count()
+                            } else {
+                                0
+                            }
+                        );
+                        assert_eq!(
+                            plan.transport_kind(),
+                            if pci {
+                                SnapshotV2DeviceTransportKind::Pci
+                            } else {
+                                SnapshotV2DeviceTransportKind::Mmio
+                            }
+                        );
+
+                        let device = prepared_device(&plan);
+                        assert_eq!(
+                            device.queue_layout(),
+                            VirtioBalloonQueueLayout::from_config(config)
+                        );
+                        assert_eq!(device.is_activated(), activated);
+                        assert_eq!(
+                            device.memory_accounting().inflated_page_count(),
+                            if activated { 3 } else { 0 }
+                        );
+                        assert_eq!(
+                            device
+                                .memory_accounting()
+                                .inflated_page_ranges()
+                                .iter()
+                                .map(|range| (range.start_pfn(), range.page_count()))
+                                .collect::<Vec<_>>(),
+                            expected
+                                .accounting()
+                                .ranges()
+                                .iter()
+                                .map(|range| (range.start_pfn(), range.page_count()))
+                                .collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            device.stats_polling_interval_s(),
+                            config.stats_polling_interval_s()
+                        );
+                        assert_eq!(
+                            device.statistics_pending_descriptor_head(),
+                            (activated && statistics_enabled).then_some(0)
+                        );
+                        assert_eq!(
+                            device.statistics(),
+                            restore_balloon_statistics(expected.continuation().statistics())
+                        );
+                        if let Some(active) = expected.continuation().active_queues() {
+                            assert_restored_queue_cursors(device, active);
+                        } else {
+                            assert!(device.active_queues().is_none());
+                        }
+
+                        if hinting_enabled {
+                            let hinting = device
+                                .hinting_status()
+                                .expect("restored hinting should remain enabled");
+                            assert_eq!(hinting.host_cmd(), VIRTIO_BALLOON_FREE_PAGE_HINT_DONE);
+                            assert_eq!(hinting.guest_cmd(), None);
+                            assert_eq!(
+                                device.hinting_last_cmd(),
+                                VIRTIO_BALLOON_FREE_PAGE_HINT_STOP
+                            );
+                            assert!(
+                                device
+                                    .hinting_acknowledge_on_stop()
+                                    .expect("restored hint policy should exist")
+                            );
+                        } else {
+                            assert!(device.hinting_status().is_err());
+                            assert_eq!(
+                                device.hinting_last_cmd(),
+                                VIRTIO_BALLOON_FREE_PAGE_HINT_STOP
+                            );
+                        }
+
+                        match plan.transport() {
+                            PreparedSnapshotV2BalloonTransport::Mmio(mmio) => {
+                                assert!(!pci);
+                                let SnapshotV2DeviceTransport::Mmio(expected_mmio) =
+                                    expected.transport()
+                                else {
+                                    panic!("expected MMIO source transport");
+                                };
+                                assert_eq!(mmio.region(), expected_mmio.region());
+                                assert_eq!(mmio.interrupt_line(), expected_mmio.interrupt_line());
+                                assert_restored_device_registers(
+                                    mmio.retained().device_registers(),
+                                    expected.virtio(),
+                                );
+                                assert_eq!(
+                                    mmio.retained().device_registers().device_features_select(),
+                                    expected_mmio.device_feature_select()
+                                );
+                                assert_eq!(
+                                    mmio.retained().device_registers().driver_features_select(),
+                                    expected_mmio.driver_feature_select()
+                                );
+                                assert_eq!(
+                                    mmio.retained().queue_select(),
+                                    expected_mmio.queue_select()
+                                );
+                                assert_eq!(
+                                    mmio.retained().queues().len(),
+                                    VirtioBalloonQueueLayout::from_config(config).queue_count()
+                                );
+                                for (actual, expected_queue) in mmio
+                                    .retained()
+                                    .queues()
+                                    .iter()
+                                    .zip(expected.virtio().queues())
+                                {
+                                    assert_restored_queue_state(actual, expected_queue);
+                                }
+                                assert_eq!(mmio.retained().is_device_activated(), activated);
+                                assert!(mmio.retained().requires_device_config_write_status());
+                                assert_eq!(
+                                    mmio.retained()
+                                        .pending_notifications()
+                                        .iter()
+                                        .copied()
+                                        .enumerate()
+                                        .filter(|(_, pending)| *pending)
+                                        .map(|(index, _)| {
+                                            u16::try_from(index)
+                                                .expect("queue index should fit u16")
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    expected.virtio().pending_notifications()
+                                );
+                            }
+                            PreparedSnapshotV2BalloonTransport::Pci(pci_transport) => {
+                                assert!(pci);
+                                let SnapshotV2DeviceTransport::Pci(expected_pci) =
+                                    expected.transport()
+                                else {
+                                    panic!("expected PCI source transport");
+                                };
+                                assert_eq!(pci_transport.origin(), expected_pci.origin());
+                                assert_eq!(pci_transport.sbdf(), expected_pci.sbdf());
+                                assert_eq!(pci_transport.bar_range(), expected_pci.bar_range());
+                                assert_eq!(
+                                    pci_transport.identity().device_type().raw_value(),
+                                    VIRTIO_BALLOON_DEVICE_ID
+                                );
+                                assert_restored_device_registers(
+                                    pci_transport.retained().device_registers(),
+                                    expected.virtio(),
+                                );
+                                assert_eq!(
+                                    pci_transport.retained().device_feature_select(),
+                                    expected_pci.device_feature_select()
+                                );
+                                assert_eq!(
+                                    pci_transport.retained().driver_feature_select(),
+                                    expected_pci.driver_feature_select()
+                                );
+                                assert_eq!(
+                                    pci_transport.retained().queue_select(),
+                                    expected_pci.queue_select()
+                                );
+                                assert_eq!(
+                                    pci_transport.retained().queues().queue_count(),
+                                    VirtioBalloonQueueLayout::from_config(config).queue_count()
+                                );
+                                for (index, expected_queue) in
+                                    expected.virtio().queues().iter().enumerate()
+                                {
+                                    let index =
+                                        u32::try_from(index).expect("queue index should fit u32");
+                                    let actual = pci_transport
+                                        .retained()
+                                        .queues()
+                                        .queue(index)
+                                        .expect("restored PCI queue should exist");
+                                    assert_restored_queue_state(actual, expected_queue);
+                                }
+                                assert_eq!(
+                                    pci_transport
+                                        .retained()
+                                        .queue_notifications()
+                                        .pending_queue_notifications()
+                                        .into_iter()
+                                        .map(|index| {
+                                            u16::try_from(index)
+                                                .expect("queue index should fit u16")
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    expected.virtio().pending_notifications()
+                                );
+                                assert_eq!(
+                                    pci_transport
+                                        .retained()
+                                        .interrupt_intents()
+                                        .iter()
+                                        .copied()
+                                        .map(|intent| match intent {
+                                            VirtioInterruptIntent::Queue { queue_index } => {
+                                                SnapshotV2InterruptIntent::Queue { queue_index }
+                                            }
+                                            VirtioInterruptIntent::Configuration => {
+                                                SnapshotV2InterruptIntent::Configuration
+                                            }
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    expected.virtio().interrupt_intents()
+                                );
+                                assert_eq!(
+                                    pci_transport.retained().msix_vector_count(),
+                                    VirtioBalloonQueueLayout::from_config(config).queue_count() + 1
+                                );
+                                let actual_msix = pci_transport.retained().msix_state();
+                                let expected_msix = expected_pci.msix();
+                                assert_eq!(
+                                    actual_msix.pending_words(),
+                                    expected_msix.pending_words()
+                                );
+                                assert_eq!(actual_msix.enabled(), expected_msix.enabled());
+                                assert_eq!(
+                                    actual_msix.function_masked(),
+                                    expected_msix.function_masked()
+                                );
+                                assert_eq!(
+                                    actual_msix.config_vector(),
+                                    expected_msix.config_vector()
+                                );
+                                assert_eq!(
+                                    actual_msix.queue_vectors(),
+                                    expected_msix.queue_vectors()
+                                );
+                                assert_eq!(
+                                    actual_msix.pending_transition_observed(),
+                                    expected_msix.pending_transition_observed()
+                                );
+                                for (actual, expected_entry) in
+                                    actual_msix.entries().iter().zip(expected_msix.entries())
+                                {
+                                    assert_eq!(
+                                        actual.message_address_low(),
+                                        expected_entry.message_address_low()
+                                    );
+                                    assert_eq!(
+                                        actual.message_address_high(),
+                                        expected_entry.message_address_high()
+                                    );
+                                    assert_eq!(
+                                        actual.message_data(),
+                                        expected_entry.message_data()
+                                    );
+                                    assert_eq!(
+                                        actual.vector_control(),
+                                        expected_entry.vector_control()
+                                    );
+                                }
+                                assert_eq!(
+                                    pci_transport.retained().is_device_activated(),
+                                    activated
+                                );
+                                assert!(
+                                    !pci_transport
+                                        .retained()
+                                        .requires_device_config_write_status()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn restore_plan_normalizes_enabled_hinting_after_retaining_checked_history() {
+    let config = config(false, true, false);
+    let mut expected = state(config, true, false, false);
+    expected.config_space = expected.config_space.with_free_page_hint_cmd_id(9);
+    expected.continuation.hinting = SnapshotV2BalloonHintState::new(9, Some(9), 9, false);
+    validate_balloon_state(&expected).expect("source hint history should validate");
+
+    let mut memory = restore_memory(&expected);
+    initialize_restore_queue_memory(&mut memory, &expected);
+    let plan = SnapshotV2BalloonRestorePlan::prepare(expected, &memory)
+        .expect("enabled hint history should prepare");
+    let device = prepared_device(&plan);
+    let hinting = device
+        .hinting_status()
+        .expect("restored hinting should remain enabled");
+
+    assert_eq!(
+        plan.config_space().free_page_hint_cmd_id(),
+        VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+    );
+    assert_eq!(hinting.host_cmd(), VIRTIO_BALLOON_FREE_PAGE_HINT_DONE);
+    assert_eq!(hinting.guest_cmd(), Some(9));
+    assert_eq!(device.hinting_last_cmd(), 9);
+    assert!(
+        !device
+            .hinting_acknowledge_on_stop()
+            .expect("restored hint policy should exist")
+    );
+}
+
+#[test]
+fn restore_plan_preserves_wrapping_queue_cursors_and_pending_statistics() {
+    let config = config(true, false, false);
+    let mut expected = state(config, true, false, true);
+    let idle = SnapshotV2BalloonQueueState::try_new(u16::MAX, u16::MAX, VIRTIO_BALLOON_QUEUE_SIZE)
+        .expect("wrapping idle cursors should validate");
+    let pending = SnapshotV2BalloonQueueState::try_new(0, u16::MAX, VIRTIO_BALLOON_QUEUE_SIZE)
+        .expect("wrapping pending cursors should validate");
+    expected.continuation.active_queues = Some(
+        SnapshotV2BalloonActiveQueuesState::try_new(config, idle, idle, Some(pending), None, None)
+            .expect("wrapping active queue cursors should validate"),
+    );
+    validate_balloon_state(&expected).expect("wrapping source state should validate");
+
+    let mut memory = restore_memory(&expected);
+    initialize_restore_queue_memory(&mut memory, &expected);
+    let plan = SnapshotV2BalloonRestorePlan::prepare(expected, &memory)
+        .expect("wrapping queue continuation should prepare");
+    let active = prepared_device(&plan)
+        .active_queues()
+        .expect("restored queues should remain active");
+    assert_eq!(active.inflate().available_ring().next_avail(), u16::MAX);
+    assert_eq!(active.inflate().used_ring().next_used(), u16::MAX);
+    let statistics = active
+        .statistics()
+        .expect("restored statistics queue should exist");
+    assert_eq!(statistics.available_ring().next_avail(), 0);
+    assert_eq!(statistics.used_ring().next_used(), u16::MAX);
+    assert_eq!(
+        prepared_device(&plan).statistics_pending_descriptor_head(),
+        Some(0)
+    );
+}
+
+#[test]
+fn restore_plan_rejects_destination_memory_and_queue_continuation_mismatches() {
+    let config = config(true, true, true);
+    let expected = state(config, true, false, true);
+
+    let mut invalid = expected.clone();
+    invalid.config_space = invalid
+        .config_space
+        .with_num_pages(invalid.config_space.num_pages() + 1);
+    let memory = restore_memory(&expected);
+    assert_eq!(
+        SnapshotV2BalloonRestorePlan::prepare(invalid, &memory).unwrap_err(),
+        SnapshotV2BalloonRestorePlanError::InvalidState
+    );
+
+    let low = GuestMemoryRange::new(GuestAddress::new(0), RESTORE_LOW_MEMORY_SIZE)
+        .expect("low memory should validate");
+    let truncated_queue =
+        GuestMemoryRange::new(GuestAddress::new(RESTORE_QUEUE_MEMORY_START), 0x4000)
+            .expect("truncated queue memory should validate");
+    let memory = GuestMemory::allocate(
+        &GuestMemoryLayout::new(vec![low, truncated_queue])
+            .expect("truncated layout should validate"),
+    )
+    .expect("truncated restore memory should allocate");
+    assert_eq!(
+        SnapshotV2BalloonRestorePlan::prepare(expected.clone(), &memory).unwrap_err(),
+        SnapshotV2BalloonRestorePlanError::QueueMemory
+    );
+
+    let mut memory = queue_only_restore_memory(&expected);
+    initialize_restore_queue_memory(&mut memory, &expected);
+    assert_eq!(
+        SnapshotV2BalloonRestorePlan::prepare(expected.clone(), &memory).unwrap_err(),
+        SnapshotV2BalloonRestorePlanError::AccountingMemory
+    );
+
+    let mut memory = restore_memory(&expected);
+    initialize_restore_queue_memory(&mut memory, &expected);
+    let inflate = expected
+        .virtio()
+        .queues()
+        .first()
+        .expect("inflate queue should exist");
+    write_memory_u16(
+        &mut memory,
+        inflate
+            .device_ring()
+            .checked_add(USED_INDEX_OFFSET)
+            .expect("used index address should fit"),
+        8,
+    );
+    assert_eq!(
+        SnapshotV2BalloonRestorePlan::prepare(expected.clone(), &memory).unwrap_err(),
+        SnapshotV2BalloonRestorePlanError::QueueContinuation
+    );
+
+    let mut memory = restore_memory(&expected);
+    initialize_restore_queue_memory(&mut memory, &expected);
+    let layout = VirtioBalloonQueueLayout::from_config(config);
+    let statistics = layout.statistics().expect("statistics queue should exist");
+    let queue = expected
+        .virtio()
+        .queues()
+        .get(statistics.index())
+        .expect("statistics queue state should exist");
+    let cursor = expected
+        .continuation()
+        .active_queues()
+        .and_then(SnapshotV2BalloonActiveQueuesState::statistics)
+        .expect("statistics cursors should exist");
+    let pending_ring_index = cursor.next_available().wrapping_sub(1) % queue.size();
+    write_memory_u16(
+        &mut memory,
+        queue
+            .driver_ring()
+            .checked_add(AVAILABLE_RING_OFFSET + u64::from(pending_ring_index) * 2)
+            .expect("pending entry address should fit"),
+        1,
+    );
+    assert_eq!(
+        SnapshotV2BalloonRestorePlan::prepare(expected.clone(), &memory).unwrap_err(),
+        SnapshotV2BalloonRestorePlanError::QueueContinuation
+    );
+
+    let mut memory = restore_memory(&expected);
+    initialize_restore_queue_memory(&mut memory, &expected);
+    write_memory_u16(
+        &mut memory,
+        queue
+            .driver_ring()
+            .checked_add(AVAILABLE_INDEX_OFFSET)
+            .expect("available index address should fit"),
+        cursor.next_available().wrapping_add(1),
+    );
+    let duplicate_ring_index = cursor.next_available() % queue.size();
+    write_memory_u16(
+        &mut memory,
+        queue
+            .driver_ring()
+            .checked_add(AVAILABLE_RING_OFFSET + u64::from(duplicate_ring_index) * 2)
+            .expect("duplicate entry address should fit"),
+        0,
+    );
+    assert_eq!(
+        SnapshotV2BalloonRestorePlan::prepare(expected, &memory).unwrap_err(),
+        SnapshotV2BalloonRestorePlanError::QueueContinuation
+    );
+}
+
+#[test]
+fn restore_plan_accepts_accounting_across_adjacent_mapped_regions() {
+    let config = config(false, false, false);
+    let mut expected = state(config, true, false, false);
+    expected.accounting = SnapshotV2BalloonAccountingState::try_new(
+        vec![
+            SnapshotV2BalloonPfnRange::try_new(3, 2)
+                .expect("cross-region accounting range should validate"),
+        ],
+        2,
+    )
+    .expect("cross-region accounting should validate");
+    let queue_size = u64::try_from(expected.virtio().queues().len())
+        .expect("queue count should fit")
+        * RESTORE_QUEUE_STRIDE;
+    let layout = GuestMemoryLayout::new(vec![
+        GuestMemoryRange::new(GuestAddress::new(0), 0x4000)
+            .expect("first accounting region should validate"),
+        GuestMemoryRange::new(GuestAddress::new(0x4000), RESTORE_LOW_MEMORY_SIZE - 0x4000)
+            .expect("second accounting region should validate"),
+        GuestMemoryRange::new(GuestAddress::new(RESTORE_QUEUE_MEMORY_START), queue_size)
+            .expect("queue region should validate"),
+    ])
+    .expect("adjacent accounting layout should validate");
+    let mut memory = GuestMemory::allocate(&layout).expect("restore memory should allocate");
+    initialize_restore_queue_memory(&mut memory, &expected);
+
+    let plan = SnapshotV2BalloonRestorePlan::prepare(expected, &memory)
+        .expect("accounting spanning adjacent mapped regions should prepare");
+    assert_eq!(
+        prepared_device(&plan)
+            .memory_accounting()
+            .inflated_page_count(),
+        2
+    );
+}
+
+#[test]
+fn restore_plan_allocation_isolation_and_diagnostics_are_deterministic() {
+    let config = config(true, true, true);
+    let expected = state(config, true, false, true);
+    let mut memory = restore_memory(&expected);
+    initialize_restore_queue_memory(&mut memory, &expected);
+    let before = restore_memory_bytes(&memory);
+
+    assert_eq!(
+        SnapshotV2BalloonRestorePlan::prepare_with_queue_range_allocation_failure(
+            expected.clone(),
+            &memory,
+        )
+        .unwrap_err(),
+        SnapshotV2BalloonRestorePlanError::Allocation
+    );
+    assert_eq!(
+        SnapshotV2BalloonRestorePlan::prepare_with_accounting_allocation_failure(
+            expected.clone(),
+            &memory,
+        )
+        .unwrap_err(),
+        SnapshotV2BalloonRestorePlanError::Allocation
+    );
+
+    let first = SnapshotV2BalloonRestorePlan::prepare(expected.clone(), &memory)
+        .expect("first restore plan should prepare");
+    let second = SnapshotV2BalloonRestorePlan::prepare(expected, &memory)
+        .expect("second restore plan should prepare");
+    assert_eq!(restore_memory_bytes(&memory), before);
+    assert_ne!(
+        first.queue_ranges().as_ptr(),
+        second.queue_ranges().as_ptr()
+    );
+    assert_ne!(
+        prepared_device(&first)
+            .memory_accounting()
+            .inflated_page_ranges()
+            .as_ptr(),
+        prepared_device(&second)
+            .memory_accounting()
+            .inflated_page_ranges()
+            .as_ptr()
+    );
+
+    let debug = format!("{first:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("2147483648"));
+    for error in [
+        SnapshotV2BalloonRestorePlanError::InvalidState,
+        SnapshotV2BalloonRestorePlanError::QueueMemory,
+        SnapshotV2BalloonRestorePlanError::AccountingMemory,
+        SnapshotV2BalloonRestorePlanError::QueueContinuation,
+        SnapshotV2BalloonRestorePlanError::Allocation,
+    ] {
+        assert!(!format!("{error:?}").contains("2147483648"));
+        assert!(!error.to_string().contains("2147483648"));
+    }
+
+    let (_, _, _, first_transport) = first.into_parts();
+    let (_, _, _, second_transport) = second.into_parts();
+    let PreparedSnapshotV2BalloonTransport::Mmio(first) = first_transport else {
+        panic!("expected MMIO restore transport");
+    };
+    let PreparedSnapshotV2BalloonTransport::Mmio(second) = second_transport else {
+        panic!("expected MMIO restore transport");
+    };
+    let (_, _, mut first_device, _) = (*first).into_parts();
+    let (_, _, second_device, _) = (*second).into_parts();
+    first_device.reset();
+    assert!(first_device.memory_accounting().is_empty());
+    assert_eq!(second_device.memory_accounting().inflated_page_count(), 3);
+    assert!(second_device.is_activated());
 }
 
 struct FailAtReserve {
