@@ -148,7 +148,7 @@ fn canonical_binding_state_and_image_round_trip() {
 }
 
 #[test]
-fn explicit_minor_four_six_seven_and_eight_memory_images_round_trip_without_advancing_writer() {
+fn explicit_minor_four_six_seven_and_current_eight_memory_images_round_trip() {
     let memory = test_memory();
     let mut output = Cursor::new(Vec::new());
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
@@ -298,7 +298,13 @@ fn explicit_minor_four_six_seven_and_eight_memory_images_round_trip_without_adva
             &[component],
         )
         .expect("minor-eight memory state should encode internally");
-    assert!(decode_snapshot_v2_state(&state_bytes).is_err());
+    assert_eq!(
+        decode_snapshot_v2_state(&state_bytes)
+            .expect("current minor-eight memory state should decode ordinarily")
+            .metadata()
+            .version(),
+        crate::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
+    );
     let state = crate::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version(
         &state_bytes,
         crate::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,

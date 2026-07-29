@@ -132,8 +132,8 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
     assert_eq!(
         state
             .v2_profile()
-            .expect("current state should classify as exact serial profile"),
-        NativeV2SnapshotArtifactProfile::SerialStateV2_7
+            .expect("current state should classify as exact entropy profile"),
+        NativeV2SnapshotArtifactProfile::EntropyStateV2_8
     );
     assert!(state.v1_record().is_none());
     let debug = format!("{state:?}");
@@ -308,7 +308,7 @@ fn current_v2_artifact_boundary_rejects_duplicate_and_nonsemantic_serial_state()
         CaptureReadySerialState::new(SerialConfig::default(), serial_device),
     )
     .expect("serial fixture should normalize")
-    .encode(NATIVE_V2_SNAPSHOT_VERSION)
+    .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
     .expect("serial fixture should encode");
     let memory_component = SnapshotV2Component::new(
         NATIVE_V2_MEMORY_COMPONENT_KEY,
@@ -438,13 +438,21 @@ fn exact_minor_eight_candidate_classifies_all_optional_storage_entropy_combinati
             &entropy_components,
         )
         .expect("exact 2.8 fixture should encode");
-        assert!(
-            NativeSnapshotArtifactState::from_current_v2(bytes.clone()).is_err(),
-            "exact 2.8 must not gain current publication authority"
+        let current = NativeSnapshotArtifactState::from_current_v2(bytes.clone())
+            .expect("exact 2.8 should have current publication authority");
+        assert_eq!(
+            current
+                .v2_profile()
+                .expect("current exact 2.8 state should classify"),
+            NativeV2SnapshotArtifactProfile::EntropyStateV2_8
         );
-        assert!(
-            NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone()).is_err(),
-            "public compatible file loading must remain capped at exact 2.7"
+        let compatible = NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone())
+            .expect("public compatible file loading should admit exact 2.8");
+        assert_eq!(
+            compatible
+                .v2_profile()
+                .expect("compatible exact 2.8 state should classify"),
+            NativeV2SnapshotArtifactProfile::EntropyStateV2_8
         );
 
         let candidate =
@@ -459,7 +467,7 @@ fn exact_minor_eight_candidate_classifies_all_optional_storage_entropy_combinati
         assert_eq!(candidate.entropy().is_some(), with_entropy);
         assert_eq!(candidate.bytes(), bytes);
 
-        let compatible = candidate.into_compatible_artifact_state();
+        let compatible = candidate.into_current_artifact_state();
         assert_eq!(
             compatible
                 .v2_profile()
@@ -542,14 +550,14 @@ fn exact_minor_eight_candidate_rejects_component_and_nested_version_mismatches()
         Err(NativeV2SnapshotCandidateStateError::StorageDeviceGraph(_))
     ));
 
-    let mut current_image = Cursor::new(Vec::new());
-    let current_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+    let mut mismatched_image = Cursor::new(Vec::new());
+    let mismatched_binding = write_snapshot_v2_memory_image_with_compatibility_version(
         &memory,
-        &mut current_image,
-        NATIVE_V2_SNAPSHOT_VERSION,
+        &mut mismatched_image,
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
     )
-    .expect("current memory fixture should encode");
-    let mismatched = entropy_v2_8_state(&current_binding, None, &[])
+    .expect("exact 2.7 memory fixture should encode");
+    let mismatched = entropy_v2_8_state(&mismatched_binding, None, &[])
         .expect("mismatch should encode structurally");
     assert!(matches!(
         NativeV2EntropySnapshotCandidateState::from_entropy_state_v2_8(mismatched),
@@ -2907,7 +2915,7 @@ fn current_v2_state(binding: &SnapshotV2MemoryBinding) -> Result<Vec<u8>, String
         CaptureReadySerialState::new(SerialConfig::default(), serial_device),
     )
     .map_err(|source| source.to_string())?
-    .encode(NATIVE_V2_SNAPSHOT_VERSION)
+    .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
     .map_err(|source| source.to_string())?;
     let components = [
         SnapshotV2Component::new(

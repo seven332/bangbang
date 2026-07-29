@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::block::{DriveConfig, DriveConfigs};
 use crate::boot::BootSourceConfig;
+use crate::entropy::EntropyConfig;
 use crate::machine::MachineConfig;
 use crate::pmem::PmemConfigs;
 use crate::serial::SerialConfig;
@@ -67,6 +68,7 @@ pub struct SnapshotV2ControllerCommit {
     drive_configs: DriveConfigs,
     pmem_configs: PmemConfigs,
     serial_config: SerialConfig,
+    entropy_config: Option<EntropyConfig>,
     resume_requested: bool,
 }
 
@@ -83,6 +85,7 @@ impl SnapshotV2ControllerCommit {
             drive_configs: DriveConfigs::new(),
             pmem_configs: PmemConfigs::new(),
             serial_config: SerialConfig::default(),
+            entropy_config: None,
             resume_requested,
         }
     }
@@ -101,6 +104,7 @@ impl SnapshotV2ControllerCommit {
             drive_configs: DriveConfigs::from_validated_single(drive_config)?,
             pmem_configs: PmemConfigs::new(),
             serial_config: SerialConfig::default(),
+            entropy_config: None,
             resume_requested,
         })
     }
@@ -120,6 +124,7 @@ impl SnapshotV2ControllerCommit {
             drive_configs,
             pmem_configs: PmemConfigs::new(),
             serial_config: SerialConfig::default(),
+            entropy_config: None,
             resume_requested,
         }
     }
@@ -140,6 +145,7 @@ impl SnapshotV2ControllerCommit {
             drive_configs: DriveConfigs::from_validated(drive_configs),
             pmem_configs: PmemConfigs::from_validated(pmem_configs),
             serial_config: SerialConfig::default(),
+            entropy_config: None,
             resume_requested,
         }
     }
@@ -158,6 +164,7 @@ impl SnapshotV2ControllerCommit {
             drive_configs: DriveConfigs::new(),
             pmem_configs: PmemConfigs::new(),
             serial_config,
+            entropy_config: None,
             resume_requested,
         }
     }
@@ -179,6 +186,32 @@ impl SnapshotV2ControllerCommit {
             drive_configs: DriveConfigs::from_validated(drive_configs),
             pmem_configs: PmemConfigs::from_validated(pmem_configs),
             serial_config,
+            entropy_config: None,
+            resume_requested,
+        }
+    }
+
+    /// Retains exact-2.8 serial, optional storage, and optional entropy
+    /// configuration as one atomic destination controller value.
+    #[doc(hidden)]
+    pub fn with_serial_storage_and_entropy_configs(
+        machine_config: MachineConfig,
+        boot_source_config: BootSourceConfig,
+        storage_configs: Option<CaptureReadyStorageConfigs>,
+        serial_config: SerialConfig,
+        entropy_config: Option<EntropyConfig>,
+        resume_requested: bool,
+    ) -> Self {
+        let (drive_configs, pmem_configs) = storage_configs
+            .map(CaptureReadyStorageConfigs::into_parts)
+            .unwrap_or_default();
+        Self {
+            machine_config,
+            boot_source_config,
+            drive_configs: DriveConfigs::from_validated(drive_configs),
+            pmem_configs: PmemConfigs::from_validated(pmem_configs),
+            serial_config,
+            entropy_config,
             resume_requested,
         }
     }
@@ -195,6 +228,7 @@ impl SnapshotV2ControllerCommit {
         DriveConfigs,
         PmemConfigs,
         SerialConfig,
+        Option<EntropyConfig>,
         bool,
     ) {
         (
@@ -203,6 +237,7 @@ impl SnapshotV2ControllerCommit {
             self.drive_configs,
             self.pmem_configs,
             self.serial_config,
+            self.entropy_config,
             self.resume_requested,
         )
     }
