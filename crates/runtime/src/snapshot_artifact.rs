@@ -45,8 +45,9 @@ use crate::snapshot_format::{
 use crate::snapshot_format_v2::{
     NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
     NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
-    NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2ComponentDisposition,
-    SnapshotV2DecodeError, decode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY,
+    NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2ComponentDisposition, SnapshotV2DecodeError,
+    decode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_format_v2::{NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES, decode_snapshot_v2_state};
@@ -55,6 +56,10 @@ use crate::snapshot_memory::{
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory::{load_snapshot_memory_image, verify_snapshot_memory_image_output};
+use crate::snapshot_memory_hotplug_v2_10::{
+    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, SnapshotV2MemoryHotplugState,
+    SnapshotV2MemoryHotplugStateDecodeError,
+};
 use crate::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryLoadError, SnapshotV2MemoryStateError,
     decode_snapshot_v2_memory_binding,
@@ -105,6 +110,8 @@ pub enum NativeV2SnapshotArtifactProfile {
     EntropyStateV2_8,
     /// Exact 2.9 profile with required serial and optional storage/entropy/balloon.
     BalloonStateV2_9,
+    /// Exact 2.10 profile with optional storage, entropy, balloon, and virtio-mem.
+    MemoryHotplugStateV2_10,
 }
 
 /// Validation failure for one owned native snapshot artifact state.
@@ -905,6 +912,134 @@ impl fmt::Debug for NativeV2BalloonSnapshotCandidateState {
     }
 }
 
+/// One closed exact native-v2 2.10 virtio-mem candidate.
+///
+/// Required serial, independently optional unchanged profile-3 storage,
+/// entropy and balloon state, optional virtio-mem state, and the memory
+/// binding are all derived from the same immutable bytes. This candidate can
+/// enter compatible internal artifact authority only; it cannot enter current
+/// publication or load authority while the public writer remains exact 2.9.
+pub struct NativeV2MemoryHotplugSnapshotCandidateState {
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+    balloon: Option<SnapshotV2BalloonState>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+}
+
+/// Owned parts retained by one exact native-v2 2.10 virtio-mem candidate.
+pub type NativeV2MemoryHotplugSnapshotCandidateParts = (
+    Vec<u8>,
+    SnapshotV2MemoryBinding,
+    Option<SnapshotV2StorageDeviceGraph>,
+    SnapshotV2SerialState,
+    Option<SnapshotV2EntropyState>,
+    Option<SnapshotV2BalloonState>,
+    Option<SnapshotV2MemoryHotplugState>,
+);
+
+impl NativeV2MemoryHotplugSnapshotCandidateState {
+    /// Validates and retains one exact native-v2 2.10 state.
+    pub fn from_memory_hotplug_state_v2_10(
+        bytes: Vec<u8>,
+    ) -> Result<Self, NativeV2SnapshotCandidateStateError> {
+        let (binding, device_graph, serial, entropy, balloon, memory_hotplug) =
+            decode_memory_hotplug_state_v2_10(&bytes)?;
+        Ok(Self {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+        })
+    }
+
+    /// Returns the exact candidate compatibility version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+    }
+
+    /// Returns the immutable encoded state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the memory commitment derived from the encoded state.
+    pub const fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.binding
+    }
+
+    /// Returns the optional unchanged profile-3 storage graph.
+    pub const fn device_graph(&self) -> Option<&SnapshotV2StorageDeviceGraph> {
+        self.device_graph.as_ref()
+    }
+
+    /// Returns the required unchanged exact-2.7 serial state.
+    pub const fn serial(&self) -> &SnapshotV2SerialState {
+        &self.serial
+    }
+
+    /// Returns the optional unchanged exact-2.8 entropy state.
+    pub const fn entropy(&self) -> Option<&SnapshotV2EntropyState> {
+        self.entropy.as_ref()
+    }
+
+    /// Returns the optional unchanged exact-2.9 balloon state.
+    pub const fn balloon(&self) -> Option<&SnapshotV2BalloonState> {
+        self.balloon.as_ref()
+    }
+
+    /// Returns the optional exact-2.10 virtio-mem state.
+    pub const fn memory_hotplug(&self) -> Option<&SnapshotV2MemoryHotplugState> {
+        self.memory_hotplug.as_ref()
+    }
+
+    /// Consumes the candidate into its exact committed components.
+    pub fn into_parts(self) -> NativeV2MemoryHotplugSnapshotCandidateParts {
+        (
+            self.bytes,
+            self.binding,
+            self.device_graph,
+            self.serial,
+            self.entropy,
+            self.balloon,
+            self.memory_hotplug,
+        )
+    }
+
+    /// Consumes this exact 2.10 candidate into compatible artifact authority.
+    pub fn into_compatible_artifact_state(self) -> NativeSnapshotArtifactState {
+        let (bytes, binding, _, _, _, _, _) = self.into_parts();
+        NativeSnapshotArtifactState {
+            inner: NativeSnapshotArtifactStateInner::V2 {
+                bytes,
+                version: NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                binding,
+            },
+        }
+    }
+}
+
+impl fmt::Debug for NativeV2MemoryHotplugSnapshotCandidateState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2MemoryHotplugSnapshotCandidateState")
+            .field("version", &self.version())
+            .field("has_storage", &self.device_graph.is_some())
+            .field("has_entropy", &self.entropy.is_some())
+            .field("has_balloon", &self.balloon.is_some())
+            .field("has_memory_hotplug", &self.memory_hotplug.is_some())
+            .field("state", &REDACTED)
+            .field("memory_binding", &REDACTED)
+            .field("serial", &REDACTED)
+            .finish()
+    }
+}
+
 fn decode_device_graph_v2_4(
     bytes: &[u8],
 ) -> Result<(SnapshotV2MemoryBinding, SnapshotV2DeviceGraph), NativeV2SnapshotCandidateStateError> {
@@ -1279,13 +1414,158 @@ fn decode_balloon_state_v2_9(
     Ok((binding, device_graph, serial, entropy, balloon))
 }
 
+type DecodedMemoryHotplugSnapshotV2_10 = (
+    SnapshotV2MemoryBinding,
+    Option<SnapshotV2StorageDeviceGraph>,
+    SnapshotV2SerialState,
+    Option<SnapshotV2EntropyState>,
+    Option<SnapshotV2BalloonState>,
+    Option<SnapshotV2MemoryHotplugState>,
+);
+
+fn decode_memory_hotplug_state_v2_10(
+    bytes: &[u8],
+) -> Result<DecodedMemoryHotplugSnapshotV2_10, NativeV2SnapshotCandidateStateError> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        bytes,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .map_err(NativeV2SnapshotCandidateStateError::Format)?;
+    let version = state.metadata().version();
+    if version != NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION {
+        return Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version });
+    }
+    let binding = decode_snapshot_v2_memory_binding(&state)
+        .map_err(NativeV2SnapshotCandidateStateError::Memory)?;
+    if binding.version() != version {
+        return Err(NativeV2SnapshotCandidateStateError::VersionMismatch {
+            state: version,
+            memory: binding.version(),
+        });
+    }
+
+    let mut graph_components = state
+        .components()
+        .filter(|component| component.key().kind() == NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind());
+    let graph = graph_components.next();
+    if graph_components.next().is_some()
+        || graph.is_some_and(|component| {
+            component.key() != NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY
+                || component.disposition() != SnapshotV2ComponentDisposition::Semantic
+        })
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidDeviceGraphComponent);
+    }
+    let device_graph = graph
+        .map(|component| {
+            SnapshotV2StorageDeviceGraph::decode(
+                NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                component.payload(),
+            )
+            .map_err(NativeV2SnapshotCandidateStateError::StorageDeviceGraph)
+        })
+        .transpose()?;
+
+    let mut serial_components = state
+        .components()
+        .filter(|component| component.key().kind() == NATIVE_V2_SERIAL_COMPONENT_KEY.kind());
+    let serial = serial_components
+        .next()
+        .ok_or(NativeV2SnapshotCandidateStateError::MissingSerialState)?;
+    if serial_components.next().is_some()
+        || serial.key() != NATIVE_V2_SERIAL_COMPONENT_KEY
+        || serial.disposition() != SnapshotV2ComponentDisposition::Semantic
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidSerialComponent);
+    }
+    let serial = SnapshotV2SerialState::decode(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        serial.payload(),
+    )
+    .map_err(NativeV2SnapshotCandidateStateError::SerialState)?;
+
+    let mut entropy_components = state
+        .components()
+        .filter(|component| component.key().kind() == NATIVE_V2_ENTROPY_COMPONENT_KEY.kind());
+    let entropy = entropy_components.next();
+    if entropy_components.next().is_some()
+        || entropy.is_some_and(|component| {
+            component.key() != NATIVE_V2_ENTROPY_COMPONENT_KEY
+                || component.disposition() != SnapshotV2ComponentDisposition::Semantic
+        })
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidEntropyComponent);
+    }
+    let entropy = entropy
+        .map(|component| {
+            SnapshotV2EntropyState::decode(
+                NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                component.payload(),
+            )
+            .map_err(NativeV2SnapshotCandidateStateError::EntropyState)
+        })
+        .transpose()?;
+
+    let mut balloon_components = state
+        .components()
+        .filter(|component| component.key().kind() == NATIVE_V2_BALLOON_COMPONENT_KEY.kind());
+    let balloon = balloon_components.next();
+    if balloon_components.next().is_some()
+        || balloon.is_some_and(|component| {
+            component.key() != NATIVE_V2_BALLOON_COMPONENT_KEY
+                || component.disposition() != SnapshotV2ComponentDisposition::Semantic
+        })
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidBalloonComponent);
+    }
+    let balloon = balloon
+        .map(|component| {
+            SnapshotV2BalloonState::decode(
+                NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                component.payload(),
+            )
+            .map_err(NativeV2SnapshotCandidateStateError::BalloonState)
+        })
+        .transpose()?;
+
+    let mut memory_hotplug_components = state.components().filter(|component| {
+        component.key().kind() == NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY.kind()
+    });
+    let memory_hotplug = memory_hotplug_components.next();
+    if memory_hotplug_components.next().is_some()
+        || memory_hotplug.is_some_and(|component| {
+            component.key() != NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY
+                || component.disposition() != SnapshotV2ComponentDisposition::Semantic
+        })
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidMemoryHotplugComponent);
+    }
+    let memory_hotplug = memory_hotplug
+        .map(|component| {
+            SnapshotV2MemoryHotplugState::decode(
+                NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                component.payload(),
+            )
+            .map_err(NativeV2SnapshotCandidateStateError::MemoryHotplugState)
+        })
+        .transpose()?;
+    Ok((
+        binding,
+        device_graph,
+        serial,
+        entropy,
+        balloon,
+        memory_hotplug,
+    ))
+}
+
 fn classify_native_v2_profile(
     bytes: &[u8],
     expected_binding: &SnapshotV2MemoryBinding,
 ) -> Result<NativeV2SnapshotArtifactProfile, NativeV2SnapshotCandidateStateError> {
     let state = decode_snapshot_v2_state_with_compatibility_version(
         bytes,
-        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
     )
     .map_err(NativeV2SnapshotCandidateStateError::Format)?;
     let version = state.metadata().version();
@@ -1365,6 +1645,10 @@ fn classify_native_v2_profile(
             decode_balloon_state_v2_9(bytes)?;
             Ok(NativeV2SnapshotArtifactProfile::BalloonStateV2_9)
         }
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION => {
+            decode_memory_hotplug_state_v2_10(bytes)?;
+            Ok(NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10)
+        }
         _ => Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version }),
     }
 }
@@ -1424,6 +1708,10 @@ pub enum NativeV2SnapshotCandidateStateError {
     InvalidBalloonComponent,
     /// The optional balloon-state payload is invalid.
     BalloonState(SnapshotV2BalloonStateDecodeError),
+    /// An exact-2.10 virtio-mem component is not one semantic singleton.
+    InvalidMemoryHotplugComponent,
+    /// The optional virtio-mem-state payload is invalid.
+    MemoryHotplugState(SnapshotV2MemoryHotplugStateDecodeError),
 }
 
 impl fmt::Display for NativeV2SnapshotCandidateStateError {
@@ -1498,6 +1786,15 @@ impl fmt::Display for NativeV2SnapshotCandidateStateError {
                     "invalid native-v2 candidate balloon state: {source}"
                 )
             }
+            Self::InvalidMemoryHotplugComponent => {
+                formatter.write_str("native-v2 candidate virtio-mem component is invalid")
+            }
+            Self::MemoryHotplugState(source) => {
+                write!(
+                    formatter,
+                    "invalid native-v2 candidate virtio-mem state: {source}"
+                )
+            }
         }
     }
 }
@@ -1513,6 +1810,7 @@ impl std::error::Error for NativeV2SnapshotCandidateStateError {
             Self::SerialState(source) => Some(source),
             Self::EntropyState(source) => Some(source),
             Self::BalloonState(source) => Some(source),
+            Self::MemoryHotplugState(source) => Some(source),
             Self::UnexpectedVersion { .. }
             | Self::VersionMismatch { .. }
             | Self::MissingDeviceGraph
@@ -1520,7 +1818,8 @@ impl std::error::Error for NativeV2SnapshotCandidateStateError {
             | Self::MissingSerialState
             | Self::InvalidSerialComponent
             | Self::InvalidEntropyComponent
-            | Self::InvalidBalloonComponent => None,
+            | Self::InvalidBalloonComponent
+            | Self::InvalidMemoryHotplugComponent => None,
         }
     }
 }

@@ -7,6 +7,7 @@ use crate::snapshot_format::{
     NativeSnapshotFormatError, NativeSnapshotState, decode_native_snapshot_state,
     encode_snapshot_envelope,
 };
+use crate::snapshot_memory_hotplug_v2_10::NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
 
 use super::*;
@@ -206,7 +207,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn current_writer_advances_to_balloon_nine_and_retains_earlier_profiles() {
+fn current_writer_stays_at_balloon_nine_while_internal_ceiling_reaches_memory_hotplug_ten() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -216,6 +217,12 @@ fn current_writer_advances_to_balloon_nine_and_retains_earlier_profiles() {
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
         NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
+    );
+    assert_eq!(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY.kind(), 11);
+    assert_eq!(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY.instance(), 0);
+    assert_eq!(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        SnapshotFormatVersion::new(2, 10, 0)
     );
     assert_eq!(
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
@@ -476,19 +483,66 @@ fn current_writer_advances_to_balloon_nine_and_retains_earlier_profiles() {
         Err(SnapshotV2DecodeError::UnknownSemanticComponent)
     );
 
-    let future = SnapshotFormatVersion::new(2, 10, 0);
+    let memory_hotplug = SnapshotV2Component::new(
+        NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        b"memory-hotplug",
+    );
+    let memory_hotplug_state = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &[serial, entropy, balloon, memory_hotplug],
+    )
+    .expect("exact 2.10 should admit virtio-mem through the explicit seam");
+    let decoded_memory_hotplug = decode_snapshot_v2_state_with_compatibility_version(
+        &memory_hotplug_state,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact 2.10 virtio-mem container should decode internally");
+    assert_eq!(
+        decoded_memory_hotplug.metadata().version(),
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        decoded_memory_hotplug.component(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY),
+        Some(memory_hotplug)
+    );
+    assert!(matches!(
+        decode_snapshot_v2_state(&memory_hotplug_state),
+        Err(SnapshotV2DecodeError::UnsupportedVersion {
+            found,
+            supported: NATIVE_V2_SNAPSHOT_VERSION,
+        }) if found == NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+    ));
+    assert!(matches!(
+        decode_native_snapshot_state(&memory_hotplug_state),
+        Err(NativeSnapshotFormatError::NativeV2(
+            SnapshotV2DecodeError::UnsupportedVersion { .. }
+        ))
+    ));
+    let downgraded_memory_hotplug =
+        with_u16_field_and_checksum(&memory_hotplug_state, VERSION_MINOR_OFFSET, 9);
+    assert_eq!(
+        decode_snapshot_v2_state_with_compatibility_version(
+            &downgraded_memory_hotplug,
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        ),
+        Err(SnapshotV2DecodeError::UnknownSemanticComponent)
+    );
+
+    let future = SnapshotFormatVersion::new(2, 11, 0);
     assert!(matches!(
         encode_snapshot_v2_state_with_compatibility_version(future, &[], &[]),
         Err(SnapshotV2EncodeError::UnsupportedVersion {
             requested,
-            maximum: NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+            maximum: NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
         }) if requested == future
     ));
     assert_eq!(
         decode_snapshot_v2_state_with_compatibility_version(&EMPTY_V2_FIXTURE, future),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
             found: future,
-            supported: NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
         })
     );
 }
