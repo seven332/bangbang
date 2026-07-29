@@ -528,7 +528,7 @@ execution proves:
   reuse for a second pair, same-GrantId concurrent-session isolation, bounded
   early description, and two fresh descriptor-bound state/memory/root restores
   with explicit and automatic resume through guest `SYSTEM_OFF`; and
-- exact native-v2 2.6 through current 2.8 profile-3 rooted pmem-only and
+- exact native-v2 2.6 through current 2.9 profile-3 rooted pmem-only and
   rootless mixed-storage create/load over MMIO and PCI, with exact read-only/read-write
   `PmemBacking` grants, source-path replacement resistance, complete-set
   cross-class alias rejection, immutable state/memory reuse, shared writable
@@ -539,12 +539,18 @@ execution proves:
   fresh destination ownership and metrics, restored UART/RX/pending-interrupt
   progress, storage composition, explicit/automatic resume, recapture,
   redaction, and session/grant cleanup; and
-- current native-v2 2.8 entropy-only and storage-plus-entropy create/load over
+- exact native-v2 2.8 entropy-only and storage-plus-entropy create/load over
   MMIO and PCI with exact pending queue/dual-limiter/retry state, fresh entropy
   source/scheduler/notifier/route/endpoint/metrics owners, source-path
   replacement resistance, explicit/automatic resume, recapture,
   checksum-malformed state rejection, graceful cancellation, redaction,
   and both launcher/worker death-order staging/session/socket cleanup; and
+- current native-v2 2.9 storage-plus-balloon create/load over MMIO and PCI with
+  exact accounting/statistics/hint/report state, destination-local polling,
+  fresh metrics/notifier/interrupt/reclaim/endpoint ownership,
+  pathname-replacement resistance, explicit/automatic resume, recapture,
+  immutable clone isolation, malformed/cancellation rejection, and both
+  launcher/worker death-order staging/session/socket cleanup; and
 - worker-first death after a durably recorded snapshot staging inode, with the
   launcher removing the exact inode or preserving a same-name replacement while
   clearing the private record and session namespace.

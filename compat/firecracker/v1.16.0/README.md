@@ -419,10 +419,11 @@ pause/capture/resume, target-to-zero convergence, metrics, failure diagnostics,
 and cleanup. The checked [`balloon-contract.md`](balloon-contract.md) promotes
 all 50 API operation/path/property/schema leaves. Exactly
 `corpus:ballooning` and
-`semantic.memory-device:balloon-oom-stats-hinting-and-reporting` remain
-`audit-required`; Wave 6 owns encoding, artifact integration, restore,
-migration/clone behavior, portability, and signed restored-guest outcomes. The
-overlay at that checkpoint was therefore 164 `implemented-and-verified`, 234
+`semantic.memory-device:balloon-oom-stats-hinting-and-reporting` remained
+`audit-required` at that checkpoint; Wave 6 owned encoding, artifact
+integration, restore, migration/clone behavior, portability policy, and signed
+restored-guest outcomes. The overlay at that checkpoint was therefore 164
+`implemented-and-verified`, 234
 `audit-required`, three `missing-platform-feasible`, and 17
 `proven-platform-impossible` records.
 
@@ -647,10 +648,20 @@ without another guest kick; entropy-only and storage-plus-entropy products;
 explicit/automatic resume; recapture; immutable same-process and fresh-process
 clones; production App Sandbox containment; malformed/cancellation/death
 cleanup; and exact 2.3–2.7 reader retention. It promotes exactly the two
-entropy aggregates. Other optional devices/MMDS, Diff, tools, Firecracker
-interoperability, and broad portability remain audited. The current aggregate
-selector is 80 terminal and five `audit-required`, and the current overlay is
-238/160/3/17.
+entropy aggregates. #1680 then activates the exact `2.9.0` writer and loader
+with optional balloon component kind 10
+across all eight storage/entropy/balloon products over coherent MMIO or PCI.
+#1681 certifies signed direct and normal-production/App-Sandbox continuation:
+explicit/automatic resume, destination-local statistics restart, latest and
+pending statistics, DONE-normalized then fresh hinting, reporting,
+inflate/deflate/API accounting, recapture, immutable independent clones, fresh
+metrics and ownership, hostile state, cancellation/death cleanup, containment,
+and best-effort Darwin reclaim. Kind 10 is capped at 262,144 canonical 4-KiB
+PFN ranges and 4 MiB inside the 16-MiB state-file cap. #1681 promotes exactly
+the two retained balloon aggregates. Other optional devices/MMDS, Diff, tools,
+Firecracker interoperability, and broad portability remain audited. The
+current aggregate selector is 82 terminal and three `audit-required`, and the
+current overlay is 240/158/3/17.
 
 ## Commands
 

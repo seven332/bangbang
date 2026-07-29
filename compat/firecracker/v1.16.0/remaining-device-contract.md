@@ -8,15 +8,16 @@ one time/identity aggregate.
 
 The original #1481 checkpoint had 77 terminal rows and eight Wave 6 handoffs.
 The exact 2.7 serial closure in #1652 made 78 rows terminal, and #1666's exact
-2.8 entropy snapshot certification now makes 80 rows
-`implemented-and-verified`; five rows remain `audit-required` because their
+2.8 entropy snapshot certification made 80 rows terminal. #1681's exact 2.9
+balloon snapshot certification now makes 82 rows
+`implemented-and-verified`; three rows remain `audit-required` because their
 remaining optional-device or public-production snapshot composition,
 clone/migration portability, and terminal certification belong to
 [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). The
 repository-wide observability, tools, and specification work belongs to
 [Wave 7 #1491](https://github.com/seven332/bangbang/issues/1491), but zero rows
 in this 85-record selector are handed to Wave 7. Global inventory totals remain
-238 implemented, 160 audit-required, three missing-platform-feasible, and 17
+240 implemented, 158 audit-required, three missing-platform-feasible, and 17
 proven-platform-impossible.
 
 ## Evidence keys
@@ -34,17 +35,20 @@ proven-platform-impossible.
   `normal_bundle_certifies_native_v2_serial_snapshot_continuation_and_containment`.
 - `B-IMPL` — `crates/api/src/http.rs`,
   `crates/bangbang/src/{api_server,vmm}.rs`,
-  `crates/runtime/src/balloon.rs`, and
-  `crates/{runtime,hvf}/src/startup.rs`.
+  `crates/runtime/src/{balloon,snapshot_balloon_v2_9}.rs`,
+  `crates/hvf/src/{snapshot_v2_balloon_platform,startup}.rs`, and
+  exact native-v2 2.9 artifact composition.
 - `B-FOCUSED` —
   `balloon_mmio_capture_retains_complete_detached_live_state`,
   `balloon_notification_signal_dispatch_signals_queued_inflate_descriptor`, and
   `balloon_notification_signal_dispatch_signals_reporting_descriptor_and_records_metrics`;
-  also `AGG-FOCUSED`.
+  plus fixed exact-2.9 codec, product, mapped-memory, owner, rollback,
+  compatibility, and 262,144-range/4-MiB/16-MiB bound tests; also
+  `AGG-FOCUSED`.
 - `B-SIGNED` —
   `capture_ready_balloon_traverses_signed_mmio_and_pci_owners`,
-  `signed_executable_exposes_virtio_balloon_to_direct_rootfs_guest`, and
-  `signed_executable_runs_all_startup_virtio_devices_over_product_pci`;
+  `signed_executable_certifies_native_v2_balloon_snapshot_continuation`, and
+  `normal_bundle_certifies_native_v2_balloon_snapshot_continuation_and_containment`;
   also `AGG-SIGNED`.
 - `M-IMPL` — `crates/api/src/http.rs`,
   `crates/bangbang/src/{api_server,vmm}.rs`,
@@ -116,11 +120,11 @@ proven-platform-impossible.
   `guest_boot::certifies_linux_pvtime_contention_idle_and_paused_accounting`,
   `hvf_lifecycle::native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progress`,
   and `AGG-SIGNED`.
-- `W6-BALLOON` — exact owner
-  [#1490](https://github.com/seven332/bangbang/issues/1490): encode and restore
-  balloon queues, features, accounting, statistics, hinting/reporting, timer
-  continuation, clone/migration policy, portability, and signed restored-guest
-  behavior.
+- `BALLOON-SNAPSHOT` — completed by
+  [#1681](https://github.com/seven332/bangbang/issues/1681): exact 2.9 kind-10
+  queue/statistics/hint/accounting/transport encoding, fresh destination
+  ownership and full-interval polling, immutable clones, direct and contained
+  MMIO/PCI optional-product certification, and signed restored-guest behavior.
 - `W6-MEMORY` — exact owner
   [#1490](https://github.com/seven332/bangbang/issues/1490): encode and restore
   virtio-mem geometry, requested/plugged blocks, mapping/accounting state,
@@ -199,8 +203,8 @@ proven-platform-impossible.
 | `api-schema:BalloonStats` | [balloon](balloon-contract.md) | `implemented-and-verified` | `B-IMPL` | `B-FOCUSED` | `B-SIGNED` | `terminal` |
 | `api-schema:BalloonStatsUpdate` | [balloon](balloon-contract.md) | `implemented-and-verified` | `B-IMPL` | `B-FOCUSED` | `B-SIGNED` | `terminal` |
 | `api-schema:BalloonUpdate` | [balloon](balloon-contract.md) | `implemented-and-verified` | `B-IMPL` | `B-FOCUSED` | `B-SIGNED` | `terminal` |
-| `corpus:ballooning` | [balloon](balloon-contract.md) | `audit-required` | `B-IMPL` | `B-FOCUSED` | `B-SIGNED` | `W6-BALLOON` |
-| `semantic.memory-device:balloon-oom-stats-hinting-and-reporting` | [balloon](balloon-contract.md) | `audit-required` | `B-IMPL` | `B-FOCUSED` | `B-SIGNED` | `W6-BALLOON` |
+| `corpus:ballooning` | [balloon](balloon-contract.md) | `implemented-and-verified` | `B-IMPL` | `B-FOCUSED` | `B-SIGNED` | `terminal` |
+| `semantic.memory-device:balloon-oom-stats-hinting-and-reporting` | [balloon](balloon-contract.md) | `implemented-and-verified` | `B-IMPL` | `B-FOCUSED` | `B-SIGNED` | `terminal` |
 | `api-operation:GET /hotplug/memory` | [memory-hotplug](memory-hotplug-contract.md) | `implemented-and-verified` | `M-IMPL` | `M-FOCUSED` | `M-SIGNED` | `terminal` |
 | `api-operation:PATCH /hotplug/memory` | [memory-hotplug](memory-hotplug-contract.md) | `implemented-and-verified` | `M-IMPL` | `M-FOCUSED` | `M-SIGNED` | `terminal` |
 | `api-operation:PUT /hotplug/memory` | [memory-hotplug](memory-hotplug-contract.md) | `implemented-and-verified` | `M-IMPL` | `M-FOCUSED` | `M-SIGNED` | `terminal` |

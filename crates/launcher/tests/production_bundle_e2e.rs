@@ -38,6 +38,8 @@ use bangbang_pager::{
     PagerError, PagerFrameKind, PagerTransport, PeerSession, ReferencePeer,
     ReferencePeerTermination,
 };
+use bangbang_runtime::balloon::VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
+use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonState;
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
 use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
 use bangbang_session::{
@@ -218,6 +220,8 @@ const SNAPSHOT_ENTROPY_SUCCESS_MARKER: &str = "BANGBANG_SNAPSHOT_ENTROPY_OK";
 const SNAPSHOT_ENTROPY_FAILURE_MARKER: &str = "BANGBANG_SNAPSHOT_ENTROPY_FAIL";
 const SNAPSHOT_ENTROPY_READ_BYTES: u64 = 64;
 const SNAPSHOT_ENTROPY_REFILL_MS: u64 = 3_000;
+const SNAPSHOT_BALLOON_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.balloon-check=1";
+const SNAPSHOT_BALLOON_MARKER: &[u8] = b"BANGBANG_BALLOON_REPORTING_GUEST_CHECK_OK";
 const SNAPSHOT_BLOCK_SECTOR_SIZE: usize = 512;
 const SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE: u8 = 0x11;
 const SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE: u8 = 0x12;
@@ -1660,6 +1664,695 @@ fn run_production_configured_serial_snapshot_continuation(bundle: &Path, enable_
         )
         .expect("opened configured serial drive should read"),
         drive_before
+    );
+}
+
+#[test]
+fn normal_bundle_certifies_native_v2_balloon_snapshot_continuation_and_containment() {
+    let bundle = production_bundle();
+    let baseline_sessions = session_entries();
+    for enable_pci in [false, true] {
+        run_production_balloon_snapshot_continuation(&bundle, enable_pci, &baseline_sessions);
+    }
+    assert_eq!(
+        session_entries(),
+        baseline_sessions,
+        "balloon snapshot launcher and worker teardown must restore the session namespace"
+    );
+}
+
+fn run_production_balloon_snapshot_continuation(
+    bundle: &Path,
+    enable_pci: bool,
+    baseline_sessions: &[PathBuf],
+) {
+    let transport = if enable_pci { "pci" } else { "mmio" };
+    let source_fixture = SnapshotSourceGrantFixture::new(&format!("{transport}-balloon-source"));
+    let mut source = spawn_ready_snapshot_grant_api_launcher(
+        bundle,
+        &source_fixture.manifest,
+        source_fixture.sensitive_strings(),
+        &format!("balloon-snapshot-{transport}-source"),
+        false,
+        enable_pci,
+    );
+    source_fixture.replace_source_file_pathnames();
+    configure_and_start_balloon_snapshot_source(&source.socket, transport);
+    wait_for_production_balloon_page_counts(
+        &source.socket,
+        2_048,
+        2_048,
+        &format!("production {transport} balloon source inflation"),
+    );
+    assert_http_status(
+        &http_request(
+            &source.socket,
+            "PATCH",
+            "/balloon/statistics",
+            r#"{"stats_polling_interval_s":2}"#,
+        ),
+        204,
+        &format!("update production {transport} balloon polling interval"),
+    );
+    wait_for_production_balloon_optional_statistics(
+        &source.socket,
+        &format!("production {transport} balloon source statistics"),
+    );
+    assert_http_status(
+        &http_request(
+            &source.socket,
+            "PATCH",
+            "/balloon/hinting/start",
+            r#"{"acknowledge_on_stop":true}"#,
+        ),
+        204,
+        &format!("start production {transport} balloon hinting"),
+    );
+    wait_for_production_balloon_hinting_status(
+        &source.socket,
+        u64::from(VIRTIO_BALLOON_FREE_PAGE_HINT_DONE),
+        Some(0),
+        &format!("production {transport} balloon source hinting"),
+    );
+    assert_http_status(
+        &http_request(&source.socket, "PATCH", "/balloon/hinting/stop", ""),
+        204,
+        &format!("stop production {transport} balloon hinting"),
+    );
+    wait_for_production_balloon_metric(
+        &source.socket,
+        &source_fixture.opened_metrics,
+        "free_page_report_count",
+        1,
+        &format!("production {transport} balloon source reporting"),
+    );
+    wait_for_file_prefix(
+        &source_fixture.opened_data_backing,
+        SNAPSHOT_BALLOON_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        panic!("production {transport} balloon guest marker should publish: {error}")
+    });
+    assert_http_status(
+        &http_request(&source.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        &format!("pause production {transport} balloon source"),
+    );
+    assert_http_status(
+        &http_put(&source.socket, "/snapshot/create", &snapshot_create_body()),
+        204,
+        &format!("create production {transport} balloon snapshot"),
+    );
+    let artifacts = source_fixture.artifacts();
+    let source_balloon = assert_production_balloon_snapshot(
+        &artifacts.state,
+        enable_pci,
+        &format!("{transport} source"),
+    );
+    assert_no_snapshot_staging(&source_fixture.state_directory);
+    assert_no_snapshot_staging(&source_fixture.memory_directory);
+    let state_before =
+        fs::read(&artifacts.state).expect("production balloon source state should read");
+    let memory_before =
+        fs::read(&artifacts.memory).expect("production balloon source memory should read");
+    stop_running_launcher(
+        &mut source,
+        &format!("production {transport} balloon snapshot source"),
+    );
+    assert_eq!(session_entries(), baseline_sessions);
+
+    let mut current = artifacts;
+    if !enable_pci {
+        run_production_balloon_malformed_state_case(bundle, &current, baseline_sessions);
+        for shutdown in [
+            BalloonSnapshotShutdown::GracefulCancellation,
+            BalloonSnapshotShutdown::WorkerFirst,
+            BalloonSnapshotShutdown::LauncherFirst,
+        ] {
+            current = run_production_balloon_paused_shutdown_case(
+                bundle,
+                current,
+                shutdown,
+                baseline_sessions,
+            );
+        }
+    }
+
+    let explicit_case = format!("{transport}-explicit");
+    current = run_production_balloon_snapshot_destination(ProductionBalloonSnapshotDestination {
+        bundle,
+        artifacts: current,
+        source_balloon: &source_balloon,
+        enable_pci,
+        resume_vm: false,
+        recapture: true,
+        case: &explicit_case,
+        baseline_sessions,
+    });
+    let automatic_case = format!("{transport}-automatic");
+    let final_artifacts =
+        run_production_balloon_snapshot_destination(ProductionBalloonSnapshotDestination {
+            bundle,
+            artifacts: current,
+            source_balloon: &source_balloon,
+            enable_pci,
+            resume_vm: true,
+            recapture: false,
+            case: &automatic_case,
+            baseline_sessions,
+        });
+    assert_eq!(
+        fs::read(&final_artifacts.state).expect("final balloon state should read"),
+        state_before,
+        "{transport} contained repeated loads must not mutate state"
+    );
+    assert_eq!(
+        fs::read(&final_artifacts.memory).expect("final balloon memory should read"),
+        memory_before,
+        "{transport} contained repeated loads must not mutate memory"
+    );
+}
+
+fn configure_and_start_balloon_snapshot_source(socket: &Path, context: &str) {
+    for (path, body, request) in [
+        (
+            "/machine-config",
+            serde_json::json!({"vcpu_count": 1, "mem_size_mib": 256}),
+            "machine config",
+        ),
+        (
+            "/balloon",
+            serde_json::json!({
+                "amount_mib": 8,
+                "deflate_on_oom": true,
+                "stats_polling_interval_s": 1,
+                "free_page_hinting": true,
+                "free_page_reporting": true,
+            }),
+            "balloon config",
+        ),
+        (
+            "/metrics",
+            serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}),
+            "metrics",
+        ),
+        (
+            "/boot-source",
+            serde_json::json!({
+                "kernel_image_path": SNAPSHOT_KERNEL_REF,
+                "boot_args": SNAPSHOT_BALLOON_BOOT_ARGS,
+            }),
+            "boot source",
+        ),
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": SNAPSHOT_ROOT_REF,
+                "is_root_device": true,
+                "is_read_only": false,
+            }),
+            "root drive",
+        ),
+        (
+            "/drives/data",
+            serde_json::json!({
+                "drive_id": "data",
+                "path_on_host": SNAPSHOT_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+            }),
+            "data drive",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                socket,
+                path,
+                &serde_json::to_string(&body)
+                    .expect("production balloon snapshot request should serialize"),
+            ),
+            204,
+            &format!("PUT production {context} balloon snapshot {request}"),
+        );
+    }
+    assert_http_status(
+        &http_put(socket, "/actions", r#"{"action_type":"InstanceStart"}"#),
+        204,
+        &format!("start production {context} balloon snapshot source"),
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BalloonSnapshotShutdown {
+    GracefulCancellation,
+    WorkerFirst,
+    LauncherFirst,
+}
+
+fn run_production_balloon_malformed_state_case(
+    bundle: &Path,
+    artifacts: &SnapshotArtifactSet,
+    baseline_sessions: &[PathBuf],
+) {
+    let original_state =
+        fs::read(&artifacts.state).expect("valid balloon state should read before corruption");
+    let original_memory =
+        fs::read(&artifacts.memory).expect("valid balloon memory should read before corruption");
+    let malformed_root = TestDir::new("balloon-snapshot-malformed");
+    let canonical_root = fs::canonicalize(malformed_root.path())
+        .expect("malformed balloon fixture root should canonicalize");
+    let malformed = SnapshotArtifactSet {
+        state: canonical_root.join("malformed-state.snap"),
+        memory: canonical_root.join("malformed-memory.snap"),
+        root: canonical_root.join("malformed-root.img"),
+        data: canonical_root.join("malformed-data.img"),
+        audit: canonical_root.join("malformed-audit.img"),
+    };
+    fs::copy(&artifacts.state, &malformed.state)
+        .expect("malformed balloon state fixture should copy");
+    for (source, destination, context) in [
+        (
+            &artifacts.memory,
+            &malformed.memory,
+            "malformed balloon memory",
+        ),
+        (&artifacts.root, &malformed.root, "malformed balloon root"),
+        (&artifacts.data, &malformed.data, "malformed balloon data"),
+        (
+            &artifacts.audit,
+            &malformed.audit,
+            "malformed balloon audit",
+        ),
+    ] {
+        hard_link_or_copy_fixture(source, destination, context);
+    }
+    let mut malformed_bytes =
+        fs::read(&malformed.state).expect("malformed balloon state fixture should read");
+    let last = malformed_bytes
+        .len()
+        .checked_sub(1)
+        .expect("native-v2 balloon state must be nonempty");
+    malformed_bytes[last] ^= 0x80;
+    fs::write(&malformed.state, malformed_bytes)
+        .expect("malformed balloon checksum fixture should write");
+
+    let fixture = BalloonSnapshotInputGrantFixture::new("malformed", malformed, false);
+    let sensitive = fixture.sensitive_strings();
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        sensitive.clone(),
+        "balloon-snapshot-malformed",
+        false,
+    );
+    fixture.replace_source_pathnames();
+    configure_balloon_snapshot_destination_metrics(&running.socket, "malformed");
+    let response = http_put(
+        &running.socket,
+        "/snapshot/load",
+        &snapshot_load_body(false),
+    );
+    assert_http_status(
+        &response,
+        400,
+        "reject malformed production balloon snapshot",
+    );
+    for private in &sensitive {
+        assert!(
+            !response.contains(private),
+            "malformed balloon restore fault must redact private grant data"
+        );
+    }
+    assert!(
+        http_get(&running.socket, "/").contains(r#""state":"Not started""#),
+        "malformed balloon restore must not publish a VM"
+    );
+    assert!(
+        fs::read(&fixture.opened_metrics)
+            .expect("malformed balloon metrics should read")
+            .is_empty(),
+        "malformed balloon restore must not publish metrics"
+    );
+    stop_running_launcher(&mut running, "malformed balloon snapshot destination");
+    assert_eq!(session_entries(), baseline_sessions);
+    assert_eq!(
+        fs::read(&artifacts.state).expect("valid balloon state should survive malformed load"),
+        original_state
+    );
+    assert_eq!(
+        fs::read(&artifacts.memory).expect("valid balloon memory should survive malformed load"),
+        original_memory
+    );
+}
+
+fn run_production_balloon_paused_shutdown_case(
+    bundle: &Path,
+    artifacts: SnapshotArtifactSet,
+    shutdown: BalloonSnapshotShutdown,
+    baseline_sessions: &[PathBuf],
+) -> SnapshotArtifactSet {
+    let name = match shutdown {
+        BalloonSnapshotShutdown::GracefulCancellation => "cancellation",
+        BalloonSnapshotShutdown::WorkerFirst => "worker-first",
+        BalloonSnapshotShutdown::LauncherFirst => "launcher-first",
+    };
+    let fixture = BalloonSnapshotInputGrantFixture::new(name, artifacts, false);
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        fixture.sensitive_strings(),
+        &format!("balloon-snapshot-{name}"),
+        false,
+    );
+    let opened = fixture.replace_source_pathnames();
+    configure_balloon_snapshot_destination_metrics(&running.socket, name);
+    assert!(
+        fs::read(&fixture.opened_metrics)
+            .expect("shutdown-case balloon metrics should read")
+            .is_empty(),
+        "fresh {name} balloon metrics should start empty"
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/snapshot/load",
+            &snapshot_load_body(false),
+        ),
+        204,
+        &format!("load production balloon snapshot before {name}"),
+    );
+    assert!(
+        http_get(&running.socket, "/").contains(r#""state":"Paused""#),
+        "balloon destination should remain Paused before {name}"
+    );
+    assert_production_balloon_config(&running.socket, name);
+    let state_before = fs::read(&opened.state).expect("shutdown-case balloon state should read");
+    let memory_before = fs::read(&opened.memory).expect("shutdown-case balloon memory should read");
+    assert_eq!(session_entries().len(), baseline_sessions.len() + 1);
+
+    let status = match shutdown {
+        BalloonSnapshotShutdown::GracefulCancellation => {
+            let launcher =
+                i32::try_from(running.child.id()).expect("balloon launcher PID should fit");
+            // SAFETY: The unreaped launcher owns this exact PID.
+            assert_eq!(unsafe { libc::kill(launcher, libc::SIGTERM) }, 0);
+            running.wait("Paused balloon restoration cancellation")
+        }
+        BalloonSnapshotShutdown::WorkerFirst => {
+            let worker = only_worker_pid(&running.child);
+            // SAFETY: The worker is the sole live child of the unreaped launcher.
+            assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+            running.wait("Paused balloon worker-first death")
+        }
+        BalloonSnapshotShutdown::LauncherFirst => {
+            let worker = only_worker_pid(&running.child);
+            let worker_exit = ProcessExitWatch::new(worker);
+            let launcher =
+                i32::try_from(running.child.id()).expect("balloon launcher PID should fit");
+            // SAFETY: The unreaped launcher owns this PID and its worker
+            // independently observes authenticated lifecycle EOF.
+            assert_eq!(unsafe { libc::kill(launcher, libc::SIGKILL) }, 0);
+            let result = running.wait("Paused balloon launcher-first death");
+            assert!(
+                worker_exit.wait(PROCESS_TIMEOUT),
+                "balloon worker should observe launcher death"
+            );
+            result
+        }
+    };
+    match shutdown {
+        BalloonSnapshotShutdown::GracefulCancellation => {
+            assert!(status.success(), "balloon cancellation should be graceful");
+        }
+        BalloonSnapshotShutdown::WorkerFirst => {
+            assert_eq!(status.code(), Some(128 + libc::SIGKILL));
+        }
+        BalloonSnapshotShutdown::LauncherFirst => {
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+        }
+    }
+    assert!(
+        !running.socket.exists(),
+        "production balloon {name} destination should remove its API socket"
+    );
+    assert_eq!(session_entries(), baseline_sessions);
+    assert_eq!(
+        fs::read(&opened.state).expect("shutdown-case balloon state should remain"),
+        state_before,
+        "balloon {name} must preserve immutable state"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("shutdown-case balloon memory should remain"),
+        memory_before,
+        "balloon {name} must preserve immutable memory"
+    );
+    assert_eq!(
+        fs::read(&fixture.metrics).expect("shutdown-case replacement metrics should read"),
+        b"replacement metrics must remain unused\n"
+    );
+    opened
+}
+
+struct ProductionBalloonSnapshotDestination<'a> {
+    bundle: &'a Path,
+    artifacts: SnapshotArtifactSet,
+    source_balloon: &'a SnapshotV2BalloonState,
+    enable_pci: bool,
+    resume_vm: bool,
+    recapture: bool,
+    case: &'a str,
+    baseline_sessions: &'a [PathBuf],
+}
+
+fn run_production_balloon_snapshot_destination(
+    destination: ProductionBalloonSnapshotDestination<'_>,
+) -> SnapshotArtifactSet {
+    let ProductionBalloonSnapshotDestination {
+        bundle,
+        artifacts,
+        source_balloon,
+        enable_pci,
+        resume_vm,
+        recapture,
+        case,
+        baseline_sessions,
+    } = destination;
+    let fixture = BalloonSnapshotInputGrantFixture::new(case, artifacts, recapture);
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        fixture.sensitive_strings(),
+        &format!("balloon-snapshot-{case}"),
+        enable_pci,
+    );
+    let opened = fixture.replace_source_pathnames();
+    let state_before =
+        fs::read(&opened.state).expect("destination balloon state should read before load");
+    let memory_before =
+        fs::read(&opened.memory).expect("destination balloon memory should read before load");
+    configure_balloon_snapshot_destination_metrics(&running.socket, case);
+    assert!(
+        fs::read(&fixture.opened_metrics)
+            .expect("destination balloon metrics should read")
+            .is_empty(),
+        "production {case} destination metrics should start empty"
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/snapshot/load",
+            &snapshot_load_body(resume_vm),
+        ),
+        204,
+        &format!("load production {case} balloon snapshot"),
+    );
+    assert!(
+        http_get(&running.socket, "/").contains(if resume_vm {
+            r#""state":"Running""#
+        } else {
+            r#""state":"Paused""#
+        }),
+        "production {case} destination should publish the requested resume state"
+    );
+    assert_production_balloon_config(&running.socket, case);
+
+    if !resume_vm {
+        thread::sleep(Duration::from_millis(2_250));
+        flush_production_metrics(&running.socket, &format!("{case} while Paused"));
+        assert_eq!(
+            production_balloon_metric_total(&fixture.opened_metrics, "stats_updates_count"),
+            0,
+            "production {case} must not schedule retained statistics while Paused"
+        );
+        if recapture {
+            assert_http_status(
+                &http_put(&running.socket, "/snapshot/create", &snapshot_create_body()),
+                204,
+                &format!("recapture production {case} balloon snapshot"),
+            );
+            let recaptured = fixture.recaptured_artifacts();
+            let recaptured_balloon = assert_production_balloon_snapshot(
+                &recaptured.state,
+                enable_pci,
+                &format!("{case} recapture"),
+            );
+            assert_eq!(
+                &recaptured_balloon, source_balloon,
+                "production {case} Paused recapture should retain normalized balloon semantics"
+            );
+            fixture.assert_no_recapture_staging();
+        }
+        assert_http_status(
+            &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            204,
+            &format!("resume production {case} balloon destination"),
+        );
+    }
+
+    let restored_statistics = http_get(&running.socket, "/balloon/statistics");
+    assert_http_status(
+        &restored_statistics,
+        200,
+        &format!("read production {case} restored balloon statistics"),
+    );
+    assert_production_balloon_statistics_match_snapshot(&restored_statistics, source_balloon, case);
+    let hinting = http_get(&running.socket, "/balloon/hinting/status");
+    assert_http_status(
+        &hinting,
+        200,
+        &format!("read production {case} restored balloon hinting"),
+    );
+    assert!(
+        hinting.contains(r#""host_cmd":1"#),
+        "production {case} restored hinting should normalize to DONE; response:\n{hinting}"
+    );
+
+    let resumed_at = Instant::now();
+    thread::sleep(Duration::from_millis(500));
+    flush_production_metrics(
+        &running.socket,
+        &format!("{case} before full statistics interval"),
+    );
+    assert_eq!(
+        production_balloon_metric_total(&fixture.opened_metrics, "stats_updates_count"),
+        0,
+        "production {case} retained statistics work must not complete early"
+    );
+    wait_for_production_balloon_metric(
+        &running.socket,
+        &fixture.opened_metrics,
+        "stats_updates_count",
+        1,
+        &format!("production {case} retained statistics descriptor"),
+    );
+    assert!(
+        resumed_at.elapsed() >= Duration::from_millis(1_500),
+        "production {case} statistics completion should wait for one destination-local interval"
+    );
+
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/balloon/hinting/start",
+            r#"{"acknowledge_on_stop":true}"#,
+        ),
+        204,
+        &format!("start production {case} fresh balloon hinting"),
+    );
+    wait_for_production_balloon_hinting_status(
+        &running.socket,
+        u64::from(VIRTIO_BALLOON_FREE_PAGE_HINT_DONE),
+        Some(0),
+        &format!("production {case} fresh balloon hinting"),
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/balloon/hinting/stop", ""),
+        204,
+        &format!("stop production {case} fresh balloon hinting"),
+    );
+    wait_for_production_balloon_metric(
+        &running.socket,
+        &fixture.opened_metrics,
+        "free_page_report_count",
+        1,
+        &format!("production {case} restored free-page reporting"),
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/balloon", r#"{"amount_mib":0}"#),
+        204,
+        &format!("deflate production {case} restored balloon"),
+    );
+    wait_for_production_balloon_page_counts(
+        &running.socket,
+        0,
+        0,
+        &format!("production {case} restored balloon deflation"),
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/balloon", r#"{"amount_mib":8}"#),
+        204,
+        &format!("inflate production {case} restored balloon"),
+    );
+    wait_for_production_balloon_page_counts(
+        &running.socket,
+        2_048,
+        2_048,
+        &format!("production {case} restored balloon reinflation"),
+    );
+    flush_production_metrics(
+        &running.socket,
+        &format!("{case} after restored balloon activity"),
+    );
+    let metrics = fs::read_to_string(&fixture.opened_metrics).unwrap_or_default();
+    for (field, minimum) in [
+        ("stats_updates_count", 1),
+        ("deflate_count", 1),
+        ("inflate_count", 1),
+        ("free_page_report_count", 1),
+        ("inflate_discard_attempts", 1),
+    ] {
+        assert!(
+            production_balloon_metric_total(&fixture.opened_metrics, field) >= minimum,
+            "production {case} should publish balloon.{field} >= {minimum}; metrics:\n{metrics}"
+        );
+    }
+    stop_running_launcher(
+        &mut running,
+        &format!("production {case} restored balloon destination"),
+    );
+    assert_eq!(session_entries(), baseline_sessions);
+    assert_eq!(
+        fs::read(&opened.state).expect("destination balloon state should remain readable"),
+        state_before,
+        "production {case} load must not mutate state"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("destination balloon memory should remain readable"),
+        memory_before,
+        "production {case} load must not mutate memory"
+    );
+    assert_eq!(
+        fs::read(&fixture.metrics).expect("replacement balloon metrics should read"),
+        b"replacement metrics must remain unused\n"
+    );
+    opened
+}
+
+fn configure_balloon_snapshot_destination_metrics(socket: &Path, context: &str) {
+    assert_http_status(
+        &http_put(
+            socket,
+            "/metrics",
+            &serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}).to_string(),
+        ),
+        204,
+        &format!("PUT production {context} balloon destination metrics"),
     );
 }
 
@@ -9171,6 +9864,258 @@ fn hard_link_or_copy_fixture(source: &Path, destination: &Path, context: &str) {
 }
 
 #[derive(Debug)]
+struct BalloonSnapshotInputGrantFixture {
+    _root: TestDir,
+    _socket_root: TestDir,
+    manifest: PathBuf,
+    sources: SnapshotArtifactSet,
+    opened: SnapshotArtifactSet,
+    metrics: PathBuf,
+    opened_metrics: PathBuf,
+    api_directory: PathBuf,
+    state_directory: Option<PathBuf>,
+    memory_directory: Option<PathBuf>,
+}
+
+impl BalloonSnapshotInputGrantFixture {
+    fn new(case: &str, sources: SnapshotArtifactSet, with_recapture: bool) -> Self {
+        let root = TestDir::new(&format!("balloon-snapshot-input-{case}"));
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("balloon snapshot input root should canonicalize");
+        let socket_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let socket_root = TestDir(
+            PathBuf::from("/private/tmp").join(format!("bbbs-{}-{socket_id}", std::process::id())),
+        );
+        fs::create_dir(socket_root.path())
+            .expect("short balloon destination socket root should create");
+        let manifest = canonical_root.join("grant-manifest.json");
+        let metrics = canonical_root.join("balloon-snapshot.metrics");
+        let opened_metrics = canonical_root.join("opened-balloon-snapshot.metrics");
+        let api_directory = socket_root.path().join("a");
+        let state_directory =
+            with_recapture.then(|| canonical_root.join("recaptured-state-output"));
+        let memory_directory =
+            with_recapture.then(|| canonical_root.join("recaptured-memory-output"));
+        let opened = SnapshotArtifactSet {
+            state: replacement_opened_path(&sources.state, case),
+            memory: replacement_opened_path(&sources.memory, case),
+            root: replacement_opened_path(&sources.root, case),
+            data: replacement_opened_path(&sources.data, case),
+            audit: replacement_opened_path(&sources.audit, case),
+        };
+
+        fs::write(&metrics, b"").expect("balloon destination metrics should write");
+        fs::create_dir(&api_directory)
+            .expect("balloon destination API socket directory should create");
+        if let Some(directory) = state_directory.as_ref() {
+            fs::create_dir(directory)
+                .expect("balloon recapture state output directory should create");
+        }
+        if let Some(directory) = memory_directory.as_ref() {
+            fs::create_dir(directory)
+                .expect("balloon recapture memory output directory should create");
+        }
+
+        let mut grants = vec![
+            serde_json::json!({
+                "id": SNAPSHOT_STATE_INPUT_ID,
+                "role": "snapshot-state-input",
+                "access": "read-only",
+                "source": path_text(&sources.state),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_MEMORY_INPUT_ID,
+                "role": "snapshot-memory-input",
+                "access": "read-only",
+                "source": path_text(&sources.memory),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_METRICS_ID,
+                "role": "metrics-sink",
+                "access": "write-only",
+                "source": path_text(&metrics),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_ROOT_ID,
+                "role": "drive-backing",
+                "access": "read-write",
+                "source": path_text(&sources.root),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_DATA_ID,
+                "role": "drive-backing",
+                "access": "read-write",
+                "source": path_text(&sources.data),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_AUDIT_ID,
+                "role": "drive-backing",
+                "access": "read-only",
+                "source": path_text(&sources.audit),
+            }),
+            serde_json::json!({
+                "id": API_SOCKET_DIRECTORY_ID,
+                "role": "api-socket-directory",
+                "access": "create-children",
+                "source": path_text(&api_directory),
+            }),
+        ];
+        if let Some(directory) = state_directory.as_ref() {
+            grants.push(serde_json::json!({
+                "id": SNAPSHOT_STATE_OUTPUT_ID,
+                "role": "snapshot-output-directory",
+                "access": "create-children",
+                "source": path_text(directory),
+            }));
+        }
+        if let Some(directory) = memory_directory.as_ref() {
+            grants.push(serde_json::json!({
+                "id": SNAPSHOT_MEMORY_OUTPUT_ID,
+                "role": "snapshot-output-directory",
+                "access": "create-children",
+                "source": path_text(directory),
+            }));
+        }
+        let manifest_json = serde_json::json!({"version": 1, "grants": grants});
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json)
+                .expect("balloon snapshot input manifest should serialize"),
+        )
+        .expect("balloon snapshot input manifest should write");
+
+        Self {
+            _root: root,
+            _socket_root: socket_root,
+            manifest,
+            sources,
+            opened,
+            metrics,
+            opened_metrics,
+            api_directory,
+            state_directory,
+            memory_directory,
+        }
+    }
+
+    fn replace_source_pathnames(&self) -> SnapshotArtifactSet {
+        for (source, opened) in [
+            (&self.sources.state, &self.opened.state),
+            (&self.sources.memory, &self.opened.memory),
+            (&self.sources.root, &self.opened.root),
+            (&self.sources.data, &self.opened.data),
+            (&self.sources.audit, &self.opened.audit),
+            (&self.metrics, &self.opened_metrics),
+        ] {
+            fs::rename(source, opened).expect("opened balloon snapshot input should move");
+        }
+        fs::write(&self.sources.state, b"replacement state must not load")
+            .expect("replacement balloon snapshot state should write");
+        fs::write(&self.sources.memory, b"replacement memory must not load")
+            .expect("replacement balloon snapshot memory should write");
+        fs::write(&self.sources.root, vec![0xff_u8; 4096])
+            .expect("replacement balloon snapshot root should write");
+        fs::write(&self.sources.data, vec![0xee_u8; 4096])
+            .expect("replacement balloon snapshot data should write");
+        fs::write(&self.sources.audit, vec![0xdd_u8; 4096])
+            .expect("replacement balloon snapshot audit should write");
+        fs::write(&self.metrics, b"replacement metrics must remain unused\n")
+            .expect("replacement balloon destination metrics should write");
+        self.opened.clone()
+    }
+
+    fn recaptured_artifacts(&self) -> SnapshotArtifactSet {
+        SnapshotArtifactSet {
+            state: self
+                .state_directory
+                .as_ref()
+                .expect("balloon recapture state directory should exist")
+                .join(SNAPSHOT_STATE_CHILD),
+            memory: self
+                .memory_directory
+                .as_ref()
+                .expect("balloon recapture memory directory should exist")
+                .join(SNAPSHOT_MEMORY_CHILD),
+            root: self.opened.root.clone(),
+            data: self.opened.data.clone(),
+            audit: self.opened.audit.clone(),
+        }
+    }
+
+    fn api_socket(&self) -> PathBuf {
+        self.api_directory.join(API_SOCKET_CHILD)
+    }
+
+    fn assert_no_recapture_staging(&self) {
+        assert_no_snapshot_staging(
+            self.state_directory
+                .as_ref()
+                .expect("balloon recapture state directory should exist"),
+        );
+        assert_no_snapshot_staging(
+            self.memory_directory
+                .as_ref()
+                .expect("balloon recapture memory directory should exist"),
+        );
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        let mut sensitive = [
+            path_text(&self.manifest),
+            path_text(&self.sources.state),
+            path_text(&self.sources.memory),
+            path_text(&self.sources.root),
+            path_text(&self.sources.data),
+            path_text(&self.sources.audit),
+            path_text(&self.opened.state),
+            path_text(&self.opened.memory),
+            path_text(&self.opened.root),
+            path_text(&self.opened.data),
+            path_text(&self.opened.audit),
+            path_text(&self.metrics),
+            path_text(&self.opened_metrics),
+            path_text(&self.api_directory),
+            path_text(&self.api_socket()),
+            SNAPSHOT_STATE_INPUT_ID,
+            SNAPSHOT_MEMORY_INPUT_ID,
+            SNAPSHOT_METRICS_ID,
+            SNAPSHOT_ROOT_ID,
+            SNAPSHOT_DATA_ID,
+            SNAPSHOT_AUDIT_ID,
+            SNAPSHOT_STATE_INPUT_REF,
+            SNAPSHOT_MEMORY_INPUT_REF,
+            SNAPSHOT_METRICS_REF,
+            SNAPSHOT_ROOT_REF,
+            SNAPSHOT_DATA_REF,
+            SNAPSHOT_AUDIT_REF,
+            API_SOCKET_DIRECTORY_ID,
+            API_SOCKET_REF,
+            API_SOCKET_CHILD,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        if let (Some(state), Some(memory)) = (&self.state_directory, &self.memory_directory) {
+            sensitive.extend(
+                [
+                    path_text(state),
+                    path_text(memory),
+                    SNAPSHOT_STATE_OUTPUT_ID,
+                    SNAPSHOT_MEMORY_OUTPUT_ID,
+                    SNAPSHOT_STATE_OUTPUT_REF,
+                    SNAPSHOT_MEMORY_OUTPUT_REF,
+                    SNAPSHOT_STATE_CHILD,
+                    SNAPSHOT_MEMORY_CHILD,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        sensitive
+    }
+}
+
+#[derive(Debug)]
 struct SnapshotInputGrantFixture {
     _root: TestDir,
     manifest: PathBuf,
@@ -12668,6 +13613,323 @@ fn configure_and_start_entropy_snapshot_grant_source(
         204,
         &format!("start production {context} entropy snapshot source"),
     );
+}
+
+fn production_http_response_json(response: &str) -> serde_json::Value {
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("production API response should contain an HTTP body");
+    serde_json::from_str(body).unwrap_or_else(|error| {
+        panic!("production API response body should be JSON: {error}; response:\n{response}")
+    })
+}
+
+fn wait_for_production_balloon_page_counts(
+    socket: &Path,
+    expected_target_pages: u64,
+    expected_actual_pages: u64,
+    context: &str,
+) {
+    let deadline = Instant::now()
+        .checked_add(PROCESS_TIMEOUT)
+        .expect("production balloon page-count deadline should fit");
+    loop {
+        let response = http_get(socket, "/balloon/statistics");
+        if response.starts_with("HTTP/1.1 200 ") {
+            let statistics = production_http_response_json(&response);
+            if statistics
+                .get("target_pages")
+                .and_then(serde_json::Value::as_u64)
+                == Some(expected_target_pages)
+                && statistics
+                    .get("actual_pages")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(expected_actual_pages)
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{context} should reach target_pages={expected_target_pages}, actual_pages={expected_actual_pages}; last response:\n{response}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_production_balloon_optional_statistics(socket: &Path, context: &str) {
+    const OPTIONAL_FIELDS: &[&str] = &[
+        "swap_in",
+        "swap_out",
+        "major_faults",
+        "minor_faults",
+        "free_memory",
+        "total_memory",
+        "available_memory",
+        "disk_caches",
+        "hugetlb_allocations",
+        "hugetlb_failures",
+        "oom_kill",
+        "alloc_stall",
+        "async_scan",
+        "direct_scan",
+        "async_reclaim",
+        "direct_reclaim",
+    ];
+
+    let deadline = Instant::now()
+        .checked_add(PROCESS_TIMEOUT)
+        .expect("production balloon optional-statistics deadline should fit");
+    loop {
+        let response = http_get(socket, "/balloon/statistics");
+        if response.starts_with("HTTP/1.1 200 ") {
+            let statistics = production_http_response_json(&response);
+            if OPTIONAL_FIELDS
+                .iter()
+                .any(|field| statistics.get(*field).is_some_and(|value| !value.is_null()))
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{context} should publish at least one optional guest statistic; last response:\n{response}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_production_balloon_hinting_status(
+    socket: &Path,
+    expected_host_cmd: u64,
+    expected_guest_cmd: Option<u64>,
+    context: &str,
+) {
+    let deadline = Instant::now()
+        .checked_add(PROCESS_TIMEOUT)
+        .expect("production balloon hinting deadline should fit");
+    loop {
+        let response = http_get(socket, "/balloon/hinting/status");
+        if response.starts_with("HTTP/1.1 200 ") {
+            let status = production_http_response_json(&response);
+            if status.get("host_cmd").and_then(serde_json::Value::as_u64) == Some(expected_host_cmd)
+                && status.get("guest_cmd").and_then(serde_json::Value::as_u64) == expected_guest_cmd
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{context} should reach host_cmd={expected_host_cmd}, guest_cmd={expected_guest_cmd:?}; last response:\n{response}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn flush_production_metrics(socket: &Path, context: &str) {
+    assert_http_status(
+        &http_put(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+        204,
+        &format!("FlushMetrics for production {context}"),
+    );
+}
+
+fn wait_for_production_balloon_metric(
+    socket: &Path,
+    metrics: &Path,
+    field: &str,
+    expected: u64,
+    context: &str,
+) {
+    let deadline = Instant::now()
+        .checked_add(PROCESS_TIMEOUT)
+        .expect("production balloon metric deadline should fit");
+    loop {
+        flush_production_metrics(socket, context);
+        let observed = production_balloon_metric_total(metrics, field);
+        if observed >= expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{context} should reach balloon.{field} >= {expected}; observed={observed}; metrics:\n{}",
+            fs::read_to_string(metrics).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn production_balloon_metric_total(path: &Path, field: &str) -> u64 {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("balloon")?
+                .get(field)?
+                .as_u64()
+        })
+        .fold(0, u64::saturating_add)
+}
+
+fn assert_production_balloon_snapshot(
+    state_path: &Path,
+    enable_pci: bool,
+    context: &str,
+) -> SnapshotV2BalloonState {
+    let bytes = fs::read(state_path).unwrap_or_else(|error| {
+        panic!(
+            "production {context} balloon state {} should read: {error}",
+            state_path.display()
+        )
+    });
+    let structural =
+        decode_snapshot_v2_state(&bytes).expect("production balloon state should decode");
+    let state = decode_hvf_snapshot_v2_balloon_state(&structural)
+        .expect("production balloon state should be exact native-v2 2.9");
+    let graph = state
+        .device_graph()
+        .expect("production balloon artifact should retain storage");
+    assert_eq!(
+        graph.block_records().len(),
+        2,
+        "production {context} should retain root and data drives"
+    );
+    assert!(
+        state.entropy().is_none(),
+        "production {context} should not add entropy state"
+    );
+    let balloon = state
+        .balloon()
+        .expect("production certification artifact should contain balloon");
+    let transport = if enable_pci {
+        SnapshotV2DeviceTransportKind::Pci
+    } else {
+        SnapshotV2DeviceTransportKind::Mmio
+    };
+    assert_eq!(graph.transport_kind(), transport);
+    assert_eq!(balloon.transport().kind(), transport);
+    assert_eq!(balloon.config().amount_mib(), 8);
+    assert!(balloon.config().deflate_on_oom());
+    assert_eq!(balloon.config().stats_polling_interval_s(), 2);
+    assert!(balloon.config().free_page_hinting());
+    assert!(balloon.config().free_page_reporting());
+    let queues = balloon
+        .continuation()
+        .active_queues()
+        .expect("production balloon queues should be active");
+    assert!(queues.statistics().is_some());
+    assert!(queues.free_page_hinting().is_some());
+    assert!(queues.free_page_reporting().is_some());
+    assert!(
+        !balloon.continuation().statistics().is_empty(),
+        "production {context} should retain latest guest statistics"
+    );
+    assert!(
+        balloon
+            .continuation()
+            .statistics_pending_descriptor_head()
+            .is_some(),
+        "production {context} should retain one statistics descriptor"
+    );
+    assert_eq!(balloon.accounting().inflated_page_count(), 2_048);
+    assert!(
+        !balloon.accounting().ranges().is_empty(),
+        "production {context} should retain canonical nonempty accounting"
+    );
+    assert_eq!(
+        balloon.continuation().hinting().host_cmd(),
+        VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+    );
+    balloon.clone()
+}
+
+fn assert_production_balloon_config(socket: &Path, context: &str) {
+    let balloon = http_get(socket, "/balloon");
+    assert_http_status(
+        &balloon,
+        200,
+        &format!("read production {context} balloon config"),
+    );
+    for expected in [
+        r#""amount_mib":8"#,
+        r#""deflate_on_oom":true"#,
+        r#""stats_polling_interval_s":2"#,
+        r#""free_page_hinting":true"#,
+        r#""free_page_reporting":true"#,
+    ] {
+        assert!(
+            balloon.contains(expected),
+            "production {context} balloon config should contain {expected}; response:\n{balloon}"
+        );
+    }
+    let config = http_get(socket, "/vm/config");
+    assert_http_status(
+        &config,
+        200,
+        &format!("read production {context} restored VM config"),
+    );
+    assert_eq!(
+        config.matches(r#""drive_id":"#).count(),
+        2,
+        "production {context} should restore root and data drives"
+    );
+    assert!(
+        config.contains(r#""balloon":"#),
+        "production {context} restored VM config should contain balloon"
+    );
+}
+
+fn assert_production_balloon_statistics_match_snapshot(
+    response: &str,
+    balloon: &SnapshotV2BalloonState,
+    context: &str,
+) {
+    let actual = production_http_response_json(response);
+    for (field, expected) in [
+        ("target_pages", 2_048),
+        ("target_mib", 8),
+        ("actual_pages", balloon.accounting().inflated_page_count()),
+        (
+            "actual_mib",
+            balloon.accounting().inflated_page_count() / 256,
+        ),
+    ] {
+        assert_eq!(
+            actual.get(field).and_then(serde_json::Value::as_u64),
+            Some(expected),
+            "production {context} should restore snapshot-derived {field}"
+        );
+    }
+    for (field, expected) in [
+        "swap_in",
+        "swap_out",
+        "major_faults",
+        "minor_faults",
+        "free_memory",
+        "total_memory",
+        "available_memory",
+        "disk_caches",
+        "hugetlb_allocations",
+        "hugetlb_failures",
+        "oom_kill",
+        "alloc_stall",
+        "async_scan",
+        "direct_scan",
+        "async_reclaim",
+        "direct_reclaim",
+    ]
+    .into_iter()
+    .zip(balloon.continuation().statistics().values())
+    {
+        assert_eq!(
+            actual.get(field).and_then(serde_json::Value::as_u64),
+            *expected,
+            "production {context} should restore latest snapshot statistic {field}"
+        );
+    }
 }
 
 fn wait_for_production_entropy_metric(

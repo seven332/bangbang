@@ -545,8 +545,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 238);
-    assert_eq!(count(Disposition::AuditRequired), 160);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 240);
+    assert_eq!(count(Disposition::AuditRequired), 158);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -770,8 +770,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 238);
-    assert_eq!(count(Disposition::AuditRequired), 160);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 240);
+    assert_eq!(count(Disposition::AuditRequired), 158);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -982,8 +982,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 238);
-    assert_eq!(count(Disposition::AuditRequired), 160);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 240);
+    assert_eq!(count(Disposition::AuditRequired), 158);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -1102,7 +1102,7 @@ fn delivery_closure_policy_is_stable() {
         "semantic.storage:pmem-root-mapping-flush-and-state",
     ];
     const WAVE_6_ISSUE_URL: &str = "https://github.com/seven332/bangbang/issues/1490";
-    const BALLOON_TERMINAL: [&str; 50] = [
+    const BALLOON_TERMINAL: [&str; 52] = [
         "api-operation:GET /balloon",
         "api-operation:GET /balloon/hinting/status",
         "api-operation:GET /balloon/statistics",
@@ -1153,11 +1153,10 @@ fn delivery_closure_policy_is_stable() {
         "api-schema:BalloonStats",
         "api-schema:BalloonStatsUpdate",
         "api-schema:BalloonUpdate",
-    ];
-    const BALLOON_WAVE_6: [&str; 2] = [
         "corpus:ballooning",
         "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
     ];
+    const BALLOON_WAVE_6: [&str; 0] = [];
     const TIME_IDENTITY_WAVE_6: [&str; 1] = ["semantic.device:rtc-vmclock-vmgenid-and-pvtime"];
 
     const MEMORY_HOTPLUG_TERMINAL: [&str; 17] = [
@@ -1249,8 +1248,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 238);
-    assert_eq!(count(Disposition::AuditRequired), 160);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 240);
+    assert_eq!(count(Disposition::AuditRequired), 158);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -1623,8 +1622,8 @@ fn delivery_closure_policy_is_stable() {
         .chain(ENTROPY_WAVE_6)
         .chain(TIME_IDENTITY_WAVE_6)
         .collect::<BTreeSet<_>>();
-    assert_eq!(remaining_terminal_ids.len(), 80);
-    assert_eq!(remaining_wave_6_ids.len(), 5);
+    assert_eq!(remaining_terminal_ids.len(), 82);
+    assert_eq!(remaining_wave_6_ids.len(), 3);
     assert!(remaining_terminal_ids.is_disjoint(&remaining_wave_6_ids));
     assert_eq!(
         remaining_terminal_ids

@@ -30,7 +30,9 @@ mod macos_arm64 {
     use std::time::{Duration, Instant};
 
     use bangbang_hvf::decode_hvf_snapshot_v2_balloon_state;
+    use bangbang_runtime::balloon::VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
     use bangbang_runtime::block::{DriveCacheType, DriveIoEngine};
+    use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonState;
     use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
     use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
     use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
@@ -308,6 +310,7 @@ mod macos_arm64 {
     const SNAPSHOT_ENTROPY_READ_BYTES: u64 = 64;
     const SNAPSHOT_ENTROPY_REFILL_MS: u64 = 3_000;
     const SNAPSHOT_ENTROPY_TIMEOUT: Duration = Duration::from_secs(60);
+    const BALLOON_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
     const SNAPSHOT_BLOCK_SECTOR_SIZE: usize = 512;
     const SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE: u8 = 0x11;
     const SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE: u8 = 0x12;
@@ -3289,18 +3292,34 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_exposes_virtio_balloon_to_direct_rootfs_guest() {
+    fn signed_executable_certifies_native_v2_balloon_snapshot_continuation() {
+        for enable_pci in [false, true] {
+            run_signed_balloon_snapshot_continuation(enable_pci);
+        }
+    }
+
+    fn run_signed_balloon_snapshot_continuation(enable_pci: bool) {
+        let transport = if enable_pci { "pci" } else { "mmio" };
+        let source_stats_polling_interval_s = 1_u16;
         let test_dir = TestDir::new();
-        let socket_path = test_dir.path().join("api.socket");
-        let data_backing_path = test_dir.path().join("data.img");
-        let metrics_path = test_dir.path().join("metrics.out");
+        let socket_path = test_dir
+            .path()
+            .join(format!("{transport}-balloon-source.socket"));
+        let data_backing_path = test_dir
+            .path()
+            .join(format!("{transport}-balloon-data.img"));
+        let metrics_path = test_dir
+            .path()
+            .join(format!("{transport}-balloon-source.metrics"));
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
         let instance_id = test_dir.instance_id();
+        let process_args: &[&str] = if enable_pci { &["--enable-pci"] } else { &[] };
 
         create_zeroed_block_backing(&data_backing_path);
 
-        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+        let mut bangbang =
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, process_args);
 
         let machine_response = http_put_json(
             &socket_path,
@@ -3319,23 +3338,22 @@ mod macos_arm64 {
         let metrics_response = http_put_json(&socket_path, "/metrics", &metrics_body);
         assert_no_content_response(&metrics_response, "PUT /metrics balloon direct rootfs");
 
-        let balloon_response = http_put_json(
-            &socket_path,
-            "/balloon",
-            r#"{"amount_mib":8,"deflate_on_oom":false,"stats_polling_interval_s":1,"free_page_hinting":true,"free_page_reporting":true}"#,
+        let balloon_body = format!(
+            r#"{{"amount_mib":8,"deflate_on_oom":true,"stats_polling_interval_s":{source_stats_polling_interval_s},"free_page_hinting":true,"free_page_reporting":true}}"#
         );
+        let balloon_response = http_put_json(&socket_path, "/balloon", &balloon_body);
         assert_no_content_response(&balloon_response, "PUT /balloon direct rootfs");
 
         let configured_balloon = http_get(&socket_path, "/balloon");
         assert_ok_response(&configured_balloon, "GET /balloon direct rootfs");
         for expected in [
-            r#""amount_mib":8"#,
-            r#""deflate_on_oom":false"#,
-            r#""stats_polling_interval_s":1"#,
-            r#""free_page_hinting":true"#,
-            r#""free_page_reporting":true"#,
+            r#""amount_mib":8"#.to_owned(),
+            r#""deflate_on_oom":true"#.to_owned(),
+            format!(r#""stats_polling_interval_s":{source_stats_polling_interval_s}"#),
+            r#""free_page_hinting":true"#.to_owned(),
+            r#""free_page_reporting":true"#.to_owned(),
         ] {
-            assert_response_contains(&configured_balloon, expected, "GET /balloon direct rootfs");
+            assert_response_contains(&configured_balloon, &expected, "GET /balloon direct rootfs");
         }
 
         let vm_config = http_get(&socket_path, "/vm/config");
@@ -3352,12 +3370,12 @@ mod macos_arm64 {
         );
         assert_response_contains(
             &vm_config,
-            r#""deflate_on_oom":false"#,
+            r#""deflate_on_oom":true"#,
             "GET /vm/config after PUT /balloon",
         );
         assert_response_contains(
             &vm_config,
-            r#""stats_polling_interval_s":1"#,
+            &format!(r#""stats_polling_interval_s":{source_stats_polling_interval_s}"#),
             "GET /vm/config after PUT /balloon",
         );
         assert_response_contains(
@@ -3455,19 +3473,6 @@ mod macos_arm64 {
             );
         }
 
-        let optional_statistics = match wait_for_balloon_optional_statistics(
-            &socket_path,
-            GUEST_EXECUTION_TIMEOUT,
-        ) {
-            Ok(statistics) => statistics,
-            Err(err) => {
-                let output = bangbang.force_stop_and_collect();
-                panic!(
-                    "direct rootfs guest did not publish optional balloon statistics: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.status, output.stdout, output.stderr
-                );
-            }
-        };
         let polling_update = http_json(
             &socket_path,
             "PATCH",
@@ -3475,6 +3480,7 @@ mod macos_arm64 {
             r#"{"stats_polling_interval_s":2}"#,
         );
         assert_no_content_response(&polling_update, "PATCH /balloon/statistics direct rootfs");
+        let snapshot_stats_polling_interval_s = 2;
         let updated_balloon = http_get(&socket_path, "/balloon");
         assert_ok_response(
             &updated_balloon,
@@ -3482,17 +3488,29 @@ mod macos_arm64 {
         );
         assert_response_contains(
             &updated_balloon,
-            r#""stats_polling_interval_s":2"#,
+            &format!(r#""stats_polling_interval_s":{snapshot_stats_polling_interval_s}"#),
             "GET /balloon after statistics polling update direct rootfs",
         );
+        let optional_statistics = match wait_for_balloon_optional_statistics(
+            &socket_path,
+            BALLOON_SNAPSHOT_TIMEOUT,
+        ) {
+            Ok(statistics) => statistics,
+            Err(err) => {
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "{transport} direct rootfs guest did not publish optional balloon statistics after the polling update: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+        };
         let statistics_after_polling_update = http_get(&socket_path, "/balloon/statistics");
         assert_eq!(
             balloon_optional_statistics(&statistics_after_polling_update)
                 .expect("updated balloon statistics response should be valid"),
             optional_statistics,
-            "updating the polling interval must preserve exactly the optional fields already reported by the guest"
+            "the updated polling interval must retain the latest optional guest fields"
         );
-
         let hinting_status = http_get(&socket_path, "/balloon/hinting/status");
         assert_ok_response(&hinting_status, "GET /balloon/hinting/status direct rootfs");
         for expected in [r#""host_cmd":0"#, r#""guest_cmd":null"#] {
@@ -3577,14 +3595,27 @@ mod macos_arm64 {
         assert_capture_ready_snapshot_succeeds(
             &socket_path,
             test_dir.path(),
-            "paused MMIO balloon capture-ready preflight",
+            &format!("paused {transport} balloon exact-2.9 publication"),
             true,
             false,
             true,
         );
+        let state_path = test_dir.path().join("capture-ready.state");
+        let memory_path = test_dir.path().join("capture-ready.memory");
+        let source_balloon = assert_active_balloon_snapshot(
+            &state_path,
+            enable_pci,
+            true,
+            false,
+            true,
+            snapshot_stats_polling_interval_s,
+            &format!("{transport} source"),
+        );
+        let state_before = fs::read(&state_path).expect("balloon source state should read");
+        let memory_before = fs::read(&memory_path).expect("balloon source memory should read");
         assert_no_content_response(
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
-            "resume after balloon capture-ready preflight",
+            &format!("resume {transport} balloon source after publication"),
         );
 
         assert_no_content_response(
@@ -3604,8 +3635,477 @@ mod macos_arm64 {
         assert_clean_shutdown(
             bangbang.terminate(),
             &socket_path,
-            "bangbang balloon direct rootfs",
+            &format!("bangbang {transport} balloon snapshot source"),
         );
+
+        let explicit_socket = test_dir
+            .path()
+            .join(format!("{transport}-balloon-explicit.socket"));
+        let explicit_metrics = test_dir
+            .path()
+            .join(format!("{transport}-balloon-explicit.metrics"));
+        let explicit_context = format!("{transport}-balloon-explicit");
+        run_signed_balloon_snapshot_destination(SignedBalloonSnapshotDestination {
+            test_root: test_dir.path(),
+            socket_path: &explicit_socket,
+            metrics_path: &explicit_metrics,
+            state_path: &state_path,
+            memory_path: &memory_path,
+            process_args,
+            enable_pci,
+            source_balloon: &source_balloon,
+            resume_vm: false,
+            recapture: true,
+            context: &explicit_context,
+        });
+        assert_eq!(
+            fs::read(&state_path).expect("explicit balloon state should remain readable"),
+            state_before,
+            "{transport} explicit destination must not mutate state"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("explicit balloon memory should remain readable"),
+            memory_before,
+            "{transport} explicit destination must not mutate memory"
+        );
+
+        let automatic_socket = test_dir
+            .path()
+            .join(format!("{transport}-balloon-automatic.socket"));
+        let automatic_metrics = test_dir
+            .path()
+            .join(format!("{transport}-balloon-automatic.metrics"));
+        let automatic_context = format!("{transport}-balloon-automatic");
+        run_signed_balloon_snapshot_destination(SignedBalloonSnapshotDestination {
+            test_root: test_dir.path(),
+            socket_path: &automatic_socket,
+            metrics_path: &automatic_metrics,
+            state_path: &state_path,
+            memory_path: &memory_path,
+            process_args,
+            enable_pci,
+            source_balloon: &source_balloon,
+            resume_vm: true,
+            recapture: false,
+            context: &automatic_context,
+        });
+        assert_eq!(
+            fs::read(&state_path).expect("automatic balloon state should remain readable"),
+            state_before,
+            "{transport} repeated destination must not mutate state"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("automatic balloon memory should remain readable"),
+            memory_before,
+            "{transport} repeated destination must not mutate memory"
+        );
+        assert_no_snapshot_staging(test_dir.path());
+    }
+
+    fn assert_active_balloon_snapshot(
+        state_path: &Path,
+        enable_pci: bool,
+        expect_storage: bool,
+        expect_entropy: bool,
+        expect_latest_statistics: bool,
+        expected_stats_polling_interval_s: u16,
+        context: &str,
+    ) -> SnapshotV2BalloonState {
+        let bytes = fs::read(state_path).unwrap_or_else(|error| {
+            panic!(
+                "{context} balloon state {} should read: {error}",
+                state_path.display()
+            )
+        });
+        let structural =
+            decode_snapshot_v2_state(&bytes).expect("balloon state should decode structurally");
+        let state = decode_hvf_snapshot_v2_balloon_state(&structural)
+            .expect("balloon state should decode as exact native-v2 2.9");
+        assert_eq!(
+            state.device_graph().is_some(),
+            expect_storage,
+            "{context} storage presence should remain exact"
+        );
+        assert_eq!(
+            state.entropy().is_some(),
+            expect_entropy,
+            "{context} entropy presence should remain exact"
+        );
+        let balloon = state
+            .balloon()
+            .expect("balloon certification artifact should contain kind 10");
+        let expected_transport = if enable_pci {
+            SnapshotV2DeviceTransportKind::Pci
+        } else {
+            SnapshotV2DeviceTransportKind::Mmio
+        };
+        assert_eq!(
+            balloon.transport().kind(),
+            expected_transport,
+            "{context} balloon transport should remain exact"
+        );
+        if let Some(graph) = state.device_graph() {
+            assert_eq!(
+                graph.transport_kind(),
+                expected_transport,
+                "{context} storage and balloon must use one transport"
+            );
+        }
+        assert_eq!(balloon.config().amount_mib(), 8);
+        assert!(balloon.config().deflate_on_oom());
+        assert_eq!(
+            balloon.config().stats_polling_interval_s(),
+            expected_stats_polling_interval_s
+        );
+        assert!(balloon.config().free_page_hinting());
+        assert!(balloon.config().free_page_reporting());
+        let queues = balloon
+            .continuation()
+            .active_queues()
+            .expect("active Linux balloon should retain queue cursors");
+        assert!(queues.statistics().is_some());
+        assert!(queues.free_page_hinting().is_some());
+        assert!(queues.free_page_reporting().is_some());
+        assert_eq!(
+            !balloon.continuation().statistics().is_empty(),
+            expect_latest_statistics,
+            "{context} latest-statistics presence should match the live transport evidence"
+        );
+        assert!(
+            balloon
+                .continuation()
+                .statistics_pending_descriptor_head()
+                .is_some(),
+            "{context} should retain one statistics descriptor; statistics cursors: {:?}, latest statistics: {:?}, available features: {:#x}, driver features: {:#x}",
+            queues.statistics().map(|queue| (
+                queue.next_available(),
+                queue.next_used(),
+                queue.outstanding()
+            )),
+            balloon.continuation().statistics().values(),
+            balloon.virtio().available_features(),
+            balloon.virtio().driver_features()
+        );
+        assert!(
+            !balloon.accounting().is_empty(),
+            "{context} should retain nonempty host PFN accounting"
+        );
+        assert_eq!(
+            balloon.accounting().inflated_page_count(),
+            2_048,
+            "{context} should retain exact 8-MiB 4-KiB guest-page accounting"
+        );
+        assert!(
+            !balloon.accounting().ranges().is_empty(),
+            "{context} should retain canonical accounting ranges"
+        );
+        assert_eq!(
+            balloon.continuation().hinting().host_cmd(),
+            VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+        );
+        balloon.clone()
+    }
+
+    fn assert_balloon_api_statistics_match_snapshot(
+        response: &str,
+        balloon: &SnapshotV2BalloonState,
+        context: &str,
+    ) {
+        let actual = balloon_response_json(response)
+            .unwrap_or_else(|| panic!("{context} statistics response should contain valid JSON"));
+        for (field, expected) in [
+            ("target_pages", 2_048),
+            ("target_mib", 8),
+            ("actual_pages", balloon.accounting().inflated_page_count()),
+            (
+                "actual_mib",
+                balloon.accounting().inflated_page_count() / 256,
+            ),
+        ] {
+            assert_eq!(
+                actual.get(field).and_then(serde_json::Value::as_u64),
+                Some(expected),
+                "{context} should restore snapshot-derived {field}"
+            );
+        }
+        for (field, expected) in [
+            "swap_in",
+            "swap_out",
+            "major_faults",
+            "minor_faults",
+            "free_memory",
+            "total_memory",
+            "available_memory",
+            "disk_caches",
+            "hugetlb_allocations",
+            "hugetlb_failures",
+            "oom_kill",
+            "alloc_stall",
+            "async_scan",
+            "direct_scan",
+            "async_reclaim",
+            "direct_reclaim",
+        ]
+        .into_iter()
+        .zip(balloon.continuation().statistics().values())
+        {
+            assert_eq!(
+                actual.get(field).and_then(serde_json::Value::as_u64),
+                *expected,
+                "{context} should restore the latest snapshot statistic {field}"
+            );
+        }
+    }
+
+    struct SignedBalloonSnapshotDestination<'a> {
+        test_root: &'a Path,
+        socket_path: &'a Path,
+        metrics_path: &'a Path,
+        state_path: &'a Path,
+        memory_path: &'a Path,
+        process_args: &'a [&'a str],
+        enable_pci: bool,
+        source_balloon: &'a SnapshotV2BalloonState,
+        resume_vm: bool,
+        recapture: bool,
+        context: &'a str,
+    }
+
+    fn run_signed_balloon_snapshot_destination(case: SignedBalloonSnapshotDestination<'_>) {
+        let SignedBalloonSnapshotDestination {
+            test_root,
+            socket_path,
+            metrics_path,
+            state_path,
+            memory_path,
+            process_args,
+            enable_pci,
+            source_balloon,
+            resume_vm,
+            recapture,
+            context,
+        } = case;
+        let mut destination =
+            BangbangProcess::start_with_extra_args(socket_path, context, process_args);
+        assert_no_content_response(
+            &http_put_json(
+                socket_path,
+                "/metrics",
+                &format!(
+                    r#"{{"metrics_path":{}}}"#,
+                    json_string(path_text(metrics_path))
+                ),
+            ),
+            &format!("PUT {context} destination metrics"),
+        );
+        assert!(
+            fs::read(metrics_path).unwrap_or_default().is_empty(),
+            "{context} metrics must start empty"
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                socket_path,
+                "PUT",
+                "/snapshot/load",
+                &snapshot_root_load_body(state_path, memory_path, resume_vm),
+                GUEST_EXECUTION_TIMEOUT,
+            ),
+            &format!("PUT {context} /snapshot/load"),
+        );
+
+        let info = http_get(socket_path, "/");
+        assert_ok_response(&info, &format!("GET {context} destination state"));
+        assert_response_contains(
+            &info,
+            if resume_vm {
+                r#""state":"Running""#
+            } else {
+                r#""state":"Paused""#
+            },
+            &format!("GET {context} destination state"),
+        );
+        let config = http_get(socket_path, "/balloon");
+        assert_ok_response(&config, &format!("GET {context} balloon config"));
+        let stats_polling_interval_s = source_balloon.config().stats_polling_interval_s();
+        for expected in [
+            r#""amount_mib":8"#.to_owned(),
+            r#""deflate_on_oom":true"#.to_owned(),
+            format!(r#""stats_polling_interval_s":{stats_polling_interval_s}"#),
+            r#""free_page_hinting":true"#.to_owned(),
+            r#""free_page_reporting":true"#.to_owned(),
+        ] {
+            assert_response_contains(&config, &expected, &format!("GET {context} balloon config"));
+        }
+        if !resume_vm {
+            std::thread::sleep(
+                Duration::from_secs(u64::from(stats_polling_interval_s))
+                    + Duration::from_millis(250),
+            );
+            assert_no_content_response(
+                &http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+                &format!("FlushMetrics {context} while Paused"),
+            );
+            assert_eq!(
+                balloon_metric_total(metrics_path, "stats_updates_count"),
+                0,
+                "{context} must not schedule a retained descriptor while Paused"
+            );
+            if recapture {
+                let recaptured_state = test_root.join(format!("{context}.recaptured.state"));
+                let recaptured_memory = test_root.join(format!("{context}.recaptured.memory"));
+                create_balloon_snapshot(
+                    socket_path,
+                    &recaptured_state,
+                    &recaptured_memory,
+                    &format!("{context} recapture"),
+                );
+                let recaptured = assert_active_balloon_snapshot(
+                    &recaptured_state,
+                    enable_pci,
+                    true,
+                    false,
+                    true,
+                    stats_polling_interval_s,
+                    &format!("{context} recapture"),
+                );
+                assert_eq!(
+                    &recaptured, source_balloon,
+                    "{context} Paused recapture should match the normalized source balloon semantics"
+                );
+            }
+            assert_no_content_response(
+                &http_json(socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+                &format!("PATCH {context} Resumed"),
+            );
+        }
+
+        let restored_statistics = http_get(socket_path, "/balloon/statistics");
+        assert_ok_response(
+            &restored_statistics,
+            &format!("GET {context} restored balloon statistics"),
+        );
+        assert_balloon_api_statistics_match_snapshot(&restored_statistics, source_balloon, context);
+        let hinting = http_get(socket_path, "/balloon/hinting/status");
+        assert_ok_response(&hinting, &format!("GET {context} restored hinting status"));
+        assert_response_contains(
+            &hinting,
+            r#""host_cmd":1"#,
+            &format!("GET {context} normalized DONE hinting status"),
+        );
+
+        let resumed_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_no_content_response(
+            &http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+            &format!("FlushMetrics {context} before full statistics interval"),
+        );
+        assert_eq!(
+            balloon_metric_total(metrics_path, "stats_updates_count"),
+            0,
+            "{context} retained statistics work must not complete early"
+        );
+        wait_for_balloon_metric(
+            socket_path,
+            metrics_path,
+            "stats_updates_count",
+            1,
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .unwrap_or_else(|error| {
+            let output = destination.force_stop_and_collect();
+            panic!(
+                "{context} retained statistics descriptor did not complete: {error}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            )
+        });
+        assert!(
+            resumed_at.elapsed()
+                >= Duration::from_millis(u64::from(stats_polling_interval_s) * 1_000 - 500),
+            "{context} statistics completion should wait for one destination-local interval"
+        );
+
+        assert_no_content_response(
+            &http_json(
+                socket_path,
+                "PATCH",
+                "/balloon/hinting/start",
+                r#"{"acknowledge_on_stop":true}"#,
+            ),
+            &format!("PATCH {context} fresh hinting start"),
+        );
+        wait_for_balloon_hinting_status(
+            socket_path,
+            u64::from(VIRTIO_BALLOON_FREE_PAGE_HINT_DONE),
+            Some(0),
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .unwrap_or_else(|error| {
+            panic!("{context} fresh hinting run did not complete safely: {error}")
+        });
+        assert_no_content_response(
+            &http_no_body(socket_path, "PATCH", "/balloon/hinting/stop"),
+            &format!("PATCH {context} fresh hinting stop"),
+        );
+        wait_for_nonzero_balloon_free_page_report_count(
+            socket_path,
+            metrics_path,
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .unwrap_or_else(|error| {
+            panic!("{context} reporting did not continue after restore: {error}")
+        });
+
+        assert_no_content_response(
+            &http_json(socket_path, "PATCH", "/balloon", r#"{"amount_mib":0}"#),
+            &format!("PATCH {context} balloon target to zero"),
+        );
+        wait_for_balloon_page_counts(socket_path, 0, 0, GUEST_EXECUTION_TIMEOUT)
+            .unwrap_or_else(|error| panic!("{context} balloon did not deflate: {error}"));
+        assert_no_content_response(
+            &http_json(socket_path, "PATCH", "/balloon", r#"{"amount_mib":8}"#),
+            &format!("PATCH {context} balloon target to eight MiB"),
+        );
+        wait_for_balloon_page_counts(socket_path, 2_048, 2_048, GUEST_EXECUTION_TIMEOUT)
+            .unwrap_or_else(|error| panic!("{context} balloon did not reinflate: {error}"));
+        assert_no_content_response(
+            &http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+            &format!("FlushMetrics {context} after restored activity"),
+        );
+        for (field, minimum) in [
+            ("stats_updates_count", 1),
+            ("deflate_count", 1),
+            ("inflate_count", 1),
+            ("free_page_report_count", 1),
+            ("inflate_discard_attempts", 1),
+        ] {
+            assert!(
+                balloon_metric_total(metrics_path, field) >= minimum,
+                "{context} should publish destination-only balloon.{field} >= {minimum}; metrics:\n{}",
+                fs::read_to_string(metrics_path).unwrap_or_default()
+            );
+        }
+        assert_clean_shutdown(
+            destination.terminate(),
+            socket_path,
+            &format!("{context} restored balloon destination"),
+        );
+    }
+
+    fn create_balloon_snapshot(socket: &Path, state: &Path, memory: &Path, context: &str) {
+        let response = http_json_with_io_timeout(
+            socket,
+            "PUT",
+            "/snapshot/create",
+            &format!(
+                r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+                json_string(path_text(state)),
+                json_string(path_text(memory))
+            ),
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert_no_content_response(&response, &format!("PUT {context} /snapshot/create"));
+        assert!(state.is_file(), "{context} state should publish");
+        assert!(memory.is_file(), "{context} memory should publish");
     }
 
     #[test]
@@ -15650,6 +16150,50 @@ mod macos_arm64 {
                 .get("free_page_report_count")?
                 .as_u64()
         })
+    }
+
+    fn balloon_metric_total(path: &Path, field: &str) -> u64 {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()?
+                    .get("balloon")?
+                    .get(field)?
+                    .as_u64()
+            })
+            .fold(0, u64::saturating_add)
+    }
+
+    fn wait_for_balloon_metric(
+        socket_path: &Path,
+        metrics_path: &Path,
+        field: &str,
+        expected: u64,
+        timeout: Duration,
+    ) -> Result<u64, String> {
+        let started_at = Instant::now();
+        loop {
+            let response =
+                http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#);
+            if !response.starts_with("HTTP/1.1 204 No Content\r\n") {
+                return Err(format!(
+                    "FlushMetrics failed while waiting for balloon.{field}:\n{response}"
+                ));
+            }
+            let observed = balloon_metric_total(metrics_path, field);
+            if observed >= expected {
+                return Ok(observed);
+            }
+            if started_at.elapsed() >= timeout {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for balloon.{field} >= {expected}; observed={observed}; metrics:\n{}",
+                    fs::read_to_string(metrics_path).unwrap_or_default()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     fn wait_for_http_response_fragment(

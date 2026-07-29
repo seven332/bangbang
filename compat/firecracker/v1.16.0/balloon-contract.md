@@ -1,16 +1,15 @@
 # Firecracker v1.16.0 balloon closure contract
 
-This ledger is the checked closure record for #1473, the first delivery slice
-of #1440 under #1348. It covers exactly 52 directly owned Firecracker v1.16.0
-balloon identities. Fifty API operation, path, property, and schema identities
-are `implemented-and-verified`. Exactly `corpus:ballooning` and
-`semantic.memory-device:balloon-oom-stats-hinting-and-reporting` remain
-`audit-required` because their complete upstream claims include optional-device
-snapshot serialization and restore, which Wave 6 owns.
+This ledger is the checked terminal closure record for #1473 and #1681 under
+#1490 and #1348. It covers exactly 52 directly owned Firecracker v1.16.0
+balloon identities. All 52 API operation, path, property, schema, corpus, and
+semantic identities are `implemented-and-verified`.
 
 The generated source manifest remains 381 identities, the overlay retains 37
-local semantic identities and 418 total records, and this reconciliation moves
-the global disposition counts from 114/284/3/17 to 164/234/3/17.
+local semantic identities and 418 total records. #1473 first moved the 50
+bounded live/API identities from 114/284/3/17 to 164/234/3/17. #1681 closes the
+two retained aggregates and moves the current global disposition counts from
+238/160/3/17 to 240/158/3/17.
 
 ## Evidence keys
 
@@ -21,9 +20,17 @@ the global disposition counts from 114/284/3/17 to 164/234/3/17.
 - **Runtime** — queue parsing, feature negotiation, statistics, hinting,
   reporting, prepared PFN accounting, metrics, and detached capture state in
   `crates/runtime/src/balloon.rs`; Linux-compatible pre-activation statistics
-  notification admission in `crates/runtime/src/virtio_mmio.rs`; MMIO/PCI
+  notification admission in `crates/runtime/src/virtio_mmio.rs` and retained
+  pre-activation PCI notification dispatch in `crates/runtime/src/balloon.rs`;
+  MMIO/PCI
   attachment and exact selected-owner traversal in `crates/runtime/src/startup.rs`,
   `crates/runtime/src/virtio_pci.rs`, and `crates/hvf/src/startup.rs`.
+- **Native-v2 2.9 artifact and restore** — exact optional component kind 10,
+  hostile-input codec, cross-component validation, transport reconstruction,
+  and fresh-owner restore planning in
+  `crates/runtime/src/snapshot_balloon_v2_9.rs`,
+  `crates/hvf/src/snapshot_v2_balloon_platform.rs`,
+  `crates/hvf/src/startup.rs`, and `crates/bangbang/src/vmm.rs`.
 - **Focused validation** — balloon route/model tests in
   `crates/api/src/http.rs` and `crates/bangbang/src/{api_server,vmm}.rs`, plus
   queue, parser, failure-order, accounting, hinting, statistics, reporting,
@@ -32,22 +39,24 @@ the global disposition counts from 114/284/3/17 to 164/234/3/17.
 - **Signed owner validation** —
   `crates/hvf/tests/hvf_lifecycle.rs::capture_ready_balloon_traverses_signed_mmio_and_pci_owners`.
 - **Signed public validation** —
-  `crates/bangbang/tests/executable_hvf_e2e.rs::macos_arm64::signed_executable_exposes_virtio_balloon_to_direct_rootfs_guest`
+  `crates/bangbang/tests/executable_hvf_e2e.rs::macos_arm64::signed_executable_certifies_native_v2_balloon_snapshot_continuation`
   and
-  `signed_executable_runs_all_startup_virtio_devices_over_product_pci`.
+  `crates/launcher/tests/production_bundle_e2e.rs::macos_arm64::normal_bundle_certifies_native_v2_balloon_snapshot_continuation_and_containment`.
 
-The signed public MMIO scenario configures all optional live features, observes
-Linux inflate, periodic optional statistics, a nonzero-to-nonzero polling
-update without losing reported fields, hinting guest STOP plus automatic host
-DONE and explicit stop, reporting metrics, paused capture-ready traversal,
-resume, target-to-zero deflate, exact target/actual convergence, and cleanup.
-It also proves that Linux's statistics-queue notification after `FEATURES_OK`
-but before `DRIVER_OK` is admitted by virtio-MMIO and retained by the balloon
-handler until activation instead of being rejected or lost.
-The product-PCI scenario independently proves selected PCI ownership, paused
-capture-ready traversal, resume, and target-to-zero convergence. The signed
-HVF test inspects the detached state and transport placement directly without
-creating a serialization format.
+The signed direct and normal-production/App-Sandbox matrices run both MMIO and
+PCI. They configure all optional live features; observe Linux inflate, periodic
+optional statistics, a nonzero-to-nonzero polling update, hinting guest STOP
+plus host DONE, reporting, and exact 2,048-page accounting; capture exact
+native-v2 `2.9.0`; and load the same immutable state/memory pair into explicit
+Paused and automatic-resume destinations. They prove no polling while Paused,
+one complete destination-local interval before a retained statistics
+descriptor completes, latest-stat preservation, normalized DONE followed by a
+fresh hint run, post-restore inflate/deflate/API/reporting behavior, fresh
+metrics, recapture, independent clones, malformed-artifact rejection,
+cancellation/death cleanup, pathname-replacement resistance, and session
+namespace cleanup. The direct runtime test also proves that Linux's
+statistics-queue kick before `DRIVER_OK` is retained on PCI just as it is on
+MMIO, then dispatched after activation.
 
 ## Exact 52-record ledger
 
@@ -103,8 +112,8 @@ creating a serialization format.
 | `api-schema:BalloonStats` | implemented and verified | Complete four required plus sixteen optional u64 fields, exact omission, queue parsing/merging, and detached capture. Focused parser/serialization tests and signed optional fields. |
 | `api-schema:BalloonStatsUpdate` | implemented and verified | Complete strict required-u16 polling update schema and runtime transition policy. Focused parser/state tests and signed update. |
 | `api-schema:BalloonUpdate` | implemented and verified | Complete strict required-u32 target update schema and runtime transaction. Focused parser/rollback tests and signed MMIO/PCI zero convergence. |
-| `corpus:ballooning` | audit required | All applicable live API/device behavior and detached state are implemented. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** owns optional-device state encoding, artifact integration, restore construction, migration/clone behavior, portability policy, and signed restored-guest outcomes. |
-| `semantic.memory-device:balloon-oom-stats-hinting-and-reporting` | audit required | Live inflate/deflate, DEFLATE_ON_OOM, paired accounting, polling/statistics, hinting/reporting, Darwin discard, metrics, MMIO/PCI ownership, capture-ready state, failures, and cleanup are implemented. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** owns serialized/restored balloon state and aggregate artifact/portability certification. |
+| `corpus:ballooning` | implemented and verified | Complete applicable live/API behavior plus exact native-v2 2.9 optional kind-10 serialization and MMIO/PCI restoration. Direct and contained signed guests certify explicit/automatic resume, statistics/hint/report continuation, post-restore inflate/deflate, immutable independent clones, recapture, failure boundaries, and cleanup. |
+| `semantic.memory-device:balloon-oom-stats-hinting-and-reporting` | implemented and verified | DEFLATE_ON_OOM, publication-safe paired accounting, polling/statistics, hinting/reporting, best-effort Darwin reclaim, metrics, exact transport ownership, bounded artifact state, fresh destination owners, restored Linux behavior, clone isolation, failures, and cleanup are implemented and verified. |
 
 ## Observable live and capture-ready contract
 
@@ -130,14 +139,33 @@ creating a serialization format.
   inward-aligned host-page interiors are advised; guest-visible queue
   completion and paired accounting do not promise synchronous RSS reduction.
 
-## Explicit Wave 6 handoff
+## Exact native-v2 2.9 terminal profile and limits
 
-This closure intentionally creates no balloon byte encoding or compatibility
-version. Wave 6 must integrate the detached value into an optional-device
-artifact, define versioning and validation, reconstruct MMIO/PCI live owners and
-pending polling/hinting/statistics state, reconcile external machine memory,
-and prove restored Linux inflate/deflate/statistics/hinting/reporting behavior.
-Only after those outcomes may the two retained aggregate records become
-terminal. Firecracker artifact compatibility, cross-host portability,
+- The current writer emits exact native-v2 `2.9.0`: required serial component
+  kind 8, optional unchanged profile-3 storage kind 7, optional unchanged
+  entropy kind 9, and optional balloon kind 10. Balloon-only,
+  storage-plus-balloon, entropy-plus-balloon, and
+  storage-plus-entropy-plus-balloon products are admitted with or without each
+  optional predecessor, over one coherent MMIO or PCI transport.
+- Kind 10 is capped at 4 MiB and at 262,144 canonical inflated-PFN ranges; the
+  complete native-v2 state file remains capped at 16 MiB. The serialized
+  accounting is the exact host-side inflate-minus-deflate PFN set and every
+  range is revalidated against destination RAM before owner construction.
+- Balloon PFNs are always guest 4 KiB pages. Darwin reclaim separately rounds
+  inward to and coalesces destination host pages, normally 16 KiB. Reclaim is
+  best effort: queue completion and exact guest accounting do not guarantee an
+  immediate or synchronous resident-set-size reduction.
+- Capture normalizes an active free-page-hinting host command to DONE. Restore
+  retains the latest guest command/history but never resumes a source hint run;
+  the destination may start a new independent run.
+- Polling timers and absolute deadlines are not serialized. A retained pending
+  statistics descriptor is scheduled only after one full destination-local
+  interval after resume, and no interval elapses while the destination remains
+  Paused.
+- Guest memory, interrupt/notifier/dispatcher authority, timers, reclaim
+  advisers, metrics, and cleanup owners are fresh per destination. Repeated
+  destinations are isolated; state/memory artifacts remain immutable.
+
+Firecracker artifact-byte compatibility, cross-host execution portability,
 guest-independent convergence, and synchronous host-footprint reduction are
-not implied by this live closure.
+not claimed.
