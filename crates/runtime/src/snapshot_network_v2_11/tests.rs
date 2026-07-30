@@ -458,6 +458,21 @@ fn active_pci_mmds_state_round_trips_all_continuation_fields() {
 }
 
 #[test]
+fn single_active_pci_mmds_fixture_is_immutable() {
+    let state = active_pci_mmds_state(1, false);
+    let encoded = state
+        .encode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION)
+        .expect("single active PCI MMDS state should encode");
+    let fixture = fixture_bytes(include_str!("fixtures/active-pci-mmds.hex"));
+    assert_eq!(encoded, fixture);
+    assert_eq!(
+        SnapshotV2NetworkState::decode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, &fixture,)
+            .expect("single active PCI MMDS fixture should decode"),
+        state
+    );
+}
+
+#[test]
 fn subset_mmds_and_every_retry_disposition_round_trip() {
     let subset = SnapshotV2NetworkState::try_new(
         vec![

@@ -149,6 +149,7 @@ use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
     write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
 };
+use bangbang_runtime::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
 use bangbang_runtime::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
 use bangbang_runtime::startup::{
     ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonDevice, Arm64BootBalloonNotificationDispatch,
@@ -256,8 +257,9 @@ use crate::snapshot_v2::{
     HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2FdtState,
     HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState,
     HvfSnapshotV2MemoryHotplugCaptureBuildError, HvfSnapshotV2MemoryHotplugCaptureState,
-    HvfSnapshotV2MemoryHotplugPlatformState, HvfSnapshotV2PlatformState,
-    HvfSnapshotV2PvTimeVcpuState, HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
+    HvfSnapshotV2MemoryHotplugPlatformState, HvfSnapshotV2NetworkPlatformState,
+    HvfSnapshotV2PlatformState, HvfSnapshotV2PvTimeVcpuState, HvfSnapshotV2TimeState,
+    HvfSnapshotV2VcpuState,
 };
 use crate::snapshot_v2_balloon_platform::{
     HvfSnapshotV2BalloonMmioPlatformPlan, HvfSnapshotV2BalloonMmioPlatformPlanParts,
@@ -13573,6 +13575,41 @@ impl HvfArm64BootSession<'_> {
         )
     }
 
+    /// Captures one closed internal exact native-v2 2.11 platform after
+    /// binding optional unchanged virtio-mem source proof to the Full memory
+    /// image.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_network_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<HvfSnapshotV2MemoryHotplugCaptureState>,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2NetworkPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel_using(
+            input,
+            memory_writer,
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            is_cancelled,
+            move |memory, machine, global, topology, vcpus, time| {
+                HvfSnapshotV2NetworkPlatformState::try_new(
+                    memory, machine, global, topology, vcpus, time, capture,
+                )
+            },
+        )
+    }
+
     /// Complete a topology-wide pause without dispatching new guest work.
     #[doc(hidden)]
     pub fn pause_for_snapshot_v2_capture(&mut self) -> Result<(), HvfArm64BootVcpuError> {
@@ -24604,6 +24641,41 @@ impl OwnedHvfArm64BootSession {
             is_cancelled,
             move |memory, machine, global, topology, vcpus, time| {
                 HvfSnapshotV2MemoryHotplugPlatformState::try_new(
+                    memory, machine, global, topology, vcpus, time, capture,
+                )
+            },
+        )
+    }
+
+    /// Captures one closed internal exact native-v2 2.11 platform after
+    /// binding optional unchanged virtio-mem source proof to the Full memory
+    /// image.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_network_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<HvfSnapshotV2MemoryHotplugCaptureState>,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2NetworkPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: &self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel_using(
+            input,
+            memory_writer,
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            is_cancelled,
+            move |memory, machine, global, topology, vcpus, time| {
+                HvfSnapshotV2NetworkPlatformState::try_new(
                     memory, machine, global, topology, vcpus, time, capture,
                 )
             },

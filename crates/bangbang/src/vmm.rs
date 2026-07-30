@@ -26,7 +26,8 @@ use bangbang_hvf::{
     HvfArm64BootMemoryHotplugCaptureState, HvfArm64BootMemoryHotplugDeviceConfig,
     HvfArm64BootMemoryHotplugSnapshotV2CaptureError, HvfArm64BootNetworkCaptureConfig,
     HvfArm64BootNetworkCaptureError, HvfArm64BootNetworkCaptureState,
-    HvfArm64BootNetworkInterfaceCaptureState, HvfArm64BootPciBalloonDeviceUpdater,
+    HvfArm64BootNetworkDeviceOrigin, HvfArm64BootNetworkInterfaceCaptureState,
+    HvfArm64BootNetworkTransportCaptureState, HvfArm64BootPciBalloonDeviceUpdater,
     HvfArm64BootPciBlockDeviceUpdater, HvfArm64BootPciNetworkDeviceUpdater,
     HvfArm64BootPciPmemDeviceUpdater, HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError,
     HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialCaptureError,
@@ -53,8 +54,9 @@ use bangbang_hvf::{
     HvfSnapshotV2MemoryHotplugPreparedProduct, HvfSnapshotV2MemoryHotplugState,
     HvfSnapshotV2MultiBlockMmioRestoreError, HvfSnapshotV2MultiBlockPciRestoreError,
     HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockProcessConfig,
-    HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2PlatformRestoreError,
-    HvfSnapshotV2PlatformState, HvfSnapshotV2RestoredSerialShell, HvfSnapshotV2RootProcessConfig,
+    HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2NetworkPlatformState,
+    HvfSnapshotV2NetworkState, HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformState,
+    HvfSnapshotV2RestoredSerialShell, HvfSnapshotV2RootProcessConfig,
     HvfSnapshotV2RootResourcePlan, HvfSnapshotV2RootRestoreError,
     HvfSnapshotV2SerialOnlyProcessConfig, HvfSnapshotV2SerialOnlyRestoreError,
     HvfSnapshotV2SerialState, HvfSnapshotV2State, HvfSnapshotV2StorageEntropyPciPlatformPlan,
@@ -75,8 +77,9 @@ use bangbang_hvf::{
     decode_hvf_snapshot_v2_state, decode_hvf_snapshot_v2_storage_state,
     encode_hvf_snapshot_v2_balloon_state, encode_hvf_snapshot_v2_entropy_state,
     encode_hvf_snapshot_v2_memory_hotplug_state, encode_hvf_snapshot_v2_multi_block_state,
-    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
-    encode_hvf_snapshot_v2_storage_state, prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    encode_hvf_snapshot_v2_network_state, encode_hvf_snapshot_v2_serial_state,
+    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
+    prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
     prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_pci_platform_plan,
@@ -162,15 +165,15 @@ use bangbang_runtime::snapshot_artifact::{
     NativeV2BalloonSnapshotCandidateState, NativeV2EntropySnapshotCandidateState,
     NativeV2MemoryHotplugSnapshotCandidateState, NativeV2MemoryHotplugSnapshotPreparation,
     NativeV2MemoryHotplugSnapshotPreparationError, NativeV2MultiBlockSnapshotCandidateState,
-    NativeV2SerialSnapshotCandidateState, NativeV2SnapshotArtifactProfile,
-    NativeV2SnapshotCandidateState, NativeV2SnapshotCandidateStateError,
-    NativeV2StorageSnapshotCandidateState, PreparedNativeSnapshotState, SnapshotArtifactLoadError,
-    SnapshotArtifactOutput, SnapshotArtifactOutputs, SnapshotArtifactPaths,
-    SnapshotCommitDurability, SnapshotMemoryStagingWriter, SnapshotPublicationOutcome,
-    SnapshotPublicationTransactionError, load_prepared_native_snapshot_memory_file,
-    load_prepared_native_snapshot_memory_path, load_snapshot_artifacts,
-    prepare_native_snapshot_state_file, prepare_native_snapshot_state_path,
-    prepare_snapshot_state_file, prepare_snapshot_state_path,
+    NativeV2NetworkSnapshotCandidateState, NativeV2SerialSnapshotCandidateState,
+    NativeV2SnapshotArtifactProfile, NativeV2SnapshotCandidateState,
+    NativeV2SnapshotCandidateStateError, NativeV2StorageSnapshotCandidateState,
+    PreparedNativeSnapshotState, SnapshotArtifactLoadError, SnapshotArtifactOutput,
+    SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotCommitDurability,
+    SnapshotMemoryStagingWriter, SnapshotPublicationOutcome, SnapshotPublicationTransactionError,
+    load_prepared_native_snapshot_memory_file, load_prepared_native_snapshot_memory_path,
+    load_snapshot_artifacts, prepare_native_snapshot_state_file,
+    prepare_native_snapshot_state_path, prepare_snapshot_state_file, prepare_snapshot_state_path,
     publish_native_snapshot_artifacts_to_with, publish_native_snapshot_artifacts_with,
     publish_snapshot_artifacts_to_with, publish_snapshot_artifacts_with,
 };
@@ -213,6 +216,11 @@ use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
     SnapshotV2MemoryHotplugControllerProjection,
 };
 use bangbang_runtime::snapshot_memory_v2::{SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError};
+use bangbang_runtime::snapshot_network_v2_11::{
+    SnapshotV2MmdsInterfaceState, SnapshotV2MmdsState, SnapshotV2NetworkBackendClass,
+    SnapshotV2NetworkInterfaceState, SnapshotV2NetworkState, SnapshotV2NetworkStateBuildError,
+    SnapshotV2NetworkStateCaptureError,
+};
 use bangbang_runtime::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
     SnapshotV2SerialStateCaptureError,
@@ -226,7 +234,9 @@ use bangbang_runtime::startup::{
     update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
     update_network_interface_rate_limiters_for_devices, update_pmem_rate_limiter_for_devices,
 };
-use bangbang_runtime::storage_capture::{CaptureReadyStorageConfigs, CaptureReadyStorageState};
+use bangbang_runtime::storage_capture::{
+    CaptureReadyStorageConfigs, CaptureReadyStorageState, StorageDeviceOrigin,
+};
 #[cfg(target_os = "macos")]
 use bangbang_runtime::vsock::{SuppliedVsockListener, VsockBackendSelector};
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput, VsockMmioLayout};
@@ -803,6 +813,18 @@ enum NativeV2SnapshotCaptureProfile {
         storage_configs: CaptureReadyStorageConfigs,
         expected_transport: SnapshotV2DeviceTransportKind,
     },
+    Network {
+        serial: SnapshotV2SerialState,
+        memory_hotplug_config: Option<MemoryHotplugConfig>,
+        memory_hotplug_requested_size_mib: u64,
+        balloon_config: Option<BalloonConfig>,
+        entropy_config: Option<EntropyConfig>,
+        storage_configs: CaptureReadyStorageConfigs,
+        network_configs: Vec<NetworkInterfaceConfig>,
+        mmds_config: Option<MmdsConfig>,
+        mmds_state: MmdsStateHandle,
+        expected_transport: SnapshotV2DeviceTransportKind,
+    },
 }
 
 struct NativeV2RootCandidateProductProfile {
@@ -875,6 +897,20 @@ struct NativeV2MemoryHotplugCandidateProductProfile {
     memory_hotplug_config: Option<MemoryHotplugConfig>,
     memory_hotplug_requested_size_mib: u64,
     storage_configs: CaptureReadyStorageConfigs,
+    expected_transport: SnapshotV2DeviceTransportKind,
+}
+
+struct NativeV2NetworkCandidateProductProfile {
+    input: HvfArm64BootSnapshotV2CaptureInput,
+    serial_config: SerialConfig,
+    entropy_config: Option<EntropyConfig>,
+    balloon_config: Option<BalloonConfig>,
+    memory_hotplug_config: Option<MemoryHotplugConfig>,
+    memory_hotplug_requested_size_mib: u64,
+    storage_configs: CaptureReadyStorageConfigs,
+    network_configs: Vec<NetworkInterfaceConfig>,
+    mmds_config: Option<MmdsConfig>,
+    mmds_state: MmdsStateHandle,
     expected_transport: SnapshotV2DeviceTransportKind,
 }
 
@@ -1150,6 +1186,62 @@ pub(crate) enum NativeV2MemoryHotplugCandidateProfileError {
     IncompatibleProcessMode,
 }
 
+#[derive(Debug)]
+pub(crate) enum NativeV2NetworkCandidateProfileError {
+    MissingBootSource,
+    InvalidBootMetadata,
+    StorageProfile(SnapshotV2StorageDeviceGraphCaptureError),
+    SerialProfile(SnapshotV2SerialStateCaptureError),
+    RequestedSize,
+    TransportCapacity,
+    NetworkInventory,
+    MmdsState(MmdsStateLockError),
+    OptionalDevices,
+    IncompatibleProcessMode,
+}
+
+impl fmt::Display for NativeV2NetworkCandidateProfileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingBootSource => formatter.write_str("boot source is not configured"),
+            Self::InvalidBootMetadata => formatter.write_str("boot metadata is invalid"),
+            Self::StorageProfile(_) => {
+                formatter.write_str("block-and-pmem inventory is unsupported")
+            }
+            Self::SerialProfile(_) => formatter.write_str("serial configuration is unsupported"),
+            Self::RequestedSize => formatter.write_str("virtio-mem requested size is inconsistent"),
+            Self::TransportCapacity => formatter.write_str("device transport capacity is exceeded"),
+            Self::NetworkInventory => {
+                formatter.write_str("network and MMDS inventory is inconsistent")
+            }
+            Self::MmdsState(_) => formatter.write_str("MMDS state is unavailable"),
+            Self::OptionalDevices => {
+                formatter.write_str("unsupported optional device is configured")
+            }
+            Self::IncompatibleProcessMode => {
+                formatter.write_str("process boot mode is incompatible")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV2NetworkCandidateProfileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::StorageProfile(source) => Some(source),
+            Self::SerialProfile(source) => Some(source),
+            Self::MmdsState(source) => Some(source),
+            Self::MissingBootSource
+            | Self::InvalidBootMetadata
+            | Self::RequestedSize
+            | Self::TransportCapacity
+            | Self::NetworkInventory
+            | Self::OptionalDevices
+            | Self::IncompatibleProcessMode => None,
+        }
+    }
+}
+
 impl fmt::Display for NativeV2MemoryHotplugCandidateProfileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1238,6 +1330,42 @@ enum NativeV2MemoryHotplugCandidateProcessError {
     Transaction(Box<NativeV2SnapshotPublicationTransactionError>),
 }
 
+#[derive(Debug)]
+enum NativeV2NetworkCandidateProcessError {
+    Profile(NativeV2NetworkCandidateProfileError),
+    SessionUnavailable,
+    Transaction(Box<NativeV2SnapshotPublicationTransactionError>),
+}
+
+impl fmt::Display for NativeV2NetworkCandidateProcessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Profile(source) => {
+                write!(
+                    formatter,
+                    "native-v2 network candidate profile rejected: {source}"
+                )
+            }
+            Self::SessionUnavailable => {
+                formatter.write_str("native-v2 network candidate boot session is unavailable")
+            }
+            Self::Transaction(_) => {
+                formatter.write_str("native-v2 network candidate capture failed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV2NetworkCandidateProcessError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Profile(source) => Some(source),
+            Self::Transaction(source) => Some(source),
+            Self::SessionUnavailable => None,
+        }
+    }
+}
+
 impl fmt::Display for NativeV2MemoryHotplugCandidateProcessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1300,6 +1428,7 @@ pub(crate) enum NativeV2SnapshotCaptureStage {
     TopologyPause,
     Balloon,
     MemoryHotplug,
+    Network,
     Device(HvfArm64BootStorageCaptureStage),
     Memory(SnapshotV2MemoryIoStage),
     Encode,
@@ -1314,6 +1443,7 @@ impl fmt::Display for NativeV2SnapshotCaptureStage {
             Self::TopologyPause => formatter.write_str("topology pause"),
             Self::Balloon => formatter.write_str("balloon capture"),
             Self::MemoryHotplug => formatter.write_str("virtio-mem capture"),
+            Self::Network => formatter.write_str("network capture"),
             Self::Device(stage) => write!(formatter, "device/{stage:?}"),
             Self::Memory(stage) => write!(formatter, "memory/{stage}"),
             Self::Encode => formatter.write_str("state encode"),
@@ -1360,6 +1490,9 @@ pub(crate) enum NativeV2SnapshotCaptureError {
     MemoryHotplug {
         source: NativeV2SnapshotMemoryHotplugCaptureError,
     },
+    Network {
+        source: NativeV2SnapshotNetworkCaptureError,
+    },
     TopologyPause {
         source: HvfArm64BootVcpuError,
     },
@@ -1402,6 +1535,7 @@ impl NativeV2SnapshotCaptureError {
             | Self::Entropy { .. }
             | Self::Balloon { .. }
             | Self::MemoryHotplug { .. }
+            | Self::Network { .. }
             | Self::Encode { .. }
             | Self::Compose { .. }
             | Self::CandidateState { .. }
@@ -1696,6 +1830,58 @@ impl std::error::Error for NativeV2SnapshotMemoryHotplugCaptureError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum NativeV2SnapshotNetworkCaptureError {
+    Live {
+        source: ProcessCaptureReadyNetworkError,
+    },
+    State {
+        source: SnapshotV2NetworkStateCaptureError,
+    },
+    Build {
+        source: SnapshotV2NetworkStateBuildError,
+    },
+    Allocation,
+    NormalizedWork,
+    Transport {
+        expected: SnapshotV2DeviceTransportKind,
+        actual: SnapshotV2DeviceTransportKind,
+    },
+}
+
+impl fmt::Display for NativeV2SnapshotNetworkCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Live { source } => write!(formatter, "network owner capture failed: {source}"),
+            Self::State { source } => {
+                write!(formatter, "captured network interface is invalid: {source}")
+            }
+            Self::Build { source } => {
+                write!(formatter, "captured network aggregate is invalid: {source}")
+            }
+            Self::Allocation => formatter.write_str("network state allocation failed"),
+            Self::NormalizedWork => {
+                formatter.write_str("network capture normalized source-owned work")
+            }
+            Self::Transport { expected, actual } => write!(
+                formatter,
+                "captured network transport {actual:?} does not match product transport {expected:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NativeV2SnapshotNetworkCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Live { source } => Some(source),
+            Self::State { source } => Some(source),
+            Self::Build { source } => Some(source),
+            Self::Allocation | Self::NormalizedWork | Self::Transport { .. } => None,
+        }
+    }
+}
+
 fn native_v2_platform_capture_is_terminal(source: &HvfArm64BootSnapshotV2CaptureError) -> bool {
     match source {
         HvfArm64BootSnapshotV2CaptureError::Topology { .. }
@@ -1766,6 +1952,9 @@ impl fmt::Display for NativeV2SnapshotCaptureError {
             Self::MemoryHotplug { source } => {
                 write!(formatter, "native-v2 virtio-mem capture failed: {source}")
             }
+            Self::Network { source } => {
+                write!(formatter, "native-v2 network capture failed: {source}")
+            }
             Self::TopologyPause { source } => {
                 write!(formatter, "native-v2 topology pause failed: {source}")
             }
@@ -1808,6 +1997,7 @@ impl std::error::Error for NativeV2SnapshotCaptureError {
             Self::Entropy { source } => Some(source),
             Self::Balloon { source } => Some(source),
             Self::MemoryHotplug { source } => Some(source),
+            Self::Network { source } => Some(source),
             Self::TopologyPause { source } => Some(source),
             Self::Platform { source } => Some(source),
             Self::Encode { source } => Some(source),
@@ -8544,6 +8734,113 @@ where
         })
     }
 
+    fn native_v2_network_candidate_product_profile(
+        &self,
+    ) -> Result<NativeV2NetworkCandidateProductProfile, NativeV2NetworkCandidateProfileError> {
+        self.starter
+            .preflight_snapshot_v2_root_process(self.pci_enabled)
+            .map_err(|_| NativeV2NetworkCandidateProfileError::IncompatibleProcessMode)?;
+
+        let boot = self
+            .controller
+            .boot_source_config()
+            .ok_or(NativeV2NetworkCandidateProfileError::MissingBootSource)?;
+        let kernel = HvfSnapshotV2NativePath::try_new(boot.kernel_image_path().as_os_str())
+            .map_err(|_| NativeV2NetworkCandidateProfileError::InvalidBootMetadata)?;
+        let initrd = boot
+            .initrd_path()
+            .map(|path| HvfSnapshotV2NativePath::try_new(path.as_os_str()))
+            .transpose()
+            .map_err(|_| NativeV2NetworkCandidateProfileError::InvalidBootMetadata)?;
+        let boot = HvfSnapshotV2BootState::try_new(kernel, initrd, boot.boot_args())
+            .map_err(|_| NativeV2NetworkCandidateProfileError::InvalidBootMetadata)?;
+
+        let drives = self.controller.drive_configs();
+        let pmem = self.controller.pmem_configs();
+        let storage_resource_count = drives
+            .len()
+            .checked_add(pmem.len())
+            .ok_or(NativeV2NetworkCandidateProfileError::TransportCapacity)?;
+        if storage_resource_count != 0 {
+            SnapshotV2StorageDeviceGraph::preflight_capture_configs(
+                NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                drives,
+                pmem,
+            )
+            .map_err(NativeV2NetworkCandidateProfileError::StorageProfile)?;
+        }
+        SnapshotV2SerialState::preflight_capture(
+            self.controller.serial_config(),
+            storage_resource_count,
+        )
+        .map_err(NativeV2NetworkCandidateProfileError::SerialProfile)?;
+
+        let entropy_config = self.controller.entropy_config();
+        let balloon_config = self.controller.balloon_config();
+        let memory_hotplug_config = self.controller.memory_hotplug_config();
+        let memory_hotplug_requested_size_mib = self
+            .controller
+            .memory_hotplug_status()
+            .map(|status| status.requested_size_mib())
+            .unwrap_or(0);
+        if let Some(config) = memory_hotplug_config {
+            config
+                .validate_size_update(MemoryHotplugSizeUpdateInput::new(
+                    memory_hotplug_requested_size_mib,
+                ))
+                .map_err(|_| NativeV2NetworkCandidateProfileError::RequestedSize)?;
+        } else if memory_hotplug_requested_size_mib != 0 {
+            return Err(NativeV2NetworkCandidateProfileError::RequestedSize);
+        }
+
+        let network_configs = self.controller.network_interface_configs().to_vec();
+        validate_network_interface_count(network_configs.len())
+            .map_err(|_| NativeV2NetworkCandidateProfileError::NetworkInventory)?;
+        let mmds_config = self
+            .controller
+            .mmds_config()
+            .map_err(NativeV2NetworkCandidateProfileError::MmdsState)?;
+        if network_configs.is_empty() && mmds_config.is_some()
+            || mmds_config
+                .as_ref()
+                .is_some_and(|config| !mmds_network_inventory_matches(config, &network_configs))
+        {
+            return Err(NativeV2NetworkCandidateProfileError::NetworkInventory);
+        }
+
+        let endpoint_count = storage_resource_count
+            .checked_add(network_configs.len())
+            .and_then(|count| count.checked_add(usize::from(entropy_config.is_some())))
+            .and_then(|count| count.checked_add(usize::from(balloon_config.is_some())))
+            .and_then(|count| count.checked_add(usize::from(memory_hotplug_config.is_some())))
+            .ok_or(NativeV2NetworkCandidateProfileError::TransportCapacity)?;
+        let pci_capacity = usize::from(PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1);
+        if self.pci_enabled && endpoint_count > pci_capacity {
+            return Err(NativeV2NetworkCandidateProfileError::TransportCapacity);
+        }
+        if self.controller.vsock_config().is_some() {
+            return Err(NativeV2NetworkCandidateProfileError::OptionalDevices);
+        }
+
+        Ok(NativeV2NetworkCandidateProductProfile {
+            input: HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            serial_config: self.controller.serial_config().clone(),
+            entropy_config,
+            balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs: CaptureReadyStorageConfigs::new(drives.to_vec(), pmem.to_vec()),
+            network_configs,
+            mmds_config,
+            mmds_state: self.controller.mmds_state_handle(),
+            expected_transport: if self.pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            },
+        })
+    }
+
     /// Publishes one strictly admitted paused source as a native-v2 2.10 pair.
     ///
     /// The public create action reaches this seam after request normalization.
@@ -8770,6 +9067,50 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
             )
             .map_err(NativeV2MemoryHotplugCandidateProcessError::Transaction)
     }
+
+    fn capture_native_v2_network_candidate(
+        &mut self,
+        output: BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: NativeV2SnapshotCaptureCancellation,
+    ) -> Result<NativeV2NetworkSnapshotCandidateState, NativeV2NetworkCandidateProcessError> {
+        let NativeV2NetworkCandidateProductProfile {
+            input,
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs,
+            network_configs,
+            mmds_config,
+            mmds_state,
+            expected_transport,
+        } = self
+            .native_v2_network_candidate_product_profile()
+            .map_err(NativeV2NetworkCandidateProcessError::Profile)?;
+        let session = self
+            .started_session
+            .as_mut()
+            .and_then(HvfProcessSession::boot_mut)
+            .ok_or(NativeV2NetworkCandidateProcessError::SessionUnavailable)?;
+        session
+            .capture_native_v2_network_candidate(NativeV2NetworkCandidateCaptureRequest {
+                input,
+                serial_config,
+                balloon_config,
+                entropy_config,
+                memory_hotplug_config,
+                memory_hotplug_requested_size_mib,
+                storage_configs,
+                network_configs,
+                mmds_config,
+                mmds_state,
+                expected_transport,
+                output,
+                cancellation,
+            })
+            .map_err(NativeV2NetworkCandidateProcessError::Transaction)
+    }
 }
 
 // Keep the frozen, intentionally non-dispatched native-v1 writer type-checked
@@ -8799,6 +9140,16 @@ const _: fn(
     NativeV2MemoryHotplugSnapshotCandidateState,
     NativeV2MemoryHotplugCandidateProcessError,
 > = ProcessVmm::<HvfInstanceStartExecutor>::capture_native_v2_memory_hotplug_candidate;
+
+// Keep the internal exact-2.11 network/MMDS candidate seam type-checked
+// without activating it through public create or load dispatch.
+const _: fn(
+    &mut ProcessVmm<HvfInstanceStartExecutor>,
+    BoxedNativeV2SnapshotMemoryOutput,
+    NativeV2SnapshotCaptureCancellation,
+)
+    -> Result<NativeV2NetworkSnapshotCandidateState, NativeV2NetworkCandidateProcessError> =
+    ProcessVmm::<HvfInstanceStartExecutor>::capture_native_v2_network_candidate;
 
 #[cfg(target_os = "macos")]
 const _: fn(
@@ -14469,6 +14820,22 @@ struct NativeV2MemoryHotplugCandidateCaptureRequest {
     cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
+struct NativeV2NetworkCandidateCaptureRequest {
+    input: HvfArm64BootSnapshotV2CaptureInput,
+    serial_config: SerialConfig,
+    balloon_config: Option<BalloonConfig>,
+    entropy_config: Option<EntropyConfig>,
+    memory_hotplug_config: Option<MemoryHotplugConfig>,
+    memory_hotplug_requested_size_mib: u64,
+    storage_configs: CaptureReadyStorageConfigs,
+    network_configs: Vec<NetworkInterfaceConfig>,
+    mmds_config: Option<MmdsConfig>,
+    mmds_state: MmdsStateHandle,
+    expected_transport: SnapshotV2DeviceTransportKind,
+    output: BoxedNativeV2SnapshotMemoryOutput,
+    cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
 impl SnapshotCaptureCancellation {
     fn begin_operation(&self) -> bool {
         if self.state.shutdown_requested.load(Ordering::Acquire) {
@@ -14671,6 +15038,8 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     type MemoryHotplugCaptureState: Send + 'static;
     type MemoryHotplugPlatformState: Send + 'static;
     type MemoryHotplugState: Send + 'static;
+    type NetworkPlatformState: Send + 'static;
+    type NetworkState: Send + 'static;
 
     fn capture_native_v2_serial(
         &self,
@@ -14701,6 +15070,16 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
         expected_transport: SnapshotV2DeviceTransportKind,
         guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
     ) -> Result<Option<Self::MemoryHotplugCaptureState>, NativeV2SnapshotMemoryHotplugCaptureError>;
+
+    fn capture_native_v2_network(
+        &self,
+        configs: &[NetworkInterfaceConfig],
+        mmds_config: Option<&MmdsConfig>,
+        mmds_state: &MmdsStateHandle,
+        expected_transport: SnapshotV2DeviceTransportKind,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        now: Instant,
+    ) -> Result<Option<SnapshotV2NetworkState>, NativeV2SnapshotNetworkCaptureError>;
 
     fn pause_native_v2_topology(&mut self) -> Result<(), HvfArm64BootVcpuError>;
 
@@ -14780,6 +15159,14 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
         output: &mut BoxedNativeV2SnapshotMemoryOutput,
         cancellation: &NativeV2SnapshotCaptureCancellation,
     ) -> Result<Self::MemoryHotplugPlatformState, HvfArm64BootSnapshotV2CaptureError>;
+
+    fn capture_native_v2_network_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<Self::MemoryHotplugCaptureState>,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::NetworkPlatformState, HvfArm64BootSnapshotV2CaptureError>;
 
     fn compose_native_v2_root(
         &self,
@@ -14865,6 +15252,21 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     fn encode_native_v2_memory_hotplug(
         &self,
         state: &Self::MemoryHotplugState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
+
+    fn compose_native_v2_network(
+        &self,
+        platform: Self::NetworkPlatformState,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+        network: Option<SnapshotV2NetworkState>,
+    ) -> Result<Self::NetworkState, HvfSnapshotV2BuildError>;
+
+    fn encode_native_v2_network(
+        &self,
+        state: &Self::NetworkState,
     ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
 
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError>;
@@ -15238,6 +15640,132 @@ fn compose_process_capture_ready_network_state(
     })
 }
 
+fn convert_process_capture_ready_network_state(
+    captured: ProcessCaptureReadyNetworkState,
+    expected_transport: SnapshotV2DeviceTransportKind,
+) -> Result<Option<SnapshotV2NetworkState>, NativeV2SnapshotNetworkCaptureError> {
+    if captured.source_work_normalized() {
+        return Err(NativeV2SnapshotNetworkCaptureError::NormalizedWork);
+    }
+    if captured.interfaces().is_empty() {
+        return if captured.mmds().is_none() {
+            Ok(None)
+        } else {
+            Err(NativeV2SnapshotNetworkCaptureError::Build {
+                source: SnapshotV2NetworkStateBuildError::Mmds,
+            })
+        };
+    }
+
+    let mut interfaces = Vec::new();
+    interfaces
+        .try_reserve_exact(captured.interfaces().len())
+        .map_err(|_| NativeV2SnapshotNetworkCaptureError::Allocation)?;
+    for captured_interface in captured.interfaces() {
+        let backend = match captured_interface.backend() {
+            ProcessCaptureReadyNetworkBackend::MmdsOnly => SnapshotV2NetworkBackendClass::MmdsOnly,
+            ProcessCaptureReadyNetworkBackend::Vmnet(_) => SnapshotV2NetworkBackendClass::Vmnet,
+        };
+        let hvf = captured_interface.hvf();
+        let state = match hvf.transport() {
+            HvfArm64BootNetworkTransportCaptureState::Mmio {
+                region,
+                interrupt_line,
+                state,
+            } => SnapshotV2NetworkInterfaceState::try_from_mmio_capture(
+                hvf.config(),
+                backend,
+                *region,
+                *interrupt_line,
+                state,
+            ),
+            HvfArm64BootNetworkTransportCaptureState::Pci {
+                origin,
+                sbdf,
+                bar_range,
+                state,
+            } => SnapshotV2NetworkInterfaceState::try_from_pci_capture(
+                hvf.config(),
+                backend,
+                match origin {
+                    HvfArm64BootNetworkDeviceOrigin::Startup => StorageDeviceOrigin::Startup,
+                    HvfArm64BootNetworkDeviceOrigin::Runtime => StorageDeviceOrigin::Runtime,
+                },
+                *sbdf,
+                *bar_range,
+                state,
+            ),
+        }
+        .map_err(|source| match source {
+            SnapshotV2NetworkStateCaptureError::NormalizedWork => {
+                NativeV2SnapshotNetworkCaptureError::NormalizedWork
+            }
+            source => NativeV2SnapshotNetworkCaptureError::State { source },
+        })?;
+        let actual = state.transport().kind();
+        if actual != expected_transport {
+            return Err(NativeV2SnapshotNetworkCaptureError::Transport {
+                expected: expected_transport,
+                actual,
+            });
+        }
+        interfaces.push(state);
+    }
+
+    let mmds = captured
+        .mmds()
+        .map(|captured_mmds| {
+            let config = captured_mmds.config();
+            let mut selected = Vec::new();
+            selected
+                .try_reserve_exact(config.network_interfaces().len())
+                .map_err(|_| NativeV2SnapshotNetworkCaptureError::Allocation)?;
+            for (index, interface) in captured.interfaces().iter().enumerate() {
+                let is_selected = config
+                    .network_interfaces()
+                    .iter()
+                    .any(|iface_id| iface_id == interface.hvf().config().iface_id());
+                match (is_selected, interface.mmds_stack()) {
+                    (true, Some(stack)) => {
+                        let interface_index = u16::try_from(index).map_err(|_| {
+                            NativeV2SnapshotNetworkCaptureError::Build {
+                                source: SnapshotV2NetworkStateBuildError::Mmds,
+                            }
+                        })?;
+                        selected.push(SnapshotV2MmdsInterfaceState::new(
+                            interface_index,
+                            stack.local_mac_address(),
+                            stack.ipv4_address(),
+                            stack.tcp_port(),
+                        ));
+                    }
+                    (false, None) => {}
+                    (true, None) | (false, Some(_)) => {
+                        return Err(NativeV2SnapshotNetworkCaptureError::Build {
+                            source: SnapshotV2NetworkStateBuildError::Mmds,
+                        });
+                    }
+                }
+            }
+            if selected.len() != config.network_interfaces().len() {
+                return Err(NativeV2SnapshotNetworkCaptureError::Build {
+                    source: SnapshotV2NetworkStateBuildError::Mmds,
+                });
+            }
+            Ok(SnapshotV2MmdsState::new(
+                config.version(),
+                config.ipv4_address(),
+                config.imds_compat(),
+                selected,
+            ))
+        })
+        .transpose()?;
+
+    SnapshotV2NetworkState::try_new(interfaces, mmds)
+        .map(Some)
+        .map_err(|source| NativeV2SnapshotNetworkCaptureError::Build { source })
+}
+
 impl<P> NativeV1SnapshotCaptureSession for ProcessHvfBootSession<OwnedHvfArm64BootSession, P>
 where
     P: ProcessRuntimeNetworkPacketIoProvider + Send + 'static,
@@ -15296,9 +15824,8 @@ where
     }
 }
 
-impl<P> NativeV2SnapshotCaptureSession for ProcessHvfBootSession<OwnedHvfArm64BootSession, P>
-where
-    P: ProcessRuntimeNetworkPacketIoProvider + Send + 'static,
+impl NativeV2SnapshotCaptureSession
+    for ProcessHvfBootSession<OwnedHvfArm64BootSession, ProcessNetworkPacketIoProvider>
 {
     type PlatformState = HvfSnapshotV2PlatformState;
     type RootState = HvfSnapshotV2State;
@@ -15310,6 +15837,8 @@ where
     type MemoryHotplugCaptureState = HvfSnapshotV2MemoryHotplugCaptureState;
     type MemoryHotplugPlatformState = HvfSnapshotV2MemoryHotplugPlatformState;
     type MemoryHotplugState = HvfSnapshotV2MemoryHotplugState;
+    type NetworkPlatformState = HvfSnapshotV2NetworkPlatformState;
+    type NetworkState = HvfSnapshotV2NetworkState;
 
     fn capture_native_v2_serial(
         &self,
@@ -15397,6 +15926,28 @@ where
             }
         }
         Ok(state)
+    }
+
+    fn capture_native_v2_network(
+        &self,
+        configs: &[NetworkInterfaceConfig],
+        mmds_config: Option<&MmdsConfig>,
+        mmds_state: &MmdsStateHandle,
+        expected_transport: SnapshotV2DeviceTransportKind,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        now: Instant,
+    ) -> Result<Option<SnapshotV2NetworkState>, NativeV2SnapshotNetworkCaptureError> {
+        let captured = self
+            .capture_ready_network_state_at(
+                self.vmnet_authority,
+                configs,
+                mmds_config,
+                mmds_state,
+                guard,
+                now,
+            )
+            .map_err(|source| NativeV2SnapshotNetworkCaptureError::Live { source })?;
+        convert_process_capture_ready_network_state(captured, expected_transport)
     }
 
     fn pause_native_v2_topology(&mut self) -> Result<(), HvfArm64BootVcpuError> {
@@ -15621,6 +16172,19 @@ where
             })
     }
 
+    fn capture_native_v2_network_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<Self::MemoryHotplugCaptureState>,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::NetworkPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        self.session
+            .capture_snapshot_v2_network_platform_with_cancel(input, capture, output, |_| {
+                cancellation.is_cancelled()
+            })
+    }
+
     fn compose_native_v2_root(
         &self,
         platform: Self::PlatformState,
@@ -15733,6 +16297,25 @@ where
         state: &Self::MemoryHotplugState,
     ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
         encode_hvf_snapshot_v2_memory_hotplug_state(state)
+    }
+
+    fn compose_native_v2_network(
+        &self,
+        platform: Self::NetworkPlatformState,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+        network: Option<SnapshotV2NetworkState>,
+    ) -> Result<Self::NetworkState, HvfSnapshotV2BuildError> {
+        HvfSnapshotV2NetworkState::try_new(platform, graph, serial, entropy, balloon, network)
+    }
+
+    fn encode_native_v2_network(
+        &self,
+        state: &Self::NetworkState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+        encode_hvf_snapshot_v2_network_state(state)
     }
 
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
@@ -21081,6 +21664,95 @@ fn preflight_native_v2_memory_hotplug_capture(
     Ok(())
 }
 
+fn mmds_network_inventory_matches(
+    config: &MmdsConfig,
+    network_configs: &[NetworkInterfaceConfig],
+) -> bool {
+    config
+        .network_interfaces()
+        .iter()
+        .enumerate()
+        .all(|(index, iface_id)| {
+            !config
+                .network_interfaces()
+                .iter()
+                .take(index)
+                .any(|previous| previous == iface_id)
+                && network_configs
+                    .iter()
+                    .filter(|network| network.iface_id() == iface_id)
+                    .count()
+                    == 1
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_native_v2_network_capture(
+    serial_config: &SerialConfig,
+    balloon_config: Option<BalloonConfig>,
+    entropy_config: Option<EntropyConfig>,
+    memory_hotplug_config: Option<MemoryHotplugConfig>,
+    memory_hotplug_requested_size_mib: u64,
+    storage_configs: &CaptureReadyStorageConfigs,
+    network_configs: &[NetworkInterfaceConfig],
+    mmds_config: Option<&MmdsConfig>,
+    mmds_state: &MmdsStateHandle,
+    expected_transport: SnapshotV2DeviceTransportKind,
+) -> Result<(), NativeV2SnapshotCaptureError> {
+    preflight_native_v2_memory_hotplug_capture(
+        serial_config,
+        balloon_config,
+        entropy_config,
+        memory_hotplug_config,
+        memory_hotplug_requested_size_mib,
+        storage_configs,
+        expected_transport,
+    )?;
+    validate_network_interface_count(network_configs.len()).map_err(|_| {
+        NativeV2SnapshotCaptureError::Network {
+            source: NativeV2SnapshotNetworkCaptureError::Build {
+                source: SnapshotV2NetworkStateBuildError::InterfaceCount,
+            },
+        }
+    })?;
+    let live_mmds_config =
+        mmds_state
+            .config()
+            .map_err(|source| NativeV2SnapshotCaptureError::Network {
+                source: NativeV2SnapshotNetworkCaptureError::Live {
+                    source: ProcessCaptureReadyNetworkError::MmdsState { source },
+                },
+            })?;
+    if live_mmds_config.as_ref() != mmds_config
+        || network_configs.is_empty() && mmds_config.is_some()
+        || mmds_config
+            .is_some_and(|config| !mmds_network_inventory_matches(config, network_configs))
+    {
+        return Err(NativeV2SnapshotCaptureError::Network {
+            source: NativeV2SnapshotNetworkCaptureError::Build {
+                source: SnapshotV2NetworkStateBuildError::Mmds,
+            },
+        });
+    }
+
+    let storage_count = storage_configs
+        .drives()
+        .len()
+        .checked_add(storage_configs.pmem().len())
+        .ok_or(NativeV2SnapshotCaptureError::TransportCapacity)?;
+    let endpoint_count = storage_count
+        .checked_add(network_configs.len())
+        .and_then(|count| count.checked_add(usize::from(balloon_config.is_some())))
+        .and_then(|count| count.checked_add(usize::from(entropy_config.is_some())))
+        .and_then(|count| count.checked_add(usize::from(memory_hotplug_config.is_some())))
+        .ok_or(NativeV2SnapshotCaptureError::TransportCapacity)?;
+    let pci_capacity = usize::from(PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1);
+    if expected_transport == SnapshotV2DeviceTransportKind::Pci && endpoint_count > pci_capacity {
+        return Err(NativeV2SnapshotCaptureError::TransportCapacity);
+    }
+    Ok(())
+}
+
 fn capture_canonical_native_v2_serial<S>(
     session: &S,
     serial_config: SerialConfig,
@@ -21511,6 +22183,111 @@ where
                     .map_err(|source| NativeV2SnapshotCaptureError::Compose { source })?;
                 session
                     .encode_native_v2_memory_hotplug(&state)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Encode { source })?
+            }
+            NativeV2SnapshotCaptureProfile::Network {
+                serial,
+                memory_hotplug_config,
+                memory_hotplug_requested_size_mib,
+                balloon_config,
+                entropy_config,
+                storage_configs,
+                network_configs,
+                mmds_config,
+                mmds_state,
+                expected_transport,
+            } => {
+                let now = Instant::now();
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Balloon,
+                    ));
+                }
+                let balloon = session
+                    .capture_native_v2_balloon(balloon_config, expected_transport, guard, now)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Balloon { source })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Balloon,
+                    ));
+                }
+                let graph =
+                    if storage_configs.drives().is_empty() && storage_configs.pmem().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            session
+                                .capture_native_v2_storage(
+                                    &storage_configs,
+                                    expected_transport,
+                                    guard,
+                                    now,
+                                    cancellation,
+                                )
+                                .map_err(|source| match source {
+                                    NativeV2SnapshotStorageCaptureError::Cancelled { stage } => {
+                                        native_v2_snapshot_cancelled(
+                                            NativeV2SnapshotCaptureStage::Device(stage),
+                                        )
+                                    }
+                                    source => NativeV2SnapshotCaptureError::Storage { source },
+                                })?,
+                        )
+                    };
+                let entropy = session
+                    .capture_native_v2_entropy(entropy_config, expected_transport, guard, now)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Entropy { source })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::MemoryHotplug,
+                    ));
+                }
+                let memory_hotplug = session
+                    .capture_native_v2_memory_hotplug(
+                        memory_hotplug_config,
+                        memory_hotplug_requested_size_mib,
+                        expected_transport,
+                        guard,
+                    )
+                    .map_err(|source| NativeV2SnapshotCaptureError::MemoryHotplug { source })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Network,
+                    ));
+                }
+                let network = session
+                    .capture_native_v2_network(
+                        &network_configs,
+                        mmds_config.as_ref(),
+                        &mmds_state,
+                        expected_transport,
+                        guard,
+                        now,
+                    )
+                    .map_err(|source| NativeV2SnapshotCaptureError::Network { source })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Network,
+                    ));
+                }
+                let platform = session
+                    .capture_native_v2_network_platform(
+                        input,
+                        memory_hotplug,
+                        &mut output,
+                        cancellation,
+                    )
+                    .map_err(native_v2_platform_capture_error)?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Encode,
+                    ));
+                }
+                let state = session
+                    .compose_native_v2_network(platform, graph, serial, entropy, balloon, network)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Compose { source })?;
+                session
+                    .encode_native_v2_network(&state)
                     .map_err(|source| NativeV2SnapshotCaptureError::Encode { source })?
             }
         };
@@ -22129,6 +22906,152 @@ where
                             encoded,
                         )
                         .map_err(|source| NativeV2SnapshotCaptureError::CandidateState { source })
+                    },
+                )
+                .map_err(native_v2_snapshot_transaction_error_before_staging)
+                .and_then(|state| {
+                    if cancellation.is_cancelled() || !cancellation.try_seal_commit() {
+                        Err(native_v2_snapshot_transaction_error_before_staging(
+                            native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::CommitSeal),
+                        ))
+                    } else {
+                        session.native_v2_candidate_commit_sealed();
+                        Ok(state)
+                    }
+                });
+
+                let terminal_capture = result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.producer())
+                    .is_some_and(|producer| producer.source().is_terminal());
+                if terminal_capture {
+                    preserve_terminal_result.store(true, Ordering::Release);
+                    terminal_status.record(BootRunLoopWorkerStatus::Failed(
+                        "terminal native-v2 capture failure".to_string(),
+                    ));
+                    terminal_admission.shutdown();
+                    terminal_pause_gate.shutdown();
+                    let _ = session.run_loop_control().request_stop();
+                }
+                drop(guard);
+                result
+            },
+            move || {
+                completion_cancellation.is_commit_sealed()
+                    || completion_terminal_result.load(Ordering::Acquire)
+            },
+        )
+        .map_err(native_v2_snapshot_publication_error_from_boot_run_loop_command)
+    }
+
+    fn capture_native_v2_network_candidate(
+        &self,
+        request: NativeV2NetworkCandidateCaptureRequest,
+    ) -> Result<
+        NativeV2NetworkSnapshotCandidateState,
+        Box<NativeV2SnapshotPublicationTransactionError>,
+    > {
+        let NativeV2NetworkCandidateCaptureRequest {
+            input,
+            serial_config,
+            balloon_config,
+            entropy_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs,
+            network_configs,
+            mmds_config,
+            mmds_state,
+            expected_transport,
+            output,
+            cancellation,
+        } = request;
+        preflight_native_v2_network_capture(
+            &serial_config,
+            balloon_config,
+            entropy_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            &storage_configs,
+            &network_configs,
+            mmds_config.as_ref(),
+            &mmds_state,
+            expected_transport,
+        )
+        .map_err(native_v2_snapshot_transaction_error_before_staging)?;
+        let active_capture = self
+            .register_snapshot_capture_raw(cancellation.clone())
+            .map_err(|source| {
+                native_v2_snapshot_transaction_error_before_staging(
+                    NativeV2SnapshotCaptureError::Supervisor { source },
+                )
+            })?;
+        if !cancellation.begin_operation() {
+            return Err(native_v2_snapshot_transaction_error_before_staging(
+                native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Source),
+            ));
+        }
+        let completion_cancellation = cancellation.clone();
+        let preserve_terminal_result = Arc::new(AtomicBool::new(false));
+        let completion_terminal_result = Arc::clone(&preserve_terminal_result);
+        let terminal_status = Arc::clone(&self.status);
+        let terminal_admission = Arc::clone(&self.admission);
+        let terminal_pause_gate = Arc::clone(&self.pause_gate);
+
+        self.run_snapshot_quiesced_preserving_result_if(
+            move |session| {
+                let _active_capture = active_capture;
+                let guard = session
+                    .quiesce_snapshot_auxiliary_work()
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Auxiliary { source },
+                        )
+                    })?;
+                if cancellation.is_cancelled() {
+                    drop(guard);
+                    return Err(native_v2_snapshot_transaction_error_before_staging(
+                        native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Source),
+                    ));
+                }
+                let serial = session
+                    .capture_native_v2_serial(serial_config, &guard)
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Serial { source },
+                        )
+                    })?;
+                let serial =
+                    SnapshotV2SerialState::try_from_capture_ready(serial).map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::SerialState { source },
+                        )
+                    })?;
+
+                let result = capture_and_recover_native_v2_state(
+                    session,
+                    input,
+                    NativeV2SnapshotCaptureProfile::Network {
+                        serial,
+                        memory_hotplug_config,
+                        memory_hotplug_requested_size_mib,
+                        balloon_config,
+                        entropy_config,
+                        storage_configs,
+                        network_configs,
+                        mmds_config,
+                        mmds_state,
+                        expected_transport,
+                    },
+                    &guard,
+                    output,
+                    &cancellation,
+                    |encoded| {
+                        NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(encoded)
+                            .map_err(|source| NativeV2SnapshotCaptureError::CandidateState {
+                                source,
+                            })
                     },
                 )
                 .map_err(native_v2_snapshot_transaction_error_before_staging)
@@ -23465,6 +24388,7 @@ mod tests {
     use std::fmt;
     use std::fs::{self, File, OpenOptions, remove_file};
     use std::io::{Cursor, Seek, SeekFrom, Write};
+    use std::net::Ipv4Addr;
     use std::num::NonZeroUsize;
     #[cfg(target_os = "macos")]
     use std::os::fd::AsRawFd;
@@ -23590,8 +24514,8 @@ mod tests {
         NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
         NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
         NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
-        NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
-        decode_snapshot_v2_state_with_compatibility_version,
+        NATIVE_V2_NETWORK_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component,
+        SnapshotV2ComponentDisposition, decode_snapshot_v2_state_with_compatibility_version,
         encode_snapshot_v2_state_with_compatibility_version,
     };
     use bangbang_runtime::snapshot_memory::{SnapshotMemoryBinding, write_snapshot_memory_image};
@@ -23602,7 +24526,10 @@ mod tests {
         SnapshotV2MemoryBinding, write_snapshot_v2_memory_image_with_cancel,
         write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
     };
-    use bangbang_runtime::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
+    use bangbang_runtime::snapshot_network_v2_11::{
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, SnapshotV2NetworkState,
+        SnapshotV2NetworkStateBuildError,
+    };
     use bangbang_runtime::snapshot_serial_v2_7::{
         NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialEndpointIntent,
         SnapshotV2SerialState,
@@ -23676,36 +24603,39 @@ mod tests {
         NativeV2BalloonCandidateCaptureRequest, NativeV2BalloonCandidateProfileError,
         NativeV2EntropyCandidateCaptureRequest, NativeV2EntropyCandidateProfileError,
         NativeV2MemoryHotplugCandidateCaptureRequest, NativeV2MemoryHotplugCandidateProfileError,
-        NativeV2MultiBlockCandidateProfileError, NativeV2RootCandidateProcessError,
-        NativeV2RootCandidateProfileError, NativeV2SerialCandidateProfileError,
-        NativeV2SnapshotBalloonCaptureError, NativeV2SnapshotCaptureCancellation,
-        NativeV2SnapshotCaptureError, NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
+        NativeV2MultiBlockCandidateProfileError, NativeV2NetworkCandidateProfileError,
+        NativeV2RootCandidateProcessError, NativeV2RootCandidateProfileError,
+        NativeV2SerialCandidateProfileError, NativeV2SnapshotBalloonCaptureError,
+        NativeV2SnapshotCaptureCancellation, NativeV2SnapshotCaptureError,
+        NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
         NativeV2SnapshotEntropyCaptureError, NativeV2SnapshotLoadError,
         NativeV2SnapshotMemoryHotplugCaptureError, NativeV2SnapshotMultiBlockCaptureError,
-        NativeV2SnapshotPublicationDestination, NativeV2SnapshotPublicationError,
-        NativeV2SnapshotPublicationProducerError, NativeV2SnapshotPublicationRequest,
-        NativeV2SnapshotRootCaptureError, NativeV2SnapshotStorageCaptureError,
-        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink,
-        ProcessCaptureReadyNetworkError, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
-        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
-        ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
-        ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessSnapshotV2BalloonLoadRequest,
-        ProcessSnapshotV2EntropyLoadRequest, ProcessSnapshotV2MemoryHotplugLoadRequest,
-        ProcessSnapshotV2MultiBlockLoadRequest, ProcessSnapshotV2MultiBlockLoadSuccess,
-        ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
-        ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2SerialLoadRequest,
-        ProcessSnapshotV2StorageLoadRequest, ProcessSnapshotV2StorageLoadSuccess, ProcessVmm,
-        ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
-        SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
-        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
-        native_v2_platform_capture_is_terminal, require_native_v1_composite_record,
-        snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
+        NativeV2SnapshotNetworkCaptureError, NativeV2SnapshotPublicationDestination,
+        NativeV2SnapshotPublicationError, NativeV2SnapshotPublicationProducerError,
+        NativeV2SnapshotPublicationRequest, NativeV2SnapshotRootCaptureError,
+        NativeV2SnapshotStorageCaptureError, NetworkPacketIoRunLoopSession,
+        NoopProcessNetworkTxPacketSink, ProcessCaptureReadyNetworkError, ProcessHvfBootSession,
+        ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
+        ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
+        ProcessNetworkPacketIoRegistryError, ProcessNetworkPacketIoStopError,
+        ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
+        ProcessSnapshotV2BalloonLoadRequest, ProcessSnapshotV2EntropyLoadRequest,
+        ProcessSnapshotV2MemoryHotplugLoadRequest, ProcessSnapshotV2MultiBlockLoadRequest,
+        ProcessSnapshotV2MultiBlockLoadSuccess, ProcessSnapshotV2RootLoadCompletion,
+        ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess,
+        ProcessSnapshotV2SerialLoadRequest, ProcessSnapshotV2StorageLoadRequest,
+        ProcessSnapshotV2StorageLoadSuccess, ProcessVmm, ProcessVmnetAuthority,
+        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
+        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
+        require_native_v1_composite_record, snapshot_destination_machine_config,
+        vsock_capture_error_from_boot_run_loop_command,
     };
     #[cfg(target_os = "macos")]
     use super::{
-        GrantAccess, HvfProcessSession, PreparedSnapshotRootBackingLease,
-        SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
+        GrantAccess, HvfProcessSession, NativeV2NetworkCandidateCaptureRequest,
+        PreparedSnapshotRootBackingLease, SnapshotRootBackingLeaseError,
+        SnapshotRootSelectorPolicy,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -26715,6 +27645,23 @@ mod tests {
         memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
     }
 
+    #[derive(Debug)]
+    struct FakeNativeV2NetworkPlatformState {
+        binding: SnapshotV2MemoryBinding,
+        memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+    }
+
+    #[derive(Debug)]
+    struct FakeNativeV2NetworkState {
+        binding: SnapshotV2MemoryBinding,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+        memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+        network: Option<SnapshotV2NetworkState>,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FakeNativeV2RootFailure {
         Inventory,
@@ -26837,6 +27784,7 @@ mod tests {
         native_v2_entropy_state: Option<SnapshotV2EntropyState>,
         native_v2_balloon_state: Option<SnapshotV2BalloonState>,
         native_v2_memory_hotplug_state: Option<SnapshotV2MemoryHotplugState>,
+        native_v2_network_state: Option<SnapshotV2NetworkState>,
         native_v2_pause_error: bool,
         native_v2_recovery_error: bool,
         native_v2_root_transport: Option<SnapshotV2DeviceTransportKind>,
@@ -26846,6 +27794,7 @@ mod tests {
         native_v2_cancel_after_pause: Option<NativeV2SnapshotCaptureCancellation>,
         native_v2_cancel_during_balloon: Option<NativeV2SnapshotCaptureCancellation>,
         native_v2_cancel_during_memory_hotplug: Option<NativeV2SnapshotCaptureCancellation>,
+        native_v2_cancel_during_network: Option<NativeV2SnapshotCaptureCancellation>,
         native_v2_cancel_during_recovery: Option<NativeV2SnapshotCaptureCancellation>,
         native_v2_topology_generation: u64,
         native_v2_generation_events: Arc<Mutex<Vec<(&'static str, u64)>>>,
@@ -26911,6 +27860,7 @@ mod tests {
                 native_v2_entropy_state: None,
                 native_v2_balloon_state: None,
                 native_v2_memory_hotplug_state: None,
+                native_v2_network_state: None,
                 native_v2_pause_error: false,
                 native_v2_recovery_error: false,
                 native_v2_root_transport: Some(SnapshotV2DeviceTransportKind::Mmio),
@@ -26920,6 +27870,7 @@ mod tests {
                 native_v2_cancel_after_pause: None,
                 native_v2_cancel_during_balloon: None,
                 native_v2_cancel_during_memory_hotplug: None,
+                native_v2_cancel_during_network: None,
                 native_v2_cancel_during_recovery: None,
                 native_v2_topology_generation: 0,
                 native_v2_generation_events: Arc::default(),
@@ -27083,6 +28034,11 @@ mod tests {
             self
         }
 
+        fn with_native_v2_network_state(mut self, state: SnapshotV2NetworkState) -> Self {
+            self.native_v2_network_state = Some(state);
+            self
+        }
+
         #[cfg(target_os = "macos")]
         const fn with_native_v2_pause_error(mut self) -> Self {
             self.native_v2_pause_error = true;
@@ -27143,6 +28099,15 @@ mod tests {
             cancellation: NativeV2SnapshotCaptureCancellation,
         ) -> Self {
             self.native_v2_cancel_during_memory_hotplug = Some(cancellation);
+            self
+        }
+
+        #[cfg(target_os = "macos")]
+        fn with_native_v2_cancel_during_network(
+            mut self,
+            cancellation: NativeV2SnapshotCaptureCancellation,
+        ) -> Self {
+            self.native_v2_cancel_during_network = Some(cancellation);
             self
         }
 
@@ -27761,6 +28726,8 @@ mod tests {
         type MemoryHotplugCaptureState = SnapshotV2MemoryHotplugState;
         type MemoryHotplugPlatformState = FakeNativeV2MemoryHotplugPlatformState;
         type MemoryHotplugState = FakeNativeV2MemoryHotplugState;
+        type NetworkPlatformState = FakeNativeV2NetworkPlatformState;
+        type NetworkState = FakeNativeV2NetworkState;
 
         fn capture_native_v2_serial(
             &self,
@@ -27898,6 +28865,59 @@ mod tests {
                 }
             }
             if let Some(cancellation) = &self.native_v2_cancel_during_memory_hotplug {
+                cancellation.cancel();
+            }
+            Ok(state)
+        }
+
+        fn capture_native_v2_network(
+            &self,
+            configs: &[NetworkInterfaceConfig],
+            mmds_config: Option<&MmdsConfig>,
+            _mmds_state: &MmdsStateHandle,
+            expected_transport: SnapshotV2DeviceTransportKind,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+            now: Instant,
+        ) -> Result<Option<SnapshotV2NetworkState>, NativeV2SnapshotNetworkCaptureError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-network");
+            self.native_v2_capture_instants
+                .lock()
+                .expect("fake native-v2 capture instants should lock")
+                .push(("network", now));
+            let state = self.native_v2_network_state.clone();
+            if state.as_ref().map_or(0, |state| state.interfaces().len()) != configs.len()
+                || state
+                    .as_ref()
+                    .and_then(SnapshotV2NetworkState::mmds)
+                    .is_some()
+                    != mmds_config.is_some()
+                || state.as_ref().is_some_and(|state| {
+                    state
+                        .interfaces()
+                        .iter()
+                        .zip(configs)
+                        .any(|(interface, config)| interface.iface_id() != config.iface_id())
+                })
+            {
+                return Err(NativeV2SnapshotNetworkCaptureError::Build {
+                    source: SnapshotV2NetworkStateBuildError::Mmds,
+                });
+            }
+            if let Some(state) = &state {
+                for interface in state.interfaces() {
+                    let actual = interface.transport().kind();
+                    if actual != expected_transport {
+                        return Err(NativeV2SnapshotNetworkCaptureError::Transport {
+                            expected: expected_transport,
+                            actual,
+                        });
+                    }
+                }
+            }
+            if let Some(cancellation) = &self.native_v2_cancel_during_network {
                 cancellation.cancel();
             }
             Ok(state)
@@ -28324,6 +29344,45 @@ mod tests {
                 cancel.cancel();
             }
             Ok(FakeNativeV2MemoryHotplugPlatformState {
+                binding,
+                memory_hotplug: capture,
+            })
+        }
+
+        fn capture_native_v2_network_platform(
+            &mut self,
+            _input: HvfArm64BootSnapshotV2CaptureInput,
+            capture: Option<Self::MemoryHotplugCaptureState>,
+            output: &mut super::BoxedNativeV2SnapshotMemoryOutput,
+            cancellation: &NativeV2SnapshotCaptureCancellation,
+        ) -> Result<Self::NetworkPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+            assert!(
+                !self.native_snapshot_panic,
+                "fake native-v2 snapshot capture panic"
+            );
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-network-platform");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("platform", self.native_v2_topology_generation));
+            let memory = self
+                .native_snapshot_memory
+                .as_ref()
+                .expect("fake native-v2 memory should be configured");
+            let binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+                memory,
+                output,
+                NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                |_| cancellation.is_cancelled(),
+            )
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
+            if let Some(cancel) = &self.native_snapshot_cancel_before_seal {
+                cancel.cancel();
+            }
+            Ok(FakeNativeV2NetworkPlatformState {
                 binding,
                 memory_hotplug: capture,
             })
@@ -28932,6 +29991,154 @@ mod tests {
             }
             encode_snapshot_v2_state_with_compatibility_version(
                 NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                &[],
+                &components,
+            )
+            .map_err(HvfSnapshotV2EncodeError::Container)
+        }
+
+        fn compose_native_v2_network(
+            &self,
+            platform: Self::NetworkPlatformState,
+            graph: Option<SnapshotV2StorageDeviceGraph>,
+            serial: SnapshotV2SerialState,
+            entropy: Option<SnapshotV2EntropyState>,
+            balloon: Option<SnapshotV2BalloonState>,
+            network: Option<SnapshotV2NetworkState>,
+        ) -> Result<Self::NetworkState, HvfSnapshotV2BuildError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-network-compose");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("compose", self.native_v2_topology_generation));
+            Ok(FakeNativeV2NetworkState {
+                binding: platform.binding,
+                graph,
+                serial,
+                entropy,
+                balloon,
+                memory_hotplug: platform.memory_hotplug,
+                network,
+            })
+        }
+
+        fn encode_native_v2_network(
+            &self,
+            state: &Self::NetworkState,
+        ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-network-encode");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("encode", self.native_v2_topology_generation));
+            let memory = state
+                .binding
+                .encode()
+                .map_err(HvfSnapshotV2EncodeError::Memory)?;
+            let graph = state
+                .graph
+                .as_ref()
+                .map(|graph| {
+                    graph
+                        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::StorageDeviceGraph)
+                })
+                .transpose()?;
+            let serial = state
+                .serial
+                .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+                .map_err(HvfSnapshotV2EncodeError::SerialState)?;
+            let entropy = state
+                .entropy
+                .as_ref()
+                .map(|entropy| {
+                    entropy
+                        .encode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::EntropyState)
+                })
+                .transpose()?;
+            let balloon = state
+                .balloon
+                .as_ref()
+                .map(|balloon| {
+                    balloon
+                        .encode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::BalloonState)
+                })
+                .transpose()?;
+            let memory_hotplug = state
+                .memory_hotplug
+                .as_ref()
+                .map(|memory_hotplug| {
+                    memory_hotplug
+                        .encode(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::MemoryHotplugState)
+                })
+                .transpose()?;
+            let network = state
+                .network
+                .as_ref()
+                .map(|network| {
+                    network
+                        .encode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::NetworkState)
+                })
+                .transpose()?;
+            let mut components = vec![SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &memory,
+            )];
+            if let Some(graph) = graph.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    graph,
+                ));
+            }
+            if !self.native_v2_invalid_candidate_state {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_SERIAL_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    &serial,
+                ));
+            }
+            if let Some(entropy) = entropy.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_ENTROPY_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    entropy,
+                ));
+            }
+            if let Some(balloon) = balloon.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_BALLOON_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    balloon,
+                ));
+            }
+            if let Some(memory_hotplug) = memory_hotplug.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    memory_hotplug,
+                ));
+            }
+            if let Some(network) = network.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_NETWORK_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    network,
+                ));
+            }
+            encode_snapshot_v2_state_with_compatibility_version(
+                NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
                 &[],
                 &components,
             )
@@ -29897,6 +31104,25 @@ mod tests {
         assert!(!diagnostics.contains("entropy-candidate-vmlinux"));
     }
 
+    fn assert_native_v2_network_candidate_profile_rejected(
+        mutate: impl FnOnce(&mut ProcessVmm<HvfInstanceStartExecutor>),
+        expected: NativeV2NetworkCandidateProfileError,
+    ) {
+        let mut vmm = native_v2_entropy_candidate_profile_vmm(false);
+        mutate(&mut vmm);
+        let error = match vmm.native_v2_network_candidate_product_profile() {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported network candidate profile should fail closed"),
+        };
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected)
+        );
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains("entropy-candidate-vmlinux"));
+        assert!(!diagnostics.contains("private-network"));
+    }
+
     fn fake_native_v2_device_graph(
         transport: SnapshotV2DeviceTransportKind,
     ) -> SnapshotV2DeviceGraph {
@@ -30029,6 +31255,88 @@ mod tests {
         .expect("fake native-v2 virtio-mem fixture should decode")
     }
 
+    #[cfg(target_os = "macos")]
+    fn fake_native_v2_network_state(
+        transport: SnapshotV2DeviceTransportKind,
+    ) -> SnapshotV2NetworkState {
+        let hex = match transport {
+            SnapshotV2DeviceTransportKind::Mmio => {
+                include_str!("../../runtime/src/snapshot_network_v2_11/fixtures/inactive-mmio.hex")
+            }
+            SnapshotV2DeviceTransportKind::Pci => include_str!(
+                "../../runtime/src/snapshot_network_v2_11/fixtures/active-pci-mmds.hex"
+            ),
+        };
+        SnapshotV2NetworkState::decode(
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            &fixture_hex_bytes(hex),
+        )
+        .expect("fake native-v2 network fixture should decode")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fake_native_v2_network_capture_profile(
+        transport: SnapshotV2DeviceTransportKind,
+    ) -> (
+        SnapshotV2NetworkState,
+        Vec<NetworkInterfaceConfig>,
+        Option<MmdsConfig>,
+        MmdsStateHandle,
+    ) {
+        let state = fake_native_v2_network_state(transport);
+        let configs = state
+            .interfaces()
+            .iter()
+            .map(|interface| {
+                let mut input = NetworkInterfaceConfigInput::new(
+                    interface.iface_id(),
+                    interface.iface_id(),
+                    interface.captured_selector(),
+                );
+                if let Some(mac) = interface.requested_guest_mac() {
+                    input = input.with_guest_mac(mac.to_string());
+                }
+                if let Some(mtu) = interface.requested_mtu() {
+                    input = input.with_mtu(mtu);
+                }
+                input
+                    .validate()
+                    .expect("fake native-v2 network config should validate")
+            })
+            .collect::<Vec<_>>();
+        let mmds_input = state.mmds().map(|mmds| {
+            let selected = mmds
+                .interfaces()
+                .iter()
+                .map(|selected| {
+                    state.interfaces()[usize::from(selected.interface_index())]
+                        .iface_id()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            let mut input = MmdsConfigInput::new(selected)
+                .with_version(mmds.version())
+                .with_imds_compat(mmds.imds_compat());
+            if let Some(ipv4_address) = mmds.ipv4_address() {
+                input = input.with_ipv4_address(ipv4_address);
+            }
+            input
+        });
+        let mmds_config = mmds_input.clone().map(|input| {
+            input
+                .validate(&configs)
+                .expect("fake native-v2 MMDS config should validate")
+        });
+        let mmds_state = MmdsStateHandle::default();
+        if let Some(input) = mmds_input {
+            mmds_state
+                .with_mut(|state| state.put_config(input, &configs))
+                .expect("fake native-v2 MMDS state should lock")
+                .expect("fake native-v2 MMDS state should configure");
+        }
+        (state, configs, mmds_config, mmds_state)
+    }
+
     fn fake_native_v2_memory_hotplug_state_for_request(
         transport: SnapshotV2DeviceTransportKind,
         config: MemoryHotplugConfig,
@@ -30119,7 +31427,7 @@ mod tests {
     }
 
     fn fixture_hex_bytes(hex: &str) -> Vec<u8> {
-        let hex = hex.trim();
+        let hex = hex.split_ascii_whitespace().collect::<String>();
         assert!(hex.len().is_multiple_of(2));
         hex.as_bytes()
             .chunks_exact(2)
@@ -45311,6 +46619,267 @@ mod tests {
     }
 
     #[test]
+    fn native_v2_network_candidate_profile_closes_interface_and_mmds_boundaries() {
+        for pci_enabled in [false, true] {
+            for count in [1, MAX_NETWORK_INTERFACE_COUNT] {
+                let mut vmm = native_v2_entropy_candidate_profile_vmm(pci_enabled);
+                for index in 0..count {
+                    let iface_id = format!("eth{index}");
+                    vmm.handle_action(VmmAction::PutNetworkInterface(
+                        NetworkInterfaceConfigInput::new(
+                            iface_id.clone(),
+                            iface_id,
+                            "vmnet:shared",
+                        ),
+                    ))
+                    .expect("boundary network interface should configure");
+                }
+                let selected = if count == 1 {
+                    vec!["eth0".to_string()]
+                } else {
+                    vec!["eth0".to_string(), format!("eth{}", count - 1)]
+                };
+                vmm.handle_action(VmmAction::PutMmdsConfig(
+                    MmdsConfigInput::new(selected.clone())
+                        .with_version(MmdsVersion::V2)
+                        .with_ipv4_address(Ipv4Addr::new(169, 254, 100, 10))
+                        .with_imds_compat(true),
+                ))
+                .expect("boundary MMDS config should configure");
+
+                let profile = vmm
+                    .native_v2_network_candidate_product_profile()
+                    .expect("boundary network candidate should classify");
+                assert_eq!(profile.network_configs.len(), count);
+                let config = profile
+                    .mmds_config
+                    .as_ref()
+                    .expect("boundary MMDS config should be retained");
+                assert_eq!(config.network_interfaces(), selected);
+                assert_eq!(
+                    profile
+                        .mmds_state
+                        .config()
+                        .expect("boundary MMDS state should lock")
+                        .as_ref(),
+                    Some(config)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_v2_network_candidate_profile_rejects_duplicate_mmds_selection() {
+        assert_native_v2_network_candidate_profile_rejected(
+            |vmm| {
+                vmm.handle_action(VmmAction::PutNetworkInterface(
+                    NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
+                ))
+                .expect("duplicate-MMDS interface should configure");
+                vmm.handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
+                    "eth0".to_string(),
+                    "eth0".to_string(),
+                ])))
+                .expect("duplicate MMDS selection remains storable before snapshot admission");
+            },
+            NativeV2NetworkCandidateProfileError::NetworkInventory,
+        );
+    }
+
+    #[test]
+    fn native_v2_network_candidate_profile_admits_all_thirty_two_products() {
+        for pci_enabled in [false, true] {
+            for mask in 0_u8..32 {
+                let has_storage = mask & 1 != 0;
+                let has_entropy = mask & 2 != 0;
+                let has_balloon = mask & 4 != 0;
+                let has_memory_hotplug = mask & 8 != 0;
+                let has_network = mask & 16 != 0;
+                let mut vmm = native_v2_entropy_candidate_profile_vmm(pci_enabled);
+                if has_storage {
+                    vmm.handle_action(VmmAction::PutDrive(
+                        DriveConfigInput::new(
+                            "rootfs",
+                            "rootfs",
+                            "/private/network-candidate-rootfs.ext4",
+                            true,
+                        )
+                        .with_is_read_only(true)
+                        .with_io_engine(DriveIoEngine::Sync),
+                    ))
+                    .expect("network candidate storage should configure");
+                }
+                if has_entropy {
+                    vmm.handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+                        .expect("network candidate entropy should configure");
+                }
+                if has_balloon {
+                    vmm.handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(64, false)))
+                        .expect("network candidate balloon should configure");
+                }
+                if has_memory_hotplug {
+                    vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+                        .expect("network candidate virtio-mem should configure");
+                }
+                if has_network {
+                    vmm.handle_action(VmmAction::PutNetworkInterface(
+                        NetworkInterfaceConfigInput::new(
+                            "eth0",
+                            "eth0",
+                            "private-network-selector",
+                        ),
+                    ))
+                    .expect("network candidate interface should configure");
+                }
+
+                let profile = vmm
+                    .native_v2_network_candidate_product_profile()
+                    .expect("supported network candidate profile should classify");
+                assert_eq!(
+                    profile.expected_transport,
+                    if pci_enabled {
+                        SnapshotV2DeviceTransportKind::Pci
+                    } else {
+                        SnapshotV2DeviceTransportKind::Mmio
+                    }
+                );
+                assert_eq!(
+                    !profile.storage_configs.drives().is_empty()
+                        || !profile.storage_configs.pmem().is_empty(),
+                    has_storage
+                );
+                assert_eq!(profile.entropy_config.is_some(), has_entropy);
+                assert_eq!(profile.balloon_config.is_some(), has_balloon);
+                assert_eq!(profile.memory_hotplug_config.is_some(), has_memory_hotplug);
+                assert_eq!(profile.memory_hotplug_requested_size_mib, 0);
+                assert_eq!(!profile.network_configs.is_empty(), has_network);
+                assert!(profile.mmds_config.is_none());
+                assert_eq!(
+                    profile
+                        .mmds_state
+                        .config()
+                        .expect("network candidate MMDS state should lock"),
+                    None
+                );
+                assert_eq!(profile.serial_config, SerialConfig::default());
+                assert!(format!("{:?}", profile.input).contains("<redacted>"));
+            }
+        }
+    }
+
+    #[test]
+    fn native_v2_network_candidate_profile_preserves_sixteen_interfaces_and_mmds_selection() {
+        for selected_count in [1_usize, MAX_NETWORK_INTERFACE_COUNT] {
+            let mut vmm = native_v2_entropy_candidate_profile_vmm(false);
+            for index in 0..MAX_NETWORK_INTERFACE_COUNT {
+                vmm.handle_action(VmmAction::PutNetworkInterface(
+                    NetworkInterfaceConfigInput::new(
+                        format!("eth{index}"),
+                        format!("eth{index}"),
+                        format!("private-network-{index}"),
+                    ),
+                ))
+                .expect("network candidate interface should configure");
+            }
+            let selected = (0..selected_count)
+                .map(|index| format!("eth{index}"))
+                .collect::<Vec<_>>();
+            vmm.handle_action(VmmAction::PutMmdsConfig(
+                MmdsConfigInput::new(selected.clone())
+                    .with_version(MmdsVersion::V2)
+                    .with_imds_compat(true),
+            ))
+            .expect("network candidate MMDS selection should configure");
+
+            let profile = vmm
+                .native_v2_network_candidate_product_profile()
+                .expect("sixteen-interface network profile should classify");
+            assert_eq!(profile.network_configs.len(), MAX_NETWORK_INTERFACE_COUNT);
+            assert_eq!(
+                profile
+                    .network_configs
+                    .iter()
+                    .map(NetworkInterfaceConfig::iface_id)
+                    .collect::<Vec<_>>(),
+                (0..MAX_NETWORK_INTERFACE_COUNT)
+                    .map(|index| format!("eth{index}"))
+                    .collect::<Vec<_>>()
+            );
+            let mmds = profile
+                .mmds_config
+                .as_ref()
+                .expect("network profile should retain MMDS");
+            assert_eq!(mmds.network_interfaces(), selected);
+            assert_eq!(
+                profile
+                    .mmds_state
+                    .config()
+                    .expect("network profile MMDS state should lock")
+                    .as_ref(),
+                Some(mmds)
+            );
+        }
+    }
+
+    #[test]
+    fn native_v2_network_candidate_profile_rejects_pci_endpoint_overflow_and_vsock() {
+        let mut vmm = native_v2_entropy_candidate_profile_vmm(true);
+        for index in 0..MAX_NETWORK_INTERFACE_COUNT {
+            vmm.handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new(
+                    format!("eth{index}"),
+                    format!("eth{index}"),
+                    format!("private-network-{index}"),
+                ),
+            ))
+            .expect("network candidate interface should configure");
+        }
+        for index in 0..MAX_NETWORK_INTERFACE_COUNT - 1 {
+            vmm.handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new(
+                    format!("drive{index}"),
+                    format!("drive{index}"),
+                    format!("/private/network-drive-{index}.img"),
+                    index == 0,
+                )
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+            ))
+            .expect("network candidate drive should configure");
+        }
+        vmm.native_v2_network_candidate_product_profile()
+            .expect("the exact PCI endpoint-capacity boundary should classify");
+
+        let overflow_index = MAX_NETWORK_INTERFACE_COUNT - 1;
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new(
+                format!("drive{overflow_index}"),
+                format!("drive{overflow_index}"),
+                format!("/private/network-drive-{overflow_index}.img"),
+                false,
+            )
+            .with_is_read_only(true)
+            .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("overflow network candidate drive should remain configurable");
+        assert!(matches!(
+            vmm.native_v2_network_candidate_product_profile(),
+            Err(NativeV2NetworkCandidateProfileError::TransportCapacity)
+        ));
+
+        assert_native_v2_network_candidate_profile_rejected(
+            |vmm| {
+                vmm.handle_action(VmmAction::PutVsock(VsockConfigInput::new(
+                    42,
+                    "/private/network-candidate-vsock.sock",
+                )))
+                .expect("vsock should configure");
+            },
+            NativeV2NetworkCandidateProfileError::OptionalDevices,
+        );
+    }
+
+    #[test]
     fn public_exact_minor_seven_profile_still_rejects_configured_entropy() {
         let mut vmm = native_v2_entropy_candidate_profile_vmm(false);
         vmm.handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
@@ -45997,6 +47566,313 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_network_candidate_captures_all_thirty_two_products_in_source_order() {
+        for transport in [
+            SnapshotV2DeviceTransportKind::Mmio,
+            SnapshotV2DeviceTransportKind::Pci,
+        ] {
+            for mask in 0_u8..32 {
+                let has_storage = mask & 1 != 0;
+                let has_entropy = mask & 2 != 0;
+                let has_balloon = mask & 4 != 0;
+                let has_memory_hotplug = mask & 8 != 0;
+                let has_network = mask & 16 != 0;
+                let control = FakeRunLoopControl::default();
+                let drop_count = Arc::new(AtomicU64::new(0));
+                let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+                let entropy = has_entropy.then(|| fake_native_v2_entropy_state(transport));
+                let entropy_config = entropy.as_ref().map(SnapshotV2EntropyState::config);
+                let balloon = has_balloon.then(|| fake_native_v2_balloon_state(transport));
+                let balloon_config = balloon.as_ref().map(SnapshotV2BalloonState::config);
+                let memory_hotplug =
+                    has_memory_hotplug.then(|| fake_native_v2_memory_hotplug_state(transport));
+                let memory_hotplug_config = memory_hotplug
+                    .as_ref()
+                    .map(SnapshotV2MemoryHotplugState::config);
+                let memory_hotplug_requested_size_mib = memory_hotplug
+                    .as_ref()
+                    .map(|state| state.config_space().requested_size() / (1024 * 1024))
+                    .unwrap_or(0);
+                let network =
+                    has_network.then(|| fake_native_v2_network_capture_profile(transport));
+                let network_configs = network
+                    .as_ref()
+                    .map(|(_, configs, _, _)| configs.clone())
+                    .unwrap_or_default();
+                let mmds_config = network
+                    .as_ref()
+                    .and_then(|(_, _, config, _)| config.clone());
+                let mmds_state = network
+                    .as_ref()
+                    .map(|(_, _, _, state)| state.clone())
+                    .unwrap_or_default();
+
+                let session =
+                    FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender);
+                let mut session = if let Some(state) = &memory_hotplug {
+                    session.with_native_snapshot_memory_hotplug(1, state)
+                } else {
+                    session.with_native_snapshot_memory(1)
+                }
+                .with_native_v2_root_transport(transport)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+                if let Some(entropy) = entropy {
+                    session = session.with_native_v2_entropy_state(entropy);
+                }
+                if let Some(balloon) = balloon {
+                    session = session.with_native_v2_balloon_state(balloon);
+                }
+                if let Some(memory_hotplug) = memory_hotplug {
+                    session = session.with_native_v2_memory_hotplug_state(memory_hotplug);
+                }
+                if let Some((network, _, _, _)) = &network {
+                    session = session.with_native_v2_network_state(network.clone());
+                }
+                let events = session.native_snapshot_events();
+                let capture_instants = session.native_v2_capture_instants();
+                let supervisor =
+                    BootRunLoopSupervisor::start(session, NonZeroUsize::new(95).expect("non-zero"))
+                        .expect("network candidate supervisor should start");
+                assert_eq!(max_steps_receiver.recv().expect("worker should start"), 95);
+                supervisor
+                    .pause()
+                    .expect("network candidate source should pause");
+
+                let candidate = supervisor
+                    .capture_native_v2_network_candidate(NativeV2NetworkCandidateCaptureRequest {
+                        input: native_v2_test_capture_input(),
+                        serial_config: SerialConfig::default(),
+                        balloon_config,
+                        entropy_config,
+                        memory_hotplug_config,
+                        memory_hotplug_requested_size_mib,
+                        storage_configs: if has_storage {
+                            native_v2_storage_configs(1)
+                        } else {
+                            CaptureReadyStorageConfigs::new(Vec::new(), Vec::new())
+                        },
+                        network_configs: network_configs.clone(),
+                        mmds_config: mmds_config.clone(),
+                        mmds_state,
+                        expected_transport: transport,
+                        output: Box::new(Cursor::new(Vec::new())),
+                        cancellation: NativeV2SnapshotCaptureCancellation::default(),
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{transport:?} storage={has_storage} entropy={has_entropy} balloon={has_balloon} memory-hotplug={has_memory_hotplug} network={has_network} candidate failed: {error}"
+                        )
+                    });
+
+                assert_eq!(
+                    candidate.version(),
+                    NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+                );
+                assert_eq!(candidate.device_graph().is_some(), has_storage);
+                assert_eq!(candidate.entropy().is_some(), has_entropy);
+                assert_eq!(candidate.balloon().is_some(), has_balloon);
+                assert_eq!(candidate.memory_hotplug().is_some(), has_memory_hotplug);
+                assert_eq!(candidate.network().is_some(), has_network);
+                if let Some(memory_hotplug) = candidate.memory_hotplug() {
+                    assert_eq!(memory_hotplug.transport().kind(), transport);
+                    memory_hotplug
+                        .validate_memory_binding_for_compatibility_version(
+                            candidate.memory_binding(),
+                            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                        )
+                        .expect("exact-2.11 candidate memory coverage should close");
+                }
+                if let Some(network) = candidate.network() {
+                    assert!(
+                        network
+                            .interfaces()
+                            .iter()
+                            .all(|interface| interface.transport().kind() == transport)
+                    );
+                    assert_eq!(
+                        network
+                            .interfaces()
+                            .iter()
+                            .map(|interface| interface.iface_id())
+                            .collect::<Vec<_>>(),
+                        network_configs
+                            .iter()
+                            .map(NetworkInterfaceConfig::iface_id)
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(network.mmds().is_some(), mmds_config.is_some());
+                }
+                assert_eq!(
+                    decode_snapshot_v2_state_with_compatibility_version(
+                        candidate.bytes(),
+                        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                    )
+                    .expect("exact-2.11 candidate should decode structurally")
+                    .metadata()
+                    .component_count(),
+                    2 + u32::from(has_storage)
+                        + u32::from(has_entropy)
+                        + u32::from(has_balloon)
+                        + u32::from(has_memory_hotplug)
+                        + u32::from(has_network)
+                );
+
+                let events = events.lock().expect("network candidate events should lock");
+                assert!(events.starts_with(&[
+                    "aux-acquire",
+                    "v2-serial",
+                    "v2-pause",
+                    "v2-balloon",
+                ]));
+                let entropy_position = events
+                    .iter()
+                    .position(|event| *event == "v2-entropy")
+                    .expect("entropy capture event should exist");
+                let memory_hotplug_position = events
+                    .iter()
+                    .position(|event| *event == "v2-memory-hotplug")
+                    .expect("virtio-mem capture event should exist");
+                let network_position = events
+                    .iter()
+                    .position(|event| *event == "v2-network")
+                    .expect("network capture event should exist");
+                assert!(entropy_position < memory_hotplug_position);
+                assert!(memory_hotplug_position < network_position);
+                if has_storage {
+                    let storage_position = events
+                        .iter()
+                        .position(|event| *event == "v2-storage-normalize")
+                        .expect("storage capture event should exist");
+                    assert!(storage_position < entropy_position);
+                }
+                assert!(events.ends_with(&[
+                    "v2-network-platform",
+                    "v2-network-compose",
+                    "v2-network-encode",
+                    "v2-recover",
+                    "v2-candidate-sealed",
+                    "aux-drop",
+                ]));
+                let capture_instants = capture_instants
+                    .lock()
+                    .expect("network capture instants should lock");
+                assert!(
+                    capture_instants
+                        .iter()
+                        .all(|(_, instant)| *instant == capture_instants[0].1)
+                );
+                assert_eq!(
+                    capture_instants
+                        .iter()
+                        .map(|(product, _)| *product)
+                        .collect::<Vec<_>>(),
+                    if has_storage {
+                        vec!["balloon", "storage", "entropy", "network"]
+                    } else {
+                        vec!["balloon", "entropy", "network"]
+                    }
+                );
+                assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+                drop(capture_instants);
+                drop(events);
+                drop(supervisor);
+                assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_network_cancellation_recovers_without_sealing_partial_state() {
+        let transport = SnapshotV2DeviceTransportKind::Mmio;
+        let (network, network_configs, mmds_config, mmds_state) =
+            fake_native_v2_network_capture_profile(transport);
+        let cancellation = NativeV2SnapshotCaptureCancellation::default();
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_v2_root_transport(transport)
+            .with_native_v2_network_state(network)
+            .with_native_v2_cancel_during_network(cancellation.clone())
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let auxiliary = session.snapshot_auxiliary_quiescence();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(96).expect("non-zero"))
+                .expect("network cancellation supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 96);
+        supervisor
+            .pause()
+            .expect("network cancellation source should pause");
+
+        let request = |output: BoxedNativeV2SnapshotMemoryOutput,
+                       cancellation: NativeV2SnapshotCaptureCancellation| {
+            NativeV2NetworkCandidateCaptureRequest {
+                input: native_v2_test_capture_input(),
+                serial_config: SerialConfig::default(),
+                balloon_config: None,
+                entropy_config: None,
+                memory_hotplug_config: None,
+                memory_hotplug_requested_size_mib: 0,
+                storage_configs: CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                network_configs: network_configs.clone(),
+                mmds_config: mmds_config.clone(),
+                mmds_state: mmds_state.clone(),
+                expected_transport: transport,
+                output,
+                cancellation,
+            }
+        };
+        let (output, _) = SharedSnapshotMemoryOutput::new(Arc::clone(&events));
+        let error = supervisor
+            .capture_native_v2_network_candidate(request(Box::new(output), cancellation))
+            .expect_err("network cancellation should fail before platform capture");
+        assert!(matches!(
+            error.producer().map(|producer| producer.source()),
+            Some(NativeV2SnapshotPublicationProducerError::Capture(
+                NativeV2SnapshotCaptureError::Cancelled {
+                    stage: NativeV2SnapshotCaptureStage::Network,
+                }
+            ))
+        ));
+        let events_after_failure = events
+            .lock()
+            .expect("network cancellation events should lock")
+            .clone();
+        assert!(events_after_failure.contains(&"v2-network"));
+        assert!(!events_after_failure.contains(&"v2-network-platform"));
+        assert!(!events_after_failure.contains(&"v2-network-compose"));
+        assert!(!events_after_failure.contains(&"v2-network-encode"));
+        assert!(!events_after_failure.contains(&"v2-candidate-sealed"));
+        assert!(events_after_failure.ends_with(&[
+            "v2-network",
+            "v2-writer-drop",
+            "v2-recover",
+            "aux-drop",
+        ]));
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        supervisor
+            .capture_native_v2_network_candidate(request(
+                Box::new(Cursor::new(Vec::new())),
+                NativeV2SnapshotCaptureCancellation::default(),
+            ))
+            .expect("recovered network source should accept a fresh capture");
+        assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 2);
+        assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 2);
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(target_os = "macos")]
