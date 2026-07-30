@@ -1673,6 +1673,17 @@ explicit `network_overrides` entry for every saved interface, including
 MMDS-only interfaces; validates and copies the complete set before macOS
 authority policy; canonicalizes it to saved interface order; and retains
 owner-free controller/MMDS projections plus exact packet-I/O resource keys.
+The same internal seam now consumes that complete value plan into a detached
+process-owned batch. It creates a fresh empty destination MMDS datastore and
+token authority, fresh MMDS and per-interface metric generations, and one
+saved-order MMDS-only or vmnet packet-I/O owner bound to every exact network
+resource key. Provider-returned identity, envelope, and effective MTU are
+checked against the saved guest-visible profile, while buffer and batch
+parameters must fit the bounded packet-I/O envelope before publication.
+Partial construction stops and drains owners in reverse order, and uncertain
+cleanup is terminal. Requested controller values remain distinct from the
+saved guest profile and destination provider result, and the batch constructs
+no device, HVF placement, controller commit, or public load.
 Captured host-device selectors remain inert source state and never select a
 destination. This is deliberately stricter than Firecracker v1.16.0, which
 updates the first matching decoded network record for each supplied override,

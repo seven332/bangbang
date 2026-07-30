@@ -42,6 +42,14 @@ impl SnapshotRestorePublicId {
     pub fn as_str(&self) -> &str {
         &self.value
     }
+
+    /// Fallibly copies this already validated public identifier.
+    pub fn try_clone(&self) -> Result<Self, TryReserveError> {
+        let mut value = String::new();
+        value.try_reserve_exact(self.value.len())?;
+        value.push_str(&self.value);
+        Ok(Self { value })
+    }
 }
 
 impl TryFrom<String> for SnapshotRestorePublicId {
@@ -204,6 +212,15 @@ impl SnapshotRestoreResourceKey {
     /// Returns the validated public identifier.
     pub const fn public_id(&self) -> &SnapshotRestorePublicId {
         &self.public_id
+    }
+
+    /// Fallibly copies this exact resource key.
+    pub fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            resource_class: self.resource_class,
+            device_key: self.device_key,
+            public_id: self.public_id.try_clone()?,
+        })
     }
 
     fn has_same_identity(&self, other: &Self) -> bool {

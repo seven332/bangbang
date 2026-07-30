@@ -1,5 +1,6 @@
 //! vmnet lifecycle boundary types for future macOS host networking.
 
+use std::collections::TryReserveError;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt;
 use std::marker::PhantomData;
@@ -271,6 +272,23 @@ impl VmnetInterfaceConfig {
         }
     }
 
+    pub(crate) fn try_clone(&self) -> Result<Self, TryReserveError> {
+        let bridged_interface_name = if let Some(name) = self.bridged_interface_name.as_deref() {
+            let mut copied = String::new();
+            copied.try_reserve_exact(name.len())?;
+            copied.push_str(name);
+            Some(copied)
+        } else {
+            None
+        };
+        Ok(Self {
+            mode: self.mode,
+            bridged_interface_name,
+            guest_mac: self.guest_mac,
+            mtu: self.mtu,
+        })
+    }
+
     pub fn from_host_dev_name(host_dev_name: &str) -> Result<Self, VmnetHostDeviceNameConfigError> {
         match host_dev_name {
             VMNET_HOST_DEVICE_NAME_HOST => Ok(Self::host()),
@@ -535,6 +553,28 @@ impl VmnetInterfaceParameters {
             direct_virtio_header_available: false,
             direct_virtio_header_enabled: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_batch_limits_for_test(
+        mut self,
+        read_max_packets: Option<u16>,
+        write_max_packets: Option<u16>,
+    ) -> Self {
+        self.read_max_packets = read_max_packets;
+        self.write_max_packets = write_max_packets;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_direct_virtio_header_for_test(
+        mut self,
+        available: bool,
+        enabled: bool,
+    ) -> Self {
+        self.direct_virtio_header_available = available;
+        self.direct_virtio_header_enabled = enabled;
+        self
     }
 
     pub const fn realized_mac(&self) -> GuestMacAddress {

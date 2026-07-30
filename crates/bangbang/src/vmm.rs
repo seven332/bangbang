@@ -11,7 +11,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -118,13 +118,15 @@ use bangbang_runtime::memory_hotplug::{
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, MmdsMetrics,
     NetworkInterfaceMetrics, NetworkInterfaceMetricsCaptureError,
-    NetworkInterfaceMetricsCaptureState, SharedBalloonDeviceMetrics,
+    NetworkInterfaceMetricsCaptureState, NetworkInterfaceMetricsLease,
+    NetworkInterfaceMetricsRegistryError, SharedBalloonDeviceMetrics,
     SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics,
     SharedMmdsMetrics, SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
     SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
-    MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
+    MmdsConfig, MmdsConfigError, MmdsConfigInput, MmdsContentInput, MmdsState, MmdsStateHandle,
+    MmdsStateLockError,
 };
 use bangbang_runtime::mmds_network::{
     MmdsNetworkStackCaptureDescriptor, MmdsNetworkStackCaptureError,
@@ -222,6 +224,12 @@ use bangbang_runtime::snapshot_network_v2_11::{
     SnapshotV2NetworkInterfaceState, SnapshotV2NetworkState, SnapshotV2NetworkStateBuildError,
     SnapshotV2NetworkStateCaptureError,
 };
+use bangbang_runtime::snapshot_restore::{
+    PreparedSnapshotRestoreBindings, SnapshotRestoreBindingAllocationError,
+    SnapshotRestoreBindingRejectionReason, SnapshotRestoreBindings, SnapshotRestoreManifest,
+    SnapshotRestoreManifestError, SnapshotRestoreResourceClass, SnapshotRestoreResourceKey,
+    SnapshotRestoreTakeError,
+};
 use bangbang_runtime::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
     SnapshotV2SerialStateCaptureError,
@@ -274,9 +282,10 @@ use crate::host_network::virtio_vmnet::{
     VmnetVirtioNetworkPacketProfile,
 };
 use crate::host_network::vmnet::{
-    StartedVmnetPacketIoBackend, SystemVmnetInterfaceBackend, VmnetHostDeviceNameConfigError,
-    VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceParameters,
-    VmnetInterfaceStartDisposition, VmnetInterfaceStartError, VmnetMode, VmnetPacketIoBackend,
+    StartedVmnetPacketIoBackend, SystemVmnetInterfaceBackend, VMNET_MAX_BYTES_PER_OPERATION,
+    VMNET_MAX_PACKETS_PER_OPERATION, VmnetHostDeviceNameConfigError, VmnetInterfaceBackend,
+    VmnetInterfaceConfig, VmnetInterfaceParameters, VmnetInterfaceStartDisposition,
+    VmnetInterfaceStartError, VmnetMode, VmnetPacketIoBackend,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_restore_resources::{
@@ -16736,6 +16745,7 @@ struct ProcessNetworkPacketIoEntry<B>
 where
     B: ProcessVmnetBackend,
 {
+    registry_id: ProcessNetworkPacketIoRegistryId,
     owner: ProcessVmnetAuthority,
     generation: u64,
     iface_id: String,
@@ -16764,6 +16774,27 @@ where
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProcessNetworkPacketIoRegistryId(u64);
+
+impl fmt::Debug for ProcessNetworkPacketIoRegistryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProcessNetworkPacketIoRegistryId(<redacted>)")
+    }
+}
+
+static NEXT_PROCESS_NETWORK_PACKET_IO_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_process_network_packet_io_registry_id()
+-> Result<ProcessNetworkPacketIoRegistryId, ProcessNetworkPacketIoProviderBuildError> {
+    NEXT_PROCESS_NETWORK_PACKET_IO_REGISTRY_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map(ProcessNetworkPacketIoRegistryId)
+        .map_err(|_| ProcessNetworkPacketIoProviderBuildError::GenerationExhausted)
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedProcessNetworkPacketIoEntry<B>
 where
@@ -16780,10 +16811,15 @@ where
     const fn device_profile(&self) -> NetworkDeviceProfile {
         self.entry.device_profile
     }
+
+    fn abort(mut self) -> Result<(), ProcessNetworkPacketIoStopError> {
+        self.entry.packet_io.stop()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PublishedProcessNetworkPacketIoEntry {
+    registry_id: ProcessNetworkPacketIoRegistryId,
     owner: ProcessVmnetAuthority,
     generation: u64,
     iface_id: String,
@@ -16892,6 +16928,7 @@ pub(crate) struct ProcessNetworkPacketIoRegistry<B>
 where
     B: ProcessVmnetBackend,
 {
+    registry_id: ProcessNetworkPacketIoRegistryId,
     owner: ProcessVmnetAuthority,
     entries: Vec<ProcessNetworkPacketIoEntry<B>>,
     reserved_macs: Vec<GuestMacAddress>,
@@ -17049,6 +17086,9 @@ fn runtime_network_packet_io_preparation_error(
         ProcessNetworkPacketIoProviderBuildError::PacketEvents { .. } => {
             "vmnet packet event initialization failed"
         }
+        ProcessNetworkPacketIoProviderBuildError::ProfileMismatch => {
+            "vmnet provider profile is incompatible"
+        }
         ProcessNetworkPacketIoProviderBuildError::CleanupUncertain => {
             "vmnet cleanup could not be confirmed"
         }
@@ -17099,7 +17139,7 @@ where
                 message: "network host device configuration is unsupported".to_string(),
             })?;
         self.validate_runtime_authority(class, &vmnet_config, authority)?;
-        self.prepare_entry_with_factory(config, class, false, factory)
+        self.prepare_resolved_entry_with_factory(config, &vmnet_config, class, false, None, factory)
             .map_err(runtime_network_packet_io_preparation_error)
     }
 
@@ -17150,39 +17190,13 @@ where
                 ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch
             }
         })?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT)
-            .map_err(
-                |source| ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { source },
-            )?;
-        let mut reserved_macs = Vec::new();
-        reserved_macs
-            .try_reserve_exact(bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT)
-            .map_err(
-                |source| ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { source },
-            )?;
-        for config in configs {
-            if let Some(mac) = config.guest_mac() {
-                if reserved_macs.contains(&mac) {
-                    return Err(ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac);
-                }
-                reserved_macs.push(mac);
-            }
-        }
-        let (readiness_signal, readiness_receiver) = mpsc::sync_channel(1);
-        let mut provider = Self {
-            owner,
-            entries,
-            reserved_macs,
-            next_generation: 0,
+        let mut provider = Self::empty_with_provisional_macs(
+            configs.len(),
             startup_policy,
-            mmds_detour: mmds_detour.cloned(),
-            readiness_signal,
-            readiness_receiver: Some(readiness_receiver),
-            readiness_wake: None,
-            readiness_bridge: None,
-        };
+            mmds_detour,
+            owner,
+            configs.iter().filter_map(NetworkInterfaceConfig::guest_mac),
+        )?;
         for config in configs {
             let class = provider.class_for_interface(config.iface_id());
             let prepared = match provider.prepare_entry_with_factory(
@@ -17199,6 +17213,51 @@ where
             provider.publish_prepared(prepared);
         }
         Ok(provider)
+    }
+
+    fn empty_with_provisional_macs(
+        interface_count: usize,
+        startup_policy: ProcessNetworkPacketIoStartupPolicy,
+        mmds_detour: Option<&ProcessMmdsPacketDetourConfig>,
+        owner: ProcessVmnetAuthority,
+        provisional_macs: impl IntoIterator<Item = GuestMacAddress>,
+    ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError> {
+        validate_network_interface_count(interface_count).map_err(|source| {
+            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source }
+        })?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT)
+            .map_err(
+                |source| ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { source },
+            )?;
+        let mut reserved_macs = Vec::new();
+        reserved_macs
+            .try_reserve_exact(bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT)
+            .map_err(
+                |source| ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { source },
+            )?;
+        for mac in provisional_macs {
+            if reserved_macs.contains(&mac) {
+                return Err(ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac);
+            }
+            reserved_macs.push(mac);
+        }
+        let (readiness_signal, readiness_receiver) = mpsc::sync_channel(1);
+        let registry_id = next_process_network_packet_io_registry_id()?;
+        Ok(Self {
+            registry_id,
+            owner,
+            entries,
+            reserved_macs,
+            next_generation: 0,
+            startup_policy,
+            mmds_detour: mmds_detour.cloned(),
+            readiness_signal,
+            readiness_receiver: Some(readiness_receiver),
+            readiness_wake: None,
+            readiness_bridge: None,
+        })
     }
 
     fn class_for_interface(&self, iface_id: &str) -> ProcessNetworkPacketIoEntryClass {
@@ -17253,6 +17312,37 @@ where
     where
         F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
     {
+        let vmnet_config = VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
+            .map(|vmnet| {
+                vmnet
+                    .with_guest_mac(config.guest_mac())
+                    .with_mtu(config.mtu())
+            })
+            .map_err(
+                |source| ProcessNetworkPacketIoProviderBuildError::HostDeviceName { source },
+            )?;
+        self.prepare_resolved_entry_with_factory(
+            config,
+            &vmnet_config,
+            class,
+            explicit_mac_pre_reserved,
+            None,
+            factory,
+        )
+    }
+
+    fn prepare_resolved_entry_with_factory<F>(
+        &mut self,
+        config: &NetworkInterfaceConfig,
+        vmnet_config: &VmnetInterfaceConfig,
+        class: ProcessNetworkPacketIoEntryClass,
+        explicit_mac_pre_reserved: bool,
+        expected_profile: Option<NetworkDeviceProfile>,
+        factory: &mut F,
+    ) -> Result<PreparedProcessNetworkPacketIoEntry<B>, ProcessNetworkPacketIoProviderBuildError>
+    where
+        F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    {
         if self
             .entries
             .iter()
@@ -17264,7 +17354,7 @@ where
             return Err(ProcessNetworkPacketIoProviderBuildError::RegistryCapacity);
         }
         if !explicit_mac_pre_reserved
-            && config
+            && vmnet_config
                 .guest_mac()
                 .is_some_and(|mac| self.reserved_macs.contains(&mac))
         {
@@ -17278,9 +17368,6 @@ where
         let iface_id = config.iface_id();
         let (packet_io, device_profile, backend_parameters, reserve_realized_mac) = match class {
             ProcessNetworkPacketIoEntryClass::MmdsOnly => {
-                VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name()).map_err(
-                    |source| ProcessNetworkPacketIoProviderBuildError::HostDeviceName { source },
-                )?;
                 let Some(detour) =
                     self.mmds_detour
                         .as_ref()
@@ -17301,6 +17388,9 @@ where
                             }
                         })?;
                 let device_profile = NetworkDeviceProfile::from_config(config);
+                if expected_profile.is_some_and(|expected| expected != device_profile) {
+                    return Err(ProcessNetworkPacketIoProviderBuildError::ProfileMismatch);
+                }
                 (
                     ProcessNetworkPacketIo::MmdsOnly(Box::new(packet_io)),
                     device_profile,
@@ -17311,16 +17401,6 @@ where
             ProcessNetworkPacketIoEntryClass::Vmnet => {
                 let (readiness_lease, packet_callback) =
                     VmnetPacketReadinessLease::new(generation, self.readiness_signal.clone());
-                let vmnet_config =
-                    VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
-                        .map(|vmnet| {
-                            vmnet
-                                .with_guest_mac(config.guest_mac())
-                                .with_mtu(config.mtu())
-                        })
-                        .map_err(|source| {
-                            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { source }
-                        })?;
                 let prepared_rx =
                     PreparedVmnetVirtioNetworkRxBuffer::supported_maximum().map_err(|source| {
                         ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { source }
@@ -17336,11 +17416,46 @@ where
                         .flatten();
                 let backend = factory.new_backend(iface_id);
                 let (mut backend, interface) =
-                    StartedVmnetPacketIoBackend::start(backend, &vmnet_config).map_err(
+                    StartedVmnetPacketIoBackend::start(backend, vmnet_config).map_err(
                         |source| ProcessNetworkPacketIoProviderBuildError::Start { source },
                     )?;
                 let parameters = backend.parameters().clone();
                 let realized_mac = parameters.realized_mac();
+                let packet_buffer_size = parameters.packet_buffer_size();
+                let read_batch_size = usize::from(parameters.read_max_packets().unwrap_or(1));
+                let write_batch_size = usize::from(parameters.write_max_packets().unwrap_or(1));
+                let batch_parameters_valid = packet_buffer_size.is_some_and(|packet_buffer_size| {
+                    read_batch_size <= VMNET_MAX_PACKETS_PER_OPERATION
+                        && write_batch_size <= VMNET_MAX_PACKETS_PER_OPERATION
+                        && packet_buffer_size
+                            .checked_mul(read_batch_size)
+                            .is_some_and(|aggregate| aggregate <= VMNET_MAX_BYTES_PER_OPERATION)
+                        && packet_buffer_size
+                            .checked_mul(write_batch_size)
+                            .is_some_and(|aggregate| aggregate <= VMNET_MAX_BYTES_PER_OPERATION)
+                });
+                if expected_profile.is_some()
+                    && (parameters.maximum_packet_size() == 0
+                        || parameters.effective_mtu() == 0
+                        || parameters.maximum_packet_size()
+                            < usize::from(parameters.effective_mtu())
+                        || parameters.direct_virtio_header_enabled()
+                            && !parameters.direct_virtio_header_available()
+                        || parameters.read_max_packets() == Some(0)
+                        || parameters.write_max_packets() == Some(0)
+                        || !batch_parameters_valid)
+                    || expected_profile
+                        .and_then(|profile| profile.guest_mac())
+                        .is_some_and(|expected| expected != realized_mac)
+                    || expected_profile
+                        .and_then(|profile| profile.mtu())
+                        .is_some_and(|expected| expected != parameters.effective_mtu())
+                {
+                    return match backend.stop() {
+                        Ok(()) => Err(ProcessNetworkPacketIoProviderBuildError::ProfileMismatch),
+                        Err(_) => Err(ProcessNetworkPacketIoProviderBuildError::CleanupUncertain),
+                    };
+                }
                 if !explicit_mac_pre_reserved && self.reserved_macs.contains(&realized_mac) {
                     return match backend.stop() {
                         Ok(()) => {
@@ -17354,13 +17469,25 @@ where
                 } else {
                     VirtioNetworkPacketEnvelope::RawEthernet
                 };
-                let rx_buffer_len = parameters.packet_buffer_size().ok_or(
-                    ProcessNetworkPacketIoProviderBuildError::PacketIoBuild {
-                        source: VmnetVirtioNetworkPacketIoBuildError::RxBufferTooSmall,
-                    },
-                )?;
-                let read_batch_size = usize::from(parameters.read_max_packets().unwrap_or(1));
-                let write_batch_size = usize::from(parameters.write_max_packets().unwrap_or(1));
+                let device_profile = NetworkDeviceProfile::new(
+                    expected_profile.map_or(Some(realized_mac), |profile| profile.guest_mac()),
+                    expected_profile.map_or(config.mtu(), |profile| profile.mtu()),
+                )
+                .with_packet_envelope(packet_envelope);
+                if expected_profile.is_some_and(|expected| expected != device_profile) {
+                    return match backend.stop() {
+                        Ok(()) => Err(ProcessNetworkPacketIoProviderBuildError::ProfileMismatch),
+                        Err(_) => Err(ProcessNetworkPacketIoProviderBuildError::CleanupUncertain),
+                    };
+                }
+                let Some(rx_buffer_len) = packet_buffer_size else {
+                    return match backend.stop() {
+                        Ok(()) => Err(ProcessNetworkPacketIoProviderBuildError::PacketIoBuild {
+                            source: VmnetVirtioNetworkPacketIoBuildError::RxBufferTooSmall,
+                        }),
+                        Err(_) => Err(ProcessNetworkPacketIoProviderBuildError::CleanupUncertain),
+                    };
+                };
                 let mut packet_io =
                     VmnetVirtioNetworkPacketIo::with_prepared_batch_envelope_and_mmds_detour(
                         backend,
@@ -17399,8 +17526,7 @@ where
                 }
                 (
                     ProcessNetworkPacketIo::Vmnet(Box::new(packet_io)),
-                    NetworkDeviceProfile::new(Some(realized_mac), config.mtu())
-                        .with_packet_envelope(packet_envelope),
+                    device_profile,
                     Some(parameters),
                     !explicit_mac_pre_reserved,
                 )
@@ -17409,6 +17535,7 @@ where
         self.next_generation = next_generation;
         Ok(PreparedProcessNetworkPacketIoEntry {
             entry: ProcessNetworkPacketIoEntry {
+                registry_id: self.registry_id,
                 owner: self.owner,
                 generation,
                 iface_id: iface_id.to_string(),
@@ -17427,6 +17554,10 @@ where
         assert_eq!(
             prepared.entry.owner, self.owner,
             "prepared network packet-I/O owner must match its registry"
+        );
+        assert_eq!(
+            prepared.entry.registry_id, self.registry_id,
+            "prepared network packet-I/O registry generation must match"
         );
         assert!(
             !self
@@ -17455,6 +17586,7 @@ where
             self.reserved_macs.push(mac);
         }
         let published = PublishedProcessNetworkPacketIoEntry {
+            registry_id: self.registry_id,
             owner: prepared.entry.owner,
             generation: prepared.entry.generation,
             iface_id: prepared.entry.iface_id.clone(),
@@ -17476,7 +17608,7 @@ where
             .entries
             .get(index)
             .ok_or(ProcessNetworkPacketIoRegistryError::UnknownInterface)?;
-        if entry.owner != self.owner {
+        if entry.registry_id != self.registry_id || entry.owner != self.owner {
             return Err(ProcessNetworkPacketIoRegistryError::AuthorityMismatch);
         }
         self.release_reserved_mac_for_entry(index)?;
@@ -17490,7 +17622,7 @@ where
         &mut self,
         published: &PublishedProcessNetworkPacketIoEntry,
     ) -> Result<RemovedProcessNetworkPacketIoEntry<B>, ProcessNetworkPacketIoRegistryError> {
-        if published.owner != self.owner {
+        if published.registry_id != self.registry_id || published.owner != self.owner {
             return Err(ProcessNetworkPacketIoRegistryError::AuthorityMismatch);
         }
         let index = self
@@ -17504,7 +17636,7 @@ where
             .entries
             .get(index)
             .ok_or(ProcessNetworkPacketIoRegistryError::UnknownInterface)?;
-        if entry.owner != self.owner {
+        if entry.registry_id != self.registry_id || entry.owner != self.owner {
             return Err(ProcessNetworkPacketIoRegistryError::AuthorityMismatch);
         }
         self.release_reserved_mac_for_entry(index)?;
@@ -17518,7 +17650,7 @@ where
         &mut self,
         removed: RemovedProcessNetworkPacketIoEntry<B>,
     ) -> Result<(), ProcessNetworkPacketIoRegistryError> {
-        if removed.entry.owner != self.owner {
+        if removed.entry.registry_id != self.registry_id || removed.entry.owner != self.owner {
             return Err(ProcessNetworkPacketIoRegistryError::AuthorityMismatch);
         }
         if self
@@ -17580,7 +17712,10 @@ where
     ) -> Result<ProcessNetworkPacketIoPublicationQuiescenceGuard, ProcessCaptureReadyNetworkError>
     {
         if owner != self.owner
-            || self.entries.iter().any(|entry| entry.owner != self.owner)
+            || self
+                .entries
+                .iter()
+                .any(|entry| entry.registry_id != self.registry_id || entry.owner != self.owner)
             || self
                 .readiness_bridge
                 .as_ref()
@@ -17810,7 +17945,12 @@ where
         configs: &[NetworkInterfaceConfig],
         owner: ProcessVmnetAuthority,
     ) -> Result<(), ProcessCaptureReadyNetworkError> {
-        if owner != self.owner || self.entries.iter().any(|entry| entry.owner != self.owner) {
+        if owner != self.owner
+            || self
+                .entries
+                .iter()
+                .any(|entry| entry.registry_id != self.registry_id || entry.owner != self.owner)
+        {
             return Err(ProcessCaptureReadyNetworkError::AuthorityMismatch);
         }
         let Some(authority) = owner.contained_authority() else {
@@ -17878,6 +18018,17 @@ where
             }
         }
         uncertain
+    }
+
+    fn abort_all(&mut self) -> bool {
+        let packet_io_uncertain = self.stop_all();
+        self.entries.clear();
+        let bridge_uncertain = self
+            .readiness_bridge
+            .take()
+            .is_some_and(|mut bridge| bridge.stop().is_err());
+        self.readiness_wake = None;
+        packet_io_uncertain || bridge_uncertain
     }
 
     fn bind_readiness_wake(
@@ -18257,6 +18408,7 @@ enum ProcessNetworkPacketIoProviderBuildError {
     PacketEvents {
         source: VmnetVirtioNetworkPacketIoStopError,
     },
+    ProfileMismatch,
     CleanupUncertain,
     MmdsOnlyPacketIoBuild {
         source: MmdsOnlyVirtioNetworkPacketIoBuildError,
@@ -18299,6 +18451,7 @@ impl fmt::Debug for ProcessNetworkPacketIoProviderBuildError {
                 "ProcessNetworkPacketIoProviderBuildError::ReadinessBridge"
             }
             Self::PacketEvents { .. } => "ProcessNetworkPacketIoProviderBuildError::PacketEvents",
+            Self::ProfileMismatch => "ProcessNetworkPacketIoProviderBuildError::ProfileMismatch",
             Self::CleanupUncertain => "ProcessNetworkPacketIoProviderBuildError::CleanupUncertain",
             Self::MmdsOnlyPacketIoBuild { .. } => {
                 "ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild"
@@ -18328,6 +18481,7 @@ impl ProcessNetworkPacketIoProviderBuildError {
             | Self::HostDeviceName { .. }
             | Self::PacketIoBuild { .. }
             | Self::PacketEvents { .. }
+            | Self::ProfileMismatch
             | Self::MmdsOnlyPacketIoBuild { .. }
             | Self::MissingMmdsDetour => false,
         }
@@ -18380,6 +18534,9 @@ impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
             Self::PacketEvents { source } => {
                 write!(f, "failed to enable vmnet packet events: {source}")
             }
+            Self::ProfileMismatch => {
+                f.write_str("vmnet provider profile does not match saved guest state")
+            }
             Self::CleanupUncertain => {
                 f.write_str("vmnet packet I/O cleanup could not be confirmed")
             }
@@ -18411,6 +18568,7 @@ impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
             | Self::DuplicateRealizedMac
             | Self::RegistryCapacity
             | Self::GenerationExhausted
+            | Self::ProfileMismatch
             | Self::CleanupUncertain
             | Self::MissingMmdsDetour => None,
         }
@@ -18578,6 +18736,1239 @@ const _: fn(
     PreparedProcessSnapshotV2NetworkRestorePlan,
 ) -> PreparedProcessSnapshotV2NetworkRestorePlanParts =
     PreparedProcessSnapshotV2NetworkRestorePlan::into_parts;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessSnapshotV2NetworkRestoreResourceDisposition {
+    Retryable,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessSnapshotV2NetworkRestoreResourceStage {
+    Start,
+    Bindings,
+    Metrics,
+    Mmds,
+    BeforePacketIo,
+    AfterPacketIo,
+    Binding,
+    Completion,
+    Take,
+    Finish,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessSnapshotV2NetworkRestoreAllocation {
+    ResourceKeys,
+    OverrideKeys,
+    ResourceKeyCopy,
+    OverrideKeyCopy,
+    Manifest,
+    Bindings,
+    ProviderVmnetConfigs,
+    ProviderVmnetConfigCopy,
+    Metrics,
+    MetricsLeases,
+    MmdsInterfaceIds,
+    MmdsInterfaceIdCopy,
+    MmdsControllers,
+    MmdsControllerCopy,
+    MmdsState,
+    ProviderEntries,
+    ProviderMacReservations,
+}
+
+enum ProcessSnapshotV2NetworkRestoreResourceErrorKind {
+    Allocation {
+        allocation: ProcessSnapshotV2NetworkRestoreAllocation,
+    },
+    CandidateMismatch,
+    Manifest(SnapshotRestoreManifestError),
+    BindingAllocation(SnapshotRestoreBindingAllocationError),
+    Metrics(NetworkInterfaceMetricsRegistryError),
+    MmdsState(MmdsStateLockError),
+    MmdsConfig,
+    Provider(ProcessNetworkPacketIoProviderBuildError),
+    Binding(SnapshotRestoreBindingRejectionReason),
+    Incomplete {
+        missing_count: usize,
+    },
+    Take(SnapshotRestoreTakeError),
+    Unconsumed {
+        unconsumed_count: usize,
+    },
+    Consumed,
+    Cancelled,
+}
+
+impl ProcessSnapshotV2NetworkRestoreResourceErrorKind {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Allocation { allocation } => {
+                let _ = allocation;
+                "allocation failed"
+            }
+            Self::CandidateMismatch => "candidate ownership is inconsistent",
+            Self::Manifest(_) => "network restore manifest is invalid",
+            Self::BindingAllocation(_) => "network restore binding allocation failed",
+            Self::Metrics(_) => "network metrics ownership failed",
+            Self::MmdsState(_) => "fresh MMDS state is unavailable",
+            Self::MmdsConfig => "fresh MMDS configuration is invalid",
+            Self::Provider(_) => "network packet-I/O provider failed",
+            Self::Binding(reason) => {
+                let _ = reason;
+                "network packet-I/O binding failed"
+            }
+            Self::Incomplete { missing_count } => {
+                let _ = missing_count;
+                "network packet-I/O bindings are incomplete"
+            }
+            Self::Take(_) => "network packet-I/O owner take failed",
+            Self::Unconsumed { unconsumed_count } => {
+                let _ = unconsumed_count;
+                "network packet-I/O owners are unconsumed"
+            }
+            Self::Consumed => "network packet-I/O ownership already escaped",
+            Self::Cancelled => "network packet-I/O preparation was cancelled",
+        }
+    }
+}
+
+impl fmt::Debug for ProcessSnapshotV2NetworkRestoreResourceErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Allocation { .. } => {
+                "ProcessSnapshotV2NetworkRestoreResourceErrorKind::Allocation"
+            }
+            Self::CandidateMismatch => {
+                "ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch"
+            }
+            Self::Manifest(_) => "ProcessSnapshotV2NetworkRestoreResourceErrorKind::Manifest",
+            Self::BindingAllocation(_) => {
+                "ProcessSnapshotV2NetworkRestoreResourceErrorKind::BindingAllocation"
+            }
+            Self::Metrics(_) => "ProcessSnapshotV2NetworkRestoreResourceErrorKind::Metrics",
+            Self::MmdsState(_) => "ProcessSnapshotV2NetworkRestoreResourceErrorKind::MmdsState",
+            Self::MmdsConfig => "ProcessSnapshotV2NetworkRestoreResourceErrorKind::MmdsConfig",
+            Self::Provider(_) => "ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider",
+            Self::Binding(_) => "ProcessSnapshotV2NetworkRestoreResourceErrorKind::Binding",
+            Self::Incomplete { .. } => {
+                "ProcessSnapshotV2NetworkRestoreResourceErrorKind::Incomplete"
+            }
+            Self::Take(_) => "ProcessSnapshotV2NetworkRestoreResourceErrorKind::Take",
+            Self::Unconsumed { .. } => {
+                "ProcessSnapshotV2NetworkRestoreResourceErrorKind::Unconsumed"
+            }
+            Self::Consumed => "ProcessSnapshotV2NetworkRestoreResourceErrorKind::Consumed",
+            Self::Cancelled => "ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled",
+        })
+    }
+}
+
+pub(crate) struct ProcessSnapshotV2NetworkRestoreResourceError {
+    stage: ProcessSnapshotV2NetworkRestoreResourceStage,
+    kind: ProcessSnapshotV2NetworkRestoreResourceErrorKind,
+    disposition: ProcessSnapshotV2NetworkRestoreResourceDisposition,
+    cleanup_uncertain: bool,
+}
+
+impl ProcessSnapshotV2NetworkRestoreResourceError {
+    fn retryable(
+        stage: ProcessSnapshotV2NetworkRestoreResourceStage,
+        kind: ProcessSnapshotV2NetworkRestoreResourceErrorKind,
+    ) -> Self {
+        Self {
+            stage,
+            kind,
+            disposition: ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable,
+            cleanup_uncertain: false,
+        }
+    }
+
+    fn terminal(
+        stage: ProcessSnapshotV2NetworkRestoreResourceStage,
+        kind: ProcessSnapshotV2NetworkRestoreResourceErrorKind,
+    ) -> Self {
+        Self {
+            stage,
+            kind,
+            disposition: ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal,
+            cleanup_uncertain: false,
+        }
+    }
+
+    fn provider(
+        stage: ProcessSnapshotV2NetworkRestoreResourceStage,
+        source: ProcessNetworkPacketIoProviderBuildError,
+    ) -> Self {
+        let terminal = source.is_terminal();
+        Self {
+            stage,
+            kind: ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(source),
+            disposition: if terminal {
+                ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+            } else {
+                ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+            },
+            cleanup_uncertain: false,
+        }
+    }
+
+    fn with_cleanup_uncertain(mut self, cleanup_uncertain: bool) -> Self {
+        if cleanup_uncertain {
+            self.disposition = ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal;
+            self.cleanup_uncertain = true;
+        }
+        self
+    }
+
+    pub(crate) const fn disposition(&self) -> ProcessSnapshotV2NetworkRestoreResourceDisposition {
+        self.disposition
+    }
+}
+
+impl fmt::Debug for ProcessSnapshotV2NetworkRestoreResourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessSnapshotV2NetworkRestoreResourceError")
+            .field("stage", &self.stage)
+            .field("kind", &self.kind)
+            .field("disposition", &self.disposition)
+            .field("cleanup_uncertain", &self.cleanup_uncertain)
+            .finish()
+    }
+}
+
+impl fmt::Display for ProcessSnapshotV2NetworkRestoreResourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "network snapshot packet-I/O preparation failed at {:?}: {} ({:?})",
+            self.stage,
+            self.kind.label(),
+            self.disposition
+        )?;
+        if self.cleanup_uncertain {
+            formatter.write_str("; cleanup could not be confirmed")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProcessSnapshotV2NetworkRestoreResourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Manifest(source) => Some(source),
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::BindingAllocation(source) => {
+                Some(source)
+            }
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Metrics(source) => Some(source),
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::MmdsState(source) => Some(source),
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(source) => Some(source),
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Take(source) => Some(source),
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Allocation { .. }
+            | ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch
+            | ProcessSnapshotV2NetworkRestoreResourceErrorKind::MmdsConfig
+            | ProcessSnapshotV2NetworkRestoreResourceErrorKind::Binding(_)
+            | ProcessSnapshotV2NetworkRestoreResourceErrorKind::Incomplete { .. }
+            | ProcessSnapshotV2NetworkRestoreResourceErrorKind::Unconsumed { .. }
+            | ProcessSnapshotV2NetworkRestoreResourceErrorKind::Consumed
+            | ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled => None,
+        }
+    }
+}
+
+pub(crate) struct PreparedProcessSnapshotV2NetworkRestoreResource {
+    publication: PublishedProcessNetworkPacketIoEntry,
+    _metrics_lease: NetworkInterfaceMetricsLease,
+    device_profile: NetworkDeviceProfile,
+}
+
+impl PreparedProcessSnapshotV2NetworkRestoreResource {
+    pub(crate) const fn publication(&self) -> &PublishedProcessNetworkPacketIoEntry {
+        &self.publication
+    }
+
+    pub(crate) const fn device_profile(&self) -> NetworkDeviceProfile {
+        self.device_profile
+    }
+}
+
+impl fmt::Debug for PreparedProcessSnapshotV2NetworkRestoreResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProcessSnapshotV2NetworkRestoreResource")
+            .field("ownership", &"<redacted>")
+            .finish()
+    }
+}
+
+pub(crate) struct PreparedProcessSnapshotV2NetworkRestoreBatch<B>
+where
+    B: ProcessVmnetBackend,
+{
+    candidate: Option<PreparedNativeV2NetworkSnapshotCandidateState>,
+    provider: Option<ProcessNetworkPacketIoRegistry<B>>,
+    bindings:
+        Option<PreparedSnapshotRestoreBindings<PreparedProcessSnapshotV2NetworkRestoreResource>>,
+    mmds_state: Option<MmdsStateHandle>,
+    mmds_metrics: Option<SharedMmdsMetrics>,
+    network_metrics: SharedNetworkInterfaceMetricsRegistry,
+    resource_count: usize,
+}
+
+impl<B> PreparedProcessSnapshotV2NetworkRestoreBatch<B>
+where
+    B: ProcessVmnetBackend,
+{
+    pub(crate) const fn candidate(&self) -> Option<&PreparedNativeV2NetworkSnapshotCandidateState> {
+        self.candidate.as_ref()
+    }
+
+    pub(crate) const fn provider(&self) -> Option<&ProcessNetworkPacketIoRegistry<B>> {
+        self.provider.as_ref()
+    }
+
+    pub(crate) const fn mmds_state(&self) -> Option<&MmdsStateHandle> {
+        self.mmds_state.as_ref()
+    }
+
+    pub(crate) const fn mmds_metrics(&self) -> Option<&SharedMmdsMetrics> {
+        self.mmds_metrics.as_ref()
+    }
+
+    pub(crate) const fn network_metrics(&self) -> &SharedNetworkInterfaceMetricsRegistry {
+        &self.network_metrics
+    }
+
+    pub(crate) fn remaining_count(&self) -> usize {
+        self.bindings
+            .as_ref()
+            .map_or(0, PreparedSnapshotRestoreBindings::remaining_count)
+    }
+
+    pub(crate) fn take(
+        &mut self,
+        key: &SnapshotRestoreResourceKey,
+    ) -> Result<
+        PreparedProcessSnapshotV2NetworkRestoreResource,
+        ProcessSnapshotV2NetworkRestoreResourceError,
+    > {
+        self.bindings
+            .as_mut()
+            .ok_or_else(|| {
+                ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                    ProcessSnapshotV2NetworkRestoreResourceStage::Take,
+                    ProcessSnapshotV2NetworkRestoreResourceErrorKind::Consumed,
+                )
+            })?
+            .take(key)
+            .map_err(|source| {
+                ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                    ProcessSnapshotV2NetworkRestoreResourceStage::Take,
+                    ProcessSnapshotV2NetworkRestoreResourceErrorKind::Take(source),
+                )
+            })
+    }
+
+    pub(crate) fn abort(mut self) -> Result<(), ProcessSnapshotV2NetworkRestoreResourceError> {
+        let remaining_count = self.remaining_count();
+        let consumed = remaining_count != self.resource_count;
+        let cleanup_uncertain = self
+            .provider
+            .as_mut()
+            .is_some_and(ProcessNetworkPacketIoRegistry::abort_all);
+        self.provider = None;
+        self.bindings = None;
+        if consumed || cleanup_uncertain {
+            return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Finish,
+                if consumed {
+                    ProcessSnapshotV2NetworkRestoreResourceErrorKind::Consumed
+                } else {
+                    ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(
+                        ProcessNetworkPacketIoProviderBuildError::CleanupUncertain,
+                    )
+                },
+            )
+            .with_cleanup_uncertain(cleanup_uncertain));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        mut self,
+    ) -> Result<
+        PreparedProcessSnapshotV2NetworkRestoreCompletion<B>,
+        ProcessSnapshotV2NetworkRestoreResourceError,
+    > {
+        let bindings = self.bindings.take().ok_or_else(|| {
+            ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Finish,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::Consumed,
+            )
+        })?;
+        if let Err(unconsumed) = bindings.finish() {
+            let unconsumed_count = unconsumed.unconsumed_count();
+            let consumed = unconsumed_count != self.resource_count;
+            let cleanup_uncertain = self
+                .provider
+                .as_mut()
+                .is_some_and(ProcessNetworkPacketIoRegistry::abort_all);
+            self.provider = None;
+            drop(unconsumed);
+            let kind = if consumed {
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::Consumed
+            } else {
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::Unconsumed { unconsumed_count }
+            };
+            let error = if consumed {
+                ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                    ProcessSnapshotV2NetworkRestoreResourceStage::Finish,
+                    kind,
+                )
+            } else {
+                ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+                    ProcessSnapshotV2NetworkRestoreResourceStage::Finish,
+                    kind,
+                )
+            };
+            return Err(error.with_cleanup_uncertain(cleanup_uncertain));
+        }
+        let candidate = match self.candidate.take() {
+            Some(candidate) => candidate,
+            None => {
+                let cleanup_uncertain = self
+                    .provider
+                    .as_mut()
+                    .is_some_and(ProcessNetworkPacketIoRegistry::abort_all);
+                self.provider = None;
+                return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                    ProcessSnapshotV2NetworkRestoreResourceStage::Finish,
+                    ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
+                )
+                .with_cleanup_uncertain(cleanup_uncertain));
+            }
+        };
+        let provider = match self.provider.take() {
+            Some(provider) => provider,
+            None => {
+                return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                    ProcessSnapshotV2NetworkRestoreResourceStage::Finish,
+                    ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
+                ));
+            }
+        };
+        Ok(PreparedProcessSnapshotV2NetworkRestoreCompletion {
+            candidate,
+            provider,
+            mmds_state: self.mmds_state.take(),
+            mmds_metrics: self.mmds_metrics.take(),
+            network_metrics: self.network_metrics.clone(),
+        })
+    }
+}
+
+impl<B> fmt::Debug for PreparedProcessSnapshotV2NetworkRestoreBatch<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProcessSnapshotV2NetworkRestoreBatch")
+            .field("resource_count", &self.resource_count)
+            .field("remaining_count", &self.remaining_count())
+            .field("mmds", &self.mmds_state.as_ref().map(|_| "<fresh>"))
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<B> Drop for PreparedProcessSnapshotV2NetworkRestoreBatch<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn drop(&mut self) {
+        if let Some(provider) = self.provider.as_mut() {
+            let _ = provider.abort_all();
+        }
+    }
+}
+
+pub(crate) struct PreparedProcessSnapshotV2NetworkRestoreCompletion<B>
+where
+    B: ProcessVmnetBackend,
+{
+    candidate: PreparedNativeV2NetworkSnapshotCandidateState,
+    provider: ProcessNetworkPacketIoRegistry<B>,
+    mmds_state: Option<MmdsStateHandle>,
+    mmds_metrics: Option<SharedMmdsMetrics>,
+    network_metrics: SharedNetworkInterfaceMetricsRegistry,
+}
+
+impl<B> PreparedProcessSnapshotV2NetworkRestoreCompletion<B>
+where
+    B: ProcessVmnetBackend,
+{
+    pub(crate) const fn candidate(&self) -> &PreparedNativeV2NetworkSnapshotCandidateState {
+        &self.candidate
+    }
+
+    pub(crate) const fn provider(&self) -> &ProcessNetworkPacketIoRegistry<B> {
+        &self.provider
+    }
+
+    pub(crate) const fn mmds_state(&self) -> Option<&MmdsStateHandle> {
+        self.mmds_state.as_ref()
+    }
+
+    pub(crate) const fn mmds_metrics(&self) -> Option<&SharedMmdsMetrics> {
+        self.mmds_metrics.as_ref()
+    }
+
+    pub(crate) const fn network_metrics(&self) -> &SharedNetworkInterfaceMetricsRegistry {
+        &self.network_metrics
+    }
+}
+
+impl<B> fmt::Debug for PreparedProcessSnapshotV2NetworkRestoreCompletion<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProcessSnapshotV2NetworkRestoreCompletion")
+            .field("mmds", &self.mmds_state.as_ref().map(|_| "<fresh>"))
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+type SystemPreparedProcessSnapshotV2NetworkRestoreBatch =
+    PreparedProcessSnapshotV2NetworkRestoreBatch<SystemVmnetInterfaceBackend>;
+type SystemPreparedProcessSnapshotV2NetworkRestoreCompletion =
+    PreparedProcessSnapshotV2NetworkRestoreCompletion<SystemVmnetInterfaceBackend>;
+
+const _: fn(
+    &ProcessSnapshotV2NetworkRestoreResourceError,
+) -> ProcessSnapshotV2NetworkRestoreResourceDisposition =
+    ProcessSnapshotV2NetworkRestoreResourceError::disposition;
+const _: fn(
+    &PreparedProcessSnapshotV2NetworkRestoreResource,
+) -> &PublishedProcessNetworkPacketIoEntry =
+    PreparedProcessSnapshotV2NetworkRestoreResource::publication;
+const _: fn(&PreparedProcessSnapshotV2NetworkRestoreResource) -> NetworkDeviceProfile =
+    PreparedProcessSnapshotV2NetworkRestoreResource::device_profile;
+const _: fn(
+    &SystemPreparedProcessSnapshotV2NetworkRestoreBatch,
+) -> Option<&PreparedNativeV2NetworkSnapshotCandidateState> =
+    SystemPreparedProcessSnapshotV2NetworkRestoreBatch::candidate;
+const _: fn(
+    &SystemPreparedProcessSnapshotV2NetworkRestoreBatch,
+) -> Option<&ProcessNetworkPacketIoProvider> =
+    SystemPreparedProcessSnapshotV2NetworkRestoreBatch::provider;
+const _: fn(&SystemPreparedProcessSnapshotV2NetworkRestoreBatch) -> Option<&MmdsStateHandle> =
+    SystemPreparedProcessSnapshotV2NetworkRestoreBatch::mmds_state;
+const _: fn(&SystemPreparedProcessSnapshotV2NetworkRestoreBatch) -> Option<&SharedMmdsMetrics> =
+    SystemPreparedProcessSnapshotV2NetworkRestoreBatch::mmds_metrics;
+const _: fn(
+    &SystemPreparedProcessSnapshotV2NetworkRestoreBatch,
+) -> &SharedNetworkInterfaceMetricsRegistry =
+    SystemPreparedProcessSnapshotV2NetworkRestoreBatch::network_metrics;
+const _: fn(&SystemPreparedProcessSnapshotV2NetworkRestoreBatch) -> usize =
+    SystemPreparedProcessSnapshotV2NetworkRestoreBatch::remaining_count;
+const _: fn(
+    &mut SystemPreparedProcessSnapshotV2NetworkRestoreBatch,
+    &SnapshotRestoreResourceKey,
+) -> Result<
+    PreparedProcessSnapshotV2NetworkRestoreResource,
+    ProcessSnapshotV2NetworkRestoreResourceError,
+> = SystemPreparedProcessSnapshotV2NetworkRestoreBatch::take;
+const _: fn(
+    SystemPreparedProcessSnapshotV2NetworkRestoreBatch,
+) -> Result<(), ProcessSnapshotV2NetworkRestoreResourceError> =
+    SystemPreparedProcessSnapshotV2NetworkRestoreBatch::abort;
+const _: fn(
+    SystemPreparedProcessSnapshotV2NetworkRestoreBatch,
+) -> Result<
+    SystemPreparedProcessSnapshotV2NetworkRestoreCompletion,
+    ProcessSnapshotV2NetworkRestoreResourceError,
+> = SystemPreparedProcessSnapshotV2NetworkRestoreBatch::finish;
+const _: fn(
+    &SystemPreparedProcessSnapshotV2NetworkRestoreCompletion,
+) -> &PreparedNativeV2NetworkSnapshotCandidateState =
+    SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::candidate;
+const _: fn(
+    &SystemPreparedProcessSnapshotV2NetworkRestoreCompletion,
+) -> &ProcessNetworkPacketIoProvider =
+    SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::provider;
+const _: fn(&SystemPreparedProcessSnapshotV2NetworkRestoreCompletion) -> Option<&MmdsStateHandle> =
+    SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::mmds_state;
+const _: fn(
+    &SystemPreparedProcessSnapshotV2NetworkRestoreCompletion,
+) -> Option<&SharedMmdsMetrics> =
+    SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::mmds_metrics;
+const _: fn(
+    &SystemPreparedProcessSnapshotV2NetworkRestoreCompletion,
+) -> &SharedNetworkInterfaceMetricsRegistry =
+    SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::network_metrics;
+
+fn process_snapshot_v2_network_restore_allocation_error(
+    stage: ProcessSnapshotV2NetworkRestoreResourceStage,
+    allocation: ProcessSnapshotV2NetworkRestoreAllocation,
+) -> ProcessSnapshotV2NetworkRestoreResourceError {
+    ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+        stage,
+        ProcessSnapshotV2NetworkRestoreResourceErrorKind::Allocation { allocation },
+    )
+}
+
+fn check_process_snapshot_v2_network_restore_allocation<A>(
+    allocation_failed: &mut A,
+    stage: ProcessSnapshotV2NetworkRestoreResourceStage,
+    allocation: ProcessSnapshotV2NetworkRestoreAllocation,
+) -> Result<(), ProcessSnapshotV2NetworkRestoreResourceError>
+where
+    A: FnMut(ProcessSnapshotV2NetworkRestoreAllocation) -> bool,
+{
+    if allocation_failed(allocation) {
+        Err(process_snapshot_v2_network_restore_allocation_error(
+            stage, allocation,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn prepare_process_snapshot_v2_network_restore_resources<C>(
+    plan: PreparedProcessSnapshotV2NetworkRestorePlan,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    cancelled: C,
+) -> Result<
+    PreparedProcessSnapshotV2NetworkRestoreBatch<SystemVmnetInterfaceBackend>,
+    ProcessSnapshotV2NetworkRestoreResourceError,
+>
+where
+    C: FnMut(ProcessSnapshotV2NetworkRestoreResourceStage) -> bool,
+{
+    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+    prepare_process_snapshot_v2_network_restore_resources_with_factory(
+        plan,
+        destination_instance_id,
+        mmds_data_store_limit_bytes,
+        &mut factory,
+        cancelled,
+    )
+}
+
+fn prepare_process_snapshot_v2_network_restore_resources_with_factory<B, F, C>(
+    plan: PreparedProcessSnapshotV2NetworkRestorePlan,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    factory: &mut F,
+    cancelled: C,
+) -> Result<
+    PreparedProcessSnapshotV2NetworkRestoreBatch<B>,
+    ProcessSnapshotV2NetworkRestoreResourceError,
+>
+where
+    B: ProcessVmnetBackend,
+    F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    C: FnMut(ProcessSnapshotV2NetworkRestoreResourceStage) -> bool,
+{
+    prepare_process_snapshot_v2_network_restore_resources_with_factory_and_allocation(
+        plan,
+        destination_instance_id,
+        mmds_data_store_limit_bytes,
+        factory,
+        |_| false,
+        cancelled,
+    )
+}
+
+fn prepare_process_snapshot_v2_network_restore_resources_with_factory_and_allocation<B, F, A, C>(
+    plan: PreparedProcessSnapshotV2NetworkRestorePlan,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    factory: &mut F,
+    mut allocation_failed: A,
+    mut cancelled: C,
+) -> Result<
+    PreparedProcessSnapshotV2NetworkRestoreBatch<B>,
+    ProcessSnapshotV2NetworkRestoreResourceError,
+>
+where
+    B: ProcessVmnetBackend,
+    F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    A: FnMut(ProcessSnapshotV2NetworkRestoreAllocation) -> bool,
+    C: FnMut(ProcessSnapshotV2NetworkRestoreResourceStage) -> bool,
+{
+    if cancelled(ProcessSnapshotV2NetworkRestoreResourceStage::Start) {
+        return Err(ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled,
+        ));
+    }
+    let (candidate, vmnet_configs, all_mmds, authority) = plan.into_parts();
+    let interfaces = candidate.topology().interfaces();
+    let resource_count = interfaces.len();
+    if interfaces.is_empty() || interfaces.len() != vmnet_configs.len() {
+        return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
+        ));
+    }
+
+    let mut resources = Vec::new();
+    check_process_snapshot_v2_network_restore_allocation(
+        &mut allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+        ProcessSnapshotV2NetworkRestoreAllocation::ResourceKeys,
+    )?;
+    resources.try_reserve_exact(interfaces.len()).map_err(|_| {
+        process_snapshot_v2_network_restore_allocation_error(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+            ProcessSnapshotV2NetworkRestoreAllocation::ResourceKeys,
+        )
+    })?;
+    let mut overrides = Vec::new();
+    check_process_snapshot_v2_network_restore_allocation(
+        &mut allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+        ProcessSnapshotV2NetworkRestoreAllocation::OverrideKeys,
+    )?;
+    overrides.try_reserve_exact(interfaces.len()).map_err(|_| {
+        process_snapshot_v2_network_restore_allocation_error(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+            ProcessSnapshotV2NetworkRestoreAllocation::OverrideKeys,
+        )
+    })?;
+    for interface in interfaces {
+        let key = interface.resource_key();
+        if key.resource_class() != SnapshotRestoreResourceClass::NetworkPacketIo
+            || !candidate.manifest().is_overridden(key)
+            || candidate.manifest().resources().binary_search(key).is_err()
+        {
+            return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
+            ));
+        }
+        check_process_snapshot_v2_network_restore_allocation(
+            &mut allocation_failed,
+            ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+            ProcessSnapshotV2NetworkRestoreAllocation::ResourceKeyCopy,
+        )?;
+        resources.push(key.try_clone().map_err(|_| {
+            process_snapshot_v2_network_restore_allocation_error(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+                ProcessSnapshotV2NetworkRestoreAllocation::ResourceKeyCopy,
+            )
+        })?);
+        check_process_snapshot_v2_network_restore_allocation(
+            &mut allocation_failed,
+            ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+            ProcessSnapshotV2NetworkRestoreAllocation::OverrideKeyCopy,
+        )?;
+        overrides.push(key.try_clone().map_err(|_| {
+            process_snapshot_v2_network_restore_allocation_error(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+                ProcessSnapshotV2NetworkRestoreAllocation::OverrideKeyCopy,
+            )
+        })?);
+    }
+    check_process_snapshot_v2_network_restore_allocation(
+        &mut allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+        ProcessSnapshotV2NetworkRestoreAllocation::Manifest,
+    )?;
+    let manifest = SnapshotRestoreManifest::try_new(resources, overrides).map_err(|source| {
+        ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Manifest(source),
+        )
+    })?;
+    check_process_snapshot_v2_network_restore_allocation(
+        &mut allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+        ProcessSnapshotV2NetworkRestoreAllocation::Bindings,
+    )?;
+    let mut bindings: SnapshotRestoreBindings<PreparedProcessSnapshotV2NetworkRestoreResource> =
+        manifest.try_into_bindings().map_err(|source| {
+            ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::BindingAllocation(source),
+            )
+        })?;
+    if cancelled(ProcessSnapshotV2NetworkRestoreResourceStage::Bindings) {
+        return Err(ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled,
+        ));
+    }
+
+    let topology_all_mmds = interfaces
+        .iter()
+        .all(|interface| interface.mmds_stack().is_some());
+    if all_mmds != topology_all_mmds {
+        return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
+        ));
+    }
+    let expected_class = if all_mmds {
+        SnapshotV2NetworkBackendClass::MmdsOnly
+    } else {
+        SnapshotV2NetworkBackendClass::Vmnet
+    };
+    let mut provider_vmnet_configs = Vec::new();
+    check_process_snapshot_v2_network_restore_allocation(
+        &mut allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+        ProcessSnapshotV2NetworkRestoreAllocation::ProviderVmnetConfigs,
+    )?;
+    provider_vmnet_configs
+        .try_reserve_exact(interfaces.len())
+        .map_err(|_| {
+            process_snapshot_v2_network_restore_allocation_error(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+                ProcessSnapshotV2NetworkRestoreAllocation::ProviderVmnetConfigs,
+            )
+        })?;
+    for (interface, resolved_vmnet) in interfaces.iter().zip(&vmnet_configs) {
+        let expected_profile = interface.portable().profile();
+        let reparsed =
+            VmnetInterfaceConfig::from_host_dev_name(interface.controller().host_dev_name())
+                .map_err(|_| {
+                    ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                        ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+                        ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
+                    )
+                })?;
+        if interface.portable().backend() != expected_class
+            || &reparsed != resolved_vmnet
+            || matches!(expected_class, SnapshotV2NetworkBackendClass::Vmnet)
+                && expected_profile.guest_mac().is_none()
+            || matches!(expected_class, SnapshotV2NetworkBackendClass::MmdsOnly)
+                && expected_profile != NetworkDeviceProfile::from_config(interface.controller())
+        {
+            return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
+            ));
+        }
+        check_process_snapshot_v2_network_restore_allocation(
+            &mut allocation_failed,
+            ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+            ProcessSnapshotV2NetworkRestoreAllocation::ProviderVmnetConfigCopy,
+        )?;
+        provider_vmnet_configs.push(
+            resolved_vmnet
+                .try_clone()
+                .map_err(|_| {
+                    process_snapshot_v2_network_restore_allocation_error(
+                        ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+                        ProcessSnapshotV2NetworkRestoreAllocation::ProviderVmnetConfigCopy,
+                    )
+                })?
+                .with_guest_mac(expected_profile.guest_mac())
+                .with_mtu(expected_profile.mtu()),
+        );
+    }
+
+    check_process_snapshot_v2_network_restore_allocation(
+        &mut allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Metrics,
+        ProcessSnapshotV2NetworkRestoreAllocation::Metrics,
+    )?;
+    let network_metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(
+        interfaces
+            .iter()
+            .map(|interface| interface.controller().iface_id()),
+        bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT,
+    )
+    .map_err(|source| {
+        ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Metrics,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Metrics(source),
+        )
+    })?;
+    let mut metrics_leases = Vec::new();
+    check_process_snapshot_v2_network_restore_allocation(
+        &mut allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Metrics,
+        ProcessSnapshotV2NetworkRestoreAllocation::MetricsLeases,
+    )?;
+    metrics_leases
+        .try_reserve_exact(interfaces.len())
+        .map_err(|_| {
+            process_snapshot_v2_network_restore_allocation_error(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Metrics,
+                ProcessSnapshotV2NetworkRestoreAllocation::MetricsLeases,
+            )
+        })?;
+    for interface in interfaces {
+        metrics_leases.push(
+            network_metrics
+                .claim_interface_lease(interface.controller().iface_id())
+                .map_err(|source| {
+                    ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+                        ProcessSnapshotV2NetworkRestoreResourceStage::Metrics,
+                        ProcessSnapshotV2NetworkRestoreResourceErrorKind::Metrics(source),
+                    )
+                })?,
+        );
+    }
+    if cancelled(ProcessSnapshotV2NetworkRestoreResourceStage::Metrics) {
+        return Err(ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Metrics,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled,
+        ));
+    }
+
+    let (mmds_state, mmds_metrics, mmds_detour) = prepare_fresh_process_snapshot_v2_network_mmds(
+        &candidate,
+        destination_instance_id,
+        mmds_data_store_limit_bytes,
+        &mut allocation_failed,
+    )?;
+    if cancelled(ProcessSnapshotV2NetworkRestoreResourceStage::Mmds) {
+        return Err(ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled,
+        ));
+    }
+
+    validate_process_vmnet_authority_for_resolved_configs(
+        interfaces.len(),
+        all_mmds,
+        authority,
+        &vmnet_configs,
+    )
+    .map_err(|source| match source {
+        ProcessVmnetAuthorityValidationError::Provider(source) => {
+            ProcessSnapshotV2NetworkRestoreResourceError::provider(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+                source,
+            )
+        }
+        ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized => {
+            ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
+            )
+        }
+    })?;
+    let startup_policy = if all_mmds {
+        ProcessNetworkPacketIoStartupPolicy::MmdsPreferred
+    } else {
+        ProcessNetworkPacketIoStartupPolicy::Vmnet
+    };
+    check_process_snapshot_v2_network_restore_allocation(
+        &mut allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+        ProcessSnapshotV2NetworkRestoreAllocation::ProviderEntries,
+    )?;
+    check_process_snapshot_v2_network_restore_allocation(
+        &mut allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+        ProcessSnapshotV2NetworkRestoreAllocation::ProviderMacReservations,
+    )?;
+    let mut provider = ProcessNetworkPacketIoRegistry::empty_with_provisional_macs(
+        interfaces.len(),
+        startup_policy,
+        mmds_detour.as_ref(),
+        authority,
+        interfaces
+            .iter()
+            .filter_map(|interface| interface.portable().profile().guest_mac()),
+    )
+    .map_err(|source| {
+        ProcessSnapshotV2NetworkRestoreResourceError::provider(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+            source,
+        )
+    })?;
+
+    for ((interface, provider_vmnet), metrics_lease) in interfaces
+        .iter()
+        .zip(&provider_vmnet_configs)
+        .zip(metrics_leases)
+    {
+        if cancelled(ProcessSnapshotV2NetworkRestoreResourceStage::BeforePacketIo) {
+            return Err(abort_process_snapshot_v2_network_restore_preparation(
+                &mut provider,
+                bindings,
+                ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+                    ProcessSnapshotV2NetworkRestoreResourceStage::BeforePacketIo,
+                    ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled,
+                ),
+            ));
+        }
+        let expected_profile = interface.portable().profile();
+        let expected_class = match interface.portable().backend() {
+            SnapshotV2NetworkBackendClass::MmdsOnly => ProcessNetworkPacketIoEntryClass::MmdsOnly,
+            SnapshotV2NetworkBackendClass::Vmnet => ProcessNetworkPacketIoEntryClass::Vmnet,
+        };
+        let class = provider.class_for_interface(interface.controller().iface_id());
+        debug_assert_eq!(class, expected_class);
+        let prepared = match provider.prepare_resolved_entry_with_factory(
+            interface.controller(),
+            provider_vmnet,
+            class,
+            expected_profile.guest_mac().is_some(),
+            Some(expected_profile),
+            factory,
+        ) {
+            Ok(prepared) => prepared,
+            Err(source) => {
+                drop(metrics_lease);
+                return Err(abort_process_snapshot_v2_network_restore_preparation(
+                    &mut provider,
+                    bindings,
+                    ProcessSnapshotV2NetworkRestoreResourceError::provider(
+                        ProcessSnapshotV2NetworkRestoreResourceStage::AfterPacketIo,
+                        source,
+                    ),
+                ));
+            }
+        };
+        if cancelled(ProcessSnapshotV2NetworkRestoreResourceStage::AfterPacketIo) {
+            let current_cleanup_uncertain = prepared.abort().is_err();
+            drop(metrics_lease);
+            return Err(abort_process_snapshot_v2_network_restore_preparation(
+                &mut provider,
+                bindings,
+                ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+                    ProcessSnapshotV2NetworkRestoreResourceStage::AfterPacketIo,
+                    ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled,
+                )
+                .with_cleanup_uncertain(current_cleanup_uncertain),
+            ));
+        }
+        let device_profile = prepared.device_profile();
+        let publication = provider.publish_prepared(prepared);
+        let resource = PreparedProcessSnapshotV2NetworkRestoreResource {
+            publication,
+            _metrics_lease: metrics_lease,
+            device_profile,
+        };
+        if let Err(rejection) = bindings.bind(interface.resource_key(), resource) {
+            let reason = rejection.reason();
+            let rejected = rejection.into_value();
+            let cleanup_uncertain = provider.abort_all();
+            drop(rejected);
+            drop(bindings);
+            return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Binding,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::Binding(reason),
+            )
+            .with_cleanup_uncertain(cleanup_uncertain));
+        }
+        if cancelled(ProcessSnapshotV2NetworkRestoreResourceStage::Binding) {
+            return Err(abort_process_snapshot_v2_network_restore_preparation(
+                &mut provider,
+                bindings,
+                ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+                    ProcessSnapshotV2NetworkRestoreResourceStage::Binding,
+                    ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled,
+                ),
+            ));
+        }
+    }
+
+    let bindings = match bindings.complete() {
+        Ok(bindings) => bindings,
+        Err(incomplete) => {
+            let missing_count = incomplete.missing_count();
+            return Err(abort_process_snapshot_v2_network_restore_preparation(
+                &mut provider,
+                incomplete.into_bindings(),
+                ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                    ProcessSnapshotV2NetworkRestoreResourceStage::Completion,
+                    ProcessSnapshotV2NetworkRestoreResourceErrorKind::Incomplete { missing_count },
+                ),
+            ));
+        }
+    };
+    if cancelled(ProcessSnapshotV2NetworkRestoreResourceStage::Completion) {
+        let cleanup_uncertain = provider.abort_all();
+        drop(bindings);
+        return Err(ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Completion,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled,
+        )
+        .with_cleanup_uncertain(cleanup_uncertain));
+    }
+
+    Ok(PreparedProcessSnapshotV2NetworkRestoreBatch {
+        candidate: Some(candidate),
+        provider: Some(provider),
+        bindings: Some(bindings),
+        mmds_state,
+        mmds_metrics,
+        network_metrics,
+        resource_count,
+    })
+}
+
+type PreparedProcessSnapshotV2NetworkMmds = (
+    Option<MmdsStateHandle>,
+    Option<SharedMmdsMetrics>,
+    Option<ProcessMmdsPacketDetourConfig>,
+);
+
+fn prepare_fresh_process_snapshot_v2_network_mmds<A>(
+    candidate: &PreparedNativeV2NetworkSnapshotCandidateState,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    allocation_failed: &mut A,
+) -> Result<PreparedProcessSnapshotV2NetworkMmds, ProcessSnapshotV2NetworkRestoreResourceError>
+where
+    A: FnMut(ProcessSnapshotV2NetworkRestoreAllocation) -> bool,
+{
+    let topology = candidate.topology();
+    let Some(config) = topology.mmds_controller() else {
+        if topology.mmds_state().is_some()
+            || topology
+                .interfaces()
+                .iter()
+                .any(|interface| interface.mmds_stack().is_some())
+        {
+            return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
+            ));
+        }
+        return Ok((None, None, None));
+    };
+    if topology.mmds_state().is_none() {
+        return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
+        ));
+    }
+
+    let mut selected = Vec::new();
+    check_process_snapshot_v2_network_restore_allocation(
+        allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+        ProcessSnapshotV2NetworkRestoreAllocation::MmdsInterfaceIds,
+    )?;
+    selected
+        .try_reserve_exact(config.network_interfaces().len())
+        .map_err(|_| {
+            process_snapshot_v2_network_restore_allocation_error(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+                ProcessSnapshotV2NetworkRestoreAllocation::MmdsInterfaceIds,
+            )
+        })?;
+    for iface_id in config.network_interfaces() {
+        check_process_snapshot_v2_network_restore_allocation(
+            allocation_failed,
+            ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+            ProcessSnapshotV2NetworkRestoreAllocation::MmdsInterfaceIdCopy,
+        )?;
+        let mut copied = String::new();
+        copied.try_reserve_exact(iface_id.len()).map_err(|_| {
+            process_snapshot_v2_network_restore_allocation_error(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+                ProcessSnapshotV2NetworkRestoreAllocation::MmdsInterfaceIdCopy,
+            )
+        })?;
+        copied.push_str(iface_id);
+        selected.push(copied);
+    }
+    let mut controllers = Vec::new();
+    check_process_snapshot_v2_network_restore_allocation(
+        allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+        ProcessSnapshotV2NetworkRestoreAllocation::MmdsControllers,
+    )?;
+    controllers
+        .try_reserve_exact(topology.interfaces().len())
+        .map_err(|_| {
+            process_snapshot_v2_network_restore_allocation_error(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+                ProcessSnapshotV2NetworkRestoreAllocation::MmdsControllers,
+            )
+        })?;
+    for interface in topology.interfaces() {
+        check_process_snapshot_v2_network_restore_allocation(
+            allocation_failed,
+            ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+            ProcessSnapshotV2NetworkRestoreAllocation::MmdsControllerCopy,
+        )?;
+        controllers.push(interface.controller().try_clone().map_err(|_| {
+            process_snapshot_v2_network_restore_allocation_error(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+                ProcessSnapshotV2NetworkRestoreAllocation::MmdsControllerCopy,
+            )
+        })?);
+    }
+    let mut input = MmdsConfigInput::new(selected)
+        .with_version(config.version())
+        .with_imds_compat(config.imds_compat());
+    if let Some(ipv4_address) = config.ipv4_address() {
+        input = input.with_ipv4_address(ipv4_address);
+    }
+    check_process_snapshot_v2_network_restore_allocation(
+        allocation_failed,
+        ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+        ProcessSnapshotV2NetworkRestoreAllocation::MmdsState,
+    )?;
+    let state = MmdsStateHandle::new(MmdsState::with_instance_id(
+        mmds_data_store_limit_bytes,
+        destination_instance_id,
+    ));
+    state
+        .with_mut(|state| state.put_config(input, &controllers))
+        .map_err(|source| {
+            ProcessSnapshotV2NetworkRestoreResourceError::retryable(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::MmdsState(source),
+            )
+        })?
+        .map_err(|_source: MmdsConfigError| {
+            ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::MmdsConfig,
+            )
+        })?;
+    let metrics = SharedMmdsMetrics::default();
+    let detour =
+        ProcessMmdsPacketDetourConfig::from_mmds_config(state.clone(), config, metrics.clone());
+    Ok((Some(state), Some(metrics), Some(detour)))
+}
+
+fn abort_process_snapshot_v2_network_restore_preparation<B, T>(
+    provider: &mut ProcessNetworkPacketIoRegistry<B>,
+    bindings: SnapshotRestoreBindings<T>,
+    source: ProcessSnapshotV2NetworkRestoreResourceError,
+) -> ProcessSnapshotV2NetworkRestoreResourceError
+where
+    B: ProcessVmnetBackend,
+{
+    let cleanup_uncertain = provider.abort_all();
+    drop(bindings);
+    source.with_cleanup_uncertain(cleanup_uncertain)
+}
+
+type ProcessSnapshotV2NetworkRestoreResourceBuilder = fn(
+    PreparedProcessSnapshotV2NetworkRestorePlan,
+    &str,
+    usize,
+    fn(ProcessSnapshotV2NetworkRestoreResourceStage) -> bool,
+) -> Result<
+    PreparedProcessSnapshotV2NetworkRestoreBatch<SystemVmnetInterfaceBackend>,
+    ProcessSnapshotV2NetworkRestoreResourceError,
+>;
+
+const _: ProcessSnapshotV2NetworkRestoreResourceBuilder =
+    prepare_process_snapshot_v2_network_restore_resources::<
+        fn(ProcessSnapshotV2NetworkRestoreResourceStage) -> bool,
+    >;
 
 #[derive(Debug)]
 enum ProcessVmnetAuthorityValidationError {
@@ -30815,11 +32206,19 @@ mod tests {
     struct RecordingVmnetPacketIoBackend {
         iface_id: String,
         events: Arc<Mutex<Vec<String>>>,
+        observed_configs: Arc<Mutex<Vec<(String, VmnetInterfaceConfig)>>>,
         packet_callbacks: Arc<Mutex<Vec<(String, VmnetPacketAvailableCallback)>>>,
         record_packet_event_lifecycle: bool,
         start_status: Option<VmnetStatus>,
+        start_disposition: VmnetInterfaceStartDisposition,
         stop_status: Option<VmnetStatus>,
+        packet_event_status: Option<VmnetStatus>,
+        packet_event_drain_status: Option<VmnetStatus>,
         realized_mac: GuestMacAddress,
+        effective_mtu: u16,
+        maximum_packet_size: usize,
+        batch_limits: Option<(Option<u16>, Option<u16>)>,
+        direct_virtio_header: Option<(bool, bool)>,
     }
 
     impl VmnetInterfaceBackend for RecordingVmnetPacketIoBackend {
@@ -30833,6 +32232,10 @@ mod tests {
                 &self.events,
                 format!("descriptor:{}:{}", self.iface_id, config.mode()),
             );
+            self.observed_configs
+                .lock()
+                .expect("observed vmnet configs should lock")
+                .push((self.iface_id.clone(), config.clone()));
             VmnetInterfaceDescriptor::new(config)
         }
 
@@ -30844,15 +32247,27 @@ mod tests {
             if let Some(status) = self.start_status {
                 return Err(VmnetInterfaceStartError::Start {
                     source: VmnetError::new(VmnetOperation::StartInterface, status),
-                    disposition: VmnetInterfaceStartDisposition::Retryable,
+                    disposition: self.start_disposition,
                 });
             }
 
+            let mut parameters = VmnetInterfaceParameters::for_test(
+                self.realized_mac,
+                self.effective_mtu,
+                self.maximum_packet_size,
+            );
+            if let Some((read_max_packets, write_max_packets)) = self.batch_limits {
+                parameters =
+                    parameters.with_batch_limits_for_test(read_max_packets, write_max_packets);
+            }
+            if let Some((available, enabled)) = self.direct_virtio_header {
+                parameters = parameters.with_direct_virtio_header_for_test(available, enabled);
+            }
             Ok(VmnetStartedInterface::new(
                 RecordingVmnetInterface {
                     iface_id: self.iface_id.clone(),
                 },
-                VmnetInterfaceParameters::for_test(self.realized_mac, 1500, 2048),
+                parameters,
             ))
         }
 
@@ -30875,6 +32290,9 @@ mod tests {
                     format!("packet-events-enable:{}", interface.iface_id),
                 );
             }
+            if let Some(status) = self.packet_event_status {
+                return Err(VmnetError::new(VmnetOperation::EnablePacketEvents, status));
+            }
             self.packet_callbacks
                 .lock()
                 .expect("recorded callback list should lock")
@@ -30891,6 +32309,9 @@ mod tests {
                     &self.events,
                     format!("packet-events-disable-drain:{}", interface.iface_id),
                 );
+            }
+            if let Some(status) = self.packet_event_drain_status {
+                return Err(VmnetError::new(VmnetOperation::DisablePacketEvents, status));
             }
             self.packet_callbacks
                 .lock()
@@ -30925,17 +32346,29 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingVmnetPacketIoBackendFactory {
         events: Arc<Mutex<Vec<String>>>,
+        observed_configs: Arc<Mutex<Vec<(String, VmnetInterfaceConfig)>>>,
         packet_callbacks: Arc<Mutex<Vec<(String, VmnetPacketAvailableCallback)>>>,
         record_packet_event_lifecycle: bool,
         start_statuses: VecDeque<Option<VmnetStatus>>,
+        start_dispositions: VecDeque<VmnetInterfaceStartDisposition>,
         stop_statuses: VecDeque<Option<VmnetStatus>>,
+        packet_event_statuses: VecDeque<Option<VmnetStatus>>,
+        packet_event_drain_statuses: VecDeque<Option<VmnetStatus>>,
         realized_macs: VecDeque<GuestMacAddress>,
+        effective_mtus: VecDeque<u16>,
+        maximum_packet_sizes: VecDeque<usize>,
+        batch_limits: VecDeque<(Option<u16>, Option<u16>)>,
+        direct_virtio_headers: VecDeque<(bool, bool)>,
         next_realized_mac: u8,
     }
 
     impl RecordingVmnetPacketIoBackendFactory {
         fn events(&self) -> Arc<Mutex<Vec<String>>> {
             Arc::clone(&self.events)
+        }
+
+        fn observed_configs(&self) -> Arc<Mutex<Vec<(String, VmnetInterfaceConfig)>>> {
+            Arc::clone(&self.observed_configs)
         }
 
         fn packet_callbacks(&self) -> Arc<Mutex<Vec<(String, VmnetPacketAvailableCallback)>>> {
@@ -30952,13 +32385,56 @@ mod tests {
             self
         }
 
+        fn with_next_start_disposition(
+            mut self,
+            disposition: VmnetInterfaceStartDisposition,
+        ) -> Self {
+            self.start_dispositions.push_back(disposition);
+            self
+        }
+
         fn with_next_stop_status(mut self, status: Option<VmnetStatus>) -> Self {
             self.stop_statuses.push_back(status);
             self
         }
 
+        fn with_next_packet_event_status(mut self, status: Option<VmnetStatus>) -> Self {
+            self.packet_event_statuses.push_back(status);
+            self
+        }
+
+        fn with_next_packet_event_drain_status(mut self, status: Option<VmnetStatus>) -> Self {
+            self.packet_event_drain_statuses.push_back(status);
+            self
+        }
+
         fn with_next_realized_mac(mut self, mac: GuestMacAddress) -> Self {
             self.realized_macs.push_back(mac);
+            self
+        }
+
+        fn with_next_effective_mtu(mut self, mtu: u16) -> Self {
+            self.effective_mtus.push_back(mtu);
+            self
+        }
+
+        fn with_next_maximum_packet_size(mut self, size: usize) -> Self {
+            self.maximum_packet_sizes.push_back(size);
+            self
+        }
+
+        fn with_next_batch_limits(
+            mut self,
+            read_max_packets: Option<u16>,
+            write_max_packets: Option<u16>,
+        ) -> Self {
+            self.batch_limits
+                .push_back((read_max_packets, write_max_packets));
+            self
+        }
+
+        fn with_next_direct_virtio_header(mut self, available: bool, enabled: bool) -> Self {
+            self.direct_virtio_headers.push_back((available, enabled));
             self
         }
     }
@@ -30972,13 +32448,27 @@ mod tests {
             RecordingVmnetPacketIoBackend {
                 iface_id: iface_id.to_string(),
                 events: Arc::clone(&self.events),
+                observed_configs: Arc::clone(&self.observed_configs),
                 packet_callbacks: Arc::clone(&self.packet_callbacks),
                 record_packet_event_lifecycle: self.record_packet_event_lifecycle,
                 start_status: self.start_statuses.pop_front().unwrap_or(None),
+                start_disposition: self
+                    .start_dispositions
+                    .pop_front()
+                    .unwrap_or(VmnetInterfaceStartDisposition::Retryable),
                 stop_status: self.stop_statuses.pop_front().unwrap_or(None),
+                packet_event_status: self.packet_event_statuses.pop_front().unwrap_or(None),
+                packet_event_drain_status: self
+                    .packet_event_drain_statuses
+                    .pop_front()
+                    .unwrap_or(None),
                 realized_mac: self.realized_macs.pop_front().unwrap_or_else(|| {
                     GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, self.next_realized_mac])
                 }),
+                effective_mtu: self.effective_mtus.pop_front().unwrap_or(1500),
+                maximum_packet_size: self.maximum_packet_sizes.pop_front().unwrap_or(2048),
+                batch_limits: self.batch_limits.pop_front(),
+                direct_virtio_header: self.direct_virtio_headers.pop_front(),
             }
         }
     }
@@ -31569,6 +33059,71 @@ mod tests {
 
         SnapshotV2NetworkState::try_new(interfaces, Some(mmds))
             .expect("partial-MMDS network state should validate")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fake_vmnet_network_state_without_requested_mac() -> SnapshotV2NetworkState {
+        let base = fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio);
+        let source = &base.interfaces()[0];
+        let interface =
+            SnapshotV2NetworkInterfaceState::try_from_parts(SnapshotV2NetworkInterfaceStateParts {
+                iface_id: source.iface_id().to_string(),
+                captured_selector: source.captured_selector().to_string(),
+                requested_guest_mac: None,
+                requested_mtu: source.requested_mtu(),
+                profile: source.profile(),
+                backend: SnapshotV2NetworkBackendClass::Vmnet,
+                local: source.local().clone(),
+                virtio: source.virtio().clone(),
+                rx_limiter: source.rx_limiter(),
+                tx_limiter: source.tx_limiter(),
+                transport: source.transport().clone(),
+            })
+            .expect("vmnet profile may retain an allocated MAC without an API request");
+        SnapshotV2NetworkState::try_new(vec![interface], None)
+            .expect("unrequested realized-MAC state should validate")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fake_vmnet_network_state_with_packet_envelope(
+        packet_envelope: bangbang_runtime::network::VirtioNetworkPacketEnvelope,
+    ) -> SnapshotV2NetworkState {
+        let base = fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio);
+        let source = &base.interfaces()[0];
+        let interface =
+            SnapshotV2NetworkInterfaceState::try_from_parts(SnapshotV2NetworkInterfaceStateParts {
+                iface_id: source.iface_id().to_string(),
+                captured_selector: source.captured_selector().to_string(),
+                requested_guest_mac: source.requested_guest_mac(),
+                requested_mtu: source.requested_mtu(),
+                profile: source.profile().with_packet_envelope(packet_envelope),
+                backend: SnapshotV2NetworkBackendClass::Vmnet,
+                local: source.local().clone(),
+                virtio: source.virtio().clone(),
+                rx_limiter: source.rx_limiter(),
+                tx_limiter: source.tx_limiter(),
+                transport: source.transport().clone(),
+            })
+            .expect("packet envelope does not change the guest feature contract");
+        SnapshotV2NetworkState::try_new(vec![interface], None)
+            .expect("vmnet packet-envelope state should validate")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fake_maximum_vmnet_network_state() -> SnapshotV2NetworkState {
+        let base = fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio);
+        let source = &base.interfaces()[0];
+        let interfaces = (0..MAX_NETWORK_INTERFACE_COUNT)
+            .map(|index| {
+                copied_inactive_mmio_network_interface(
+                    source,
+                    index,
+                    SnapshotV2NetworkBackendClass::Vmnet,
+                )
+            })
+            .collect::<Vec<_>>();
+        SnapshotV2NetworkState::try_new(interfaces, None)
+            .expect("maximum vmnet state should validate")
     }
 
     #[cfg(target_os = "macos")]
@@ -34809,6 +36364,7 @@ mod tests {
             },
         };
         let published = super::PublishedProcessNetworkPacketIoEntry {
+            registry_id: super::ProcessNetworkPacketIoRegistryId(7),
             owner: ProcessVmnetAuthority::Direct,
             generation: 7,
             iface_id: private_iface.to_string(),
@@ -35197,6 +36753,1521 @@ mod tests {
         assert!(!diagnostic.contains("ungranted-private-bridge"));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_network_restore_batch_preserves_unrequested_realized_mac() {
+        let state = fake_vmnet_network_state_without_requested_mac();
+        let expected_profile = state.interfaces()[0].profile();
+        let expected_mac = expected_profile
+            .guest_mac()
+            .expect("vmnet snapshot profile should retain its realized MAC");
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("network restore value plan should prepare");
+        let key = plan.candidate().topology().interfaces()[0]
+            .resource_key()
+            .clone();
+        assert_eq!(
+            plan.candidate().topology().interfaces()[0]
+                .controller()
+                .guest_mac(),
+            None,
+            "destination controller intent must retain the absent API MAC"
+        );
+
+        let mut factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(expected_mac);
+        let events = factory.events();
+        let observed_configs = factory.observed_configs();
+        let mut batch = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-destination-instance",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("fresh network packet-I/O batch should prepare");
+
+        assert_eq!(batch.remaining_count(), 1);
+        let observed_configs = observed_configs
+            .lock()
+            .expect("observed vmnet configs should lock");
+        assert_eq!(observed_configs.len(), 1);
+        assert_eq!(observed_configs[0].1.guest_mac(), Some(expected_mac));
+        assert_eq!(observed_configs[0].1.mtu(), expected_profile.mtu());
+        drop(observed_configs);
+        assert!(batch.mmds_state().is_none());
+        assert!(batch.mmds_metrics().is_none());
+        assert_eq!(
+            batch
+                .provider()
+                .expect("batch should retain its aggregate provider")
+                .device_profiles()
+                .get("eth0"),
+            Some(&expected_profile)
+        );
+        assert_eq!(
+            batch
+                .candidate()
+                .expect("batch should retain candidate")
+                .topology()
+                .interfaces()[0]
+                .controller()
+                .guest_mac(),
+            None
+        );
+        let metrics = batch
+            .network_metrics()
+            .capture_state()
+            .expect("fresh network metrics should capture");
+        assert_eq!(metrics.entries().len(), 1);
+        assert_eq!(
+            metrics.entries()[0].metrics(),
+            NetworkInterfaceMetrics::default()
+        );
+        assert_eq!(metrics.aggregate(), NetworkInterfaceMetrics::default());
+
+        let resource = batch
+            .take(&key)
+            .expect("exact network packet-I/O owner should be taken once");
+        assert_eq!(resource.device_profile(), expected_profile);
+        assert_eq!(batch.remaining_count(), 0);
+        let completion = batch
+            .finish()
+            .expect("fully consumed network restore batch should finish");
+        assert_eq!(completion.provider().entries.len(), 1);
+        assert_eq!(
+            completion
+                .network_metrics()
+                .capture_state()
+                .expect("claimed metrics should remain live")
+                .entries()
+                .len(),
+            1
+        );
+        let diagnostics = format!("{resource:?} {completion:?}");
+        assert!(diagnostics.contains("<redacted>"));
+        assert!(!diagnostics.contains("private-destination-instance"));
+        assert!(!diagnostics.contains("eth0"));
+        assert!(!diagnostics.contains(&expected_mac.to_string()));
+
+        drop(resource);
+        assert!(
+            completion
+                .network_metrics()
+                .capture_state()
+                .expect("released metrics lease should capture")
+                .entries()
+                .is_empty()
+        );
+        drop(completion);
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_all_mmds_restore_uses_fresh_clone_local_state() {
+        let state = fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Pci);
+        let prepare = || {
+            prepare_process_snapshot_v2_network_restore_plan(
+                prepared_native_v2_network_restore_candidate(
+                    state.clone(),
+                    &["vmnet:bridged:private-bridge"],
+                ),
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("all-MMDS value plan should prepare")
+        };
+        let mut first_factory = RecordingVmnetPacketIoBackendFactory::default();
+        let first_events = first_factory.events();
+        let first = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            prepare(),
+            "private-first-clone",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut first_factory,
+            |_| false,
+        )
+        .expect("first all-MMDS owner batch should prepare");
+        let mut second_factory = RecordingVmnetPacketIoBackendFactory::default();
+        let second_events = second_factory.events();
+        let second = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            prepare(),
+            "private-second-clone",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut second_factory,
+            |_| false,
+        )
+        .expect("second all-MMDS owner batch should prepare");
+
+        assert!(first_events.lock().expect("events should lock").is_empty());
+        assert!(second_events.lock().expect("events should lock").is_empty());
+        assert_eq!(first.provider().expect("first provider").vmnet_count(), 0);
+        assert_eq!(second.provider().expect("second provider").vmnet_count(), 0);
+        let first_state = first.mmds_state().expect("first fresh MMDS state");
+        let second_state = second.mmds_state().expect("second fresh MMDS state");
+        assert!(!first_state.shares_state_with(second_state));
+        assert_eq!(
+            first_state.with(|state| state.get_data()),
+            Ok(Err(
+                bangbang_runtime::mmds::MmdsDataStoreError::NotInitialized
+            ))
+        );
+        assert_eq!(
+            second_state.with(|state| state.get_data()),
+            Ok(Err(
+                bangbang_runtime::mmds::MmdsDataStoreError::NotInitialized
+            ))
+        );
+        let first_token = first_state
+            .with_mut(|state| state.generate_guest_token(60))
+            .expect("first MMDS state should lock")
+            .expect("first MMDS token should generate");
+        let second_token = second_state
+            .with_mut(|state| state.generate_guest_token(60))
+            .expect("second MMDS state should lock")
+            .expect("second MMDS token should generate");
+        assert_ne!(first_token, second_token);
+        assert_eq!(
+            first_state.with(|state| state.is_guest_token_valid(&second_token)),
+            Ok(false)
+        );
+        assert_eq!(
+            second_state.with(|state| state.is_guest_token_valid(&first_token)),
+            Ok(false)
+        );
+        assert!(
+            !first
+                .mmds_metrics()
+                .expect("first MMDS metrics")
+                .shares_state_with(second.mmds_metrics().expect("second MMDS metrics"))
+        );
+        assert_eq!(
+            first.mmds_metrics().expect("first MMDS metrics").snapshot(),
+            MmdsMetrics::default()
+        );
+        first
+            .network_metrics()
+            .record_config_failure_for_interface("eth0");
+        assert!(
+            !first.network_metrics().aggregate_snapshot().is_empty(),
+            "first clone metrics should record independently"
+        );
+        assert_eq!(
+            second.network_metrics().aggregate_snapshot(),
+            NetworkInterfaceMetrics::default()
+        );
+
+        first.abort().expect("first all-MMDS batch should abort");
+        assert_eq!(second.remaining_count(), 1);
+        second.abort().expect("second all-MMDS batch should abort");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_partial_mmds_restore_aborts_vmnet_in_reverse_order() {
+        let state = fake_partial_mmds_network_state();
+        let expected_macs = state
+            .interfaces()
+            .iter()
+            .map(|interface| {
+                interface
+                    .profile()
+                    .guest_mac()
+                    .expect("partial-MMDS vmnet profile should retain MAC")
+            })
+            .collect::<Vec<_>>();
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared", "vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("partial-MMDS value plan should prepare");
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .recording_packet_event_lifecycle()
+            .with_next_realized_mac(expected_macs[0])
+            .with_next_realized_mac(expected_macs[1]);
+        let events = factory.events();
+        let observed = Arc::clone(&events);
+        let batch = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-partial-clone",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            move |stage| {
+                push_recorded_event(&observed, format!("stage:{stage:?}"));
+                false
+            },
+        )
+        .expect("partial-MMDS vmnet owner batch should prepare");
+        assert_eq!(batch.provider().expect("provider").vmnet_count(), 2);
+        batch
+            .abort()
+            .expect("unconsumed batch should abort exactly");
+
+        let events = recorded_events(&events);
+        let mmds_stage = events
+            .iter()
+            .position(|event| event == "stage:Mmds")
+            .expect("MMDS stage should be observed");
+        let first_backend = events
+            .iter()
+            .position(|event| event == "backend:eth0")
+            .expect("first backend should start");
+        assert!(mmds_stage < first_backend);
+        let stop_second = events
+            .iter()
+            .position(|event| event == "stop:eth1")
+            .expect("second backend should stop");
+        let stop_first = events
+            .iter()
+            .position(|event| event == "stop:eth0")
+            .expect("first backend should stop");
+        assert!(stop_second < stop_first);
+        assert!(
+            events
+                .iter()
+                .any(|event| event == "packet-events-enable:eth0")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event == "packet-events-disable-drain:eth1")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_profile_mismatch_stops_before_publication() {
+        let state = fake_vmnet_network_state_without_requested_mac();
+        let saved_mac = state.interfaces()[0]
+            .profile()
+            .guest_mac()
+            .expect("saved vmnet profile should retain MAC");
+        let returned_mac = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0xfe]);
+        assert_ne!(saved_mac, returned_mac);
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("network restore value plan should prepare");
+        let mut factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(returned_mac);
+        let events = factory.events();
+
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-profile-mismatch",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect_err("provider profile mismatch must fail");
+
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(
+                ProcessNetworkPacketIoProviderBuildError::ProfileMismatch
+            )
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains("private-profile-mismatch"));
+        assert!(!diagnostics.contains(&saved_mac.to_string()));
+        assert!(!diagnostics.contains(&returned_mac.to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_cancellation_drains_current_callback() {
+        let state = fake_vmnet_network_state_without_requested_mac();
+        let expected_mac = state.interfaces()[0]
+            .profile()
+            .guest_mac()
+            .expect("saved vmnet profile should retain MAC");
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("network restore value plan should prepare");
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .recording_packet_event_lifecycle()
+            .with_next_realized_mac(expected_mac);
+        let events = factory.events();
+
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-cancelled-clone",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |stage| stage == super::ProcessSnapshotV2NetworkRestoreResourceStage::AfterPacketIo,
+        )
+        .expect_err("post-provider cancellation must abort the live entry");
+
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "packet-events-enable:eth0".to_string(),
+                "packet-events-disable-drain:eth0".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_maximum_batch_binds_and_aborts_every_owner() {
+        let state = fake_maximum_vmnet_network_state();
+        let selectors = vec!["vmnet:shared"; state.interfaces().len()];
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        for interface in state.interfaces() {
+            factory = factory.with_next_realized_mac(
+                interface
+                    .profile()
+                    .guest_mac()
+                    .expect("maximum vmnet profile should retain MAC"),
+            );
+        }
+        let events = factory.events();
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &selectors),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("maximum network value plan should prepare");
+
+        let batch = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-maximum-clone",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("maximum network owner batch should prepare");
+        assert_eq!(batch.remaining_count(), MAX_NETWORK_INTERFACE_COUNT);
+        assert_eq!(
+            batch.provider().expect("provider").entries.len(),
+            MAX_NETWORK_INTERFACE_COUNT
+        );
+        batch
+            .abort()
+            .expect("maximum unconsumed batch should abort");
+
+        let events = recorded_events(&events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("start:"))
+                .count(),
+            MAX_NETWORK_INTERFACE_COUNT
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("stop:"))
+                .count(),
+            MAX_NETWORK_INTERFACE_COUNT
+        );
+        assert!(
+            events
+                .iter()
+                .position(|event| event == "stop:eth15")
+                .expect("last owner should stop")
+                < events
+                    .iter()
+                    .position(|event| event == "stop:eth0")
+                    .expect("first owner should stop")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_maximum_partial_failure_unwinds_fifteen_to_zero() {
+        let state = fake_maximum_vmnet_network_state();
+        let selectors = vec!["vmnet:shared"; state.interfaces().len()];
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        for (index, interface) in state.interfaces().iter().enumerate() {
+            factory = factory
+                .with_next_start_status(
+                    (index == MAX_NETWORK_INTERFACE_COUNT - 1).then_some(VmnetStatus::Failure),
+                )
+                .with_next_realized_mac(
+                    interface
+                        .profile()
+                        .guest_mac()
+                        .expect("maximum vmnet profile should retain MAC"),
+                );
+        }
+        let events = factory.events();
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &selectors),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("maximum network value plan should prepare");
+
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-maximum-partial-failure",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect_err("last maximum-batch provider start should fail");
+
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+        );
+        let events = recorded_events(&events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("start:"))
+                .count(),
+            MAX_NETWORK_INTERFACE_COUNT
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("stop:"))
+                .count(),
+            MAX_NETWORK_INTERFACE_COUNT - 1
+        );
+        assert!(!events.iter().any(|event| event == "stop:eth15"));
+        assert!(
+            events
+                .iter()
+                .position(|event| event == "stop:eth14")
+                .expect("last live owner should stop first")
+                < events
+                    .iter()
+                    .position(|event| event == "stop:eth0")
+                    .expect("first owner should stop last")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_take_is_single_use_and_consumption_is_terminal() {
+        let state = fake_vmnet_network_state_without_requested_mac();
+        let expected_mac = state.interfaces()[0]
+            .profile()
+            .guest_mac()
+            .expect("saved vmnet profile should retain MAC");
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("network restore value plan should prepare");
+        let key = plan.candidate().topology().interfaces()[0]
+            .resource_key()
+            .clone();
+        let mut factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(expected_mac);
+        let mut batch = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-consumed-clone",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("network owner batch should prepare");
+
+        let resource = batch.take(&key).expect("first exact take should succeed");
+        let take_error = batch.take(&key).expect_err("second exact take must fail");
+        assert_eq!(
+            take_error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(matches!(
+            take_error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Take(
+                bangbang_runtime::snapshot_restore::SnapshotRestoreTakeError::AlreadyTaken
+            )
+        ));
+        let abort_error = batch
+            .abort()
+            .expect_err("escaped ownership must make batch abort terminal");
+        assert_eq!(
+            abort_error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(matches!(
+            abort_error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Consumed
+        ));
+        drop(resource);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_finish_tracks_actual_consumption() {
+        let state = fake_vmnet_network_state_without_requested_mac();
+        let expected_mac = state.interfaces()[0]
+            .profile()
+            .guest_mac()
+            .expect("saved vmnet profile should retain MAC");
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("network restore value plan should prepare");
+        let mut factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(expected_mac);
+        let events = factory.events();
+        let batch = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-unconsumed-finish",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("unconsumed batch should prepare");
+        let error = batch
+            .finish()
+            .expect_err("fully unconsumed finish must abort and report");
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Unconsumed {
+                unconsumed_count: 1
+            }
+        ));
+        assert!(
+            recorded_events(&events)
+                .iter()
+                .any(|event| event == "stop:eth0")
+        );
+
+        let state = fake_partial_mmds_network_state();
+        let expected_macs = state
+            .interfaces()
+            .iter()
+            .map(|interface| {
+                interface
+                    .profile()
+                    .guest_mac()
+                    .expect("partial-MMDS vmnet profile should retain MAC")
+            })
+            .collect::<Vec<_>>();
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared", "vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("partial-MMDS value plan should prepare");
+        let key = plan.candidate().topology().interfaces()[0]
+            .resource_key()
+            .clone();
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_macs[0])
+            .with_next_realized_mac(expected_macs[1]);
+        let mut batch = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-partially-consumed-finish",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("partially consumed batch should prepare");
+        let resource = batch.take(&key).expect("one owner should escape");
+        let error = batch
+            .finish()
+            .expect_err("partially consumed finish must be terminal");
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Consumed
+        ));
+        drop(resource);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_cancellation_covers_every_preparation_stage() {
+        use super::ProcessSnapshotV2NetworkRestoreResourceStage::{
+            AfterPacketIo, BeforePacketIo, Binding, Bindings, Completion, Metrics, Mmds, Start,
+        };
+
+        for cancelled_stage in [
+            Start,
+            Bindings,
+            Metrics,
+            Mmds,
+            BeforePacketIo,
+            AfterPacketIo,
+            Binding,
+            Completion,
+        ] {
+            let state = fake_vmnet_network_state_without_requested_mac();
+            let expected_mac = state.interfaces()[0]
+                .profile()
+                .guest_mac()
+                .expect("saved vmnet profile should retain MAC");
+            let plan = prepare_process_snapshot_v2_network_restore_plan(
+                prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("network restore value plan should prepare");
+            let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+                .recording_packet_event_lifecycle()
+                .with_next_realized_mac(expected_mac);
+            let events = factory.events();
+            let callbacks = factory.packet_callbacks();
+
+            let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+                plan,
+                "private-stage-cancellation",
+                bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                &mut factory,
+                |stage| stage == cancelled_stage,
+            )
+            .expect_err("selected preparation stage should cancel");
+
+            assert_eq!(
+                error.disposition(),
+                super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable,
+                "confirmed cleanup should keep {cancelled_stage:?} retryable"
+            );
+            assert!(matches!(
+                error.kind,
+                super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled
+            ));
+            let events = recorded_events(&events);
+            let expected_provider_count = usize::from(matches!(
+                cancelled_stage,
+                AfterPacketIo | Binding | Completion
+            ));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.starts_with("start:"))
+                    .count(),
+                expected_provider_count,
+                "{cancelled_stage:?} must not acquire a provider early"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.starts_with("stop:"))
+                    .count(),
+                expected_provider_count,
+                "{cancelled_stage:?} must stop every acquired provider"
+            );
+            assert!(
+                callbacks
+                    .lock()
+                    .expect("recorded callback list should lock")
+                    .is_empty(),
+                "{cancelled_stage:?} must leave no callback reachable"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_injected_allocation_failures_precede_provider_work() {
+        use super::ProcessSnapshotV2NetworkRestoreAllocation::{
+            Bindings, Manifest, Metrics, MetricsLeases, MmdsControllerCopy, MmdsControllers,
+            MmdsInterfaceIdCopy, MmdsInterfaceIds, MmdsState, OverrideKeyCopy, OverrideKeys,
+            ProviderEntries, ProviderMacReservations, ProviderVmnetConfigCopy,
+            ProviderVmnetConfigs, ResourceKeyCopy, ResourceKeys,
+        };
+
+        let allocations = [
+            ResourceKeys,
+            OverrideKeys,
+            ResourceKeyCopy,
+            OverrideKeyCopy,
+            Manifest,
+            Bindings,
+            ProviderVmnetConfigs,
+            ProviderVmnetConfigCopy,
+            Metrics,
+            MetricsLeases,
+            MmdsInterfaceIds,
+            MmdsInterfaceIdCopy,
+            MmdsControllers,
+            MmdsControllerCopy,
+            MmdsState,
+            ProviderEntries,
+            ProviderMacReservations,
+        ];
+        for failed_allocation in allocations {
+            let state = fake_partial_mmds_network_state();
+            let plan = prepare_process_snapshot_v2_network_restore_plan(
+                prepared_native_v2_network_restore_candidate(
+                    state,
+                    &["vmnet:shared", "vmnet:shared"],
+                ),
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("partial-MMDS value plan should prepare");
+            let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+            let events = factory.events();
+
+            let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory_and_allocation(
+                plan,
+                "private-allocation-injection",
+                bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                &mut factory,
+                |allocation| allocation == failed_allocation,
+                |_| false,
+            )
+            .expect_err("selected allocation must fail");
+
+            assert_eq!(
+                error.disposition(),
+                super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+            );
+            assert!(matches!(
+                error.kind,
+                super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Allocation {
+                    allocation
+                } if allocation == failed_allocation
+            ));
+            assert!(
+                recorded_events(&events).is_empty(),
+                "{failed_allocation:?} must fail before the first provider call"
+            );
+            let diagnostics = format!("{error:?} {error}");
+            assert!(!diagnostics.contains("private-allocation-injection"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_provider_failures_preserve_cleanup_disposition() {
+        let prepare = || {
+            let state = fake_vmnet_network_state_without_requested_mac();
+            let expected_mac = state.interfaces()[0]
+                .profile()
+                .guest_mac()
+                .expect("saved vmnet profile should retain MAC");
+            let plan = prepare_process_snapshot_v2_network_restore_plan(
+                prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("network restore value plan should prepare");
+            (plan, expected_mac)
+        };
+
+        let (plan, _) = prepare();
+        let mut terminal_start = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_start_status(Some(VmnetStatus::InvalidAccess))
+            .with_next_start_disposition(VmnetInterfaceStartDisposition::Terminal);
+        let terminal_start_events = terminal_start.events();
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-terminal-start",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut terminal_start,
+            |_| false,
+        )
+        .expect_err("terminal provider start should fail");
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(
+                ProcessNetworkPacketIoProviderBuildError::Start { .. }
+            )
+        ));
+        assert_eq!(
+            recorded_events(&terminal_start_events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+            ]
+        );
+
+        let (plan, expected_mac) = prepare();
+        let mut callback_failure = RecordingVmnetPacketIoBackendFactory::default()
+            .recording_packet_event_lifecycle()
+            .with_next_packet_event_status(Some(VmnetStatus::Failure))
+            .with_next_realized_mac(expected_mac);
+        let callback_events = callback_failure.events();
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-callback-failure",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut callback_failure,
+            |_| false,
+        )
+        .expect_err("callback installation should fail");
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(
+                ProcessNetworkPacketIoProviderBuildError::PacketEvents { .. }
+            )
+        ));
+        assert_eq!(
+            recorded_events(&callback_events)
+                .iter()
+                .filter(|event| event.as_str() == "stop:eth0")
+                .count(),
+            1
+        );
+
+        let (plan, expected_mac) = prepare();
+        let mut uncertain_cleanup = RecordingVmnetPacketIoBackendFactory::default()
+            .recording_packet_event_lifecycle()
+            .with_next_packet_event_status(Some(VmnetStatus::Failure))
+            .with_next_stop_status(Some(VmnetStatus::Failure))
+            .with_next_realized_mac(expected_mac);
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-uncertain-cleanup",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut uncertain_cleanup,
+            |_| false,
+        )
+        .expect_err("uncertain provider cleanup should fail terminally");
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(
+                ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
+            )
+        ));
+
+        let (plan, expected_mac) = prepare();
+        let mut uncertain_drain = RecordingVmnetPacketIoBackendFactory::default()
+            .recording_packet_event_lifecycle()
+            .with_next_packet_event_drain_status(Some(VmnetStatus::Failure))
+            .with_next_realized_mac(expected_mac);
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-uncertain-drain",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut uncertain_drain,
+            |stage| stage == super::ProcessSnapshotV2NetworkRestoreResourceStage::AfterPacketIo,
+        )
+        .expect_err("uncertain callback drain should fail terminally");
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(error.cleanup_uncertain);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_rejects_invalid_provider_parameters_before_publication() {
+        let state = fake_vmnet_network_state_without_requested_mac();
+        let expected_mac = state.interfaces()[0]
+            .profile()
+            .guest_mac()
+            .expect("saved vmnet profile should retain MAC");
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("network restore value plan should prepare");
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_mac)
+            .with_next_effective_mtu(1400)
+            .with_next_maximum_packet_size(1000)
+            .with_next_batch_limits(Some(0), Some(1))
+            .with_next_direct_virtio_header(true, true);
+        let events = factory.events();
+
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-invalid-parameters",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect_err("invalid provider parameters should fail");
+
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(
+                ProcessNetworkPacketIoProviderBuildError::ProfileMismatch
+            )
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_rejects_oversized_batches_with_explicit_cleanup() {
+        let prepare = || {
+            let state = fake_vmnet_network_state_without_requested_mac();
+            let expected_mac = state.interfaces()[0]
+                .profile()
+                .guest_mac()
+                .expect("saved vmnet profile should retain MAC");
+            let plan = prepare_process_snapshot_v2_network_restore_plan(
+                prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("network restore value plan should prepare");
+            (plan, expected_mac)
+        };
+
+        for (read_max_packets, write_max_packets) in
+            [(Some(u16::MAX), Some(1)), (Some(1), Some(u16::MAX))]
+        {
+            let (plan, expected_mac) = prepare();
+            let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+                .with_next_realized_mac(expected_mac)
+                .with_next_batch_limits(read_max_packets, write_max_packets);
+            let events = factory.events();
+
+            let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+                plan,
+                "private-oversized-batch",
+                bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                &mut factory,
+                |_| false,
+            )
+            .expect_err("oversized provider batch must fail");
+
+            assert_eq!(
+                error.disposition(),
+                super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+            );
+            assert!(matches!(
+                error.kind,
+                super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(
+                    ProcessNetworkPacketIoProviderBuildError::ProfileMismatch
+                )
+            ));
+            assert_eq!(
+                recorded_events(&events),
+                [
+                    "backend:eth0".to_string(),
+                    "descriptor:eth0:shared".to_string(),
+                    "start:eth0".to_string(),
+                    "stop:eth0".to_string(),
+                ]
+            );
+        }
+
+        let (plan, expected_mac) = prepare();
+        let mut uncertain = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_mac)
+            .with_next_batch_limits(Some(u16::MAX), Some(1))
+            .with_next_stop_status(Some(VmnetStatus::Failure));
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-oversized-batch-uncertain",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut uncertain,
+            |_| false,
+        )
+        .expect_err("unconfirmed oversized-batch cleanup must fail terminally");
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(
+                ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
+            )
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_partial_start_failure_unwinds_and_retries() {
+        let prepare = || {
+            let state = fake_partial_mmds_network_state();
+            let expected_macs = state
+                .interfaces()
+                .iter()
+                .map(|interface| {
+                    interface
+                        .profile()
+                        .guest_mac()
+                        .expect("partial-MMDS vmnet profile should retain MAC")
+                })
+                .collect::<Vec<_>>();
+            let plan = prepare_process_snapshot_v2_network_restore_plan(
+                prepared_native_v2_network_restore_candidate(
+                    state,
+                    &["vmnet:shared", "vmnet:shared"],
+                ),
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("partial-MMDS value plan should prepare");
+            (plan, expected_macs)
+        };
+        let (plan, expected_macs) = prepare();
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_start_status(None)
+            .with_next_start_status(Some(VmnetStatus::Failure))
+            .with_next_realized_mac(expected_macs[0])
+            .with_next_realized_mac(expected_macs[1]);
+        let events = factory.events();
+
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-partial-failure",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect_err("second provider start should fail");
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+        );
+        let events = recorded_events(&events);
+        assert!(
+            events
+                .iter()
+                .position(|event| event == "start:eth1")
+                .expect("second start should fail")
+                < events
+                    .iter()
+                    .position(|event| event == "stop:eth0")
+                    .expect("first owner should unwind")
+        );
+
+        let (retry_plan, expected_macs) = prepare();
+        let mut retry_factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_macs[0])
+            .with_next_realized_mac(expected_macs[1]);
+        let retry = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            retry_plan,
+            "private-partial-retry",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut retry_factory,
+            |_| false,
+        )
+        .expect("confirmed rollback should permit exact retry");
+        retry.abort().expect("retried batch should abort cleanly");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_take_rejects_unknown_and_wrong_class_keys() {
+        let state = fake_vmnet_network_state_without_requested_mac();
+        let expected_mac = state.interfaces()[0]
+            .profile()
+            .guest_mac()
+            .expect("saved vmnet profile should retain MAC");
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("network restore value plan should prepare");
+        let key = plan.candidate().topology().interfaces()[0]
+            .resource_key()
+            .clone();
+        let wrong_class = bangbang_runtime::snapshot_restore::SnapshotRestoreResourceKey::new(
+            key.device_key(),
+            key.public_id().clone(),
+            bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::SerialSink,
+        );
+        let unknown = bangbang_runtime::snapshot_restore::SnapshotRestoreResourceKey::new(
+            key.device_key(),
+            bangbang_runtime::snapshot_restore::SnapshotRestorePublicId::try_from("missing")
+                .expect("test public ID should validate"),
+            bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::NetworkPacketIo,
+        );
+        let mut factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(expected_mac);
+        let mut batch = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-key-errors",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("network owner batch should prepare");
+
+        for (requested, expected) in [
+            (
+                &wrong_class,
+                bangbang_runtime::snapshot_restore::SnapshotRestoreTakeError::WrongClass,
+            ),
+            (
+                &unknown,
+                bangbang_runtime::snapshot_restore::SnapshotRestoreTakeError::UnknownResource,
+            ),
+        ] {
+            let error = batch
+                .take(requested)
+                .expect_err("invalid exact key should be rejected");
+            assert_eq!(
+                error.disposition(),
+                super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+            );
+            assert!(matches!(
+                error.kind,
+                super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Take(source)
+                    if source == expected
+            ));
+        }
+        batch
+            .abort()
+            .expect("failed takes must not consume any exact owner");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_isolates_same_id_registry_owners_and_callbacks() {
+        let prepare = || {
+            let state = fake_vmnet_network_state_without_requested_mac();
+            let expected_mac = state.interfaces()[0]
+                .profile()
+                .guest_mac()
+                .expect("saved vmnet profile should retain MAC");
+            let plan = prepare_process_snapshot_v2_network_restore_plan(
+                prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("network restore value plan should prepare");
+            let key = plan.candidate().topology().interfaces()[0]
+                .resource_key()
+                .clone();
+            (plan, key, expected_mac)
+        };
+
+        let (first_plan, first_key, expected_mac) = prepare();
+        let mut first_factory = RecordingVmnetPacketIoBackendFactory::default()
+            .recording_packet_event_lifecycle()
+            .with_next_realized_mac(expected_mac);
+        let first_events = first_factory.events();
+        let first_callbacks = first_factory.packet_callbacks();
+        let mut first = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            first_plan,
+            "private-first-same-id",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut first_factory,
+            |_| false,
+        )
+        .expect("first same-ID owner should prepare");
+
+        let (second_plan, _, expected_mac) = prepare();
+        let mut second_factory = RecordingVmnetPacketIoBackendFactory::default()
+            .recording_packet_event_lifecycle()
+            .with_next_realized_mac(expected_mac);
+        let second_events = second_factory.events();
+        let second_callbacks = second_factory.packet_callbacks();
+        let mut second = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            second_plan,
+            "private-second-same-id",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut second_factory,
+            |_| false,
+        )
+        .expect("second same-ID owner should prepare");
+
+        assert_ne!(
+            first.provider().expect("first provider").registry_id,
+            second.provider().expect("second provider").registry_id
+        );
+        let first_resource = first
+            .take(&first_key)
+            .expect("first exact owner should be taken");
+        let foreign_publication = first_resource.publication().clone();
+        assert!(matches!(
+            second
+                .provider
+                .as_mut()
+                .expect("second provider")
+                .take_published(&foreign_publication),
+            Err(ProcessNetworkPacketIoRegistryError::AuthorityMismatch)
+        ));
+        assert_eq!(second.provider().expect("second provider").entries.len(), 1);
+
+        let first_abort = first
+            .abort()
+            .expect_err("escaped token makes the first transition terminal");
+        assert_eq!(
+            first_abort.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(
+            first_callbacks
+                .lock()
+                .expect("first callbacks should lock")
+                .is_empty()
+        );
+        assert_eq!(
+            second_callbacks
+                .lock()
+                .expect("second callbacks should lock")
+                .len(),
+            1,
+            "first cleanup must not drain the second clone callback"
+        );
+        assert!(
+            recorded_events(&first_events)
+                .iter()
+                .any(|event| event == "stop:eth0")
+        );
+        assert!(
+            !recorded_events(&second_events)
+                .iter()
+                .any(|event| event == "stop:eth0")
+        );
+
+        drop(first_resource);
+        second
+            .abort()
+            .expect("unconsumed second batch should abort cleanly");
+        assert!(
+            second_callbacks
+                .lock()
+                .expect("second callbacks should lock")
+                .is_empty()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_validates_direct_envelope_and_batch_parameters() {
+        let state = fake_vmnet_network_state_with_packet_envelope(
+            bangbang_runtime::network::VirtioNetworkPacketEnvelope::DirectVirtioHeader,
+        );
+        let expected_profile = state.interfaces()[0].profile();
+        let expected_mac = expected_profile
+            .guest_mac()
+            .expect("saved direct-envelope profile should retain MAC");
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("direct-envelope value plan should prepare");
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_mac)
+            .with_next_batch_limits(Some(4), Some(3))
+            .with_next_direct_virtio_header(true, true);
+        let batch = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-direct-envelope",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("matching direct-envelope provider should prepare");
+        let provider = batch.provider().expect("provider should remain owned");
+        assert_eq!(provider.device_profiles()["eth0"], expected_profile);
+        let parameters = provider.entries[0]
+            .backend_parameters
+            .as_ref()
+            .expect("vmnet entry should retain typed parameters");
+        assert_eq!(parameters.read_max_packets(), Some(4));
+        assert_eq!(parameters.write_max_packets(), Some(3));
+        assert!(parameters.direct_virtio_header_available());
+        assert!(parameters.direct_virtio_header_enabled());
+        batch.abort().expect("matching direct batch should abort");
+
+        let state = fake_vmnet_network_state_without_requested_mac();
+        let expected_mac = state.interfaces()[0]
+            .profile()
+            .guest_mac()
+            .expect("saved raw profile should retain MAC");
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("raw-envelope value plan should prepare");
+        let mut mismatch = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_mac)
+            .with_next_direct_virtio_header(true, true);
+        let events = mismatch.events();
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-envelope-mismatch",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut mismatch,
+            |_| false,
+        )
+        .expect_err("provider envelope mismatch must fail");
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(
+                ProcessNetworkPacketIoProviderBuildError::ProfileMismatch
+            )
+        ));
+        assert!(
+            recorded_events(&events)
+                .iter()
+                .any(|event| event == "stop:eth0")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_drop_drains_owned_callbacks_and_metrics() {
+        let state = fake_vmnet_network_state_without_requested_mac();
+        let expected_mac = state.interfaces()[0]
+            .profile()
+            .guest_mac()
+            .expect("saved vmnet profile should retain MAC");
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("network restore value plan should prepare");
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .recording_packet_event_lifecycle()
+            .with_next_realized_mac(expected_mac);
+        let events = factory.events();
+        let callbacks = factory.packet_callbacks();
+        let batch = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-drop-cleanup",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("drop-cleanup batch should prepare");
+        let metrics = batch.network_metrics().clone();
+
+        drop(batch);
+
+        assert!(
+            callbacks
+                .lock()
+                .expect("recorded callbacks should lock")
+                .is_empty()
+        );
+        assert!(
+            metrics
+                .capture_state()
+                .expect("dropped metrics registry should capture")
+                .entries()
+                .is_empty()
+        );
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "packet-events-enable:eth0".to_string(),
+                "packet-events-disable-drain:eth0".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_restore_callback_drain_uncertainty_is_terminal() {
+        let state = fake_vmnet_network_state_without_requested_mac();
+        let expected_mac = state.interfaces()[0]
+            .profile()
+            .guest_mac()
+            .expect("saved vmnet profile should retain MAC");
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(state, &["vmnet:shared"]),
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("network restore value plan should prepare");
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .recording_packet_event_lifecycle()
+            .with_next_packet_event_drain_status(Some(VmnetStatus::Failure))
+            .with_next_realized_mac(expected_mac);
+        let events = factory.events();
+        let callbacks = factory.packet_callbacks();
+        let batch = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-drain-uncertainty",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("drain-uncertainty batch should prepare");
+
+        let error = batch
+            .abort()
+            .expect_err("unconfirmed callback drain must be terminal");
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(error.cleanup_uncertain);
+        assert_eq!(
+            callbacks
+                .lock()
+                .expect("recorded callbacks should lock")
+                .len(),
+            1,
+            "failed drain must not claim the callback was released"
+        );
+        assert_eq!(
+            recorded_events(&events)
+                .iter()
+                .filter(|event| event.as_str() == "packet-events-disable-drain:eth0")
+                .count(),
+            1
+        );
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains("private-drain-uncertainty"));
+        assert!(!diagnostics.contains(&expected_mac.to_string()));
+    }
+
     #[test]
     fn contained_runtime_vmnet_authority_counts_only_live_vmnet_entries() {
         let configs = network_configs([("eth0", "vmnet:shared")]);
@@ -35310,6 +38381,7 @@ mod tests {
         assert_eq!(published.owner, owner);
 
         let wrong_handle = super::PublishedProcessNetworkPacketIoEntry {
+            registry_id: published.registry_id,
             owner: other_owner,
             generation: published.generation,
             iface_id: published.iface_id.clone(),
@@ -35520,6 +38592,7 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketEvents { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ProfileMismatch
             | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
@@ -35564,6 +38637,7 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketEvents { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ProfileMismatch
             | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
@@ -35601,6 +38675,7 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketEvents { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ProfileMismatch
             | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
@@ -35638,6 +38713,7 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketEvents { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ProfileMismatch
             | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
