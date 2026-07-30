@@ -82,8 +82,8 @@ terminal. The directly reviewed identities that do not change disposition are:
 | --- | --- | --- |
 | Exported configuration | `api-operation:GET /vm/config`; `api-path:/vm/config`; `api-schema:FullVmConfiguration` | `audit-required`; Wave 8 owns final cross-capability certification after every exported device field has a terminal result. |
 | Snapshot API aggregates | `api-operation:PUT /snapshot/create`; `api-operation:PUT /snapshot/load`; `api-path:/snapshot/create`; `api-path:/snapshot/load`; `api-schema:SnapshotCreateParams`; `api-schema:SnapshotLoadParams` | `audit-required`; Wave 6 owns Diff artifacts, merge/restore, overrides, additional backends, optional-device schemas, and portability beyond the current native-v2 Full/File profile. |
-| Snapshot semantics | `semantic.snapshot:full-create-load-and-public-lifecycle` | `implemented-and-verified`; #1578 certifies the initial device-free native-v2 2.3 Full/File multi-vCPU public lifecycle, #1589 adds exact 2.4 with one read-only File/Sync root, #1616/#1617 add exact 2.5 rooted/rootless ordered regular-file block vectors, #1634 adds exact 2.6 profile-3 block/pmem storage, #1651/#1652 add exact 2.7 complete serial state, #1665/#1666 add exact 2.8 optional entropy, and #1680/#1681 activate and certify current 2.9 optional balloon across all eight storage/entropy/balloon products while retaining all earlier readers. |
-| Remaining snapshot semantics | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `semantic.snapshot:multi-vcpu-drives-devices-and-mmds`; `semantic.snapshot:network-vsock-overrides-portability-and-clones` | `audit-required`; Wave 6 owns Diff/native-v2-Uffd, optional devices other than serial, pmem, entropy, and balloon, overrides/tools, and broader portability. |
+| Snapshot semantics | `semantic.snapshot:full-create-load-and-public-lifecycle` | `implemented-and-verified`; #1578 certifies the initial device-free native-v2 2.3 Full/File multi-vCPU public lifecycle, #1589 adds exact 2.4 with one read-only File/Sync root, #1616/#1617 add exact 2.5 rooted/rootless ordered regular-file block vectors, #1634 adds exact 2.6 profile-3 block/pmem storage, #1651/#1652 add exact 2.7 complete serial state, #1665/#1666 add exact 2.8 optional entropy, #1680/#1681 add exact 2.9 optional balloon, and #1697/#1698 activate and certify current 2.10 optional virtio-mem across all sixteen storage/entropy/balloon/virtio-mem products while retaining all earlier readers. |
+| Remaining snapshot semantics | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `semantic.snapshot:multi-vcpu-drives-devices-and-mmds`; `semantic.snapshot:network-vsock-overrides-portability-and-clones` | `audit-required`; Wave 6 owns Diff/native-v2-Uffd, network/vsock/MMDS restore, overrides/tools, and broader portability. |
 | Snapshot tracking leaves | `api-property:SnapshotLoadParams.enable_diff_snapshots`; `api-property:SnapshotLoadParams.track_dirty_pages` | Already `implemented-and-verified`; they select complete destination dirty tracking but do not imply Diff artifact support. |
 | Broad specifications | `corpus:specification`; `semantic.specification:api-availability-stability-and-failure-information`; `semantic.specification:performance-resource-and-telemetry-outcomes` | `audit-required`; applicable repository-wide outcomes remain Wave 7 work after their producers stabilize. |
 | Cross-capability certification | `semantic.cross-capability:state-errors-metrics-security-and-snapshots` | `audit-required`; Wave 8 owns the final interaction audit after the individual lifecycle, error, telemetry, security, device, network, and snapshot producers stabilize. |
@@ -91,11 +91,11 @@ terminal. The directly reviewed identities that do not change disposition are:
 
 Those exact identities establish the following non-overlapping handoffs:
 
-- Wave 6 has terminal current native-v2 2.9 Full/File create/load for complete
-  serial state plus independently optional entropy, balloon, and rooted/rootless
-  regular-file block/pmem profile-3 vectors over MMIO/PCI, and retains exact
-  2.8/2.7/2.6/2.5/2.4/2.3 plus frozen native-v1 readers. It still owns Diff
-  artifacts, optional-device state other than serial, pmem, entropy, and balloon,
+- Wave 6 has terminal current native-v2 2.10 Full/File create/load for complete
+  serial state plus independently optional entropy, balloon, virtio-mem, and
+  rooted/rootless regular-file block/pmem profile-3 vectors over MMIO/PCI, and
+  retains exact 2.9/2.8/2.7/2.6/2.5/2.4/2.3 plus frozen native-v1 readers. It
+  still owns Diff artifacts, network/vsock/MMDS restore,
   dirty-image serialization and merging, native-v2 Uffd, restore overrides,
   tools, broader portability, and schema evolution. The
   terminal load tracking properties and complete dirty epochs are

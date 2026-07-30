@@ -3390,6 +3390,16 @@ mod tests {
             FIXTURE_MEMORY_MIB * MIB,
         )
         .expect("mixed mapping should plan");
+        let aperture = plan.reservation().range();
+        let dynamic_range = memory
+            .regions()
+            .iter()
+            .map(|region| region.range())
+            .find(|range| {
+                range.start() >= aperture.start()
+                    && range.end_exclusive() <= aperture.end_exclusive()
+            })
+            .expect("materialized mapping should have a block-granular dynamic owner");
         let restored = topology
             .into_mmio_handler(&memory)
             .expect("inactive MMIO handler should reconstruct");
@@ -3426,7 +3436,6 @@ mod tests {
             .expect("restored owners should close over the mapping proof");
         assert!(plan.matches_capture(&mapping_capture));
 
-        let dynamic_range = plan.dynamic_ranges()[0];
         mapping
             .unmap_dynamic_region(dynamic_range)
             .expect("restored dynamic owner should unplug");
@@ -3521,7 +3530,10 @@ mod tests {
             .map(|region| region.range())
             .collect::<Vec<_>>();
         let retained_dynamic_range = expected_ranges[region_count - 2];
-        assert!(plan.dynamic_ranges().contains(&retained_dynamic_range));
+        assert!(plan.dynamic_ranges().iter().any(|range| {
+            range.start() <= retained_dynamic_range.start()
+                && range.end_exclusive() >= retained_dynamic_range.end_exclusive()
+        }));
         let mapper = Arc::new(MemoryHotplugMappingTestMapper::failing(
             Some(region_count),
             Some(1),

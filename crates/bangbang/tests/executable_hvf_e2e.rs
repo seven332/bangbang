@@ -36,6 +36,7 @@ mod macos_arm64 {
     use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
     use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
     use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
+    use bangbang_runtime::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugState;
     use bangbang_runtime::storage_capture::StorageRetryState;
 
     use crate::macos_virtual_block::{
@@ -59,10 +60,38 @@ mod macos_arm64 {
     const BOOT_TIMER_LOG_MARKER: &[u8] = b"Guest-boot-time =";
     const DIRECT_ROOTFS_BALLOON_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.balloon-check=1";
     const DIRECT_ROOTFS_BALLOON_MARKER: &[u8] = b"BANGBANG_BALLOON_REPORTING_GUEST_CHECK_OK";
-    const DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-check=1";
     const DIRECT_ROOTFS_MEMORY_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_READY";
     const DIRECT_ROOTFS_MEMORY_HOTPLUG_GROWN_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_GROWN";
     const DIRECT_ROOTFS_MEMORY_HOTPLUG_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK";
+    const DIRECT_ROOTFS_MEMORY_HOTPLUG_SNAPSHOT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-snapshot=1";
+    const MEMORY_HOTPLUG_SNAPSHOT_READY_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_READY";
+    const MEMORY_HOTPLUG_SNAPSHOT_CAPTURE_READY_MARKER: &[u8] =
+        b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_CAPTURE_READY";
+    const MEMORY_HOTPLUG_SNAPSHOT_RESTORED_MARKER: &[u8] =
+        b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_BYTES_OK";
+    const MEMORY_HOTPLUG_SNAPSHOT_OFFLINE_READY_MARKER: &[u8] =
+        b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_OFFLINE_READY";
+    const MEMORY_HOTPLUG_SNAPSHOT_SHRUNK_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_SHRUNK";
+    const MEMORY_HOTPLUG_SNAPSHOT_REGROWN_MARKER: &[u8] =
+        b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_REGROWN";
+    const MEMORY_HOTPLUG_SNAPSHOT_REPROBED_MARKER: &[u8] =
+        b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_REPROBED";
+    const MEMORY_HOTPLUG_SNAPSHOT_UNPLUG_ALL_MARKER: &[u8] =
+        b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_UNPLUG_ALL";
+    const MEMORY_HOTPLUG_SNAPSHOT_SUCCESS_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_OK";
+    const MEMORY_HOTPLUG_SNAPSHOT_FAILURE_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL";
+    const MEMORY_HOTPLUG_SNAPSHOT_CONTINUE_MARKER: &[u8] =
+        b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_CONTINUE";
+    const MEMORY_HOTPLUG_SNAPSHOT_OFFLINE_MARKER: &[u8] =
+        b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_OFFLINE";
+    const MEMORY_HOTPLUG_SNAPSHOT_REPROBE_MARKER: &[u8] =
+        b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_REPROBE";
+    const MEMORY_HOTPLUG_SNAPSHOT_SECTORS: u64 = 3;
+    const MEMORY_HOTPLUG_SNAPSHOT_CONTINUE_OFFSET: u64 =
+        bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const MEMORY_HOTPLUG_SNAPSHOT_REPROBE_OFFSET: u64 =
+        2 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
     const DIRECT_ROOTFS_RTC_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.rtc-check=1";
     const DIRECT_ROOTFS_RTC_MARKER: &[u8] = b"BANGBANG_RTC_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_VMCLOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vmclock-check=1";
@@ -4111,25 +4140,41 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_hotplugs_memory_from_direct_rootfs_guest() {
+    fn signed_executable_certifies_native_v2_memory_hotplug_snapshot_continuation() {
+        for enable_pci in [false, true] {
+            run_signed_memory_hotplug_snapshot_continuation(enable_pci);
+        }
+    }
+
+    fn run_signed_memory_hotplug_snapshot_continuation(enable_pci: bool) {
         const MIB: u64 = 1024 * 1024;
 
+        let transport = if enable_pci { "pci" } else { "mmio" };
         let test_dir = TestDir::new();
-        let socket_path = test_dir.path().join("api.socket");
-        let data_backing_path = test_dir.path().join("data.img");
-        let metrics_path = test_dir.path().join("metrics.out");
+        let socket_path = test_dir.path().join(format!("{transport}-mh-src.sock"));
+        let data_backing_path = test_dir
+            .path()
+            .join(format!("{transport}-memory-hotplug-data.img"));
+        let metrics_path = test_dir
+            .path()
+            .join(format!("{transport}-memory-hotplug-source.metrics"));
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
         let instance_id = test_dir.instance_id();
+        let process_args: &[&str] = if enable_pci { &["--enable-pci"] } else { &[] };
 
-        create_zeroed_block_backing(&data_backing_path);
+        create_zeroed_block_backing_with_sectors(
+            &data_backing_path,
+            MEMORY_HOTPLUG_SNAPSHOT_SECTORS,
+        );
 
-        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+        let mut bangbang =
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, process_args);
 
         let machine_response = http_put_json(
             &socket_path,
             "/machine-config",
-            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":256,"track_dirty_pages":true}"#,
         );
         assert_no_content_response(
             &machine_response,
@@ -4168,7 +4213,7 @@ mod macos_arm64 {
         );
 
         let kernel_path_json = json_string(path_text(&kernel_path));
-        let boot_args_json = json_string(DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS);
+        let boot_args_json = json_string(DIRECT_ROOTFS_MEMORY_HOTPLUG_SNAPSHOT_BOOT_ARGS);
         let boot_body = format!(
             r#"{{
                 "kernel_image_path":{kernel_path_json},
@@ -4234,13 +4279,13 @@ mod macos_arm64 {
 
         if let Err(err) = wait_for_file_prefix_marker(
             &data_backing_path,
-            DIRECT_ROOTFS_MEMORY_HOTPLUG_READY_MARKER,
+            MEMORY_HOTPLUG_SNAPSHOT_READY_MARKER,
             GUEST_EXECUTION_TIMEOUT,
         ) {
             let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not report virtio-mem readiness through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "{transport} direct rootfs guest did not report snapshot virtio-mem readiness: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
@@ -4270,13 +4315,13 @@ mod macos_arm64 {
 
         if let Err(err) = wait_for_file_prefix_marker(
             &data_backing_path,
-            DIRECT_ROOTFS_MEMORY_HOTPLUG_GROWN_MARKER,
+            MEMORY_HOTPLUG_SNAPSHOT_CAPTURE_READY_MARKER,
             GUEST_EXECUTION_TIMEOUT,
         ) {
             let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not observe runtime virtio-mem grow request through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "{transport} direct rootfs guest did not plant and verify plugged-memory sentinels: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
@@ -4332,86 +4377,555 @@ mod macos_arm64 {
         assert_capture_ready_snapshot_succeeds(
             &socket_path,
             test_dir.path(),
-            "paused MMIO memory-hotplug capture-ready preflight",
+            &format!("paused {transport} memory-hotplug exact-2.10 publication"),
             true,
             false,
             false,
             true,
         );
-        assert_no_content_response(
-            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
-            "resume after memory-hotplug capture-ready preflight",
+        let state_path = test_dir.path().join("capture-ready.state");
+        let memory_path = test_dir.path().join("capture-ready.memory");
+        let source_memory_hotplug = assert_active_memory_hotplug_snapshot(
+            &state_path,
+            enable_pci,
+            &format!("{transport} source"),
         );
-
-        let memory_hotplug_shrink = http_json_with_io_timeout(
-            &socket_path,
-            "PATCH",
-            "/hotplug/memory",
-            r#"{"requested_size_mib":0}"#,
-            GUEST_EXECUTION_TIMEOUT,
-        );
-        assert_no_content_response(
-            &memory_hotplug_shrink,
-            "PATCH /hotplug/memory shrink direct rootfs",
-        );
-
-        if let Err(err) = wait_for_file_prefix_marker(
-            &data_backing_path,
-            DIRECT_ROOTFS_MEMORY_HOTPLUG_MARKER,
-            GUEST_EXECUTION_TIMEOUT,
-        ) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
-            let output = bangbang.force_stop_and_collect();
-            panic!(
-                "direct rootfs guest did not observe runtime virtio-mem shrink request through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                output.status, output.stdout, output.stderr
-            );
-        }
-
-        let unplugged_memory_hotplug = match wait_for_http_response_fragment(
-            &socket_path,
-            "/hotplug/memory",
-            r#""plugged_size_mib":0"#,
-            GUEST_EXECUTION_TIMEOUT,
-        ) {
-            Ok(response) => response,
-            Err(err) => {
-                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
-                let output = bangbang.force_stop_and_collect();
-                panic!(
-                    "public API did not report the guest-completed virtio-mem shrink: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.status, output.stdout, output.stderr
-                );
-            }
-        };
-        assert_ok_response(
-            &unplugged_memory_hotplug,
-            "GET /hotplug/memory after guest-completed shrink",
-        );
-        assert_response_contains(
-            &unplugged_memory_hotplug,
-            r#""requested_size_mib":0"#,
-            "GET /hotplug/memory after guest-completed shrink",
-        );
-        let shrink_metrics = flush_memory_hotplug_metrics(
-            &socket_path,
-            &metrics_path,
-            "FlushMetrics after virtio-mem shrink",
-        );
-        assert_eq!(shrink_metrics["unplug_bytes"].as_u64(), Some(128 * MIB));
-        assert!(
-            shrink_metrics["unplug_count"]
-                .as_u64()
-                .is_some_and(|count| count > 0)
-        );
-        assert_eq!(shrink_metrics["unplug_fails"].as_u64(), Some(0));
-        assert_eq!(shrink_metrics["plug_bytes"].as_u64(), Some(0));
-
+        let state_before = fs::read(&state_path).expect("memory-hotplug source state should read");
+        let memory_before =
+            fs::read(&memory_path).expect("memory-hotplug source memory should read");
         assert_clean_shutdown(
             bangbang.terminate(),
             &socket_path,
-            "bangbang memory hotplug direct rootfs",
+            &format!("bangbang {transport} memory-hotplug snapshot source"),
         );
+
+        let explicit_socket = test_dir.path().join(format!("{transport}-mh-exp.sock"));
+        let explicit_metrics = test_dir
+            .path()
+            .join(format!("{transport}-memory-hotplug-explicit.metrics"));
+        let explicit_context = format!("{transport}-memory-hotplug-explicit");
+        run_signed_memory_hotplug_snapshot_destination(SignedMemoryHotplugSnapshotDestination {
+            test_root: test_dir.path(),
+            socket_path: &explicit_socket,
+            data_backing_path: &data_backing_path,
+            metrics_path: &explicit_metrics,
+            state_path: &state_path,
+            memory_path: &memory_path,
+            process_args,
+            enable_pci,
+            source_memory_hotplug: &source_memory_hotplug,
+            resume_vm: false,
+            recapture: true,
+            context: &explicit_context,
+        });
+        assert_eq!(
+            fs::read(&state_path).expect("explicit memory-hotplug state should remain readable"),
+            state_before,
+            "{transport} explicit destination must not mutate state"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("explicit memory-hotplug memory should remain readable"),
+            memory_before,
+            "{transport} explicit destination must not mutate memory"
+        );
+
+        let automatic_socket = test_dir.path().join(format!("{transport}-mh-auto.sock"));
+        let automatic_metrics = test_dir
+            .path()
+            .join(format!("{transport}-memory-hotplug-automatic.metrics"));
+        let automatic_context = format!("{transport}-memory-hotplug-automatic");
+        run_signed_memory_hotplug_snapshot_destination(SignedMemoryHotplugSnapshotDestination {
+            test_root: test_dir.path(),
+            socket_path: &automatic_socket,
+            data_backing_path: &data_backing_path,
+            metrics_path: &automatic_metrics,
+            state_path: &state_path,
+            memory_path: &memory_path,
+            process_args,
+            enable_pci,
+            source_memory_hotplug: &source_memory_hotplug,
+            resume_vm: true,
+            recapture: false,
+            context: &automatic_context,
+        });
+        assert_eq!(
+            fs::read(&state_path).expect("automatic memory-hotplug state should remain readable"),
+            state_before,
+            "{transport} automatic destination must not mutate state"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("automatic memory-hotplug memory should remain readable"),
+            memory_before,
+            "{transport} automatic destination must not mutate memory"
+        );
+        assert_no_snapshot_staging(test_dir.path());
+    }
+
+    fn assert_active_memory_hotplug_snapshot(
+        state_path: &Path,
+        enable_pci: bool,
+        context: &str,
+    ) -> SnapshotV2MemoryHotplugState {
+        const MIB: u64 = 1024 * 1024;
+
+        let bytes = fs::read(state_path).unwrap_or_else(|error| {
+            panic!(
+                "{context} memory-hotplug state {} should read: {error}",
+                state_path.display()
+            )
+        });
+        let structural =
+            decode_snapshot_v2_state(&bytes).expect("memory-hotplug state should decode");
+        let state = decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
+            .expect("memory-hotplug state should be exact native-v2 2.10");
+        let graph = state
+            .device_graph()
+            .expect("memory-hotplug certification artifact should retain root and data");
+        assert_eq!(
+            graph.block_records().len(),
+            2,
+            "{context} should retain root and data drives"
+        );
+        assert!(state.entropy().is_none(), "{context} should omit entropy");
+        assert!(state.balloon().is_none(), "{context} should omit balloon");
+        let memory_hotplug = state
+            .memory_hotplug()
+            .expect("memory-hotplug certification artifact should contain kind 11");
+        let expected_transport = if enable_pci {
+            SnapshotV2DeviceTransportKind::Pci
+        } else {
+            SnapshotV2DeviceTransportKind::Mmio
+        };
+        assert_eq!(graph.transport_kind(), expected_transport);
+        assert_eq!(memory_hotplug.transport().kind(), expected_transport);
+        assert_eq!(memory_hotplug.config().total_size_mib(), 128);
+        assert_eq!(memory_hotplug.config().block_size_mib(), 2);
+        assert_eq!(memory_hotplug.config().slot_size_mib(), 128);
+        assert_eq!(memory_hotplug.config_space().region_size(), 128 * MIB);
+        assert_eq!(
+            memory_hotplug.config_space().usable_region_size(),
+            128 * MIB
+        );
+        assert_eq!(memory_hotplug.config_space().requested_size(), 128 * MIB);
+        assert_eq!(memory_hotplug.config_space().plugged_size(), 128 * MIB);
+        let queue = memory_hotplug
+            .active_queue()
+            .expect("active Linux virtio-mem should retain queue cursors");
+        assert_eq!(
+            queue.next_available(),
+            queue.next_used(),
+            "{context} queue should be quiescent"
+        );
+        let plugged_ranges = memory_hotplug.plugged_ranges().collect::<Vec<_>>();
+        assert_eq!(
+            plugged_ranges.len(),
+            1,
+            "{context} should retain one contiguous plugged range"
+        );
+        assert_eq!(plugged_ranges[0].start_block(), 0);
+        assert_eq!(plugged_ranges[0].block_count(), 64);
+        memory_hotplug
+            .validate_memory_binding(state.platform().memory())
+            .expect("kind-11 bitmap should exactly close the kind-1 memory extents");
+        memory_hotplug.clone()
+    }
+
+    struct SignedMemoryHotplugSnapshotDestination<'a> {
+        test_root: &'a Path,
+        socket_path: &'a Path,
+        data_backing_path: &'a Path,
+        metrics_path: &'a Path,
+        state_path: &'a Path,
+        memory_path: &'a Path,
+        process_args: &'a [&'a str],
+        enable_pci: bool,
+        source_memory_hotplug: &'a SnapshotV2MemoryHotplugState,
+        resume_vm: bool,
+        recapture: bool,
+        context: &'a str,
+    }
+
+    fn run_signed_memory_hotplug_snapshot_destination(
+        case: SignedMemoryHotplugSnapshotDestination<'_>,
+    ) {
+        const MIB: u64 = 1024 * 1024;
+
+        let SignedMemoryHotplugSnapshotDestination {
+            test_root,
+            socket_path,
+            data_backing_path,
+            metrics_path,
+            state_path,
+            memory_path,
+            process_args,
+            enable_pci,
+            source_memory_hotplug,
+            resume_vm,
+            recapture,
+            context,
+        } = case;
+        reset_zeroed_block_backing(data_backing_path, MEMORY_HOTPLUG_SNAPSHOT_SECTORS);
+        write_block_marker_at(
+            data_backing_path,
+            MEMORY_HOTPLUG_SNAPSHOT_CONTINUE_OFFSET,
+            MEMORY_HOTPLUG_SNAPSHOT_CONTINUE_MARKER,
+        );
+
+        let mut destination =
+            BangbangProcess::start_with_extra_args(socket_path, context, process_args);
+        assert_no_content_response(
+            &http_put_json(
+                socket_path,
+                "/metrics",
+                &format!(
+                    r#"{{"metrics_path":{}}}"#,
+                    json_string(path_text(metrics_path))
+                ),
+            ),
+            &format!("PUT {context} destination metrics"),
+        );
+        assert!(
+            fs::read(metrics_path).unwrap_or_default().is_empty(),
+            "{context} destination metrics should start empty"
+        );
+        let load_response = http_json_with_io_timeout(
+            socket_path,
+            "PUT",
+            "/snapshot/load",
+            &snapshot_root_load_body(state_path, memory_path, resume_vm),
+            MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+        );
+        if !load_response.starts_with("HTTP/1.1 204 No Content") {
+            let output = destination.force_stop_and_collect();
+            panic!(
+                "PUT {context} /snapshot/load failed; response:\n{load_response}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_no_content_response(&load_response, &format!("PUT {context} /snapshot/load"));
+
+        let info = http_get(socket_path, "/");
+        assert_ok_response(&info, &format!("GET {context} destination state"));
+        assert_response_contains(
+            &info,
+            if resume_vm {
+                r#""state":"Running""#
+            } else {
+                r#""state":"Paused""#
+            },
+            &format!("GET {context} destination state"),
+        );
+        assert_memory_hotplug_destination_api(socket_path, 128, 128, context);
+
+        if !resume_vm {
+            if recapture {
+                let recaptured_state = test_root.join(format!("{context}.recaptured.state"));
+                let recaptured_memory = test_root.join(format!("{context}.recaptured.memory"));
+                create_memory_hotplug_snapshot(
+                    socket_path,
+                    &recaptured_state,
+                    &recaptured_memory,
+                    &format!("{context} recapture"),
+                );
+                let recaptured = assert_active_memory_hotplug_snapshot(
+                    &recaptured_state,
+                    enable_pci,
+                    &format!("{context} recapture"),
+                );
+                assert_eq!(
+                    &recaptured, source_memory_hotplug,
+                    "{context} Paused recapture should preserve normalized kind-11 semantics"
+                );
+            }
+            assert_no_content_response(
+                &http_json(socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+                &format!("PATCH {context} Resumed"),
+            );
+        }
+
+        wait_for_memory_hotplug_snapshot_marker_or_collect(
+            data_backing_path,
+            MEMORY_HOTPLUG_SNAPSHOT_RESTORED_MARKER,
+            &mut destination,
+            &format!("{context} restored plugged-memory bytes"),
+        );
+        assert_memory_hotplug_destination_api(socket_path, 128, 128, context);
+        write_block_marker_at(
+            data_backing_path,
+            MEMORY_HOTPLUG_SNAPSHOT_CONTINUE_OFFSET,
+            MEMORY_HOTPLUG_SNAPSHOT_OFFLINE_MARKER,
+        );
+        wait_for_memory_hotplug_snapshot_marker_or_collect(
+            data_backing_path,
+            MEMORY_HOTPLUG_SNAPSHOT_OFFLINE_READY_MARKER,
+            &mut destination,
+            &format!("{context} guest memory offline preparation"),
+        );
+
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                socket_path,
+                "PATCH",
+                "/hotplug/memory",
+                r#"{"requested_size_mib":64}"#,
+                MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+            ),
+            &format!("PATCH {context} requested size to 64 MiB"),
+        );
+        wait_for_memory_hotplug_snapshot_marker_or_collect(
+            data_backing_path,
+            MEMORY_HOTPLUG_SNAPSHOT_SHRUNK_MARKER,
+            &mut destination,
+            &format!("{context} disjoint UNPLUG"),
+        );
+        if let Err(error) = wait_for_http_response_fragment(
+            socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":64"#,
+            MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+        ) {
+            let flush_response =
+                http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#);
+            let metrics_output = fs::read_to_string(metrics_path).unwrap_or_default();
+            let backing_prefix = file_prefix_lossy(data_backing_path, 128);
+            let output = destination.force_stop_and_collect();
+            panic!(
+                "{context} should report 64 MiB plugged: {error}; FlushMetrics response:\n{flush_response}\nmetrics:\n{metrics_output}\nbacking prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_memory_hotplug_destination_api(socket_path, 64, 64, context);
+
+        write_block_marker_at(
+            data_backing_path,
+            MEMORY_HOTPLUG_SNAPSHOT_REPROBE_OFFSET,
+            MEMORY_HOTPLUG_SNAPSHOT_REPROBE_MARKER,
+        );
+        wait_for_memory_hotplug_snapshot_marker_or_collect(
+            data_backing_path,
+            MEMORY_HOTPLUG_SNAPSHOT_UNPLUG_ALL_MARKER,
+            &mut destination,
+            &format!("{context} Linux reprobe UNPLUG_ALL"),
+        );
+        wait_for_http_response_fragment(
+            socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":0"#,
+            MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+        )
+        .unwrap_or_else(|error| {
+            panic!("{context} should report zero plugged after UNPLUG_ALL: {error}")
+        });
+        assert_memory_hotplug_destination_api(socket_path, 0, 64, context);
+
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                socket_path,
+                "PATCH",
+                "/hotplug/memory",
+                r#"{"requested_size_mib":64}"#,
+                MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+            ),
+            &format!("PATCH {context} refresh 64 MiB after UNPLUG_ALL"),
+        );
+        wait_for_memory_hotplug_snapshot_marker_or_collect(
+            data_backing_path,
+            MEMORY_HOTPLUG_SNAPSHOT_REPROBED_MARKER,
+            &mut destination,
+            &format!("{context} Linux reprobe UNPLUG_ALL"),
+        );
+        wait_for_http_response_fragment(
+            socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":64"#,
+            MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+        )
+        .unwrap_or_else(|error| panic!("{context} should replug 64 MiB after reprobe: {error}"));
+        assert_memory_hotplug_destination_api(socket_path, 64, 64, context);
+
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                socket_path,
+                "PATCH",
+                "/hotplug/memory",
+                r#"{"requested_size_mib":128}"#,
+                MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+            ),
+            &format!("PATCH {context} requested size to 128 MiB"),
+        );
+        wait_for_memory_hotplug_snapshot_marker_or_collect(
+            data_backing_path,
+            MEMORY_HOTPLUG_SNAPSHOT_REGROWN_MARKER,
+            &mut destination,
+            &format!("{context} disjoint PLUG"),
+        );
+        wait_for_http_response_fragment(
+            socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":128"#,
+            MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+        )
+        .unwrap_or_else(|error| panic!("{context} should report 128 MiB regrown: {error}"));
+        assert_memory_hotplug_destination_api(socket_path, 128, 128, context);
+
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                socket_path,
+                "PATCH",
+                "/hotplug/memory",
+                r#"{"requested_size_mib":0}"#,
+                MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+            ),
+            &format!("PATCH {context} requested size to zero"),
+        );
+        wait_for_memory_hotplug_snapshot_marker_or_collect(
+            data_backing_path,
+            MEMORY_HOTPLUG_SNAPSHOT_SUCCESS_MARKER,
+            &mut destination,
+            &format!("{context} final UNPLUG"),
+        );
+        wait_for_http_response_fragment(
+            socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":0"#,
+            MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+        )
+        .unwrap_or_else(|error| panic!("{context} should report zero plugged: {error}"));
+        assert_memory_hotplug_destination_api(socket_path, 0, 0, context);
+
+        let metrics = flush_memory_hotplug_metrics(
+            socket_path,
+            metrics_path,
+            &format!("FlushMetrics {context} after restored topology activity"),
+        );
+        assert!(
+            metrics["queue_event_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "{context} should process destination-local virtio-mem queues"
+        );
+        assert!(
+            metrics["plug_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "{context} should process restored PLUG requests"
+        );
+        assert!(
+            metrics["unplug_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "{context} should process restored UNPLUG requests"
+        );
+        assert!(
+            metrics["unplug_all_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "{context} should process a restored Linux reprobe UNPLUG_ALL"
+        );
+        assert_eq!(metrics["plug_bytes"].as_u64(), Some(128 * MIB));
+        assert_eq!(metrics["unplug_bytes"].as_u64(), Some(192 * MIB));
+        for field in [
+            "activate_fails",
+            "queue_event_fails",
+            "plug_fails",
+            "unplug_fails",
+            "unplug_discard_fails",
+            "unplug_all_fails",
+            "state_fails",
+            "interrupt_fails",
+            "rollback_fails",
+            "owner_cleanup_fails",
+            "teardown_fails",
+        ] {
+            assert_eq!(
+                metrics[field].as_u64(),
+                Some(0),
+                "{context} destination memory_hotplug.{field} should remain zero; metrics:\n{}",
+                fs::read_to_string(metrics_path).unwrap_or_default()
+            );
+        }
+        assert_clean_shutdown(
+            destination.terminate(),
+            socket_path,
+            &format!("{context} restored memory-hotplug destination"),
+        );
+    }
+
+    fn assert_memory_hotplug_destination_api(
+        socket_path: &Path,
+        plugged_size_mib: u64,
+        requested_size_mib: u64,
+        context: &str,
+    ) {
+        let status = http_get(socket_path, "/hotplug/memory");
+        assert_ok_response(&status, &format!("GET {context} /hotplug/memory"));
+        for expected in [
+            r#""block_size_mib":2"#.to_owned(),
+            format!(r#""plugged_size_mib":{plugged_size_mib}"#),
+            format!(r#""requested_size_mib":{requested_size_mib}"#),
+            r#""slot_size_mib":128"#.to_owned(),
+            r#""total_size_mib":128"#.to_owned(),
+        ] {
+            assert_response_contains(
+                &status,
+                &expected,
+                &format!("GET {context} /hotplug/memory"),
+            );
+        }
+        let config = http_get(socket_path, "/vm/config");
+        assert_ok_response(&config, &format!("GET {context} /vm/config"));
+        assert_response_contains(
+            &config,
+            r#""memory-hotplug":"#,
+            &format!("GET {context} /vm/config"),
+        );
+        assert_eq!(
+            config.matches(r#""drive_id":"#).count(),
+            2,
+            "{context} should retain root and data drive configuration"
+        );
+    }
+
+    fn create_memory_hotplug_snapshot(
+        socket_path: &Path,
+        state_path: &Path,
+        memory_path: &Path,
+        context: &str,
+    ) {
+        let response = http_json_with_io_timeout(
+            socket_path,
+            "PUT",
+            "/snapshot/create",
+            &format!(
+                r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+                json_string(path_text(state_path)),
+                json_string(path_text(memory_path))
+            ),
+            MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+        );
+        assert_no_content_response(&response, &format!("PUT {context} /snapshot/create"));
+        assert!(state_path.is_file(), "{context} state should publish");
+        assert!(memory_path.is_file(), "{context} memory should publish");
+    }
+
+    fn wait_for_memory_hotplug_snapshot_marker_or_collect(
+        data_backing_path: &Path,
+        marker: &[u8],
+        process: &mut BangbangProcess,
+        context: &str,
+    ) {
+        if let Err(error) = wait_for_file_markers_at(
+            data_backing_path,
+            &[(0, marker, MEMORY_HOTPLUG_SNAPSHOT_FAILURE_MARKER)],
+            MEMORY_HOTPLUG_SNAPSHOT_TIMEOUT,
+        ) {
+            let backing_prefix = file_prefix_lossy(data_backing_path, 128);
+            let output = process.force_stop_and_collect();
+            panic!(
+                "{context} failed: {error}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
     }
 
     #[test]

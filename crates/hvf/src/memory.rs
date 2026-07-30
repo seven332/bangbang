@@ -707,6 +707,7 @@ fn normalize_capture_ranges(ranges: &mut Vec<GuestMemoryRange>) -> bool {
 pub struct HvfSnapshotV2MemoryHotplugMappingPlan {
     static_ranges: Vec<GuestMemoryRange>,
     dynamic_ranges: Vec<GuestMemoryRange>,
+    mapped_dynamic_ranges: Vec<GuestMemoryRange>,
     reservation: GuestMemorySharedReservationCaptureState,
     base_bytes: u64,
     active_bytes: u64,
@@ -784,6 +785,10 @@ impl fmt::Debug for HvfSnapshotV2MemoryHotplugMappingPlan {
             .debug_struct("HvfSnapshotV2MemoryHotplugMappingPlan")
             .field("static_range_count", &self.static_ranges.len())
             .field("dynamic_range_count", &self.dynamic_ranges.len())
+            .field(
+                "mapped_dynamic_range_count",
+                &self.mapped_dynamic_ranges.len(),
+            )
             .field("state", &"<redacted>")
             .finish()
     }
@@ -954,6 +959,13 @@ fn prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan_with(
     )?;
     active_ranges.extend(memory.regions().iter().map(GuestMemoryRegion::range));
 
+    let mut mapped_dynamic_ranges = Vec::new();
+    policy.reserve(
+        &mut mapped_dynamic_ranges,
+        active_ranges.len(),
+        SnapshotV2MemoryHotplugMappingPlanStage::ActiveRanges,
+    )?;
+
     policy.checkpoint(SnapshotV2MemoryHotplugMappingPlanStage::MappingPreflight)?;
     let page_size = host_page_size()
         .map_err(|_| PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::MappingPreflight)?;
@@ -966,13 +978,13 @@ fn prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan_with(
         if range.overlaps(aperture) {
             if range.start() < aperture.start()
                 || range.end_exclusive() > aperture.end_exclusive()
-                || dynamic_ranges.get(dynamic_index) != Some(&range)
                 || region.backing() != GuestMemoryRegionBacking::Shared
                 || region.mapping_identity() != reservation.mapping_identity()
                 || region.validate_shared_backing().ok() != Some(true)
             {
                 return Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::RegionTopology);
             }
+            mapped_dynamic_ranges.push(range);
             dynamic_index += 1;
         } else {
             if static_ranges.get(static_index) != Some(&range)
@@ -984,11 +996,12 @@ fn prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan_with(
         }
     }
     if static_index != static_ranges.len()
-        || dynamic_index != dynamic_ranges.len()
+        || dynamic_index != mapped_dynamic_ranges.len()
+        || !ranges_have_equivalent_coverage(&mapped_dynamic_ranges, &dynamic_ranges)
         || active_ranges.len()
             != static_ranges
                 .len()
-                .checked_add(dynamic_ranges.len())
+                .checked_add(mapped_dynamic_ranges.len())
                 .ok_or(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Accounting)?
     {
         return Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::RegionTopology);
@@ -1044,6 +1057,7 @@ fn prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan_with(
     Ok(HvfSnapshotV2MemoryHotplugMappingPlan {
         static_ranges,
         dynamic_ranges,
+        mapped_dynamic_ranges,
         reservation,
         base_bytes,
         active_bytes,
@@ -1062,6 +1076,48 @@ fn checked_range_bytes(
             .checked_add(range.size())
             .ok_or(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Accounting)
     })
+}
+
+fn ranges_have_equivalent_coverage(left: &[GuestMemoryRange], right: &[GuestMemoryRange]) -> bool {
+    let mut left_index = 0_usize;
+    let mut right_index = 0_usize;
+    let mut left_cursor = left.first().map(|range| range.start().raw_value());
+    let mut right_cursor = right.first().map(|range| range.start().raw_value());
+
+    loop {
+        let cursor = match (left_cursor, right_cursor) {
+            (None, None) => return true,
+            (Some(left), Some(right)) if left == right => left,
+            _ => return false,
+        };
+        let Some(left_range) = left.get(left_index) else {
+            return false;
+        };
+        let Some(right_range) = right.get(right_index) else {
+            return false;
+        };
+        let left_end = left_range.end_exclusive().raw_value();
+        let right_end = right_range.end_exclusive().raw_value();
+        let boundary = left_end.min(right_end);
+        if boundary <= cursor {
+            return false;
+        }
+
+        if boundary == left_end {
+            left_index += 1;
+            left_cursor = left.get(left_index).map(|range| range.start().raw_value());
+        } else {
+            left_cursor = Some(boundary);
+        }
+        if boundary == right_end {
+            right_index += 1;
+            right_cursor = right
+                .get(right_index)
+                .map(|range| range.start().raw_value());
+        } else {
+            right_cursor = Some(boundary);
+        }
+    }
 }
 
 fn validate_snapshot_v2_memory_hotplug_mapping(
@@ -1089,7 +1145,7 @@ fn validate_snapshot_v2_memory_hotplug_mapping(
     let expected_region_count = plan
         .static_ranges
         .len()
-        .checked_add(plan.dynamic_ranges.len())
+        .checked_add(plan.mapped_dynamic_ranges.len())
         .ok_or(INVALID_PLAN)?;
     if requests.len() != expected_region_count || memory.regions().len() != expected_region_count {
         return Err(INVALID_PLAN);
@@ -1102,7 +1158,7 @@ fn validate_snapshot_v2_memory_hotplug_mapping(
         if range.overlaps(aperture) {
             if range.start() < aperture.start()
                 || range.end_exclusive() > aperture.end_exclusive()
-                || plan.dynamic_ranges.get(dynamic_index) != Some(&range)
+                || plan.mapped_dynamic_ranges.get(dynamic_index) != Some(&range)
                 || region.backing() != GuestMemoryRegionBacking::Shared
                 || region.mapping_identity() != reservation.mapping_identity()
                 || region.validate_shared_backing().ok() != Some(true)
@@ -1119,7 +1175,8 @@ fn validate_snapshot_v2_memory_hotplug_mapping(
             static_index += 1;
         }
     }
-    if static_index != plan.static_ranges.len() || dynamic_index != plan.dynamic_ranges.len() {
+    if static_index != plan.static_ranges.len() || dynamic_index != plan.mapped_dynamic_ranges.len()
+    {
         return Err(INVALID_PLAN);
     }
 
@@ -2214,7 +2271,7 @@ impl HvfGuestMemoryMappingState {
                 |source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source },
             )?;
         self.dynamic_regions
-            .try_reserve_exact(plan.dynamic_ranges.len())
+            .try_reserve_exact(plan.mapped_dynamic_ranges.len())
             .map_err(
                 |source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source },
             )?;

@@ -1723,7 +1723,15 @@ fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
             cleanup,
         ));
     }
-    if !memory_matches_binding(&memory, state.memory()) {
+    let memory_matches = match mapping {
+        HvfSnapshotV2MemoryMappingRestore::Ordinary => {
+            memory_matches_binding(&memory, state.memory())
+        }
+        HvfSnapshotV2MemoryMappingRestore::MemoryHotplug(_) => {
+            memory_covers_binding(&memory, state.memory())
+        }
+    };
+    if !memory_matches {
         return Err(HvfSnapshotV2PlatformRestoreError::new(
             HvfSnapshotV2PlatformRestoreStage::Preflight,
             HvfSnapshotV2PlatformRestoreFailure::MemoryTopology,
@@ -2390,6 +2398,58 @@ fn memory_matches_binding(memory: &GuestMemory, binding: &SnapshotV2MemoryBindin
             .iter()
             .zip(binding.extents())
             .all(|(region, extent)| region.range() == extent.range())
+}
+
+fn memory_covers_binding(memory: &GuestMemory, binding: &SnapshotV2MemoryBinding) -> bool {
+    let mut region_index = 0_usize;
+    let mut extent_index = 0_usize;
+    let mut region_cursor = memory
+        .regions()
+        .first()
+        .map(|region| region.range().start().raw_value());
+    let mut extent_cursor = binding
+        .extents()
+        .first()
+        .map(|extent| extent.range().start().raw_value());
+
+    loop {
+        let cursor = match (region_cursor, extent_cursor) {
+            (None, None) => return true,
+            (Some(region), Some(extent)) if region == extent => region,
+            _ => return false,
+        };
+        let Some(region) = memory.regions().get(region_index) else {
+            return false;
+        };
+        let Some(extent) = binding.extents().get(extent_index) else {
+            return false;
+        };
+        let region_end = region.range().end_exclusive().raw_value();
+        let extent_end = extent.range().end_exclusive().raw_value();
+        let boundary = region_end.min(extent_end);
+        if boundary <= cursor {
+            return false;
+        }
+
+        if boundary == region_end {
+            region_index += 1;
+            region_cursor = memory
+                .regions()
+                .get(region_index)
+                .map(|region| region.range().start().raw_value());
+        } else {
+            region_cursor = Some(boundary);
+        }
+        if boundary == extent_end {
+            extent_index += 1;
+            extent_cursor = binding
+                .extents()
+                .get(extent_index)
+                .map(|extent| extent.range().start().raw_value());
+        } else {
+            extent_cursor = Some(boundary);
+        }
+    }
 }
 
 fn prepare_root_resource_plan(
@@ -3893,6 +3953,46 @@ pub(crate) mod tests {
     use bangbang_runtime::snapshot_memory_v2::write_snapshot_v2_memory_image;
 
     use super::*;
+
+    #[test]
+    fn memory_coverage_accepts_only_equivalent_extent_segmentation() {
+        let page_size = 64 * 1024;
+        let start = bangbang_runtime::memory::aarch64::DRAM_MEM_START;
+        let first = GuestMemoryRange::new(GuestAddress::new(start), page_size)
+            .expect("first range should validate");
+        let second = GuestMemoryRange::new(GuestAddress::new(start + page_size), page_size)
+            .expect("second range should validate");
+        let split_layout = bangbang_runtime::memory::GuestMemoryLayout::new(vec![first, second])
+            .expect("split layout should validate");
+        let split = GuestMemory::allocate(&split_layout).expect("split memory should allocate");
+        let mut image = std::io::Cursor::new(Vec::new());
+        let binding = write_snapshot_v2_memory_image(&split, &mut image)
+            .expect("split binding should encode");
+        assert_eq!(binding.extents().len(), 2);
+
+        let combined = GuestMemoryRange::new(GuestAddress::new(start), page_size * 2)
+            .expect("combined range should validate");
+        let combined_layout = bangbang_runtime::memory::GuestMemoryLayout::new(vec![combined])
+            .expect("combined layout should validate");
+        let combined_memory =
+            GuestMemory::allocate(&combined_layout).expect("combined memory should allocate");
+        assert!(!memory_matches_binding(&combined_memory, &binding));
+        assert!(memory_covers_binding(&combined_memory, &binding));
+
+        let incomplete_layout = bangbang_runtime::memory::GuestMemoryLayout::new(vec![first])
+            .expect("incomplete layout should validate");
+        let incomplete =
+            GuestMemory::allocate(&incomplete_layout).expect("incomplete memory should allocate");
+        assert!(!memory_covers_binding(&incomplete, &binding));
+
+        let shifted = GuestMemoryRange::new(GuestAddress::new(start + page_size), page_size * 2)
+            .expect("shifted range should validate");
+        let shifted_layout = bangbang_runtime::memory::GuestMemoryLayout::new(vec![shifted])
+            .expect("shifted layout should validate");
+        let shifted_memory =
+            GuestMemory::allocate(&shifted_layout).expect("shifted memory should allocate");
+        assert!(!memory_covers_binding(&shifted_memory, &binding));
+    }
 
     fn root_restore_memory() -> GuestMemory {
         let layout = bangbang_runtime::memory::GuestMemoryLayout::new(vec![

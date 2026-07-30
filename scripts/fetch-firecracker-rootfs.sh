@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v91"
+direct_boot_variant="direct-boot-v100"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -2488,6 +2488,505 @@ PY
   esac
 }
 
+check_memory_hotplug_snapshot_marker() {
+  if [ ! -d /sys/bus/virtio/devices ]; then
+    emit_line BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL_NO_VIRTIO_BUS
+    write_vdb_marker BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL
+    return
+  fi
+
+  memory_device=
+  for driver_link in /sys/bus/virtio/devices/*/driver; do
+    if [ ! -L "$driver_link" ]; then
+      continue
+    fi
+
+    driver_target=$(readlink "$driver_link" 2>/dev/null || true)
+    if [ "${driver_target##*/}" = virtio_mem ]; then
+      memory_device=${driver_link%/driver}
+      break
+    fi
+  done
+
+  if [ -z "$memory_device" ]; then
+    emit_line BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL_NO_DEVICE
+    write_vdb_marker BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL
+    return
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    emit_line BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL_NO_PYTHON
+    write_vdb_marker BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL
+    return
+  fi
+
+  memory_hotplug_snapshot_result=$(
+    BANGBANG_MEMORY_HOTPLUG_DEVICE="$memory_device" python3 - <<'PY' 2>/dev/null || true
+import glob
+import mmap
+import os
+import select
+import subprocess
+import sys
+import time
+
+DEVICE = "/dev/vdb"
+MEMORY_DEVICE = os.environ["BANGBANG_MEMORY_HOTPLUG_DEVICE"]
+MEMORY_DEVICE_NAME = os.path.basename(MEMORY_DEVICE)
+EXPECTED_REQUESTED_SIZE = 128 * 1024 * 1024
+INTERMEDIATE_REQUESTED_SIZE = 64 * 1024 * 1024
+FORCED_HOTPLUG_BYTES = 32 * 1024 * 1024
+MINIMUM_RESERVE_BYTES = 32 * 1024 * 1024
+SECTOR_SIZE = 512
+GUEST_OUTPUT_OFFSET = 0
+HOST_CONTINUE_OFFSET = SECTOR_SIZE
+HOST_REPROBE_OFFSET = 2 * SECTOR_SIZE
+READY_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_READY"
+SNAPSHOT_READY_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_CAPTURE_READY"
+RESTORED_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_BYTES_OK"
+OFFLINE_READY_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_OFFLINE_READY"
+SHRUNK_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_SHRUNK"
+REGROWN_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_REGROWN"
+REPROBED_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_REPROBED"
+UNPLUG_ALL_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_UNPLUG_ALL"
+SUCCESS_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_OK"
+FAIL_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL"
+HOST_CONTINUE_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_CONTINUE"
+HOST_OFFLINE_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_OFFLINE"
+HOST_REPROBE_MARKER = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_REPROBE"
+STAGE_TIMEOUT_SECONDS = 90.0
+MEMORY_TOLERANCE_BYTES = 2 * 1024 * 1024
+SENTINEL_SEED = 0xB16B_00B5_A55A_10C5
+
+
+def marker_text(marker):
+    return marker.decode("ascii")
+
+
+def write_marker(marker):
+    try:
+        with open(DEVICE, "r+b", buffering=0) as drive:
+            drive.seek(GUEST_OUTPUT_OFFSET)
+            drive.write(marker.ljust(SECTOR_SIZE, b" "))
+            try:
+                os.fsync(drive.fileno())
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def fail(reason):
+    marker = FAIL_MARKER + b"_" + reason.encode("ascii")
+    write_marker(marker)
+    print(marker_text(marker))
+    sys.exit(1)
+
+
+def read_marker(offset):
+    try:
+        with open(DEVICE, "rb", buffering=0) as drive:
+            drive.seek(offset)
+            return drive.read(SECTOR_SIZE).rstrip(b"\0 ")
+    except OSError:
+        return b""
+
+
+def wait_for_host_marker(offset, expected, reason):
+    deadline = time.monotonic() + STAGE_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if read_marker(offset).startswith(expected):
+            return
+        time.sleep(0.05)
+    fail(reason)
+
+
+def meminfo_bytes(field):
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as meminfo:
+            for line in meminfo:
+                name, value = line.split(":", 1)
+                if name == field:
+                    amount, unit = value.split()
+                    if unit != "kB":
+                        fail("MEMINFO_UNIT")
+                    return int(amount) * 1024
+    except (OSError, ValueError):
+        pass
+    fail("MEMINFO_" + field.upper())
+
+
+def requested_size_from_line(line):
+    if "virtio_mem" not in line or "requested size" not in line:
+        return None
+
+    value = line.rsplit(":", 1)[-1].strip().split()
+    if value:
+        try:
+            return int(value[0], 0)
+        except ValueError:
+            return None
+    return None
+
+
+def wait_for_requested_size(dmesg, expected, reason):
+    if dmesg.stdout is None:
+        fail("DMESG_STDOUT")
+    deadline = time.monotonic() + STAGE_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        readable, _, _ = select.select([dmesg.stdout], [], [], remaining)
+        if not readable:
+            break
+        line = dmesg.stdout.readline()
+        if not line:
+            if dmesg.poll() is not None:
+                fail("DMESG_EXIT")
+            continue
+        value = requested_size_from_line(line.decode("utf-8", "replace").strip())
+        if value == expected:
+            return
+    fail(reason)
+
+
+def wait_for_hotplugged_total(baseline_total, expected, reason):
+    target = baseline_total + expected
+    deadline = time.monotonic() + STAGE_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        observed = meminfo_bytes("MemTotal")
+        if target - MEMORY_TOLERANCE_BYTES <= observed <= target + MEMORY_TOLERANCE_BYTES:
+            return
+        time.sleep(0.05)
+    fail(reason)
+
+
+def parse_aperture():
+    try:
+        output = subprocess.check_output(
+            ["dmesg"],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", "replace")
+    except (OSError, subprocess.CalledProcessError):
+        fail("DMESG_APERTURE")
+
+    start = None
+    size = None
+    for line in output.splitlines():
+        if "virtio_mem" not in line:
+            continue
+        if "start address" in line:
+            try:
+                start = int(line.rsplit(":", 1)[-1].strip().split()[0], 0)
+            except (IndexError, ValueError):
+                pass
+        elif "region size" in line:
+            try:
+                size = int(line.rsplit(":", 1)[-1].strip().split()[0], 0)
+            except (IndexError, ValueError):
+                pass
+    if start is None or size is None or size <= 0:
+        fail("APERTURE")
+    return start, size
+
+
+def sentinel_bytes(page_index):
+    value = (SENTINEL_SEED ^ page_index) & ((1 << 64) - 1)
+    if value == 0:
+        value = SENTINEL_SEED
+    return value.to_bytes(8, "little")
+
+
+def write_sentinels(mapping, page_size, length):
+    for page_index, offset in enumerate(range(0, length, page_size)):
+        mapping[offset : offset + 8] = sentinel_bytes(page_index)
+
+
+def verify_sentinels(mapping, page_size, length, reason):
+    for page_index, offset in enumerate(range(0, length, page_size)):
+        if mapping[offset : offset + 8] != sentinel_bytes(page_index):
+            fail(reason)
+
+
+def write_sysfs(path, value, reason):
+    try:
+        with open(path, "w", encoding="ascii") as target:
+            target.write(value)
+    except OSError:
+        fail(reason)
+
+
+def wait_for_path(path, exists, reason):
+    deadline = time.monotonic() + STAGE_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if os.path.exists(path) == exists:
+            return
+        time.sleep(0.05)
+    fail(reason)
+
+
+def virtio_mem_blocks(aperture_start, aperture_size):
+    try:
+        with open(
+            "/sys/devices/system/memory/block_size_bytes",
+            "r",
+            encoding="ascii",
+        ) as source:
+            block_size = int(source.read().strip(), 16)
+    except (OSError, ValueError):
+        fail("MEMORY_BLOCK_SIZE")
+
+    aperture_end = aperture_start + aperture_size
+    selected = []
+    for path in glob.glob("/sys/devices/system/memory/memory[0-9]*"):
+        try:
+            with open(os.path.join(path, "phys_index"), "r", encoding="ascii") as source:
+                index = int(source.read().strip(), 16)
+        except (OSError, ValueError):
+            continue
+        address = index * block_size
+        if aperture_start <= address < aperture_end:
+            selected.append((address, path))
+    if not selected:
+        fail("MEMORY_BLOCKS")
+    return [path for _, path in sorted(selected)]
+
+
+def offline_blocks(blocks):
+    for path in blocks:
+        state_path = os.path.join(path, "state")
+        try:
+            with open(state_path, "r", encoding="ascii") as source:
+                state = source.read().strip()
+        except OSError:
+            fail("MEMORY_BLOCK_STATE_READ")
+        if state != "offline":
+            write_sysfs(state_path, "offline", "MEMORY_BLOCK_OFFLINE")
+            deadline = time.monotonic() + STAGE_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                try:
+                    with open(state_path, "r", encoding="ascii") as source:
+                        if source.read().strip() == "offline":
+                            break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+            else:
+                fail("MEMORY_BLOCK_OFFLINE_WAIT")
+
+
+def online_blocks(blocks):
+    for path in blocks:
+        state_path = os.path.join(path, "state")
+        try:
+            with open(state_path, "r", encoding="ascii") as source:
+                state = source.read().strip()
+        except OSError:
+            fail("MEMORY_BLOCK_ONLINE_STATE_READ")
+        if not state.startswith("online"):
+            write_sysfs(state_path, "online_movable", "MEMORY_BLOCK_ONLINE")
+            deadline = time.monotonic() + STAGE_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                try:
+                    with open(state_path, "r", encoding="ascii") as source:
+                        if source.read().strip().startswith("online"):
+                            break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+            else:
+                fail("MEMORY_BLOCK_ONLINE_WAIT")
+
+
+def wait_for_blocks_removed(blocks, reason):
+    deadline = time.monotonic() + STAGE_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if all(not os.path.exists(path) for path in blocks):
+            return
+        time.sleep(0.05)
+    fail(reason)
+
+
+def reprobe_driver():
+    driver_root = "/sys/bus/virtio/drivers/virtio_mem"
+    driver_link = os.path.join(MEMORY_DEVICE, "driver")
+    write_sysfs(
+        os.path.join(driver_root, "unbind"),
+        MEMORY_DEVICE_NAME,
+        "DRIVER_UNBIND",
+    )
+    wait_for_path(driver_link, False, "DRIVER_UNBIND_WAIT")
+    write_sysfs(
+        os.path.join(driver_root, "bind"),
+        MEMORY_DEVICE_NAME,
+        "DRIVER_BIND",
+    )
+    wait_for_path(driver_link, True, "DRIVER_BIND_WAIT")
+    try:
+        if os.path.basename(os.readlink(driver_link)) != "virtio_mem":
+            fail("DRIVER_BIND_TARGET")
+    except OSError:
+        fail("DRIVER_BIND_TARGET")
+
+
+baseline_total = meminfo_bytes("MemTotal")
+baseline_available = meminfo_bytes("MemAvailable")
+aperture_start, aperture_size = parse_aperture()
+
+try:
+    dmesg = subprocess.Popen(
+        ["dmesg", "--follow"],
+        bufsize=0,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+except OSError:
+    fail("DMESG_START")
+
+sentinel_mapping = None
+try:
+    write_marker(READY_MARKER)
+    print(marker_text(READY_MARKER), flush=True)
+
+    wait_for_requested_size(dmesg, EXPECTED_REQUESTED_SIZE, "GROW_REQUEST_TIMEOUT")
+    wait_for_hotplugged_total(
+        baseline_total,
+        EXPECTED_REQUESTED_SIZE,
+        "GROW_TOTAL_TIMEOUT",
+    )
+
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    allocation_bytes = baseline_available + FORCED_HOTPLUG_BYTES
+    allocation_bytes = (
+        (allocation_bytes + page_size - 1) // page_size
+    ) * page_size
+    post_plug_available = meminfo_bytes("MemAvailable")
+    if post_plug_available < allocation_bytes + MINIMUM_RESERVE_BYTES:
+        fail("INSUFFICIENT_HOTPLUG_MEMORY")
+    try:
+        sentinel_mapping = mmap.mmap(-1, allocation_bytes)
+    except (OSError, ValueError):
+        fail("SENTINEL_ALLOC")
+    write_sentinels(
+        sentinel_mapping,
+        page_size,
+        allocation_bytes,
+    )
+    verify_sentinels(
+        sentinel_mapping,
+        page_size,
+        allocation_bytes,
+        "SENTINEL_SOURCE_VERIFY",
+    )
+    write_marker(SNAPSHOT_READY_MARKER)
+    print(marker_text(SNAPSHOT_READY_MARKER), flush=True)
+
+    wait_for_host_marker(
+        HOST_CONTINUE_OFFSET,
+        HOST_CONTINUE_MARKER,
+        "HOST_CONTINUE_TIMEOUT",
+    )
+    verify_sentinels(
+        sentinel_mapping,
+        page_size,
+        allocation_bytes,
+        "SENTINEL_RESTORE_VERIFY",
+    )
+    write_marker(RESTORED_MARKER)
+    print(marker_text(RESTORED_MARKER), flush=True)
+    wait_for_host_marker(
+        HOST_CONTINUE_OFFSET,
+        HOST_OFFLINE_MARKER,
+        "HOST_OFFLINE_TIMEOUT",
+    )
+    sentinel_mapping.close()
+    sentinel_mapping = None
+    blocks = virtio_mem_blocks(aperture_start, aperture_size)
+    offline_blocks(blocks)
+    write_marker(OFFLINE_READY_MARKER)
+    print(marker_text(OFFLINE_READY_MARKER), flush=True)
+
+    wait_for_requested_size(
+        dmesg,
+        INTERMEDIATE_REQUESTED_SIZE,
+        "SHRINK_REQUEST_TIMEOUT",
+    )
+    if any(not os.path.exists(path) for path in blocks):
+        fail("SHRINK_PARTIAL_BLOCK")
+    write_marker(SHRUNK_MARKER)
+    print(marker_text(SHRUNK_MARKER), flush=True)
+
+    wait_for_host_marker(
+        HOST_REPROBE_OFFSET,
+        HOST_REPROBE_MARKER,
+        "HOST_REPROBE_TIMEOUT",
+    )
+    reprobe_driver()
+    wait_for_requested_size(
+        dmesg,
+        INTERMEDIATE_REQUESTED_SIZE,
+        "REPROBE_UNPLUG_ALL_TIMEOUT",
+    )
+    write_marker(UNPLUG_ALL_MARKER)
+    print(marker_text(UNPLUG_ALL_MARKER), flush=True)
+
+    wait_for_requested_size(
+        dmesg,
+        INTERMEDIATE_REQUESTED_SIZE,
+        "REPROBE_REPLUG_REQUEST_TIMEOUT",
+    )
+    for path in blocks:
+        wait_for_path(path, True, "REPROBE_MEMORY_BLOCK_WAIT")
+    online_blocks(blocks)
+    wait_for_hotplugged_total(
+        baseline_total,
+        INTERMEDIATE_REQUESTED_SIZE,
+        "REPROBE_TOTAL_TIMEOUT",
+    )
+    write_marker(REPROBED_MARKER)
+    print(marker_text(REPROBED_MARKER), flush=True)
+
+    wait_for_requested_size(dmesg, EXPECTED_REQUESTED_SIZE, "REGROW_REQUEST_TIMEOUT")
+    wait_for_hotplugged_total(
+        baseline_total,
+        EXPECTED_REQUESTED_SIZE,
+        "REGROW_TOTAL_TIMEOUT",
+    )
+    blocks = virtio_mem_blocks(aperture_start, aperture_size)
+    offline_blocks(blocks)
+    write_marker(REGROWN_MARKER)
+    print(marker_text(REGROWN_MARKER), flush=True)
+
+    wait_for_requested_size(dmesg, 0, "FINAL_SHRINK_REQUEST_TIMEOUT")
+    wait_for_blocks_removed(blocks, "FINAL_SHRINK_REMOVE_TIMEOUT")
+    wait_for_hotplugged_total(baseline_total, 0, "FINAL_SHRINK_TOTAL_TIMEOUT")
+    write_marker(SUCCESS_MARKER)
+    print(marker_text(SUCCESS_MARKER))
+finally:
+    if sentinel_mapping is not None:
+        sentinel_mapping.close()
+    dmesg.terminate()
+    try:
+        dmesg.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        dmesg.kill()
+        dmesg.wait()
+PY
+  )
+
+  case "$memory_hotplug_snapshot_result" in
+    *BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_OK*)
+      emit_line BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_OK
+      ;;
+    *BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL_*)
+      emit_line BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL
+      ;;
+    *)
+      emit_line BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL_RESULT
+      write_vdb_marker BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL
+      ;;
+  esac
+}
+
 check_cache_fdt_marker() {
   cache_report=/dev/bangbang-cache-report
   cache_report_limit=65536
@@ -4293,6 +4792,8 @@ elif cmdline_has bangbang.entropy-lifecycle=1; then
   read_entropy_lifecycle_marker
 elif cmdline_has bangbang.balloon-check=1; then
   check_balloon_marker
+elif cmdline_has bangbang.memory-hotplug-snapshot=1; then
+  check_memory_hotplug_snapshot_marker
 elif cmdline_has bangbang.memory-hotplug-check=1; then
   check_memory_hotplug_marker
 elif cmdline_has bangbang.rtc-check=1; then

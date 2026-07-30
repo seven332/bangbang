@@ -891,6 +891,18 @@ impl GuestMemory {
         self.insert_region_with_mapper(range, page_size, &mut mapper)
     }
 
+    /// Reserve metadata for a checked batch of later region insertions.
+    ///
+    /// Transactional builders use this before a large ordered batch so each
+    /// individual insertion cannot turn a bounded topology into repeated
+    /// reallocations.
+    pub(crate) fn try_reserve_region_metadata(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), TryReserveError> {
+        self.regions.try_reserve_exact(additional)
+    }
+
     fn insert_region_with_mapper(
         &mut self,
         range: GuestMemoryRange,
@@ -928,18 +940,24 @@ impl GuestMemory {
     ) -> Result<usize, GuestMemoryAllocationError> {
         validate_allocation_range(range, page_size)?;
 
-        let mut insert_index = self.regions.len();
-        for (index, region) in self.regions.iter().enumerate() {
-            let existing_range = region.range();
-            if existing_range.overlaps(range) {
-                return Err(GuestMemoryAllocationError::InvalidLayout(
-                    overlapping_ranges_error(existing_range, range),
-                ));
-            }
-
-            if insert_index == self.regions.len() && range.start() < existing_range.start() {
-                insert_index = index;
-            }
+        let insert_index = self
+            .regions
+            .partition_point(|region| region.range().start() < range.start());
+        if let Some(previous) = insert_index
+            .checked_sub(1)
+            .and_then(|index| self.regions.get(index))
+            && previous.range().overlaps(range)
+        {
+            return Err(GuestMemoryAllocationError::InvalidLayout(
+                overlapping_ranges_error(previous.range(), range),
+            ));
+        }
+        if let Some(next) = self.regions.get(insert_index)
+            && next.range().overlaps(range)
+        {
+            return Err(GuestMemoryAllocationError::InvalidLayout(
+                overlapping_ranges_error(range, next.range()),
+            ));
         }
 
         for reservation in &self.shared_reservations {

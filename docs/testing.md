@@ -347,10 +347,12 @@ two vCPUs writing shared and distinct protected pages through two reset epochs,
 include a current-device write in the shared bitmap, explicitly redispatch each
 dirty outcome, verify final guest values and both exact sets, bound event
 progress without sleeps, batch-cancel, join every owner, restore permissions,
-and destroy the VM. Accepted signed syndromes are EC `0x24`, WnR set,
-CM/S1PTW clear, and exact DFSC `0x07` for initial protection or `0x0f` after
-re-protection at a tracker-owned currently protected IPA. Every other encoding
-must fail closed and reopen feasibility; tests must not broaden this pair.
+and destroy the VM. Accepted signed syndromes are EC `0x24`, WnR set, S1PTW
+clear, and translation DFSC `0x05`, `0x06`, or `0x07`, or level-three
+permission DFSC `0x0f`, at a tracker-owned currently protected IPA. CM may be
+clear for ordinary stores or set for observed Linux cache-maintenance writes;
+the ownership and protection checks remain mandatory. Every other encoding
+must fail closed and reopen feasibility; tests must not broaden this set.
 
 Run the focused signed proof with:
 
@@ -561,12 +563,12 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
 production catalog admits semantic memory kind 1 introduced in minor 1; the
-current `2.9.0` writer additionally admits machine/global/topology kinds 2–4
+current `2.10.0` writer additionally admits machine/global/topology kinds 2–4
 and per-vCPU kind 5 introduced in minor 2, singleton time kind 6 introduced in
 minor 3, optional singleton device-graph kind 7 introduced in minor 4, and
 mandatory singleton serial kind 8 introduced in minor 7, plus optional entropy
-kind 9 introduced in minor 8 and optional balloon kind 10 introduced in minor
-9.
+kind 9 introduced in minor 8, optional balloon kind 10 introduced in minor 9,
+and optional virtio-mem kind 11 introduced in minor 10.
 Exact `2.4.0` retains device-graph profile 1's singleton root, while `2.5.0`
 uses profile 2's bounded ordered block vector and `2.6.0` uses profile 3's
 bounded ordered block-and-pmem vector. Exact `2.7.0` requires kind 8 and
@@ -575,6 +577,9 @@ rules and optionally appends kind 9 with one exact queue, dual buckets,
 pending/retry state, and MMIO/PCI placement. Exact `2.9.0` retains those rules
 and optionally appends kind 10 with variable active queue state, latest and
 pending statistics, DONE-normalized hint history, exact PFN accounting, and
+MMIO/PCI placement. Exact `2.10.0` retains those rules and optionally appends
+kind 11 with configuration, config space, an inactive or active queue, a canonical
+plugged-block bitmap bound to exact kind-1 extents, common virtio state, and
 MMIO/PCI placement. Exact `2.3.0` remains the
 legacy device-free platform profile. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
@@ -588,7 +593,7 @@ resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
 Native-v2 lazy-memory tests retain exact multi-extent binding and complete
-`2.1.0` compatibility fixtures while proving that new output uses `2.9.0`.
+`2.1.0` compatibility fixtures while proving that new output uses `2.10.0`.
 They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
 binding/header/topology/length mutation, exact admitted-version retention,
 typed state profiles,
@@ -666,7 +671,7 @@ The wrapper builds the `bangbang` binary unit-test harness, locates and signs
 that exact test executable, and runs only the ignored private-seam proof. Its
 minimal two-vCPU guest does not touch serial or optional devices beyond the
 required read-only root. The first test starts and pauses the real
-process-owned HVF supervisor, publishes one current 2.9
+process-owned HVF supervisor, publishes one current 2.10
 serial-plus-profile-3 MMIO-root pair without entropy, resumes and repauses the
 source, publishes a fresh recapture,
 and drops the source. It
@@ -1339,10 +1344,13 @@ records. #1634 promotes the final two pmem storage composites after native-v2
 after exact 2.7 direct and normal-production continuation certification. #1665
 activates exact native-v2 2.8 with optional entropy, and #1666 promotes the
 two entropy artifact/restore records after direct and normal-production
-continuation certification. #1680 activates current native-v2 2.9 with optional
+continuation certification. #1680 activates exact native-v2 2.9 with optional
 balloon, and #1681 promotes the two balloon aggregate records after direct and
+normal-production continuation certification. #1697 activates current
+native-v2 2.10 with optional virtio-mem, and #1698 promotes only the
+memory-hotplug corpus and virtio-mem lifecycle aggregate after direct and
 normal-production continuation certification. The current overlay is
-240/158/3/17.
+242/156/3/17.
 
 Snapshot paging feasibility, its standalone protocol/client, internal
 lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
@@ -1678,7 +1686,7 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
-- exact external snapshot grants creating current native-v2 2.9
+- exact external snapshot grants creating current native-v2 2.10
   serial-plus-profile-3 rooted three-drive MMIO and PCI pairs without entropy
   into separate output directories, reusing both retained
   directories for a second successful pair, preserving all finals on
@@ -1883,9 +1891,10 @@ punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
 separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
-checks exact `v2.9.0` output for `--snapshot-version`, exact description of
-native-v1, legacy `2.3.0`, `2.4.0`, `2.5.0`, `2.6.0`, `2.7.0`, and `2.8.0`, and current
-native-v2 fixtures, plus explicit pinned Firecracker/unknown incompatibility. It also
+checks exact `v2.10.0` output for `--snapshot-version`, exact description of
+native-v1, legacy `2.3.0`, `2.4.0`, `2.5.0`, `2.6.0`, `2.7.0`, `2.8.0`, and
+`2.9.0`, and current native-v2 fixtures, plus explicit pinned
+Firecracker/unknown incompatibility. It also
 covers missing, non-regular,
 oversized, malformed, truncated, trailing/inconsistent-length, corrupt,
 unsupported-version, incompatible-architecture, and incompatible-page-size
@@ -1939,7 +1948,7 @@ pausing, proving the source has already followed live MMIO or PCI root I/O.
 The source UART must remain canonical, while its Linux-consumed FDT bytes are
 captured and CRC-bound without being reparsed as trusted post-boot topology.
 Creation through `/snapshot/create` then verifies the real CLI reports
-`v2.9.0`. Fresh signed processes repeatedly load the same immutable pair: one
+`v2.10.0`. Fresh signed processes repeatedly load the same immutable pair: one
 remains paused until public `PATCH /vm`, and one uses `resume_vm: true`. The
 paused destination is also publicly recaptured and its decoded root graph must
 equal the source graph. After resume Linux reads the known root marker through
@@ -2133,6 +2142,51 @@ combinations, destination-unmapped accounting rejection, source recovery after
 over-bound create, fresh owner construction, rollback, and exact 2.3–2.8
 compatibility. Guest PFNs stay 4 KiB even though Darwin host-page reclaim
 normally aligns/coalesces at 16 KiB.
+
+Exact native-v2 2.10 virtio-mem continuation is certified separately by
+`signed_executable_certifies_native_v2_memory_hotplug_snapshot_continuation`
+and
+`normal_bundle_certifies_native_v2_memory_hotplug_snapshot_continuation_and_containment`.
+Both loop over MMIO and PCI. The checked Linux
+`bangbang.memory-hotplug-snapshot=1` guest records its pre-plug available
+memory, grows from 0 to 128 MiB, retains a Python mapping larger than that
+baseline, and writes a deterministic nonzero sentinel on every page. Each
+destination verifies every page as its first restored action before releasing
+the mapping or changing topology.
+
+The source publishes a byte-stable Full/File exact-2.10 pair with kind 11
+bound to the plugged kind-1 extents and terminates while Paused. One fresh
+destination remains Paused, verifies API/config/queue/accounting and the
+restored bytes, recaptures normalized state, and explicitly resumes. A second
+fresh destination automatically resumes from the same unchanged pair. Each
+then offlines the aperture, shrinks requested size from 128 to 64 MiB, unbinds
+and rebinds `virtio_mem`, observes the real reprobe UNPLUG_ALL transition,
+reissues the retained 64-MiB request to re-PLUG, grows to 128 MiB, and finally
+shrinks to zero. Exact destination metrics require 128 MiB plugged, 192 MiB
+unplugged, at least one successful UNPLUG_ALL, and zero failure counters.
+
+The normal production/App Sandbox case uses exact kernel/root/data/metrics/
+snapshot/API grants, replaces every source pathname after open, and requires
+the replacements and immutable pair to stay unchanged. Its representative MMIO
+faults cover checksum-corrupted state, structurally truncated memory, graceful
+cancellation, worker-first death, and launcher-first death with no published
+socket or retained session namespace. The lower-layer exact-2.10 suites retain
+fixed and hostile codec/bitmap/geometry/extent tests, a 523,264-block and
+65,408-byte bitmap bound, the 128-KiB component and 16-MiB state caps,
+block-granular materialization/dynamic mappings, all sixteen products,
+same-process immutable peer loads, controller commit/cancellation, owner
+rollback, signed recapture, and exact 2.3–2.9 readers.
+
+Run the focused signed proofs with:
+
+```sh
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  signed_executable_certifies_native_v2_memory_hotplug_snapshot_continuation \
+  --nocapture
+scripts/run-integration-tests.sh --test production_bundle -- \
+  normal_bundle_certifies_native_v2_memory_hotplug_snapshot_continuation_and_containment \
+  --nocapture
+```
 
 Runtime `PATCH /balloon` target-size updates are covered by unit, API socket,
 and process-session tests that verify stored config updates, active config-space
@@ -2357,7 +2411,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v87.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v100.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -2369,7 +2423,13 @@ public `/serial` output and waits for `BANGBANG_DIRECT_ROOTFS_BOOT_OK` in the
 host output file. Most other direct-rootfs executable HVF e2e scenarios observe
 guest success through a second writable scratch drive, using markers such as
 `BANGBANG_DIRECT_ROOTFS_BLOCK_OK`, because they do not configure a public serial
-output path. When the boot args also include `bangbang.mmds-fetch=1`, the same
+output path. With `bangbang.memory-hotplug-snapshot=1`, the script uses separate
+output, continuation, and reprobe sectors. It discovers the real `virtio_mem`
+device, retains and verifies the pressure-backed nonzero mapping described
+above, offlines aperture blocks, coordinates requested-size changes, unbinds
+and rebinds the driver, requires a real UNPLUG_ALL/replug transition, and
+publishes bounded success/failure markers for every restored topology stage.
+When the boot args also include `bangbang.mmds-fetch=1`, the same
 init script configures the
 first non-loopback guest interface with a link-local address, runs a bounded
 `curl` request for `/meta-data/bangbang-marker`, and writes

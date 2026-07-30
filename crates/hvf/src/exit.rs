@@ -45,8 +45,9 @@ const ESR_ISS_DFSC_MASK: u64 = 0x3f;
 // translation faults across zero-permission lazy instruction/data mappings,
 // while re-protecting a page after one writable epoch exits as a level-three
 // permission fault. The lazy classifier accepts that complete observed set.
-// The dirty-write predicate below deliberately remains narrower, and neither
-// classifier is ownership evidence without its handler's range/state checks.
+// Dirty tracking has also produced all three translation levels across static
+// and dynamically mapped RAM. Neither classifier is ownership evidence without
+// its handler's range/state checks.
 const ESR_ISS_DFSC_LEVEL_ONE_TRANSLATION: u64 = 0x05;
 const ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION: u64 = 0x06;
 const ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION: u64 = 0x07;
@@ -193,18 +194,23 @@ impl HvfExceptionExit {
         }
     }
 
-    /// Match only the syndrome observed for an HVF-protected write.
+    /// Match only the syndromes observed for an HVF-protected write.
     ///
     /// This predicate is not ownership evidence. The dirty tracker must also
     /// prove that `physical_address` identifies one of its protected RAM pages.
+    /// Cache-maintenance faults are admitted because Apple Silicon reports
+    /// Linux cache operations against write-protected RAM with both `WnR` and
+    /// `CM` set. Conservatively dirtying that owned page is safe and lets the
+    /// faulting operation retry after WRITE is restored.
     pub(crate) fn matches_observed_hvf_protected_write_syndrome(self) -> bool {
         let dfsc = self.syndrome & ESR_ISS_DFSC_MASK;
         exception_class(self.syndrome) == ESR_EC_DATA_ABORT_LOWER_EL
             && self.syndrome & ESR_ISS_WNR != 0
-            && self.syndrome & (ESR_ISS_CM | ESR_ISS_S1PTW) == 0
+            && self.syndrome & ESR_ISS_S1PTW == 0
             && matches!(
                 dfsc,
-                ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION
+                ESR_ISS_DFSC_LEVEL_ONE_TRANSLATION
+                    | ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION
                     | ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION
                     | ESR_ISS_DFSC_LEVEL_THREE_PERMISSION
             )
@@ -935,6 +941,7 @@ mod tests {
     #[test]
     fn classifies_signed_observed_anonymous_lazy_and_reprotected_write_faults() {
         for dfsc in [
+            ESR_ISS_DFSC_LEVEL_ONE_TRANSLATION,
             ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION,
             ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION,
             ESR_ISS_DFSC_LEVEL_THREE_PERMISSION,
@@ -944,6 +951,10 @@ mod tests {
 
             assert!(
                 exception_exit(syndrome, 0x4123).matches_observed_hvf_protected_write_syndrome()
+            );
+            assert!(
+                exception_exit(syndrome | ESR_ISS_CM, 0x4123)
+                    .matches_observed_hvf_protected_write_syndrome()
             );
         }
     }
@@ -959,10 +970,8 @@ mod tests {
             (0x20_u64 << ESR_EC_SHIFT) | ESR_ISS_WNR | ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION;
         let rejected = [
             candidate & !ESR_ISS_WNR,
-            candidate | ESR_ISS_CM,
             candidate | ESR_ISS_S1PTW,
             (candidate & !ESR_ISS_DFSC_MASK) | 0x04,
-            (candidate & !ESR_ISS_DFSC_MASK) | 0x05,
             (candidate & !ESR_ISS_DFSC_MASK) | 0x0c,
             (candidate & !ESR_ISS_DFSC_MASK) | 0x0e,
             same_el_data_abort,

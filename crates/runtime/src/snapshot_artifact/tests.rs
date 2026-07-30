@@ -1146,18 +1146,25 @@ fn exact_minor_ten_materialization_preserves_bytes_ownership_and_clean_isolation
             assert_eq!(region.backing(), GuestMemoryRegionBacking::PrivateFile);
         }
     }
+    let block_size = state.config_space().block_size();
     for range in first.topology().plugged_ranges() {
-        let region = first
-            .memory()
-            .regions()
-            .iter()
-            .find(|region| region.range() == *range)
-            .expect("every canonical plugged range should be active");
-        assert_eq!(region.backing(), GuestMemoryRegionBacking::Shared);
-        assert_eq!(
-            region.mapping_identity(),
-            first_reservation.mapping_identity()
-        );
+        let mut start = range.start().raw_value();
+        while start < range.end_exclusive().raw_value() {
+            let block = GuestMemoryRange::new(GuestAddress::new(start), block_size)
+                .expect("plugged block should validate");
+            let region = first
+                .memory()
+                .regions()
+                .iter()
+                .find(|region| region.range() == block)
+                .expect("every canonical plugged block should be active");
+            assert_eq!(region.backing(), GuestMemoryRegionBacking::Shared);
+            assert_eq!(
+                region.mapping_identity(),
+                first_reservation.mapping_identity()
+            );
+            start = block.end_exclusive().raw_value();
+        }
     }
 
     for range in source_ranges {
@@ -1523,10 +1530,10 @@ fn exact_minor_ten_dynamic_only_materialization_uses_no_placeholder_or_private_m
             File::open(&source_path).expect("dynamic-only source should open read-only"),
         )
         .expect("dynamic-only topology should materialize");
-    assert_eq!(
-        materialized.memory().regions().len(),
-        materialized.topology().plugged_ranges().len()
-    );
+    let config = materialized.topology().state().config_space();
+    let plugged_block_count = usize::try_from(config.plugged_size() / config.block_size())
+        .expect("plugged block count should fit usize");
+    assert_eq!(materialized.memory().regions().len(), plugged_block_count);
     assert!(
         materialized
             .memory()

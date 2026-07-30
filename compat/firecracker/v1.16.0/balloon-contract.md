@@ -141,9 +141,10 @@ MMIO, then dispatched after activation.
 
 ## Exact native-v2 2.9 terminal profile and limits
 
-- The current writer emits exact native-v2 `2.9.0`: required serial component
-  kind 8, optional unchanged profile-3 storage kind 7, optional unchanged
-  entropy kind 9, and optional balloon kind 10. Balloon-only,
+- Exact native-v2 `2.9.0` introduced required serial component kind 8,
+  optional unchanged profile-3 storage kind 7, optional unchanged entropy kind
+  9, and optional balloon kind 10. Current `2.10.0` retains kind 10 unchanged
+  and may independently add virtio-mem kind 11. Balloon-only,
   storage-plus-balloon, entropy-plus-balloon, and
   storage-plus-entropy-plus-balloon products are admitted with or without each
   optional predecessor, over one coherent MMIO or PCI transport.

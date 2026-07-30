@@ -4,14 +4,14 @@ This document records the implemented boundary and remaining roadmap for
 Firecracker-shaped snapshot APIs on macOS with Hypervisor.framework. bangbang
 supports a public bangbang-native Full/File lifecycle with a rooted or
 rootless ordered regular-file block-and-pmem profile-3 graph. The current
-writer is exact native-v2 2.9: it retains required complete serial state and
-independently permits optional storage, entropy, and balloon components, so all
-eight products share one Full/File lifecycle over coherent MMIO or PCI. Exact
-entropy-profile native-v2 2.8, serial-required native-v2 2.7, storage-only
-native-v2 2.6, block-only native-v2 2.5, single-root native-v2 2.4,
-device-free native-v2 2.3, and frozen native-v1 File/Uffd remain compatibility
-readers. Broader Firecracker snapshot-file and migration compatibility remains
-out of scope.
+writer is exact native-v2 2.10: it retains required complete serial state and
+independently permits optional storage, entropy, balloon, and virtio-mem
+components, so all sixteen products share one Full/File lifecycle over coherent
+MMIO or PCI. Exact balloon-profile native-v2 2.9, entropy-profile native-v2
+2.8, serial-required native-v2 2.7, storage-only native-v2 2.6, block-only
+native-v2 2.5, single-root native-v2 2.4, device-free native-v2 2.3, and
+frozen native-v1 File/Uffd remain compatibility readers. Broader Firecracker
+snapshot-file and migration compatibility remains out of scope.
 
 The immutable native-v2 `2.0.0` profile contains no semantic
 component, `2.1.x` adds one state-bound demand-paged File/COW memory image, and
@@ -22,10 +22,11 @@ read-only File/Sync root. Exact `2.5.0` retains kind 7 and activates profile 2
 with 1–64 ordered regular-file block records. Exact `2.6.0` activates profile
 3 with 1–64 ordered regular-file storage records spanning block and pmem over
 MMIO or the product PCI endpoint budget. Exact `2.7.0` adds mandatory serial
-component kind 8 and makes kind 7 optional without changing profile 3. Current
+component kind 8 and makes kind 7 optional without changing profile 3. Exact
 compatibility profile `2.8.0` retains that product and adds optional entropy
-component kind 9 over the selected MMIO or PCI transport. Current `2.9.0`
+component kind 9 over the selected MMIO or PCI transport. Exact `2.9.0`
 retains all earlier components and adds optional balloon component kind 10.
+Current `2.10.0` adds optional virtio-mem component kind 11.
 The storage graph may be rootless or
 select the first cross-storage record as root.
 Block records retain read-only/read-write, Sync/Async, Unsafe/Writeback,
@@ -43,12 +44,20 @@ host-side inflated-PFN accounting. Kind 10 admits at most 262,144 ranges and
 4 MiB inside the complete 16-MiB state-file cap. Guest PFNs are always 4 KiB;
 Darwin reclaim separately rounds inward and coalesces to destination host pages,
 normally 16 KiB, and remains best effort without a synchronous RSS guarantee.
+Virtio-mem retains exact configuration, features, config space, an inactive or
+active queue, common virtio and MMIO/PCI placement, and a canonical
+plugged-block bitmap bound to exact kind-1 extents. Kind 11 is capped at
+128 KiB inside the same 16-MiB state-file cap. Restore creates one fresh
+unlinked shared aperture with block-granular plugged views and a clean
+destination dirty epoch; source mapping identity, owner identity, and
+dirty-epoch identity do not cross the artifact.
 The public process reconstructs the complete multi-vCPU
 platform, time/identity ownership, fresh serial endpoint, any storage owners,
 fresh entropy source/metrics/scheduler/notifier/route/endpoint owners, and fresh
 balloon memory bindings/timer/metrics/reclaim/notifier/interrupt/dispatcher/
-endpoint/cleanup ownership through one newly authorized transaction. Optional
-devices other than pmem, serial, entropy, and balloon remain excluded.
+endpoint/cleanup ownership, and fresh virtio-mem aperture/mapping/dirty/
+notifier/interrupt/dispatcher/route/metrics/cleanup owners through one newly
+authorized transaction. Network, vsock, and MMDS restore remain excluded.
 `LazyGuestMemory` remains the backend-neutral
 private-anonymous
 coordinator for the external-paging roadmap; it is not the v2 File/COW loader
@@ -63,13 +72,15 @@ path adds Linux UFFD wire compatibility.
 bangbang implements two classified native state families, exact-version
 inspection, bound guest-memory image I/O, and one macOS no-clobber two-file
 publisher/loader. The current public writer captures an accepted paused
-native-v2 2.9 source into a state/memory pair. A fresh process consumes that
+native-v2 2.10 source into a state/memory pair. A fresh process consumes that
 pair through retained read-only private File/COW mappings, one exact
 storage-plus-serial authority transaction, optional fresh entropy owners, and
-optional fresh balloon owners, commits the complete destination initially
-paused, and optionally resumes through the ordinary lifecycle path. The public
-loader also recognizes entropy-profile native-v2 2.8, serial-required
-native-v2 2.7, storage-only native-v2 2.6, block-only native-v2
+optional fresh balloon owners plus one optional fresh unlinked shared
+virtio-mem aperture with block-granular plugged views, commits the complete
+destination initially paused, and optionally resumes through the ordinary
+lifecycle path. The public loader also recognizes balloon-profile native-v2
+2.9, entropy-profile native-v2 2.8, serial-required native-v2 2.7,
+storage-only native-v2 2.6, block-only native-v2
 2.5, singleton-root native-v2 2.4, device-free native-v2 2.3, and frozen
 native-v1 state, routing the latter to the unchanged eager File or macOS pager
 compatibility path.
@@ -86,21 +97,29 @@ extends the same boundary to a configured `SerialSink` grant and fresh default
 stdio. Exact 2.8 constructs entropy entirely from destination-local owners;
 signed normal-production paths cover immutable clones, malformed state,
 cancellation, worker/launcher death, and exact cleanup. Other optional-device
-overrides and broad portability remain unchanged. Current 2.9 adds balloon
+overrides and broad portability remain unchanged. Exact 2.9 adds balloon
 entirely from destination-local owners; signed direct and normal-production
 MMIO/PCI paths cover explicit/automatic resume, full-interval retained
 statistics, DONE then new hinting, reporting, inflate/deflate/API continuity,
 recapture, fresh metrics, immutable isolated clones, malformed state,
 cancellation, worker/launcher death, and exact cleanup.
+Current 2.10 adds optional virtio-mem kind 11. Signed direct and
+normal-production/App Sandbox MMIO/PCI destinations verify retained nonzero
+plugged-memory bytes before topology mutation, then continue partial UNPLUG,
+driver-reprobe UNPLUG_ALL/replug, later PLUG, and final UNPLUG through
+explicit-Paused/recapture and automatic fresh-process clones. The contained
+matrix also covers exact grants with pathname replacement, checksum-corrupted
+state, truncated memory, graceful cancellation, both independent death orders,
+immutable inputs, and session cleanup.
 
 - `PUT /snapshot/create` and `PUT /snapshot/load` parse and normalize complete
   request bodies into debug-redacted API and runtime values before reaching VMM
 action policy. Paths and override contents are never logged or echoed.
 - Create is paused-state-only and supports only `Full` for a 1–32-vCPU source
   with a configured boot source, complete live serial state, optional entropy
-  and balloon, and zero or 1–64 ordered regular-file block/pmem devices. No
-  optional device other than pmem, serial, entropy, and balloon, MMDS, boot timer, or vhost-user is
-  admitted. The storage graph may be rootless or have one first cross-storage
+  balloon, and virtio-mem, and zero or 1–64 ordered regular-file block/pmem
+  devices. Network, vsock, MMDS, boot timer, and vhost-user are not admitted.
+  The storage graph may be rootless or have one first cross-storage
   root. Block records may mix
   access, engine, cache, partuuid, and limiter state; pmem records retain
   access, limiter, exact file/mapped geometry, and mapping state. Every storage
@@ -118,9 +137,9 @@ action policy. Paths and override contents are never logged or echoed.
   shared registry placement needed to recreate the complete owner vector. Pmem
   additionally binds exact file length, aligned mapped length, and guest
   range/configuration-space state. This activation does not generalize PCI
-  persistence to network, vsock, virtio-mem, vhost-user, or host-adapter state.
-  Entropy's separate exact 2.8 component and balloon's exact 2.9 component each
-  carry their selected MMIO or PCI placement.
+  persistence to network, vsock, vhost-user, or host-adapter state. Entropy's
+  separate exact 2.8 component, balloon's exact 2.9 component, and virtio-mem's
+  exact 2.10 component each carry their selected MMIO or PCI placement.
 - Before applying those native-v2 profile exclusions, paused create asks
   the boot owner for one complete capture-ready storage traversal. It reconciles
   every configured startup or runtime block/pmem device with its authoritative
@@ -129,13 +148,15 @@ action policy. Paths and override contents are never logged or echoed.
   together, drained together, and have every completion plus its MMIO SPI or PCI
   MSI-X interrupt published before state capture and same-generation reopen.
   An admitted regular-file vector feeds the profile-3 graph shared by exact
-  2.6, 2.7, 2.8, and current 2.9.
+  2.6, 2.7, 2.8, 2.9, and current 2.10.
   Vhost-user and any broader optional-device inventory remain followed by profile
   rejection, so they publish no artifact bytes and create no load contract.
 - An admitted create holds one scoped supervisor transaction from FIFO
   admission through publication. It failure-atomically quiesces block, PMEM,
-  network, entropy retry, and balloon-statistics schedulers, preflights both final namespaces,
-  captures aggregate state, streams complete memory, verifies and synchronizes
+  network, entropy retry, balloon-statistics, and virtio-mem publishers,
+  preflights both final namespaces,
+  captures aggregate state, streams complete mixed base/aperture memory,
+  verifies and synchronizes
   the artifacts, commits memory first and state last, and invokes the explicit
   successful-publication hook before releasing auxiliary ownership and command
   admission. Success returns `204 No Content` and leaves the source paused and
@@ -151,7 +172,8 @@ action policy. Paths and override contents are never logged or echoed.
   selects a `bangbang-pager-v1` Unix peer rather than a memory file or Linux
   UFFD transport.
 - A valid current native-v2 load performs full bounded state, memory, FDT,
-  UART, HVF, topology, time, identity, optional device-graph, entropy,
+  UART, HVF, topology, time, identity, optional device-graph, entropy, balloon,
+  virtio-mem,
   transport, and complete storage-plus-serial resource validation before
   constructing a fresh VM. Every selector stays inert until exact set, order,
   identity, role,
@@ -184,7 +206,7 @@ action policy. Paths and override contents are never logged or echoed.
   invocation, restored acknowledgement/reconnect/override proof,
   clone/versioning, and portability. The signed source resume is deliberately
   not described as artifact restore.
-- `--snapshot-version` prints the current writer version `v2.9.0`.
+- `--snapshot-version` prints the current writer version `v2.10.0`.
   `--describe-snapshot <PATH>` opens a bounded regular file with the same
   nonblocking, path-redacted startup-file policy, classifies and fully
   validates either native-v1 or native-v2, and prints its exact embedded
@@ -337,15 +359,18 @@ the 64-byte header plus its eight-byte CRC, nonsemantic extensions can be
 structurally represented, and every required feature or semantic component
 rejects. Minor 1 adds semantic memory kind `1`, whose typed profile requires
 its sole instance to be `0`. Minor 2 adds semantic machine kind `2`, global
-kind `3`, topology kind `4`, and per-vCPU kind `5`. The current writer emits
-`2.5.0`; minor 3 adds singleton time/clone-identity kind `6`, minor 4 adds
-mandatory singleton device-graph kind `7` with profile 1, and minor 5 retains
-kind 7 while activating profile 2's bounded ordered block vector. The
-required-feature catalog remains empty because those semantic component kinds
-are the mandatory compatibility identities. Decoded `2.1.x`, `2.2.x`,
-`2.3.x`, and exact `2.4.0` memory bindings retain their exact admitted version
-so their unchanged paired image headers still validate; newly written bindings
-use `2.5.0`. No other identifier or future minor is reserved.
+kind `3`, topology kind `4`, and per-vCPU kind `5`. Minor 3 adds singleton
+time/clone-identity kind `6`; minor 4 adds mandatory singleton device-graph
+kind `7` with profile 1; minor 5 retains kind 7 while activating profile 2's
+bounded ordered block vector; minor 6 selects profile 3; minor 7 adds required
+serial kind 8 and makes kind 7 optional; minors 8 and 9 add optional entropy
+kind 9 and balloon kind 10; and current minor 10 adds optional virtio-mem kind
+11. The current writer emits `2.10.0`. The required-feature catalog remains
+empty because those semantic component kinds are the mandatory compatibility
+identities. Decoded `2.1.x`, `2.2.x`, `2.3.x`, and exact `2.4.0` through
+`2.9.0` memory bindings retain their exact admitted version so their unchanged
+paired image headers still validate; newly written bindings use `2.10.0`. No
+other identifier or future minor is reserved.
 
 Decoding first checks the fixed header, version, count caps, checked length and
 offset arithmetic, exact length, whole-state CRC, complete feature inventory,
@@ -375,7 +400,7 @@ binding header followed by one 24-byte entry per ordered guest extent:
 | Offset | Width | Field | Native-v2 memory rule |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | bytes `BANGM2A\0` |
-| 8..14 | 6 | semantic version | admitted `2.1.x`, `2.2.x`, `2.3.x`, exact `2.4.0`, exact `2.5.0`, exact `2.6.0`, exact `2.7.0`, exact `2.8.0`, or exact `2.9.0`; current writer emits `2.9.0` |
+| 8..14 | 6 | semantic version | admitted `2.1.x`, `2.2.x`, `2.3.x`, exact `2.4.0`, exact `2.5.0`, exact `2.6.0`, exact `2.7.0`, exact `2.8.0`, exact `2.9.0`, or exact `2.10.0`; current writer emits `2.10.0` |
 | 14 | 2 | header bytes | exact `64` |
 | 16 | 4 | flags | must be zero |
 | 20 | 4 | guest granule | exact `4096` bytes |
@@ -768,6 +793,48 @@ recapture, immutable same- and fresh-process clones, destination-only metrics,
 malformed state, graceful cancellation, both death orders, pathname
 replacement, redaction, containment, and cleanup.
 
+### Native V2 2.10 Virtio-Mem Activation
+
+#1697 activates exact `2.10.0` and #1698 certifies its public continuation and
+containment boundary. Required kind `8` serial and optional kind `7` storage,
+kind `9` entropy, and kind `10` balloon retain their exact codecs. New optional
+kind `11` contains one bounded `BANGME2\0` profile-1 virtio-mem value.
+Independent presence of the four optional components yields all sixteen
+products, and every present virtio component uses the process-selected MMIO or
+PCI transport.
+
+Kind 11 has one fixed header and ordered memory-hotplug-local, plugged-bitmap,
+common-virtio, and transport sections. It retains external configuration,
+available and negotiated features, activation, config-space requested and
+usable sizes, exact one-queue mapping/cursors/notification and interrupt
+intent, canonical MMIO or PCI placement, and one bit per configured device
+block. The bitmap admits at most 523,264 blocks and 65,408 bytes; the
+worst-case component is 65,920 bytes and the public cap is 128 KiB inside the
+16-MiB state-file ceiling.
+
+The kind-1 memory binding is authoritative for bytes. Capture emits base File
+extents plus exact plugged aperture extents and closes their ordered coverage
+against kind 11. Restore rejects any bitmap/geometry/extent mismatch before
+publication, maps base RAM privately, creates one fresh unlinked shared
+aperture, and exposes only block-granular plugged views. Source mappings,
+handles, dirty-epoch identity, metrics, notifier/interrupt/dispatcher/route
+authority, endpoints, and cleanup ownership do not enter the artifact; every
+destination creates those owners fresh and starts a clean dirty epoch.
+
+Focused codec, geometry, bitmap, allocation, product, materialization,
+controller, cancellation, owner-rollback, and signed-HVF tests cover both
+transports and all sixteen products. Signed direct and normal-production/App
+Sandbox MMIO/PCI destinations load the same immutable Full/File pair, verify a
+retained nonzero guest sentinel before any mutation, recapture normalized
+state, and continue partial UNPLUG, driver-reprobe UNPLUG_ALL/replug, later
+PLUG, and final UNPLUG through explicit-Paused and automatic-resume clones.
+Contained coverage adds exact grants and pathname replacement, checksum-
+corrupted state, structurally truncated memory, graceful cancellation, both
+independent death orders, and session cleanup. Diff, native-v2 Uffd,
+network/vsock/MMDS restore, Firecracker artifact bytes, source owner/dirty
+identity, synchronous host RSS, and unconstrained cross-host portability
+remain explicit non-claims.
+
 ### Native V2 HVF Platform State Profile
 
 Minor 2 defines the base editor-friendly platform graph, minor 3 appends its
@@ -775,7 +842,8 @@ portable time/clone-identity component, minor 4 appends device-graph profile 1,
 minor 5 retains the same component key with profile 2, and minor 6 selects
 profile 3. Minor 7 adds mandatory serial kind 8 and makes kind 7 optional.
 Minor 8 retains those rules and adds optional entropy kind 9. Minor 9 retains
-all earlier components and adds optional balloon kind 10. Every directory entry
+all earlier components and adds optional balloon kind 10. Minor 10 retains all
+earlier components and adds optional virtio-mem kind 11. Every directory entry
 is semantic, singleton kinds appear exactly once, and per-vCPU instances are
 contiguous:
 
@@ -787,26 +855,30 @@ contiguous:
 | `(4, 0)` | `BANGTP2\0` stable topology and PSCI lifecycle state | exactly one |
 | `(5, i)` | `BANGVC2\0` complete state for vCPU index/MPIDR `i` | `i = 0..vcpu_count-1` |
 | `(6, 0)` | `BANGTM2\0` portable PL031/PVTime/VMGenID/VMClock state and policies | exactly one, after all vCPUs |
-| `(7, 0)` | `BANGD2A\0` exact profile-1 singleton root, profile-2 ordered block graph, or profile-3 ordered block-and-pmem graph | exactly one in 2.4/2.5/2.6; optional profile 3 in 2.7/2.8/2.9, after time state |
-| `(8, 0)` | `BANGSR2\0` exact endpoint intent, limiter configuration, complete UART state, RX FIFO, and pending work | exactly one in 2.7/2.8/2.9, after optional storage |
-| `(9, 0)` | `BANGEN2\0` exact entropy configuration, queue, dual buckets, pending/retry, common virtio, and MMIO/PCI transport state | optional in 2.8/2.9, after serial |
-| `(10, 0)` | `BANGBL2\0` exact balloon configuration, variable queues, statistics/pending work, hint history, accounting, common virtio, and MMIO/PCI transport state | optional in 2.9, after entropy |
+| `(7, 0)` | `BANGD2A\0` exact profile-1 singleton root, profile-2 ordered block graph, or profile-3 ordered block-and-pmem graph | exactly one in 2.4/2.5/2.6; optional profile 3 in 2.7/2.8/2.9/2.10, after time state |
+| `(8, 0)` | `BANGSR2\0` exact endpoint intent, limiter configuration, complete UART state, RX FIFO, and pending work | exactly one in 2.7/2.8/2.9/2.10, after optional storage |
+| `(9, 0)` | `BANGEN2\0` exact entropy configuration, queue, dual buckets, pending/retry, common virtio, and MMIO/PCI transport state | optional in 2.8/2.9/2.10, after serial |
+| `(10, 0)` | `BANGBL2\0` exact balloon configuration, variable queues, statistics/pending work, hint history, accounting, common virtio, and MMIO/PCI transport state | optional in 2.9/2.10, after entropy |
+| `(11, 0)` | `BANGME2\0` exact virtio-mem configuration, config space, queue, plugged bitmap, common virtio, and MMIO/PCI transport state | optional in 2.10, after balloon |
 
 The legacy platform scan requires 6–37 entries in that exact key order; the
 exact 2.4–2.6 graph-bearing profiles require 7–38, exact 2.7 requires 7–39,
 exact 2.8 requires 7–40 depending on optional storage and entropy, and exact
-2.9 requires 7–41 depending on optional storage, entropy, and balloon. All
+2.9 requires 7–41 depending on optional storage, entropy, and balloon. Exact
+2.10 requires 7–42 depending on optional storage, entropy, balloon, and
+virtio-mem. All
 validate before payload-dependent allocation. Kinds 2–6 require profile 1;
 kind 7 requires profile 1 at exact 2.4, profile 2 at exact 2.5, or profile 3 at
-exact 2.6/2.7/2.8/2.9; kind 8 requires profile 1 at exact 2.7/2.8/2.9; kind 9
-requires profile 1 at exact 2.8/2.9; and kind 10 requires profile 1 at exact
-2.9. Every payload requires its exact fixed header size, zero flags/reserved
+exact 2.6/2.7/2.8/2.9/2.10; kind 8 requires profile 1 at exact
+2.7/2.8/2.9/2.10; kind 9 requires profile 1 at exact 2.8/2.9/2.10; kind 10
+requires profile 1 at exact 2.9/2.10; and kind 11 requires profile 1 at exact
+2.10. Every payload requires its exact fixed header size, zero flags/reserved
 fields, exact checked lengths, and complete consumption.
 
 Kind 2 stores the checked machine configuration, bounded native kernel/initrd
 path bytes, optional UTF-8 boot arguments, deterministic live-FDT
 placement/size, a redacted checksum identity, and one version-defined FDT
-profile word. Exact 2.3 requires the legacy zero value; exact 2.4 through 2.9
+profile word. Exact 2.3 requires the legacy zero value; exact 2.4 through 2.10
 require the product value proving that VMM-owned source admission used the
 versioned process shell. Paths are inert metadata: construction and decode
 neither resolve nor open them. A custom CPU-template receipt contains at most 256
@@ -886,11 +958,12 @@ already-authorized `GuestMemory`. Exact ranges, retained live-FDT
 address/length/checksum, destination cache facts, time metadata, guest ABI
 bytes, PVTime records, identity destinations, and notification lines are
 checked before VM creation. Legacy 2.3 additionally parses those bytes as its
-exact default process shell. Exact 2.4 through current 2.9 instead require the
+exact default process shell. Exact 2.4 through current 2.10 instead require the
 source-product profile word and derive the versioned product shell from the
 typed machine, transport, interrupt, optional storage graph, required serial
 component from 2.7 onward, optional entropy component from 2.8 onward, and
-optional 2.9 balloon component after checking every cross-binding. The
+optional 2.9 balloon and 2.10 virtio-mem components after checking every
+cross-binding. The
 focused guard then creates VM, memory/dirty tracking, exact GIC, the
 complete never-run topology, retained CPU-template targets, common identity,
 global GIC, and canonical per-vCPU state. It next creates a fresh PL031,
@@ -916,11 +989,12 @@ destination endpoints. Exact 2.8 onward additionally reconstructs optional
 entropy with fresh source/metrics/scheduler/notifier/route/endpoint ownership.
 Exact 2.9 additionally reconstructs optional balloon with fresh memory,
 timer, metrics, reclaim, notifier/interrupt/dispatcher, endpoint, and cleanup
-ownership. It
+ownership. Exact 2.10 additionally reconstructs optional virtio-mem with a
+fresh unlinked shared aperture and destination-local mapping, dirty, notifier,
+interrupt, dispatcher, route, metrics, endpoint, and cleanup ownership. It
 commits that owner into the normal lifecycle initially `Paused`. Public
-native-v2 activation uses this exact boundary; serialization/restoration for
-optional devices other than pmem, serial, entropy, and balloon remains in
-their device slices.
+native-v2 activation uses this exact boundary; network, vsock, MMDS, and
+vhost-user serialization/restoration remain in their device slices.
 
 ### Stable Paused vCPU Topology State
 
@@ -961,9 +1035,9 @@ legacy `2.3.0` retains that exact topology payload and appends the
 time/clone-identity component. Exact `2.4.0` retains both and appends the
 single-root device graph; exact `2.5.0` retains the same platform/time payloads
 and selects kind 7's ordered regular-file block profile; exact `2.6.0` selects
-the ordered block-and-pmem profile. Current `2.7.0` adds required kind 8 serial
-state and makes kind 7 optional. Production-resource ownership for optional
-devices other than pmem and serial remains outside it.
+the ordered block-and-pmem profile. Exact `2.7.0` adds required kind 8 serial
+state and makes kind 7 optional; later exact profiles add entropy, balloon, and
+virtio-mem without changing the topology value.
 
 ## Native V1 Guest-Memory Image and Binding
 
@@ -1188,9 +1262,10 @@ vhost snapshot support. Wave 6 owns those versioned decisions.
 
 The supervisor command detaches the accepted machine/drive/serial
 configuration, reserves FIFO snapshot admission on a paused worker, and
-failure-atomically quiesces block, PMEM, network, and entropy retry schedulers.
-Only after all four acknowledge does it drain already-published tokens into
-deferred work. One aggregate runner command then atomically reserves metadata,
+failure-atomically quiesces block, PMEM, network, entropy retry,
+balloon-statistics, and virtio-mem publishers. Only after every applicable
+publisher acknowledges does it drain already-published tokens into deferred
+work. One aggregate runner command then atomically reserves metadata,
 core, timer, and interrupt operation domains and captures its fixed state order.
 The boot session reuses the atomic cache manifest retained at startup,
 cross-checks its MMFR2 identity against the runner capture, captures baseline
@@ -1224,9 +1299,9 @@ ownership on separate threads:
 | Owner | Live resources and responsibilities |
 | --- | --- |
 | Process owner | `ProcessVmm` owns the VMM controller, startup executor, and active `BootRunLoopSupervisor` handle. It serves API requests and commits public instance-state transitions, but it does not own the live boot session after startup. |
-| Boot worker | The `bangbang-hvf-boot-loop` thread owns `ProcessHvfBootSession`, including packet I/O and `OwnedHvfArm64BootSession`. The latter owns mapped guest memory, the MMIO dispatcher and device resources, GIC metadata, metrics state, entropy state, and block, PMEM, network, and entropy retry schedulers. Device-update commands and the native-family publishers execute here under snapshot admission. |
+| Boot worker | The `bangbang-hvf-boot-loop` thread owns `ProcessHvfBootSession`, including packet I/O and `OwnedHvfArm64BootSession`. The latter owns mapped guest memory, the MMIO dispatcher and device resources, GIC metadata, metrics state, entropy, balloon, and virtio-mem state, and the block, PMEM, network, entropy-retry, balloon-statistics, and virtio-mem publishers. Device-update commands and the native-family publishers execute here under snapshot admission. |
 | vCPU runner | The `bangbang-hvf-vcpu` thread owns `HvfVcpuOwner`. `HvfVcpuRunner` serializes HVF operations through commands and can return immutable X0-X30, PC, and CPSR values; guest-visible MIDR, MPIDR, and baseline PFR/DFR/ISAR/MMFR compatibility metadata; optional macOS 15.2 ZFR0/SMFR0 SVE/SME compatibility metadata; mutable macOS 15.2 SME `PSTATE.SM`/`PSTATE.ZA` controls; conditional maximum-width macOS 15.2 streaming Z0-Z31 bytes, maximum-derived P0-P15 predicate bytes, a maximum-SVL-square ZA matrix, and fixed 64-byte SME2 ZT0 contents in separate debug-redacted values; raw macOS 15.2 SMCR_EL1, SMPRI_EL1, and TPIDR2_EL0 values in a debug-redacted value; raw macOS 15.2 SCXTNUM_EL0 and SCXTNUM_EL1 software context numbers in a debug-redacted value with paired ordered restore; raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 values with paired ordered restore; raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and VBAR_EL1 values; raw ACTLR_EL1 and CPACR_EL1 values; raw CSSELR_EL1 cache-selection state with paired ordered restore; every DFR0-reported raw DBGBVR/DBGBCR hardware-breakpoint pair; every DFR0-reported raw DBGWVR/DBGWCR hardware-watchpoint pair; raw MDCCINT_EL1 and MDSCR_EL1 debug controls with paired ordered restore; raw Hypervisor.framework debug-exception and debug-register-access trap policy with paired ordered restore; raw SCTLR_EL1, TTBR0_EL1, TTBR1_EL1, TCR_EL1, MAIR_EL1, AMAIR_EL1, and CONTEXTIDR_EL1 values with paired ordered restore; raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 values with paired ordered restore; raw baseline Q0-Q31, FPCR, and FPSR values with paired ordered restore; raw APIA, APIB, APDA, APDB, and APGA pointer-authentication keys in a debug-redacted value with paired ordered restore; raw physical/virtual timers plus a normalized freeze-downtime timer value with paired never-run restore; CPU-level IRQ/FIQ pending values with paired ordered restore; Hypervisor.framework's opaque GIC device-state bytes with paired pre-first-run apply; or raw EL1 GIC ICC CPU-interface values with paired owner-thread capture and pre-first-run restore of nine mutable registers plus derived-RPR validation. A separate one-attempt never-run aggregate validates and restores every implemented breakpoint/watchpoint plus compatible SME PSTATE/system/Z/P/ZA/ZT0 and authoritative SIMD/FP state in one owner command; any failure makes that runner permanently execution-ineligible. The public native-v2 writer and native-v1/native-v2 loaders capture or restore their admitted state through aggregate commands that hold metadata, core, timer, and interrupt admission until completion. |
-| Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation during ordinary running or paused operation. Native snapshot publication temporarily quiesces all four current retry schedulers through artifact commit and the post-publication hook. The synchronous process owner cannot dispatch another API/MMDS/controller mutation or periodic callback until publication returns. The vmnet interface, vsock listener, retained streams, peers, and their host/kernel buffers remain outside snapshot state; the accepted profile has no network/vsock device, and a transient vsock polling thread is joined at the end of each vCPU run step. |
+| Auxiliary and host | Limiter retry threads retain deadlines and can request vCPU cancellation during ordinary running or paused operation. Native snapshot publication temporarily quiesces every applicable auxiliary publisher through artifact commit and the post-publication hook. The synchronous process owner cannot dispatch another API/MMDS/controller mutation or periodic callback until publication returns. The vmnet interface, vsock listener, retained streams, peers, and their host/kernel buffers remain outside snapshot state; the accepted profile has no network/vsock device, and a transient vsock polling thread is joined at the end of each vCPU run step. |
 
 A successful public pause has a narrower boundary than a snapshot needs:
 
@@ -1859,10 +1934,12 @@ The implemented low-level guest-CPU primitive instead removes WRITE from every
 mapped writable guest-RAM range with `hv_vm_protect`, records the first owned
 page exit, restores that page's original permission, and leaves the same store
 for the caller's next bounded run. Signed Apple Silicon evidence observes EC
-`0x24`, WnR set, CM/S1PTW clear, and exact DFSC `0x07` for initial protection
-or `0x0f` after a page is re-protected for the next epoch. Those values are an
-empirical Hypervisor.framework contract, not encodings Apple documents; every
-other value is declined and follows the existing MMIO/error path.
+`0x24`, WnR set, S1PTW clear, and translation DFSC `0x05`, `0x06`, or `0x07`,
+or level-three permission DFSC `0x0f`. CM may be clear for ordinary stores or
+set for observed Linux cache-maintenance writes. Those values are an empirical
+Hypervisor.framework contract, not encodings Apple documents; every other
+value is declined and follows the existing MMIO/error path. Exact
+tracker-owned, currently protected IPA validation remains mandatory.
 
 The primitive starts only after memory mapping and before any vCPU owner, and it
 stops only after every owner has joined. Activation protects complete ranges
@@ -2265,12 +2342,13 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | Native-v2 2.4 root activation (implemented compatibility profile) | #1589 advanced only the then-current writer to `2.4.0`, preserved exact device-free 2.3 compatibility, and admitted one read-only File/Sync root over MMIO or PCI. The mandatory device graph binds configuration, block runtime, common virtio, and transport state to the same state/memory candidate. Public load validates the complete graph, authorizes the inert root selector at the destination, keeps the backing lease provisional through owner construction, and commits it only with the Paused session/controller handoff. Exact 2.4 remains readable with those unchanged limits. | Exact 2.3/2.4 version and graph boundary fixtures; hostile graph/candidate/transport/backing mutations; MMIO/PCI public create/load and controller-handoff fault injection; collision, redaction, retry, terminal, and lease cleanup tests; signed direct two-vCPU root create/restore and signed production root-grant identity across replacement, explicit/automatic resume, immutable artifacts, and cleanup. |
 | Native-v2 2.5 regular-file multi-block activation and certification (implemented compatibility profile) | #1616 advanced the then-current writer to exact `2.5.0` profile 2 with rooted or rootless ordered vectors of 1–64 regular-file block devices over MMIO or the product PCI budget. Mixed RO/RW, Sync/Async, Unsafe/Writeback, partuuid, limiter/retry, queue, interrupt, and transport state bind to the same immutable state/memory pair. Load derives one exact keyed complete-set transaction with no fallback or per-drive override and commits every lease/fresh Async generation with the Paused session. File/COW memory is private; externally managed writable drive bytes are deliberately shared and require operator serialization. Vhost-user and optional devices remain excluded from exact 2.5. | #1617's finite create/load stage matrix; hostile profile/graph/state-memory/authority/geometry/transport/Async/controller/completion/cancellation/cleanup injections; exact retryable/terminal/redaction checks; signed direct and normal-production rooted/rootless × MMIO/PCI deterministic all-drive pre/post-capture persistence, limiter/interrupt progress, recapture, fresh destination ownership, explicit/automatic resume, immutable state/memory, shared writable epochs, retained grants, collision/replacement safety, and both worker/launcher death orders. |
 | Native-v2 2.6 regular-file block-and-pmem activation and certification (implemented compatibility profile) | #1634 advanced the then-current writer to exact `2.6.0` profile 3 with 1–64 ordered block/pmem records, rooted or rootless across the storage classes. It persists exact configuration/runtime/limiter/queue/interrupt/mapping and MMIO/PCI transport state, then resolves one direct or contained keyed complete-set transaction without ambient fallback. State/memory and File/COW RAM remain immutable/private; writable external block and pmem prefixes deliberately share bytes, while each fresh pmem private tail starts zero. | Fixed profile-3 fixtures; hostile missing/extra/swapped/aliased/role/kind/access/length/geometry/cancellation/construction/controller/completion/cleanup tests; signed direct and normal-production rooted pmem-only/rootless mixed × MMIO/PCI pre/post-capture persistence, read-only protection, limiter/interrupt progress, recapture, explicit/automatic resume, immutable-pair reuse, shared writable epochs, fresh zero DAX tails, exact grants, replacement safety, and worker/launcher death cleanup. |
-| Native-v2 2.7 serial activation and certification (implemented compatibility profile) | #1651 added mandatory complete serial state with optional unchanged profile-3 storage; #1652 certifies fresh default/configured endpoint reconstruction, exact UART registers/RX/status/pending work, serial-only and MMIO/PCI-storage products, complete direct/contained authority, repeated immutable loads, recapture, and destination-local limiter/metrics/terminal/FIFO policy. Current 2.9 retains this component unchanged. | Exact codec/cross-graph/resource/fault/compatibility fixtures; private signed HVF reconstruction; signed direct bare-arm64 default stdio and configured regular-file/FIFO continuation; signed normal production/App Sandbox default-pipe and configured write-only-grant continuation with pathname replacement, source-only byte exclusion, redaction, and cleanup. |
-| Native-v2 2.8 entropy activation and certification (implemented compatibility profile) | #1665 adds optional exact entropy state after required serial and optional unchanged profile-3 storage. It retains negotiated/activated one-queue state, dual limiter buckets, one pending descriptor, retry intent, common virtio state, and MMIO/PCI placement while reconstructing fresh source, metrics, scheduler, notifier, route, and endpoint owners. #1666 certifies entropy-only-relative-to-serial and storage-plus-entropy products, no-second-kick continuation, immutable clones, and hostile contained lifecycle cleanup. Current 2.9 retains this component unchanged. | Fixed exact codec and hostile relation fixtures; public product/resource/stage failure matrices; deterministic fresh-source factory counts; signed HVF recapture/rollback; signed direct MMIO/PCI explicit/automatic restored Linux `/dev/hwrng` continuation; signed normal production/App Sandbox create/load, recapture, pathname replacement, malformed state, cancellation, worker/launcher death, redaction, immutable reuse, and cleanup; retained exact 2.3–2.7 readers. |
-| Native-v2 2.9 balloon activation and certification (implemented current profile) | #1680 adds optional exact balloon kind 10 after required serial and independently optional unchanged storage/entropy. It retains configuration/features, variable queue cursors, latest and pending statistics, DONE-normalized hint history, exact accounting, common virtio state, and MMIO/PCI placement while reconstructing fresh memory bindings, timer, metrics, reclaim adviser, notifier/interrupt/dispatcher, endpoint, and cleanup ownership. #1681 certifies all four balloon-bearing products, full destination-local polling, new hint runs, reporting, inflate/deflate/API continuity, immutable clones, malformed state, cancellation/death, and contained cleanup. | Fixed exact codec, 262,144-range/4-MiB component/16-MiB state bounds, hostile relation and destination-memory fixtures; public product/resource/stage failure matrices; signed HVF recapture/rollback; signed direct MMIO/PCI explicit/automatic restored Linux balloon continuation; signed normal production/App Sandbox create/load, recapture, pathname replacement, malformed state, cancellation, worker/launcher death, redaction, immutable reuse, destination-only metrics, best-effort reclaim, and cleanup; retained exact 2.3–2.8 readers. |
+| Native-v2 2.7 serial activation and certification (implemented compatibility profile) | #1651 added mandatory complete serial state with optional unchanged profile-3 storage; #1652 certifies fresh default/configured endpoint reconstruction, exact UART registers/RX/status/pending work, serial-only and MMIO/PCI-storage products, complete direct/contained authority, repeated immutable loads, recapture, and destination-local limiter/metrics/terminal/FIFO policy. Current 2.10 retains this component unchanged. | Exact codec/cross-graph/resource/fault/compatibility fixtures; private signed HVF reconstruction; signed direct bare-arm64 default stdio and configured regular-file/FIFO continuation; signed normal production/App Sandbox default-pipe and configured write-only-grant continuation with pathname replacement, source-only byte exclusion, redaction, and cleanup. |
+| Native-v2 2.8 entropy activation and certification (implemented compatibility profile) | #1665 adds optional exact entropy state after required serial and optional unchanged profile-3 storage. It retains negotiated/activated one-queue state, dual limiter buckets, one pending descriptor, retry intent, common virtio state, and MMIO/PCI placement while reconstructing fresh source, metrics, scheduler, notifier, route, and endpoint owners. #1666 certifies entropy-only-relative-to-serial and storage-plus-entropy products, no-second-kick continuation, immutable clones, and hostile contained lifecycle cleanup. Current 2.10 retains this component unchanged. | Fixed exact codec and hostile relation fixtures; public product/resource/stage failure matrices; deterministic fresh-source factory counts; signed HVF recapture/rollback; signed direct MMIO/PCI explicit/automatic restored Linux `/dev/hwrng` continuation; signed normal production/App Sandbox create/load, recapture, pathname replacement, malformed state, cancellation, worker/launcher death, redaction, immutable reuse, and cleanup; retained exact 2.3–2.7 readers. |
+| Native-v2 2.9 balloon activation and certification (implemented compatibility profile) | #1680 adds optional exact balloon kind 10 after required serial and independently optional unchanged storage/entropy. It retains configuration/features, variable queue cursors, latest and pending statistics, DONE-normalized hint history, exact accounting, common virtio state, and MMIO/PCI placement while reconstructing fresh memory bindings, timer, metrics, reclaim adviser, notifier/interrupt/dispatcher, endpoint, and cleanup ownership. #1681 certifies all four balloon-bearing products, full destination-local polling, new hint runs, reporting, inflate/deflate/API continuity, immutable clones, malformed state, cancellation/death, and contained cleanup. | Fixed exact codec, 262,144-range/4-MiB component/16-MiB state bounds, hostile relation and destination-memory fixtures; public product/resource/stage failure matrices; signed HVF recapture/rollback; signed direct MMIO/PCI explicit/automatic restored Linux balloon continuation; signed normal production/App Sandbox create/load, recapture, pathname replacement, malformed state, cancellation, worker/launcher death, redaction, immutable reuse, destination-only metrics, best-effort reclaim, and cleanup; retained exact 2.3–2.8 readers. |
+| Native-v2 2.10 virtio-mem activation and certification (implemented current profile) | #1697 adds optional exact virtio-mem kind 11 after required serial and independently optional unchanged storage/entropy/balloon. It binds configuration, features, config space, queue, common virtio and MMIO/PCI placement, and a canonical plugged bitmap to exact kind-1 mixed File/COW memory extents while restoring one fresh shared aperture and destination-local owners. #1698 certifies all eight virtio-mem-bearing products, byte-first retained-memory proof, partial UNPLUG, driver-reprobe UNPLUG_ALL/replug, later PLUG/final UNPLUG, explicit-Paused recapture, automatic clones, immutable inputs, malformed state/memory, cancellation/death, and contained cleanup. | Fixed exact codec, 523,264-block/65,408-byte bitmap/128-KiB component/16-MiB state bounds, hostile geometry/extent/memory/product fixtures; materialization and dynamic-mapping tests; public all-sixteen-product and same-process peer matrices; signed HVF recapture/rollback; signed direct MMIO/PCI explicit/automatic restored Linux continuation; signed normal production/App Sandbox granted create/load, pathname replacement, recapture, checksum-corrupted state, truncated memory, cancellation, worker/launcher death, redaction, immutable reuse, destination-only metrics, and cleanup; retained exact 2.3–2.9 readers. |
 | Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence and complete publication transaction (implemented for native-v1 baseline) | #1162 introduced acknowledged RAII quiescence for block and entropy; #1389 added the topology-wide SMP pause barrier and PMEM guard; #1390 includes network, acquires all four failure-atomically, drains tokens only after complete acknowledgement, preserves in-flight/deferred/deadline work, and holds the worker lease through commit plus the post-publication hook. Process API/MMDS/controller and periodic work are serialized by the synchronous owner borrow. | Deterministic scheduler, supervisor, cancellation/seal, publication-visibility, process/API serialization, and fresh-retry tests plus combined signed SMP pause and one-vCPU baseline publication evidence. |
-| Complete dirty epochs and public tracking (implemented) | #1395 supplies fail-closed HVF protection/fault retry. #1396 adds the shared `GuestMemory` bitmap, exact initial/reprotected DFSC `0x07`/`0x0f` ownership checks, every current bounded host/device writer, conservative discard, protected wholly-dirty dynamic RAM, destination load ordering, and post-visible-Full reset/rollback/poison semantics. Machine and load tracking flags are enabled without adding Diff artifacts. | Exact/repeated/concurrent host and CPU union, discard, dynamic mapping, load override/VMGenID, publication/cancellation/reset failures, and public transaction tests plus signed normal boot/load, two-vCPU current-device, and two-epoch exact-set evidence. |
+| Complete dirty epochs and public tracking (implemented) | #1395 supplies fail-closed HVF protection/fault retry. #1396 adds the shared `GuestMemory` bitmap, and #1698 extends signed dynamic-memory evidence across translation DFSC `0x05`/`0x06`/`0x07`, level-three permission DFSC `0x0f`, ordinary stores, and cache-maintenance writes while retaining exact owned-IPA checks. Every current bounded host/device writer, conservative discard, protected wholly-dirty dynamic RAM, destination load ordering, and post-visible-Full reset/rollback/poison semantics remain covered. Machine and load tracking flags are enabled without adding Diff artifacts. | Exact/repeated/concurrent host and CPU union, discard, block-granular dynamic mapping, load override/VMGenID, publication/cancellation/reset failures, and public transaction tests plus signed normal boot/load, restored virtio-mem, two-vCPU current-device, and two-epoch exact-set evidence. |
 | Runner general-register capture and restore (first bidirectional subset implemented) | #1164 adds a typed immutable X0-X30, PC, and CPSR value plus one failure-atomic owner-thread capture. #1228 adds ordered owner-thread restore of that complete typed value and generalizes the shared admission name from capture to operation. Hypervisor.framework does not make the 33 writes transactional: typed failure context identifies the failed register and completed prefix, and callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore, but the snapshot lease invokes neither. Core system, exception, execution-control, identification, translation, baseline SIMD/FP, schema, validation, rollback, wider ordering, and multi-vCPU coordination remain separate or deferred. | Exact 33-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed same-vCPU idle capture/restore/recapture without guest execution or value logging. |
 | Runner core system-register capture and restore (second bidirectional subset implemented) | #1170 adds a typed immutable raw SP_EL0, SP_EL1, ELR_EL1, and SPSR_EL1 value plus one owner-thread capture. #1230 adds ordered owner-thread restore of that complete value and a reusable typed system-register failure with the exact failed register and completed prefix. Hypervisor.framework does not make the four writes transactional, so callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore under shared core-operation admission, but the snapshot lease invokes neither. Exception, execution-control, identification, translation, broader system state, validation, schema, rollback, wider ordering, orchestration, and multi-vCPU coordination remain separate or deferred. | Exact four-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed guest-written known-value capture/restore/recapture without post-restore guest execution or value logging. |
 | Runner EL1 exception-register capture and restore (third bidirectional subset implemented) | #1184 adds typed immutable raw AFSR0_EL1, AFSR1_EL1, ESR_EL1, FAR_EL1, PAR_EL1, and VBAR_EL1 state plus one owner-thread capture. #1232 adds ordered owner-thread restore of that complete value through the reusable typed system-register failure with the exact failed register and completed prefix. Hypervisor.framework does not make the six writes transactional, so callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore under shared core-operation admission, but the snapshot lease invokes neither. Vector-table memory, coherent exception semantics, destination validation, persistence, schema, rollback, wider ordering, orchestration, and multi-vCPU coordination remain deferred. | Exact six-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed guest-written capture/restore/recapture preserving implementation-defined AFSR readback without post-restore guest execution or value logging. |

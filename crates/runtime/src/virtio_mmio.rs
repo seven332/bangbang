@@ -675,6 +675,14 @@ impl VirtioMmioQueueRegisters {
         value: u32,
         status: u32,
     ) -> Result<(), VirtioMmioQueueRegisterError> {
+        // Linux clears device status before deleting its virtqueues, then
+        // writes QueueReady=0 for each queue. Accept that idempotent teardown
+        // write after the common reset while keeping every enabling or
+        // configuration write gated on FEATURES_OK and !DRIVER_OK.
+        if status == VIRTIO_DEVICE_STATUS_INIT && value == 0 {
+            self.selected_queue_mut()?.ready = false;
+            return Ok(());
+        }
         validate_queue_config_status(status)?;
 
         let ready = validate_queue_ready_value(self.queue_select, value)?;
@@ -4174,6 +4182,21 @@ mod tests {
     #[test]
     fn queue_registers_gate_configuration_writes_on_status() {
         let mut queues = VirtioMmioQueueRegisters::new(&[8]).expect("queue table should build");
+
+        queues
+            .write_register(VirtioMmioRegister::QueueReady, 0, VIRTIO_DEVICE_STATUS_INIT)
+            .expect("idempotent queue reset should remain valid after device status reset");
+        assert!(!queues.selected_queue().expect("queue should exist").ready());
+
+        let err = queues
+            .write_register(VirtioMmioRegister::QueueReady, 1, VIRTIO_DEVICE_STATUS_INIT)
+            .expect_err("queue enable should not write before FEATURES_OK");
+        assert_eq!(
+            err,
+            VirtioMmioQueueRegisterError::QueueConfigNotWritable {
+                status: VIRTIO_DEVICE_STATUS_INIT,
+            }
+        );
 
         let err = queues
             .write_register(VirtioMmioRegister::QueueNum, 8, VIRTIO_DEVICE_STATUS_INIT)
