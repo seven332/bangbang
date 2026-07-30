@@ -641,6 +641,22 @@ pub struct HvfSnapshotV2MemoryHotplugPciPlatformPlan {
     vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2MemoryHotplugPciPlatformPlanParts {
+    pub(crate) product: HvfSnapshotV2MemoryHotplugPreparedProduct,
+    pub(crate) mapping: HvfSnapshotV2MemoryHotplugMappingPlan,
+    pub(crate) balloon: Option<HvfSnapshotV2BalloonPciEndpointPlan>,
+    pub(crate) storage: Option<HvfSnapshotV2StoragePciPlatformPlan>,
+    pub(crate) entropy: Option<HvfSnapshotV2EntropyPciEndpointPlan>,
+    pub(crate) memory_hotplug: HvfSnapshotV2MemoryHotplugPciEndpointPlan,
+    pub(crate) host: Arm64FdtPciHost,
+    pub(crate) msi: HvfGicMsiMetadata,
+    pub(crate) endpoint_count: usize,
+    pub(crate) route_demand: usize,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 impl HvfSnapshotV2MemoryHotplugPciPlatformPlan {
     pub const fn kind(&self) -> HvfSnapshotV2MemoryHotplugProductKind {
         self.product.kind()
@@ -692,6 +708,24 @@ impl HvfSnapshotV2MemoryHotplugPciPlatformPlan {
 
     pub const fn vmclock_interrupt(&self) -> GuestInterruptLine {
         self.vmclock_interrupt
+    }
+
+    pub(crate) fn into_parts(self) -> HvfSnapshotV2MemoryHotplugPciPlatformPlanParts {
+        HvfSnapshotV2MemoryHotplugPciPlatformPlanParts {
+            product: self.product,
+            mapping: self.mapping,
+            balloon: self.balloon,
+            storage: self.storage,
+            entropy: self.entropy,
+            memory_hotplug: self.memory_hotplug,
+            host: self.host,
+            msi: self.msi,
+            endpoint_count: self.endpoint_count,
+            route_demand: self.route_demand,
+            serial_interrupt: self.serial_interrupt,
+            vmgenid_interrupt: self.vmgenid_interrupt,
+            vmclock_interrupt: self.vmclock_interrupt,
+        }
     }
 }
 

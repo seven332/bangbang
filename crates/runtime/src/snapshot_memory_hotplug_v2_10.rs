@@ -18,7 +18,9 @@ use crate::memory_hotplug::{
     VirtioMemDeviceCaptureState, VirtioMemMmioCaptureState, VirtioMemMmioHandler,
     VirtioMemPciCaptureState, VirtioMemQueue, VirtioMemQueueBuildError, VirtioMemQueueCaptureError,
 };
-use crate::mmio::MmioRegion;
+use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::metrics::SharedMemoryHotplugDeviceMetrics;
+use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::PciSbdf;
 use crate::snapshot_device_v2::{
     SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport,
@@ -33,7 +35,11 @@ use crate::snapshot_device_v2_5::{
 use crate::snapshot_format::SnapshotFormatVersion;
 use crate::snapshot_memory_v2::{SnapshotV2MemoryBinding, SnapshotV2MemoryExtent};
 use crate::storage_capture::StorageDeviceOrigin;
+use crate::virtio::VirtioDeviceType;
 use crate::virtio_mmio::{VirtioMmioQueueState, VirtioMmioRegisterHandlerError};
+use crate::virtio_pci::{
+    PreparedVirtioPciEndpoint, VirtioPciEndpointError, VirtioPciIdentity, VirtioPciTransportState,
+};
 
 mod codec;
 
@@ -351,6 +357,53 @@ pub type PreparedSnapshotV2MemoryHotplugTopologyParts = (
     SnapshotV2MemoryHotplugControllerProjection,
 );
 
+enum RestoreSnapshotV2MemoryHotplugDeviceError {
+    QueueContinuation(VirtioMemQueueBuildError),
+    QueueMemory(VirtioMemQueueCaptureError),
+    Device,
+}
+
+fn restore_snapshot_v2_memory_hotplug_device(
+    state: &SnapshotV2MemoryHotplugState,
+    destination_memory: &GuestMemory,
+) -> Result<VirtioMemDevice, RestoreSnapshotV2MemoryHotplugDeviceError> {
+    let queue_state = state.virtio().queues().first().ok_or(
+        RestoreSnapshotV2MemoryHotplugDeviceError::QueueContinuation(
+            VirtioMemQueueBuildError::QueueNotReady,
+        ),
+    )?;
+    let transport_queue = VirtioMmioQueueState::from_parts(
+        queue_state.max_size(),
+        queue_state.size(),
+        queue_state.ready(),
+        queue_state.descriptor_table(),
+        queue_state.driver_ring(),
+        queue_state.device_ring(),
+    );
+    let active_queue = state
+        .active_queue()
+        .map(|cursor| {
+            let queue = VirtioMemQueue::from_snapshot_state(
+                &transport_queue,
+                cursor.next_available(),
+                cursor.next_used(),
+            )
+            .map_err(RestoreSnapshotV2MemoryHotplugDeviceError::QueueContinuation)?;
+            queue
+                .validate_snapshot_state(&transport_queue, destination_memory)
+                .map_err(RestoreSnapshotV2MemoryHotplugDeviceError::QueueMemory)?;
+            Ok(queue)
+        })
+        .transpose()?;
+    VirtioMemDevice::from_snapshot_parts(
+        active_queue,
+        state
+            .plugged_ranges()
+            .map(|range| (range.start_block(), range.block_count())),
+    )
+    .map_err(|_| RestoreSnapshotV2MemoryHotplugDeviceError::Device)
+}
+
 /// Immutable owner-free exact-2.10 virtio-mem topology.
 ///
 /// The value contains only checked snapshot facts. It owns no guest mapping,
@@ -448,42 +501,19 @@ impl PreparedSnapshotV2MemoryHotplugTopology {
         let SnapshotV2DeviceTransport::Mmio(mmio) = state.transport() else {
             return Err(SnapshotV2MemoryHotplugMmioHandlerError::WrongTransport);
         };
-        let queue_state = state.virtio().queues().first().ok_or(
-            SnapshotV2MemoryHotplugMmioHandlerError::QueueContinuation(
-                VirtioMemQueueBuildError::QueueNotReady,
-            ),
-        )?;
-        let transport_queue = VirtioMmioQueueState::from_parts(
-            queue_state.max_size(),
-            queue_state.size(),
-            queue_state.ready(),
-            queue_state.descriptor_table(),
-            queue_state.driver_ring(),
-            queue_state.device_ring(),
-        );
-        let active_queue = state
-            .active_queue()
-            .map(|cursor| {
-                let queue = VirtioMemQueue::from_snapshot_state(
-                    &transport_queue,
-                    cursor.next_available(),
-                    cursor.next_used(),
-                )
-                .map_err(SnapshotV2MemoryHotplugMmioHandlerError::QueueContinuation)?;
-                queue
-                    .validate_snapshot_state(&transport_queue, destination_memory)
-                    .map_err(SnapshotV2MemoryHotplugMmioHandlerError::QueueMemory)?;
-                Ok(queue)
-            })
-            .transpose()?;
-        let activation_is_active = active_queue.is_some();
-        let device = VirtioMemDevice::from_snapshot_parts(
-            active_queue,
-            state
-                .plugged_ranges()
-                .map(|range| (range.start_block(), range.block_count())),
-        )
-        .map_err(|_| SnapshotV2MemoryHotplugMmioHandlerError::Device)?;
+        let device = restore_snapshot_v2_memory_hotplug_device(&state, destination_memory)
+            .map_err(|source| match source {
+                RestoreSnapshotV2MemoryHotplugDeviceError::QueueContinuation(source) => {
+                    SnapshotV2MemoryHotplugMmioHandlerError::QueueContinuation(source)
+                }
+                RestoreSnapshotV2MemoryHotplugDeviceError::QueueMemory(source) => {
+                    SnapshotV2MemoryHotplugMmioHandlerError::QueueMemory(source)
+                }
+                RestoreSnapshotV2MemoryHotplugDeviceError::Device => {
+                    SnapshotV2MemoryHotplugMmioHandlerError::Device
+                }
+            })?;
+        let activation_is_active = device.is_activated();
         let retained = restore_mmio_transport_state_for_device_with_config_status_gate(
             VIRTIO_MEM_DEVICE_ID,
             state.virtio(),
@@ -531,6 +561,79 @@ impl PreparedSnapshotV2MemoryHotplugTopology {
             region,
             interrupt_line,
             handler,
+        })
+    }
+
+    /// Consumes one checked PCI topology into a complete retained endpoint
+    /// against the destination mixed-memory owner.
+    ///
+    /// The caller supplies one fresh destination message registry and the
+    /// dispatcher region reserved by the destination platform plan. The
+    /// returned value owns no route resources, dispatcher registration,
+    /// BAR/function lease, mapper, metrics registry, or VM authority.
+    #[doc(hidden)]
+    pub fn into_pci_endpoint(
+        self,
+        destination_memory: &GuestMemory,
+        region_id: MmioRegionId,
+        messages: GuestMessageInterruptRegistry,
+    ) -> Result<PreparedSnapshotV2MemoryHotplugPciEndpoint, SnapshotV2MemoryHotplugPciEndpointError>
+    {
+        let Self {
+            memory: _,
+            plugged_ranges,
+            queue_ranges,
+            state,
+            controller,
+        } = self;
+        let SnapshotV2DeviceTransport::Pci(pci) = state.transport() else {
+            return Err(SnapshotV2MemoryHotplugPciEndpointError::WrongTransport);
+        };
+        let device = restore_snapshot_v2_memory_hotplug_device(&state, destination_memory)
+            .map_err(|source| match source {
+                RestoreSnapshotV2MemoryHotplugDeviceError::QueueContinuation(source) => {
+                    SnapshotV2MemoryHotplugPciEndpointError::QueueContinuation(source)
+                }
+                RestoreSnapshotV2MemoryHotplugDeviceError::QueueMemory(source) => {
+                    SnapshotV2MemoryHotplugPciEndpointError::QueueMemory(source)
+                }
+                RestoreSnapshotV2MemoryHotplugDeviceError::Device => {
+                    SnapshotV2MemoryHotplugPciEndpointError::Device
+                }
+            })?;
+        let activation_is_active = device.is_activated();
+        let metrics = device.shared_metrics();
+        let device_type = VirtioDeviceType::new(VIRTIO_MEM_DEVICE_ID)
+            .map_err(|_| SnapshotV2MemoryHotplugPciEndpointError::DeviceType)?;
+        let identity = VirtioPciIdentity::new(device_type, state.virtio().available_features())
+            .with_config_generation(state.virtio().config_generation());
+        let origin = pci.origin();
+        let retained =
+            VirtioPciTransportState::from_snapshot_v2_parts(identity, state.virtio(), pci, false)
+                .map_err(SnapshotV2MemoryHotplugPciEndpointError::RetainedTransport)?;
+        let endpoint = PreparedVirtioPciEndpoint::new(
+            identity,
+            &VIRTIO_MEM_QUEUE_SIZES,
+            state.config_space(),
+            device,
+            activation_is_active,
+            false,
+            &retained,
+            pci.sbdf(),
+            pci.bar_range(),
+            region_id,
+            messages,
+        )
+        .map_err(SnapshotV2MemoryHotplugPciEndpointError::Endpoint)?;
+
+        Ok(PreparedSnapshotV2MemoryHotplugPciEndpoint {
+            expected_state: state,
+            controller,
+            plugged_ranges,
+            queue_ranges,
+            origin,
+            metrics,
+            endpoint,
         })
     }
 }
@@ -627,6 +730,156 @@ impl fmt::Debug for PreparedSnapshotV2MemoryHotplugMmioHandler {
             .debug_struct("PreparedSnapshotV2MemoryHotplugMmioHandler")
             .field("state", &REDACTED)
             .finish()
+    }
+}
+
+/// One checked exact-2.10 virtio-mem endpoint awaiting destination PCI
+/// publication.
+#[doc(hidden)]
+pub struct PreparedSnapshotV2MemoryHotplugPciEndpoint {
+    expected_state: SnapshotV2MemoryHotplugState,
+    controller: SnapshotV2MemoryHotplugControllerProjection,
+    plugged_ranges: Vec<GuestMemoryRange>,
+    queue_ranges: Option<[GuestMemoryRange; 3]>,
+    origin: StorageDeviceOrigin,
+    metrics: SharedMemoryHotplugDeviceMetrics,
+    endpoint: PreparedVirtioPciEndpoint<VirtioMemConfigSpace, VirtioMemDevice>,
+}
+
+/// Consumed checked virtio-mem continuation and retained PCI endpoint.
+#[doc(hidden)]
+pub type PreparedSnapshotV2MemoryHotplugPciEndpointParts = (
+    SnapshotV2MemoryHotplugState,
+    SnapshotV2MemoryHotplugControllerProjection,
+    Vec<GuestMemoryRange>,
+    Option<[GuestMemoryRange; 3]>,
+    StorageDeviceOrigin,
+    SharedMemoryHotplugDeviceMetrics,
+    PreparedVirtioPciEndpoint<VirtioMemConfigSpace, VirtioMemDevice>,
+);
+
+impl PreparedSnapshotV2MemoryHotplugPciEndpoint {
+    /// Returns the exact normalized portable state this endpoint must retain.
+    pub const fn expected_state(&self) -> &SnapshotV2MemoryHotplugState {
+        &self.expected_state
+    }
+
+    /// Returns the public controller projection reconstructed with the device.
+    pub const fn controller(&self) -> SnapshotV2MemoryHotplugControllerProjection {
+        self.controller
+    }
+
+    /// Returns canonical shared-aperture ranges retained as plugged memory.
+    pub fn plugged_ranges(&self) -> &[GuestMemoryRange] {
+        &self.plugged_ranges
+    }
+
+    /// Returns the descriptor, available, and used ranges for an active queue.
+    pub const fn queue_ranges(&self) -> Option<[GuestMemoryRange; 3]> {
+        self.queue_ranges
+    }
+
+    /// Returns the retained startup/runtime origin.
+    pub const fn origin(&self) -> StorageDeviceOrigin {
+        self.origin
+    }
+
+    /// Returns the fresh destination-local device metrics.
+    pub fn shared_metrics(&self) -> SharedMemoryHotplugDeviceMetrics {
+        self.metrics.clone()
+    }
+
+    /// Returns the complete retained endpoint before publication.
+    pub const fn endpoint(
+        &self,
+    ) -> &PreparedVirtioPciEndpoint<VirtioMemConfigSpace, VirtioMemDevice> {
+        &self.endpoint
+    }
+
+    /// Consumes the checked continuation and retained endpoint.
+    pub fn into_parts(self) -> PreparedSnapshotV2MemoryHotplugPciEndpointParts {
+        (
+            self.expected_state,
+            self.controller,
+            self.plugged_ranges,
+            self.queue_ranges,
+            self.origin,
+            self.metrics,
+            self.endpoint,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2MemoryHotplugPciEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2MemoryHotplugPciEndpoint")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Failure while binding a checked virtio-mem topology to a destination PCI
+/// registry.
+#[doc(hidden)]
+pub enum SnapshotV2MemoryHotplugPciEndpointError {
+    /// The checked topology selects MMIO rather than PCI.
+    WrongTransport,
+    /// The retained active queue cursors could not be reconstructed.
+    QueueContinuation(VirtioMemQueueBuildError),
+    /// The retained active queue does not resolve against destination memory.
+    QueueMemory(VirtioMemQueueCaptureError),
+    /// The canonical plugged-range device inventory could not be rebuilt.
+    Device,
+    /// The fixed virtio-mem PCI identity cannot be represented.
+    DeviceType,
+    /// The detached PCI transport could not be reconstructed.
+    RetainedTransport(VirtioPciEndpointError),
+    /// The retained endpoint could not be reconstructed exactly.
+    Endpoint(VirtioPciEndpointError),
+}
+
+impl fmt::Debug for SnapshotV2MemoryHotplugPciEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::WrongTransport => "wrong-transport",
+            Self::QueueContinuation(_) => "queue-continuation",
+            Self::QueueMemory(_) => "queue-memory",
+            Self::Device => "device",
+            Self::DeviceType => "device-type",
+            Self::RetainedTransport(_) => "retained-transport",
+            Self::Endpoint(_) => "endpoint",
+        };
+        formatter
+            .debug_struct("SnapshotV2MemoryHotplugPciEndpointError")
+            .field("kind", &kind)
+            .field("source", &REDACTED)
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotV2MemoryHotplugPciEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::WrongTransport => "native-v2 virtio-mem topology is not PCI",
+            Self::QueueContinuation(_) => "native-v2 virtio-mem PCI queue continuation is invalid",
+            Self::QueueMemory(_) => "native-v2 virtio-mem PCI queue is outside destination memory",
+            Self::Device => "native-v2 virtio-mem PCI device reconstruction failed",
+            Self::DeviceType => "native-v2 virtio-mem PCI identity is invalid",
+            Self::RetainedTransport(_) => "native-v2 virtio-mem detached PCI transport is invalid",
+            Self::Endpoint(_) => "native-v2 virtio-mem PCI endpoint reconstruction failed",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2MemoryHotplugPciEndpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueContinuation(source) => Some(source),
+            Self::QueueMemory(source) => Some(source),
+            Self::RetainedTransport(source) | Self::Endpoint(source) => Some(source),
+            Self::WrongTransport | Self::Device | Self::DeviceType => None,
+        }
     }
 }
 
