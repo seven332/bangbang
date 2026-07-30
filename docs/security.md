@@ -280,13 +280,15 @@ retains private File/COW mappings. None of these inert handoffs authorizes a VM,
 host endpoint, public API action, or production session.
 
 Native-family publication holds paused-worker admission,
-block/PMEM/network/entropy retry quiescence, and every required runner operation
-domain through non-memory encoding, complete memory streaming, artifact
-verification and synchronization, exclusive memory-first/state-last commit,
-and the successful-publication hook. The current public writer is native-v2
-2.8 with mandatory complete serial state, optional entropy, and an optional
-exact profile-3 graph of 1–64 ordered regular-file block/pmem records. The graph
-may be rooted or rootless across the storage classes.
+block/PMEM/network/entropy-retry/balloon-statistics/virtio-mem-publisher
+quiescence, and every required runner operation domain through non-memory
+encoding, complete memory streaming, artifact verification and synchronization,
+exclusive memory-first/state-last commit, and the successful-publication hook.
+The current public writer is native-v2
+2.10 with mandatory complete serial state and independently optional entropy,
+balloon, virtio-mem, and an exact profile-3 graph of 1–64 ordered regular-file
+block/pmem records. The graph may be rooted or rootless across the storage
+classes.
 Block records may mix access, engine, cache, partuuid, and limiter
 configuration; pmem records bind access/root/limiter, exact file/mapped
 geometry, queue/retry/interrupt, mapping, and transport state. Serial binds
@@ -318,8 +320,8 @@ Native-v2 represents PL031 through fixed MMIO metadata and an explicit
 destination-`SystemTime` fresh-device policy; no mutable alarm state is
 persisted. It also carries bounded PVTime and VMGenID/VMClock clone policies.
 Active unsupported SVE/SME or breakpoint/watchpoint state is rejected rather
-than silently omitted, and optional devices other than pmem, serial, entropy,
-and balloon remain outside the accepted profile.
+than silently omitted. Network, vsock, MMDS, boot-timer, and vhost-user state
+remain outside the accepted profile.
 
 The #1481 aggregate preflight traverses balloon, memory-hotplug, entropy,
 serial, and time/identity state in one fixed order before the existing
@@ -329,11 +331,17 @@ complete cleanup. Family values remain private validation objects unless a
 versioned public profile explicitly adopts them. Exact 2.7 now adopts serial
 state but still serializes no host endpoint: destination authority constructs
 a fresh one. Exact 2.8 adopts entropy state but creates a fresh destination
-OS source, empty metrics, scheduler, notifier, route, and endpoint. Other
-optional-device encoding/restore and broad cross-host portability remain with
-Wave 6 #1490. Current 2.9 adopts balloon state but creates fresh destination
+OS source, empty metrics, scheduler, notifier, route, and endpoint. Exact 2.9
+adopts balloon state but creates fresh destination
 memory bindings, timer and process clock, empty metrics, reclaim adviser,
 notifier/interrupt/dispatcher, transport endpoint, and cleanup owner.
+Current 2.10 adopts virtio-mem state but creates a fresh unlinked shared
+aperture, clean dirty epoch, block-granular plugged views, and destination-local
+mapping, notifier, interrupt, dispatcher, route, metrics, endpoint, and cleanup
+owners. Kind 11 and the exact kind-1 aperture extents must close as one topology
+before publication. Network, vsock, MMDS, boot-timer, vhost-user, native-v2
+Diff/Uffd, Firecracker artifact bytes, and broad cross-host portability remain
+outside the current public profile.
 
 The frozen native-v1 device profile is untrusted input even when its outer
 state file passed length and CRC checks; CRC detects accidental corruption and
@@ -383,7 +391,7 @@ For native-v2, state family classification, retained File/COW memory binding,
 the live-FDT identity, versioned UART profile, cache/platform state, topology,
 and every time/identity guest destination validate before HVF construction.
 Legacy 2.3 parses its retained bytes as the exact default process FDT. Exact
-2.4 through current 2.9 require a versioned source-product marker instead,
+2.4 through current 2.10 require a versioned source-product marker instead,
 because a booted guest may have consumed or reclaimed those bytes. Exact 2.4
 validates its singleton root; exact 2.5 validates the complete ordered block
 graph; exact 2.6 validates the complete ordered block/pmem configuration,
@@ -393,23 +401,28 @@ Exact 2.7 additionally requires complete cross-validated serial state and
 allows that storage graph to be absent. Exact 2.8 retains those rules and
 optionally requires exact entropy queue/limiter/pending/retry/common-virtio/
 transport state cross-bound to memory and the selected product transport.
-Current 2.9 retains those rules and optionally requires exact balloon
+Exact 2.9 retains those rules and optionally requires exact balloon
 configuration/queue/statistics/hint/accounting/common-virtio/transport state,
-including mapped canonical PFN ranges. The
+including mapped canonical PFN ranges. Current 2.10 retains those rules and
+optionally requires exact virtio-mem configuration/features/config-space/
+queue/common-virtio/transport state plus a canonical plugged-block bitmap whose
+coverage exactly matches the kind-1 aperture extents. The
 live bytes still must match the retained address, length, and CRC. The memory descriptor
 must remain read-only and close-on-exec; guest
 mappings are private, so destination writes do not mutate the pair. Recorded
 kernel/initrd paths remain inert metadata and are never reopened. Every graph
 selector is likewise inert until destination policy treats it as a direct path
 or resolves the complete keyed vector through exact destination authority.
-Current 2.9 resolves exact drive, pmem, and configured-serial grants as one
+Current 2.10 resolves exact drive, pmem, and configured-serial grants as one
 batch; default serial stdio and entropy source/metrics/scheduler/notifier/
 route/endpoint owners are destination-local and resource-free. Balloon memory,
 timer, metrics, reclaim, notifier/interrupt/dispatcher, endpoint, and cleanup
-owners are likewise destination-local and require no external grant. The batch
+owners are likewise destination-local and require no external grant. The
+virtio-mem aperture and all mapping/dirty/device owners are also
+destination-local and require no external grant. The batch
 remains provisional through storage/platform construction and commits only
 with Paused session/controller publication. The restorer creates no
-optional-device owner other than pmem, serial, entropy, and balloon. Writable external block
+network, vsock, MMDS, boot-timer, or vhost-user owner. Writable external block
 files and pmem prefixes
 remain shared rather than COW clones and require operator serialization. Each
 fresh pmem mapping owns a volatile zeroed private tail outside the backing
@@ -1295,11 +1308,12 @@ is resource-specific:
   native-state capture. Unsupported profiles then fail before artifact I/O. An
   accepted create opens only preflighted namespaces, temporarily
   closes ordinary boot-worker command admission, and acknowledges process-local
-  block/PMEM/network/entropy retry quiescence through complete capture,
-  publication, and the post-publication hook. API/MMDS/controller mutation and
-  periodic callbacks cannot re-enter the synchronously borrowed process during
-  that interval. External vmnet/vsock peers and their host/kernel buffers are
-  neither frozen nor persisted; the admitted profile excludes those devices.
+  block/PMEM/network/entropy-retry/balloon-statistics/virtio-mem-publisher
+  quiescence through complete capture, publication, and the post-publication
+  hook. API/MMDS/controller mutation and periodic callbacks cannot re-enter the
+  synchronously borrowed process during that interval. External vmnet/vsock
+  peers and their host/kernel buffers are neither frozen nor persisted; the
+  admitted profile excludes those devices.
   Load freshness uses
   successful configuration history plus current non-logger/metrics state, so
   explicit defaults and residual MMDS presence fail closed without treating a
@@ -1308,10 +1322,11 @@ is resource-specific:
   untrusted, preserve redaction, and prevent one process from cleaning up or
   overwriting another process's resources. In contained mode, state
   preinspection is non-consuming and the eventual native-v2 state/memory claim
-  is atomic; current 2.9 then derives every ordered block/pmem request, any
-  configured serial sink, and optional entropy/balloon state from decoded state,
+  is atomic; current 2.10 then derives every ordered block/pmem request, any
+  configured serial sink, and optional entropy/balloon/virtio-mem state from decoded state,
   resolves the entire typed keyed vector through one exact destination
-  authority transaction, and constructs fresh entropy owners. Default serial
+  authority transaction, and constructs fresh entropy/balloon/virtio-mem
+  owners. Default serial
   stdio is constructed only from destination descriptors. Missing, extra,
   reordered, swapped, cross-class aliased, wrong-access, wrong-role/kind, wrong-size,
   changed-geometry, and consumed
@@ -1322,6 +1337,17 @@ is resource-specific:
   Create uses only exact retained output anchors and validated children. Direct
   mode retains ordinary path adapters. The current boundary is documented in
   [Snapshot Feasibility](snapshot-feasibility.md).
+  The signed normal-production/App Sandbox exact-2.10 matrix keeps kernel,
+  root, command/data, metrics, state, and memory authority in typed grants. The
+  launcher opens each source before pathname replacement and the worker never
+  reopens the replaced name. Checksum-corrupted state and structurally
+  truncated memory reject before destination publication; graceful
+  cancellation, worker-first death, and launcher-first death remove the API
+  socket and session namespace and release mapping, route, staging, and grant
+  authority. These cleanup proofs do not authenticate the artifact bytes:
+  CRCs and length checks are corruption/structure defenses, while operators
+  remain responsible for snapshot confidentiality, integrity, provenance, and
+  access control.
 - Native snapshot inspection treats the entire state file as untrusted binary
   input. The process opens it nonblocking, accepts only a regular file, caps the
   complete read at 16 MiB plus the 40-byte envelope overhead, and rechecks the
@@ -1348,8 +1374,9 @@ is resource-specific:
   `2.5.0` retains kind 7 with the bounded profile-2 multi-block graph, and
   exact `2.6.0` selects its bounded profile-3 block/pmem graph. Exact `2.7.0`
   adds mandatory serial kind 8 and makes kind 7 optional. Exact `2.8.0`
-  retains those rules and adds optional entropy kind 9. Current `2.9.0`
-  retains those rules and adds optional balloon kind 10. The
+  retains those rules and adds optional entropy kind 9. Exact `2.9.0`
+  retains those rules and adds optional balloon kind 10. Current `2.10.0`
+  retains those rules and adds optional virtio-mem kind 11. The
   platform decoder verifies that complete directory profile without
   payload-dependent allocation, caps every inner count and length before
   reservation, allocation-free scans the closed optional debug/SME registry,
@@ -1367,9 +1394,16 @@ is resource-specific:
   the component at 4 MiB under the 16-MiB state cap; every 4-KiB guest PFN must
   be mapped in adopted destination memory. Timers, deadlines, metrics, reclaim
   advisers, handles, and cleanup ownership never enter the format. Every
+  virtio-mem value admits at most 523,264 configured blocks and a 65,408-byte
+  bitmap, stays below its 128-KiB component cap, and closes configuration,
+  requested/usable sizes, queue, transport, and bitmap coverage against exact
+  kind-1 memory extents before any owner is built. Aperture mappings, shared-file
+  handles, dirty identity, metrics, notifiers, routes, endpoints, and cleanup
+  authority never enter the format. Every
   device-graph or configured-serial selector remains
   inert during decode; only the destination authority layer may resolve the
-  complete vector after graph, serial, entropy, balloon, and memory validation.
+  complete vector after graph, serial, entropy, balloon, virtio-mem, and memory
+  validation.
   State/memory inputs stay immutable and File/COW memory is
   private to each destination, but writable external block files and pmem
   prefixes are not copied or authenticated by the snapshot. Repeated
@@ -1386,10 +1420,11 @@ is resource-specific:
   kernel, initrd, or memory path. Exact memory ranges, mapped live-FDT
   address/length/checksum, destination cache identity, guest VMClock/PVTime
   bytes, and identity destinations are checked before VM creation. Exact 2.3
-  parses the retained FDT shell; exact 2.4 through 2.8 instead require their
+  parses the retained FDT shell; exact 2.4 through 2.10 instead require their
   versioned source-product marker and reconstruct singleton-root, complete
   profile-2 block, complete profile-3 block/pmem, exact serial plus optional
-  storage, optional entropy, or current optional balloon semantics from typed
+  storage, optional entropy, optional balloon, or current optional virtio-mem
+  semantics from typed
   state because the guest may have reclaimed those bytes. The
   guard owns VM, memory, GIC,
   all never-run vCPU owners, CPU replay, global GIC, per-vCPU state, fresh
@@ -1399,7 +1434,7 @@ is resource-specific:
   failure after the first guest-visible identity write is terminal, while
   earlier partial failure attempts reverse topology/backend cleanup and retains
   value-free primary and cleanup evidence. No control or runnable owner escapes
-  earlier. General devices other than pmem, serial, entropy, and balloon,
+  earlier. Network, vsock, MMDS, boot-timer, and vhost-user devices,
   source-process host endpoints, and unsupported VM actions remain outside
   this boundary.
 - Native-v2 lazy memory validates the state binding before opening or adopting
@@ -2001,7 +2036,7 @@ private and volatile. Operators must treat DAX as a guest/filesystem choice and
 profile page faults, page-cache/RSS accounting, huge-page realization,
 eviction, same-backing physical-page sharing, side channels, and throughput on
 the deployed macOS/HVF system. Linux Firecracker measurements are not portable
-security or performance promises. Exact native-v2 2.6 through current 2.9
+security or performance promises. Exact native-v2 2.6 through current 2.10
 profile 3 bind exact file/mapped geometry and direct or contained backing
 authority, then restore the same external prefix through a complete-set
 transaction. Signed direct and
@@ -2081,12 +2116,14 @@ real MMDS exchange without vmnet authority. This evidence does not prove
 interrupt remapping, external vmnet connectivity, or Firecracker's KVM ITS
 behavior. Exact native-v2 2.5 reconstructs the exact GICv2m/MSI-X state for
 every admitted profile-2 PCI block endpoint under the same product capacity.
-Exact native-v2 2.6 through current 2.9 additionally reconstruct every admitted
+Exact native-v2 2.6 through current 2.10 additionally reconstruct every admitted
 profile-3 PCI block and pmem endpoint, including mapping and limiter/retry
 ownership; serial remains a platform MMIO device whose exact 2.7 state is
 composed with that PCI storage graph. Exact 2.8 may also reconstruct an exact
-PCI entropy endpoint, and current 2.9 may reconstruct a variable-queue PCI
-balloon endpoint first in the canonical product order under the same capacity.
+PCI entropy endpoint, exact 2.9 may reconstruct a variable-queue PCI balloon
+endpoint, and current 2.10 may reconstruct a one-queue PCI virtio-mem endpoint
+with its fresh shared aperture and exact MSI-X/registry identity in canonical
+product order under the same capacity.
 Mismatched, aliased, reordered, or unmodeled MSI-bearing ownership is rejected
 rather than silently omitted. Exact 2.4 retains only its singleton PCI-root
 profile.
@@ -2172,13 +2209,16 @@ when HVF is unavailable.
 `hv_vm_protect` dirty-write tracking is an observation mechanism, not a guest
 memory security boundary. It removes WRITE only from mapped guest RAM owned by
 one active tracker and accepts an exit only when the lower-EL write has
-CM/S1PTW clear, a physical address resolving to a tracker-owned currently
-protected RAM page, and one of two signed-observed encodings: level-three
-translation DFSC `0x07` for initial protection or level-three permission DFSC
-`0x0f` after re-protection. These values are empirical Apple Silicon evidence,
-not public Apple promises. Drift is fail-closed through ordinary MMIO/error
-handling. MMIO, host-backed pmem payload mappings, readonly mappings, and IPAs
-outside the current tracker set cannot become dirty through this path.
+S1PTW clear, a physical address resolving to a tracker-owned currently
+protected RAM page, and one signed-observed encoding: level-one, level-two, or
+level-three translation DFSC `0x05`, `0x06`, or `0x07`, or level-three
+permission DFSC `0x0f`. CM may be clear for ordinary stores or set for observed
+Linux cache-maintenance writes; conservatively dirtying that owned page and
+retrying after WRITE restoration preserves correctness. These values are
+empirical Apple Silicon evidence, not public Apple promises. Drift is
+fail-closed through ordinary MMIO/error handling. MMIO, host-backed pmem
+payload mappings, readonly mappings, and IPAs outside the current tracker set
+cannot become dirty through this path.
 
 `GuestMemory` owns the authoritative atomic bitmap. Its bounded write API marks
 boot-loader and every current VMM/virtio guest-RAM write after whole-range

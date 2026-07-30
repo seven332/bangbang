@@ -8820,11 +8820,75 @@
     {
       "id": "corpus:memory-hotplug",
       "family": "memory-devices",
-      "summary": "Validated API sizing and status, block-granular STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe guest/HVF/dirty ownership, exact rollback, best-effort discard, Firecracker-shaped metrics, MMIO/PCI capture-ready state, sparse vhost aperture coexistence, failures, and cleanup are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains the aggregate until virtio-mem state is encoded, integrated into artifacts, restored into live owners and shared mappings, and certified for migration/clone, portability, and signed restored-guest behavior.",
+      "summary": "The applicable pinned Firecracker v1.16 virtio-mem corpus is implemented and verified: strict API sizing/status, block-granular STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe shared-aperture/HVF/dirty ownership, exact rollback, best-effort discard, metrics, MMIO/PCI capture and restoration, failures, and cleanup. Exact native-v2 2.10 optional kind 11 retains bounded configuration, features, config space, queue cursors, transport, and canonical plugged topology across all sixteen optional-product combinations. File/COW restore gives every destination private base RAM plus one fresh shared reservation with block-granular plugged views. Signed direct and normal-production/App Sandbox MMIO/PCI guests verify nonzero plugged-memory sentinels before mutation, then continue partial UNPLUG, reprobe UNPLUG_ALL/replug, PLUG, and final UNPLUG through explicit-Paused/recapture and automatic fresh-process clones. Same-process peers load one immutable pair independently; malformed/cancellation/death cases clean all unpublished authority. Diff, native-v2 Uffd, network/vsock/MMDS restore, Firecracker artifact bytes, source owner/dirty identity, synchronous RSS, and unconstrained cross-host portability are not claimed.",
       "source_refs": [
         "corpus:memory-hotplug"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "exact native-v2 2.10 virtio-mem capture, all-product dispatch, and failure-atomic public destination transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_memory_hotplug_platform.rs",
+          "anchor": "validated MMIO and PCI virtio-mem destination placement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_platform.rs",
+          "anchor": "fresh restored virtio-mem owner and mixed-memory construction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "live queue execution, topology mutation, metrics, capture, and teardown"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_memory_hotplug_v2_10.rs",
+          "anchor": "exact bounded kind-11 state, bitmap, binding, and transport semantics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_memory_v2/materialize.rs",
+          "anchor": "private base plus fresh block-granular shared-aperture materialization"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/memory-hotplug-contract.md",
+          "anchor": "live, exact-2.10 artifact, fresh-owner, continuation, portability, and exclusion evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public_native_v2_create_and_load_routes_all_products_over_mmio_and_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_memory_hotplug_snapshot_continuation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed exact-2.10 MMIO/PCI owner reconstruction and rollback product matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_memory_hotplug_snapshot_continuation_and_containment"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_memory_hotplug_v2_10/tests.rs",
+          "anchor": "fixed codec, bitmap, geometry, queue, binding, transport, limit, and hostile-state fixtures"
+        }
+      ]
     },
     {
       "id": "corpus:metrics",
@@ -10811,11 +10875,75 @@
     {
       "id": "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
       "family": "memory-devices",
-      "summary": "Live virtio-mem sizing and status, block lifecycle, publication-safe guest/HVF mapping, dirty metadata, exact reverse rollback, best-effort discard, singleton metrics, opaque shared-aperture identity, MMIO/PCI capture-ready state, failures, and cleanup are implemented and verified, including stable vhost coexistence. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains the aggregate until detached state is encoded, integrated into native artifacts, restored into exact transport and mapping owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
+      "summary": "Virtio-mem lifecycle, accounting, state, and restore semantics are implemented and verified. Live sizing/status, STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe guest/HVF mappings, dirty metadata, exact reverse rollback, best-effort discard, singleton metrics, opaque shared-aperture identity, MMIO/PCI ownership, failures, cleanup, and stable vhost coexistence are complete. Exact native-v2 2.10 kind 11 canonically binds configuration, features, config space, active/inactive queue state, plugged bitmap/ranges, transport, and unchanged kind-1 memory extents. Restore validates the complete state/memory pair before publication, creates fresh private base RAM and a destination-local shared aperture, copies only plugged bytes into block-granular views, installs a clean dirty epoch, and reconstructs fresh device/interrupt/dispatcher/route/cleanup owners. Signed Linux destinations first verify retained nonzero plugged-memory bytes, then continue partial UNPLUG, driver-reprobe UNPLUG_ALL, re-PLUG, growth, and final UNPLUG over MMIO and PCI through direct and contained explicit/automatic clones. Normalized recapture, immutable same-process and fresh-process pairs, malformed input, cancellation, death ordering, redaction, and cleanup are covered. Diff, native-v2 Uffd, network/vsock/MMDS restore, Firecracker artifact bytes, source owner/dirty identity, synchronous RSS, and unconstrained cross-host portability remain explicit non-claims.",
       "source_refs": [
         "corpus:memory-hotplug"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "virtio-mem capture, exact-2.10 create/load, controller commit, and immutable peer restore"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "fresh shared reservation, block-granular dynamic mappings, dirty ownership, and exact coverage validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_memory_hotplug_platform.rs",
+          "anchor": "MMIO/PCI placement and mapped-range planning"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_platform.rs",
+          "anchor": "fresh owner construction, recapture, rollback, and cleanup"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "block lifecycle, accounting, metrics, snapshot capture, and owner teardown"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_memory_hotplug_v2_10.rs",
+          "anchor": "portable exact-2.10 kind-11 state and memory binding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/memory-hotplug-contract.md",
+          "anchor": "terminal live and snapshot lifecycle contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "all sixteen products, same-process peer loads, controller commit, cancellation, and publication rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_memory_hotplug_snapshot_continuation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed MMIO/PCI all-product owner reconstruction and rollback"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_memory_hotplug_snapshot_continuation_and_containment"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_memory_hotplug_v2_10/tests.rs",
+          "anchor": "fixed and hostile bitmap, geometry, queue, transport, extent-binding, and limit coverage"
+        }
+      ]
     },
     {
       "id": "semantic.memory:machine-sizing-hugepages-and-dirty-tracking",

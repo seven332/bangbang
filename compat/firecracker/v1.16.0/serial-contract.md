@@ -55,10 +55,11 @@ global disposition counts from 235/163/3/17 to 236/162/3/17.
 
 ## Exact 2.7 snapshot value
 
-The current writer requires one serial component and admits either a
+Exact 2.7 introduced one required serial component and admitted either a
 serial-only product or the same serial component plus the optional profile-3
-regular-file block/pmem graph introduced by exact 2.6. The serial component
-contains:
+regular-file block/pmem graph introduced by exact 2.6. Current 2.10 retains
+that component unchanged while independently permitting entropy, balloon, and
+virtio-mem. The serial component contains:
 
 - destination endpoint intent: default process stdio or one bounded configured
   selector;

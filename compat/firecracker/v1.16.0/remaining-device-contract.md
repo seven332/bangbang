@@ -9,15 +9,16 @@ one time/identity aggregate.
 The original #1481 checkpoint had 77 terminal rows and eight Wave 6 handoffs.
 The exact 2.7 serial closure in #1652 made 78 rows terminal, and #1666's exact
 2.8 entropy snapshot certification made 80 rows terminal. #1681's exact 2.9
-balloon snapshot certification now makes 82 rows
-`implemented-and-verified`; three rows remain `audit-required` because their
-remaining optional-device or public-production snapshot composition,
-clone/migration portability, and terminal certification belong to
+balloon snapshot certification made 82 rows terminal. #1698's exact 2.10
+virtio-mem snapshot certification now makes 84 rows
+`implemented-and-verified`; one time/identity row remains `audit-required`
+because its remaining public-production composition and broad time-source
+portability certification belong to
 [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). The
 repository-wide observability, tools, and specification work belongs to
 [Wave 7 #1491](https://github.com/seven332/bangbang/issues/1491), but zero rows
 in this 85-record selector are handed to Wave 7. Global inventory totals remain
-240 implemented, 158 audit-required, three missing-platform-feasible, and 17
+242 implemented, 156 audit-required, three missing-platform-feasible, and 17
 proven-platform-impossible.
 
 ## Evidence keys
@@ -125,10 +126,13 @@ proven-platform-impossible.
   queue/statistics/hint/accounting/transport encoding, fresh destination
   ownership and full-interval polling, immutable clones, direct and contained
   MMIO/PCI optional-product certification, and signed restored-guest behavior.
-- `W6-MEMORY` — exact owner
-  [#1490](https://github.com/seven332/bangbang/issues/1490): encode and restore
-  virtio-mem geometry, requested/plugged blocks, mapping/accounting state,
-  clone/migration policy, portability, and signed restored-guest behavior.
+- `MEMORY-SNAPSHOT` — completed by
+  [#1698](https://github.com/seven332/bangbang/issues/1698): exact 2.10 kind-11
+  geometry/configuration/queue/bitmap/transport encoding, exact kind-1 binding,
+  fresh private-base/shared-aperture destination ownership, immutable
+  same-process and fresh-process clones, direct and contained MMIO/PCI
+  byte-first continuation through UNPLUG/UNPLUG_ALL/PLUG, malformed and death
+  containment, and signed restored-guest behavior.
 - `ENTROPY-SNAPSHOT` — completed by
   [#1666](https://github.com/seven332/bangbang/issues/1666): exact 2.8
   queue/limiter/pending/retry encoding, fresh OS source and scheduler/notifier/
@@ -222,8 +226,8 @@ proven-platform-impossible.
 | `api-schema:MemoryHotplugConfig` | [memory-hotplug](memory-hotplug-contract.md) | `implemented-and-verified` | `M-IMPL` | `M-FOCUSED` | `M-SIGNED` | `terminal` |
 | `api-schema:MemoryHotplugSizeUpdate` | [memory-hotplug](memory-hotplug-contract.md) | `implemented-and-verified` | `M-IMPL` | `M-FOCUSED` | `M-SIGNED` | `terminal` |
 | `api-schema:MemoryHotplugStatus` | [memory-hotplug](memory-hotplug-contract.md) | `implemented-and-verified` | `M-IMPL` | `M-FOCUSED` | `M-SIGNED` | `terminal` |
-| `corpus:memory-hotplug` | [memory-hotplug](memory-hotplug-contract.md) | `audit-required` | `M-IMPL` | `M-FOCUSED` | `M-SIGNED` | `W6-MEMORY` |
-| `semantic.memory-device:virtio-mem-lifecycle-accounting-and-state` | [memory-hotplug](memory-hotplug-contract.md) | `audit-required` | `M-IMPL` | `M-FOCUSED` | `M-SIGNED` | `W6-MEMORY` |
+| `corpus:memory-hotplug` | [memory-hotplug](memory-hotplug-contract.md) | `implemented-and-verified` | `M-IMPL` | `M-FOCUSED` | `M-SIGNED + MEMORY-SNAPSHOT` | `terminal` |
+| `semantic.memory-device:virtio-mem-lifecycle-accounting-and-state` | [memory-hotplug](memory-hotplug-contract.md) | `implemented-and-verified` | `M-IMPL` | `M-FOCUSED` | `M-SIGNED + MEMORY-SNAPSHOT` | `terminal` |
 | `api-operation:PUT /entropy` | [entropy](entropy-contract.md) | `implemented-and-verified` | `E-IMPL` | `E-FOCUSED` | `E-SIGNED` | `terminal` |
 | `api-path:/entropy` | [entropy](entropy-contract.md) | `implemented-and-verified` | `E-IMPL` | `E-FOCUSED` | `E-SIGNED` | `terminal` |
 | `api-property:EntropyDevice.rate_limiter` | [entropy](entropy-contract.md) | `implemented-and-verified` | `E-IMPL` | `E-FOCUSED` | `E-SIGNED` | `terminal` |
@@ -254,12 +258,13 @@ helper, socket, or session root after independent EOF and termination.
 
 Capture-ready values remain private validated live state except where a
 family-specific terminal ledger binds them to a public artifact profile.
-Current exact native-v2 2.8 composes required serial, optional unchanged
-profile-3 storage, and optional entropy. Serial endpoints and entropy
-source/metrics/scheduler/notifier/route/endpoint owners are fresh per
-destination; retained entropy queue/limiter/pending/retry state is implemented
-and signed. The five remaining optional-device rows are not implied by that
-closure.
+Current exact native-v2 2.10 composes required serial and independently
+optional profile-3 storage, entropy, balloon, and virtio-mem across all sixteen
+products. Serial, entropy, balloon, and virtio-mem endpoints, metrics,
+notifiers, interrupts, dispatchers, routes, shared-aperture mappings, timers,
+schedulers, and cleanup owners are fresh per destination; retained portable
+state and signed direct/contained restored-guest continuation are implemented.
+Only the time/identity aggregate remains nonterminal in this selector.
 This contract still does not claim Firecracker artifact compatibility,
 arbitrary cross-host time-source portability, or Wave 7 aggregate
 observability. #1529 separately proves the focused native-v2 PVTime/identity

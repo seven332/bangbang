@@ -50,17 +50,18 @@ claims mechanically visible.
   ledger, completed by #1634's pmem snapshot certification. It pins the exact
   40-record family with 40 terminal outcomes, field-specific implementation
   evidence, and signed direct/production live plus exact native-v2 2.6/current
-  2.8 create/load/cleanup proof.
+  2.10 create/load/cleanup proof.
 - [`balloon-contract.md`](balloon-contract.md) is the #1473 balloon ledger. It
-  pins all 52 records, promotes the 50 complete API/path/property/schema leaves,
-  records publication-safe paired PFN accounting and coherent MMIO/PCI
-  capture-ready ownership, and hands exactly two serialization/restore
-  aggregates to Wave 6.
+  pins all 52 records as terminal after #1681, records publication-safe paired
+  PFN accounting, exact 2.9 kind-10 state retained unchanged by current 2.10,
+  coherent MMIO/PCI fresh ownership, and signed direct/contained restored-guest
+  continuation.
 - [`memory-hotplug-contract.md`](memory-hotplug-contract.md) is the #1474
-  virtio-mem ledger. It pins all 19 records, promotes the 17 complete
-  API/path/property/schema leaves, records singleton metrics and exact
-  shared-aperture/HVF/dirty capture ownership, and hands exactly two
-  serialization/restore aggregates to Wave 6.
+  virtio-mem ledger. It pins all 19 records as terminal after #1698 and records
+  singleton metrics, exact shared-aperture/HVF/dirty ownership, exact 2.10 kind
+  11 across all sixteen products, fresh mixed-memory MMIO/PCI restoration,
+  immutable clones, signed byte-first Linux continuation, and contained
+  malformed/death cleanup.
 - [`entropy-contract.md`](entropy-contract.md) is the #1475 virtio-rng ledger.
   #1666 completes its snapshot gate. It pins all seven records as terminal and
   records dual-bucket retry, exact MMIO/PCI queue/limiter/pending state,
@@ -70,7 +71,7 @@ claims mechanically visible.
   and snapshot ledger. It pins all six records as terminal, records default
   stdout, configured-output stdin exclusion, bounded terminal/FIFO/pipe RX,
   exact MMIO capture ownership, native-v2 2.7 encoding retained by current
-  2.8, fresh endpoint
+  2.10, fresh endpoint
   reconstruction, signed serial-only and storage-bearing continuation, clone
   loads, recapture, redaction, and cleanup.
 - [`time-identity-contract.md`](time-identity-contract.md) is the
@@ -84,10 +85,10 @@ claims mechanically visible.
   cross-host portability certification.
 - [`remaining-device-contract.md`](remaining-device-contract.md) is the #1481
   checked aggregate ledger. It joins the exact 52 balloon, 19 memory-hotplug,
-  seven entropy, six serial, and one time/identity records; pins the current 80
-  terminal and five Wave 6 outcomes; and binds focused, signed MMIO/PCI,
-  production serial/entropy isolation, exact 2.7 restored-serial evidence, and
-  exact 2.8 restored-entropy evidence.
+  seven entropy, six serial, and one time/identity records; pins the current 84
+  terminal and one Wave 6 outcome; and binds focused, signed MMIO/PCI,
+  production containment, exact 2.7 serial, 2.8 entropy, 2.9 balloon, and 2.10
+  virtio-mem restored-guest evidence.
 - [`network-mmds-contract.md`](network-mmds-contract.md) is the #1496 checked
   aggregate network/MMDS ledger. It pins an exact 35-record set, promotes 31
   complete live/capture-ready outcomes, and retains four explicit #1378,
@@ -436,8 +437,8 @@ discard, and owner cleanup remain distinct. Detached MMIO/PCI state validates
 feature negotiation, queue geometry and cursors, pending notification and
 interrupt state, compact plugged ranges, one exact shared reservation identity,
 guest owners, actual HVF maps, dirty tracking, epoch, and byte accounting.
-Current public native-v2 create retains this paused preflight before
-optional-profile rejection without claiming a serialization format. The checked
+The public native-v2 create at that checkpoint retained this paused preflight
+before optional-profile rejection without claiming a serialization format. The checked
 [`memory-hotplug-contract.md`](memory-hotplug-contract.md) promotes all 17 API
 operation/path/property/schema leaves. Exactly `corpus:memory-hotplug` and
 `semantic.memory-device:virtio-mem-lifecycle-accounting-and-state` remain
@@ -482,9 +483,9 @@ Shared descriptor ownership restores original flags and terminal attributes
 only after the final endpoint drops. Detached state pairs exact external
 configuration with complete UART registers, RX bytes, status, and pending
 intents while excluding host descriptors, pipe buffers, and terminal state.
-The capture-ready preflight retained by current public native-v2 create
-traverses this state before optional-profile rejection without claiming a new
-encoding. Signed direct processes prove default stdout,
+The capture-ready preflight retained by public native-v2 create at that
+checkpoint traversed this state before optional-profile rejection without
+claiming a new encoding. Signed direct processes prove default stdout,
 greater-than-FIFO stdin, configured-output exclusion, rate limiting,
 pause/capture/resume, EOF, concurrency isolation, metrics, and cleanup; the
 signed production bundle repeats the default stdio flow across the launcher
@@ -640,7 +641,7 @@ complete serial component and optional unchanged profile-3 storage. #1652
 certifies fresh default/configured endpoint authority, complete UART/RX/pending
 work continuation, serial-only and MMIO/PCI-storage-bearing restore, repeated
 clone loads, recapture, containment, redaction, and cleanup; it promotes the
-final serial semantic. #1665 advances the current writer to `2.8.0` with
+final serial semantic. #1665 advances the then-current writer to `2.8.0` with
 optional exact entropy queue/limiter/pending/retry state over the selected
 MMIO or PCI transport. #1666 certifies fresh OS source, metrics, scheduler,
 notifier, route, and endpoint reconstruction; retained-request continuation
@@ -658,10 +659,21 @@ inflate/deflate/API accounting, recapture, immutable independent clones, fresh
 metrics and ownership, hostile state, cancellation/death cleanup, containment,
 and best-effort Darwin reclaim. Kind 10 is capped at 262,144 canonical 4-KiB
 PFN ranges and 4 MiB inside the 16-MiB state-file cap. #1681 promotes exactly
-the two retained balloon aggregates. Other optional devices/MMDS, Diff, tools,
-Firecracker interoperability, and broad portability remain audited. The
-current aggregate selector is 82 terminal and three `audit-required`, and the
-current overlay is 240/158/3/17.
+the two retained balloon aggregates. #1697 then activates exact `2.10.0` with
+optional singleton virtio-mem kind 11 across all sixteen storage/entropy/
+balloon/virtio-mem products, exact kind-1 extent binding, and fresh private
+base plus descriptor-backed shared-aperture restoration. #1698 certifies
+direct and normal-production/App-Sandbox MMIO/PCI sources and independent
+explicit-Paused/recaptured and automatic destinations. Each guest verifies
+retained nonzero plugged-memory bytes before partial UNPLUG, driver-reprobe
+UNPLUG_ALL/replug, later PLUG, and final UNPLUG; same-process peers, immutable
+fresh-process clones, exact metrics, malformed state/memory, cancellation,
+both death orders, redaction, and cleanup are covered. Kind 11 is capped at
+128 KiB inside the 16-MiB state-file cap. Diff, native-v2 Uffd,
+network/vsock/MMDS restore, tools, Firecracker artifact compatibility, source
+owner/dirty identity, synchronous RSS, and broad portability remain audited or
+explicitly unclaimed. The current aggregate selector is 84 terminal and one
+`audit-required`, and the current overlay is 242/156/3/17.
 
 ## Commands
 

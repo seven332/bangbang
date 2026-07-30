@@ -32,7 +32,7 @@ pub enum SnapshotV2MemoryHotplugMaterializationStage {
     BaseStability,
     /// Create the fresh shared reservation for the whole virtio-mem aperture.
     ApertureReservation,
-    /// Insert one canonical active view into the shared reservation.
+    /// Insert one block-granular active view into the shared reservation.
     PluggedViews,
     /// Allocate the bounded positional-copy buffer.
     CopyBuffer,
@@ -261,6 +261,14 @@ trait MaterializationPolicy {
         memory.reserve_shared_region(range)
     }
 
+    fn reserve_plugged_view_metadata(
+        &mut self,
+        memory: &mut GuestMemory,
+        count: usize,
+    ) -> Result<(), TryReserveError> {
+        memory.try_reserve_region_metadata(count)
+    }
+
     fn insert_view(
         &mut self,
         memory: &mut GuestMemory,
@@ -390,17 +398,62 @@ fn materialize_with_policy(
             },
         )?;
 
+    let block_size = config.block_size();
+    if block_size == 0 {
+        return Err(
+            SnapshotV2MemoryHotplugMaterializationError::InvalidTopology {
+                stage: Stage::PluggedViews,
+            },
+        );
+    }
+    if !config.plugged_size().is_multiple_of(block_size) {
+        return Err(
+            SnapshotV2MemoryHotplugMaterializationError::InvalidTopology {
+                stage: Stage::PluggedViews,
+            },
+        );
+    }
+    let plugged_view_count = usize::try_from(config.plugged_size() / block_size).map_err(|_| {
+        SnapshotV2MemoryHotplugMaterializationError::InvalidTopology {
+            stage: Stage::PluggedViews,
+        }
+    })?;
+    policy
+        .reserve_plugged_view_metadata(&mut memory, plugged_view_count)
+        .map_err(
+            |source| SnapshotV2MemoryHotplugMaterializationError::MetadataAllocation {
+                stage: Stage::PluggedViews,
+                source,
+            },
+        )?;
     if topology.plugged_ranges().is_empty() {
         policy.checkpoint(Stage::PluggedViews)?;
     }
     for range in topology.plugged_ranges().iter().copied() {
-        policy.checkpoint(Stage::PluggedViews)?;
-        policy.insert_view(&mut memory, range).map_err(|source| {
-            SnapshotV2MemoryHotplugMaterializationError::Memory {
-                stage: Stage::PluggedViews,
-                source,
+        let mut start = range.start().raw_value();
+        while start < range.end_exclusive().raw_value() {
+            policy.checkpoint(Stage::PluggedViews)?;
+            let view =
+                GuestMemoryRange::new(GuestAddress::new(start), block_size).map_err(|_| {
+                    SnapshotV2MemoryHotplugMaterializationError::InvalidTopology {
+                        stage: Stage::PluggedViews,
+                    }
+                })?;
+            if view.end_exclusive().raw_value() > range.end_exclusive().raw_value() {
+                return Err(
+                    SnapshotV2MemoryHotplugMaterializationError::InvalidTopology {
+                        stage: Stage::PluggedViews,
+                    },
+                );
             }
-        })?;
+            policy.insert_view(&mut memory, view).map_err(|source| {
+                SnapshotV2MemoryHotplugMaterializationError::Memory {
+                    stage: Stage::PluggedViews,
+                    source,
+                }
+            })?;
+            start = view.end_exclusive().raw_value();
+        }
     }
 
     if has_dynamic_extents {
@@ -821,8 +874,15 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AllocationFailurePoint {
+        BaseInventory,
+        PluggedViews,
+        CopyBuffer,
+    }
+
     struct AllocationFailurePolicy {
-        copy_buffer: bool,
+        target: AllocationFailurePoint,
         probe: Option<GuestMemoryOwnerProbe>,
     }
 
@@ -839,10 +899,30 @@ mod tests {
             ranges: &mut Vec<(GuestMemoryRange, u64)>,
             count: usize,
         ) -> Result<(), TryReserveError> {
-            if self.copy_buffer {
-                ranges.try_reserve_exact(count)
-            } else {
+            if self.target == AllocationFailurePoint::BaseInventory {
                 ranges.try_reserve_exact(usize::MAX)
+            } else {
+                ranges.try_reserve_exact(count)
+            }
+        }
+
+        fn reserve_plugged_view_metadata(
+            &mut self,
+            memory: &mut GuestMemory,
+            count: usize,
+        ) -> Result<(), TryReserveError> {
+            if self.target == AllocationFailurePoint::PluggedViews {
+                self.probe = Some(
+                    memory
+                        .try_owner_probe()
+                        .expect("test owner probe should allocate"),
+                );
+                let mut metadata = Vec::<u8>::new();
+                Err(metadata
+                    .try_reserve_exact(usize::MAX)
+                    .expect_err("test plugged-view metadata allocation should fail"))
+            } else {
+                memory.try_reserve_region_metadata(count)
             }
         }
 
@@ -852,7 +932,7 @@ mod tests {
             range: GuestMemoryRange,
         ) -> Result<(), GuestMemoryAllocationError> {
             memory.insert_region(range)?;
-            if self.copy_buffer {
+            if self.target == AllocationFailurePoint::CopyBuffer {
                 self.probe = Some(
                     memory
                         .try_owner_probe()
@@ -867,7 +947,7 @@ mod tests {
             buffer: &mut Vec<u8>,
             count: usize,
         ) -> Result<(), TryReserveError> {
-            if self.copy_buffer {
+            if self.target == AllocationFailurePoint::CopyBuffer {
                 buffer.try_reserve_exact(usize::MAX)
             } else {
                 buffer.try_reserve_exact(count)
@@ -878,18 +958,22 @@ mod tests {
     #[test]
     fn bounded_metadata_allocation_failures_are_staged_and_transactional() {
         let (topology, image) = mixed_fixture();
-        for (copy_buffer, expected_stage) in [
+        for (target, expected_stage) in [
             (
-                false,
+                AllocationFailurePoint::BaseInventory,
                 SnapshotV2MemoryHotplugMaterializationStage::BaseInventory,
             ),
             (
-                true,
+                AllocationFailurePoint::PluggedViews,
+                SnapshotV2MemoryHotplugMaterializationStage::PluggedViews,
+            ),
+            (
+                AllocationFailurePoint::CopyBuffer,
                 SnapshotV2MemoryHotplugMaterializationStage::CopyBuffer,
             ),
         ] {
             let mut policy = AllocationFailurePolicy {
-                copy_buffer,
+                target,
                 probe: None,
             };
             let error = materialize_with_policy(&topology, image.open(), &mut policy)
@@ -899,7 +983,7 @@ mod tests {
                 SnapshotV2MemoryHotplugMaterializationError::MetadataAllocation { stage, .. }
                     if stage == expected_stage
             ));
-            if copy_buffer {
+            if target != AllocationFailurePoint::BaseInventory {
                 assert!(
                     policy
                         .probe
@@ -1084,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn maximum_fragment_inventory_normalizes_into_one_bounded_shared_view() {
+    fn maximum_fragment_inventory_normalizes_into_block_granular_shared_views() {
         const MIB: u64 = 1024 * 1024;
         const FRAGMENT_BYTES: u64 = 16 * 1024;
         const EXTENT_COUNT: usize = 4096;
@@ -1151,10 +1235,12 @@ mod tests {
 
         let memory = materialize_snapshot_v2_memory_hotplug_file(&topology, image.open())
             .expect("maximum-fragment image should materialize");
-        assert_eq!(memory.regions().len(), 1);
-        assert_eq!(
-            memory.regions()[0].backing(),
-            GuestMemoryRegionBacking::Shared
+        assert_eq!(memory.regions().len(), 32);
+        assert!(
+            memory
+                .regions()
+                .iter()
+                .all(|region| region.backing() == GuestMemoryRegionBacking::Shared)
         );
         for index in [0, 127, 2048, EXTENT_COUNT - 1] {
             let mut actual = [0_u8; 1];

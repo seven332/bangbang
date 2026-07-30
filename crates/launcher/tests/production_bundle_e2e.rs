@@ -42,6 +42,7 @@ use bangbang_runtime::balloon::VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
 use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonState;
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
 use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
+use bangbang_runtime::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugState;
 use bangbang_session::{
     BLOCK_CONTROL_BROKER_FD, Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY,
     SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId, VHOST_USER_BROKER_FD, WorkerPolicy,
@@ -222,6 +223,27 @@ const SNAPSHOT_ENTROPY_READ_BYTES: u64 = 64;
 const SNAPSHOT_ENTROPY_REFILL_MS: u64 = 3_000;
 const SNAPSHOT_BALLOON_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.balloon-check=1";
 const SNAPSHOT_BALLOON_MARKER: &[u8] = b"BANGBANG_BALLOON_REPORTING_GUEST_CHECK_OK";
+const SNAPSHOT_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-snapshot=1";
+const SNAPSHOT_MEMORY_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_READY";
+const SNAPSHOT_MEMORY_HOTPLUG_CAPTURE_READY_MARKER: &[u8] =
+    b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_CAPTURE_READY";
+const SNAPSHOT_MEMORY_HOTPLUG_RESTORED_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_BYTES_OK";
+const SNAPSHOT_MEMORY_HOTPLUG_OFFLINE_READY_MARKER: &[u8] =
+    b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_OFFLINE_READY";
+const SNAPSHOT_MEMORY_HOTPLUG_SHRUNK_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_SHRUNK";
+const SNAPSHOT_MEMORY_HOTPLUG_UNPLUG_ALL_MARKER: &[u8] =
+    b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_UNPLUG_ALL";
+const SNAPSHOT_MEMORY_HOTPLUG_REPROBED_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_REPROBED";
+const SNAPSHOT_MEMORY_HOTPLUG_REGROWN_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_REGROWN";
+const SNAPSHOT_MEMORY_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_OK";
+const SNAPSHOT_MEMORY_HOTPLUG_FAILURE_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_FAIL";
+const SNAPSHOT_MEMORY_HOTPLUG_CONTINUE_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_CONTINUE";
+const SNAPSHOT_MEMORY_HOTPLUG_OFFLINE_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_OFFLINE";
+const SNAPSHOT_MEMORY_HOTPLUG_REPROBE_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_SNAPSHOT_REPROBE";
+const SNAPSHOT_MEMORY_HOTPLUG_SECTORS: u64 = 3;
+const SNAPSHOT_MEMORY_HOTPLUG_CONTINUE_OFFSET: u64 = 512;
+const SNAPSHOT_MEMORY_HOTPLUG_REPROBE_OFFSET: u64 = 2 * 512;
+const SNAPSHOT_MEMORY_HOTPLUG_TIMEOUT: Duration = Duration::from_secs(120);
 const SNAPSHOT_BLOCK_SECTOR_SIZE: usize = 512;
 const SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE: u8 = 0x11;
 const SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE: u8 = 0x12;
@@ -1668,6 +1690,964 @@ fn run_production_configured_serial_snapshot_continuation(bundle: &Path, enable_
 }
 
 #[test]
+fn normal_bundle_certifies_native_v2_memory_hotplug_snapshot_continuation_and_containment() {
+    let bundle = production_bundle();
+    let baseline_sessions = session_entries();
+    for enable_pci in [false, true] {
+        run_production_memory_hotplug_snapshot_continuation(
+            &bundle,
+            enable_pci,
+            &baseline_sessions,
+        );
+    }
+    assert_eq!(
+        session_entries(),
+        baseline_sessions,
+        "memory-hotplug snapshot launcher and worker teardown must restore the session namespace"
+    );
+}
+
+fn run_production_memory_hotplug_snapshot_continuation(
+    bundle: &Path,
+    enable_pci: bool,
+    baseline_sessions: &[PathBuf],
+) {
+    const MIB: u64 = 1024 * 1024;
+
+    let transport = if enable_pci { "pci" } else { "mmio" };
+    let source_fixture =
+        SnapshotSourceGrantFixture::new(&format!("{transport}-memory-hotplug-source"));
+    reset_zeroed_file(
+        &source_fixture.data_backing,
+        SNAPSHOT_MEMORY_HOTPLUG_SECTORS * 512,
+    );
+    let mut source = spawn_ready_snapshot_grant_api_launcher(
+        bundle,
+        &source_fixture.manifest,
+        source_fixture.sensitive_strings(),
+        &format!("memory-hotplug-snapshot-{transport}-source"),
+        false,
+        enable_pci,
+    );
+    source_fixture.replace_source_file_pathnames();
+    configure_and_start_memory_hotplug_snapshot_source(&source.socket, transport);
+    wait_for_memory_hotplug_snapshot_marker(
+        &source_fixture.opened_data_backing,
+        SNAPSHOT_MEMORY_HOTPLUG_READY_MARKER,
+        &format!("production {transport} memory-hotplug source readiness"),
+    );
+    assert_http_status(
+        &http_request(
+            &source.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":128}"#,
+        ),
+        204,
+        &format!("grow production {transport} memory-hotplug source"),
+    );
+    wait_for_memory_hotplug_snapshot_marker(
+        &source_fixture.opened_data_backing,
+        SNAPSHOT_MEMORY_HOTPLUG_CAPTURE_READY_MARKER,
+        &format!("production {transport} memory-hotplug source sentinel planting"),
+    );
+    wait_for_http_response_fragment(
+        &source.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":128"#,
+        SNAPSHOT_MEMORY_HOTPLUG_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        panic!("production {transport} source should report 128 MiB plugged: {error}")
+    });
+    assert_production_memory_hotplug_config(&source.socket, 128, 128, transport);
+    let source_metrics = flush_production_memory_hotplug_metrics(
+        &source.socket,
+        &source_fixture.opened_metrics,
+        &format!("{transport} source grow"),
+    );
+    assert_eq!(source_metrics["plug_bytes"].as_u64(), Some(128 * MIB));
+    assert!(
+        source_metrics["plug_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "production {transport} source should process guest PLUG requests"
+    );
+    assert_eq!(source_metrics["plug_fails"].as_u64(), Some(0));
+    assert_http_status(
+        &http_request(&source.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        &format!("pause production {transport} memory-hotplug source"),
+    );
+    assert_http_status(
+        &http_put(&source.socket, "/snapshot/create", &snapshot_create_body()),
+        204,
+        &format!("create production {transport} memory-hotplug snapshot"),
+    );
+    let artifacts = source_fixture.artifacts();
+    let source_memory_hotplug = assert_production_memory_hotplug_snapshot(
+        &artifacts.state,
+        enable_pci,
+        &format!("{transport} source"),
+    );
+    assert_no_snapshot_staging(&source_fixture.state_directory);
+    assert_no_snapshot_staging(&source_fixture.memory_directory);
+    let state_before =
+        fs::read(&artifacts.state).expect("production memory-hotplug source state should read");
+    let memory_before =
+        fs::read(&artifacts.memory).expect("production memory-hotplug source memory should read");
+    stop_running_launcher(
+        &mut source,
+        &format!("production {transport} memory-hotplug snapshot source"),
+    );
+    assert_session_entries_eventually_restored(
+        baseline_sessions,
+        &format!("production {transport} memory-hotplug snapshot source"),
+    );
+    source_fixture.assert_replacement_pathnames_unused(&format!(
+        "production {transport} memory-hotplug snapshot source"
+    ));
+
+    let mut current = artifacts;
+    if !enable_pci {
+        for malformed in [
+            MemoryHotplugMalformedInput::StateChecksum,
+            MemoryHotplugMalformedInput::TruncatedMemory,
+        ] {
+            run_production_memory_hotplug_malformed_case(
+                bundle,
+                &current,
+                malformed,
+                baseline_sessions,
+            );
+        }
+        for shutdown in [
+            SnapshotContinuationShutdown::GracefulCancellation,
+            SnapshotContinuationShutdown::WorkerFirst,
+            SnapshotContinuationShutdown::LauncherFirst,
+        ] {
+            current = run_production_memory_hotplug_paused_shutdown_case(
+                bundle,
+                current,
+                shutdown,
+                baseline_sessions,
+            );
+        }
+    }
+
+    let explicit_case = format!("{transport}-memory-hotplug-explicit");
+    current =
+        run_production_memory_hotplug_snapshot_destination(ProductionMemoryHotplugDestination {
+            bundle,
+            artifacts: current,
+            source_memory_hotplug: &source_memory_hotplug,
+            enable_pci,
+            resume_vm: false,
+            recapture: true,
+            case: &explicit_case,
+            baseline_sessions,
+        });
+    let automatic_case = format!("{transport}-memory-hotplug-automatic");
+    let final_artifacts =
+        run_production_memory_hotplug_snapshot_destination(ProductionMemoryHotplugDestination {
+            bundle,
+            artifacts: current,
+            source_memory_hotplug: &source_memory_hotplug,
+            enable_pci,
+            resume_vm: true,
+            recapture: false,
+            case: &automatic_case,
+            baseline_sessions,
+        });
+    assert_eq!(
+        fs::read(&final_artifacts.state).expect("final memory-hotplug state should read"),
+        state_before,
+        "{transport} contained repeated loads must not mutate state"
+    );
+    assert_eq!(
+        fs::read(&final_artifacts.memory).expect("final memory-hotplug memory should read"),
+        memory_before,
+        "{transport} contained repeated loads must not mutate memory"
+    );
+}
+
+fn configure_and_start_memory_hotplug_snapshot_source(socket: &Path, context: &str) {
+    for (path, body, request) in [
+        (
+            "/machine-config",
+            serde_json::json!({
+                "vcpu_count": 1,
+                "mem_size_mib": 256,
+                "track_dirty_pages": true,
+            }),
+            "machine config",
+        ),
+        (
+            "/metrics",
+            serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}),
+            "metrics",
+        ),
+        (
+            "/hotplug/memory",
+            serde_json::json!({
+                "total_size_mib": 128,
+                "block_size_mib": 2,
+                "slot_size_mib": 128,
+            }),
+            "memory-hotplug config",
+        ),
+        (
+            "/boot-source",
+            serde_json::json!({
+                "kernel_image_path": SNAPSHOT_KERNEL_REF,
+                "boot_args": SNAPSHOT_MEMORY_HOTPLUG_BOOT_ARGS,
+            }),
+            "boot source",
+        ),
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": SNAPSHOT_ROOT_REF,
+                "is_root_device": true,
+                "is_read_only": false,
+            }),
+            "root drive",
+        ),
+        (
+            "/drives/data",
+            serde_json::json!({
+                "drive_id": "data",
+                "path_on_host": SNAPSHOT_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+            }),
+            "data drive",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                socket,
+                path,
+                &serde_json::to_string(&body)
+                    .expect("production memory-hotplug snapshot request should serialize"),
+            ),
+            204,
+            &format!("PUT production {context} memory-hotplug snapshot {request}"),
+        );
+    }
+    assert_http_status(
+        &http_put(socket, "/actions", r#"{"action_type":"InstanceStart"}"#),
+        204,
+        &format!("start production {context} memory-hotplug snapshot source"),
+    );
+}
+
+fn assert_production_memory_hotplug_snapshot(
+    state_path: &Path,
+    enable_pci: bool,
+    context: &str,
+) -> SnapshotV2MemoryHotplugState {
+    const MIB: u64 = 1024 * 1024;
+
+    let bytes = fs::read(state_path).unwrap_or_else(|error| {
+        panic!(
+            "production {context} memory-hotplug state {} should read: {error}",
+            state_path.display()
+        )
+    });
+    let structural =
+        decode_snapshot_v2_state(&bytes).expect("production memory-hotplug state should decode");
+    let state = decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
+        .expect("production memory-hotplug state should be exact native-v2 2.10");
+    let graph = state
+        .device_graph()
+        .expect("production memory-hotplug artifact should retain root and data");
+    assert_eq!(
+        graph.block_records().len(),
+        2,
+        "production {context} should retain root and data drives"
+    );
+    assert!(state.entropy().is_none());
+    assert!(state.balloon().is_none());
+    let memory_hotplug = state
+        .memory_hotplug()
+        .expect("production certification artifact should contain kind 11");
+    let expected_transport = if enable_pci {
+        SnapshotV2DeviceTransportKind::Pci
+    } else {
+        SnapshotV2DeviceTransportKind::Mmio
+    };
+    assert_eq!(graph.transport_kind(), expected_transport);
+    assert_eq!(memory_hotplug.transport().kind(), expected_transport);
+    assert_eq!(memory_hotplug.config().total_size_mib(), 128);
+    assert_eq!(memory_hotplug.config().block_size_mib(), 2);
+    assert_eq!(memory_hotplug.config().slot_size_mib(), 128);
+    assert_eq!(memory_hotplug.config_space().region_size(), 128 * MIB);
+    assert_eq!(
+        memory_hotplug.config_space().usable_region_size(),
+        128 * MIB
+    );
+    assert_eq!(memory_hotplug.config_space().requested_size(), 128 * MIB);
+    assert_eq!(memory_hotplug.config_space().plugged_size(), 128 * MIB);
+    let queue = memory_hotplug
+        .active_queue()
+        .expect("production active Linux virtio-mem should retain queue cursors");
+    assert_eq!(queue.next_available(), queue.next_used());
+    let plugged_ranges = memory_hotplug.plugged_ranges().collect::<Vec<_>>();
+    assert_eq!(plugged_ranges.len(), 1);
+    assert_eq!(plugged_ranges[0].start_block(), 0);
+    assert_eq!(plugged_ranges[0].block_count(), 64);
+    memory_hotplug
+        .validate_memory_binding(state.platform().memory())
+        .expect("production kind-11 bitmap should close the kind-1 memory extents");
+    memory_hotplug.clone()
+}
+
+fn assert_production_memory_hotplug_config(
+    socket: &Path,
+    plugged_size_mib: u64,
+    requested_size_mib: u64,
+    context: &str,
+) {
+    let status = http_get(socket, "/hotplug/memory");
+    assert_http_status(
+        &status,
+        200,
+        &format!("read production {context} memory-hotplug status"),
+    );
+    for expected in [
+        r#""block_size_mib":2"#.to_owned(),
+        format!(r#""plugged_size_mib":{plugged_size_mib}"#),
+        format!(r#""requested_size_mib":{requested_size_mib}"#),
+        r#""slot_size_mib":128"#.to_owned(),
+        r#""total_size_mib":128"#.to_owned(),
+    ] {
+        assert!(
+            status.contains(&expected),
+            "production {context} memory-hotplug status should contain {expected}; response:\n{status}"
+        );
+    }
+    let config = http_get(socket, "/vm/config");
+    assert_http_status(
+        &config,
+        200,
+        &format!("read production {context} restored VM config"),
+    );
+    assert!(config.contains(r#""memory-hotplug":"#));
+    assert_eq!(config.matches(r#""drive_id":"#).count(), 2);
+}
+
+fn flush_production_memory_hotplug_metrics(
+    socket: &Path,
+    metrics_path: &Path,
+    context: &str,
+) -> serde_json::Value {
+    flush_production_metrics(socket, context);
+    let output = fs::read_to_string(metrics_path).unwrap_or_else(|error| {
+        panic!(
+            "production memory-hotplug metrics {} should read: {error}",
+            metrics_path.display()
+        )
+    });
+    output
+        .lines()
+        .rev()
+        .find_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("memory_hotplug")
+                .cloned()
+        })
+        .unwrap_or_else(|| {
+            panic!("production {context} should emit memory_hotplug metrics; output:\n{output}")
+        })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MemoryHotplugMalformedInput {
+    StateChecksum,
+    TruncatedMemory,
+}
+
+fn run_production_memory_hotplug_malformed_case(
+    bundle: &Path,
+    artifacts: &SnapshotArtifactSet,
+    malformed_input: MemoryHotplugMalformedInput,
+    baseline_sessions: &[PathBuf],
+) {
+    let case = match malformed_input {
+        MemoryHotplugMalformedInput::StateChecksum => "malformed-state",
+        MemoryHotplugMalformedInput::TruncatedMemory => "truncated-memory",
+    };
+    let original_state =
+        fs::read(&artifacts.state).expect("valid memory-hotplug state should read");
+    let original_memory =
+        fs::read(&artifacts.memory).expect("valid memory-hotplug memory should read");
+    let malformed_root = TestDir::new(&format!("memory-hotplug-snapshot-{case}"));
+    let canonical_root = fs::canonicalize(malformed_root.path())
+        .expect("malformed memory-hotplug fixture root should canonicalize");
+    let malformed = SnapshotArtifactSet {
+        state: canonical_root.join("malformed-state.snap"),
+        memory: canonical_root.join("malformed-memory.snap"),
+        root: canonical_root.join("malformed-root.img"),
+        data: canonical_root.join("malformed-data.img"),
+        audit: canonical_root.join("malformed-audit.img"),
+    };
+    fs::copy(&artifacts.state, &malformed.state)
+        .expect("malformed memory-hotplug state fixture should copy");
+    fs::copy(&artifacts.memory, &malformed.memory)
+        .expect("malformed memory-hotplug memory fixture should copy");
+    for (source, destination, context) in [
+        (
+            &artifacts.root,
+            &malformed.root,
+            "malformed memory-hotplug root",
+        ),
+        (
+            &artifacts.data,
+            &malformed.data,
+            "malformed memory-hotplug data",
+        ),
+        (
+            &artifacts.audit,
+            &malformed.audit,
+            "malformed memory-hotplug audit",
+        ),
+    ] {
+        hard_link_or_copy_fixture(source, destination, context);
+    }
+    match malformed_input {
+        MemoryHotplugMalformedInput::StateChecksum => {
+            let mut malformed_bytes =
+                fs::read(&malformed.state).expect("malformed state fixture should read");
+            let last = malformed_bytes
+                .len()
+                .checked_sub(1)
+                .expect("native-v2 memory-hotplug state must be nonempty");
+            malformed_bytes[last] ^= 0x80;
+            fs::write(&malformed.state, malformed_bytes)
+                .expect("malformed memory-hotplug checksum fixture should write");
+        }
+        MemoryHotplugMalformedInput::TruncatedMemory => {
+            let len = fs::metadata(&malformed.memory)
+                .expect("malformed memory fixture metadata should read")
+                .len();
+            let truncated = len
+                .checked_sub(4096)
+                .expect("native-v2 memory file should exceed one page");
+            OpenOptions::new()
+                .write(true)
+                .open(&malformed.memory)
+                .expect("malformed memory fixture should reopen")
+                .set_len(truncated)
+                .expect("malformed memory fixture should truncate");
+        }
+    }
+
+    let fixture = SnapshotContinuationInputGrantFixture::new(case, malformed, false);
+    let sensitive = fixture.sensitive_strings();
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        sensitive.clone(),
+        &format!("memory-hotplug-snapshot-{case}"),
+        false,
+    );
+    fixture.replace_source_pathnames();
+    configure_memory_hotplug_snapshot_destination_metrics(&running.socket, case);
+    let response = http_put(
+        &running.socket,
+        "/snapshot/load",
+        &snapshot_load_body(false),
+    );
+    assert_http_status(
+        &response,
+        400,
+        &format!("reject production memory-hotplug {case}"),
+    );
+    for private in &sensitive {
+        assert!(
+            !response.contains(private),
+            "memory-hotplug {case} restore fault must redact private grant data"
+        );
+    }
+    assert!(
+        fs::read(&fixture.opened_metrics)
+            .expect("malformed memory-hotplug metrics should read")
+            .is_empty(),
+        "memory-hotplug {case} restore must not publish metrics"
+    );
+    thread::sleep(Duration::from_millis(100));
+    if running
+        .child
+        .try_wait()
+        .expect("malformed memory-hotplug launcher status should read")
+        .is_some()
+        || !running.socket.exists()
+    {
+        let status = running.wait(&format!(
+            "terminal production memory-hotplug {case} destination"
+        ));
+        assert!(
+            !status.success(),
+            "terminal memory-hotplug {case} rejection should fail closed"
+        );
+        assert!(
+            !running.socket.exists(),
+            "terminal memory-hotplug {case} rejection should remove its API socket"
+        );
+    } else {
+        assert!(
+            http_get(&running.socket, "/").contains(r#""state":"Not started""#),
+            "memory-hotplug {case} restore must not publish a VM"
+        );
+        stop_running_launcher(
+            &mut running,
+            &format!("production memory-hotplug {case} destination"),
+        );
+    }
+    assert_session_entries_eventually_restored(
+        baseline_sessions,
+        &format!("production memory-hotplug {case} malformed destination"),
+    );
+    assert_eq!(
+        fs::read(&artifacts.state).expect("valid state should survive malformed load"),
+        original_state
+    );
+    assert_eq!(
+        fs::read(&artifacts.memory).expect("valid memory should survive malformed load"),
+        original_memory
+    );
+    fixture.assert_replacement_pathnames_unused(&format!(
+        "production memory-hotplug {case} malformed destination"
+    ));
+}
+
+fn run_production_memory_hotplug_paused_shutdown_case(
+    bundle: &Path,
+    artifacts: SnapshotArtifactSet,
+    shutdown: SnapshotContinuationShutdown,
+    baseline_sessions: &[PathBuf],
+) -> SnapshotArtifactSet {
+    let name = match shutdown {
+        SnapshotContinuationShutdown::GracefulCancellation => "memory-hotplug-cancellation",
+        SnapshotContinuationShutdown::WorkerFirst => "memory-hotplug-worker-first",
+        SnapshotContinuationShutdown::LauncherFirst => "memory-hotplug-launcher-first",
+    };
+    let fixture = SnapshotContinuationInputGrantFixture::new(name, artifacts, false);
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        fixture.sensitive_strings(),
+        &format!("memory-hotplug-snapshot-{name}"),
+        false,
+    );
+    let opened = fixture.replace_source_pathnames();
+    configure_memory_hotplug_snapshot_destination_metrics(&running.socket, name);
+    assert!(
+        fs::read(&fixture.opened_metrics)
+            .expect("shutdown-case memory-hotplug metrics should read")
+            .is_empty(),
+        "fresh {name} metrics should start empty"
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/snapshot/load",
+            &snapshot_load_body(false),
+        ),
+        204,
+        &format!("load production memory-hotplug snapshot before {name}"),
+    );
+    assert!(
+        http_get(&running.socket, "/").contains(r#""state":"Paused""#),
+        "memory-hotplug destination should remain Paused before {name}"
+    );
+    assert_production_memory_hotplug_config(&running.socket, 128, 128, name);
+    let state_before =
+        fs::read(&opened.state).expect("shutdown-case memory-hotplug state should read");
+    let memory_before =
+        fs::read(&opened.memory).expect("shutdown-case memory-hotplug memory should read");
+    assert_eq!(session_entries().len(), baseline_sessions.len() + 1);
+
+    let status = match shutdown {
+        SnapshotContinuationShutdown::GracefulCancellation => {
+            let launcher =
+                i32::try_from(running.child.id()).expect("memory-hotplug launcher PID should fit");
+            // SAFETY: The unreaped launcher owns this exact PID.
+            assert_eq!(unsafe { libc::kill(launcher, libc::SIGTERM) }, 0);
+            running.wait("Paused memory-hotplug restoration cancellation")
+        }
+        SnapshotContinuationShutdown::WorkerFirst => {
+            let worker = only_worker_pid(&running.child);
+            // SAFETY: The worker is the sole live child of the unreaped launcher.
+            assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+            running.wait("Paused memory-hotplug worker-first death")
+        }
+        SnapshotContinuationShutdown::LauncherFirst => {
+            let worker = only_worker_pid(&running.child);
+            let worker_exit = ProcessExitWatch::new(worker);
+            let launcher =
+                i32::try_from(running.child.id()).expect("memory-hotplug launcher PID should fit");
+            // SAFETY: The unreaped launcher owns this PID and its worker
+            // independently observes authenticated lifecycle EOF.
+            assert_eq!(unsafe { libc::kill(launcher, libc::SIGKILL) }, 0);
+            let result = running.wait("Paused memory-hotplug launcher-first death");
+            assert!(
+                worker_exit.wait(PROCESS_TIMEOUT),
+                "memory-hotplug worker should observe launcher death"
+            );
+            result
+        }
+    };
+    match shutdown {
+        SnapshotContinuationShutdown::GracefulCancellation => {
+            assert!(
+                status.success(),
+                "memory-hotplug cancellation should be graceful"
+            );
+        }
+        SnapshotContinuationShutdown::WorkerFirst => {
+            assert_eq!(status.code(), Some(128 + libc::SIGKILL));
+        }
+        SnapshotContinuationShutdown::LauncherFirst => {
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+        }
+    }
+    assert!(
+        !running.socket.exists(),
+        "production {name} destination should remove its API socket"
+    );
+    assert_session_entries_eventually_restored(baseline_sessions, name);
+    assert_eq!(
+        fs::read(&opened.state).expect("shutdown-case memory-hotplug state should remain"),
+        state_before,
+        "{name} must preserve immutable state"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("shutdown-case memory-hotplug memory should remain"),
+        memory_before,
+        "{name} must preserve immutable memory"
+    );
+    fixture.assert_replacement_pathnames_unused(&format!(
+        "production {name} memory-hotplug shutdown destination"
+    ));
+    opened
+}
+
+struct ProductionMemoryHotplugDestination<'a> {
+    bundle: &'a Path,
+    artifacts: SnapshotArtifactSet,
+    source_memory_hotplug: &'a SnapshotV2MemoryHotplugState,
+    enable_pci: bool,
+    resume_vm: bool,
+    recapture: bool,
+    case: &'a str,
+    baseline_sessions: &'a [PathBuf],
+}
+
+fn run_production_memory_hotplug_snapshot_destination(
+    destination: ProductionMemoryHotplugDestination<'_>,
+) -> SnapshotArtifactSet {
+    const MIB: u64 = 1024 * 1024;
+
+    let ProductionMemoryHotplugDestination {
+        bundle,
+        artifacts,
+        source_memory_hotplug,
+        enable_pci,
+        resume_vm,
+        recapture,
+        case,
+        baseline_sessions,
+    } = destination;
+    let fixture = SnapshotContinuationInputGrantFixture::new(case, artifacts, recapture);
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        fixture.sensitive_strings(),
+        &format!("memory-hotplug-snapshot-{case}"),
+        enable_pci,
+    );
+    let opened = fixture.replace_source_pathnames();
+    let state_before =
+        fs::read(&opened.state).expect("destination memory-hotplug state should read before load");
+    let memory_before = fs::read(&opened.memory)
+        .expect("destination memory-hotplug memory should read before load");
+    reset_zeroed_file(&opened.data, SNAPSHOT_MEMORY_HOTPLUG_SECTORS * 512);
+    resize_and_write_file_marker_at(
+        &opened.data,
+        SNAPSHOT_MEMORY_HOTPLUG_SECTORS * 512,
+        SNAPSHOT_MEMORY_HOTPLUG_CONTINUE_OFFSET,
+        SNAPSHOT_MEMORY_HOTPLUG_CONTINUE_MARKER,
+    );
+    configure_memory_hotplug_snapshot_destination_metrics(&running.socket, case);
+    assert!(
+        fs::read(&fixture.opened_metrics)
+            .expect("destination memory-hotplug metrics should read")
+            .is_empty(),
+        "production {case} destination metrics should start empty"
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/snapshot/load",
+            &snapshot_load_body(resume_vm),
+        ),
+        204,
+        &format!("load production {case} memory-hotplug snapshot"),
+    );
+    assert!(
+        http_get(&running.socket, "/").contains(if resume_vm {
+            r#""state":"Running""#
+        } else {
+            r#""state":"Paused""#
+        }),
+        "production {case} destination should publish the requested resume state"
+    );
+    assert_production_memory_hotplug_config(&running.socket, 128, 128, case);
+
+    if !resume_vm {
+        if recapture {
+            assert_http_status(
+                &http_put(&running.socket, "/snapshot/create", &snapshot_create_body()),
+                204,
+                &format!("recapture production {case} memory-hotplug snapshot"),
+            );
+            let recaptured = fixture.recaptured_artifacts();
+            let recaptured_memory_hotplug = assert_production_memory_hotplug_snapshot(
+                &recaptured.state,
+                enable_pci,
+                &format!("{case} recapture"),
+            );
+            assert_eq!(
+                &recaptured_memory_hotplug, source_memory_hotplug,
+                "production {case} Paused recapture should retain normalized kind-11 semantics"
+            );
+            fixture.assert_no_recapture_staging();
+        }
+        assert_http_status(
+            &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            204,
+            &format!("resume production {case} memory-hotplug destination"),
+        );
+    }
+
+    wait_for_memory_hotplug_snapshot_marker(
+        &opened.data,
+        SNAPSHOT_MEMORY_HOTPLUG_RESTORED_MARKER,
+        &format!("production {case} restored plugged-memory sentinels"),
+    );
+    assert_production_memory_hotplug_config(&running.socket, 128, 128, case);
+    resize_and_write_file_marker_at(
+        &opened.data,
+        SNAPSHOT_MEMORY_HOTPLUG_SECTORS * 512,
+        SNAPSHOT_MEMORY_HOTPLUG_CONTINUE_OFFSET,
+        SNAPSHOT_MEMORY_HOTPLUG_OFFLINE_MARKER,
+    );
+    wait_for_memory_hotplug_snapshot_marker(
+        &opened.data,
+        SNAPSHOT_MEMORY_HOTPLUG_OFFLINE_READY_MARKER,
+        &format!("production {case} guest memory offline preparation"),
+    );
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":64}"#,
+        ),
+        204,
+        &format!("shrink production {case} memory-hotplug destination"),
+    );
+    wait_for_memory_hotplug_snapshot_marker(
+        &opened.data,
+        SNAPSHOT_MEMORY_HOTPLUG_SHRUNK_MARKER,
+        &format!("production {case} restored disjoint UNPLUG"),
+    );
+    wait_for_http_response_fragment(
+        &running.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":64"#,
+        SNAPSHOT_MEMORY_HOTPLUG_TIMEOUT,
+    )
+    .unwrap_or_else(|error| panic!("production {case} should report 64 MiB plugged: {error}"));
+    assert_production_memory_hotplug_config(&running.socket, 64, 64, case);
+
+    resize_and_write_file_marker_at(
+        &opened.data,
+        SNAPSHOT_MEMORY_HOTPLUG_SECTORS * 512,
+        SNAPSHOT_MEMORY_HOTPLUG_REPROBE_OFFSET,
+        SNAPSHOT_MEMORY_HOTPLUG_REPROBE_MARKER,
+    );
+    wait_for_memory_hotplug_snapshot_marker(
+        &opened.data,
+        SNAPSHOT_MEMORY_HOTPLUG_UNPLUG_ALL_MARKER,
+        &format!("production {case} restored Linux reprobe UNPLUG_ALL"),
+    );
+    wait_for_http_response_fragment(
+        &running.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":0"#,
+        SNAPSHOT_MEMORY_HOTPLUG_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        panic!("production {case} should report zero plugged after UNPLUG_ALL: {error}")
+    });
+    assert_production_memory_hotplug_config(&running.socket, 0, 64, case);
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":64}"#,
+        ),
+        204,
+        &format!("refresh production {case} 64 MiB after UNPLUG_ALL"),
+    );
+    wait_for_memory_hotplug_snapshot_marker(
+        &opened.data,
+        SNAPSHOT_MEMORY_HOTPLUG_REPROBED_MARKER,
+        &format!("production {case} restored Linux reprobe"),
+    );
+    wait_for_http_response_fragment(
+        &running.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":64"#,
+        SNAPSHOT_MEMORY_HOTPLUG_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        panic!("production {case} should replug 64 MiB after reprobe: {error}")
+    });
+    assert_production_memory_hotplug_config(&running.socket, 64, 64, case);
+
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":128}"#,
+        ),
+        204,
+        &format!("regrow production {case} memory-hotplug destination"),
+    );
+    wait_for_memory_hotplug_snapshot_marker(
+        &opened.data,
+        SNAPSHOT_MEMORY_HOTPLUG_REGROWN_MARKER,
+        &format!("production {case} restored disjoint PLUG"),
+    );
+    wait_for_http_response_fragment(
+        &running.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":128"#,
+        SNAPSHOT_MEMORY_HOTPLUG_TIMEOUT,
+    )
+    .unwrap_or_else(|error| panic!("production {case} should report 128 MiB regrown: {error}"));
+    assert_production_memory_hotplug_config(&running.socket, 128, 128, case);
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":0}"#,
+        ),
+        204,
+        &format!("fully unplug production {case} memory-hotplug destination"),
+    );
+    wait_for_memory_hotplug_snapshot_marker(
+        &opened.data,
+        SNAPSHOT_MEMORY_HOTPLUG_SUCCESS_MARKER,
+        &format!("production {case} restored final UNPLUG"),
+    );
+    wait_for_http_response_fragment(
+        &running.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":0"#,
+        SNAPSHOT_MEMORY_HOTPLUG_TIMEOUT,
+    )
+    .unwrap_or_else(|error| panic!("production {case} should report zero plugged: {error}"));
+    assert_production_memory_hotplug_config(&running.socket, 0, 0, case);
+
+    let metrics = flush_production_memory_hotplug_metrics(
+        &running.socket,
+        &fixture.opened_metrics,
+        &format!("{case} restored topology activity"),
+    );
+    for field in ["queue_event_count", "plug_count", "unplug_count"] {
+        assert!(
+            metrics[field].as_u64().is_some_and(|count| count > 0),
+            "production {case} destination memory_hotplug.{field} should be positive"
+        );
+    }
+    assert!(
+        metrics["unplug_all_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "production {case} destination should process Linux reprobe UNPLUG_ALL"
+    );
+    assert_eq!(metrics["plug_bytes"].as_u64(), Some(128 * MIB));
+    assert_eq!(metrics["unplug_bytes"].as_u64(), Some(192 * MIB));
+    for field in [
+        "activate_fails",
+        "queue_event_fails",
+        "plug_fails",
+        "unplug_fails",
+        "unplug_discard_fails",
+        "unplug_all_fails",
+        "state_fails",
+        "interrupt_fails",
+        "rollback_fails",
+        "owner_cleanup_fails",
+        "teardown_fails",
+    ] {
+        assert_eq!(
+            metrics[field].as_u64(),
+            Some(0),
+            "production {case} destination memory_hotplug.{field} should remain zero; metrics:\n{}",
+            fs::read_to_string(&fixture.opened_metrics).unwrap_or_default()
+        );
+    }
+    stop_running_launcher(
+        &mut running,
+        &format!("production {case} restored memory-hotplug destination"),
+    );
+    assert_session_entries_eventually_restored(
+        baseline_sessions,
+        &format!("production {case} restored memory-hotplug destination"),
+    );
+    assert_eq!(
+        fs::read(&opened.state).expect("destination memory-hotplug state should remain"),
+        state_before,
+        "production {case} load must not mutate state"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("destination memory-hotplug memory should remain"),
+        memory_before,
+        "production {case} load must not mutate memory"
+    );
+    fixture.assert_replacement_pathnames_unused(&format!(
+        "production {case} restored memory-hotplug destination"
+    ));
+    opened
+}
+
+fn configure_memory_hotplug_snapshot_destination_metrics(socket: &Path, context: &str) {
+    assert_http_status(
+        &http_put(
+            socket,
+            "/metrics",
+            &serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}).to_string(),
+        ),
+        204,
+        &format!("PUT production {context} memory-hotplug destination metrics"),
+    );
+}
+
+#[test]
 fn normal_bundle_certifies_native_v2_balloon_snapshot_continuation_and_containment() {
     let bundle = production_bundle();
     let baseline_sessions = session_entries();
@@ -1786,9 +2766,9 @@ fn run_production_balloon_snapshot_continuation(
     if !enable_pci {
         run_production_balloon_malformed_state_case(bundle, &current, baseline_sessions);
         for shutdown in [
-            BalloonSnapshotShutdown::GracefulCancellation,
-            BalloonSnapshotShutdown::WorkerFirst,
-            BalloonSnapshotShutdown::LauncherFirst,
+            SnapshotContinuationShutdown::GracefulCancellation,
+            SnapshotContinuationShutdown::WorkerFirst,
+            SnapshotContinuationShutdown::LauncherFirst,
         ] {
             current = run_production_balloon_paused_shutdown_case(
                 bundle,
@@ -1905,7 +2885,7 @@ fn configure_and_start_balloon_snapshot_source(socket: &Path, context: &str) {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum BalloonSnapshotShutdown {
+enum SnapshotContinuationShutdown {
     GracefulCancellation,
     WorkerFirst,
     LauncherFirst,
@@ -1958,7 +2938,7 @@ fn run_production_balloon_malformed_state_case(
     fs::write(&malformed.state, malformed_bytes)
         .expect("malformed balloon checksum fixture should write");
 
-    let fixture = BalloonSnapshotInputGrantFixture::new("malformed", malformed, false);
+    let fixture = SnapshotContinuationInputGrantFixture::new("malformed", malformed, false);
     let sensitive = fixture.sensitive_strings();
     let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
         bundle,
@@ -2011,15 +2991,15 @@ fn run_production_balloon_malformed_state_case(
 fn run_production_balloon_paused_shutdown_case(
     bundle: &Path,
     artifacts: SnapshotArtifactSet,
-    shutdown: BalloonSnapshotShutdown,
+    shutdown: SnapshotContinuationShutdown,
     baseline_sessions: &[PathBuf],
 ) -> SnapshotArtifactSet {
     let name = match shutdown {
-        BalloonSnapshotShutdown::GracefulCancellation => "cancellation",
-        BalloonSnapshotShutdown::WorkerFirst => "worker-first",
-        BalloonSnapshotShutdown::LauncherFirst => "launcher-first",
+        SnapshotContinuationShutdown::GracefulCancellation => "cancellation",
+        SnapshotContinuationShutdown::WorkerFirst => "worker-first",
+        SnapshotContinuationShutdown::LauncherFirst => "launcher-first",
     };
-    let fixture = BalloonSnapshotInputGrantFixture::new(name, artifacts, false);
+    let fixture = SnapshotContinuationInputGrantFixture::new(name, artifacts, false);
     let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
         bundle,
         &fixture.manifest,
@@ -2055,20 +3035,20 @@ fn run_production_balloon_paused_shutdown_case(
     assert_eq!(session_entries().len(), baseline_sessions.len() + 1);
 
     let status = match shutdown {
-        BalloonSnapshotShutdown::GracefulCancellation => {
+        SnapshotContinuationShutdown::GracefulCancellation => {
             let launcher =
                 i32::try_from(running.child.id()).expect("balloon launcher PID should fit");
             // SAFETY: The unreaped launcher owns this exact PID.
             assert_eq!(unsafe { libc::kill(launcher, libc::SIGTERM) }, 0);
             running.wait("Paused balloon restoration cancellation")
         }
-        BalloonSnapshotShutdown::WorkerFirst => {
+        SnapshotContinuationShutdown::WorkerFirst => {
             let worker = only_worker_pid(&running.child);
             // SAFETY: The worker is the sole live child of the unreaped launcher.
             assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
             running.wait("Paused balloon worker-first death")
         }
-        BalloonSnapshotShutdown::LauncherFirst => {
+        SnapshotContinuationShutdown::LauncherFirst => {
             let worker = only_worker_pid(&running.child);
             let worker_exit = ProcessExitWatch::new(worker);
             let launcher =
@@ -2085,13 +3065,13 @@ fn run_production_balloon_paused_shutdown_case(
         }
     };
     match shutdown {
-        BalloonSnapshotShutdown::GracefulCancellation => {
+        SnapshotContinuationShutdown::GracefulCancellation => {
             assert!(status.success(), "balloon cancellation should be graceful");
         }
-        BalloonSnapshotShutdown::WorkerFirst => {
+        SnapshotContinuationShutdown::WorkerFirst => {
             assert_eq!(status.code(), Some(128 + libc::SIGKILL));
         }
-        BalloonSnapshotShutdown::LauncherFirst => {
+        SnapshotContinuationShutdown::LauncherFirst => {
             assert_eq!(status.signal(), Some(libc::SIGKILL));
         }
     }
@@ -2141,7 +3121,7 @@ fn run_production_balloon_snapshot_destination(
         case,
         baseline_sessions,
     } = destination;
-    let fixture = BalloonSnapshotInputGrantFixture::new(case, artifacts, recapture);
+    let fixture = SnapshotContinuationInputGrantFixture::new(case, artifacts, recapture);
     let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
         bundle,
         &fixture.manifest,
@@ -9474,6 +10454,34 @@ impl SnapshotSourceGrantFixture {
             .expect("replacement snapshot audit should write");
     }
 
+    fn assert_replacement_pathnames_unused(&self, context: &str) {
+        assert_eq!(
+            fs::read(&self.kernel).expect("replacement snapshot kernel should read"),
+            b"replacement kernel must not boot",
+            "{context} must not reopen the kernel pathname"
+        );
+        assert_eq!(
+            fs::read(&self.metrics).expect("replacement snapshot metrics should read"),
+            b"replacement metrics must remain unused\n",
+            "{context} must not reopen the metrics pathname"
+        );
+        assert_eq!(
+            fs::read(&self.root_backing).expect("replacement snapshot root should read"),
+            vec![0xff_u8; 4096],
+            "{context} must not reopen the root pathname"
+        );
+        assert_eq!(
+            fs::read(&self.data_backing).expect("replacement snapshot data should read"),
+            vec![0xee_u8; 4096],
+            "{context} must not reopen the data pathname"
+        );
+        assert_eq!(
+            fs::read(&self.audit_backing).expect("replacement snapshot audit should read"),
+            vec![0xdd_u8; 4096],
+            "{context} must not reopen the audit pathname"
+        );
+    }
+
     fn artifacts(&self) -> SnapshotArtifactSet {
         self.artifacts_with_children(SNAPSHOT_STATE_CHILD, SNAPSHOT_MEMORY_CHILD)
     }
@@ -9864,7 +10872,7 @@ fn hard_link_or_copy_fixture(source: &Path, destination: &Path, context: &str) {
 }
 
 #[derive(Debug)]
-struct BalloonSnapshotInputGrantFixture {
+struct SnapshotContinuationInputGrantFixture {
     _root: TestDir,
     _socket_root: TestDir,
     manifest: PathBuf,
@@ -9877,7 +10885,7 @@ struct BalloonSnapshotInputGrantFixture {
     memory_directory: Option<PathBuf>,
 }
 
-impl BalloonSnapshotInputGrantFixture {
+impl SnapshotContinuationInputGrantFixture {
     fn new(case: &str, sources: SnapshotArtifactSet, with_recapture: bool) -> Self {
         let root = TestDir::new(&format!("balloon-snapshot-input-{case}"));
         let canonical_root =
@@ -10022,6 +11030,39 @@ impl BalloonSnapshotInputGrantFixture {
         fs::write(&self.metrics, b"replacement metrics must remain unused\n")
             .expect("replacement balloon destination metrics should write");
         self.opened.clone()
+    }
+
+    fn assert_replacement_pathnames_unused(&self, context: &str) {
+        assert_eq!(
+            fs::read(&self.sources.state).expect("replacement snapshot state should read"),
+            b"replacement state must not load",
+            "{context} must not reopen the state pathname"
+        );
+        assert_eq!(
+            fs::read(&self.sources.memory).expect("replacement snapshot memory should read"),
+            b"replacement memory must not load",
+            "{context} must not reopen the memory pathname"
+        );
+        assert_eq!(
+            fs::read(&self.sources.root).expect("replacement snapshot root should read"),
+            vec![0xff_u8; 4096],
+            "{context} must not reopen the root pathname"
+        );
+        assert_eq!(
+            fs::read(&self.sources.data).expect("replacement snapshot data should read"),
+            vec![0xee_u8; 4096],
+            "{context} must not reopen the data pathname"
+        );
+        assert_eq!(
+            fs::read(&self.sources.audit).expect("replacement snapshot audit should read"),
+            vec![0xdd_u8; 4096],
+            "{context} must not reopen the audit pathname"
+        );
+        assert_eq!(
+            fs::read(&self.metrics).expect("replacement snapshot metrics should read"),
+            b"replacement metrics must remain unused\n",
+            "{context} must not reopen the metrics pathname"
+        );
     }
 
     fn recaptured_artifacts(&self) -> SnapshotArtifactSet {
@@ -14795,6 +15836,23 @@ fn session_entries() -> Vec<PathBuf> {
     entries
 }
 
+fn assert_session_entries_eventually_restored(expected: &[PathBuf], context: &str) {
+    let deadline = Instant::now()
+        .checked_add(PROCESS_TIMEOUT)
+        .expect("session cleanup deadline should fit");
+    loop {
+        let current = session_entries();
+        if current == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{context} should restore the session namespace; expected {expected:?}, observed {current:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn wait_for_new_session(baseline: &[PathBuf], timeout: Duration) -> bool {
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -15392,6 +16450,17 @@ fn create_sized_file(path: &Path, len: u64) {
     file.set_len(len).expect("test backing length should set");
 }
 
+fn reset_zeroed_file(path: &Path, len: u64) {
+    assert!(len > 0, "reset backing length must be nonzero");
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("reset backing should reopen");
+    file.set_len(0).expect("reset backing should truncate");
+    file.set_len(len).expect("reset backing should regrow");
+    file.sync_all().expect("reset backing should fsync");
+}
+
 fn resize_and_write_file_marker_at(path: &Path, len: u64, offset: u64, marker: &[u8]) {
     let mut file = OpenOptions::new()
         .write(true)
@@ -15489,6 +16558,30 @@ fn wait_for_file_prefix(path: &Path, marker: &[u8], timeout: Duration) -> Result
                 String::from_utf8_lossy(marker)
             ));
         }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_memory_hotplug_snapshot_marker(path: &Path, marker: &[u8], context: &str) {
+    let deadline = Instant::now()
+        .checked_add(SNAPSHOT_MEMORY_HOTPLUG_TIMEOUT)
+        .expect("memory-hotplug marker deadline should fit");
+    loop {
+        let contents = fs::read(path).unwrap_or_default();
+        if contents.starts_with(marker) {
+            return;
+        }
+        assert!(
+            !contents.starts_with(SNAPSHOT_MEMORY_HOTPLUG_FAILURE_MARKER),
+            "{context} reported guest failure; backing prefix: {:?}",
+            String::from_utf8_lossy(&contents[..contents.len().min(128)])
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{context} timed out waiting for {:?}; backing prefix: {:?}",
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(&contents[..contents.len().min(128)])
+        );
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -15851,10 +16944,12 @@ fn http_request(socket: &Path, method: &str, path: &str, body: &str) -> String {
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )
-    .expect("HTTP request should be written");
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .expect("HTTP request write should close");
+    .unwrap_or_else(|error| panic!("HTTP request {method} {path} should be written: {error}"));
+    if let Err(error) = stream.shutdown(std::net::Shutdown::Write)
+        && error.kind() != std::io::ErrorKind::NotConnected
+    {
+        panic!("HTTP request {method} {path} write should close: {error}");
+    }
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
