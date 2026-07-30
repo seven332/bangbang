@@ -1752,7 +1752,7 @@ fn allocation_failures_are_deterministic_and_escape_no_partial_state() {
 fn debug_output_redacts_interface_selector_and_state_values() {
     let state = inactive_mmio_state();
     let debug = format!("{state:?}");
-    let interface_debug = format!("{:?}", &state.interfaces()[0]);
+    let interface_debug = format!("{:?}", state.interfaces()[0]);
 
     assert!(!debug.contains("eth0"));
     assert!(!debug.contains("vmnet:host"));
