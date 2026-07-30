@@ -27,6 +27,7 @@ mod snapshot_restore;
 mod snapshot_v2;
 mod snapshot_v2_balloon_platform;
 mod snapshot_v2_entropy_platform;
+mod snapshot_v2_memory_hotplug_platform;
 mod snapshot_v2_multi_block_platform;
 mod snapshot_v2_platform;
 mod snapshot_v2_storage_platform;
@@ -83,7 +84,8 @@ pub use lazy_host_fault::{
 pub use lazy_pager::{HvfLazyPager, HvfLazyPagerError};
 pub use memory::{
     HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions,
-    HvfVirtioMemMappingCaptureError, HvfVirtioMemMappingCaptureState,
+    HvfSnapshotV2MemoryHotplugMappingPlan, HvfVirtioMemMappingCaptureError,
+    HvfVirtioMemMappingCaptureState, PrepareHvfSnapshotV2MemoryHotplugMappingPlanError,
 };
 pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
 pub use optional_state::{
@@ -170,6 +172,15 @@ pub use snapshot_v2_entropy_platform::{
     PrepareHvfSnapshotV2EntropyPciPlatformPlanError,
     prepare_hvf_snapshot_v2_serial_entropy_pci_platform_plan,
     prepare_hvf_snapshot_v2_storage_entropy_pci_platform_plan,
+};
+pub use snapshot_v2_memory_hotplug_platform::{
+    HvfSnapshotV2MemoryHotplugEntropyMmioEndpointPlan, HvfSnapshotV2MemoryHotplugMmioEndpointPlan,
+    HvfSnapshotV2MemoryHotplugMmioPlatformPlan, HvfSnapshotV2MemoryHotplugMmioProcessConfig,
+    HvfSnapshotV2MemoryHotplugPciEndpointPlan, HvfSnapshotV2MemoryHotplugPciPlatformPlan,
+    HvfSnapshotV2MemoryHotplugPreparedProduct, HvfSnapshotV2MemoryHotplugProductKind,
+    PrepareHvfSnapshotV2MemoryHotplugPlatformPlanError,
+    prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan,
+    prepare_hvf_snapshot_v2_memory_hotplug_pci_platform_plan,
 };
 pub use snapshot_v2_multi_block_platform::{
     HvfSnapshotV2MultiBlockMmioRecordPlan, HvfSnapshotV2MultiBlockPciPlan,

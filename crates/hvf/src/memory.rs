@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bangbang_runtime::BackendError;
 use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryAllocationError, GuestMemoryMappingIdentity,
-    GuestMemoryRange, GuestMemoryRegion, GuestMemoryRegionRemovalError,
+    GuestMemoryRange, GuestMemoryRegion, GuestMemoryRegionBacking, GuestMemoryRegionRemovalError,
     GuestMemorySharedReservationCaptureError, GuestMemorySharedReservationCaptureState,
 };
 #[cfg(test)]
@@ -21,6 +21,9 @@ use bangbang_runtime::memory_hotplug::{
     VirtioMemMutationRollbackOutcome,
 };
 use bangbang_runtime::pmem::PmemBackingMapping;
+use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
+    PreparedSnapshotV2MemoryHotplugTopology, SnapshotV2MemoryHotplugExtentClass,
+};
 
 use crate::dirty::{
     HvfDirtyWriteEpochResetError, HvfDirtyWriteMappingMutationError, HvfDirtyWriteTracker,
@@ -693,6 +696,430 @@ fn normalize_capture_ranges(ranges: &mut Vec<GuestMemoryRange>) -> bool {
     }
     ranges.truncate(write_index);
     true
+}
+
+/// Immutable value proof for one exact-2.10 restored mixed-memory mapping.
+///
+/// The plan classifies private Base memory as static HVF mappings and active
+/// shared virtio-mem views as dynamic mappings. It retains no host address,
+/// descriptor, mapper, or VM authority.
+#[derive(PartialEq, Eq)]
+pub struct HvfSnapshotV2MemoryHotplugMappingPlan {
+    static_ranges: Vec<GuestMemoryRange>,
+    dynamic_ranges: Vec<GuestMemoryRange>,
+    reservation: GuestMemorySharedReservationCaptureState,
+    base_bytes: u64,
+    active_bytes: u64,
+    offline_bytes: u64,
+    current_memory_bytes: u64,
+    dirty_page_size: u64,
+    dirty_epoch: u64,
+}
+
+impl HvfSnapshotV2MemoryHotplugMappingPlan {
+    /// Returns ordered private Base ranges to map as static guest RAM.
+    pub fn static_ranges(&self) -> &[GuestMemoryRange] {
+        &self.static_ranges
+    }
+
+    /// Returns canonical active aperture ranges to map as dynamic guest RAM.
+    pub fn dynamic_ranges(&self) -> &[GuestMemoryRange] {
+        &self.dynamic_ranges
+    }
+
+    /// Returns the detached shared-aperture identity proof.
+    pub const fn reservation(&self) -> GuestMemorySharedReservationCaptureState {
+        self.reservation
+    }
+
+    /// Returns the exact static Base byte count.
+    pub const fn base_bytes(&self) -> u64 {
+        self.base_bytes
+    }
+
+    /// Returns the exact active plugged byte count.
+    pub const fn active_bytes(&self) -> u64 {
+        self.active_bytes
+    }
+
+    /// Returns the exact inactive aperture byte count.
+    pub const fn offline_bytes(&self) -> u64 {
+        self.offline_bytes
+    }
+
+    /// Returns the exact active Base-plus-plugged byte count.
+    pub const fn current_memory_bytes(&self) -> u64 {
+        self.current_memory_bytes
+    }
+
+    /// Returns the clean dirty tracker's host-page granularity.
+    pub const fn dirty_page_size(&self) -> u64 {
+        self.dirty_page_size
+    }
+
+    /// Returns the clean materialization epoch.
+    pub const fn dirty_epoch(&self) -> u64 {
+        self.dirty_epoch
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2MemoryHotplugMappingPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2MemoryHotplugMappingPlan")
+            .field("static_range_count", &self.static_ranges.len())
+            .field("dynamic_range_count", &self.dynamic_ranges.len())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Redacted failure while proving an exact-2.10 mixed-memory mapping plan.
+pub enum PrepareHvfSnapshotV2MemoryHotplugMappingPlanError {
+    /// One temporary value inventory could not reserve capacity.
+    Allocation,
+    /// A topology or platform memory relationship diverged.
+    Binding,
+    /// The virtio-mem aperture range or reservation is inconsistent.
+    Aperture,
+    /// An active guest-memory range or backing class is inconsistent.
+    RegionTopology,
+    /// One region cannot be represented by the normal HVF mapping path.
+    MappingPreflight,
+    /// Dirty tracking is missing, dirty, advanced, or incomplete.
+    DirtyTracking,
+    /// Dirty metadata could not be inspected.
+    DirtyAccess,
+    /// Base, active, offline, current, or extent byte accounting diverged.
+    Accounting,
+}
+
+impl fmt::Debug for PrepareHvfSnapshotV2MemoryHotplugMappingPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let category = match self {
+            Self::Allocation => "allocation",
+            Self::Binding => "binding",
+            Self::Aperture => "aperture",
+            Self::RegionTopology => "region-topology",
+            Self::MappingPreflight => "mapping-preflight",
+            Self::DirtyTracking => "dirty-tracking",
+            Self::DirtyAccess => "dirty-access",
+            Self::Accounting => "accounting",
+        };
+        formatter
+            .debug_struct("PrepareHvfSnapshotV2MemoryHotplugMappingPlanError")
+            .field("category", &category)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for PrepareHvfSnapshotV2MemoryHotplugMappingPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Allocation => "native-v2 memory-hotplug mapping plan allocation failed",
+            Self::Binding => "native-v2 memory-hotplug mapping binding is inconsistent",
+            Self::Aperture => "native-v2 memory-hotplug mapping aperture is inconsistent",
+            Self::RegionTopology => {
+                "native-v2 memory-hotplug guest-memory topology is inconsistent"
+            }
+            Self::MappingPreflight => {
+                "native-v2 memory-hotplug guest memory cannot be mapped by HVF"
+            }
+            Self::DirtyTracking => "native-v2 memory-hotplug dirty tracking is inconsistent",
+            Self::DirtyAccess => "native-v2 memory-hotplug dirty metadata could not be inspected",
+            Self::Accounting => "native-v2 memory-hotplug mapping accounting is inconsistent",
+        })
+    }
+}
+
+impl std::error::Error for PrepareHvfSnapshotV2MemoryHotplugMappingPlanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotV2MemoryHotplugMappingPlanStage {
+    StaticRanges,
+    DynamicRanges,
+    ActiveRanges,
+    MappingPreflight,
+    DirtySnapshot,
+}
+
+trait SnapshotV2MemoryHotplugMappingPlanPolicy {
+    fn checkpoint(
+        &mut self,
+        _stage: SnapshotV2MemoryHotplugMappingPlanStage,
+    ) -> Result<(), PrepareHvfSnapshotV2MemoryHotplugMappingPlanError> {
+        Ok(())
+    }
+
+    fn reserve<T>(
+        &mut self,
+        values: &mut Vec<T>,
+        additional: usize,
+        stage: SnapshotV2MemoryHotplugMappingPlanStage,
+    ) -> Result<(), PrepareHvfSnapshotV2MemoryHotplugMappingPlanError> {
+        self.checkpoint(stage)?;
+        values
+            .try_reserve_exact(additional)
+            .map_err(|_| PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Allocation)
+    }
+}
+
+struct SystemSnapshotV2MemoryHotplugMappingPlanPolicy;
+
+impl SnapshotV2MemoryHotplugMappingPlanPolicy for SystemSnapshotV2MemoryHotplugMappingPlanPolicy {}
+
+pub(crate) fn prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan(
+    topology: &PreparedSnapshotV2MemoryHotplugTopology,
+    memory: &GuestMemory,
+    expected_base_bytes: u64,
+) -> Result<HvfSnapshotV2MemoryHotplugMappingPlan, PrepareHvfSnapshotV2MemoryHotplugMappingPlanError>
+{
+    prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan_with(
+        topology,
+        memory,
+        expected_base_bytes,
+        &mut SystemSnapshotV2MemoryHotplugMappingPlanPolicy,
+    )
+}
+
+fn prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan_with(
+    topology: &PreparedSnapshotV2MemoryHotplugTopology,
+    memory: &GuestMemory,
+    expected_base_bytes: u64,
+    policy: &mut impl SnapshotV2MemoryHotplugMappingPlanPolicy,
+) -> Result<HvfSnapshotV2MemoryHotplugMappingPlan, PrepareHvfSnapshotV2MemoryHotplugMappingPlanError>
+{
+    if topology.memory().extent_count() != topology.memory().binding().extents().len() {
+        return Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Binding);
+    }
+
+    let config_space = topology.state().config_space();
+    let aperture = GuestMemoryRange::new(
+        GuestAddress::new(config_space.addr()),
+        config_space.region_size(),
+    )
+    .map_err(|_| PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Aperture)?;
+    let reservation = memory
+        .shared_reservation_capture_state(aperture)
+        .map_err(|_| PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Aperture)?;
+    if reservation.range() != aperture {
+        return Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Aperture);
+    }
+
+    let mut static_ranges = Vec::new();
+    policy.reserve(
+        &mut static_ranges,
+        topology.memory().extent_count(),
+        SnapshotV2MemoryHotplugMappingPlanStage::StaticRanges,
+    )?;
+    for classified in topology.memory().classified_extents() {
+        if classified.class() == SnapshotV2MemoryHotplugExtentClass::Base {
+            static_ranges.push(classified.extent().range());
+        }
+    }
+
+    let mut dynamic_ranges = Vec::new();
+    policy.reserve(
+        &mut dynamic_ranges,
+        topology.plugged_ranges().len(),
+        SnapshotV2MemoryHotplugMappingPlanStage::DynamicRanges,
+    )?;
+    dynamic_ranges.extend_from_slice(topology.plugged_ranges());
+
+    let mut active_ranges = Vec::new();
+    policy.reserve(
+        &mut active_ranges,
+        memory.regions().len(),
+        SnapshotV2MemoryHotplugMappingPlanStage::ActiveRanges,
+    )?;
+    active_ranges.extend(memory.regions().iter().map(GuestMemoryRegion::range));
+
+    policy.checkpoint(SnapshotV2MemoryHotplugMappingPlanStage::MappingPreflight)?;
+    let page_size = host_page_size()
+        .map_err(|_| PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::MappingPreflight)?;
+    let mut static_index = 0;
+    let mut dynamic_index = 0;
+    for region in memory.regions() {
+        validated_region_map_request(region, page_size)
+            .map_err(|_| PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::MappingPreflight)?;
+        let range = region.range();
+        if range.overlaps(aperture) {
+            if range.start() < aperture.start()
+                || range.end_exclusive() > aperture.end_exclusive()
+                || dynamic_ranges.get(dynamic_index) != Some(&range)
+                || region.backing() != GuestMemoryRegionBacking::Shared
+                || region.mapping_identity() != reservation.mapping_identity()
+                || region.validate_shared_backing().ok() != Some(true)
+            {
+                return Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::RegionTopology);
+            }
+            dynamic_index += 1;
+        } else {
+            if static_ranges.get(static_index) != Some(&range)
+                || region.backing() != GuestMemoryRegionBacking::PrivateFile
+            {
+                return Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::RegionTopology);
+            }
+            static_index += 1;
+        }
+    }
+    if static_index != static_ranges.len()
+        || dynamic_index != dynamic_ranges.len()
+        || active_ranges.len()
+            != static_ranges
+                .len()
+                .checked_add(dynamic_ranges.len())
+                .ok_or(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Accounting)?
+    {
+        return Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::RegionTopology);
+    }
+
+    let dirty = memory
+        .dirty_tracker()
+        .ok_or(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::DirtyTracking)?;
+    if dirty.page_size() != page_size
+        || dirty.epoch() != 0
+        || active_ranges
+            .iter()
+            .copied()
+            .any(|range| !dirty.contains_range(range))
+    {
+        return Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::DirtyTracking);
+    }
+    policy.checkpoint(SnapshotV2MemoryHotplugMappingPlanStage::DirtySnapshot)?;
+    if !dirty
+        .dirty_pages()
+        .map_err(|_| PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::DirtyAccess)?
+        .is_empty()
+    {
+        return Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::DirtyTracking);
+    }
+
+    let base_bytes = checked_range_bytes(&static_ranges)?;
+    let active_bytes = checked_range_bytes(&dynamic_ranges)?;
+    let binding_bytes = topology
+        .memory()
+        .binding()
+        .extents()
+        .iter()
+        .try_fold(0_u64, |bytes, extent| {
+            bytes.checked_add(extent.range().size())
+        })
+        .ok_or(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Accounting)?;
+    let offline_bytes = config_space
+        .region_size()
+        .checked_sub(active_bytes)
+        .ok_or(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Accounting)?;
+    let current_memory_bytes = base_bytes
+        .checked_add(active_bytes)
+        .ok_or(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Accounting)?;
+    if base_bytes != expected_base_bytes
+        || active_bytes != config_space.plugged_size()
+        || binding_bytes != current_memory_bytes
+        || memory.total_size() != current_memory_bytes
+    {
+        return Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Accounting);
+    }
+
+    Ok(HvfSnapshotV2MemoryHotplugMappingPlan {
+        static_ranges,
+        dynamic_ranges,
+        reservation,
+        base_bytes,
+        active_bytes,
+        offline_bytes,
+        current_memory_bytes,
+        dirty_page_size: dirty.page_size(),
+        dirty_epoch: dirty.epoch(),
+    })
+}
+
+fn checked_range_bytes(
+    ranges: &[GuestMemoryRange],
+) -> Result<u64, PrepareHvfSnapshotV2MemoryHotplugMappingPlanError> {
+    ranges.iter().try_fold(0_u64, |bytes, range| {
+        bytes
+            .checked_add(range.size())
+            .ok_or(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Accounting)
+    })
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HvfSnapshotV2MemoryHotplugMappingPlanFailureStage {
+    StaticRanges,
+    DynamicRanges,
+    ActiveRanges,
+    MappingPreflight,
+    DirtySnapshot,
+}
+
+#[cfg(test)]
+struct FailingSnapshotV2MemoryHotplugMappingPlanPolicy {
+    target: HvfSnapshotV2MemoryHotplugMappingPlanFailureStage,
+}
+
+#[cfg(test)]
+impl SnapshotV2MemoryHotplugMappingPlanPolicy for FailingSnapshotV2MemoryHotplugMappingPlanPolicy {
+    fn checkpoint(
+        &mut self,
+        stage: SnapshotV2MemoryHotplugMappingPlanStage,
+    ) -> Result<(), PrepareHvfSnapshotV2MemoryHotplugMappingPlanError> {
+        let matches = matches!(
+            (self.target, stage),
+            (
+                HvfSnapshotV2MemoryHotplugMappingPlanFailureStage::StaticRanges,
+                SnapshotV2MemoryHotplugMappingPlanStage::StaticRanges
+            ) | (
+                HvfSnapshotV2MemoryHotplugMappingPlanFailureStage::DynamicRanges,
+                SnapshotV2MemoryHotplugMappingPlanStage::DynamicRanges
+            ) | (
+                HvfSnapshotV2MemoryHotplugMappingPlanFailureStage::ActiveRanges,
+                SnapshotV2MemoryHotplugMappingPlanStage::ActiveRanges
+            ) | (
+                HvfSnapshotV2MemoryHotplugMappingPlanFailureStage::MappingPreflight,
+                SnapshotV2MemoryHotplugMappingPlanStage::MappingPreflight
+            ) | (
+                HvfSnapshotV2MemoryHotplugMappingPlanFailureStage::DirtySnapshot,
+                SnapshotV2MemoryHotplugMappingPlanStage::DirtySnapshot
+            )
+        );
+        if matches {
+            if matches!(
+                stage,
+                SnapshotV2MemoryHotplugMappingPlanStage::StaticRanges
+                    | SnapshotV2MemoryHotplugMappingPlanStage::DynamicRanges
+                    | SnapshotV2MemoryHotplugMappingPlanStage::ActiveRanges
+            ) {
+                Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::Allocation)
+            } else {
+                Err(PrepareHvfSnapshotV2MemoryHotplugMappingPlanError::DirtyAccess)
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan_with_failure(
+    topology: &PreparedSnapshotV2MemoryHotplugTopology,
+    memory: &GuestMemory,
+    expected_base_bytes: u64,
+    target: HvfSnapshotV2MemoryHotplugMappingPlanFailureStage,
+) -> Result<HvfSnapshotV2MemoryHotplugMappingPlan, PrepareHvfSnapshotV2MemoryHotplugMappingPlanError>
+{
+    prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan_with(
+        topology,
+        memory,
+        expected_base_bytes,
+        &mut FailingSnapshotV2MemoryHotplugMappingPlanPolicy { target },
+    )
 }
 
 #[derive(Debug)]

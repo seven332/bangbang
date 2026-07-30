@@ -45,7 +45,7 @@ use super::*;
 use crate::memory::{HvfVirtioMemMappingCaptureState, HvfVirtioMemMappingCaptureTestParts};
 use crate::snapshot_bundle::tests::fixture as native_v1_fixture;
 
-const FIXTURE_MEMORY_MIB: u64 = 4;
+pub(crate) const FIXTURE_MEMORY_MIB: u64 = 4;
 pub(crate) const MMIO_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2/fixtures/mmio.hex");
 pub(crate) const PCI_GRAPH_FIXTURE_HEX: &str =
@@ -705,7 +705,7 @@ fn relocate_memory_hotplug_product_fixture(
     }
 }
 
-fn product_storage_fixture(
+pub(crate) fn product_storage_fixture(
     transport: SnapshotV2DeviceTransportKind,
 ) -> SnapshotV2StorageDeviceGraph {
     let mut bytes = fixture_bytes(match transport {
@@ -730,7 +730,7 @@ fn product_entropy_fixture(transport: SnapshotV2DeviceTransportKind) -> Snapshot
         .expect("relocated entropy fixture should decode")
 }
 
-fn memory_hotplug_product_entropy_fixture(
+pub(crate) fn memory_hotplug_product_entropy_fixture(
     transport: SnapshotV2DeviceTransportKind,
 ) -> SnapshotV2EntropyState {
     let mut bytes = fixture_bytes(match transport {
@@ -748,7 +748,9 @@ fn memory_hotplug_product_entropy_fixture(
         .expect("relocated exact-2.10 entropy fixture should decode")
 }
 
-fn product_balloon_fixture(transport: SnapshotV2DeviceTransportKind) -> SnapshotV2BalloonState {
+pub(crate) fn product_balloon_fixture(
+    transport: SnapshotV2DeviceTransportKind,
+) -> SnapshotV2BalloonState {
     let mut bytes = fixture_bytes(match transport {
         SnapshotV2DeviceTransportKind::Mmio => BALLOON_INACTIVE_MMIO_FIXTURE_HEX,
         SnapshotV2DeviceTransportKind::Pci => BALLOON_ACTIVE_PCI_FIXTURE_HEX,
@@ -758,7 +760,7 @@ fn product_balloon_fixture(transport: SnapshotV2DeviceTransportKind) -> Snapshot
         .expect("relocated balloon fixture should decode")
 }
 
-fn product_memory_hotplug_fixture(
+pub(crate) fn product_memory_hotplug_fixture(
     transport: SnapshotV2DeviceTransportKind,
 ) -> SnapshotV2MemoryHotplugState {
     let mut bytes = fixture_bytes(match transport {
@@ -797,7 +799,9 @@ fn complete_balloon_state_fixture(
     .expect("complete minor-nine fixture should validate")
 }
 
-fn memory_hotplug_active_ranges(state: &SnapshotV2MemoryHotplugState) -> Vec<GuestMemoryRange> {
+pub(crate) fn memory_hotplug_active_ranges(
+    state: &SnapshotV2MemoryHotplugState,
+) -> Vec<GuestMemoryRange> {
     let config_space = state.config_space();
     state
         .plugged_ranges()
@@ -845,7 +849,7 @@ fn memory_hotplug_mapping_fixture(
     })
 }
 
-fn memory_hotplug_capture_fixture(
+pub(crate) fn memory_hotplug_capture_fixture(
     state: SnapshotV2MemoryHotplugState,
 ) -> HvfSnapshotV2MemoryHotplugCaptureState {
     let active_bytes = state.config_space().plugged_size();
@@ -888,7 +892,7 @@ fn exact_minor_ten_platform_fixture(
         .expect("exact-2.10 platform fixture should validate")
 }
 
-fn try_exact_minor_ten_platform(
+pub(crate) fn try_exact_minor_ten_platform(
     memory: SnapshotV2MemoryBinding,
     capture: Option<HvfSnapshotV2MemoryHotplugCaptureState>,
 ) -> Result<HvfSnapshotV2MemoryHotplugPlatformState, HvfSnapshotV2BuildError> {
