@@ -35148,10 +35148,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn exact_minor_eleven_value_failures_stop_before_every_provider_seam() {
-        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
-        let events = factory.events();
-
+    fn exact_minor_eleven_value_failures_are_redacted_before_every_provider_seam() {
         let selector_error = prepare_process_snapshot_v2_network_restore_plan(
             prepared_native_v2_network_restore_candidate(
                 fake_partial_mmds_network_state(),
@@ -35164,7 +35161,6 @@ mod tests {
             selector_error,
             ProcessSnapshotV2NetworkRestorePlanError::Selector { .. }
         ));
-        assert!(recorded_events(&events).is_empty());
 
         let all_mmds_selector_error = prepare_process_snapshot_v2_network_restore_plan(
             prepared_native_v2_network_restore_candidate(
@@ -35178,7 +35174,6 @@ mod tests {
             all_mmds_selector_error,
             ProcessSnapshotV2NetworkRestorePlanError::Selector { .. }
         ));
-        assert!(recorded_events(&events).is_empty());
 
         let authority_error = prepare_process_snapshot_v2_network_restore_plan(
             prepared_native_v2_network_restore_candidate(
@@ -35192,7 +35187,6 @@ mod tests {
             authority_error,
             ProcessSnapshotV2NetworkRestorePlanError::Authority(_)
         ));
-        assert!(recorded_events(&events).is_empty());
 
         let diagnostic = format!(
             "{selector_error:?} {selector_error} {all_mmds_selector_error:?} \
@@ -35201,8 +35195,6 @@ mod tests {
         assert!(!diagnostic.contains("private-invalid-selector"));
         assert!(!diagnostic.contains("private-all-mmds-invalid-selector"));
         assert!(!diagnostic.contains("ungranted-private-bridge"));
-
-        let _ = &mut factory;
     }
 
     #[test]
