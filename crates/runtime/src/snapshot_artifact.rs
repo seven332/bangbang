@@ -57,8 +57,8 @@ use crate::snapshot_memory::{
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory::{load_snapshot_memory_image, verify_snapshot_memory_image_output};
 use crate::snapshot_memory_hotplug_v2_10::{
-    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, SnapshotV2MemoryHotplugState,
-    SnapshotV2MemoryHotplugStateDecodeError,
+    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, SnapshotV2MemoryHotplugBindingError,
+    SnapshotV2MemoryHotplugState, SnapshotV2MemoryHotplugStateDecodeError,
 };
 use crate::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryLoadError, SnapshotV2MemoryStateError,
@@ -1549,6 +1549,11 @@ fn decode_memory_hotplug_state_v2_10(
             .map_err(NativeV2SnapshotCandidateStateError::MemoryHotplugState)
         })
         .transpose()?;
+    if let Some(memory_hotplug) = &memory_hotplug {
+        memory_hotplug
+            .validate_memory_binding(&binding)
+            .map_err(NativeV2SnapshotCandidateStateError::MemoryHotplugBinding)?;
+    }
     Ok((
         binding,
         device_graph,
@@ -1712,6 +1717,8 @@ pub enum NativeV2SnapshotCandidateStateError {
     InvalidMemoryHotplugComponent,
     /// The optional virtio-mem-state payload is invalid.
     MemoryHotplugState(SnapshotV2MemoryHotplugStateDecodeError),
+    /// Kind-1 memory and optional kind-11 topology do not form one closed pair.
+    MemoryHotplugBinding(SnapshotV2MemoryHotplugBindingError),
 }
 
 impl fmt::Display for NativeV2SnapshotCandidateStateError {
@@ -1795,6 +1802,12 @@ impl fmt::Display for NativeV2SnapshotCandidateStateError {
                     "invalid native-v2 candidate virtio-mem state: {source}"
                 )
             }
+            Self::MemoryHotplugBinding(source) => {
+                write!(
+                    formatter,
+                    "invalid native-v2 candidate virtio-mem binding: {source}"
+                )
+            }
         }
     }
 }
@@ -1811,6 +1824,7 @@ impl std::error::Error for NativeV2SnapshotCandidateStateError {
             Self::EntropyState(source) => Some(source),
             Self::BalloonState(source) => Some(source),
             Self::MemoryHotplugState(source) => Some(source),
+            Self::MemoryHotplugBinding(source) => Some(source),
             Self::UnexpectedVersion { .. }
             | Self::VersionMismatch { .. }
             | Self::MissingDeviceGraph

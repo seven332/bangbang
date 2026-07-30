@@ -12,6 +12,8 @@ use bangbang_runtime::memory::{
     GuestMemoryRange, GuestMemoryRegion, GuestMemoryRegionRemovalError,
     GuestMemorySharedReservationCaptureError, GuestMemorySharedReservationCaptureState,
 };
+#[cfg(test)]
+use bangbang_runtime::memory::{GuestMemoryBacking, GuestMemoryLayout};
 use bangbang_runtime::memory_hotplug::{
     VirtioMemAppliedMutation, VirtioMemDeviceCaptureError, VirtioMemDeviceCaptureState,
     VirtioMemMutation, VirtioMemMutationCommitOutcome, VirtioMemMutationError,
@@ -476,6 +478,18 @@ pub struct HvfVirtioMemMappingCaptureState {
     dirty_epoch: Option<u64>,
 }
 
+#[cfg(test)]
+pub(crate) struct HvfVirtioMemMappingCaptureTestParts {
+    pub aperture: GuestMemoryRange,
+    pub active_ranges: Vec<GuestMemoryRange>,
+    pub active_bytes: u64,
+    pub offline_bytes: u64,
+    pub current_memory_bytes: u64,
+    pub guest_dirty_tracking: bool,
+    pub hvf_dirty_tracking: bool,
+    pub dirty_epoch: Option<u64>,
+}
+
 impl HvfVirtioMemMappingCaptureState {
     pub const fn reservation(&self) -> GuestMemorySharedReservationCaptureState {
         self.reservation
@@ -511,6 +525,33 @@ impl HvfVirtioMemMappingCaptureState {
 
     pub const fn dirty_epoch(&self) -> Option<u64> {
         self.dirty_epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(parts: HvfVirtioMemMappingCaptureTestParts) -> Self {
+        let base = GuestMemoryRange::new(GuestAddress::new(0), 16_384)
+            .expect("test mapping base range should validate");
+        let layout =
+            GuestMemoryLayout::new(vec![base]).expect("test mapping layout should validate");
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("test shared mapping owner should allocate");
+        memory
+            .reserve_shared_region(parts.aperture)
+            .expect("test mapping aperture should reserve");
+        let reservation = memory
+            .shared_reservation_capture_state(parts.aperture)
+            .expect("test mapping reservation should capture");
+        Self {
+            reservation,
+            mapping_identity: reservation.mapping_identity(),
+            active_ranges: parts.active_ranges,
+            active_bytes: parts.active_bytes,
+            offline_bytes: parts.offline_bytes,
+            current_memory_bytes: parts.current_memory_bytes,
+            guest_dirty_tracking: parts.guest_dirty_tracking,
+            hvf_dirty_tracking: parts.hvf_dirty_tracking,
+            dirty_epoch: parts.dirty_epoch,
+        }
     }
 }
 

@@ -1,8 +1,11 @@
 use std::io::Cursor;
 
 use bangbang_runtime::machine::MachineConfigInput;
-use bangbang_runtime::memory::{GuestMemory, aarch64};
+use bangbang_runtime::memory::{
+    GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange, aarch64,
+};
 use bangbang_runtime::pci::{PCI_BAR64_START, PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE};
+use bangbang_runtime::snapshot_artifact::NativeV2MemoryHotplugSnapshotCandidateState;
 use bangbang_runtime::snapshot_balloon_v2_9::{
     NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, NATIVE_V2_BALLOON_STATE_HEADER_BYTES,
     NATIVE_V2_BALLOON_STATE_SECTION_ENTRY_BYTES,
@@ -24,6 +27,11 @@ use bangbang_runtime::snapshot_format_v2::{
     decode_snapshot_v2_state, decode_snapshot_v2_state_with_compatibility_version,
     encode_snapshot_v2_state_with_compatibility_version,
 };
+use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
+    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    NATIVE_V2_MEMORY_HOTPLUG_STATE_HEADER_BYTES,
+    NATIVE_V2_MEMORY_HOTPLUG_STATE_SECTION_ENTRY_BYTES, SnapshotV2MemoryHotplugState,
+};
 use bangbang_runtime::snapshot_memory_v2::{
     decode_snapshot_v2_memory_binding, write_snapshot_v2_memory_image_with_compatibility_version,
 };
@@ -34,6 +42,7 @@ use bangbang_runtime::snapshot_serial_v2_7::{
 use bangbang_runtime::virtio_pci::VIRTIO_PCI_CAPABILITY_BAR_SIZE;
 
 use super::*;
+use crate::memory::{HvfVirtioMemMappingCaptureState, HvfVirtioMemMappingCaptureTestParts};
 use crate::snapshot_bundle::tests::fixture as native_v1_fixture;
 
 const FIXTURE_MEMORY_MIB: u64 = 4;
@@ -61,12 +70,17 @@ const BALLOON_INACTIVE_MMIO_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_balloon_v2_9/fixtures/inactive-mmio.hex");
 const BALLOON_ACTIVE_PCI_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_balloon_v2_9/fixtures/active-pci.hex");
+const MEMORY_HOTPLUG_INACTIVE_MMIO_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex");
+const MEMORY_HOTPLUG_ACTIVE_PCI_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_memory_hotplug_v2_10/fixtures/active-pci.hex");
 const DETERMINISTIC_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.4-fixture-id!";
 const DETERMINISTIC_MULTI_BLOCK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.5-fixture-id!";
 const DETERMINISTIC_STORAGE_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.6-fixture-id!";
 const DETERMINISTIC_SERIAL_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.7-fixture-id!";
 const DETERMINISTIC_ENTROPY_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.8-fixture-id!";
 const DETERMINISTIC_BALLOON_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.9-fixture-id!";
+const DETERMINISTIC_MEMORY_HOTPLUG_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.10-fixture-id";
 const COMPLETE_STATE_FINGERPRINTS: [(usize, u64); 2] = [
     (4_887, 10_136_861_786_457_474_800),
     (4_983, 7_169_128_621_506_763_529),
@@ -544,6 +558,7 @@ fn bytes_set_pci_endpoint(bytes: &mut [u8], transport_offset: usize, device: u8)
 const PRODUCT_STORAGE_QUEUE_BASE: u64 = 0x8004_0000;
 const PRODUCT_ENTROPY_QUEUE_BASE: u64 = 0x8006_0000;
 const PRODUCT_BALLOON_QUEUE_BASE: u64 = 0x8008_0000;
+const PRODUCT_MEMORY_HOTPLUG_QUEUE_BASE: u64 = 0x8010_0000;
 const PRODUCT_QUEUE_STRIDE: u64 = 0x1_0000;
 const PRODUCT_DRIVER_RING_OFFSET: u64 = 0x2000;
 const PRODUCT_DEVICE_RING_OFFSET: u64 = 0x4000;
@@ -665,6 +680,31 @@ fn relocate_balloon_product_fixture(bytes: &mut [u8]) {
     relocate_common_queues(bytes, common_offset, PRODUCT_BALLOON_QUEUE_BASE);
 }
 
+fn relocate_memory_hotplug_product_fixture(
+    bytes: &mut [u8],
+    transport: SnapshotV2DeviceTransportKind,
+) {
+    let common_entry = NATIVE_V2_MEMORY_HOTPLUG_STATE_HEADER_BYTES
+        + NATIVE_V2_MEMORY_HOTPLUG_STATE_SECTION_ENTRY_BYTES;
+    let common_offset = component_section_offset(bytes, common_entry);
+    relocate_common_queues(bytes, common_offset, PRODUCT_MEMORY_HOTPLUG_QUEUE_BASE);
+
+    let transport_entry = NATIVE_V2_MEMORY_HOTPLUG_STATE_HEADER_BYTES
+        + 3 * NATIVE_V2_MEMORY_HOTPLUG_STATE_SECTION_ENTRY_BYTES;
+    let transport_offset = component_section_offset(bytes, transport_entry);
+    match transport {
+        SnapshotV2DeviceTransportKind::Mmio => {
+            bytes[transport_offset + 12..transport_offset + 16]
+                .copy_from_slice(&42_u32.to_le_bytes());
+            write_wire_u64(bytes, transport_offset + 16, 102);
+            write_wire_u64(bytes, transport_offset + 24, 0xd002_0000);
+        }
+        SnapshotV2DeviceTransportKind::Pci => {
+            bytes_set_pci_endpoint(bytes, transport_offset, PCI_LAST_ENDPOINT_DEVICE);
+        }
+    }
+}
+
 fn product_storage_fixture(
     transport: SnapshotV2DeviceTransportKind,
 ) -> SnapshotV2StorageDeviceGraph {
@@ -690,6 +730,24 @@ fn product_entropy_fixture(transport: SnapshotV2DeviceTransportKind) -> Snapshot
         .expect("relocated entropy fixture should decode")
 }
 
+fn memory_hotplug_product_entropy_fixture(
+    transport: SnapshotV2DeviceTransportKind,
+) -> SnapshotV2EntropyState {
+    let mut bytes = fixture_bytes(match transport {
+        SnapshotV2DeviceTransportKind::Mmio => ENTROPY_INACTIVE_MMIO_FIXTURE_HEX,
+        SnapshotV2DeviceTransportKind::Pci => ENTROPY_ACTIVE_PCI_FIXTURE_HEX,
+    });
+    relocate_entropy_product_fixture(&mut bytes, transport);
+    if transport == SnapshotV2DeviceTransportKind::Pci {
+        let transport_entry =
+            NATIVE_V2_ENTROPY_STATE_HEADER_BYTES + 2 * NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES;
+        let transport_offset = component_section_offset(&bytes, transport_entry);
+        bytes_set_pci_endpoint(&mut bytes, transport_offset, PCI_LAST_ENDPOINT_DEVICE - 1);
+    }
+    SnapshotV2EntropyState::decode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, &bytes)
+        .expect("relocated exact-2.10 entropy fixture should decode")
+}
+
 fn product_balloon_fixture(transport: SnapshotV2DeviceTransportKind) -> SnapshotV2BalloonState {
     let mut bytes = fixture_bytes(match transport {
         SnapshotV2DeviceTransportKind::Mmio => BALLOON_INACTIVE_MMIO_FIXTURE_HEX,
@@ -698,6 +756,21 @@ fn product_balloon_fixture(transport: SnapshotV2DeviceTransportKind) -> Snapshot
     relocate_balloon_product_fixture(&mut bytes);
     SnapshotV2BalloonState::decode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, &bytes)
         .expect("relocated balloon fixture should decode")
+}
+
+fn product_memory_hotplug_fixture(
+    transport: SnapshotV2DeviceTransportKind,
+) -> SnapshotV2MemoryHotplugState {
+    let mut bytes = fixture_bytes(match transport {
+        SnapshotV2DeviceTransportKind::Mmio => MEMORY_HOTPLUG_INACTIVE_MMIO_FIXTURE_HEX,
+        SnapshotV2DeviceTransportKind::Pci => MEMORY_HOTPLUG_ACTIVE_PCI_FIXTURE_HEX,
+    });
+    relocate_memory_hotplug_product_fixture(&mut bytes, transport);
+    SnapshotV2MemoryHotplugState::decode(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &bytes,
+    )
+    .expect("relocated virtio-mem fixture should decode")
 }
 
 fn product_serial_fixture() -> SnapshotV2SerialState {
@@ -722,6 +795,133 @@ fn complete_balloon_state_fixture(
         has_balloon.then(|| product_balloon_fixture(transport)),
     )
     .expect("complete minor-nine fixture should validate")
+}
+
+fn memory_hotplug_active_ranges(state: &SnapshotV2MemoryHotplugState) -> Vec<GuestMemoryRange> {
+    let config_space = state.config_space();
+    state
+        .plugged_ranges()
+        .map(|plugged| {
+            let start = config_space
+                .addr()
+                .checked_add(
+                    plugged
+                        .start_block()
+                        .checked_mul(config_space.block_size())
+                        .expect("plugged fixture offset should fit"),
+                )
+                .expect("plugged fixture start should fit");
+            let length = plugged
+                .block_count()
+                .checked_mul(config_space.block_size())
+                .expect("plugged fixture length should fit");
+            GuestMemoryRange::new(GuestAddress::new(start), length)
+                .expect("plugged fixture range should validate")
+        })
+        .collect()
+}
+
+fn memory_hotplug_mapping_fixture(
+    state: &SnapshotV2MemoryHotplugState,
+    current_memory_bytes: u64,
+) -> HvfVirtioMemMappingCaptureState {
+    let config_space = state.config_space();
+    let active_ranges = memory_hotplug_active_ranges(state);
+    let active_bytes = active_ranges.iter().map(|range| range.size()).sum::<u64>();
+    let aperture = GuestMemoryRange::new(
+        GuestAddress::new(config_space.addr()),
+        config_space.region_size(),
+    )
+    .expect("virtio-mem fixture aperture should validate");
+    HvfVirtioMemMappingCaptureState::from_test_parts(HvfVirtioMemMappingCaptureTestParts {
+        aperture,
+        active_ranges,
+        active_bytes,
+        offline_bytes: config_space.region_size() - active_bytes,
+        current_memory_bytes,
+        guest_dirty_tracking: false,
+        hvf_dirty_tracking: false,
+        dirty_epoch: None,
+    })
+}
+
+fn memory_hotplug_capture_fixture(
+    state: SnapshotV2MemoryHotplugState,
+) -> HvfSnapshotV2MemoryHotplugCaptureState {
+    let active_bytes = state.config_space().plugged_size();
+    let mapping = memory_hotplug_mapping_fixture(&state, FIXTURE_MEMORY_MIB * MIB + active_bytes);
+    let requested_size_mib = state.config_space().requested_size() / MIB;
+    HvfSnapshotV2MemoryHotplugCaptureState::try_new(state, mapping, requested_size_mib)
+        .expect("virtio-mem live fixture should close")
+}
+
+fn exact_minor_ten_memory_binding(
+    state: Option<&SnapshotV2MemoryHotplugState>,
+) -> SnapshotV2MemoryBinding {
+    let mut ranges = aarch64::dram_layout(FIXTURE_MEMORY_MIB * MIB)
+        .expect("exact-2.10 base layout should validate")
+        .ranges()
+        .to_vec();
+    if let Some(state) = state {
+        ranges.extend(memory_hotplug_active_ranges(state));
+    }
+    let layout = GuestMemoryLayout::new(ranges).expect("exact-2.10 memory layout should validate");
+    let memory = GuestMemory::allocate(&layout).expect("exact-2.10 memory should allocate");
+    write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut Cursor::new(Vec::new()),
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact-2.10 memory binding should encode")
+}
+
+fn exact_minor_ten_platform_fixture(
+    state: Option<SnapshotV2MemoryHotplugState>,
+) -> HvfSnapshotV2MemoryHotplugPlatformState {
+    let capture = state.map(memory_hotplug_capture_fixture);
+    let memory = exact_minor_ten_memory_binding(
+        capture
+            .as_ref()
+            .map(HvfSnapshotV2MemoryHotplugCaptureState::state),
+    );
+    try_exact_minor_ten_platform(memory, capture)
+        .expect("exact-2.10 platform fixture should validate")
+}
+
+fn try_exact_minor_ten_platform(
+    memory: SnapshotV2MemoryBinding,
+    capture: Option<HvfSnapshotV2MemoryHotplugCaptureState>,
+) -> Result<HvfSnapshotV2MemoryHotplugPlatformState, HvfSnapshotV2BuildError> {
+    let (_, machine, global, topology, vcpus, time) = deterministic_device_graph_platform_fixture(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        DETERMINISTIC_MEMORY_HOTPLUG_MEMORY_IMAGE_ID,
+    )
+    .into_parts();
+    HvfSnapshotV2MemoryHotplugPlatformState::try_new(
+        memory, machine, global, topology, vcpus, time, capture,
+    )
+}
+
+fn complete_memory_hotplug_state_fixture(
+    transport: SnapshotV2DeviceTransportKind,
+    has_storage: bool,
+    has_entropy: bool,
+    has_balloon: bool,
+    has_memory_hotplug: bool,
+) -> HvfSnapshotV2MemoryHotplugState {
+    let memory_hotplug = has_memory_hotplug.then(|| product_memory_hotplug_fixture(transport));
+    HvfSnapshotV2MemoryHotplugState::try_new(
+        exact_minor_ten_platform_fixture(memory_hotplug),
+        has_storage.then(|| product_storage_fixture(transport)),
+        product_serial_fixture(),
+        has_entropy.then(|| memory_hotplug_product_entropy_fixture(transport)),
+        has_balloon.then(|| product_balloon_fixture(transport)),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "{transport:?} storage={has_storage} entropy={has_entropy} balloon={has_balloon} memory-hotplug={has_memory_hotplug} exact-2.10 fixture failed: {error:?}"
+        )
+    })
 }
 
 fn decode_platform(bytes: &[u8]) -> Result<HvfSnapshotV2PlatformState, HvfSnapshotV2DecodeError> {
@@ -1801,6 +2001,193 @@ fn exact_minor_nine_balloon_round_trips_every_mmio_and_pci_product_canonically()
             assert!(debug.contains("<redacted>"));
             assert!(!debug.contains("serial-log"));
         }
+    }
+}
+
+#[test]
+fn exact_minor_ten_memory_hotplug_encodes_all_sixteen_mmio_and_pci_products() {
+    for transport in [
+        SnapshotV2DeviceTransportKind::Mmio,
+        SnapshotV2DeviceTransportKind::Pci,
+    ] {
+        for mask in 0_u8..16 {
+            let has_storage = mask & 1 != 0;
+            let has_entropy = mask & 2 != 0;
+            let has_balloon = mask & 4 != 0;
+            let has_memory_hotplug = mask & 8 != 0;
+            let original = complete_memory_hotplug_state_fixture(
+                transport,
+                has_storage,
+                has_entropy,
+                has_balloon,
+                has_memory_hotplug,
+            );
+            let encoded = encode_hvf_snapshot_v2_memory_hotplug_state(&original)
+                .expect("complete exact-2.10 state should encode");
+            assert_eq!(
+                encode_hvf_snapshot_v2_memory_hotplug_state(&original)
+                    .expect("exact-2.10 encoding should be deterministic"),
+                encoded
+            );
+            let structural = decode_snapshot_v2_state_with_compatibility_version(
+                &encoded,
+                NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("exact-2.10 state should decode structurally");
+            assert_eq!(
+                structural.metadata().component_count(),
+                8 + u32::from(has_storage)
+                    + u32::from(has_entropy)
+                    + u32::from(has_balloon)
+                    + u32::from(has_memory_hotplug)
+            );
+            let candidate =
+                NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
+                    encoded.clone(),
+                )
+                .expect("exact-2.10 state should classify as an internal candidate");
+            assert_eq!(candidate.bytes(), encoded);
+            assert_eq!(candidate.device_graph().is_some(), has_storage);
+            assert_eq!(candidate.entropy().is_some(), has_entropy);
+            assert_eq!(candidate.balloon().is_some(), has_balloon);
+            assert_eq!(candidate.memory_hotplug().is_some(), has_memory_hotplug);
+            if let Some(memory_hotplug) = candidate.memory_hotplug() {
+                assert_eq!(memory_hotplug.transport().kind(), transport);
+                memory_hotplug
+                    .validate_memory_binding(candidate.memory_binding())
+                    .expect("kind-1 and kind-11 candidate coverage should close");
+            }
+            let debug = format!("{original:?}");
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains("serial-log"));
+        }
+    }
+}
+
+#[test]
+fn exact_minor_ten_capture_and_platform_reject_every_live_memory_mismatch() {
+    let state = product_memory_hotplug_fixture(SnapshotV2DeviceTransportKind::Mmio);
+    let config_space = state.config_space();
+    let requested_size_mib = config_space.requested_size() / MIB;
+    let active_ranges = memory_hotplug_active_ranges(&state);
+    let active_bytes = config_space.plugged_size();
+    let aperture = GuestMemoryRange::new(
+        GuestAddress::new(config_space.addr()),
+        config_space.region_size(),
+    )
+    .expect("fixture aperture should validate");
+    let base_bytes = FIXTURE_MEMORY_MIB * MIB;
+    let mapping = memory_hotplug_mapping_fixture(&state, base_bytes + active_bytes);
+
+    assert_eq!(
+        HvfSnapshotV2MemoryHotplugCaptureState::try_new(
+            state.clone(),
+            mapping.clone(),
+            requested_size_mib + 1,
+        ),
+        Err(HvfSnapshotV2MemoryHotplugCaptureBuildError::RequestedSize)
+    );
+    let wrong_aperture = GuestMemoryRange::new(
+        GuestAddress::new(config_space.addr() + config_space.region_size()),
+        config_space.region_size(),
+    )
+    .expect("wrong fixture aperture should remain valid");
+    let wrong_aperture_mapping =
+        HvfVirtioMemMappingCaptureState::from_test_parts(HvfVirtioMemMappingCaptureTestParts {
+            aperture: wrong_aperture,
+            active_ranges: active_ranges.clone(),
+            active_bytes,
+            offline_bytes: config_space.region_size() - active_bytes,
+            current_memory_bytes: base_bytes + active_bytes,
+            guest_dirty_tracking: false,
+            hvf_dirty_tracking: false,
+            dirty_epoch: None,
+        });
+    assert_eq!(
+        HvfSnapshotV2MemoryHotplugCaptureState::try_new(
+            state.clone(),
+            wrong_aperture_mapping,
+            requested_size_mib,
+        ),
+        Err(HvfSnapshotV2MemoryHotplugCaptureBuildError::Aperture)
+    );
+
+    let mut missing_ranges = active_ranges.clone();
+    missing_ranges.pop();
+    let wrong_topology_mapping =
+        HvfVirtioMemMappingCaptureState::from_test_parts(HvfVirtioMemMappingCaptureTestParts {
+            aperture,
+            active_ranges: missing_ranges,
+            active_bytes,
+            offline_bytes: config_space.region_size() - active_bytes,
+            current_memory_bytes: base_bytes + active_bytes,
+            guest_dirty_tracking: false,
+            hvf_dirty_tracking: false,
+            dirty_epoch: None,
+        });
+    assert_eq!(
+        HvfSnapshotV2MemoryHotplugCaptureState::try_new(
+            state.clone(),
+            wrong_topology_mapping,
+            requested_size_mib,
+        ),
+        Err(HvfSnapshotV2MemoryHotplugCaptureBuildError::Topology)
+    );
+
+    let wrong_accounting_mapping =
+        HvfVirtioMemMappingCaptureState::from_test_parts(HvfVirtioMemMappingCaptureTestParts {
+            aperture,
+            active_ranges: active_ranges.clone(),
+            active_bytes,
+            offline_bytes: config_space.region_size() - active_bytes + 4096,
+            current_memory_bytes: base_bytes + active_bytes,
+            guest_dirty_tracking: true,
+            hvf_dirty_tracking: false,
+            dirty_epoch: Some(7),
+        });
+    assert_eq!(
+        HvfSnapshotV2MemoryHotplugCaptureState::try_new(
+            state.clone(),
+            wrong_accounting_mapping,
+            requested_size_mib,
+        ),
+        Err(HvfSnapshotV2MemoryHotplugCaptureBuildError::Accounting)
+    );
+
+    let capture = memory_hotplug_capture_fixture(state.clone());
+    assert_eq!(
+        try_exact_minor_ten_platform(exact_minor_ten_memory_binding(None), Some(capture)),
+        Err(HvfSnapshotV2BuildError::Memory)
+    );
+
+    let wrong_current_mapping =
+        memory_hotplug_mapping_fixture(&state, base_bytes + active_bytes + 4096);
+    let wrong_current_capture = HvfSnapshotV2MemoryHotplugCaptureState::try_new(
+        state.clone(),
+        wrong_current_mapping,
+        requested_size_mib,
+    )
+    .expect("current byte count is closed only after kind-1 exists");
+    assert_eq!(
+        try_exact_minor_ten_platform(
+            exact_minor_ten_memory_binding(Some(&state)),
+            Some(wrong_current_capture),
+        ),
+        Err(HvfSnapshotV2BuildError::Memory)
+    );
+
+    exact_minor_ten_platform_fixture(None);
+    exact_minor_ten_platform_fixture(Some(state));
+    for error in [
+        HvfSnapshotV2MemoryHotplugCaptureBuildError::RequestedSize,
+        HvfSnapshotV2MemoryHotplugCaptureBuildError::Aperture,
+        HvfSnapshotV2MemoryHotplugCaptureBuildError::Topology,
+        HvfSnapshotV2MemoryHotplugCaptureBuildError::Accounting,
+        HvfSnapshotV2MemoryHotplugCaptureBuildError::Overflow,
+    ] {
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains(&config_space.addr().to_string()));
+        assert!(!diagnostics.contains(&requested_size_mib.to_string()));
     }
 }
 

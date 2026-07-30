@@ -25,7 +25,9 @@ use crate::snapshot_format_v2::{
     encode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
-use crate::snapshot_memory_hotplug_v2_10::NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION;
+use crate::snapshot_memory_hotplug_v2_10::{
+    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, SnapshotV2MemoryHotplugState,
+};
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory_v2::{
     write_snapshot_v2_memory_image, write_snapshot_v2_memory_image_with_compatibility_version,
@@ -769,14 +771,6 @@ fn exact_minor_nine_candidate_rejects_balloon_cardinality_payload_and_version_mi
 #[cfg(target_os = "macos")]
 #[test]
 fn exact_minor_ten_candidate_classifies_all_sixteen_optional_component_products() {
-    let memory = test_v2_memory();
-    let mut image = Cursor::new(Vec::new());
-    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
-        &memory,
-        &mut image,
-        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
-    )
-    .expect("exact 2.10 memory should encode internally");
     let storage_payload = fixture_bytes(include_str!(
         "../snapshot_device_v2_6/fixtures/block-root-mmio.hex"
     ));
@@ -789,6 +783,27 @@ fn exact_minor_ten_candidate_classifies_all_sixteen_optional_component_products(
     let memory_hotplug_payload = fixture_bytes(include_str!(
         "../snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex"
     ));
+    let memory_hotplug_state = SnapshotV2MemoryHotplugState::decode(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &memory_hotplug_payload,
+    )
+    .expect("exact 2.10 virtio-mem fixture should decode");
+    let base_memory = test_v2_memory();
+    let mut base_image = Cursor::new(Vec::new());
+    let base_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &base_memory,
+        &mut base_image,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("base exact 2.10 memory should encode internally");
+    let hotplug_memory = test_v2_memory_with_hotplug(&memory_hotplug_state);
+    let mut hotplug_image = Cursor::new(Vec::new());
+    let hotplug_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &hotplug_memory,
+        &mut hotplug_image,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("dynamic exact 2.10 memory should encode internally");
 
     let mut product_count = 0;
     for with_storage in [false, true] {
@@ -822,8 +837,13 @@ fn exact_minor_ten_candidate_classifies_all_sixteen_optional_component_products(
                     } else {
                         Vec::new()
                     };
+                    let binding = if with_memory_hotplug {
+                        &hotplug_binding
+                    } else {
+                        &base_binding
+                    };
                     let bytes = memory_hotplug_v2_10_state(
-                        &binding,
+                        binding,
                         with_storage.then_some(storage_payload.as_slice()),
                         &entropy_components,
                         &balloon_components,
@@ -853,7 +873,7 @@ fn exact_minor_ten_candidate_classifies_all_sixteen_optional_component_products(
                         candidate.version(),
                         NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
                     );
-                    assert_eq!(candidate.memory_binding(), &binding);
+                    assert_eq!(candidate.memory_binding(), binding);
                     assert_eq!(candidate.device_graph().is_some(), with_storage);
                     assert_eq!(candidate.entropy().is_some(), with_entropy);
                     assert_eq!(candidate.balloon().is_some(), with_balloon);
@@ -883,6 +903,39 @@ fn exact_minor_ten_candidate_classifies_all_sixteen_optional_component_products(
         }
     }
     assert_eq!(product_count, 16);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_ten_candidate_rejects_mismatched_memory_and_virtio_mem_coverage() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("base exact 2.10 memory should encode");
+    let memory_hotplug_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex"
+    ));
+    let bytes = memory_hotplug_v2_10_state(
+        &binding,
+        None,
+        &[],
+        &[],
+        &[(
+            NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            memory_hotplug_payload.as_slice(),
+        )],
+    )
+    .expect("mismatched product should remain structurally encodable");
+
+    assert!(matches!(
+        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(bytes),
+        Err(NativeV2SnapshotCandidateStateError::MemoryHotplugBinding(_))
+    ));
 }
 
 #[cfg(target_os = "macos")]
@@ -3325,6 +3378,38 @@ fn test_v2_memory() -> GuestMemory {
         .write_slice(&test_bytes(), GuestAddress::new(aarch64::DRAM_MEM_START))
         .expect("native-v2 fixture bytes should write");
     memory
+}
+
+#[cfg(target_os = "macos")]
+fn test_v2_memory_with_hotplug(state: &SnapshotV2MemoryHotplugState) -> GuestMemory {
+    let mut ranges = vec![
+        GuestMemoryRange::new(
+            GuestAddress::new(aarch64::DRAM_MEM_START),
+            u64::try_from(TEST_MEMORY_BYTES).expect("fixture size should fit u64"),
+        )
+        .expect("native-v2 fixture range should be valid"),
+    ];
+    let config_space = state.config_space();
+    for plugged in state.plugged_ranges() {
+        let offset = plugged
+            .start_block()
+            .checked_mul(config_space.block_size())
+            .expect("fixture plugged offset should fit");
+        let start = config_space
+            .addr()
+            .checked_add(offset)
+            .expect("fixture plugged start should fit");
+        let length = plugged
+            .block_count()
+            .checked_mul(config_space.block_size())
+            .expect("fixture plugged length should fit");
+        ranges.push(
+            GuestMemoryRange::new(GuestAddress::new(start), length)
+                .expect("fixture plugged range should validate"),
+        );
+    }
+    let layout = GuestMemoryLayout::new(ranges).expect("hotplug fixture layout should validate");
+    GuestMemory::allocate(&layout).expect("hotplug fixture memory should allocate")
 }
 
 #[cfg(target_os = "macos")]

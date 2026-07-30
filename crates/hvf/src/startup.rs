@@ -138,6 +138,10 @@ use bangbang_runtime::snapshot_entropy_v2_8::{
 };
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
+use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
+    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, SnapshotV2MemoryHotplugState,
+    SnapshotV2MemoryHotplugStateCaptureError,
+};
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
     write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
@@ -246,7 +250,9 @@ use crate::snapshot_restore::{
 };
 use crate::snapshot_v2::{
     HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2FdtState,
-    HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState, HvfSnapshotV2PlatformState,
+    HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState,
+    HvfSnapshotV2MemoryHotplugCaptureBuildError, HvfSnapshotV2MemoryHotplugCaptureState,
+    HvfSnapshotV2MemoryHotplugPlatformState, HvfSnapshotV2PlatformState,
     HvfSnapshotV2PvTimeVcpuState, HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
 };
 use crate::snapshot_v2_balloon_platform::{
@@ -7432,6 +7438,45 @@ impl HvfArm64BootMemoryHotplugCaptureState {
     pub const fn mapping(&self) -> &HvfVirtioMemMappingCaptureState {
         &self.mapping
     }
+
+    /// Converts this detached live capture into the exact-2.10 source proof.
+    pub fn try_to_snapshot_v2(
+        &self,
+        requested_size_mib: u64,
+    ) -> Result<
+        HvfSnapshotV2MemoryHotplugCaptureState,
+        HvfArm64BootMemoryHotplugSnapshotV2CaptureError,
+    > {
+        let state = match &self.transport {
+            HvfArm64BootMemoryHotplugTransportState::Mmio {
+                region,
+                interrupt_line,
+                state,
+            } => SnapshotV2MemoryHotplugState::try_from_mmio_capture(
+                self.config,
+                *region,
+                *interrupt_line,
+                state,
+            ),
+            HvfArm64BootMemoryHotplugTransportState::Pci {
+                sbdf,
+                bar_range,
+                state,
+            } => SnapshotV2MemoryHotplugState::try_from_pci_capture(
+                self.config,
+                *sbdf,
+                *bar_range,
+                state,
+            ),
+        }
+        .map_err(HvfArm64BootMemoryHotplugSnapshotV2CaptureError::State)?;
+        HvfSnapshotV2MemoryHotplugCaptureState::try_new(
+            state,
+            self.mapping.clone(),
+            requested_size_mib,
+        )
+        .map_err(HvfArm64BootMemoryHotplugSnapshotV2CaptureError::Proof)
+    }
 }
 
 impl fmt::Debug for HvfArm64BootMemoryHotplugCaptureState {
@@ -7440,6 +7485,40 @@ impl fmt::Debug for HvfArm64BootMemoryHotplugCaptureState {
             .debug_struct("HvfArm64BootMemoryHotplugCaptureState")
             .field("state", &"<redacted>")
             .finish()
+    }
+}
+
+/// Failure while converting one complete live virtio-mem capture into the
+/// exact-2.10 source proof.
+pub enum HvfArm64BootMemoryHotplugSnapshotV2CaptureError {
+    /// Portable device/transport conversion failed.
+    State(SnapshotV2MemoryHotplugStateCaptureError),
+    /// Controller and live mapping facts do not close around the portable
+    /// state.
+    Proof(HvfSnapshotV2MemoryHotplugCaptureBuildError),
+}
+
+impl fmt::Debug for HvfArm64BootMemoryHotplugSnapshotV2CaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for HvfArm64BootMemoryHotplugSnapshotV2CaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::State(_) => "native-v2 virtio-mem portable capture failed",
+            Self::Proof(_) => "native-v2 virtio-mem live proof is inconsistent",
+        })
+    }
+}
+
+impl std::error::Error for HvfArm64BootMemoryHotplugSnapshotV2CaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::State(source) => Some(source),
+            Self::Proof(source) => Some(source),
+        }
     }
 }
 
@@ -11096,7 +11175,8 @@ fn hvf_arm64_boot_snapshot_v2_platform_profile(
         | NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
         | NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
         | NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
-        | NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION => {
+        | NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
+        | NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION => {
             Some(HvfArm64BootSnapshotV2PlatformProfile::ProductProcess)
         }
         _ => None,
@@ -11133,6 +11213,30 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
         version: SnapshotFormatVersion,
         is_cancelled: impl FnMut(SnapshotV2MemoryIoStage) -> bool,
     ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        self.capture_with_compatibility_version_and_cancel_using(
+            input,
+            memory_writer,
+            version,
+            is_cancelled,
+            HvfSnapshotV2PlatformState::try_new,
+        )
+    }
+
+    fn capture_with_compatibility_version_and_cancel_using<T>(
+        self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut (impl std::io::Write + std::io::Seek),
+        version: SnapshotFormatVersion,
+        is_cancelled: impl FnMut(SnapshotV2MemoryIoStage) -> bool,
+        finalize: impl FnOnce(
+            SnapshotV2MemoryBinding,
+            HvfSnapshotV2MachineState,
+            HvfSnapshotV2GlobalState,
+            HvfArm64StablePausedTopologyState,
+            Vec<HvfSnapshotV2VcpuState>,
+            HvfSnapshotV2TimeState,
+        ) -> Result<T, HvfSnapshotV2BuildError>,
+    ) -> Result<T, HvfArm64BootSnapshotV2CaptureError> {
         let profile = hvf_arm64_boot_snapshot_v2_platform_profile(version);
         debug_assert!(profile.is_some());
         let (stable, captures, pvtime_capture) =
@@ -11302,11 +11406,12 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
             is_cancelled,
         )
         .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
-        HvfSnapshotV2PlatformState::try_new(memory_binding, machine, global, stable, vcpus, time)
-            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
+        finalize(memory_binding, machine, global, stable, vcpus, time).map_err(|source| {
+            HvfArm64BootSnapshotV2CaptureError::Build {
                 stage: HvfArm64BootSnapshotV2CaptureStage::Platform,
                 source,
-            })
+            }
+        })
     }
 }
 
@@ -12628,6 +12733,40 @@ impl HvfArm64BootSession<'_> {
             memory_writer,
             NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
             is_cancelled,
+        )
+    }
+
+    /// Captures one closed internal exact native-v2 2.10 platform after
+    /// binding optional virtio-mem source proof to the Full memory image.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_memory_hotplug_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<HvfSnapshotV2MemoryHotplugCaptureState>,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2MemoryHotplugPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel_using(
+            input,
+            memory_writer,
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            is_cancelled,
+            move |memory, machine, global, topology, vcpus, time| {
+                HvfSnapshotV2MemoryHotplugPlatformState::try_new(
+                    memory, machine, global, topology, vcpus, time, capture,
+                )
+            },
         )
     }
 
@@ -22162,6 +22301,40 @@ impl OwnedHvfArm64BootSession {
         )
     }
 
+    /// Captures one closed internal exact native-v2 2.10 platform after
+    /// binding optional virtio-mem source proof to the Full memory image.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_memory_hotplug_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<HvfSnapshotV2MemoryHotplugCaptureState>,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2MemoryHotplugPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: &self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel_using(
+            input,
+            memory_writer,
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            is_cancelled,
+            move |memory, machine, global, topology, vcpus, time| {
+                HvfSnapshotV2MemoryHotplugPlatformState::try_new(
+                    memory, machine, global, topology, vcpus, time, capture,
+                )
+            },
+        )
+    }
+
     /// Complete a topology-wide pause without dispatching new guest work.
     #[doc(hidden)]
     pub fn pause_for_snapshot_v2_capture(&mut self) -> Result<(), HvfArm64BootVcpuError> {
@@ -30957,6 +31130,16 @@ mod tests {
             pvtime_layout,
             pvtime_capture,
         )
+    }
+
+    #[test]
+    fn exact_minor_ten_uses_the_product_process_platform_profile() {
+        assert_eq!(
+            super::hvf_arm64_boot_snapshot_v2_platform_profile(
+                super::NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            ),
+            Some(super::HvfArm64BootSnapshotV2PlatformProfile::ProductProcess)
+        );
     }
 
     #[test]
