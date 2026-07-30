@@ -6919,6 +6919,11 @@ where
                     return Err(NativeV2SnapshotLoadError::Cancelled);
                 }
             }
+            NativeV2SnapshotArtifactProfile::NetworkStateV2_11 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
         }
 
         let (state, state_id, memory_id) = prepared.into_parts();
@@ -7277,6 +7282,9 @@ where
                 self.started_session = Some(session);
                 Ok(self.controller.commit_snapshot_v2_load(controller_commit))
             }
+            NativeV2SnapshotArtifactProfile::NetworkStateV2_11 => Err(
+                NativeV2SnapshotLoadError::Preflight(VmmActionError::SnapshotUnsupported),
+            ),
         }
     }
 
@@ -8975,6 +8983,11 @@ impl HvfInstanceStartExecutor {
             NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10 => {
                 NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
             }
+            NativeV2SnapshotArtifactProfile::NetworkStateV2_11 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
         };
         let structural = decode_snapshot_v2_state_with_compatibility_version(bytes, version)
             .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
@@ -9010,6 +9023,11 @@ impl HvfInstanceStartExecutor {
             NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10 => {
                 decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
                     .map_err(NativeV2SnapshotLoadError::Decode)?;
+            }
+            NativeV2SnapshotArtifactProfile::NetworkStateV2_11 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
             }
         }
         Ok(())
@@ -23538,8 +23556,9 @@ mod tests {
         LoadedNativeSnapshotArtifacts, NativeSnapshotPublicationOutcome,
         NativeV2BalloonSnapshotCandidateState, NativeV2EntropySnapshotCandidateState,
         NativeV2MemoryHotplugSnapshotCandidateState, NativeV2MemoryHotplugSnapshotPreparation,
-        NativeV2SnapshotArtifactProfile, PreparedNativeSnapshotState, SnapshotArtifactOutputs,
-        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
+        NativeV2NetworkSnapshotCandidateState, NativeV2SnapshotArtifactProfile,
+        PreparedNativeSnapshotState, SnapshotArtifactOutputs, SnapshotArtifactPaths,
+        SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_artifact::{
@@ -23583,6 +23602,7 @@ mod tests {
         SnapshotV2MemoryBinding, write_snapshot_v2_memory_image_with_cancel,
         write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
     };
+    use bangbang_runtime::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
     use bangbang_runtime::snapshot_serial_v2_7::{
         NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialEndpointIntent,
         SnapshotV2SerialState,
@@ -31592,6 +31612,74 @@ mod tests {
                 NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10,
             ),
             Err(NativeV2SnapshotLoadError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn native_v2_process_preflight_explicitly_rejects_exact_minor_eleven_profile() {
+        let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
+            .expect("exact minor-eleven fixture range should validate");
+        let layout = GuestMemoryLayout::new(vec![range])
+            .expect("exact minor-eleven fixture layout should validate");
+        let memory =
+            GuestMemory::allocate(&layout).expect("exact minor-eleven fixture should allocate");
+        let mut image = Cursor::new(Vec::new());
+        let binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+            &memory,
+            &mut image,
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            |_| false,
+        )
+        .expect("exact minor-eleven memory should encode internally")
+        .encode()
+        .expect("exact minor-eleven binding should encode");
+        let serial_device = SerialMmioDevice::discarding()
+            .capture_state()
+            .expect("fixture serial device should capture");
+        let serial = SnapshotV2SerialState::try_from_capture_ready(CaptureReadySerialState::new(
+            SerialConfig::default(),
+            serial_device,
+        ))
+        .expect("fixture serial state should validate")
+        .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+        .expect("fixture serial state should encode");
+        let components = [
+            SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &binding,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_SERIAL_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &serial,
+            ),
+        ];
+        let encoded = encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            &[],
+            &components,
+        )
+        .expect("network-free exact minor-eleven state should encode internally");
+        let state = NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(encoded)
+            .expect("network-free exact minor-eleven candidate should validate")
+            .into_compatible_artifact_state();
+        assert_eq!(
+            state
+                .v2_profile()
+                .expect("exact minor-eleven profile should classify"),
+            NativeV2SnapshotArtifactProfile::NetworkStateV2_11
+        );
+        let prepared = PreparedNativeSnapshotState::from_state(state);
+
+        assert!(matches!(
+            HvfInstanceStartExecutor::default().validate_snapshot_v2_artifact_profile(
+                &prepared,
+                NativeV2SnapshotArtifactProfile::NetworkStateV2_11,
+            ),
+            Err(NativeV2SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported
+            ))
         ));
     }
 

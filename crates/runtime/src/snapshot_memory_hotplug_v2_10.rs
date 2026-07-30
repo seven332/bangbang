@@ -1069,7 +1069,20 @@ impl SnapshotV2MemoryHotplugState {
         &self,
         binding: &SnapshotV2MemoryBinding,
     ) -> Result<(), SnapshotV2MemoryHotplugBindingError> {
-        if binding.version() != NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION {
+        self.validate_memory_binding_for_compatibility_version(
+            binding,
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        )
+    }
+
+    /// Applies the unchanged exact-2.10 topology geometry to a later closed
+    /// container whose kind-1 binding carries that container's exact version.
+    pub(crate) fn validate_memory_binding_for_compatibility_version(
+        &self,
+        binding: &SnapshotV2MemoryBinding,
+        compatibility_version: SnapshotFormatVersion,
+    ) -> Result<(), SnapshotV2MemoryHotplugBindingError> {
+        if binding.version() != compatibility_version {
             return Err(SnapshotV2MemoryHotplugBindingError::Version);
         }
 

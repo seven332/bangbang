@@ -20,9 +20,9 @@ use crate::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_format_v2::{
     NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
     NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY,
-    NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component,
-    SnapshotV2ComponentDisposition, SnapshotV2ComponentKey,
-    encode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY, NATIVE_V2_NETWORK_COMPONENT_KEY,
+    NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
+    SnapshotV2ComponentKey, encode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory_hotplug_v2_10::{
@@ -31,6 +31,10 @@ use crate::snapshot_memory_hotplug_v2_10::{
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory_v2::{
     write_snapshot_v2_memory_image, write_snapshot_v2_memory_image_with_compatibility_version,
+};
+#[cfg(target_os = "macos")]
+use crate::snapshot_network_v2_11::{
+    NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, SnapshotV2NetworkState,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_serial_v2_7::{
@@ -767,6 +771,271 @@ fn exact_minor_nine_candidate_rejects_balloon_cardinality_payload_and_version_mi
     assert!(matches!(
         NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(mismatched),
         Err(NativeV2SnapshotCandidateStateError::VersionMismatch { .. })
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_eleven_candidate_closes_every_optional_component_product() {
+    let storage_payload = fixture_bytes(include_str!(
+        "../snapshot_device_v2_6/fixtures/block-root-mmio.hex"
+    ));
+    let entropy_payload = fixture_bytes(include_str!(
+        "../snapshot_entropy_v2_8/fixtures/inactive-mmio.hex"
+    ));
+    let balloon_payload = fixture_bytes(include_str!(
+        "../snapshot_balloon_v2_9/fixtures/active-pci.hex"
+    ));
+    let memory_hotplug_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex"
+    ));
+    let memory_hotplug_state = SnapshotV2MemoryHotplugState::decode(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &memory_hotplug_payload,
+    )
+    .expect("unchanged exact-2.10 virtio-mem fixture should decode");
+    let network_payload = fixture_bytes(include_str!(
+        "../snapshot_network_v2_11/fixtures/inactive-mmio.hex"
+    ));
+    let network_state = SnapshotV2NetworkState::decode(
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+        &network_payload,
+    )
+    .expect("exact-2.11 network fixture should decode");
+
+    let base_memory = test_v2_memory();
+    let mut base_image = Cursor::new(Vec::new());
+    let base_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &base_memory,
+        &mut base_image,
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("base exact-2.11 memory should encode internally");
+    let hotplug_memory = test_v2_memory_with_hotplug(&memory_hotplug_state);
+    let mut hotplug_image = Cursor::new(Vec::new());
+    let hotplug_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &hotplug_memory,
+        &mut hotplug_image,
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("virtio-mem exact-2.11 memory should encode internally");
+
+    let serial_device = SerialMmioDevice::discarding()
+        .capture_state()
+        .expect("fixture serial device should capture");
+    let serial_payload = SnapshotV2SerialState::try_from_capture_ready(
+        CaptureReadySerialState::new(SerialConfig::default(), serial_device),
+    )
+    .expect("fixture serial state should validate")
+    .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+    .expect("fixture serial state should encode");
+
+    for product in 0_u8..32 {
+        let with_storage = product & 0b00001 != 0;
+        let with_entropy = product & 0b00010 != 0;
+        let with_balloon = product & 0b00100 != 0;
+        let with_memory_hotplug = product & 0b01000 != 0;
+        let with_network = product & 0b10000 != 0;
+        let binding = if with_memory_hotplug {
+            &hotplug_binding
+        } else {
+            &base_binding
+        };
+        let binding_payload = binding.encode().expect("exact-2.11 binding should encode");
+        let mut components = vec![SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &binding_payload,
+        )];
+        if with_storage {
+            components.push(SnapshotV2Component::new(
+                NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &storage_payload,
+            ));
+        }
+        components.push(SnapshotV2Component::new(
+            NATIVE_V2_SERIAL_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &serial_payload,
+        ));
+        if with_entropy {
+            components.push(SnapshotV2Component::new(
+                NATIVE_V2_ENTROPY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &entropy_payload,
+            ));
+        }
+        if with_balloon {
+            components.push(SnapshotV2Component::new(
+                NATIVE_V2_BALLOON_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &balloon_payload,
+            ));
+        }
+        if with_memory_hotplug {
+            components.push(SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &memory_hotplug_payload,
+            ));
+        }
+        if with_network {
+            components.push(SnapshotV2Component::new(
+                NATIVE_V2_NETWORK_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &network_payload,
+            ));
+        }
+        let bytes = encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            &[],
+            &components,
+        )
+        .expect("exact-2.11 optional product should encode");
+        let candidate =
+            NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(bytes.clone())
+                .expect("exact-2.11 optional product should close");
+
+        assert_eq!(
+            candidate.version(),
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+        );
+        assert_eq!(candidate.bytes(), bytes);
+        assert_eq!(candidate.memory_binding(), binding);
+        assert_eq!(candidate.device_graph().is_some(), with_storage);
+        assert_eq!(candidate.entropy().is_some(), with_entropy);
+        assert_eq!(candidate.balloon().is_some(), with_balloon);
+        assert_eq!(candidate.memory_hotplug().is_some(), with_memory_hotplug);
+        assert_eq!(candidate.network().is_some(), with_network);
+        if with_network {
+            assert_eq!(candidate.network(), Some(&network_state));
+        }
+        let debug = format!("{candidate:?}");
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("BANGNW2"));
+        assert!(!debug.contains("vmnet:host"));
+
+        let artifact = candidate.into_compatible_artifact_state();
+        assert_eq!(
+            artifact
+                .v2_profile()
+                .expect("exact-2.11 optional product should classify"),
+            NativeV2SnapshotArtifactProfile::NetworkStateV2_11
+        );
+        assert!(matches!(
+            artifact.validate_for_publication(),
+            Err(NativeSnapshotArtifactStateError::NonCurrentV2Publication {
+                state: NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                memory: NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            })
+        ));
+        assert!(
+            NativeSnapshotArtifactState::from_current_v2(bytes).is_err(),
+            "the public exact-2.10 constructor must reject product {product}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_eleven_candidate_rejects_invalid_or_non_singleton_network_components() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact-2.11 memory should encode internally");
+    let binding_payload = binding.encode().expect("memory binding should encode");
+    let serial_device = SerialMmioDevice::discarding()
+        .capture_state()
+        .expect("fixture serial device should capture");
+    let serial_payload = SnapshotV2SerialState::try_from_capture_ready(
+        CaptureReadySerialState::new(SerialConfig::default(), serial_device),
+    )
+    .expect("fixture serial state should validate")
+    .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+    .expect("fixture serial state should encode");
+    let network_payload = fixture_bytes(include_str!(
+        "../snapshot_network_v2_11/fixtures/inactive-mmio.hex"
+    ));
+    let memory_component = SnapshotV2Component::new(
+        NATIVE_V2_MEMORY_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &binding_payload,
+    );
+    let serial_component = SnapshotV2Component::new(
+        NATIVE_V2_SERIAL_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &serial_payload,
+    );
+
+    let invalid_payload = [0_u8; 64];
+    let invalid_network = SnapshotV2Component::new(
+        NATIVE_V2_NETWORK_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &invalid_payload,
+    );
+    let invalid = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &[memory_component, serial_component, invalid_network],
+    )
+    .expect("invalid nested payload should remain structurally encodable");
+    assert!(matches!(
+        NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(invalid),
+        Err(NativeV2SnapshotCandidateStateError::NetworkState(_))
+    ));
+
+    for component in [
+        SnapshotV2Component::new(
+            NATIVE_V2_NETWORK_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::NonSemantic,
+            &network_payload,
+        ),
+        SnapshotV2Component::new(
+            SnapshotV2ComponentKey::new(NATIVE_V2_NETWORK_COMPONENT_KEY.kind(), 1),
+            SnapshotV2ComponentDisposition::Semantic,
+            &network_payload,
+        ),
+    ] {
+        let invalid = encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            &[],
+            &[memory_component, serial_component, component],
+        )
+        .expect("invalid singleton shape should remain structurally encodable");
+        assert!(matches!(
+            NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(invalid),
+            Err(NativeV2SnapshotCandidateStateError::InvalidNetworkComponent)
+        ));
+    }
+
+    let duplicate_kind = [
+        memory_component,
+        serial_component,
+        SnapshotV2Component::new(
+            NATIVE_V2_NETWORK_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &network_payload,
+        ),
+        SnapshotV2Component::new(
+            SnapshotV2ComponentKey::new(NATIVE_V2_NETWORK_COMPONENT_KEY.kind(), 1),
+            SnapshotV2ComponentDisposition::Semantic,
+            &network_payload,
+        ),
+    ];
+    let invalid = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &duplicate_kind,
+    )
+    .expect("two distinct kind-12 instances should remain structurally encodable");
+    assert!(matches!(
+        NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(invalid),
+        Err(NativeV2SnapshotCandidateStateError::InvalidNetworkComponent)
     ));
 }
 
