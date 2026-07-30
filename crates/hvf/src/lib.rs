@@ -147,7 +147,8 @@ pub use snapshot_v2::{
     HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState,
     HvfSnapshotV2MemoryHotplugCaptureBuildError, HvfSnapshotV2MemoryHotplugCaptureState,
     HvfSnapshotV2MemoryHotplugPlatformState, HvfSnapshotV2MemoryHotplugState,
-    HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2PlatformState,
+    HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2NetworkPlatformState,
+    HvfSnapshotV2NetworkState, HvfSnapshotV2NetworkStateParts, HvfSnapshotV2PlatformState,
     HvfSnapshotV2SerialState, HvfSnapshotV2State, HvfSnapshotV2StorageState,
     HvfSnapshotV2VcpuState, decode_hvf_snapshot_v2_balloon_state,
     decode_hvf_snapshot_v2_entropy_state, decode_hvf_snapshot_v2_memory_hotplug_state,
@@ -155,9 +156,9 @@ pub use snapshot_v2::{
     decode_hvf_snapshot_v2_serial_state, decode_hvf_snapshot_v2_state,
     decode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_balloon_state,
     encode_hvf_snapshot_v2_entropy_state, encode_hvf_snapshot_v2_memory_hotplug_state,
-    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_platform_state,
-    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
-    encode_hvf_snapshot_v2_storage_state,
+    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_network_state,
+    encode_hvf_snapshot_v2_platform_state, encode_hvf_snapshot_v2_serial_state,
+    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
 };
 pub use snapshot_v2_balloon_platform::{
     HvfSnapshotV2BalloonEntropyMmioEndpointPlan, HvfSnapshotV2BalloonMmioEndpointPlan,

@@ -7,23 +7,31 @@
 use std::fmt;
 use std::net::Ipv4Addr;
 
+use crate::interrupt::GuestInterruptLine;
+use crate::memory::GuestMemoryRange;
 use crate::mmds::{
     DEFAULT_MMDS_IPV4_ADDRESS, DEFAULT_MMDS_MAC_ADDRESS, EthernetMacAddress, MMDS_GUEST_TCP_PORT,
     MmdsVersion,
 };
+use crate::mmio::MmioRegion;
 use crate::network::{
-    GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkDeviceProfile, VIRTIO_NET_MAX_MTU,
-    VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE, VirtioNetworkConfigSpace,
-    VirtioNetworkFeatureCapabilities,
+    GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkDeviceProfile, NetworkInterfaceConfig,
+    VIRTIO_NET_DEVICE_ID, VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT,
+    VIRTIO_NET_QUEUE_SIZE, VirtioNetworkConfigSpace, VirtioNetworkDeviceCaptureState,
+    VirtioNetworkFeatureCapabilities, VirtioNetworkMmioCaptureState, VirtioNetworkPciCaptureState,
+    VirtioNetworkRateLimiterCaptureState, VirtioNetworkRetryCaptureState,
+    VirtioNetworkTokenBucketCaptureState,
 };
 use crate::pci::{
     PCI_BAR64_SIZE, PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
-    PCI_LAST_ENDPOINT_DEVICE, PCI_SEGMENT_ZERO, PciBarAddressSpace, PciBarPrefetchable,
+    PCI_LAST_ENDPOINT_DEVICE, PCI_SEGMENT_ZERO, PciBarAddressSpace, PciBarPrefetchable, PciSbdf,
 };
 use crate::snapshot_device_v2::{
-    SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind, SnapshotV2InterruptIntent,
-    SnapshotV2MmioDeviceState, SnapshotV2PciDeviceState, SnapshotV2VirtioQueueState,
-    SnapshotV2VirtioState,
+    SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
+    SnapshotV2InterruptIntent, SnapshotV2MmioDeviceState, SnapshotV2PciDeviceState,
+    SnapshotV2VirtioQueueState, SnapshotV2VirtioState,
+    capture_mmio_common_for_device_with_queue_count_and_config_status_gate, capture_mmio_transport,
+    capture_pci_common_for_device_with_queue_count, capture_pci_transport_parts_with_queue_count,
 };
 use crate::snapshot_device_v2_5::queue_ranges;
 use crate::snapshot_format::SnapshotFormatVersion;
@@ -392,6 +400,60 @@ pub struct SnapshotV2NetworkInterfaceState {
 }
 
 impl SnapshotV2NetworkInterfaceState {
+    /// Converts one checked MMIO live capture without retaining source
+    /// ownership or normalized source-only work.
+    pub fn try_from_mmio_capture(
+        config: &NetworkInterfaceConfig,
+        backend: SnapshotV2NetworkBackendClass,
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+        captured: &VirtioNetworkMmioCaptureState,
+    ) -> Result<Self, SnapshotV2NetworkStateCaptureError> {
+        let device = captured.device();
+        let virtio = capture_mmio_common_for_device_with_queue_count_and_config_status_gate(
+            captured.transport(),
+            VIRTIO_NET_DEVICE_ID,
+            device.available_features(),
+            VIRTIO_NET_QUEUE_COUNT,
+            true,
+        )
+        .map_err(capture_common_error)?;
+        let transport = capture_mmio_transport(region, interrupt_line, captured.transport())
+            .map(SnapshotV2DeviceTransport::Mmio)
+            .map_err(capture_common_error)?;
+        capture_network_interface(config, backend, device, virtio, transport)
+    }
+
+    /// Converts one checked PCI live capture without retaining source
+    /// ownership or normalized source-only work.
+    pub fn try_from_pci_capture(
+        config: &NetworkInterfaceConfig,
+        backend: SnapshotV2NetworkBackendClass,
+        origin: StorageDeviceOrigin,
+        sbdf: PciSbdf,
+        bar_range: GuestMemoryRange,
+        captured: &VirtioNetworkPciCaptureState,
+    ) -> Result<Self, SnapshotV2NetworkStateCaptureError> {
+        let device = captured.device();
+        let virtio = capture_pci_common_for_device_with_queue_count(
+            captured.transport(),
+            VIRTIO_NET_DEVICE_ID,
+            device.available_features(),
+            VIRTIO_NET_QUEUE_COUNT,
+        )
+        .map_err(capture_common_error)?;
+        let transport = capture_pci_transport_parts_with_queue_count(
+            origin,
+            sbdf,
+            bar_range,
+            captured.transport(),
+            VIRTIO_NET_QUEUE_COUNT,
+        )
+        .map(SnapshotV2DeviceTransport::Pci)
+        .map_err(capture_common_error)?;
+        capture_network_interface(config, backend, device, virtio, transport)
+    }
+
     /// Creates one record and validates all record-local relationships.
     pub fn try_from_parts(
         parts: SnapshotV2NetworkInterfaceStateParts,
@@ -644,6 +706,58 @@ impl fmt::Display for SnapshotV2NetworkStateBuildError {
 
 impl std::error::Error for SnapshotV2NetworkStateBuildError {}
 
+/// Failure while converting one trusted live network capture into exact-2.11
+/// state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2NetworkStateCaptureError {
+    /// A bounded string or common-state collection could not be allocated.
+    Allocation,
+    /// Repeated device, profile, queue, and common state disagree.
+    Device,
+    /// Source-owned cached packet or retry work was normalized away.
+    NormalizedWork,
+    /// Common virtio or transport capture failed.
+    Common {
+        /// Redacted common capture category.
+        source: SnapshotV2DeviceGraphCaptureError,
+    },
+    /// Complete converted state failed its final semantic gate.
+    Build {
+        /// Redacted exact-2.11 build category.
+        source: SnapshotV2NetworkStateBuildError,
+    },
+}
+
+impl fmt::Debug for SnapshotV2NetworkStateCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2NetworkStateCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Allocation => "native-v2 captured network state allocation failed",
+            Self::Device => "native-v2 captured network device state is inconsistent",
+            Self::NormalizedWork => {
+                "native-v2 captured network state contains normalized source work"
+            }
+            Self::Common { .. } => "native-v2 captured network transport state is invalid",
+            Self::Build { .. } => "native-v2 captured network state is invalid",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2NetworkStateCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Common { source } => Some(source),
+            Self::Build { source } => Some(source),
+            Self::Allocation | Self::Device | Self::NormalizedWork => None,
+        }
+    }
+}
+
 /// Failure while encoding exact-2.11 network state.
 #[derive(Debug)]
 pub enum SnapshotV2NetworkStateEncodeError {
@@ -730,6 +844,102 @@ impl std::error::Error for SnapshotV2NetworkStateDecodeError {
             | Self::InvalidUtf8
             | Self::Allocation => None,
         }
+    }
+}
+
+fn capture_network_interface(
+    config: &NetworkInterfaceConfig,
+    backend: SnapshotV2NetworkBackendClass,
+    device: &VirtioNetworkDeviceCaptureState,
+    virtio: SnapshotV2VirtioState,
+    transport: SnapshotV2DeviceTransport,
+) -> Result<SnapshotV2NetworkInterfaceState, SnapshotV2NetworkStateCaptureError> {
+    if device.source_rx_cache_normalized() || device.source_rx_retry_normalized() {
+        return Err(SnapshotV2NetworkStateCaptureError::NormalizedWork);
+    }
+    if device.available_features() != virtio.available_features()
+        || device.negotiated_features() != virtio.driver_features()
+        || device.active_rx_queue().is_some() != virtio.is_activated()
+        || device.active_tx_queue().is_some() != virtio.is_activated()
+    {
+        return Err(SnapshotV2NetworkStateCaptureError::Device);
+    }
+
+    let iface_id = copy_capture_string(config.iface_id())?;
+    let captured_selector = copy_capture_string(config.host_dev_name())?;
+    let local = SnapshotV2NetworkLocalState::new(
+        device.active_rx_queue().map(|queue| {
+            SnapshotV2NetworkQueueState::new(queue.next_available(), queue.next_used())
+        }),
+        device.active_tx_queue().map(|queue| {
+            SnapshotV2NetworkQueueState::new(queue.next_available(), queue.next_used())
+        }),
+        capture_retry(device.tx_retry()),
+    );
+    let rx_limiter = capture_limiter(device.rx_rate_limiter());
+    let tx_limiter = capture_limiter(device.tx_rate_limiter());
+    SnapshotV2NetworkInterfaceState::try_from_parts(SnapshotV2NetworkInterfaceStateParts {
+        iface_id,
+        captured_selector,
+        requested_guest_mac: config.guest_mac(),
+        requested_mtu: config.mtu(),
+        profile: device.profile(),
+        backend,
+        local,
+        virtio,
+        rx_limiter,
+        tx_limiter,
+        transport,
+    })
+    .map_err(|source| SnapshotV2NetworkStateCaptureError::Build { source })
+}
+
+fn capture_limiter(limiter: VirtioNetworkRateLimiterCaptureState) -> SnapshotV2NetworkLimiterState {
+    SnapshotV2NetworkLimiterState::new(
+        limiter.bandwidth().map(capture_token_bucket),
+        limiter.ops().map(capture_token_bucket),
+    )
+}
+
+fn capture_token_bucket(
+    bucket: VirtioNetworkTokenBucketCaptureState,
+) -> SnapshotV2NetworkTokenBucketState {
+    let config = bucket.config();
+    SnapshotV2NetworkTokenBucketState::new(
+        config.size(),
+        config.one_time_burst(),
+        config.refill_time(),
+        bucket.budget(),
+        bucket.one_time_burst(),
+        bucket.age_nanos(),
+    )
+}
+
+const fn capture_retry(retry: VirtioNetworkRetryCaptureState) -> SnapshotV2NetworkRetryState {
+    match retry {
+        VirtioNetworkRetryCaptureState::None => SnapshotV2NetworkRetryState::None,
+        VirtioNetworkRetryCaptureState::Immediate => SnapshotV2NetworkRetryState::Immediate,
+        VirtioNetworkRetryCaptureState::After { remaining_nanos } => {
+            SnapshotV2NetworkRetryState::After { remaining_nanos }
+        }
+    }
+}
+
+fn copy_capture_string(value: &str) -> Result<String, SnapshotV2NetworkStateCaptureError> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(value.len())
+        .map_err(|_| SnapshotV2NetworkStateCaptureError::Allocation)?;
+    copy.push_str(value);
+    Ok(copy)
+}
+
+fn capture_common_error(
+    source: SnapshotV2DeviceGraphCaptureError,
+) -> SnapshotV2NetworkStateCaptureError {
+    if source == SnapshotV2DeviceGraphCaptureError::Allocation {
+        SnapshotV2NetworkStateCaptureError::Allocation
+    } else {
+        SnapshotV2NetworkStateCaptureError::Common { source }
     }
 }
 

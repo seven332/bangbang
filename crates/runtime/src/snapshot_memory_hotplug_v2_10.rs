@@ -1077,7 +1077,8 @@ impl SnapshotV2MemoryHotplugState {
 
     /// Applies the unchanged exact-2.10 topology geometry to a later closed
     /// container whose kind-1 binding carries that container's exact version.
-    pub(crate) fn validate_memory_binding_for_compatibility_version(
+    #[doc(hidden)]
+    pub fn validate_memory_binding_for_compatibility_version(
         &self,
         binding: &SnapshotV2MemoryBinding,
         compatibility_version: SnapshotFormatVersion,

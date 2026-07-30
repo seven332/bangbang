@@ -13,6 +13,7 @@ use bangbang_runtime::machine::{
     MachineConfigInput,
 };
 use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange, aarch64};
+use bangbang_runtime::pci::PciSbdf;
 use bangbang_runtime::pvtime::{
     ARM64_PVTIME_STRUCTURE_ALIGNMENT, ARM64_PVTIME_STRUCTURE_SIZE, Arm64PvTimeLayout,
 };
@@ -45,10 +46,10 @@ use bangbang_runtime::snapshot_format_v2::{
     NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_GLOBAL_COMPONENT_KEY,
     NATIVE_V2_LEGACY_PLATFORM_VERSION, NATIVE_V2_MACHINE_COMPONENT_KEY,
     NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
-    NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_TIME_COMPONENT_KEY, NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
-    NATIVE_V2_VCPU_COMPONENT_KIND, SnapshotV2Component, SnapshotV2ComponentDisposition,
-    SnapshotV2EncodeError, SnapshotV2State, encode_snapshot_v2_state_with_compatibility_version,
-    native_v2_vcpu_component_key,
+    NATIVE_V2_NETWORK_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_TIME_COMPONENT_KEY,
+    NATIVE_V2_TOPOLOGY_COMPONENT_KEY, NATIVE_V2_VCPU_COMPONENT_KIND, SnapshotV2Component,
+    SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
+    encode_snapshot_v2_state_with_compatibility_version, native_v2_vcpu_component_key,
 };
 use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
     NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, SnapshotV2MemoryHotplugState,
@@ -57,6 +58,10 @@ use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError, SnapshotV2MemoryStateError,
     decode_snapshot_v2_memory_binding,
+};
+use bangbang_runtime::snapshot_network_v2_11::{
+    NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, SnapshotV2NetworkState,
+    SnapshotV2NetworkStateEncodeError,
 };
 use bangbang_runtime::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
@@ -1257,6 +1262,7 @@ impl HvfSnapshotV2BalloonState {
             entropy.as_ref(),
             balloon.as_ref(),
             None,
+            None,
         )?;
         Ok(Self {
             platform,
@@ -1563,6 +1569,7 @@ impl HvfSnapshotV2MemoryHotplugState {
             entropy.as_ref(),
             balloon.as_ref(),
             memory_hotplug.as_ref(),
+            None,
         )?;
         Ok(Self {
             platform,
@@ -1640,6 +1647,224 @@ impl fmt::Debug for HvfSnapshotV2MemoryHotplugState {
     }
 }
 
+/// Exact-2.11 platform whose kind-1 memory has already been closed against
+/// optional unchanged portable kind 11 and the live source proof.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfSnapshotV2NetworkPlatformState {
+    platform: HvfSnapshotV2PlatformState,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+}
+
+impl HvfSnapshotV2NetworkPlatformState {
+    /// Constructs one exact-2.11 platform after the Full writer has returned
+    /// kind 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        memory: SnapshotV2MemoryBinding,
+        machine: HvfSnapshotV2MachineState,
+        global: HvfSnapshotV2GlobalState,
+        topology: HvfArm64StablePausedTopologyState,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+        time: HvfSnapshotV2TimeState,
+        capture: Option<HvfSnapshotV2MemoryHotplugCaptureState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let platform = HvfSnapshotV2PlatformState {
+            memory,
+            machine,
+            global,
+            topology,
+            vcpus,
+            time,
+        };
+        let memory_hotplug = capture
+            .as_ref()
+            .map(HvfSnapshotV2MemoryHotplugCaptureState::state);
+        validate_platform_with_memory_hotplug(&platform, memory_hotplug)?;
+        if platform.memory().version() != NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION {
+            return Err(HvfSnapshotV2BuildError::Version);
+        }
+        if let Some(capture) = &capture {
+            validate_live_memory_hotplug_platform(&platform, capture)?;
+        }
+        Ok(Self {
+            platform,
+            memory_hotplug: capture.map(HvfSnapshotV2MemoryHotplugCaptureState::into_state),
+        })
+    }
+
+    /// Returns the checked exact-2.11 platform graph.
+    pub const fn platform(&self) -> &HvfSnapshotV2PlatformState {
+        &self.platform
+    }
+
+    /// Returns optional unchanged portable exact-2.10 virtio-mem state.
+    pub const fn memory_hotplug(&self) -> Option<&SnapshotV2MemoryHotplugState> {
+        self.memory_hotplug.as_ref()
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        HvfSnapshotV2PlatformState,
+        Option<SnapshotV2MemoryHotplugState>,
+    ) {
+        (self.platform, self.memory_hotplug)
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2NetworkPlatformState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2NetworkPlatformState")
+            .field("has_memory_hotplug", &self.memory_hotplug.is_some())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Complete internal exact native-v2 2.11 HVF product composition.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfSnapshotV2NetworkState {
+    platform: HvfSnapshotV2PlatformState,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+    balloon: Option<SnapshotV2BalloonState>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+    network: Option<SnapshotV2NetworkState>,
+}
+
+/// Owned components retained by one exact-2.11 HVF network composition.
+pub type HvfSnapshotV2NetworkStateParts = (
+    HvfSnapshotV2PlatformState,
+    Option<SnapshotV2StorageDeviceGraph>,
+    SnapshotV2SerialState,
+    Option<SnapshotV2EntropyState>,
+    Option<SnapshotV2BalloonState>,
+    Option<SnapshotV2MemoryHotplugState>,
+    Option<SnapshotV2NetworkState>,
+);
+
+impl HvfSnapshotV2NetworkState {
+    /// Constructs one exact-2.11 product after platform-memory closure.
+    pub fn try_new(
+        platform: HvfSnapshotV2NetworkPlatformState,
+        device_graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+        network: Option<SnapshotV2NetworkState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (platform, memory_hotplug) = platform.into_parts();
+        validate_platform_with_memory_hotplug(&platform, memory_hotplug.as_ref())?;
+        if platform.memory().version() != NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+            || serial.compatibility_version() != NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
+            || device_graph.as_ref().is_some_and(|graph| {
+                graph.compatibility_version()
+                    != NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+            })
+            || entropy.as_ref().is_some_and(|state| {
+                state.compatibility_version() != NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
+            })
+            || balloon.as_ref().is_some_and(|state| {
+                state.compatibility_version() != NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
+            })
+            || network.as_ref().is_some_and(|state| {
+                state.compatibility_version() != NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+            })
+            || !platform.machine().fdt().is_product_process_profile()
+        {
+            return Err(HvfSnapshotV2BuildError::Version);
+        }
+        validate_product_placement(
+            &platform,
+            device_graph.as_ref(),
+            entropy.as_ref(),
+            balloon.as_ref(),
+            memory_hotplug.as_ref(),
+            network.as_ref(),
+        )?;
+        Ok(Self {
+            platform,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network,
+        })
+    }
+
+    /// Returns the exact-2.11 platform graph.
+    pub const fn platform(&self) -> &HvfSnapshotV2PlatformState {
+        &self.platform
+    }
+
+    /// Returns optional unchanged profile-3 storage.
+    pub const fn device_graph(&self) -> Option<&SnapshotV2StorageDeviceGraph> {
+        self.device_graph.as_ref()
+    }
+
+    /// Returns required unchanged exact-2.7 serial state.
+    pub const fn serial(&self) -> &SnapshotV2SerialState {
+        &self.serial
+    }
+
+    /// Returns optional unchanged exact-2.8 entropy state.
+    pub const fn entropy(&self) -> Option<&SnapshotV2EntropyState> {
+        self.entropy.as_ref()
+    }
+
+    /// Returns optional unchanged exact-2.9 balloon state.
+    pub const fn balloon(&self) -> Option<&SnapshotV2BalloonState> {
+        self.balloon.as_ref()
+    }
+
+    /// Returns optional unchanged exact-2.10 virtio-mem state.
+    pub const fn memory_hotplug(&self) -> Option<&SnapshotV2MemoryHotplugState> {
+        self.memory_hotplug.as_ref()
+    }
+
+    /// Returns optional exact-2.11 network/MMDS state.
+    pub const fn network(&self) -> Option<&SnapshotV2NetworkState> {
+        self.network.as_ref()
+    }
+
+    /// Consumes the exact-2.11 product into its checked components.
+    pub fn into_parts(self) -> HvfSnapshotV2NetworkStateParts {
+        (
+            self.platform,
+            self.device_graph,
+            self.serial,
+            self.entropy,
+            self.balloon,
+            self.memory_hotplug,
+            self.network,
+        )
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2NetworkState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2NetworkState")
+            .field("vcpu_count", &self.platform.vcpus.len())
+            .field("has_storage", &self.device_graph.is_some())
+            .field("has_entropy", &self.entropy.is_some())
+            .field("has_balloon", &self.balloon.is_some())
+            .field("has_memory_hotplug", &self.memory_hotplug.is_some())
+            .field(
+                "network_interface_count",
+                &self
+                    .network
+                    .as_ref()
+                    .map_or(0, |state| state.interfaces().len()),
+            )
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct HvfSnapshotV2ProductDevice<'a> {
     virtio: &'a SnapshotV2VirtioState,
@@ -1652,12 +1877,15 @@ fn validate_product_placement(
     entropy: Option<&SnapshotV2EntropyState>,
     balloon: Option<&SnapshotV2BalloonState>,
     memory_hotplug: Option<&SnapshotV2MemoryHotplugState>,
+    network: Option<&SnapshotV2NetworkState>,
 ) -> Result<(), HvfSnapshotV2BuildError> {
     let storage_count = device_graph.map_or(0, SnapshotV2StorageDeviceGraph::record_count);
+    let network_count = network.map_or(0, |state| state.interfaces().len());
     let device_count = storage_count
         .checked_add(usize::from(entropy.is_some()))
         .and_then(|count| count.checked_add(usize::from(balloon.is_some())))
         .and_then(|count| count.checked_add(usize::from(memory_hotplug.is_some())))
+        .and_then(|count| count.checked_add(network_count))
         .ok_or(HvfSnapshotV2BuildError::CrossComponent)?;
     let mut devices = Vec::new();
     devices
@@ -1700,6 +1928,17 @@ fn validate_product_placement(
             virtio: memory_hotplug.virtio(),
             transport: memory_hotplug.transport(),
         });
+    }
+    if let Some(network) = network {
+        devices.extend(
+            network
+                .interfaces()
+                .iter()
+                .map(|interface| HvfSnapshotV2ProductDevice {
+                    virtio: interface.virtio(),
+                    transport: interface.transport(),
+                }),
+        );
     }
 
     if let Some(first) = devices.first()
@@ -1796,7 +2035,7 @@ fn validate_product_placement(
         }
     }
 
-    validate_product_pci_shape_and_order(device_graph, entropy, balloon, memory_hotplug)?;
+    validate_product_pci_shape_and_order(device_graph, entropy, balloon, memory_hotplug, network)?;
     Ok(())
 }
 
@@ -1906,19 +2145,8 @@ fn validate_product_pci_shape_and_order(
     entropy: Option<&SnapshotV2EntropyState>,
     balloon: Option<&SnapshotV2BalloonState>,
     memory_hotplug: Option<&SnapshotV2MemoryHotplugState>,
+    network: Option<&SnapshotV2NetworkState>,
 ) -> Result<(), HvfSnapshotV2BuildError> {
-    let balloon_sbdf = balloon.and_then(|state| match state.transport() {
-        SnapshotV2DeviceTransport::Pci(pci) => Some(pci.sbdf()),
-        SnapshotV2DeviceTransport::Mmio(_) => None,
-    });
-    let entropy_sbdf = entropy.and_then(|state| match state.transport() {
-        SnapshotV2DeviceTransport::Pci(pci) => Some(pci.sbdf()),
-        SnapshotV2DeviceTransport::Mmio(_) => None,
-    });
-    let memory_hotplug_sbdf = memory_hotplug.and_then(|state| match state.transport() {
-        SnapshotV2DeviceTransport::Pci(pci) => Some(pci.sbdf()),
-        SnapshotV2DeviceTransport::Mmio(_) => None,
-    });
     if let Some(balloon) = balloon
         && let SnapshotV2DeviceTransport::Pci(pci) = balloon.transport()
         && (pci.msix().entries().len() != balloon.virtio().queues().len() + 1
@@ -1933,37 +2161,56 @@ fn validate_product_pci_shape_and_order(
     {
         return Err(HvfSnapshotV2BuildError::CrossComponent);
     }
-    if matches!(
-        (balloon_sbdf, entropy_sbdf),
-        (Some(balloon), Some(entropy)) if balloon >= entropy
-    ) {
-        return Err(HvfSnapshotV2BuildError::CrossComponent);
-    }
-    if memory_hotplug_sbdf.is_some_and(|memory_hotplug| {
-        balloon_sbdf.is_some_and(|balloon| balloon >= memory_hotplug)
-            || entropy_sbdf.is_some_and(|entropy| entropy >= memory_hotplug)
-    }) {
-        return Err(HvfSnapshotV2BuildError::CrossComponent);
-    }
-    if let Some(graph) = device_graph {
-        for transport in graph
-            .block_records()
-            .iter()
-            .map(|record| record.transport())
-            .chain(graph.pmem_records().iter().map(|record| record.transport()))
-        {
-            let SnapshotV2DeviceTransport::Pci(storage) = transport else {
-                continue;
-            };
-            if balloon_sbdf.is_some_and(|balloon| balloon >= storage.sbdf())
-                || entropy_sbdf.is_some_and(|entropy| storage.sbdf() >= entropy)
-                || memory_hotplug_sbdf
-                    .is_some_and(|memory_hotplug| storage.sbdf() >= memory_hotplug)
+    if let Some(network) = network {
+        for interface in network.interfaces() {
+            if let SnapshotV2DeviceTransport::Pci(pci) = interface.transport()
+                && (pci.msix().entries().len() != interface.virtio().queues().len() + 1
+                    || pci.msix().queue_vectors().len() != interface.virtio().queues().len())
             {
                 return Err(HvfSnapshotV2BuildError::CrossComponent);
             }
         }
     }
+
+    let mut previous = None;
+    if let Some(balloon) = balloon {
+        retain_product_pci_order(&mut previous, balloon.transport())?;
+    }
+    if let Some(graph) = device_graph {
+        for record in graph.block_records() {
+            retain_product_pci_order(&mut previous, record.transport())?;
+        }
+    }
+    if let Some(network) = network {
+        for interface in network.interfaces() {
+            retain_product_pci_order(&mut previous, interface.transport())?;
+        }
+    }
+    if let Some(graph) = device_graph {
+        for record in graph.pmem_records() {
+            retain_product_pci_order(&mut previous, record.transport())?;
+        }
+    }
+    if let Some(entropy) = entropy {
+        retain_product_pci_order(&mut previous, entropy.transport())?;
+    }
+    if let Some(memory_hotplug) = memory_hotplug {
+        retain_product_pci_order(&mut previous, memory_hotplug.transport())?;
+    }
+    Ok(())
+}
+
+fn retain_product_pci_order(
+    previous: &mut Option<PciSbdf>,
+    transport: &SnapshotV2DeviceTransport,
+) -> Result<(), HvfSnapshotV2BuildError> {
+    let SnapshotV2DeviceTransport::Pci(pci) = transport else {
+        return Ok(());
+    };
+    if previous.is_some_and(|previous| previous >= pci.sbdf()) {
+        return Err(HvfSnapshotV2BuildError::CrossComponent);
+    }
+    *previous = Some(pci.sbdf());
     Ok(())
 }
 
@@ -2103,10 +2350,16 @@ fn validate_platform_with_memory_hotplug(
             if state.machine.fdt.is_product_process_profile() => {}
         NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
             if state.machine.fdt.is_product_process_profile() => {}
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+            if state.machine.fdt.is_product_process_profile() => {}
         _ => return Err(HvfSnapshotV2BuildError::Version),
     }
     if memory_hotplug.is_some()
-        && state.memory.version() != NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+        && !matches!(
+            state.memory.version(),
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+                | NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+        )
     {
         return Err(HvfSnapshotV2BuildError::Version);
     }
@@ -2220,7 +2473,7 @@ fn validate_platform_memory(
     };
 
     memory_hotplug
-        .validate_memory_binding(&state.memory)
+        .validate_memory_binding_for_compatibility_version(&state.memory, state.memory.version())
         .map_err(|_| HvfSnapshotV2BuildError::Memory)?;
     let aperture_start = memory_hotplug.config_space().addr();
     let aperture_end = aperture_start
@@ -2606,6 +2859,8 @@ pub enum HvfSnapshotV2EncodeError {
     BalloonState(SnapshotV2BalloonStateEncodeError),
     /// Exact-2.10 virtio-mem component encoding failed.
     MemoryHotplugState(SnapshotV2MemoryHotplugStateEncodeError),
+    /// Exact-2.11 network component encoding failed.
+    NetworkState(SnapshotV2NetworkStateEncodeError),
     /// Nested mandatory-vCPU encoding failed.
     Mandatory(HvfSnapshotV1EncodeError),
     /// A bounded component allocation failed.
@@ -2640,6 +2895,7 @@ impl fmt::Display for HvfSnapshotV2EncodeError {
             Self::MemoryHotplugState(_) => {
                 f.write_str("native-v2 virtio-mem state encoding failed")
             }
+            Self::NetworkState(_) => f.write_str("native-v2 network state encoding failed"),
             Self::Mandatory(_) => f.write_str("native-v2 mandatory vCPU state encoding failed"),
             Self::Allocation(_) => f.write_str("native-v2 HVF component allocation failed"),
             Self::LengthOverflow => {
@@ -2662,6 +2918,7 @@ impl std::error::Error for HvfSnapshotV2EncodeError {
             Self::EntropyState(source) => Some(source),
             Self::BalloonState(source) => Some(source),
             Self::MemoryHotplugState(source) => Some(source),
+            Self::NetworkState(source) => Some(source),
             Self::Mandatory(source) => Some(source),
             Self::Allocation(source) => Some(source),
             Self::Container(source) => Some(source),
@@ -2789,11 +3046,7 @@ pub fn encode_hvf_snapshot_v2_platform_state(
     encode_hvf_snapshot_v2_components(
         state,
         NATIVE_V2_LEGACY_PLATFORM_VERSION,
-        None,
-        None,
-        None,
-        None,
-        None,
+        (None, None, None, None, None, None),
     )
 }
 
@@ -2804,11 +3057,14 @@ pub fn encode_hvf_snapshot_v2_state(
     encode_hvf_snapshot_v2_components(
         state.platform(),
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-        Some(HvfSnapshotV2DeviceGraphRef::V2_4(state.device_graph())),
-        None,
-        None,
-        None,
-        None,
+        (
+            Some(HvfSnapshotV2DeviceGraphRef::V2_4(state.device_graph())),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
     )
 }
 
@@ -2819,11 +3075,14 @@ pub fn encode_hvf_snapshot_v2_multi_block_state(
     encode_hvf_snapshot_v2_components(
         state.platform(),
         NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-        Some(HvfSnapshotV2DeviceGraphRef::V2_5(state.device_graph())),
-        None,
-        None,
-        None,
-        None,
+        (
+            Some(HvfSnapshotV2DeviceGraphRef::V2_5(state.device_graph())),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
     )
 }
 
@@ -2834,11 +3093,14 @@ pub fn encode_hvf_snapshot_v2_storage_state(
     encode_hvf_snapshot_v2_components(
         state.platform(),
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-        Some(HvfSnapshotV2DeviceGraphRef::V2_6(state.device_graph())),
-        None,
-        None,
-        None,
-        None,
+        (
+            Some(HvfSnapshotV2DeviceGraphRef::V2_6(state.device_graph())),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
     )
 }
 
@@ -2849,11 +3111,14 @@ pub fn encode_hvf_snapshot_v2_serial_state(
     encode_hvf_snapshot_v2_components(
         state.platform(),
         NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
-        state.device_graph().map(HvfSnapshotV2DeviceGraphRef::V2_6),
-        Some(state.serial()),
-        None,
-        None,
-        None,
+        (
+            state.device_graph().map(HvfSnapshotV2DeviceGraphRef::V2_6),
+            Some(state.serial()),
+            None,
+            None,
+            None,
+            None,
+        ),
     )
 }
 
@@ -2864,11 +3129,14 @@ pub fn encode_hvf_snapshot_v2_entropy_state(
     encode_hvf_snapshot_v2_components(
         state.platform(),
         NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
-        state.device_graph().map(HvfSnapshotV2DeviceGraphRef::V2_6),
-        Some(state.serial()),
-        state.entropy(),
-        None,
-        None,
+        (
+            state.device_graph().map(HvfSnapshotV2DeviceGraphRef::V2_6),
+            Some(state.serial()),
+            state.entropy(),
+            None,
+            None,
+            None,
+        ),
     )
 }
 
@@ -2879,11 +3147,14 @@ pub fn encode_hvf_snapshot_v2_balloon_state(
     encode_hvf_snapshot_v2_components(
         state.platform(),
         NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
-        state.device_graph().map(HvfSnapshotV2DeviceGraphRef::V2_6),
-        Some(state.serial()),
-        state.entropy(),
-        state.balloon(),
-        None,
+        (
+            state.device_graph().map(HvfSnapshotV2DeviceGraphRef::V2_6),
+            Some(state.serial()),
+            state.entropy(),
+            state.balloon(),
+            None,
+            None,
+        ),
     )
 }
 
@@ -2895,11 +3166,32 @@ pub fn encode_hvf_snapshot_v2_memory_hotplug_state(
     encode_hvf_snapshot_v2_components(
         state.platform(),
         NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
-        state.device_graph().map(HvfSnapshotV2DeviceGraphRef::V2_6),
-        Some(state.serial()),
-        state.entropy(),
-        state.balloon(),
-        state.memory_hotplug(),
+        (
+            state.device_graph().map(HvfSnapshotV2DeviceGraphRef::V2_6),
+            Some(state.serial()),
+            state.entropy(),
+            state.balloon(),
+            state.memory_hotplug(),
+            None,
+        ),
+    )
+}
+
+/// Encodes one complete internal exact native-v2 2.11 network composition.
+pub fn encode_hvf_snapshot_v2_network_state(
+    state: &HvfSnapshotV2NetworkState,
+) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+    encode_hvf_snapshot_v2_components(
+        state.platform(),
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+        (
+            state.device_graph().map(HvfSnapshotV2DeviceGraphRef::V2_6),
+            Some(state.serial()),
+            state.entropy(),
+            state.balloon(),
+            state.memory_hotplug(),
+            state.network(),
+        ),
     )
 }
 
@@ -2909,6 +3201,15 @@ enum HvfSnapshotV2DeviceGraphRef<'a> {
     V2_5(&'a SnapshotV2MultiBlockDeviceGraph),
     V2_6(&'a SnapshotV2StorageDeviceGraph),
 }
+
+type HvfSnapshotV2ComponentRefs<'a> = (
+    Option<HvfSnapshotV2DeviceGraphRef<'a>>,
+    Option<&'a SnapshotV2SerialState>,
+    Option<&'a SnapshotV2EntropyState>,
+    Option<&'a SnapshotV2BalloonState>,
+    Option<&'a SnapshotV2MemoryHotplugState>,
+    Option<&'a SnapshotV2NetworkState>,
+);
 
 impl HvfSnapshotV2DeviceGraphRef<'_> {
     const fn version(self) -> SnapshotFormatVersion {
@@ -2937,31 +3238,47 @@ impl HvfSnapshotV2DeviceGraphRef<'_> {
 fn encode_hvf_snapshot_v2_components(
     state: &HvfSnapshotV2PlatformState,
     version: SnapshotFormatVersion,
-    device_graph: Option<HvfSnapshotV2DeviceGraphRef<'_>>,
-    serial: Option<&SnapshotV2SerialState>,
-    entropy: Option<&SnapshotV2EntropyState>,
-    balloon: Option<&SnapshotV2BalloonState>,
-    memory_hotplug: Option<&SnapshotV2MemoryHotplugState>,
+    components: HvfSnapshotV2ComponentRefs<'_>,
 ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+    let (device_graph, serial, entropy, balloon, memory_hotplug, network) = components;
     validate_platform_with_memory_hotplug(state, memory_hotplug)
         .map_err(HvfSnapshotV2EncodeError::Build)?;
-    match (device_graph, serial, entropy, balloon, memory_hotplug) {
-        (device_graph, Some(serial), entropy, balloon, memory_hotplug)
+    match (
+        device_graph,
+        serial,
+        entropy,
+        balloon,
+        memory_hotplug,
+        network,
+    ) {
+        (device_graph, Some(serial), entropy, balloon, memory_hotplug, network)
             if matches!(
-                (version, entropy, balloon, memory_hotplug),
+                (version, entropy, balloon, memory_hotplug, network),
                 (
                     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
                     None,
                     None,
+                    None,
                     None
-                ) | (NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, _, None, None)
-                    | (NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, _, _, None)
-                    | (
-                        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
-                        _,
-                        _,
-                        _
-                    )
+                ) | (
+                    NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                    _,
+                    None,
+                    None,
+                    None
+                ) | (
+                    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                    _,
+                    _,
+                    None,
+                    None
+                ) | (
+                    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                    _,
+                    _,
+                    _,
+                    None
+                ) | (NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, _, _, _, _)
             ) && serial.compatibility_version()
                 == NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
                 && device_graph.is_none_or(|graph| {
@@ -2977,11 +3294,14 @@ fn encode_hvf_snapshot_v2_components(
                     state.compatibility_version()
                         == NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
                 })
+                && network.is_none_or(|state| {
+                    state.compatibility_version() == NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+                })
                 && state.machine().fdt().is_product_process_profile() => {}
-        (Some(graph), None, None, None, None)
+        (Some(graph), None, None, None, None, None)
             if graph.version() == version && state.machine().fdt().is_product_process_profile() => {
         }
-        (None, None, None, None, None)
+        (None, None, None, None, None, None)
             if version == NATIVE_V2_LEGACY_PLATFORM_VERSION
                 && !state.machine().fdt().is_product_process_profile() => {}
         _ => {
@@ -3031,6 +3351,10 @@ fn encode_hvf_snapshot_v2_components(
         })
         .transpose()
         .map_err(HvfSnapshotV2EncodeError::MemoryHotplugState)?;
+    let network = network
+        .map(|network| network.encode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION))
+        .transpose()
+        .map_err(HvfSnapshotV2EncodeError::NetworkState)?;
 
     let component_count = 5_usize
         .checked_add(vcpu_payloads.len())
@@ -3039,6 +3363,7 @@ fn encode_hvf_snapshot_v2_components(
         .and_then(|count| count.checked_add(usize::from(entropy.is_some())))
         .and_then(|count| count.checked_add(usize::from(balloon.is_some())))
         .and_then(|count| count.checked_add(usize::from(memory_hotplug.is_some())))
+        .and_then(|count| count.checked_add(usize::from(network.is_some())))
         .ok_or(HvfSnapshotV2EncodeError::LengthOverflow)?;
     let mut components = Vec::new();
     components
@@ -3103,6 +3428,13 @@ fn encode_hvf_snapshot_v2_components(
             NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
             SnapshotV2ComponentDisposition::Semantic,
             memory_hotplug,
+        ));
+    }
+    if let Some(network) = network.as_deref() {
+        components.push(SnapshotV2Component::new(
+            NATIVE_V2_NETWORK_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            network,
         ));
     }
     encode_snapshot_v2_state_with_compatibility_version(version, &[], &components)
@@ -3355,6 +3687,7 @@ pub fn decode_hvf_snapshot_v2_memory_hotplug_state(
         entropy.as_ref(),
         balloon.as_ref(),
         memory_hotplug.as_ref(),
+        None,
     )
     .map_err(HvfSnapshotV2DecodeError::Build)?;
     Ok(HvfSnapshotV2MemoryHotplugState {

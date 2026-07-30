@@ -5,7 +5,9 @@ use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange, aarch64,
 };
 use bangbang_runtime::pci::{PCI_BAR64_START, PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE};
-use bangbang_runtime::snapshot_artifact::NativeV2MemoryHotplugSnapshotCandidateState;
+use bangbang_runtime::snapshot_artifact::{
+    NativeV2MemoryHotplugSnapshotCandidateState, NativeV2NetworkSnapshotCandidateState,
+};
 use bangbang_runtime::snapshot_balloon_v2_9::{
     NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, NATIVE_V2_BALLOON_STATE_HEADER_BYTES,
     NATIVE_V2_BALLOON_STATE_SECTION_ENTRY_BYTES,
@@ -34,6 +36,12 @@ use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
 };
 use bangbang_runtime::snapshot_memory_v2::{
     decode_snapshot_v2_memory_binding, write_snapshot_v2_memory_image_with_compatibility_version,
+};
+use bangbang_runtime::snapshot_network_v2_11::{
+    NATIVE_V2_NETWORK_INTERFACE_DIRECTORY_ENTRY_BYTES,
+    NATIVE_V2_NETWORK_INTERFACE_RECORD_HEADER_BYTES,
+    NATIVE_V2_NETWORK_INTERFACE_SECTION_ENTRY_BYTES, NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+    NATIVE_V2_NETWORK_STATE_HEADER_BYTES, SnapshotV2NetworkState,
 };
 use bangbang_runtime::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
@@ -74,6 +82,10 @@ const MEMORY_HOTPLUG_INACTIVE_MMIO_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex");
 const MEMORY_HOTPLUG_ACTIVE_PCI_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_memory_hotplug_v2_10/fixtures/active-pci.hex");
+const NETWORK_INACTIVE_MMIO_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_network_v2_11/fixtures/inactive-mmio.hex");
+const NETWORK_ACTIVE_PCI_MMDS_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_network_v2_11/fixtures/active-pci-mmds.hex");
 const DETERMINISTIC_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.4-fixture-id!";
 const DETERMINISTIC_MULTI_BLOCK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.5-fixture-id!";
 const DETERMINISTIC_STORAGE_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.6-fixture-id!";
@@ -81,6 +93,7 @@ const DETERMINISTIC_SERIAL_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.7-fixture-id!";
 const DETERMINISTIC_ENTROPY_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.8-fixture-id!";
 const DETERMINISTIC_BALLOON_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.9-fixture-id!";
 const DETERMINISTIC_MEMORY_HOTPLUG_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.10-fixture-id";
+const DETERMINISTIC_NETWORK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.11-fixture-id";
 const COMPLETE_STATE_FINGERPRINTS: [(usize, u64); 2] = [
     (4_887, 10_136_861_786_457_474_800),
     (4_983, 7_169_128_621_506_763_529),
@@ -705,19 +718,118 @@ fn relocate_memory_hotplug_product_fixture(
     }
 }
 
+fn network_record_section_offset(bytes: &[u8], record_index: usize, section_index: usize) -> usize {
+    let record_entry = NATIVE_V2_NETWORK_STATE_HEADER_BYTES
+        + record_index * NATIVE_V2_NETWORK_INTERFACE_DIRECTORY_ENTRY_BYTES;
+    let record_offset = usize::try_from(read_wire_u64(bytes, record_entry + 8))
+        .expect("network record offset should fit usize");
+    let section_entry = record_offset
+        + NATIVE_V2_NETWORK_INTERFACE_RECORD_HEADER_BYTES
+        + section_index * NATIVE_V2_NETWORK_INTERFACE_SECTION_ENTRY_BYTES;
+    record_offset
+        + usize::try_from(read_wire_u64(bytes, section_entry + 8))
+            .expect("network section offset should fit usize")
+}
+
+fn relocate_network_product_fixture(
+    bytes: &mut [u8],
+    transport: SnapshotV2DeviceTransportKind,
+    pci_device: u8,
+) {
+    let record_count = usize::from(read_wire_u16(bytes, 14));
+    for record_index in 0..record_count {
+        let common_offset = network_record_section_offset(bytes, record_index, 2);
+        relocate_common_queues(
+            bytes,
+            common_offset,
+            0x8014_0000
+                + u64::try_from(record_index).expect("network record index should fit")
+                    * PRODUCT_QUEUE_STRIDE,
+        );
+        let transport_offset = network_record_section_offset(bytes, record_index, 4);
+        match transport {
+            SnapshotV2DeviceTransportKind::Mmio => {
+                bytes[transport_offset + 12..transport_offset + 16].copy_from_slice(
+                    &(43 + u32::try_from(record_index)
+                        .expect("network interrupt index should fit"))
+                    .to_le_bytes(),
+                );
+                write_wire_u64(
+                    bytes,
+                    transport_offset + 16,
+                    103 + u64::try_from(record_index).expect("network region index should fit"),
+                );
+                write_wire_u64(
+                    bytes,
+                    transport_offset + 24,
+                    0xd003_0000
+                        + u64::try_from(record_index).expect("network MMIO index should fit")
+                            * 0x1000,
+                );
+            }
+            SnapshotV2DeviceTransportKind::Pci => {
+                let device = pci_device
+                    .checked_add(u8::try_from(record_index).expect("network PCI index should fit"))
+                    .expect("network PCI endpoint should fit");
+                bytes_set_pci_endpoint(bytes, transport_offset, device);
+            }
+        }
+    }
+}
+
 pub(crate) fn product_storage_fixture(
     transport: SnapshotV2DeviceTransportKind,
+) -> SnapshotV2StorageDeviceGraph {
+    product_storage_fixture_with_network(transport, false)
+}
+
+fn product_storage_fixture_with_network(
+    transport: SnapshotV2DeviceTransportKind,
+    has_network: bool,
 ) -> SnapshotV2StorageDeviceGraph {
     let mut bytes = fixture_bytes(match transport {
         SnapshotV2DeviceTransportKind::Mmio => STORAGE_MMIO_GRAPH_FIXTURE_HEX,
         SnapshotV2DeviceTransportKind::Pci => STORAGE_PCI_GRAPH_FIXTURE_HEX,
     });
     relocate_storage_product_fixture(&mut bytes, transport == SnapshotV2DeviceTransportKind::Pci);
+    if transport == SnapshotV2DeviceTransportKind::Pci && has_network {
+        let standard = SnapshotV2StorageDeviceGraph::decode(
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &bytes,
+        )
+        .expect("standard storage fixture should decode before network relocation");
+        let block_count = standard.block_records().len();
+        let record_count = standard.record_count();
+        let section_directory = usize::try_from(read_wire_u64(&bytes, 48))
+            .expect("storage section directory should fit usize");
+        for record_index in block_count..record_count {
+            let transport_entry = section_directory
+                + (record_index * 4 + 3) * NATIVE_V2_STORAGE_DEVICE_GRAPH_SECTION_ENTRY_BYTES;
+            let transport_offset = storage_section_offset(&bytes, transport_entry);
+            let shifted_device = bytes[transport_offset + 11]
+                .checked_add(1)
+                .expect("network-shifted pmem endpoint should fit");
+            bytes_set_pci_endpoint(&mut bytes, transport_offset, shifted_device);
+        }
+    }
     SnapshotV2StorageDeviceGraph::decode(
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         &bytes,
     )
     .expect("relocated storage fixture should decode")
+}
+
+fn product_network_fixture(
+    transport: SnapshotV2DeviceTransportKind,
+    pci_device: u8,
+) -> SnapshotV2NetworkState {
+    let mut bytes = fixture_bytes(match transport {
+        SnapshotV2DeviceTransportKind::Mmio => NETWORK_INACTIVE_MMIO_FIXTURE_HEX,
+        SnapshotV2DeviceTransportKind::Pci => NETWORK_ACTIVE_PCI_MMDS_FIXTURE_HEX,
+    });
+    relocate_network_product_fixture(&mut bytes, transport, pci_device);
+    SnapshotV2NetworkState::decode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, &bytes)
+        .expect("relocated network fixture should decode")
 }
 
 fn product_entropy_fixture(transport: SnapshotV2DeviceTransportKind) -> SnapshotV2EntropyState {
@@ -924,6 +1036,82 @@ fn complete_memory_hotplug_state_fixture(
     .unwrap_or_else(|error| {
         panic!(
             "{transport:?} storage={has_storage} entropy={has_entropy} balloon={has_balloon} memory-hotplug={has_memory_hotplug} exact-2.10 fixture failed: {error:?}"
+        )
+    })
+}
+
+fn exact_minor_eleven_memory_binding(
+    state: Option<&SnapshotV2MemoryHotplugState>,
+) -> SnapshotV2MemoryBinding {
+    let mut ranges = aarch64::dram_layout(FIXTURE_MEMORY_MIB * MIB)
+        .expect("exact-2.11 base layout should validate")
+        .ranges()
+        .to_vec();
+    if let Some(state) = state {
+        ranges.extend(memory_hotplug_active_ranges(state));
+    }
+    let layout = GuestMemoryLayout::new(ranges).expect("exact-2.11 memory layout should validate");
+    let memory = GuestMemory::allocate(&layout).expect("exact-2.11 memory should allocate");
+    write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut Cursor::new(Vec::new()),
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact-2.11 memory binding should encode")
+}
+
+fn exact_minor_eleven_platform_fixture(
+    state: Option<SnapshotV2MemoryHotplugState>,
+) -> HvfSnapshotV2NetworkPlatformState {
+    let capture = state.map(memory_hotplug_capture_fixture);
+    let memory = exact_minor_eleven_memory_binding(
+        capture
+            .as_ref()
+            .map(HvfSnapshotV2MemoryHotplugCaptureState::state),
+    );
+    let (_, machine, global, topology, vcpus, time) = deterministic_device_graph_platform_fixture(
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+        DETERMINISTIC_NETWORK_MEMORY_IMAGE_ID,
+    )
+    .into_parts();
+    HvfSnapshotV2NetworkPlatformState::try_new(
+        memory, machine, global, topology, vcpus, time, capture,
+    )
+    .expect("exact-2.11 platform fixture should validate")
+}
+
+fn complete_network_state_fixture(
+    transport: SnapshotV2DeviceTransportKind,
+    has_storage: bool,
+    has_entropy: bool,
+    has_balloon: bool,
+    has_memory_hotplug: bool,
+    has_network: bool,
+) -> HvfSnapshotV2NetworkState {
+    let memory_hotplug = has_memory_hotplug.then(|| product_memory_hotplug_fixture(transport));
+    let graph = has_storage.then(|| product_storage_fixture_with_network(transport, has_network));
+    let block_count = graph
+        .as_ref()
+        .map_or(0, |graph| graph.block_records().len());
+    let network_device = PCI_FIRST_ENDPOINT_DEVICE
+        .checked_add(1)
+        .and_then(|device| {
+            device.checked_add(u8::try_from(block_count).expect("block count should fit u8"))
+        })
+        .expect("network product endpoint should fit");
+    let balloon = has_balloon.then(|| product_balloon_fixture(transport));
+    let network = has_network.then(|| product_network_fixture(transport, network_device));
+    HvfSnapshotV2NetworkState::try_new(
+        exact_minor_eleven_platform_fixture(memory_hotplug),
+        graph,
+        product_serial_fixture(),
+        has_entropy.then(|| memory_hotplug_product_entropy_fixture(transport)),
+        balloon,
+        network,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "{transport:?} storage={has_storage} entropy={has_entropy} balloon={has_balloon} memory-hotplug={has_memory_hotplug} network={has_network} exact-2.11 fixture failed: {error:?}"
         )
     })
 }
@@ -2071,6 +2259,110 @@ fn exact_minor_ten_memory_hotplug_encodes_all_sixteen_mmio_and_pci_products() {
             let debug = format!("{original:?}");
             assert!(debug.contains("<redacted>"));
             assert!(!debug.contains("serial-log"));
+        }
+    }
+}
+
+#[test]
+fn exact_minor_eleven_network_encodes_all_thirty_two_mmio_and_pci_products() {
+    for transport in [
+        SnapshotV2DeviceTransportKind::Mmio,
+        SnapshotV2DeviceTransportKind::Pci,
+    ] {
+        for mask in 0_u8..32 {
+            let has_storage = mask & 1 != 0;
+            let has_entropy = mask & 2 != 0;
+            let has_balloon = mask & 4 != 0;
+            let has_memory_hotplug = mask & 8 != 0;
+            let has_network = mask & 16 != 0;
+            let original = complete_network_state_fixture(
+                transport,
+                has_storage,
+                has_entropy,
+                has_balloon,
+                has_memory_hotplug,
+                has_network,
+            );
+            let encoded = encode_hvf_snapshot_v2_network_state(&original)
+                .expect("complete exact-2.11 state should encode");
+            assert_eq!(
+                encode_hvf_snapshot_v2_network_state(&original)
+                    .expect("exact-2.11 encoding should be deterministic"),
+                encoded
+            );
+            let structural = decode_snapshot_v2_state_with_compatibility_version(
+                &encoded,
+                NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("exact-2.11 state should decode structurally");
+            assert_eq!(
+                structural.metadata().component_count(),
+                8 + u32::from(has_storage)
+                    + u32::from(has_entropy)
+                    + u32::from(has_balloon)
+                    + u32::from(has_memory_hotplug)
+                    + u32::from(has_network)
+            );
+            let candidate = NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(
+                encoded.clone(),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{transport:?} storage={has_storage} entropy={has_entropy} balloon={has_balloon} memory-hotplug={has_memory_hotplug} network={has_network} exact-2.11 candidate failed: {error}"
+                )
+            });
+            assert_eq!(candidate.bytes(), encoded);
+            assert_eq!(candidate.memory_binding(), original.platform().memory());
+            assert_eq!(candidate.device_graph(), original.device_graph());
+            assert_eq!(candidate.serial(), original.serial());
+            assert_eq!(candidate.entropy(), original.entropy());
+            assert_eq!(candidate.balloon(), original.balloon());
+            assert_eq!(candidate.memory_hotplug(), original.memory_hotplug());
+            assert_eq!(candidate.network(), original.network());
+
+            if let Some(graph) = original.device_graph() {
+                assert_eq!(
+                    structural
+                        .component(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)
+                        .expect("exact-2.11 storage component should exist")
+                        .payload(),
+                    graph
+                        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                        .expect("unchanged exact-2.6 storage should encode")
+                );
+            }
+            assert_eq!(
+                structural
+                    .component(NATIVE_V2_SERIAL_COMPONENT_KEY)
+                    .expect("exact-2.11 serial component should exist")
+                    .payload(),
+                original
+                    .serial()
+                    .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+                    .expect("unchanged exact-2.7 serial should encode")
+            );
+            if let Some(network) = original.network() {
+                assert_eq!(
+                    structural
+                        .component(NATIVE_V2_NETWORK_COMPONENT_KEY)
+                        .expect("exact-2.11 network component should exist")
+                        .payload(),
+                    network
+                        .encode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION)
+                        .expect("exact-2.11 network should encode")
+                );
+                assert!(
+                    network
+                        .interfaces()
+                        .iter()
+                        .all(|interface| { interface.transport().kind() == transport })
+                );
+            }
+
+            let debug = format!("{original:?}");
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains("serial-log"));
+            assert!(!debug.contains("vmnet:"));
         }
     }
 }

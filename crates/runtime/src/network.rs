@@ -7907,13 +7907,21 @@ mod tests {
     use std::str::FromStr;
     use std::time::{Duration, Instant};
 
-    use crate::interrupt::DeviceInterruptKind;
+    use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
     use crate::metrics::{NetworkInterfaceMetrics, SharedNetworkInterfaceMetrics};
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
-        MmioRegionId,
+        MmioRegion, MmioRegionId,
     };
+    use crate::snapshot_device_v2::{SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind};
+    use crate::snapshot_network_v2_11::{
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, SnapshotV2NetworkBackendClass,
+        SnapshotV2NetworkInterfaceState, SnapshotV2NetworkLimiterState,
+        SnapshotV2NetworkRetryState, SnapshotV2NetworkState, SnapshotV2NetworkStateCaptureError,
+        SnapshotV2NetworkTokenBucketState,
+    };
+    use crate::virtio::VirtioDeviceType;
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
@@ -7947,12 +7955,14 @@ mod tests {
         VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX,
         VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkBackendMetrics, VirtioNetworkConfigSpace,
         VirtioNetworkDevice, VirtioNetworkDeviceActivationError, VirtioNetworkDeviceCaptureError,
-        VirtioNetworkDeviceNotificationError, VirtioNetworkFeatureCapabilities,
-        VirtioNetworkLatencyAggregate, VirtioNetworkMmioHandler, VirtioNetworkPacketEnvelope,
-        VirtioNetworkRateLimiter, VirtioNetworkRetryCaptureState, VirtioNetworkRxBuffer,
-        VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
-        VirtioNetworkRxPacketSourceError, VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame,
-        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketCommit,
+        VirtioNetworkDeviceCaptureState, VirtioNetworkDeviceNotificationError,
+        VirtioNetworkFeatureCapabilities, VirtioNetworkLatencyAggregate, VirtioNetworkMmioHandler,
+        VirtioNetworkPacketEnvelope, VirtioNetworkPciCaptureState, VirtioNetworkQueueCaptureState,
+        VirtioNetworkRateLimiter, VirtioNetworkRateLimiterCaptureState,
+        VirtioNetworkRetryCaptureState, VirtioNetworkRxBuffer, VirtioNetworkRxBufferParseError,
+        VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
+        VirtioNetworkRxQueueDispatchError, VirtioNetworkTokenBucketCaptureState,
+        VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketCommit,
         VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
         VirtioNetworkTxPacketSinkError, VirtioNetworkTxPacketStage, VirtioNetworkTxQueue,
         VirtioNetworkTxQueueDispatchError,
@@ -12441,6 +12451,249 @@ mod tests {
                 Err(VirtioNetworkDeviceCaptureError::CachedRxPacketInvalid)
             ));
         }
+    }
+
+    #[test]
+    fn virtio_network_mmio_capture_converts_to_exact_2_11_without_mutating_source() {
+        let handler = network_activation_handler();
+        let memory = tx_frame_memory();
+        let config = input()
+            .with_guest_mac(test_guest_mac().to_string())
+            .validate()
+            .expect("capture network config should validate");
+        let profile = NetworkDeviceProfile::from_config(&config);
+        let now = Instant::now();
+        let (captured, _) = handler
+            .capture_network_state_at(&config, profile, &memory, None, now)
+            .expect("inactive MMIO network should be capture-ready");
+        let source = captured.clone();
+        let region = MmioRegion::new(
+            MmioRegionId::new(1),
+            TEST_MMIO_BASE,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("test MMIO region should validate");
+        let interrupt_line = GuestInterruptLine::new(32).expect("test SPI should validate");
+
+        let interface = SnapshotV2NetworkInterfaceState::try_from_mmio_capture(
+            &config,
+            SnapshotV2NetworkBackendClass::Vmnet,
+            region,
+            interrupt_line,
+            &captured,
+        )
+        .expect("capture-ready MMIO state should convert");
+
+        assert_eq!(captured, source);
+        assert_eq!(interface.iface_id(), config.iface_id());
+        assert_eq!(interface.captured_selector(), config.host_dev_name());
+        assert_eq!(interface.profile(), profile);
+        assert_eq!(
+            interface.transport().kind(),
+            SnapshotV2DeviceTransportKind::Mmio
+        );
+        assert!(matches!(
+            interface.transport(),
+            SnapshotV2DeviceTransport::Mmio(mmio)
+                if mmio.region() == region && mmio.interrupt_line() == interrupt_line
+        ));
+        let state = SnapshotV2NetworkState::try_new(vec![interface], None)
+            .expect("converted interface should close as exact-2.11 state");
+        let encoded = state
+            .encode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION)
+            .expect("converted exact-2.11 state should encode");
+        assert_eq!(
+            SnapshotV2NetworkState::decode(
+                NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                &encoded,
+            )
+            .expect("converted exact-2.11 state should decode"),
+            state
+        );
+    }
+
+    #[test]
+    fn virtio_network_mmio_capture_rejects_normalized_rx_work_without_mutating_source() {
+        let handler = network_activation_handler();
+        let memory = tx_frame_memory();
+        let config = input()
+            .with_guest_mac(test_guest_mac().to_string())
+            .validate()
+            .expect("capture network config should validate");
+        let profile = NetworkDeviceProfile::from_config(&config);
+        let (captured, _) = handler
+            .capture_network_state_at(&config, profile, &memory, Some(4), Instant::now())
+            .expect("bounded cached RX should produce a validated normalized capture");
+        let source = captured.clone();
+        let region = MmioRegion::new(
+            MmioRegionId::new(1),
+            TEST_MMIO_BASE,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("test MMIO region should validate");
+        let interrupt_line = GuestInterruptLine::new(32).expect("test SPI should validate");
+
+        assert_eq!(
+            SnapshotV2NetworkInterfaceState::try_from_mmio_capture(
+                &config,
+                SnapshotV2NetworkBackendClass::Vmnet,
+                region,
+                interrupt_line,
+                &captured,
+            ),
+            Err(SnapshotV2NetworkStateCaptureError::NormalizedWork)
+        );
+        assert_eq!(captured, source);
+
+        let mut retry_only = captured.clone();
+        retry_only.device.source_rx_cache_normalized = false;
+        retry_only.device.source_rx_retry_normalized = true;
+        let retry_source = retry_only.clone();
+        assert_eq!(
+            SnapshotV2NetworkInterfaceState::try_from_mmio_capture(
+                &config,
+                SnapshotV2NetworkBackendClass::Vmnet,
+                region,
+                interrupt_line,
+                &retry_only,
+            ),
+            Err(SnapshotV2NetworkStateCaptureError::NormalizedWork)
+        );
+        assert_eq!(retry_only, retry_source);
+    }
+
+    #[test]
+    fn virtio_network_pci_capture_converts_every_exact_2_11_continuation_field() {
+        fn fixture_bytes(fixture: &str) -> Vec<u8> {
+            let compact = fixture.split_ascii_whitespace().collect::<String>();
+            compact
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    u8::from_str_radix(
+                        std::str::from_utf8(pair).expect("fixture should be ASCII"),
+                        16,
+                    )
+                    .expect("fixture should contain hexadecimal bytes")
+                })
+                .collect()
+        }
+
+        fn capture_bucket(
+            bucket: SnapshotV2NetworkTokenBucketState,
+        ) -> VirtioNetworkTokenBucketCaptureState {
+            VirtioNetworkTokenBucketCaptureState {
+                config: NetworkTokenBucketConfig::new(
+                    bucket.size(),
+                    bucket.configured_burst(),
+                    bucket.refill_time_millis(),
+                ),
+                budget: bucket.budget(),
+                one_time_burst: bucket.remaining_burst(),
+                age_nanos: bucket.age_nanos(),
+            }
+        }
+
+        fn capture_limiter(
+            limiter: SnapshotV2NetworkLimiterState,
+        ) -> VirtioNetworkRateLimiterCaptureState {
+            VirtioNetworkRateLimiterCaptureState {
+                bandwidth: limiter.bandwidth().map(capture_bucket),
+                ops: limiter.ops().map(capture_bucket),
+            }
+        }
+
+        fn capture_retry(retry: SnapshotV2NetworkRetryState) -> VirtioNetworkRetryCaptureState {
+            match retry {
+                SnapshotV2NetworkRetryState::None => VirtioNetworkRetryCaptureState::None,
+                SnapshotV2NetworkRetryState::Immediate => VirtioNetworkRetryCaptureState::Immediate,
+                SnapshotV2NetworkRetryState::After { remaining_nanos } => {
+                    VirtioNetworkRetryCaptureState::After { remaining_nanos }
+                }
+            }
+        }
+
+        let fixture = fixture_bytes(include_str!(
+            "snapshot_network_v2_11/fixtures/active-pci-mmds.hex"
+        ));
+        let state =
+            SnapshotV2NetworkState::decode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, &fixture)
+                .expect("active PCI exact-2.11 fixture should decode");
+        let expected = state
+            .interfaces()
+            .first()
+            .expect("fixture should contain one interface");
+        let config = NetworkInterfaceConfigInput::new(
+            expected.iface_id(),
+            expected.iface_id(),
+            expected.captured_selector(),
+        )
+        .with_guest_mac(
+            expected
+                .requested_guest_mac()
+                .expect("fixture should retain requested MAC")
+                .to_string(),
+        )
+        .with_mtu(
+            expected
+                .requested_mtu()
+                .expect("fixture should retain requested MTU"),
+        )
+        .validate()
+        .expect("fixture network config should validate");
+        let negotiated_features = expected.virtio().driver_features();
+        let event_idx_enabled =
+            negotiated_features & virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX) != 0;
+        let capture_queue = |queue: crate::snapshot_network_v2_11::SnapshotV2NetworkQueueState| {
+            VirtioNetworkQueueCaptureState {
+                next_available: queue.next_available(),
+                next_used: queue.next_used(),
+                event_idx_enabled,
+                negotiated_features,
+            }
+        };
+        let device = VirtioNetworkDeviceCaptureState {
+            profile: expected.profile(),
+            available_features: expected.virtio().available_features(),
+            negotiated_features,
+            active_rx_queue: expected.local().active_rx_queue().map(capture_queue),
+            active_tx_queue: expected.local().active_tx_queue().map(capture_queue),
+            rx_rate_limiter: capture_limiter(expected.rx_limiter()),
+            tx_rate_limiter: capture_limiter(expected.tx_limiter()),
+            source_rx_cache_normalized: false,
+            source_rx_retry_normalized: false,
+            tx_retry: capture_retry(expected.local().tx_retry()),
+        };
+        let SnapshotV2DeviceTransport::Pci(pci) = expected.transport() else {
+            panic!("fixture should use PCI transport");
+        };
+        let identity = crate::virtio_pci::VirtioPciIdentity::new(
+            VirtioDeviceType::new(VIRTIO_NET_DEVICE_ID).expect("network device type should fit"),
+            expected.virtio().available_features(),
+        )
+        .with_config_generation(expected.virtio().config_generation());
+        let transport = crate::virtio_pci::VirtioPciTransportState::from_snapshot_v2_parts(
+            identity,
+            expected.virtio(),
+            pci,
+            false,
+        )
+        .expect("fixture PCI transport should reconstruct");
+        let captured = VirtioNetworkPciCaptureState { device, transport };
+        let source = captured.clone();
+
+        let converted = SnapshotV2NetworkInterfaceState::try_from_pci_capture(
+            &config,
+            expected.backend(),
+            pci.origin(),
+            pci.sbdf(),
+            pci.bar_range(),
+            &captured,
+        )
+        .expect("capture-ready PCI state should convert");
+
+        assert_eq!(captured, source);
+        assert_eq!(&converted, expected);
     }
 
     #[test]
