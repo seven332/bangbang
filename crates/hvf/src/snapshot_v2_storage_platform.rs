@@ -666,6 +666,30 @@ impl HvfSnapshotV2StorageMmioPlatformPrefix {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum HvfSnapshotV2StorageMmioFollowingInterrupts {
+    None,
+    Entropy(GuestInterruptLine),
+    MemoryHotplug(GuestInterruptLine),
+    EntropyMemoryHotplug {
+        entropy: GuestInterruptLine,
+        memory_hotplug: GuestInterruptLine,
+    },
+}
+
+impl HvfSnapshotV2StorageMmioFollowingInterrupts {
+    fn lines(self) -> [Option<GuestInterruptLine>; 2] {
+        match self {
+            Self::None => [None, None],
+            Self::Entropy(interrupt) | Self::MemoryHotplug(interrupt) => [Some(interrupt), None],
+            Self::EntropyMemoryHotplug {
+                entropy,
+                memory_hotplug,
+            } => [Some(entropy), Some(memory_hotplug)],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum HvfSnapshotV2StoragePciMsiProfile {
     Root,
     RootOrEntropy,
@@ -754,7 +778,7 @@ pub fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan(
         bundle,
         process,
         HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
-        None,
+        HvfSnapshotV2StorageMmioFollowingInterrupts::None,
         &mut SystemStoragePlatformPlanReserve,
     )
 }
@@ -774,7 +798,7 @@ pub fn prepare_hvf_snapshot_v2_storage_entropy_mmio_platform_plan(
         bundle,
         process,
         HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
-        Some(entropy_interrupt),
+        HvfSnapshotV2StorageMmioFollowingInterrupts::Entropy(entropy_interrupt),
         &mut SystemStoragePlatformPlanReserve,
     )
 }
@@ -784,7 +808,7 @@ pub(crate) fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix(
     bundle: &PreparedSnapshotV2StorageBundle,
     process: HvfSnapshotV2StorageMmioProcessConfig,
     prefix: HvfSnapshotV2StorageMmioPlatformPrefix,
-    entropy_interrupt: Option<GuestInterruptLine>,
+    following_interrupts: HvfSnapshotV2StorageMmioFollowingInterrupts,
 ) -> Result<HvfSnapshotV2StorageMmioPlatformPlan, PrepareHvfSnapshotV2StorageMmioPlatformPlanError>
 {
     prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
@@ -792,7 +816,7 @@ pub(crate) fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix(
         bundle,
         process,
         prefix,
-        entropy_interrupt,
+        following_interrupts,
         &mut SystemStoragePlatformPlanReserve,
     )
 }
@@ -802,7 +826,7 @@ fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
     bundle: &PreparedSnapshotV2StorageBundle,
     process: HvfSnapshotV2StorageMmioProcessConfig,
     prefix: HvfSnapshotV2StorageMmioPlatformPrefix,
-    entropy_interrupt: Option<GuestInterruptLine>,
+    following_interrupts: HvfSnapshotV2StorageMmioFollowingInterrupts,
     reserve: &mut impl StoragePlatformPlanReserve,
 ) -> Result<HvfSnapshotV2StorageMmioPlatformPlan, PrepareHvfSnapshotV2StorageMmioPlatformPlanError>
 {
@@ -1038,13 +1062,14 @@ fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
     }
     .map_err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::CommandLine)?;
 
-    if let Some(expected) = entropy_interrupt
-        && interrupt_allocator
+    for expected in following_interrupts.lines().into_iter().flatten() {
+        if interrupt_allocator
             .allocate()
             .map_err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::Interrupt)?
             != expected
-    {
-        return Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan);
+        {
+            return Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan);
+        }
     }
     let serial_interrupt = interrupt_allocator
         .allocate()
@@ -2669,7 +2694,7 @@ pub(crate) mod tests {
             &fixture.bundle,
             process_config(),
             HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
-            None,
+            HvfSnapshotV2StorageMmioFollowingInterrupts::None,
         )
         .expect("zero-prefix MMIO storage plan should validate");
         assert_eq!(legacy.root_key(), prefixed.root_key());
@@ -2769,7 +2794,7 @@ pub(crate) mod tests {
                     &fixture.bundle,
                     process_config(),
                     HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
-                    None,
+                    HvfSnapshotV2StorageMmioFollowingInterrupts::None,
                     &mut FailingReserve { calls: 0, fail_at },
                 ),
                 Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::Allocation)

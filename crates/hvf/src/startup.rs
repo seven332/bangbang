@@ -29477,6 +29477,22 @@ pub(crate) fn pci_balloon_restore_gic_msi_configuration(
     pci_all_virtio_gic_msi_configuration_for_fixed_demand(fixed_demand)
 }
 
+pub(crate) fn pci_memory_hotplug_restore_gic_msi_configuration(
+    balloon_queue_count: Option<usize>,
+    entropy_configured: bool,
+) -> Result<HvfGicMsiConfiguration, HvfArm64BootPciDataError> {
+    let fixed_demand = pci_all_virtio_resource_demand(
+        0,
+        0,
+        0,
+        balloon_queue_count,
+        false,
+        entropy_configured,
+        true,
+    )?;
+    pci_all_virtio_gic_msi_configuration_for_fixed_demand(fixed_demand)
+}
+
 pub(crate) fn pci_root_restore_bar_region_id() -> Result<MmioRegionId, HvfArm64BootPciDataError> {
     pci_data_region_id(0)
 }
@@ -30489,18 +30505,20 @@ mod tests {
         dispatch_network_runtime_notifications_with_packet_io, dispatch_serial_input_with,
         lock_boot_mmio_dispatcher, lock_boot_mmio_dispatcher_runtime,
         pci_all_virtio_gic_msi_configuration, pci_all_virtio_resource_demand,
-        pci_data_available_bar_count, pci_data_bar_plan, pci_data_endpoint_count,
-        pci_data_region_id, pci_data_resource_demand, preflight_pci_data_dispatcher,
-        quiesce_limiter_retry_wakeups, record_entropy_dispatch_metrics,
-        record_memory_hotplug_signal_metrics, record_memory_hotplug_teardown_metrics,
-        record_pmem_dispatch_metrics, replace_vmgenid_and_signal_with,
-        restore_time_identity_and_signal_with, run_boot_session_loop, run_boot_session_vcpu_step,
-        signal_balloon_queue_interrupts, signal_block_queue_interrupts,
-        signal_capture_ready_mmio_block_interrupts, signal_entropy_queue_interrupts,
-        signal_memory_hotplug_queue_interrupts, signal_network_queue_interrupts,
-        signal_pmem_queue_interrupts, signal_vsock_queue_interrupts,
-        snapshot_limiter_retry_state_at, update_memory_hotplug_requested_size_and_signal_interrupt,
-        update_vmclock_and_signal_with,
+        pci_balloon_restore_gic_msi_configuration, pci_data_available_bar_count, pci_data_bar_plan,
+        pci_data_endpoint_count, pci_data_region_id, pci_data_resource_demand,
+        pci_entropy_restore_gic_msi_configuration,
+        pci_memory_hotplug_restore_gic_msi_configuration, pci_root_restore_gic_msi_configuration,
+        preflight_pci_data_dispatcher, quiesce_limiter_retry_wakeups,
+        record_entropy_dispatch_metrics, record_memory_hotplug_signal_metrics,
+        record_memory_hotplug_teardown_metrics, record_pmem_dispatch_metrics,
+        replace_vmgenid_and_signal_with, restore_time_identity_and_signal_with,
+        run_boot_session_loop, run_boot_session_vcpu_step, signal_balloon_queue_interrupts,
+        signal_block_queue_interrupts, signal_capture_ready_mmio_block_interrupts,
+        signal_entropy_queue_interrupts, signal_memory_hotplug_queue_interrupts,
+        signal_network_queue_interrupts, signal_pmem_queue_interrupts,
+        signal_vsock_queue_interrupts, snapshot_limiter_retry_state_at,
+        update_memory_hotplug_requested_size_and_signal_interrupt, update_vmclock_and_signal_with,
     };
     use crate::coordinator::HvfVcpuRunCoordinator;
     use crate::exit::{
@@ -41225,6 +41243,68 @@ mod tests {
             configuration.interrupt_count().get(),
             u32::try_from(PCI_ENDPOINT_SLOT_COUNT * (VIRTIO_NET_QUEUE_SIZES.len() + 1))
                 .expect("bounded route count should fit u32")
+        );
+    }
+
+    #[test]
+    fn memory_hotplug_restore_msi_capacity_matches_fixed_endpoint_formula() {
+        let queue_count = 5;
+        assert_eq!(
+            pci_memory_hotplug_restore_gic_msi_configuration(None, false)
+                .expect("memory-only MSI capacity should validate")
+                .interrupt_count()
+                .get(),
+            92
+        );
+        assert_eq!(
+            pci_memory_hotplug_restore_gic_msi_configuration(None, true)
+                .expect("entropy-and-memory MSI capacity should validate")
+                .interrupt_count()
+                .get(),
+            91
+        );
+        assert_eq!(
+            pci_memory_hotplug_restore_gic_msi_configuration(Some(queue_count), false,)
+                .expect("balloon-and-memory MSI capacity should validate")
+                .interrupt_count()
+                .get(),
+            u32::try_from(queue_count).expect("queue count should fit") + 90
+        );
+        assert_eq!(
+            pci_memory_hotplug_restore_gic_msi_configuration(Some(queue_count), true,)
+                .expect("balloon-entropy-and-memory MSI capacity should validate")
+                .interrupt_count()
+                .get(),
+            u32::try_from(queue_count).expect("queue count should fit") + 89
+        );
+
+        assert_eq!(
+            pci_root_restore_gic_msi_configuration()
+                .expect("legacy root MSI capacity should validate")
+                .interrupt_count()
+                .get(),
+            93
+        );
+        assert_eq!(
+            pci_entropy_restore_gic_msi_configuration()
+                .expect("legacy entropy MSI capacity should validate")
+                .interrupt_count()
+                .get(),
+            92
+        );
+        assert_eq!(
+            pci_balloon_restore_gic_msi_configuration(queue_count, false)
+                .expect("legacy balloon MSI capacity should validate")
+                .interrupt_count()
+                .get(),
+            u32::try_from(queue_count).expect("queue count should fit") + 91
+        );
+        assert_eq!(
+            pci_balloon_restore_gic_msi_configuration(queue_count, true)
+                .expect("legacy balloon-and-entropy MSI capacity should validate")
+                .interrupt_count()
+                .get(),
+            u32::try_from(queue_count).expect("queue count should fit") + 90
         );
     }
 

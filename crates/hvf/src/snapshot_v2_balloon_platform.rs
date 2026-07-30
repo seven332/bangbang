@@ -36,9 +36,10 @@ use crate::snapshot_v2_multi_block_platform::{
 };
 use crate::snapshot_v2_platform::{PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID};
 use crate::snapshot_v2_storage_platform::{
-    HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioPlatformPrefix,
-    HvfSnapshotV2StorageMmioProcessConfig, HvfSnapshotV2StoragePciPlatformPlan,
-    HvfSnapshotV2StoragePciPlatformPrefix, PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
+    HvfSnapshotV2StorageMmioFollowingInterrupts, HvfSnapshotV2StorageMmioPlatformPlan,
+    HvfSnapshotV2StorageMmioPlatformPrefix, HvfSnapshotV2StorageMmioProcessConfig,
+    HvfSnapshotV2StoragePciPlatformPlan, HvfSnapshotV2StoragePciPlatformPrefix,
+    PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
     PrepareHvfSnapshotV2StoragePciPlatformPlanError, mmio_region_conflicts_with_platform,
     prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix,
     prepare_hvf_snapshot_v2_storage_pci_platform_plan_with_prefix,
@@ -693,32 +694,13 @@ fn prepare_balloon_mmio_platform_plan(
         return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::TransportPolicy);
     }
 
-    let expected_balloon_region = mmio_region(
-        process.balloon_layout().region_id(),
-        process.balloon_layout().address(),
+    let balloon_endpoint = prepare_hvf_snapshot_v2_balloon_mmio_endpoint_plan(
+        platform,
+        product.balloon(),
+        process.balloon_layout(),
     )?;
-    let PreparedSnapshotV2BalloonTransport::Mmio(balloon_transport) = product.balloon().transport()
-    else {
-        return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::TransportPolicy);
-    };
-    if balloon_transport.region() != expected_balloon_region
-        || mmio_region_conflicts_with_platform(
-            platform,
-            expected_balloon_region,
-            &platform.global().compatibility().gic_metadata(),
-        )
-        .map_err(|_| PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?
-    {
-        return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan);
-    }
-    for ranges in product.balloon().queue_ranges() {
-        if queue_ranges_conflict_with_platform(platform, Some(*ranges))
-            .map_err(|_| PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?
-        {
-            return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::RangeConflict);
-        }
-    }
-    let balloon_interrupt = balloon_transport.interrupt_line();
+    let expected_balloon_region = balloon_endpoint.region();
+    let balloon_interrupt = balloon_endpoint.interrupt_line();
 
     let entropy_endpoint = product
         .entropy()
@@ -736,7 +718,14 @@ fn prepare_balloon_mmio_platform_plan(
                     expected_balloon_region,
                     balloon_interrupt,
                 ),
-                entropy_endpoint.map(|entropy| entropy.interrupt_line()),
+                entropy_endpoint.map_or(
+                    HvfSnapshotV2StorageMmioFollowingInterrupts::None,
+                    |entropy| {
+                        HvfSnapshotV2StorageMmioFollowingInterrupts::Entropy(
+                            entropy.interrupt_line(),
+                        )
+                    },
+                ),
             )
             .map_err(|source| {
                 PrepareHvfSnapshotV2BalloonPlatformPlanError::StorageMmio(Box::new(source))
@@ -786,11 +775,7 @@ fn prepare_balloon_mmio_platform_plan(
 
     Ok(HvfSnapshotV2BalloonMmioPlatformPlan {
         product,
-        balloon: HvfSnapshotV2BalloonMmioEndpointPlan {
-            region: expected_balloon_region,
-            interrupt_line: balloon_interrupt,
-            fdt_device: mmio_fdt_device(expected_balloon_region, balloon_interrupt),
-        },
+        balloon: balloon_endpoint,
         storage: storage_plan,
         entropy: entropy_endpoint,
         serial_interrupt,
@@ -827,31 +812,18 @@ fn prepare_balloon_pci_platform_plan(
         .msi
         .ok_or(PrepareHvfSnapshotV2BalloonPlatformPlanError::TransportPolicy)?;
     let queue_count = balloon_transport.device().queue_layout().queue_count();
-    let balloon_route_count = snapshot_v2_pci_endpoint_route_count(queue_count)
-        .filter(|count| (3..=6).contains(count))
-        .ok_or(PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?;
     let expected_msi =
         pci_balloon_restore_gic_msi_configuration(queue_count, product.entropy().is_some())
             .map_err(|_| PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?;
     let expected_msi_interrupt_count = expected_msi.interrupt_count().get();
-    let balloon_placement = snapshot_v2_pci_endpoint_placement(address_plan, 0)
-        .ok_or(PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?;
-    if msi.interrupt_range.count != expected_msi_interrupt_count
-        || balloon_transport.origin() != StorageDeviceOrigin::Startup
-        || balloon_transport.sbdf() != balloon_placement.sbdf
-        || balloon_transport.bar_range() != balloon_placement.bar_range
-        || balloon_transport.retained().phase() != VirtioPciEndpointPhase::Active
-    {
-        return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan);
-    }
-    let balloon_origin = balloon_transport.origin();
-    for ranges in product.balloon().queue_ranges() {
-        if queue_ranges_conflict_with_pci_platform(platform, Some(*ranges), &gic, address_plan)
-            .map_err(|_| PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?
-        {
-            return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::RangeConflict);
-        }
-    }
+    let balloon_endpoint = prepare_hvf_snapshot_v2_balloon_pci_endpoint_plan(
+        platform,
+        product.balloon(),
+        address_plan,
+        msi,
+        expected_msi_interrupt_count,
+    )?;
+    let balloon_route_count = balloon_endpoint.route_count();
 
     let reserved_entropy = usize::from(product.entropy().is_some());
     let storage_plan = product
@@ -940,7 +912,7 @@ fn prepare_balloon_pci_platform_plan(
         return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::RangeConflict);
     }
 
-    endpoint_bars.push(balloon_placement.bar_range);
+    endpoint_bars.push(balloon_endpoint.bar_range());
     if let Some(storage) = &storage_plan {
         if storage.pci().host() != host || storage.pci().msi() != msi {
             return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan);
@@ -1016,14 +988,7 @@ fn prepare_balloon_pci_platform_plan(
         validate_pci_interrupt_sequence(platform, storage_plan.as_ref())?;
     Ok(HvfSnapshotV2BalloonPciPlatformPlan {
         product,
-        balloon: HvfSnapshotV2BalloonPciEndpointPlan {
-            origin: balloon_origin,
-            sbdf: balloon_placement.sbdf,
-            bar_region_id: balloon_placement.bar_region_id,
-            bar_range: balloon_placement.bar_range,
-            route_count: balloon_route_count,
-            msi_interrupt_count: expected_msi_interrupt_count,
-        },
+        balloon: balloon_endpoint,
         storage: storage_plan,
         entropy: entropy_endpoint,
         host,
@@ -1046,6 +1011,82 @@ fn validate_product_profile(
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn prepare_hvf_snapshot_v2_balloon_mmio_endpoint_plan(
+    platform: &HvfSnapshotV2PlatformState,
+    balloon: &SnapshotV2BalloonRestorePlan,
+    layout: BalloonMmioLayout,
+) -> Result<HvfSnapshotV2BalloonMmioEndpointPlan, PrepareHvfSnapshotV2BalloonPlatformPlanError> {
+    let expected_region = mmio_region(layout.region_id(), layout.address())?;
+    let PreparedSnapshotV2BalloonTransport::Mmio(transport) = balloon.transport() else {
+        return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::TransportPolicy);
+    };
+    if transport.region() != expected_region
+        || mmio_region_conflicts_with_platform(
+            platform,
+            expected_region,
+            &platform.global().compatibility().gic_metadata(),
+        )
+        .map_err(|_| PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?
+    {
+        return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan);
+    }
+    for ranges in balloon.queue_ranges() {
+        if queue_ranges_conflict_with_platform(platform, Some(*ranges))
+            .map_err(|_| PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?
+        {
+            return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::RangeConflict);
+        }
+    }
+    Ok(HvfSnapshotV2BalloonMmioEndpointPlan {
+        region: expected_region,
+        interrupt_line: transport.interrupt_line(),
+        fdt_device: mmio_fdt_device(expected_region, transport.interrupt_line()),
+    })
+}
+
+pub(crate) fn prepare_hvf_snapshot_v2_balloon_pci_endpoint_plan(
+    platform: &HvfSnapshotV2PlatformState,
+    balloon: &SnapshotV2BalloonRestorePlan,
+    address_plan: Arm64PciAddressPlan,
+    msi: HvfGicMsiMetadata,
+    expected_msi_interrupt_count: u32,
+) -> Result<HvfSnapshotV2BalloonPciEndpointPlan, PrepareHvfSnapshotV2BalloonPlatformPlanError> {
+    let PreparedSnapshotV2BalloonTransport::Pci(transport) = balloon.transport() else {
+        return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::TransportPolicy);
+    };
+    let queue_count = transport.device().queue_layout().queue_count();
+    let route_count = snapshot_v2_pci_endpoint_route_count(queue_count)
+        .filter(|count| (3..=6).contains(count))
+        .ok_or(PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?;
+    let placement = snapshot_v2_pci_endpoint_placement(address_plan, 0)
+        .ok_or(PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?;
+    let gic = platform.global().compatibility().gic_metadata();
+    if gic.msi != Some(msi)
+        || msi.interrupt_range.count != expected_msi_interrupt_count
+        || transport.origin() != StorageDeviceOrigin::Startup
+        || transport.sbdf() != placement.sbdf
+        || transport.bar_range() != placement.bar_range
+        || transport.retained().phase() != VirtioPciEndpointPhase::Active
+    {
+        return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan);
+    }
+    for ranges in balloon.queue_ranges() {
+        if queue_ranges_conflict_with_pci_platform(platform, Some(*ranges), &gic, address_plan)
+            .map_err(|_| PrepareHvfSnapshotV2BalloonPlatformPlanError::ResourcePlan)?
+        {
+            return Err(PrepareHvfSnapshotV2BalloonPlatformPlanError::RangeConflict);
+        }
+    }
+    Ok(HvfSnapshotV2BalloonPciEndpointPlan {
+        origin: transport.origin(),
+        sbdf: placement.sbdf,
+        bar_region_id: placement.bar_region_id,
+        bar_range: placement.bar_range,
+        route_count,
+        msi_interrupt_count: expected_msi_interrupt_count,
+    })
 }
 
 fn prepare_entropy_mmio_endpoint(
