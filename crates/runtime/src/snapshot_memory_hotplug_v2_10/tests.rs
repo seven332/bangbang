@@ -12,10 +12,10 @@ use crate::pci::{
     PciBarAddressSpace, PciBarPrefetchable, PciSbdf,
 };
 use crate::snapshot_device_v2::{
-    SnapshotV2InterruptIntent, SnapshotV2MmioDeviceState, SnapshotV2PciBarProbeState,
-    SnapshotV2PciDeviceState, SnapshotV2PciDeviceStateParts, SnapshotV2PciMsixState,
-    SnapshotV2PciMsixStateParts, SnapshotV2PciMsixTableEntry, SnapshotV2PciWritableByte,
-    SnapshotV2VirtioQueueState, SnapshotV2VirtioStateParts,
+    SnapshotV2DeviceTransportKind, SnapshotV2InterruptIntent, SnapshotV2MmioDeviceState,
+    SnapshotV2PciBarProbeState, SnapshotV2PciDeviceState, SnapshotV2PciDeviceStateParts,
+    SnapshotV2PciMsixState, SnapshotV2PciMsixStateParts, SnapshotV2PciMsixTableEntry,
+    SnapshotV2PciWritableByte, SnapshotV2VirtioQueueState, SnapshotV2VirtioStateParts,
 };
 use crate::snapshot_memory_v2::write_snapshot_v2_memory_image_with_compatibility_version;
 use crate::storage_capture::StorageDeviceOrigin;
@@ -98,6 +98,18 @@ fn inactive_virtio() -> SnapshotV2VirtioState {
 }
 
 fn active_virtio() -> SnapshotV2VirtioState {
+    active_virtio_with_queue(
+        GuestAddress::new(0x10_0000),
+        GuestAddress::new(0x12_0000),
+        GuestAddress::new(0x14_0000),
+    )
+}
+
+fn active_virtio_with_queue(
+    descriptor_table: GuestAddress,
+    driver_ring: GuestAddress,
+    device_ring: GuestAddress,
+) -> SnapshotV2VirtioState {
     SnapshotV2VirtioState::from_parts(SnapshotV2VirtioStateParts {
         available_features: REQUIRED_FEATURES,
         driver_features: REQUIRED_FEATURES,
@@ -108,9 +120,9 @@ fn active_virtio() -> SnapshotV2VirtioState {
             VIRTIO_MEM_QUEUE_SIZE,
             VIRTIO_MEM_QUEUE_SIZE,
             true,
-            GuestAddress::new(0x10_0000),
-            GuestAddress::new(0x12_0000),
-            GuestAddress::new(0x14_0000),
+            descriptor_table,
+            driver_ring,
+            device_ring,
         )],
         pending_notifications: vec![0],
         interrupt_intents: vec![
@@ -346,6 +358,339 @@ fn kind_one_binding_closes_fragmented_plugged_unions_and_rejects_hostile_coverag
         assert!(!diagnostics.contains(&config_space.addr().to_string()));
         assert!(!diagnostics.contains(&first_start.to_string()));
     }
+}
+
+fn test_range(start: u64, size: u64) -> GuestMemoryRange {
+    GuestMemoryRange::new(GuestAddress::new(start), size)
+        .expect("test guest-memory range should validate")
+}
+
+fn plugged_guest_test_range(
+    state: &SnapshotV2MemoryHotplugState,
+    start_block: u64,
+    block_count: u64,
+) -> GuestMemoryRange {
+    let config_space = state.config_space();
+    let start = config_space
+        .addr()
+        .checked_add(
+            start_block
+                .checked_mul(config_space.block_size())
+                .expect("test plugged offset should fit"),
+        )
+        .expect("test plugged start should fit");
+    let size = block_count
+        .checked_mul(config_space.block_size())
+        .expect("test plugged size should fit");
+    test_range(start, size)
+}
+
+fn active_mmio_state_with_queue(
+    plugged_ranges: &[(usize, usize)],
+    descriptor_table: GuestAddress,
+    driver_ring: GuestAddress,
+    device_ring: GuestAddress,
+) -> SnapshotV2MemoryHotplugState {
+    let plugged_blocks = plugged_ranges
+        .iter()
+        .map(|(_, count)| u64::try_from(*count).expect("test block count should fit u64"))
+        .sum();
+    SnapshotV2MemoryHotplugState::try_new(
+        base_config(),
+        base_config_space(plugged_blocks),
+        Some(
+            SnapshotV2MemoryHotplugQueueState::try_new(7, 7)
+                .expect("equal active cursors should validate"),
+        ),
+        bitmap_with_ranges(plugged_ranges),
+        active_virtio_with_queue(descriptor_table, driver_ring, device_ring),
+        SnapshotV2DeviceTransport::Mmio(mmio_transport()),
+    )
+    .expect("active MMIO topology fixture should validate")
+}
+
+#[test]
+fn prepared_topology_preserves_ordered_partition_ranges_and_controller_projection() {
+    let state = inactive_mmio_state();
+    let aperture_start = state.config_space().addr();
+    let aperture_end = aperture_start + state.config_space().region_size();
+    let first = plugged_guest_test_range(&state, 1, 2);
+    let second = plugged_guest_test_range(&state, 5, 3);
+    let binding = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![
+            test_range(aarch64::DRAM_MEM_START, 4 * aarch64::GUEST_PAGE_SIZE),
+            test_range(first.start().raw_value(), state.config_space().block_size()),
+            test_range(
+                first.start().raw_value() + state.config_space().block_size(),
+                state.config_space().block_size(),
+            ),
+            second,
+            test_range(aperture_end, 4 * aarch64::GUEST_PAGE_SIZE),
+        ],
+    );
+    let expected_binding = binding.clone();
+    let expected_offsets = binding
+        .extents()
+        .iter()
+        .map(|extent| extent.file_offset())
+        .collect::<Vec<_>>();
+
+    let prepared = PreparedSnapshotV2MemoryHotplugTopology::prepare(state.clone(), binding)
+        .expect("closed fragmented topology should prepare");
+    assert_eq!(prepared.memory().binding(), &expected_binding);
+    assert_eq!(prepared.memory().extent_count(), 5);
+    let classified = prepared.memory().classified_extents().collect::<Vec<_>>();
+    assert_eq!(
+        classified
+            .iter()
+            .map(|classified| classified.class())
+            .collect::<Vec<_>>(),
+        vec![
+            SnapshotV2MemoryHotplugExtentClass::Base,
+            SnapshotV2MemoryHotplugExtentClass::Dynamic,
+            SnapshotV2MemoryHotplugExtentClass::Dynamic,
+            SnapshotV2MemoryHotplugExtentClass::Dynamic,
+            SnapshotV2MemoryHotplugExtentClass::Base,
+        ]
+    );
+    assert_eq!(
+        classified
+            .iter()
+            .map(|classified| classified.extent().file_offset())
+            .collect::<Vec<_>>(),
+        expected_offsets
+    );
+    assert_eq!(prepared.plugged_ranges(), &[first, second]);
+    assert_eq!(prepared.queue_ranges(), None);
+    assert_eq!(prepared.state(), &state);
+    assert_eq!(prepared.controller().config(), base_config());
+    assert_eq!(prepared.controller().requested_size_mib(), 128);
+    assert_eq!(
+        prepared.state().transport().kind(),
+        SnapshotV2DeviceTransportKind::Mmio
+    );
+
+    let sentinel = aperture_start.to_string();
+    for diagnostic in [
+        format!("{prepared:?}"),
+        format!("{:?}", prepared.memory()),
+        format!("{:?}", prepared.controller()),
+        format!("{:?}", classified[1]),
+    ] {
+        assert!(diagnostic.contains(REDACTED));
+        assert!(!diagnostic.contains(&sentinel));
+    }
+}
+
+#[test]
+fn prepared_topology_retains_active_pci_queue_in_one_base_extent() {
+    let state = active_pci_state();
+    let binding = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![
+            test_range(0x10_0000, 0x50_000),
+            plugged_guest_test_range(&state, 0, 1),
+            plugged_guest_test_range(&state, 7, 2),
+            plugged_guest_test_range(&state, 127, 1),
+        ],
+    );
+
+    let prepared = PreparedSnapshotV2MemoryHotplugTopology::prepare(state.clone(), binding)
+        .expect("active PCI queue in base memory should prepare");
+    assert!(prepared.queue_ranges().is_some());
+    assert!(prepared.state().active_queue().is_some());
+    assert_eq!(
+        prepared.state().transport().kind(),
+        SnapshotV2DeviceTransportKind::Pci
+    );
+    assert_eq!(
+        prepared
+            .memory()
+            .classified_extents()
+            .map(|classified| classified.class())
+            .collect::<Vec<_>>(),
+        vec![
+            SnapshotV2MemoryHotplugExtentClass::Base,
+            SnapshotV2MemoryHotplugExtentClass::Dynamic,
+            SnapshotV2MemoryHotplugExtentClass::Dynamic,
+            SnapshotV2MemoryHotplugExtentClass::Dynamic,
+        ]
+    );
+}
+
+#[test]
+fn dynamic_queue_uses_canonical_plugged_region_not_source_fragment_boundaries() {
+    let aperture = VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value();
+    let split = aperture + 2 * MIB;
+    let state = active_mmio_state_with_queue(
+        &[(0, 2)],
+        GuestAddress::new(split - 2048),
+        GuestAddress::new(aperture + 0x1000),
+        GuestAddress::new(aperture + 3 * MIB),
+    );
+    let binding = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![test_range(aperture, 2 * MIB), test_range(split, 2 * MIB)],
+    );
+
+    let prepared = PreparedSnapshotV2MemoryHotplugTopology::prepare(state, binding)
+        .expect("queue spanning adjacent dynamic source extents should prepare");
+    assert_eq!(prepared.plugged_ranges(), &[test_range(aperture, 4 * MIB)]);
+    assert!(
+        prepared
+            .memory()
+            .classified_extents()
+            .all(|classified| classified.class() == SnapshotV2MemoryHotplugExtentClass::Dynamic)
+    );
+}
+
+#[test]
+fn queue_topology_rejects_missing_gaps_source_boundaries_and_aperture_crossing() {
+    let active = active_pci_state();
+    let dynamic_only = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![
+            plugged_guest_test_range(&active, 0, 1),
+            plugged_guest_test_range(&active, 7, 2),
+            plugged_guest_test_range(&active, 127, 1),
+        ],
+    );
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare_with_extent_class_allocation_failure(
+            active.clone(),
+            dynamic_only.clone(),
+        ),
+        Err(SnapshotV2MemoryHotplugPreparationError::QueueMemory)
+    ));
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare(active, dynamic_only),
+        Err(SnapshotV2MemoryHotplugPreparationError::QueueMemory)
+    ));
+
+    let aperture = VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value();
+    let base_split = 0x20_0000;
+    let base_crossing = active_mmio_state_with_queue(
+        &[(0, 1)],
+        GuestAddress::new(base_split - 2048),
+        GuestAddress::new(base_split + 0x1_0000),
+        GuestAddress::new(base_split + 0x2_0000),
+    );
+    let base_fragmented = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![
+            test_range(
+                base_split - 4 * aarch64::GUEST_PAGE_SIZE,
+                4 * aarch64::GUEST_PAGE_SIZE,
+            ),
+            test_range(base_split, 0x30_000),
+            plugged_guest_test_range(&base_crossing, 0, 1),
+        ],
+    );
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare(base_crossing, base_fragmented),
+        Err(SnapshotV2MemoryHotplugPreparationError::QueueMemory)
+    ));
+
+    let plugged_gap = active_mmio_state_with_queue(
+        &[(0, 1), (2, 1)],
+        GuestAddress::new(aperture + 2 * MIB - 2048),
+        GuestAddress::new(aperture + 0x1000),
+        GuestAddress::new(aperture + 4 * MIB + 0x1000),
+    );
+    let separated = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![
+            plugged_guest_test_range(&plugged_gap, 0, 1),
+            plugged_guest_test_range(&plugged_gap, 2, 1),
+        ],
+    );
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare(plugged_gap, separated),
+        Err(SnapshotV2MemoryHotplugPreparationError::QueueMemory)
+    ));
+
+    let boundary_crossing = active_mmio_state_with_queue(
+        &[(0, 1)],
+        GuestAddress::new(aperture - 2048),
+        GuestAddress::new(aperture + 0x1000),
+        GuestAddress::new(aperture + 0x2000),
+    );
+    let boundary_binding = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![
+            test_range(
+                aperture - 4 * aarch64::GUEST_PAGE_SIZE,
+                4 * aarch64::GUEST_PAGE_SIZE,
+            ),
+            plugged_guest_test_range(&boundary_crossing, 0, 1),
+        ],
+    );
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare(boundary_crossing, boundary_binding),
+        Err(SnapshotV2MemoryHotplugPreparationError::QueueBoundary)
+    ));
+}
+
+#[test]
+fn empty_topology_and_both_reservation_failures_are_deterministic() {
+    let empty = SnapshotV2MemoryHotplugState::try_new(
+        base_config(),
+        base_config_space(0),
+        None,
+        bitmap_with_ranges(&[]),
+        inactive_virtio(),
+        SnapshotV2DeviceTransport::Mmio(mmio_transport()),
+    )
+    .expect("empty topology state should validate");
+    let empty_binding = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![test_range(
+            aarch64::DRAM_MEM_START,
+            4 * aarch64::GUEST_PAGE_SIZE,
+        )],
+    );
+    let prepared =
+        PreparedSnapshotV2MemoryHotplugTopology::prepare(empty.clone(), empty_binding.clone())
+            .expect("empty plugged topology should prepare");
+    assert!(prepared.plugged_ranges().is_empty());
+    assert_eq!(
+        prepared
+            .memory()
+            .classified_extents()
+            .next()
+            .expect("base extent should remain")
+            .class(),
+        SnapshotV2MemoryHotplugExtentClass::Base
+    );
+
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare_with_extent_class_allocation_failure(
+            empty,
+            empty_binding,
+        ),
+        Err(SnapshotV2MemoryHotplugPreparationError::Allocation)
+    ));
+    let nonempty = inactive_mmio_state();
+    let nonempty_binding = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![
+            plugged_guest_test_range(&nonempty, 1, 2),
+            plugged_guest_test_range(&nonempty, 5, 3),
+        ],
+    );
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare_with_plugged_range_allocation_failure(
+            nonempty,
+            nonempty_binding,
+        ),
+        Err(SnapshotV2MemoryHotplugPreparationError::Allocation)
+    ));
+    let error = SnapshotV2MemoryHotplugPreparationError::Binding(
+        SnapshotV2MemoryHotplugBindingError::Coverage,
+    );
+    assert!(format!("{error:?}").contains("binding"));
+    assert!(!format!("{error:?} {error}").contains("536870912"));
 }
 
 fn section_offset(bytes: &[u8], index: usize) -> usize {

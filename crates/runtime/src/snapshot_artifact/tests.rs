@@ -770,7 +770,7 @@ fn exact_minor_nine_candidate_rejects_balloon_cardinality_payload_and_version_mi
 
 #[cfg(target_os = "macos")]
 #[test]
-fn exact_minor_ten_candidate_classifies_all_sixteen_optional_component_products() {
+fn exact_minor_ten_products_prepare_or_preserve_every_optional_component_product() {
     let storage_payload = fixture_bytes(include_str!(
         "../snapshot_device_v2_6/fixtures/block-root-mmio.hex"
     ));
@@ -780,14 +780,6 @@ fn exact_minor_ten_candidate_classifies_all_sixteen_optional_component_products(
     let balloon_payload = fixture_bytes(include_str!(
         "../snapshot_balloon_v2_9/fixtures/active-pci.hex"
     ));
-    let memory_hotplug_payload = fixture_bytes(include_str!(
-        "../snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex"
-    ));
-    let memory_hotplug_state = SnapshotV2MemoryHotplugState::decode(
-        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
-        &memory_hotplug_payload,
-    )
-    .expect("exact 2.10 virtio-mem fixture should decode");
     let base_memory = test_v2_memory();
     let mut base_image = Cursor::new(Vec::new());
     let base_binding = write_snapshot_v2_memory_image_with_compatibility_version(
@@ -796,113 +788,178 @@ fn exact_minor_ten_candidate_classifies_all_sixteen_optional_component_products(
         NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
     )
     .expect("base exact 2.10 memory should encode internally");
-    let hotplug_memory = test_v2_memory_with_hotplug(&memory_hotplug_state);
-    let mut hotplug_image = Cursor::new(Vec::new());
-    let hotplug_binding = write_snapshot_v2_memory_image_with_compatibility_version(
-        &hotplug_memory,
-        &mut hotplug_image,
-        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
-    )
-    .expect("dynamic exact 2.10 memory should encode internally");
 
-    let mut product_count = 0;
-    for with_storage in [false, true] {
-        for with_entropy in [false, true] {
-            for with_balloon in [false, true] {
-                for with_memory_hotplug in [false, true] {
-                    let entropy_components = if with_entropy {
-                        vec![(
-                            NATIVE_V2_ENTROPY_COMPONENT_KEY,
-                            SnapshotV2ComponentDisposition::Semantic,
-                            entropy_payload.as_slice(),
-                        )]
-                    } else {
-                        Vec::new()
-                    };
-                    let balloon_components = if with_balloon {
-                        vec![(
-                            NATIVE_V2_BALLOON_COMPONENT_KEY,
-                            SnapshotV2ComponentDisposition::Semantic,
-                            balloon_payload.as_slice(),
-                        )]
-                    } else {
-                        Vec::new()
-                    };
-                    let memory_hotplug_components = if with_memory_hotplug {
-                        vec![(
-                            NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
-                            SnapshotV2ComponentDisposition::Semantic,
-                            memory_hotplug_payload.as_slice(),
-                        )]
-                    } else {
-                        Vec::new()
-                    };
-                    let binding = if with_memory_hotplug {
-                        &hotplug_binding
-                    } else {
-                        &base_binding
-                    };
-                    let bytes = memory_hotplug_v2_10_state(
-                        binding,
-                        with_storage.then_some(storage_payload.as_slice()),
-                        &entropy_components,
-                        &balloon_components,
-                        &memory_hotplug_components,
-                    )
-                    .expect("exact 2.10 product should encode");
+    let mut profiles = Vec::new();
+    for payload in [
+        fixture_bytes(include_str!(
+            "../snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex"
+        )),
+        fixture_bytes(include_str!(
+            "../snapshot_memory_hotplug_v2_10/fixtures/active-pci.hex"
+        )),
+    ] {
+        let state = SnapshotV2MemoryHotplugState::decode(
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            &payload,
+        )
+        .expect("exact 2.10 virtio-mem fixture should decode");
+        let memory = test_v2_memory_with_hotplug(&state);
+        let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+            &memory,
+            &mut Cursor::new(Vec::new()),
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        )
+        .expect("dynamic exact 2.10 memory should encode internally");
+        profiles.push((payload, state, binding));
+    }
 
-                    assert!(matches!(
-                        NativeSnapshotArtifactState::from_current_v2(bytes.clone()),
-                        Err(NativeSnapshotArtifactStateError::CurrentV2Profile(_))
-                    ));
-                    assert!(matches!(
-                        NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone()),
-                        Err(NativeSnapshotArtifactStateError::Format(
-                            NativeSnapshotFormatError::NativeV2(
-                                SnapshotV2DecodeError::UnsupportedVersion { .. }
-                            )
-                        ))
-                    ));
-
-                    let candidate =
-                        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
-                            bytes.clone(),
+    let mut prepared_count = 0;
+    let mut compatible_count = 0;
+    for (memory_hotplug_payload, memory_hotplug_state, hotplug_binding) in &profiles {
+        for with_storage in [false, true] {
+            for with_entropy in [false, true] {
+                for with_balloon in [false, true] {
+                    for with_memory_hotplug in [false, true] {
+                        let entropy_components = if with_entropy {
+                            vec![(
+                                NATIVE_V2_ENTROPY_COMPONENT_KEY,
+                                SnapshotV2ComponentDisposition::Semantic,
+                                entropy_payload.as_slice(),
+                            )]
+                        } else {
+                            Vec::new()
+                        };
+                        let balloon_components = if with_balloon {
+                            vec![(
+                                NATIVE_V2_BALLOON_COMPONENT_KEY,
+                                SnapshotV2ComponentDisposition::Semantic,
+                                balloon_payload.as_slice(),
+                            )]
+                        } else {
+                            Vec::new()
+                        };
+                        let memory_hotplug_components = if with_memory_hotplug {
+                            vec![(
+                                NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+                                SnapshotV2ComponentDisposition::Semantic,
+                                memory_hotplug_payload.as_slice(),
+                            )]
+                        } else {
+                            Vec::new()
+                        };
+                        let binding = if with_memory_hotplug {
+                            hotplug_binding
+                        } else {
+                            &base_binding
+                        };
+                        let bytes = memory_hotplug_v2_10_state(
+                            binding,
+                            with_storage.then_some(storage_payload.as_slice()),
+                            &entropy_components,
+                            &balloon_components,
+                            &memory_hotplug_components,
                         )
-                        .expect("exact 2.10 candidate should validate");
-                    assert_eq!(
-                        candidate.version(),
-                        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
-                    );
-                    assert_eq!(candidate.memory_binding(), binding);
-                    assert_eq!(candidate.device_graph().is_some(), with_storage);
-                    assert_eq!(candidate.entropy().is_some(), with_entropy);
-                    assert_eq!(candidate.balloon().is_some(), with_balloon);
-                    assert_eq!(candidate.memory_hotplug().is_some(), with_memory_hotplug);
-                    assert_eq!(candidate.bytes(), bytes);
-                    let debug = format!("{candidate:?}");
-                    assert!(debug.contains(REDACTED));
-                    assert!(!debug.contains("BANGME2"));
+                        .expect("exact 2.10 product should encode");
 
-                    let compatible = candidate.into_compatible_artifact_state();
-                    assert_eq!(
-                        compatible
-                            .v2_profile()
-                            .expect("internal exact 2.10 state should classify"),
-                        NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
-                    );
-                    assert!(matches!(
-                        compatible.validate_for_publication(),
-                        Err(NativeSnapshotArtifactStateError::NonCurrentV2Publication {
-                            state: NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
-                            memory: NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
-                        })
-                    ));
-                    product_count += 1;
+                        assert!(matches!(
+                            NativeSnapshotArtifactState::from_current_v2(bytes.clone()),
+                            Err(NativeSnapshotArtifactStateError::CurrentV2Profile(_))
+                        ));
+                        assert!(matches!(
+                            NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone()),
+                            Err(NativeSnapshotArtifactStateError::Format(
+                                NativeSnapshotFormatError::NativeV2(
+                                    SnapshotV2DecodeError::UnsupportedVersion { .. }
+                                )
+                            ))
+                        ));
+
+                        let candidate =
+                            NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
+                                bytes.clone(),
+                            )
+                            .expect("exact 2.10 candidate should validate");
+                        assert_eq!(
+                            candidate.version(),
+                            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+                        );
+                        assert_eq!(candidate.memory_binding(), binding);
+                        assert_eq!(candidate.device_graph().is_some(), with_storage);
+                        assert_eq!(candidate.entropy().is_some(), with_entropy);
+                        assert_eq!(candidate.balloon().is_some(), with_balloon);
+                        assert_eq!(candidate.memory_hotplug().is_some(), with_memory_hotplug);
+                        assert_eq!(candidate.bytes(), bytes);
+                        let debug = format!("{candidate:?}");
+                        assert!(debug.contains(REDACTED));
+                        assert!(!debug.contains("BANGME2"));
+                        let expected_device_graph = candidate.device_graph().cloned();
+                        let expected_serial = candidate.serial().clone();
+                        let expected_entropy = candidate.entropy().cloned();
+                        let expected_balloon = candidate.balloon().cloned();
+
+                        let preparation = candidate
+                            .prepare()
+                            .expect("exact 2.10 candidate should prepare");
+                        let preparation_debug = format!("{preparation:?}");
+                        assert!(preparation_debug.contains(REDACTED));
+                        assert!(!preparation_debug.contains("BANGME2"));
+                        if with_memory_hotplug {
+                            let prepared = preparation
+                                .prepared()
+                                .expect("kind-11 product should be prepared");
+                            assert!(preparation.compatible().is_none());
+                            assert_eq!(prepared.bytes(), bytes);
+                            assert_eq!(prepared.memory_binding(), binding);
+                            assert_eq!(prepared.device_graph(), expected_device_graph.as_ref());
+                            assert_eq!(prepared.serial(), &expected_serial);
+                            assert_eq!(prepared.entropy(), expected_entropy.as_ref());
+                            assert_eq!(prepared.balloon(), expected_balloon.as_ref());
+                            assert_eq!(prepared.topology().state(), memory_hotplug_state);
+                            assert_eq!(
+                                prepared.topology().queue_ranges().is_some(),
+                                memory_hotplug_state.virtio().is_activated()
+                            );
+                            let prepared_debug = format!("{prepared:?}");
+                            assert!(prepared_debug.contains(REDACTED));
+                            assert!(!prepared_debug.contains("BANGME2"));
+                            prepared_count += 1;
+                        } else {
+                            let compatible_candidate = preparation
+                                .compatible()
+                                .expect("no-kind-11 product should remain compatible");
+                            assert!(preparation.prepared().is_none());
+                            assert_eq!(compatible_candidate.bytes(), bytes);
+                            assert_eq!(compatible_candidate.memory_binding(), binding);
+                            assert!(compatible_candidate.memory_hotplug().is_none());
+                            compatible_count += 1;
+                        }
+
+                        let compatible =
+                            NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
+                                bytes,
+                            )
+                            .expect("exact 2.10 compatibility candidate should validate")
+                            .into_compatible_artifact_state();
+                        assert_eq!(
+                            compatible
+                                .v2_profile()
+                                .expect("internal exact 2.10 state should classify"),
+                            NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
+                        );
+                        assert!(matches!(
+                            compatible.validate_for_publication(),
+                            Err(NativeSnapshotArtifactStateError::NonCurrentV2Publication {
+                                state: NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                                memory: NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                            })
+                        ));
+                    }
                 }
             }
         }
     }
-    assert_eq!(product_count, 16);
+    assert_eq!(prepared_count, 16);
+    assert_eq!(compatible_count, 16);
 }
 
 #[cfg(target_os = "macos")]
@@ -936,6 +993,53 @@ fn exact_minor_ten_candidate_rejects_mismatched_memory_and_virtio_mem_coverage()
         NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(bytes),
         Err(NativeV2SnapshotCandidateStateError::MemoryHotplugBinding(_))
     ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_ten_preparation_rejects_queue_missing_from_the_closed_binding() {
+    let memory_hotplug_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/active-pci.hex"
+    ));
+    let state = SnapshotV2MemoryHotplugState::decode(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &memory_hotplug_payload,
+    )
+    .expect("active exact 2.10 virtio-mem fixture should decode");
+    let memory = test_v2_memory_with_hotplug_data_only(&state);
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut Cursor::new(Vec::new()),
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("dynamic-only exact 2.10 memory should encode");
+    let bytes = memory_hotplug_v2_10_state(
+        &binding,
+        None,
+        &[],
+        &[],
+        &[(
+            NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            memory_hotplug_payload.as_slice(),
+        )],
+    )
+    .expect("queue-missing product should remain structurally encodable");
+    let candidate =
+        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(bytes)
+            .expect("kind-1 and plugged union should close before queue preparation");
+    let error = candidate
+        .prepare()
+        .expect_err("queue addresses missing from kind 1 should reject");
+    assert!(matches!(
+        error,
+        NativeV2MemoryHotplugSnapshotPreparationError::Topology(
+            SnapshotV2MemoryHotplugPreparationError::QueueMemory
+        )
+    ));
+    let diagnostic = format!("{error:?} {error}");
+    assert!(!diagnostic.contains(&state.config_space().addr().to_string()));
+    assert!(!diagnostic.contains("BANGME2"));
 }
 
 #[cfg(target_os = "macos")]
@@ -3382,13 +3486,38 @@ fn test_v2_memory() -> GuestMemory {
 
 #[cfg(target_os = "macos")]
 fn test_v2_memory_with_hotplug(state: &SnapshotV2MemoryHotplugState) -> GuestMemory {
-    let mut ranges = vec![
+    let mut ranges = Vec::new();
+    if let Some(queue) = state.virtio().queues().first()
+        && let Some(queue_ranges) = crate::snapshot_device_v2_5::queue_ranges(queue)
+            .expect("fixture queue ranges should validate")
+    {
+        let alignment = 4 * aarch64::GUEST_PAGE_SIZE;
+        let start = queue_ranges
+            .iter()
+            .map(|range| range.start().raw_value())
+            .min()
+            .expect("active queue should have ranges")
+            & !(alignment - 1);
+        let end = queue_ranges
+            .iter()
+            .map(|range| range.end_exclusive().raw_value())
+            .max()
+            .expect("active queue should have ranges")
+            .checked_add(alignment - 1)
+            .expect("fixture queue end should fit")
+            & !(alignment - 1);
+        ranges.push(
+            GuestMemoryRange::new(GuestAddress::new(start), end - start)
+                .expect("queue base-memory fixture should validate"),
+        );
+    }
+    ranges.push(
         GuestMemoryRange::new(
             GuestAddress::new(aarch64::DRAM_MEM_START),
             u64::try_from(TEST_MEMORY_BYTES).expect("fixture size should fit u64"),
         )
         .expect("native-v2 fixture range should be valid"),
-    ];
+    );
     let config_space = state.config_space();
     for plugged in state.plugged_ranges() {
         let offset = plugged
@@ -3408,8 +3537,36 @@ fn test_v2_memory_with_hotplug(state: &SnapshotV2MemoryHotplugState) -> GuestMem
                 .expect("fixture plugged range should validate"),
         );
     }
+    ranges.sort_by_key(|range| range.start());
     let layout = GuestMemoryLayout::new(ranges).expect("hotplug fixture layout should validate");
     GuestMemory::allocate(&layout).expect("hotplug fixture memory should allocate")
+}
+
+#[cfg(target_os = "macos")]
+fn test_v2_memory_with_hotplug_data_only(state: &SnapshotV2MemoryHotplugState) -> GuestMemory {
+    let config_space = state.config_space();
+    let ranges = state
+        .plugged_ranges()
+        .map(|plugged| {
+            let offset = plugged
+                .start_block()
+                .checked_mul(config_space.block_size())
+                .expect("fixture plugged offset should fit");
+            let start = config_space
+                .addr()
+                .checked_add(offset)
+                .expect("fixture plugged start should fit");
+            let length = plugged
+                .block_count()
+                .checked_mul(config_space.block_size())
+                .expect("fixture plugged length should fit");
+            GuestMemoryRange::new(GuestAddress::new(start), length)
+                .expect("fixture plugged range should validate")
+        })
+        .collect::<Vec<_>>();
+    let layout =
+        GuestMemoryLayout::new(ranges).expect("dynamic-only fixture layout should validate");
+    GuestMemory::allocate(&layout).expect("dynamic-only fixture memory should allocate")
 }
 
 #[cfg(target_os = "macos")]

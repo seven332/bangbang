@@ -57,7 +57,8 @@ use crate::snapshot_memory::{
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory::{load_snapshot_memory_image, verify_snapshot_memory_image_output};
 use crate::snapshot_memory_hotplug_v2_10::{
-    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, SnapshotV2MemoryHotplugBindingError,
+    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2MemoryHotplugTopology,
+    SnapshotV2MemoryHotplugBindingError, SnapshotV2MemoryHotplugPreparationError,
     SnapshotV2MemoryHotplugState, SnapshotV2MemoryHotplugStateDecodeError,
 };
 use crate::snapshot_memory_v2::{
@@ -940,6 +941,171 @@ pub type NativeV2MemoryHotplugSnapshotCandidateParts = (
     Option<SnapshotV2MemoryHotplugState>,
 );
 
+/// Prepared exact-2.10 artifact outcome before memory mapping.
+pub enum NativeV2MemoryHotplugSnapshotPreparation {
+    /// The original exact candidate has no kind-11 component and remains on
+    /// its compatible internal path unchanged.
+    Compatible(NativeV2MemoryHotplugSnapshotCandidateState),
+    /// The memory-bearing candidate has a closed owner-free virtio-mem
+    /// topology.
+    Prepared(PreparedNativeV2MemoryHotplugSnapshotCandidateState),
+}
+
+impl NativeV2MemoryHotplugSnapshotPreparation {
+    /// Returns the unchanged compatible candidate when kind 11 was absent.
+    pub const fn compatible(&self) -> Option<&NativeV2MemoryHotplugSnapshotCandidateState> {
+        match self {
+            Self::Compatible(candidate) => Some(candidate),
+            Self::Prepared(_) => None,
+        }
+    }
+
+    /// Returns the prepared memory-bearing candidate when kind 11 was present.
+    pub const fn prepared(&self) -> Option<&PreparedNativeV2MemoryHotplugSnapshotCandidateState> {
+        match self {
+            Self::Compatible(_) => None,
+            Self::Prepared(candidate) => Some(candidate),
+        }
+    }
+}
+
+impl fmt::Debug for NativeV2MemoryHotplugSnapshotPreparation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let outcome = match self {
+            Self::Compatible(_) => "compatible",
+            Self::Prepared(_) => "prepared",
+        };
+        formatter
+            .debug_struct("NativeV2MemoryHotplugSnapshotPreparation")
+            .field("outcome", &outcome)
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// One memory-bearing exact-2.10 candidate with prepared topology.
+///
+/// The candidate keeps all components from the same immutable encoded state.
+/// It owns no opened memory image, mapping, host resource, device, or platform
+/// VM authority.
+pub struct PreparedNativeV2MemoryHotplugSnapshotCandidateState {
+    bytes: Vec<u8>,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+    balloon: Option<SnapshotV2BalloonState>,
+    topology: PreparedSnapshotV2MemoryHotplugTopology,
+}
+
+/// Owned exact components of one prepared memory-bearing 2.10 candidate.
+pub type PreparedNativeV2MemoryHotplugSnapshotCandidateParts = (
+    Vec<u8>,
+    Option<SnapshotV2StorageDeviceGraph>,
+    SnapshotV2SerialState,
+    Option<SnapshotV2EntropyState>,
+    Option<SnapshotV2BalloonState>,
+    PreparedSnapshotV2MemoryHotplugTopology,
+);
+
+impl PreparedNativeV2MemoryHotplugSnapshotCandidateState {
+    /// Returns the exact candidate compatibility version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+    }
+
+    /// Returns the unchanged immutable encoded state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the exact binding attached to the prepared extent partition.
+    pub const fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
+        self.topology.memory().binding()
+    }
+
+    /// Returns the optional unchanged profile-3 storage graph.
+    pub const fn device_graph(&self) -> Option<&SnapshotV2StorageDeviceGraph> {
+        self.device_graph.as_ref()
+    }
+
+    /// Returns the required unchanged exact-2.7 serial state.
+    pub const fn serial(&self) -> &SnapshotV2SerialState {
+        &self.serial
+    }
+
+    /// Returns the optional unchanged exact-2.8 entropy state.
+    pub const fn entropy(&self) -> Option<&SnapshotV2EntropyState> {
+        self.entropy.as_ref()
+    }
+
+    /// Returns the optional unchanged exact-2.9 balloon state.
+    pub const fn balloon(&self) -> Option<&SnapshotV2BalloonState> {
+        self.balloon.as_ref()
+    }
+
+    /// Returns the closed owner-free kind-1/kind-11 topology.
+    pub const fn topology(&self) -> &PreparedSnapshotV2MemoryHotplugTopology {
+        &self.topology
+    }
+
+    /// Consumes the candidate into its exact still-detached components.
+    pub fn into_parts(self) -> PreparedNativeV2MemoryHotplugSnapshotCandidateParts {
+        (
+            self.bytes,
+            self.device_graph,
+            self.serial,
+            self.entropy,
+            self.balloon,
+            self.topology,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedNativeV2MemoryHotplugSnapshotCandidateState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedNativeV2MemoryHotplugSnapshotCandidateState")
+            .field("version", &self.version())
+            .field("has_storage", &self.device_graph.is_some())
+            .field("has_entropy", &self.entropy.is_some())
+            .field("has_balloon", &self.balloon.is_some())
+            .field("state", &REDACTED)
+            .field("memory_topology", &REDACTED)
+            .field("serial", &REDACTED)
+            .finish()
+    }
+}
+
+/// Failure while preparing one exact-2.10 artifact candidate.
+pub enum NativeV2MemoryHotplugSnapshotPreparationError {
+    /// The closed kind-1/kind-11 topology could not be prepared.
+    Topology(SnapshotV2MemoryHotplugPreparationError),
+}
+
+impl fmt::Debug for NativeV2MemoryHotplugSnapshotPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for NativeV2MemoryHotplugSnapshotPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Topology(_) => {
+                formatter.write_str("native-v2 virtio-mem artifact topology is invalid")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV2MemoryHotplugSnapshotPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Topology(source) => Some(source),
+        }
+    }
+}
+
 impl NativeV2MemoryHotplugSnapshotCandidateState {
     /// Validates and retains one exact native-v2 2.10 state.
     pub fn from_memory_hotplug_state_v2_10(
@@ -996,6 +1162,45 @@ impl NativeV2MemoryHotplugSnapshotCandidateState {
     /// Returns the optional exact-2.10 virtio-mem state.
     pub const fn memory_hotplug(&self) -> Option<&SnapshotV2MemoryHotplugState> {
         self.memory_hotplug.as_ref()
+    }
+
+    /// Prepares kind-11 topology or preserves this candidate unchanged when
+    /// kind 11 is absent.
+    pub fn prepare(
+        self,
+    ) -> Result<
+        NativeV2MemoryHotplugSnapshotPreparation,
+        NativeV2MemoryHotplugSnapshotPreparationError,
+    > {
+        if self.memory_hotplug.is_none() {
+            return Ok(NativeV2MemoryHotplugSnapshotPreparation::Compatible(self));
+        }
+
+        let Self {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+        } = self;
+        let state =
+            memory_hotplug.ok_or(NativeV2MemoryHotplugSnapshotPreparationError::Topology(
+                SnapshotV2MemoryHotplugPreparationError::InvalidState,
+            ))?;
+        let topology = PreparedSnapshotV2MemoryHotplugTopology::prepare(state, binding)
+            .map_err(NativeV2MemoryHotplugSnapshotPreparationError::Topology)?;
+        Ok(NativeV2MemoryHotplugSnapshotPreparation::Prepared(
+            PreparedNativeV2MemoryHotplugSnapshotCandidateState {
+                bytes,
+                device_graph,
+                serial,
+                entropy,
+                balloon,
+                topology,
+            },
+        ))
     }
 
     /// Consumes the candidate into its exact committed components.

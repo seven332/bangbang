@@ -9,12 +9,12 @@ use std::fmt;
 use std::iter::FusedIterator;
 
 use crate::interrupt::GuestInterruptLine;
-use crate::memory::{GuestMemoryRange, aarch64};
+use crate::memory::{GuestAddress, GuestMemoryRange, aarch64};
 use crate::memory_hotplug::{
-    MemoryHotplugConfig, MemoryHotplugConfigInput, VIRTIO_FEATURE_VERSION_1,
-    VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_DEVICE_ID, VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE,
-    VIRTIO_MEM_QUEUE_SIZE, VirtioMemConfigSpace, VirtioMemDeviceCaptureState,
-    VirtioMemMmioCaptureState, VirtioMemPciCaptureState,
+    MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
+    VIRTIO_FEATURE_VERSION_1, VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_DEVICE_ID,
+    VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE, VIRTIO_MEM_QUEUE_SIZE, VirtioMemConfigSpace,
+    VirtioMemDeviceCaptureState, VirtioMemMmioCaptureState, VirtioMemPciCaptureState,
 };
 use crate::mmio::MmioRegion;
 use crate::pci::PciSbdf;
@@ -27,7 +27,7 @@ use crate::snapshot_device_v2_5::{
     queue_ranges, validate_mmio, validate_pci, validate_virtio_with_queue_size,
 };
 use crate::snapshot_format::SnapshotFormatVersion;
-use crate::snapshot_memory_v2::SnapshotV2MemoryBinding;
+use crate::snapshot_memory_v2::{SnapshotV2MemoryBinding, SnapshotV2MemoryExtent};
 use crate::storage_capture::StorageDeviceOrigin;
 
 mod codec;
@@ -222,6 +222,215 @@ impl fmt::Debug for SnapshotV2MemoryHotplugPluggedRanges<'_> {
         formatter
             .debug_struct("SnapshotV2MemoryHotplugPluggedRanges")
             .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Destination ownership class of one exact kind-1 memory extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2MemoryHotplugExtentClass {
+    /// Memory outside the virtio-mem aperture, retained as base RAM.
+    Base,
+    /// Plugged memory inside the virtio-mem aperture.
+    Dynamic,
+}
+
+/// Immutable classified view of one original ordered kind-1 extent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotV2MemoryHotplugClassifiedExtent {
+    extent: SnapshotV2MemoryExtent,
+    class: SnapshotV2MemoryHotplugExtentClass,
+}
+
+impl SnapshotV2MemoryHotplugClassifiedExtent {
+    /// Returns the unchanged original GPA and file-offset record.
+    pub const fn extent(self) -> SnapshotV2MemoryExtent {
+        self.extent
+    }
+
+    /// Returns whether the original extent is base or dynamic memory.
+    pub const fn class(self) -> SnapshotV2MemoryHotplugExtentClass {
+        self.class
+    }
+}
+
+impl fmt::Debug for SnapshotV2MemoryHotplugClassifiedExtent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotV2MemoryHotplugClassifiedExtent")
+            .field("class", &self.class)
+            .field("extent", &REDACTED)
+            .finish()
+    }
+}
+
+/// Checked controller values retained before destination owner construction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotV2MemoryHotplugControllerProjection {
+    config: MemoryHotplugConfig,
+    requested_size_mib: u64,
+}
+
+impl SnapshotV2MemoryHotplugControllerProjection {
+    /// Returns the validated external virtio-mem configuration.
+    pub const fn config(self) -> MemoryHotplugConfig {
+        self.config
+    }
+
+    /// Returns the validated requested size in MiB.
+    pub const fn requested_size_mib(self) -> u64 {
+        self.requested_size_mib
+    }
+}
+
+impl fmt::Debug for SnapshotV2MemoryHotplugControllerProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotV2MemoryHotplugControllerProjection")
+            .field("controller", &REDACTED)
+            .finish()
+    }
+}
+
+/// Original kind-1 binding and its cardinality-locked extent partition.
+///
+/// This value keeps the private classification vector attached to the exact
+/// binding so callers cannot recombine tags with a different image.
+#[derive(PartialEq, Eq)]
+pub struct PreparedSnapshotV2MemoryHotplugMemory {
+    binding: SnapshotV2MemoryBinding,
+    extent_classes: Vec<SnapshotV2MemoryHotplugExtentClass>,
+}
+
+impl PreparedSnapshotV2MemoryHotplugMemory {
+    /// Returns the unchanged exact state/image binding.
+    pub const fn binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.binding
+    }
+
+    /// Returns the number of original ordered extents.
+    pub fn extent_count(&self) -> usize {
+        self.extent_classes.len()
+    }
+
+    /// Iterates over original extents paired with their immutable class.
+    pub fn classified_extents(
+        &self,
+    ) -> impl ExactSizeIterator<Item = SnapshotV2MemoryHotplugClassifiedExtent> + '_ {
+        self.binding
+            .extents()
+            .iter()
+            .copied()
+            .zip(self.extent_classes.iter().copied())
+            .map(|(extent, class)| SnapshotV2MemoryHotplugClassifiedExtent { extent, class })
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2MemoryHotplugMemory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2MemoryHotplugMemory")
+            .field("version", &self.binding.version())
+            .field("extent_count", &self.extent_classes.len())
+            .field("binding", &REDACTED)
+            .finish()
+    }
+}
+
+/// Owned parts of one prepared exact-2.10 virtio-mem topology.
+pub type PreparedSnapshotV2MemoryHotplugTopologyParts = (
+    PreparedSnapshotV2MemoryHotplugMemory,
+    Vec<GuestMemoryRange>,
+    Option<[GuestMemoryRange; 3]>,
+    SnapshotV2MemoryHotplugState,
+    SnapshotV2MemoryHotplugControllerProjection,
+);
+
+/// Immutable owner-free exact-2.10 virtio-mem topology.
+///
+/// The value contains only checked snapshot facts. It owns no guest mapping,
+/// memory descriptor, device, notifier, interrupt, platform slot, or VM
+/// authority.
+#[derive(PartialEq, Eq)]
+pub struct PreparedSnapshotV2MemoryHotplugTopology {
+    memory: PreparedSnapshotV2MemoryHotplugMemory,
+    plugged_ranges: Vec<GuestMemoryRange>,
+    queue_ranges: Option<[GuestMemoryRange; 3]>,
+    state: SnapshotV2MemoryHotplugState,
+    controller: SnapshotV2MemoryHotplugControllerProjection,
+}
+
+impl PreparedSnapshotV2MemoryHotplugTopology {
+    /// Validates and prepares one closed kind-1/kind-11 state pair.
+    pub fn prepare(
+        state: SnapshotV2MemoryHotplugState,
+        binding: SnapshotV2MemoryBinding,
+    ) -> Result<Self, SnapshotV2MemoryHotplugPreparationError> {
+        prepare_memory_hotplug_topology(state, binding, TopologyReservePolicy::System)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_with_extent_class_allocation_failure(
+        state: SnapshotV2MemoryHotplugState,
+        binding: SnapshotV2MemoryBinding,
+    ) -> Result<Self, SnapshotV2MemoryHotplugPreparationError> {
+        prepare_memory_hotplug_topology(state, binding, TopologyReservePolicy::FailExtentClasses)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_with_plugged_range_allocation_failure(
+        state: SnapshotV2MemoryHotplugState,
+        binding: SnapshotV2MemoryBinding,
+    ) -> Result<Self, SnapshotV2MemoryHotplugPreparationError> {
+        prepare_memory_hotplug_topology(state, binding, TopologyReservePolicy::FailPluggedRanges)
+    }
+
+    /// Returns the exact binding and attached extent classification.
+    pub const fn memory(&self) -> &PreparedSnapshotV2MemoryHotplugMemory {
+        &self.memory
+    }
+
+    /// Returns canonical maximal plugged GPA regions.
+    pub fn plugged_ranges(&self) -> &[GuestMemoryRange] {
+        &self.plugged_ranges
+    }
+
+    /// Returns descriptor, available-ring, and used-ring GPA ranges.
+    pub const fn queue_ranges(&self) -> Option<[GuestMemoryRange; 3]> {
+        self.queue_ranges
+    }
+
+    /// Returns the complete typed device and transport continuation.
+    pub const fn state(&self) -> &SnapshotV2MemoryHotplugState {
+        &self.state
+    }
+
+    /// Returns the checked controller configuration and requested size.
+    pub const fn controller(&self) -> SnapshotV2MemoryHotplugControllerProjection {
+        self.controller
+    }
+
+    /// Consumes the topology into its still-detached prepared parts.
+    pub fn into_parts(self) -> PreparedSnapshotV2MemoryHotplugTopologyParts {
+        (
+            self.memory,
+            self.plugged_ranges,
+            self.queue_ranges,
+            self.state,
+            self.controller,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2MemoryHotplugTopology {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2MemoryHotplugTopology")
+            .field("version", &self.state.compatibility_version())
+            .field("extent_count", &self.memory.extent_count())
+            .field("plugged_range_count", &self.plugged_ranges.len())
+            .field("has_queue_ranges", &self.queue_ranges.is_some())
+            .field("topology", &REDACTED)
             .finish()
     }
 }
@@ -736,6 +945,238 @@ fn count_ranges(bitmap: &[u8], block_count: usize) -> usize {
                 && (*index == 0 || !bitmap_bit(bitmap, index.saturating_sub(1)))
         })
         .count()
+}
+
+#[derive(Clone, Copy)]
+enum TopologyReservePolicy {
+    System,
+    #[cfg(test)]
+    FailExtentClasses,
+    #[cfg(test)]
+    FailPluggedRanges,
+}
+
+impl TopologyReservePolicy {
+    fn reserve_extent_classes(
+        self,
+        classes: &mut Vec<SnapshotV2MemoryHotplugExtentClass>,
+        count: usize,
+    ) -> Result<(), SnapshotV2MemoryHotplugPreparationError> {
+        #[cfg(test)]
+        if matches!(self, Self::FailExtentClasses) {
+            return Err(SnapshotV2MemoryHotplugPreparationError::Allocation);
+        }
+        classes
+            .try_reserve_exact(count)
+            .map_err(|_| SnapshotV2MemoryHotplugPreparationError::Allocation)
+    }
+
+    fn reserve_plugged_ranges(
+        self,
+        ranges: &mut Vec<GuestMemoryRange>,
+        count: usize,
+    ) -> Result<(), SnapshotV2MemoryHotplugPreparationError> {
+        #[cfg(test)]
+        if matches!(self, Self::FailPluggedRanges) {
+            return Err(SnapshotV2MemoryHotplugPreparationError::Allocation);
+        }
+        ranges
+            .try_reserve_exact(count)
+            .map_err(|_| SnapshotV2MemoryHotplugPreparationError::Allocation)
+    }
+}
+
+fn prepare_memory_hotplug_topology(
+    state: SnapshotV2MemoryHotplugState,
+    binding: SnapshotV2MemoryBinding,
+    reserve_policy: TopologyReservePolicy,
+) -> Result<PreparedSnapshotV2MemoryHotplugTopology, SnapshotV2MemoryHotplugPreparationError> {
+    validate_memory_hotplug_state(&state)
+        .map_err(|_| SnapshotV2MemoryHotplugPreparationError::InvalidState)?;
+    state
+        .validate_memory_binding(&binding)
+        .map_err(SnapshotV2MemoryHotplugPreparationError::Binding)?;
+
+    let config_space = state.config_space();
+    let aperture = GuestMemoryRange::new(
+        GuestAddress::new(config_space.addr()),
+        config_space.region_size(),
+    )
+    .map_err(|_| SnapshotV2MemoryHotplugPreparationError::Aperture)?;
+    let queue = state
+        .virtio()
+        .queues()
+        .first()
+        .ok_or(SnapshotV2MemoryHotplugPreparationError::InvalidState)?;
+    let restored_queue_ranges =
+        queue_ranges(queue).map_err(|_| SnapshotV2MemoryHotplugPreparationError::Queue)?;
+    if let Some(ranges) = restored_queue_ranges {
+        for range in ranges {
+            validate_prepared_queue_range(&state, &binding, aperture, range)?;
+        }
+    }
+
+    let requested_size = config_space.requested_size();
+    if !requested_size.is_multiple_of(MIB) {
+        return Err(SnapshotV2MemoryHotplugPreparationError::Controller);
+    }
+    let requested_size_mib = requested_size / MIB;
+    if requested_size_mib.checked_mul(MIB) != Some(requested_size) {
+        return Err(SnapshotV2MemoryHotplugPreparationError::Controller);
+    }
+    let update = state
+        .config()
+        .validate_size_update(MemoryHotplugSizeUpdateInput::new(requested_size_mib))
+        .map_err(|_| SnapshotV2MemoryHotplugPreparationError::Controller)?;
+    if update.requested_size() != requested_size {
+        return Err(SnapshotV2MemoryHotplugPreparationError::Controller);
+    }
+    let controller = SnapshotV2MemoryHotplugControllerProjection {
+        config: state.config(),
+        requested_size_mib,
+    };
+
+    let mut extent_classes = Vec::new();
+    reserve_policy.reserve_extent_classes(&mut extent_classes, binding.extents().len())?;
+    for extent in binding.extents() {
+        let class = if range_is_wholly_contained(aperture, extent.range()) {
+            SnapshotV2MemoryHotplugExtentClass::Dynamic
+        } else {
+            SnapshotV2MemoryHotplugExtentClass::Base
+        };
+        extent_classes.push(class);
+    }
+
+    let plugged_range_count = state.plugged_ranges().len();
+    let mut plugged_ranges = Vec::new();
+    reserve_policy.reserve_plugged_ranges(&mut plugged_ranges, plugged_range_count)?;
+    for plugged in state.plugged_ranges() {
+        plugged_ranges.push(plugged_guest_range(config_space, plugged)?);
+    }
+
+    debug_assert_eq!(binding.extents().len(), extent_classes.len());
+    debug_assert_eq!(plugged_range_count, plugged_ranges.len());
+
+    Ok(PreparedSnapshotV2MemoryHotplugTopology {
+        memory: PreparedSnapshotV2MemoryHotplugMemory {
+            binding,
+            extent_classes,
+        },
+        plugged_ranges,
+        queue_ranges: restored_queue_ranges,
+        state,
+        controller,
+    })
+}
+
+fn validate_prepared_queue_range(
+    state: &SnapshotV2MemoryHotplugState,
+    binding: &SnapshotV2MemoryBinding,
+    aperture: GuestMemoryRange,
+    queue_range: GuestMemoryRange,
+) -> Result<(), SnapshotV2MemoryHotplugPreparationError> {
+    if queue_range.overlaps(aperture) {
+        if !range_is_wholly_contained(aperture, queue_range) {
+            return Err(SnapshotV2MemoryHotplugPreparationError::QueueBoundary);
+        }
+        for plugged in state.plugged_ranges() {
+            let plugged_range = plugged_guest_range(state.config_space(), plugged)?;
+            if range_is_wholly_contained(plugged_range, queue_range) {
+                return Ok(());
+            }
+        }
+        return Err(SnapshotV2MemoryHotplugPreparationError::QueueMemory);
+    }
+
+    if binding.extents().iter().any(|extent| {
+        !extent.range().overlaps(aperture) && range_is_wholly_contained(extent.range(), queue_range)
+    }) {
+        Ok(())
+    } else {
+        Err(SnapshotV2MemoryHotplugPreparationError::QueueMemory)
+    }
+}
+
+fn plugged_guest_range(
+    config_space: VirtioMemConfigSpace,
+    plugged: SnapshotV2MemoryHotplugPluggedRange,
+) -> Result<GuestMemoryRange, SnapshotV2MemoryHotplugPreparationError> {
+    let offset = plugged
+        .start_block()
+        .checked_mul(config_space.block_size())
+        .ok_or(SnapshotV2MemoryHotplugPreparationError::Aperture)?;
+    let length = plugged
+        .block_count()
+        .checked_mul(config_space.block_size())
+        .ok_or(SnapshotV2MemoryHotplugPreparationError::Aperture)?;
+    let start = config_space
+        .addr()
+        .checked_add(offset)
+        .ok_or(SnapshotV2MemoryHotplugPreparationError::Aperture)?;
+    GuestMemoryRange::new(GuestAddress::new(start), length)
+        .map_err(|_| SnapshotV2MemoryHotplugPreparationError::Aperture)
+}
+
+const fn range_is_wholly_contained(outer: GuestMemoryRange, inner: GuestMemoryRange) -> bool {
+    outer.start().raw_value() <= inner.start().raw_value()
+        && inner.end_exclusive().raw_value() <= outer.end_exclusive().raw_value()
+}
+
+/// Failure while preparing owner-free exact-2.10 virtio-mem topology.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2MemoryHotplugPreparationError {
+    /// The retained typed state no longer satisfies its exact profile.
+    InvalidState,
+    /// Kind-1 memory and kind 11 do not form one closed topology.
+    Binding(SnapshotV2MemoryHotplugBindingError),
+    /// The checked aperture or plugged GPA projection is invalid.
+    Aperture,
+    /// Queue range derivation failed.
+    Queue,
+    /// A queue range crosses the virtio-mem aperture boundary.
+    QueueBoundary,
+    /// A queue range is not contained by one planned destination region.
+    QueueMemory,
+    /// Controller requested-size projection is invalid.
+    Controller,
+    /// Bounded topology metadata could not be reserved.
+    Allocation,
+}
+
+impl fmt::Debug for SnapshotV2MemoryHotplugPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2MemoryHotplugPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidState => "native-v2 virtio-mem preparation state is invalid",
+            Self::Binding(_) => "native-v2 virtio-mem preparation binding is invalid",
+            Self::Aperture => "native-v2 virtio-mem preparation aperture is invalid",
+            Self::Queue => "native-v2 virtio-mem preparation queue is invalid",
+            Self::QueueBoundary => "native-v2 virtio-mem preparation queue crosses the aperture",
+            Self::QueueMemory => "native-v2 virtio-mem preparation queue memory is invalid",
+            Self::Controller => "native-v2 virtio-mem preparation controller state is invalid",
+            Self::Allocation => "native-v2 virtio-mem preparation allocation failed",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2MemoryHotplugPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Binding(source) => Some(source),
+            Self::InvalidState
+            | Self::Aperture
+            | Self::Queue
+            | Self::QueueBoundary
+            | Self::QueueMemory
+            | Self::Controller
+            | Self::Allocation => None,
+        }
+    }
 }
 
 /// Failure while closing exact-2.10 kind-1 memory extents against kind 11.
