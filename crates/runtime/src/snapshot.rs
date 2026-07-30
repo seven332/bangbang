@@ -11,10 +11,62 @@ use crate::entropy::EntropyConfig;
 use crate::machine::MachineConfig;
 use crate::pmem::PmemConfigs;
 use crate::serial::SerialConfig;
+use crate::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugControllerProjection;
 use crate::storage_capture::CaptureReadyStorageConfigs;
 use crate::vsock::{VsockBackendSelector, VsockBackendSelectorError};
 
 const REDACTED: &str = "<redacted>";
+
+type SnapshotV2ControllerCommitParts = (
+    MachineConfig,
+    BootSourceConfig,
+    DriveConfigs,
+    PmemConfigs,
+    SerialConfig,
+    Option<EntropyConfig>,
+    Option<BalloonConfig>,
+    Option<SnapshotV2MemoryHotplugControllerProjection>,
+    bool,
+);
+
+/// Complete exact-2.10 device configuration retained for one atomic
+/// controller commit.
+#[doc(hidden)]
+pub struct SnapshotV2ControllerCommitProductConfigs {
+    storage_configs: Option<CaptureReadyStorageConfigs>,
+    serial_config: SerialConfig,
+    entropy_config: Option<EntropyConfig>,
+    balloon_config: Option<BalloonConfig>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
+}
+
+impl SnapshotV2ControllerCommitProductConfigs {
+    /// Joins all exact-2.10 device configurations before controller commit.
+    pub fn new(
+        storage_configs: Option<CaptureReadyStorageConfigs>,
+        serial_config: SerialConfig,
+        entropy_config: Option<EntropyConfig>,
+        balloon_config: Option<BalloonConfig>,
+        memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
+    ) -> Self {
+        Self {
+            storage_configs,
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug,
+        }
+    }
+}
+
+impl fmt::Debug for SnapshotV2ControllerCommitProductConfigs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotV2ControllerCommitProductConfigs")
+            .field("configuration", &REDACTED)
+            .finish()
+    }
+}
 
 /// Preallocated controller state committed only after native-v1 restore success.
 pub struct SnapshotV1ControllerCommit {
@@ -71,6 +123,7 @@ pub struct SnapshotV2ControllerCommit {
     serial_config: SerialConfig,
     entropy_config: Option<EntropyConfig>,
     balloon_config: Option<BalloonConfig>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
     resume_requested: bool,
 }
 
@@ -89,6 +142,7 @@ impl SnapshotV2ControllerCommit {
             serial_config: SerialConfig::default(),
             entropy_config: None,
             balloon_config: None,
+            memory_hotplug: None,
             resume_requested,
         }
     }
@@ -109,6 +163,7 @@ impl SnapshotV2ControllerCommit {
             serial_config: SerialConfig::default(),
             entropy_config: None,
             balloon_config: None,
+            memory_hotplug: None,
             resume_requested,
         })
     }
@@ -130,6 +185,7 @@ impl SnapshotV2ControllerCommit {
             serial_config: SerialConfig::default(),
             entropy_config: None,
             balloon_config: None,
+            memory_hotplug: None,
             resume_requested,
         }
     }
@@ -152,6 +208,7 @@ impl SnapshotV2ControllerCommit {
             serial_config: SerialConfig::default(),
             entropy_config: None,
             balloon_config: None,
+            memory_hotplug: None,
             resume_requested,
         }
     }
@@ -172,6 +229,7 @@ impl SnapshotV2ControllerCommit {
             serial_config,
             entropy_config: None,
             balloon_config: None,
+            memory_hotplug: None,
             resume_requested,
         }
     }
@@ -195,6 +253,7 @@ impl SnapshotV2ControllerCommit {
             serial_config,
             entropy_config: None,
             balloon_config: None,
+            memory_hotplug: None,
             resume_requested,
         }
     }
@@ -221,6 +280,7 @@ impl SnapshotV2ControllerCommit {
             serial_config,
             entropy_config,
             balloon_config: None,
+            memory_hotplug: None,
             resume_requested,
         }
     }
@@ -248,6 +308,39 @@ impl SnapshotV2ControllerCommit {
             serial_config,
             entropy_config,
             balloon_config,
+            memory_hotplug: None,
+            resume_requested,
+        }
+    }
+
+    /// Retains exact-2.10 serial, optional storage, entropy, balloon, and
+    /// virtio-mem controller state as one atomic destination value.
+    #[doc(hidden)]
+    pub fn with_serial_storage_entropy_balloon_and_memory_hotplug_configs(
+        machine_config: MachineConfig,
+        boot_source_config: BootSourceConfig,
+        configs: SnapshotV2ControllerCommitProductConfigs,
+        resume_requested: bool,
+    ) -> Self {
+        let SnapshotV2ControllerCommitProductConfigs {
+            storage_configs,
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug,
+        } = configs;
+        let (drive_configs, pmem_configs) = storage_configs
+            .map(CaptureReadyStorageConfigs::into_parts)
+            .unwrap_or_default();
+        Self {
+            machine_config,
+            boot_source_config,
+            drive_configs: DriveConfigs::from_validated(drive_configs),
+            pmem_configs: PmemConfigs::from_validated(pmem_configs),
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug,
             resume_requested,
         }
     }
@@ -256,18 +349,7 @@ impl SnapshotV2ControllerCommit {
         self.resume_requested
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        MachineConfig,
-        BootSourceConfig,
-        DriveConfigs,
-        PmemConfigs,
-        SerialConfig,
-        Option<EntropyConfig>,
-        Option<BalloonConfig>,
-        bool,
-    ) {
+    pub(crate) fn into_parts(self) -> SnapshotV2ControllerCommitParts {
         (
             self.machine_config,
             self.boot_source_config,
@@ -276,6 +358,7 @@ impl SnapshotV2ControllerCommit {
             self.serial_config,
             self.entropy_config,
             self.balloon_config,
+            self.memory_hotplug,
             self.resume_requested,
         )
     }

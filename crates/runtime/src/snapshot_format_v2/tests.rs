@@ -207,7 +207,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn current_writer_stays_at_balloon_nine_while_internal_ceiling_reaches_memory_hotplug_ten() {
+fn current_writer_activates_memory_hotplug_ten_while_earlier_revisions_remain_stable() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -216,7 +216,7 @@ fn current_writer_stays_at_balloon_nine_while_internal_ceiling_reaches_memory_ho
     );
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
-        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
     );
     assert_eq!(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY.kind(), 11);
     assert_eq!(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY.instance(), 0);
@@ -245,8 +245,8 @@ fn current_writer_stays_at_balloon_nine_while_internal_ceiling_reaches_memory_ho
         SnapshotFormatVersion::new(2, 8, 0)
     );
     assert_eq!(
-        NATIVE_V2_SNAPSHOT_VERSION,
-        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
+        NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+        SnapshotFormatVersion::new(2, 9, 0)
     );
 
     let graph = SnapshotV2Component::new(
@@ -507,18 +507,15 @@ fn current_writer_stays_at_balloon_nine_while_internal_ceiling_reaches_memory_ho
         decoded_memory_hotplug.component(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY),
         Some(memory_hotplug)
     );
-    assert!(matches!(
-        decode_snapshot_v2_state(&memory_hotplug_state),
-        Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found,
-            supported: NATIVE_V2_SNAPSHOT_VERSION,
-        }) if found == NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
-    ));
+    let public_memory_hotplug = decode_snapshot_v2_state(&memory_hotplug_state)
+        .expect("current public seam should decode exact 2.10");
+    assert_eq!(
+        public_memory_hotplug.metadata().version(),
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+    );
     assert!(matches!(
         decode_native_snapshot_state(&memory_hotplug_state),
-        Err(NativeSnapshotFormatError::NativeV2(
-            SnapshotV2DecodeError::UnsupportedVersion { .. }
-        ))
+        Ok(NativeSnapshotState::V2(_))
     ));
     let downgraded_memory_hotplug =
         with_u16_field_and_checksum(&memory_hotplug_state, VERSION_MINOR_OFFSET, 9);
@@ -603,11 +600,11 @@ fn version_policy_rejects_major_and_newer_minor_but_accepts_patch() {
         })
     );
 
-    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 10);
+    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 11);
     assert_eq!(
         decode_snapshot_v2_state(&minor),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: SnapshotFormatVersion::new(2, 10, 0),
+            found: SnapshotFormatVersion::new(2, 11, 0),
             supported: NATIVE_V2_SNAPSHOT_VERSION,
         })
     );

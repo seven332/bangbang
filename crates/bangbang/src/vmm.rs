@@ -47,7 +47,10 @@ use bangbang_hvf::{
     HvfSnapshotV2EncodeError, HvfSnapshotV2EntropyMmioRestoreError,
     HvfSnapshotV2EntropyPciEndpointPlan, HvfSnapshotV2EntropyPciRestoreError,
     HvfSnapshotV2EntropyState, HvfSnapshotV2MemoryHotplugCaptureState,
-    HvfSnapshotV2MemoryHotplugPlatformState, HvfSnapshotV2MemoryHotplugState,
+    HvfSnapshotV2MemoryHotplugMmioPlatformPlan, HvfSnapshotV2MemoryHotplugMmioProcessConfig,
+    HvfSnapshotV2MemoryHotplugMmioRestoreError, HvfSnapshotV2MemoryHotplugPciPlatformPlan,
+    HvfSnapshotV2MemoryHotplugPciRestoreError, HvfSnapshotV2MemoryHotplugPlatformState,
+    HvfSnapshotV2MemoryHotplugPreparedProduct, HvfSnapshotV2MemoryHotplugState,
     HvfSnapshotV2MultiBlockMmioRestoreError, HvfSnapshotV2MultiBlockPciRestoreError,
     HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockProcessConfig,
     HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2PlatformRestoreError,
@@ -61,19 +64,22 @@ use bangbang_hvf::{
     HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
     PrepareHvfSnapshotV1LoadError, PrepareHvfSnapshotV2BalloonPlatformPlanError,
     PrepareHvfSnapshotV2EntropyPciPlatformPlanError,
+    PrepareHvfSnapshotV2MemoryHotplugPlatformPlanError,
     PrepareHvfSnapshotV2MultiBlockPlatformPlanError, PrepareHvfSnapshotV2RootPlanError,
     PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
     PrepareHvfSnapshotV2StoragePciPlatformPlanError, PreparedHvfArm64BootPciNetworkRemoval,
     PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2Platform,
     decode_hvf_snapshot_v2_balloon_state, decode_hvf_snapshot_v2_entropy_state,
-    decode_hvf_snapshot_v2_multi_block_state, decode_hvf_snapshot_v2_platform_state,
-    decode_hvf_snapshot_v2_serial_state, decode_hvf_snapshot_v2_state,
-    decode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_balloon_state,
-    encode_hvf_snapshot_v2_entropy_state, encode_hvf_snapshot_v2_memory_hotplug_state,
-    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_serial_state,
-    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
-    prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    decode_hvf_snapshot_v2_memory_hotplug_state, decode_hvf_snapshot_v2_multi_block_state,
+    decode_hvf_snapshot_v2_platform_state, decode_hvf_snapshot_v2_serial_state,
+    decode_hvf_snapshot_v2_state, decode_hvf_snapshot_v2_storage_state,
+    encode_hvf_snapshot_v2_balloon_state, encode_hvf_snapshot_v2_entropy_state,
+    encode_hvf_snapshot_v2_memory_hotplug_state, encode_hvf_snapshot_v2_multi_block_state,
+    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
+    encode_hvf_snapshot_v2_storage_state, prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
     prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
+    prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan,
+    prepare_hvf_snapshot_v2_memory_hotplug_pci_platform_plan,
     prepare_hvf_snapshot_v2_multi_block_platform_plan, prepare_hvf_snapshot_v2_root_plan,
     prepare_hvf_snapshot_v2_serial_entropy_pci_platform_plan,
     prepare_hvf_snapshot_v2_storage_entropy_mmio_platform_plan,
@@ -146,7 +152,7 @@ use bangbang_runtime::serial::{
 };
 use bangbang_runtime::snapshot::{
     SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackendType, SnapshotV1ControllerCommit,
-    SnapshotV2ControllerCommit,
+    SnapshotV2ControllerCommit, SnapshotV2ControllerCommitProductConfigs,
 };
 #[cfg(target_os = "macos")]
 use bangbang_runtime::snapshot_artifact::SnapshotStagingTracker;
@@ -154,7 +160,8 @@ use bangbang_runtime::snapshot_artifact::{
     LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactFamily, NativeSnapshotArtifactState,
     NativeSnapshotArtifactStateError, NativeSnapshotPublicationOutcome,
     NativeV2BalloonSnapshotCandidateState, NativeV2EntropySnapshotCandidateState,
-    NativeV2MemoryHotplugSnapshotCandidateState, NativeV2MultiBlockSnapshotCandidateState,
+    NativeV2MemoryHotplugSnapshotCandidateState, NativeV2MemoryHotplugSnapshotPreparation,
+    NativeV2MemoryHotplugSnapshotPreparationError, NativeV2MultiBlockSnapshotCandidateState,
     NativeV2SerialSnapshotCandidateState, NativeV2SnapshotArtifactProfile,
     NativeV2SnapshotCandidateState, NativeV2SnapshotCandidateStateError,
     NativeV2StorageSnapshotCandidateState, PreparedNativeSnapshotState, SnapshotArtifactLoadError,
@@ -200,6 +207,10 @@ use bangbang_runtime::snapshot_format_v2::{
 };
 use bangbang_runtime::snapshot_memory::{
     SnapshotMemoryIoStage, SnapshotMemoryWriteError, write_snapshot_memory_image_with_cancel,
+};
+use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
+    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2MemoryHotplugTopology,
+    SnapshotV2MemoryHotplugControllerProjection,
 };
 use bangbang_runtime::snapshot_memory_v2::{SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError};
 use bangbang_runtime::snapshot_serial_v2_7::{
@@ -361,31 +372,11 @@ pub(crate) struct NativeV2SnapshotPublicationRequest {
     pub(crate) serial_config: SerialConfig,
     pub(crate) entropy_config: Option<EntropyConfig>,
     pub(crate) balloon_config: Option<BalloonConfig>,
+    pub(crate) memory_hotplug_config: Option<MemoryHotplugConfig>,
+    pub(crate) memory_hotplug_requested_size_mib: u64,
     pub(crate) storage_configs: CaptureReadyStorageConfigs,
     pub(crate) expected_transport: SnapshotV2DeviceTransportKind,
     pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
-}
-
-impl NativeV2SnapshotPublicationRequest {
-    const fn new(
-        input: HvfArm64BootSnapshotV2CaptureInput,
-        serial_config: SerialConfig,
-        entropy_config: Option<EntropyConfig>,
-        balloon_config: Option<BalloonConfig>,
-        storage_configs: CaptureReadyStorageConfigs,
-        expected_transport: SnapshotV2DeviceTransportKind,
-        cancellation: NativeV2SnapshotCaptureCancellation,
-    ) -> Self {
-        Self {
-            input,
-            serial_config,
-            entropy_config,
-            balloon_config,
-            storage_configs,
-            expected_transport,
-            cancellation,
-        }
-    }
 }
 
 pub(crate) struct ProcessSnapshotV2RootLoadRequest<'a> {
@@ -456,6 +447,18 @@ pub(crate) struct ProcessSnapshotV2BalloonLoadRequest<'a> {
     pub(crate) pci_enabled: bool,
     pub(crate) input: &'a SnapshotLoadInput,
     pub(crate) candidate: NativeV2BalloonSnapshotCandidateState,
+    pub(crate) memory: GuestMemory,
+    pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
+pub(crate) struct ProcessSnapshotV2MemoryHotplugLoadRequest<'a> {
+    pub(crate) controller: &'a VmmController,
+    pub(crate) vmnet_authority: ProcessVmnetAuthority,
+    #[cfg(target_os = "macos")]
+    pub(crate) contained_restore_authority: Option<&'a ContainedSnapshotRestoreAuthority>,
+    pub(crate) pci_enabled: bool,
+    pub(crate) input: &'a SnapshotLoadInput,
+    pub(crate) candidate: NativeV2MemoryHotplugSnapshotCandidateState,
     pub(crate) memory: GuestMemory,
     pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
 }
@@ -681,6 +684,15 @@ pub(crate) trait InstanceStartExecutor {
         ))
     }
 
+    fn load_prepared_snapshot_v2_memory_hotplug(
+        &mut self,
+        _request: ProcessSnapshotV2MemoryHotplugLoadRequest<'_>,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        Err(NativeV2SnapshotLoadError::ProcessPreparation(
+            BackendError::InvalidState("native-v2 virtio-mem snapshot loading is unavailable"),
+        ))
+    }
+
     fn commit_prepared_snapshot_v2_root_load(
         &mut self,
         _completion: ProcessSnapshotV2RootLoadCompletion,
@@ -845,6 +857,7 @@ struct NativeV2EntropyCandidateProductProfile {
     expected_transport: SnapshotV2DeviceTransportKind,
 }
 
+#[cfg(test)]
 struct NativeV2BalloonCandidateProductProfile {
     input: HvfArm64BootSnapshotV2CaptureInput,
     serial_config: SerialConfig,
@@ -1073,6 +1086,7 @@ impl std::error::Error for NativeV2EntropyCandidateProfileError {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum NativeV2BalloonCandidateProfileError {
     MissingBootSource,
@@ -1085,6 +1099,7 @@ pub(crate) enum NativeV2BalloonCandidateProfileError {
     IncompatibleProcessMode,
 }
 
+#[cfg(test)]
 impl fmt::Display for NativeV2BalloonCandidateProfileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1106,6 +1121,7 @@ impl fmt::Display for NativeV2BalloonCandidateProfileError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for NativeV2BalloonCandidateProfileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -1935,7 +1951,7 @@ pub(crate) enum NativeV1SnapshotPublicationProducerError {
 pub(crate) enum NativeV2SnapshotPublicationError {
     Preflight(VmmActionError),
     CaptureReadyPreflight(SnapshotCaptureReadyPreflightError),
-    Profile(NativeV2BalloonCandidateProfileError),
+    Profile(NativeV2MemoryHotplugCandidateProfileError),
     Resource(GrantClaimError),
     SessionUnavailable,
     ConfigurationUnavailable,
@@ -1960,7 +1976,7 @@ impl fmt::Display for NativeV2SnapshotPublicationError {
             Self::Profile(source) => {
                 write!(
                     formatter,
-                    "native-v2 balloon profile is unsupported: {source}"
+                    "native-v2 virtio-mem profile is unsupported: {source}"
                 )
             }
             Self::Resource(source) => {
@@ -2770,6 +2786,80 @@ impl fmt::Display for NativeV2BalloonDestinationLoadError {
 #[cfg(target_os = "macos")]
 impl std::error::Error for NativeV2BalloonDestinationLoadError {}
 
+#[cfg(target_os = "macos")]
+pub(crate) struct NativeV2MemoryHotplugDestinationLoadError {
+    transport: SnapshotV2DeviceTransportKind,
+    terminal: bool,
+    detail: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeV2MemoryHotplugDestinationLoadError {
+    const fn new(transport: SnapshotV2DeviceTransportKind, terminal: bool) -> Self {
+        Self {
+            transport,
+            terminal,
+            detail: None,
+        }
+    }
+
+    fn with_source(
+        transport: SnapshotV2DeviceTransportKind,
+        terminal: bool,
+        source: &(dyn std::error::Error + 'static),
+    ) -> Self {
+        let mut leaf = source;
+        while let Some(next) = leaf.source() {
+            leaf = next;
+        }
+        Self {
+            transport,
+            terminal,
+            detail: Some(leaf.to_string()),
+        }
+    }
+
+    const fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for NativeV2MemoryHotplugDestinationLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2MemoryHotplugDestinationLoadError")
+            .field("transport", &self.transport)
+            .field("terminal", &self.terminal)
+            .field("has_detail", &self.detail.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for NativeV2MemoryHotplugDestinationLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "native-v2 2.10 {:?} destination transaction failed ({})",
+            self.transport,
+            if self.terminal {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )?;
+        if let Some(detail) = &self.detail {
+            write!(formatter, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for NativeV2MemoryHotplugDestinationLoadError {}
+
 #[allow(
     dead_code,
     reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
@@ -2821,6 +2911,11 @@ pub(crate) enum NativeV2SnapshotLoadError {
     BalloonBundle(SnapshotV2SerialRestoreBundleError),
     #[cfg(target_os = "macos")]
     BalloonDestination(NativeV2BalloonDestinationLoadError),
+    MemoryHotplugPreparation(NativeV2MemoryHotplugSnapshotPreparationError),
+    #[cfg(target_os = "macos")]
+    MemoryHotplugBundle(SnapshotV2SerialRestoreBundleError),
+    #[cfg(target_os = "macos")]
+    MemoryHotplugDestination(NativeV2MemoryHotplugDestinationLoadError),
     AfterResourceAdoption {
         source: Box<NativeV2SnapshotLoadError>,
     },
@@ -2909,6 +3004,12 @@ impl NativeV2SnapshotLoadError {
             }
             #[cfg(target_os = "macos")]
             Self::BalloonDestination(source) => source.is_terminal(),
+            #[cfg(target_os = "macos")]
+            Self::MemoryHotplugBundle(source) => {
+                source.disposition() == SnapshotRestoreResourceDisposition::Terminal
+            }
+            #[cfg(target_os = "macos")]
+            Self::MemoryHotplugDestination(source) => source.is_terminal(),
             Self::Restore(source) => source.is_committed() || !source.cleanup_failures().is_empty(),
             Self::RootRestore(source) => source.is_terminal(),
             Self::Preflight(_)
@@ -2920,6 +3021,7 @@ impl NativeV2SnapshotLoadError {
             | Self::State(_)
             | Self::CandidateFormat(_)
             | Self::CandidateMismatch
+            | Self::MemoryHotplugPreparation(_)
             | Self::Decode(_)
             | Self::RootPlan(_)
             | Self::RootConfiguration(_)
@@ -3059,6 +3161,21 @@ impl fmt::Display for NativeV2SnapshotLoadError {
             }
             #[cfg(target_os = "macos")]
             Self::BalloonDestination(source) => source.fmt(formatter),
+            Self::MemoryHotplugPreparation(source) => {
+                write!(
+                    formatter,
+                    "native-v2 2.10 virtio-mem topology preparation failed: {source}"
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::MemoryHotplugBundle(source) => {
+                write!(
+                    formatter,
+                    "native-v2 2.10 serial resource bundle preparation failed: {source}"
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::MemoryHotplugDestination(source) => source.fmt(formatter),
             Self::AfterResourceAdoption { source } => {
                 write!(
                     formatter,
@@ -3211,6 +3328,11 @@ impl std::error::Error for NativeV2SnapshotLoadError {
             Self::BalloonBundle(source) => Some(source),
             #[cfg(target_os = "macos")]
             Self::BalloonDestination(source) => Some(source),
+            Self::MemoryHotplugPreparation(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::MemoryHotplugBundle(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::MemoryHotplugDestination(source) => Some(source),
             Self::AfterResourceAdoption { source } => Some(source.as_ref()),
             #[cfg(target_os = "macos")]
             Self::RootResourceCleanup { source, .. } => Some(source.as_ref()),
@@ -6788,18 +6910,14 @@ where
             | NativeV2SnapshotArtifactProfile::StorageDeviceGraphV2_6
             | NativeV2SnapshotArtifactProfile::SerialStateV2_7
             | NativeV2SnapshotArtifactProfile::EntropyStateV2_8
-            | NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => {
+            | NativeV2SnapshotArtifactProfile::BalloonStateV2_9
+            | NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10 => {
                 self.starter
                     .preflight_snapshot_v2_root_process(self.pci_enabled)
                     .map_err(NativeV2SnapshotLoadError::Preflight)?;
                 if !self.snapshot_capture_cancellation.begin_operation() {
                     return Err(NativeV2SnapshotLoadError::Cancelled);
                 }
-            }
-            NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10 => {
-                return Err(NativeV2SnapshotLoadError::Preflight(
-                    VmmActionError::SnapshotUnsupported,
-                ));
             }
         }
 
@@ -7081,7 +7199,7 @@ where
             }
             NativeV2SnapshotArtifactProfile::BalloonStateV2_9 => {
                 let (candidate, memory) = artifacts
-                    .into_current_v2_candidate()
+                    .into_v2_9_candidate()
                     .map_err(NativeV2SnapshotLoadError::ArtifactState)
                     .map_err(|source| {
                         if resource_adopted {
@@ -7118,9 +7236,47 @@ where
                 self.started_session = Some(session);
                 Ok(self.controller.commit_snapshot_v2_load(controller_commit))
             }
-            NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10 => Err(
-                NativeV2SnapshotLoadError::Preflight(VmmActionError::SnapshotUnsupported),
-            ),
+            NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10 => {
+                let (candidate, memory) = artifacts
+                    .into_current_v2_candidate()
+                    .map_err(NativeV2SnapshotLoadError::ArtifactState)
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let restored = self
+                    .starter
+                    .load_prepared_snapshot_v2_memory_hotplug(
+                        ProcessSnapshotV2MemoryHotplugLoadRequest {
+                            controller: &self.controller,
+                            vmnet_authority: self.vmnet_authority,
+                            #[cfg(target_os = "macos")]
+                            contained_restore_authority: self.contained_restore_authority.as_ref(),
+                            pci_enabled: self.pci_enabled,
+                            input,
+                            candidate,
+                            memory,
+                            cancellation: self.snapshot_capture_cancellation.clone(),
+                        },
+                    )
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let (session, controller_commit) = restored.into_parts();
+                self.started_session = Some(session);
+                Ok(self.controller.commit_snapshot_v2_load(controller_commit))
+            }
         }
     }
 
@@ -8199,6 +8355,7 @@ where
         })
     }
 
+    #[cfg(test)]
     fn native_v2_balloon_candidate_product_profile(
         &self,
     ) -> Result<NativeV2BalloonCandidateProductProfile, NativeV2BalloonCandidateProfileError> {
@@ -8379,7 +8536,7 @@ where
         })
     }
 
-    /// Publishes one strictly admitted paused source as a native-v2 2.9 pair.
+    /// Publishes one strictly admitted paused source as a native-v2 2.10 pair.
     ///
     /// The public create action reaches this seam after request normalization.
     pub(crate) fn publish_native_v2_snapshot(
@@ -8389,15 +8546,17 @@ where
         self.controller
             .preflight_create_snapshot_v2_request(input)
             .map_err(NativeV2SnapshotPublicationError::Preflight)?;
-        let NativeV2BalloonCandidateProductProfile {
+        let NativeV2MemoryHotplugCandidateProductProfile {
             input: capture_input,
             serial_config,
             entropy_config,
             balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
             storage_configs,
             expected_transport,
         } = self
-            .native_v2_balloon_candidate_product_profile()
+            .native_v2_memory_hotplug_candidate_product_profile()
             .map_err(NativeV2SnapshotPublicationError::Profile)?;
         let cancellation = self.snapshot_capture_cancellation.clone();
         let _serial = self
@@ -8415,15 +8574,17 @@ where
             .started_session
             .as_mut()
             .ok_or(NativeV2SnapshotPublicationError::SessionUnavailable)?;
-        let publication = NativeV2SnapshotPublicationRequest::new(
-            capture_input,
+        let publication = NativeV2SnapshotPublicationRequest {
+            input: capture_input,
             serial_config,
             entropy_config,
             balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
             storage_configs,
             expected_transport,
             cancellation,
-        );
+        };
         let outcome = match outputs {
             Some(outputs) => self
                 .starter
@@ -8812,9 +8973,7 @@ impl HvfInstanceStartExecutor {
                 NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
             }
             NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10 => {
-                return Err(NativeV2SnapshotLoadError::Preflight(
-                    VmmActionError::SnapshotUnsupported,
-                ));
+                NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
             }
         };
         let structural = decode_snapshot_v2_state_with_compatibility_version(bytes, version)
@@ -8849,9 +9008,8 @@ impl HvfInstanceStartExecutor {
                     .map_err(NativeV2SnapshotLoadError::Decode)?;
             }
             NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10 => {
-                return Err(NativeV2SnapshotLoadError::Preflight(
-                    VmmActionError::SnapshotUnsupported,
-                ));
+                decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
+                    .map_err(NativeV2SnapshotLoadError::Decode)?;
             }
         }
         Ok(())
@@ -9892,6 +10050,8 @@ enum HvfSnapshotV2SerialOwnerRestoreError {
     EntropyPci(HvfSnapshotV2EntropyPciRestoreError),
     BalloonMmio(HvfSnapshotV2BalloonMmioRestoreError),
     BalloonPci(HvfSnapshotV2BalloonPciRestoreError),
+    MemoryHotplugMmio(HvfSnapshotV2MemoryHotplugMmioRestoreError),
+    MemoryHotplugPci(HvfSnapshotV2MemoryHotplugPciRestoreError),
 }
 
 #[cfg(target_os = "macos")]
@@ -9905,6 +10065,8 @@ impl HvfSnapshotV2RestoreDisposition for HvfSnapshotV2SerialOwnerRestoreError {
             Self::EntropyPci(source) => source.is_terminal(),
             Self::BalloonMmio(source) => source.is_terminal(),
             Self::BalloonPci(source) => source.is_terminal(),
+            Self::MemoryHotplugMmio(source) => source.is_terminal(),
+            Self::MemoryHotplugPci(source) => source.is_terminal(),
         }
     }
 }
@@ -9924,6 +10086,8 @@ impl fmt::Debug for HvfSnapshotV2SerialOwnerRestoreError {
                     Self::EntropyPci(_) => "entropy-pci",
                     Self::BalloonMmio(_) => "balloon-mmio",
                     Self::BalloonPci(_) => "balloon-pci",
+                    Self::MemoryHotplugMmio(_) => "memory-hotplug-mmio",
+                    Self::MemoryHotplugPci(_) => "memory-hotplug-pci",
                 },
             )
             .field("terminal", &self.is_terminal())
@@ -9958,6 +10122,8 @@ impl std::error::Error for HvfSnapshotV2SerialOwnerRestoreError {
             Self::EntropyPci(source) => Some(source),
             Self::BalloonMmio(source) => Some(source),
             Self::BalloonPci(source) => Some(source),
+            Self::MemoryHotplugMmio(source) => Some(source),
+            Self::MemoryHotplugPci(source) => Some(source),
         }
     }
 }
@@ -9987,6 +10153,12 @@ enum HvfSnapshotV2BalloonPlatformPlan {
 }
 
 #[cfg(target_os = "macos")]
+enum HvfSnapshotV2MemoryHotplugPlatformPlan {
+    Mmio(HvfSnapshotV2MemoryHotplugMmioPlatformPlan),
+    Pci(HvfSnapshotV2MemoryHotplugPciPlatformPlan),
+}
+
+#[cfg(target_os = "macos")]
 enum HvfSnapshotV2SerialConstructionError {
     TransportPolicy {
         storage_cleanup: Option<SnapshotV2StorageCleanupError>,
@@ -10005,6 +10177,7 @@ enum HvfSnapshotV2SerialConstructionError {
         storage_cleanup: Option<SnapshotV2StorageCleanupError>,
     },
     BalloonPlan(PrepareHvfSnapshotV2BalloonPlatformPlanError),
+    MemoryHotplugPlan(PrepareHvfSnapshotV2MemoryHotplugPlatformPlanError),
     InvalidOwners {
         storage_cleanup: Option<SnapshotV2StorageCleanupError>,
     },
@@ -10029,12 +10202,16 @@ impl HvfSnapshotV2SerialConstructionError {
                 storage_cleanup: None,
             }
             | Self::BalloonPlan(PrepareHvfSnapshotV2BalloonPlatformPlanError::Allocation) => false,
+            Self::MemoryHotplugPlan(
+                PrepareHvfSnapshotV2MemoryHotplugPlatformPlanError::Allocation,
+            ) => false,
             Self::Process(source) => source.is_terminal(),
             Self::TransportPolicy { .. }
             | Self::StorageMmioPlan { .. }
             | Self::StoragePciPlan { .. }
             | Self::EntropyPciPlan { .. }
             | Self::BalloonPlan(_)
+            | Self::MemoryHotplugPlan(_)
             | Self::InvalidOwners { .. } => true,
         }
     }
@@ -10054,6 +10231,7 @@ impl fmt::Debug for HvfSnapshotV2SerialConstructionError {
                     Self::StoragePciPlan { .. } => "storage-pci-plan",
                     Self::EntropyPciPlan { .. } => "entropy-pci-plan",
                     Self::BalloonPlan(_) => "balloon-plan",
+                    Self::MemoryHotplugPlan(_) => "memory-hotplug-plan",
                     Self::InvalidOwners { .. } => "owners",
                     Self::Process(_) => "process",
                 },
@@ -10093,6 +10271,7 @@ impl std::error::Error for HvfSnapshotV2SerialConstructionError {
             Self::StoragePciPlan { source, .. } => Some(source),
             Self::EntropyPciPlan { source, .. } => Some(source),
             Self::BalloonPlan(source) => Some(source),
+            Self::MemoryHotplugPlan(source) => Some(source),
             Self::Process(source) => Some(source),
         }
     }
@@ -10137,6 +10316,11 @@ enum HvfSnapshotV2SerialControllerProfile {
         entropy_config: Option<EntropyConfig>,
         balloon_config: Option<BalloonConfig>,
     },
+    CurrentV2_10 {
+        entropy_config: Option<EntropyConfig>,
+        balloon_config: Option<BalloonConfig>,
+        memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
+    },
 }
 
 #[cfg(target_os = "macos")]
@@ -10150,6 +10334,7 @@ impl fmt::Debug for HvfSnapshotV2SerialControllerProfile {
                     Self::RetainedV2_7 => "2.7",
                     Self::RetainedV2_8 { .. } => "2.8",
                     Self::CurrentV2_9 { .. } => "2.9",
+                    Self::CurrentV2_10 { .. } => "2.10",
                 },
             )
             .field(
@@ -10161,6 +10346,9 @@ impl fmt::Debug for HvfSnapshotV2SerialControllerProfile {
                     } | Self::CurrentV2_9 {
                         entropy_config: Some(_),
                         ..
+                    } | Self::CurrentV2_10 {
+                        entropy_config: Some(_),
+                        ..
                     }
                 ),
             )
@@ -10170,6 +10358,19 @@ impl fmt::Debug for HvfSnapshotV2SerialControllerProfile {
                     self,
                     Self::CurrentV2_9 {
                         balloon_config: Some(_),
+                        ..
+                    } | Self::CurrentV2_10 {
+                        balloon_config: Some(_),
+                        ..
+                    }
+                ),
+            )
+            .field(
+                "has_memory_hotplug",
+                &matches!(
+                    self,
+                    Self::CurrentV2_10 {
+                        memory_hotplug: Some(_),
                         ..
                     }
                 ),
@@ -10262,6 +10463,24 @@ impl HvfSnapshotV2SerialDestination {
                 balloon_config,
                 resume_requested,
             ),
+            HvfSnapshotV2SerialControllerProfile::CurrentV2_10 {
+                entropy_config,
+                balloon_config,
+                memory_hotplug,
+            } => {
+                SnapshotV2ControllerCommit::with_serial_storage_entropy_balloon_and_memory_hotplug_configs(
+                    machine,
+                    boot,
+                    SnapshotV2ControllerCommitProductConfigs::new(
+                        storage_configs,
+                        serial_config,
+                        entropy_config,
+                        balloon_config,
+                        memory_hotplug,
+                    ),
+                    resume_requested,
+                )
+            }
         };
         Ok((self, controller))
     }
@@ -11581,6 +11800,339 @@ fn prepare_hvf_native_v2_balloon_destination(
                 controller_profile: HvfSnapshotV2SerialControllerProfile::CurrentV2_9 {
                     entropy_config,
                     balloon_config: Some(balloon_config),
+                },
+                serial_output: Some(serial_output),
+                restoration,
+                unavailable_diagnostics: (),
+            })
+        })
+        .map_err(PrepareHvfSnapshotV2SerialDestinationError::Construction)?;
+    let (destination, controller) = destination
+        .commit(
+            |destination| {
+                if !cancellation.try_seal_commit() {
+                    return Err((
+                        Box::new(destination),
+                        PreparedHvfSnapshotV2SerialControllerError::Cancelled,
+                    ));
+                }
+                destination.prepare_controller(machine, boot, resume_requested)
+            },
+            HvfSnapshotV2SerialDestination::shutdown,
+        )
+        .map_err(PrepareHvfSnapshotV2SerialDestinationError::Commit)?;
+    Ok((destination, controller))
+}
+
+#[cfg(target_os = "macos")]
+type PrepareHvfSnapshotV2MemoryHotplugDestinationError = PrepareHvfSnapshotV2SerialDestinationError;
+
+#[cfg(target_os = "macos")]
+struct PrepareHvfSnapshotV2MemoryHotplugDestinationInput {
+    platform: HvfSnapshotV2PlatformState,
+    graph: Option<SnapshotV2StorageDeviceGraph>,
+    entropy: Option<SnapshotV2EntropyRestorePlan>,
+    balloon: Option<SnapshotV2BalloonRestorePlan>,
+    topology: PreparedSnapshotV2MemoryHotplugTopology,
+    memory: GuestMemory,
+    pci_enabled: bool,
+    now: Instant,
+    packet_io: ProcessNetworkPacketIoProvider,
+    mmds_metrics: Option<SharedMmdsMetrics>,
+    vmnet_authority: ProcessVmnetAuthority,
+    bundle: PreparedSnapshotV2SerialRestoreBundle,
+    machine: bangbang_runtime::machine::MachineConfig,
+    boot: bangbang_runtime::boot::BootSourceConfig,
+    resume_requested: bool,
+    cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
+/// Reconstructs and atomically commits one exact-2.10 virtio-mem-bearing
+/// destination. Every detached component is closed into one MMIO or PCI
+/// product before the first live owner is constructed.
+#[cfg(target_os = "macos")]
+fn prepare_hvf_native_v2_memory_hotplug_destination(
+    input: PrepareHvfSnapshotV2MemoryHotplugDestinationInput,
+) -> Result<
+    (HvfSnapshotV2SerialDestination, SnapshotV2ControllerCommit),
+    PrepareHvfSnapshotV2MemoryHotplugDestinationError,
+> {
+    let PrepareHvfSnapshotV2MemoryHotplugDestinationInput {
+        platform,
+        graph,
+        entropy,
+        balloon,
+        topology,
+        memory,
+        pci_enabled,
+        now,
+        packet_io,
+        mmds_metrics,
+        vmnet_authority,
+        bundle,
+        machine,
+        boot,
+        resume_requested,
+        cancellation,
+    } = input;
+    let expected_transport = if pci_enabled {
+        SnapshotV2DeviceTransportKind::Pci
+    } else {
+        SnapshotV2DeviceTransportKind::Mmio
+    };
+    let destination = bundle
+        .construct_destination(|owners| {
+            if graph
+                .as_ref()
+                .is_some_and(|graph| graph.transport_kind() != expected_transport)
+                || entropy
+                    .as_ref()
+                    .is_some_and(|entropy| entropy.transport_kind() != expected_transport)
+                || balloon
+                    .as_ref()
+                    .is_some_and(|balloon| balloon.transport_kind() != expected_transport)
+                || topology.state().transport().kind() != expected_transport
+            {
+                return Err((
+                    Box::new(owners),
+                    HvfSnapshotV2SerialConstructionError::TransportPolicy {
+                        storage_cleanup: None,
+                    },
+                ));
+            }
+            let (owners, storage) = owners
+                .adopt_storage(graph, &memory, now, &|| cancellation.is_cancelled())
+                .map_err(|(owners, source)| {
+                    (
+                        owners,
+                        HvfSnapshotV2SerialConstructionError::StorageAdoption(source),
+                    )
+                })?;
+
+            let product = match (balloon, storage, entropy) {
+                (None, None, None) => {
+                    HvfSnapshotV2MemoryHotplugPreparedProduct::serial_memory_hotplug(
+                        topology, memory,
+                    )
+                }
+                (None, Some(storage), None) => {
+                    HvfSnapshotV2MemoryHotplugPreparedProduct::serial_storage_memory_hotplug(
+                        topology, memory, storage,
+                    )
+                }
+                (None, None, Some(entropy)) => {
+                    HvfSnapshotV2MemoryHotplugPreparedProduct::serial_entropy_memory_hotplug(
+                        topology, memory, entropy,
+                    )
+                }
+                (None, Some(storage), Some(entropy)) => {
+                    HvfSnapshotV2MemoryHotplugPreparedProduct::serial_storage_entropy_memory_hotplug(
+                        topology, memory, storage, entropy,
+                    )
+                }
+                (Some(balloon), None, None) => {
+                    HvfSnapshotV2MemoryHotplugPreparedProduct::serial_balloon_memory_hotplug(
+                        topology, memory, balloon,
+                    )
+                }
+                (Some(balloon), Some(storage), None) => {
+                    HvfSnapshotV2MemoryHotplugPreparedProduct::serial_balloon_storage_memory_hotplug(
+                        topology, memory, balloon, storage,
+                    )
+                }
+                (Some(balloon), None, Some(entropy)) => {
+                    HvfSnapshotV2MemoryHotplugPreparedProduct::serial_balloon_entropy_memory_hotplug(
+                        topology, memory, balloon, entropy,
+                    )
+                }
+                (Some(balloon), Some(storage), Some(entropy)) => {
+                    HvfSnapshotV2MemoryHotplugPreparedProduct::serial_balloon_storage_entropy_memory_hotplug(
+                        topology,
+                        memory,
+                        balloon,
+                        storage,
+                        entropy,
+                    )
+                }
+            };
+            let platform_plan = if pci_enabled {
+                match prepare_hvf_snapshot_v2_memory_hotplug_pci_platform_plan(&platform, product) {
+                    Ok(plan) => HvfSnapshotV2MemoryHotplugPlatformPlan::Pci(plan),
+                    Err(source) => {
+                        return Err((
+                            Box::new(owners),
+                            HvfSnapshotV2SerialConstructionError::MemoryHotplugPlan(source),
+                        ));
+                    }
+                }
+            } else {
+                let process = HvfSnapshotV2MemoryHotplugMmioProcessConfig::new(
+                    BalloonMmioLayout::new(
+                        DEFAULT_BALLOON_MMIO_BASE,
+                        DEFAULT_BALLOON_MMIO_REGION_ID,
+                    ),
+                    HvfSnapshotV2StorageMmioProcessConfig::new(
+                        BlockMmioLayout::new(DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID),
+                        PmemMmioLayout::new(DEFAULT_PMEM_MMIO_BASE, DEFAULT_PMEM_MMIO_REGION_ID),
+                    ),
+                    EntropyMmioLayout::new(
+                        DEFAULT_ENTROPY_MMIO_BASE,
+                        DEFAULT_ENTROPY_MMIO_REGION_ID,
+                    ),
+                    VirtioMemMmioLayout::new(
+                        DEFAULT_MEMORY_HOTPLUG_MMIO_BASE,
+                        DEFAULT_MEMORY_HOTPLUG_MMIO_REGION_ID,
+                    ),
+                );
+                match prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan(
+                    &platform, product, process,
+                ) {
+                    Ok(plan) => HvfSnapshotV2MemoryHotplugPlatformPlan::Mmio(plan),
+                    Err(source) => {
+                        return Err((
+                            Box::new(owners),
+                            HvfSnapshotV2SerialConstructionError::MemoryHotplugPlan(source),
+                        ));
+                    }
+                }
+            };
+
+            let (blocks, pmems, serial, input, restoration, serial_config) = owners.into_parts();
+            debug_assert!(blocks.is_empty());
+            debug_assert!(pmems.is_empty());
+            let (serial, serial_config) = match (serial, serial_config) {
+                (Some(serial), Some(serial_config)) => (serial, serial_config),
+                (serial, serial_config) => {
+                    drop(platform_plan);
+                    return Err((
+                        Box::new(PreparedSnapshotV2SerialRestoreOwners::from_parts((
+                            blocks,
+                            pmems,
+                            serial,
+                            input,
+                            restoration,
+                            serial_config,
+                        ))),
+                        HvfSnapshotV2SerialConstructionError::InvalidOwners {
+                            storage_cleanup: None,
+                        },
+                    ));
+                }
+            };
+            let serial_output = serial.output().clone();
+            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial);
+            let restored = match platform_plan {
+                HvfSnapshotV2MemoryHotplugPlatformPlan::Mmio(plan) => {
+                    OwnedHvfArm64BootSession::restore_snapshot_v2_memory_hotplug_mmio(
+                        platform,
+                        process_shell,
+                        input,
+                        plan,
+                    )
+                    .map(|owners| owners.into_parts())
+                    .map_err(HvfSnapshotV2SerialOwnerRestoreError::MemoryHotplugMmio)
+                }
+                HvfSnapshotV2MemoryHotplugPlatformPlan::Pci(plan) => {
+                    OwnedHvfArm64BootSession::restore_snapshot_v2_memory_hotplug_pci(
+                        platform,
+                        process_shell,
+                        input,
+                        plan,
+                    )
+                    .map(|owners| owners.into_parts())
+                    .map_err(HvfSnapshotV2SerialOwnerRestoreError::MemoryHotplugPci)
+                }
+            };
+            let (
+                mut session,
+                _memory_hotplug_state,
+                memory_hotplug,
+                storage_configs,
+                entropy_config,
+                balloon_config,
+            ) = match restored {
+                Ok(restored) => restored,
+                Err(source) => {
+                    return Err((
+                        Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                            restoration,
+                        )),
+                        HvfSnapshotV2SerialConstructionError::Process(
+                            HvfSnapshotV2ProcessConstructionError::Restore(source),
+                        ),
+                    ));
+                }
+            };
+
+            if let Err(source) = session.prepare_restored_serial_continuation() {
+                let cleanup = session
+                    .shutdown()
+                    .err()
+                    .map(|source| BackendError::Hypervisor(source.to_string()));
+                return Err((
+                    Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                        restoration,
+                    )),
+                    HvfSnapshotV2SerialConstructionError::Process(
+                        HvfSnapshotV2ProcessConstructionError::SerialContinuation {
+                            source,
+                            cleanup,
+                        },
+                    ),
+                ));
+            }
+            if let Err(source) = session.resume_after_snapshot_v2_capture() {
+                let cleanup = session
+                    .shutdown()
+                    .err()
+                    .map(|source| BackendError::Hypervisor(source.to_string()));
+                return Err((
+                    Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                        restoration,
+                    )),
+                    HvfSnapshotV2SerialConstructionError::Process(
+                        HvfSnapshotV2ProcessConstructionError::RunReady { source, cleanup },
+                    ),
+                ));
+            }
+            let process_session = ProcessHvfBootSession::new_with_vmnet_authority(
+                session,
+                packet_io,
+                mmds_metrics,
+                vmnet_authority,
+            );
+            let supervisor = match HvfBootRunLoopSupervisor::start_paused(
+                process_session,
+                default_hvf_boot_run_loop_step_limit(),
+            ) {
+                Ok(supervisor) => supervisor,
+                Err(error) => {
+                    let (source, mut failed_session) = error.into_parts();
+                    let cleanup = failed_session
+                        .session
+                        .shutdown()
+                        .err()
+                        .map(|source| BackendError::Hypervisor(source.to_string()));
+                    return Err((
+                        Box::new(PreparedSnapshotV2SerialRestoreOwners::endpoint_cleanup(
+                            restoration,
+                        )),
+                        HvfSnapshotV2SerialConstructionError::Process(
+                            HvfSnapshotV2ProcessConstructionError::WorkerStart { source, cleanup },
+                        ),
+                    ));
+                }
+            };
+            let has_storage = storage_configs.is_some();
+            Ok(HvfSnapshotV2SerialDestination {
+                session: Some(Box::new(HvfProcessSession::Boot(supervisor))),
+                storage_configs,
+                has_storage,
+                serial_config: Some(serial_config),
+                controller_profile: HvfSnapshotV2SerialControllerProfile::CurrentV2_10 {
+                    entropy_config,
+                    balloon_config,
+                    memory_hotplug: Some(memory_hotplug),
                 },
                 serial_output: Some(serial_output),
                 restoration,
@@ -12969,6 +13521,321 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             NativeV2SnapshotLoadError::SerialDestination(NativeV2SerialDestinationLoadError::new(
                 true,
             ))
+        })?;
+        self.active_serial_output = Some(serial_output);
+        Ok(SnapshotV2LoadSuccess::new(
+            HvfProcessSession::SerialSnapshotV2(Box::new(destination)),
+            controller_commit,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_prepared_snapshot_v2_memory_hotplug(
+        &mut self,
+        request: ProcessSnapshotV2MemoryHotplugLoadRequest<'_>,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        let ProcessSnapshotV2MemoryHotplugLoadRequest {
+            controller,
+            vmnet_authority,
+            contained_restore_authority,
+            pci_enabled,
+            input,
+            candidate,
+            memory,
+            cancellation,
+        } = request;
+        self.preflight_snapshot_v2_root_process(pci_enabled)
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+
+        let preparation = candidate
+            .prepare()
+            .map_err(NativeV2SnapshotLoadError::MemoryHotplugPreparation)?;
+        let expected_transport = if pci_enabled {
+            SnapshotV2DeviceTransportKind::Pci
+        } else {
+            SnapshotV2DeviceTransportKind::Mmio
+        };
+        let now = Instant::now();
+
+        let (destination, controller_commit) = match preparation {
+            NativeV2MemoryHotplugSnapshotPreparation::Compatible(candidate) => {
+                let (
+                    bytes,
+                    binding,
+                    candidate_graph,
+                    candidate_serial,
+                    candidate_entropy,
+                    candidate_balloon,
+                    candidate_memory_hotplug,
+                ) = candidate.into_parts();
+                let structural = decode_snapshot_v2_state_with_compatibility_version(
+                    &bytes,
+                    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                )
+                .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
+                let decoded = decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
+                    .map_err(NativeV2SnapshotLoadError::Decode)?;
+                if decoded.platform().memory() != &binding
+                    || decoded.device_graph() != candidate_graph.as_ref()
+                    || decoded.serial() != &candidate_serial
+                    || decoded.entropy() != candidate_entropy.as_ref()
+                    || decoded.balloon() != candidate_balloon.as_ref()
+                    || decoded.memory_hotplug() != candidate_memory_hotplug.as_ref()
+                    || candidate_memory_hotplug.is_some()
+                {
+                    return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+                }
+                let (platform, graph, serial, entropy, balloon, memory_hotplug) =
+                    decoded.into_parts();
+                debug_assert!(memory_hotplug.is_none());
+                drop(candidate_graph);
+                drop(candidate_serial);
+                drop(candidate_entropy);
+                drop(candidate_balloon);
+                drop(candidate_memory_hotplug);
+
+                if graph
+                    .as_ref()
+                    .is_some_and(|graph| graph.transport_kind() != expected_transport)
+                    || entropy
+                        .as_ref()
+                        .is_some_and(|state| state.transport().kind() != expected_transport)
+                    || balloon
+                        .as_ref()
+                        .is_some_and(|state| state.transport().kind() != expected_transport)
+                {
+                    return Err(NativeV2SnapshotLoadError::Preflight(
+                        VmmActionError::SnapshotUnsupported,
+                    ));
+                }
+
+                let boot = native_v2_boot_source_config(platform.machine().boot())
+                    .map_err(NativeV2SnapshotLoadError::BootMetadata)?;
+                let machine = snapshot_destination_machine_config(
+                    platform.machine().machine(),
+                    input.track_dirty_pages(),
+                );
+                let entropy = entropy
+                    .map(|state| SnapshotV2EntropyRestorePlan::prepare(state, &memory, now))
+                    .transpose()
+                    .map_err(NativeV2SnapshotLoadError::EntropyPlan)?;
+                let balloon = balloon
+                    .map(|state| SnapshotV2BalloonRestorePlan::prepare(state, &memory))
+                    .transpose()
+                    .map_err(NativeV2SnapshotLoadError::BalloonPlan)?;
+                let bundle = prepare_native_v2_serial_restore_bundle(
+                    graph.as_ref(),
+                    serial,
+                    contained_restore_authority,
+                    || cancellation.is_cancelled(),
+                )
+                .map_err(NativeV2SnapshotLoadError::MemoryHotplugBundle)?;
+                let (packet_io, mmds_metrics) =
+                    match ProcessNetworkPacketIoProvider::from_controller(
+                        controller,
+                        vmnet_authority,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(source) => {
+                            if bundle.abort().is_err() {
+                                return Err(NativeV2SnapshotLoadError::MemoryHotplugDestination(
+                                    NativeV2MemoryHotplugDestinationLoadError::new(
+                                        expected_transport,
+                                        true,
+                                    ),
+                                ));
+                            }
+                            return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                                BackendError::Hypervisor(format!(
+                                    "failed to build native-v2 network packet I/O provider: {source}"
+                                )),
+                            ));
+                        }
+                    };
+
+                let result = match balloon {
+                    Some(balloon) => prepare_hvf_native_v2_balloon_destination(
+                        PrepareHvfSnapshotV2BalloonDestinationInput {
+                            platform,
+                            graph,
+                            entropy,
+                            balloon,
+                            memory,
+                            pci_enabled,
+                            now,
+                            packet_io,
+                            mmds_metrics,
+                            vmnet_authority,
+                            bundle,
+                            machine,
+                            boot,
+                            resume_requested: input.resume_vm(),
+                            cancellation,
+                        },
+                    ),
+                    None => prepare_hvf_native_v2_entropy_destination(
+                        PrepareHvfSnapshotV2EntropyDestinationInput {
+                            platform,
+                            graph,
+                            entropy,
+                            memory,
+                            pci_enabled,
+                            now,
+                            packet_io,
+                            mmds_metrics,
+                            vmnet_authority,
+                            bundle,
+                            machine,
+                            boot,
+                            resume_requested: input.resume_vm(),
+                            controller_version: HvfSnapshotV2EntropyControllerVersion::CurrentV2_9,
+                            cancellation,
+                        },
+                    ),
+                };
+                result.map_err(|source| {
+                    let terminal = source.is_terminal();
+                    NativeV2SnapshotLoadError::MemoryHotplugDestination(
+                        NativeV2MemoryHotplugDestinationLoadError::with_source(
+                            expected_transport,
+                            terminal,
+                            &source,
+                        ),
+                    )
+                })?
+            }
+            NativeV2MemoryHotplugSnapshotPreparation::Prepared(candidate) => {
+                let (
+                    bytes,
+                    candidate_graph,
+                    candidate_serial,
+                    candidate_entropy,
+                    candidate_balloon,
+                    topology,
+                ) = candidate.into_parts();
+                let structural = decode_snapshot_v2_state_with_compatibility_version(
+                    &bytes,
+                    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                )
+                .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
+                let decoded = decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
+                    .map_err(NativeV2SnapshotLoadError::Decode)?;
+                if decoded.platform().memory() != topology.memory().binding()
+                    || decoded.device_graph() != candidate_graph.as_ref()
+                    || decoded.serial() != &candidate_serial
+                    || decoded.entropy() != candidate_entropy.as_ref()
+                    || decoded.balloon() != candidate_balloon.as_ref()
+                    || decoded.memory_hotplug() != Some(topology.state())
+                {
+                    return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+                }
+                let (platform, graph, serial, entropy, balloon, memory_hotplug) =
+                    decoded.into_parts();
+                if memory_hotplug.as_ref() != Some(topology.state()) {
+                    return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+                }
+                drop(memory_hotplug);
+                drop(candidate_graph);
+                drop(candidate_serial);
+                drop(candidate_entropy);
+                drop(candidate_balloon);
+
+                if graph
+                    .as_ref()
+                    .is_some_and(|graph| graph.transport_kind() != expected_transport)
+                    || entropy
+                        .as_ref()
+                        .is_some_and(|state| state.transport().kind() != expected_transport)
+                    || balloon
+                        .as_ref()
+                        .is_some_and(|state| state.transport().kind() != expected_transport)
+                    || topology.state().transport().kind() != expected_transport
+                {
+                    return Err(NativeV2SnapshotLoadError::Preflight(
+                        VmmActionError::SnapshotUnsupported,
+                    ));
+                }
+
+                let boot = native_v2_boot_source_config(platform.machine().boot())
+                    .map_err(NativeV2SnapshotLoadError::BootMetadata)?;
+                let machine = snapshot_destination_machine_config(
+                    platform.machine().machine(),
+                    input.track_dirty_pages(),
+                );
+                let entropy = entropy
+                    .map(|state| SnapshotV2EntropyRestorePlan::prepare(state, &memory, now))
+                    .transpose()
+                    .map_err(NativeV2SnapshotLoadError::EntropyPlan)?;
+                let balloon = balloon
+                    .map(|state| SnapshotV2BalloonRestorePlan::prepare(state, &memory))
+                    .transpose()
+                    .map_err(NativeV2SnapshotLoadError::BalloonPlan)?;
+                let bundle = prepare_native_v2_serial_restore_bundle(
+                    graph.as_ref(),
+                    serial,
+                    contained_restore_authority,
+                    || cancellation.is_cancelled(),
+                )
+                .map_err(NativeV2SnapshotLoadError::MemoryHotplugBundle)?;
+                let (packet_io, mmds_metrics) =
+                    match ProcessNetworkPacketIoProvider::from_controller(
+                        controller,
+                        vmnet_authority,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(source) => {
+                            if bundle.abort().is_err() {
+                                return Err(NativeV2SnapshotLoadError::MemoryHotplugDestination(
+                                    NativeV2MemoryHotplugDestinationLoadError::new(
+                                        expected_transport,
+                                        true,
+                                    ),
+                                ));
+                            }
+                            return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                                BackendError::Hypervisor(format!(
+                                    "failed to build native-v2 network packet I/O provider: {source}"
+                                )),
+                            ));
+                        }
+                    };
+
+                prepare_hvf_native_v2_memory_hotplug_destination(
+                    PrepareHvfSnapshotV2MemoryHotplugDestinationInput {
+                        platform,
+                        graph,
+                        entropy,
+                        balloon,
+                        topology,
+                        memory,
+                        pci_enabled,
+                        now,
+                        packet_io,
+                        mmds_metrics,
+                        vmnet_authority,
+                        bundle,
+                        machine,
+                        boot,
+                        resume_requested: input.resume_vm(),
+                        cancellation,
+                    },
+                )
+                .map_err(|source| {
+                    let terminal = source.is_terminal();
+                    NativeV2SnapshotLoadError::MemoryHotplugDestination(
+                        NativeV2MemoryHotplugDestinationLoadError::with_source(
+                            expected_transport,
+                            terminal,
+                            &source,
+                        ),
+                    )
+                })?
+            }
+        };
+        let serial_output = destination.serial_output_clone().ok_or_else(|| {
+            NativeV2SnapshotLoadError::MemoryHotplugDestination(
+                NativeV2MemoryHotplugDestinationLoadError::new(expected_transport, true),
+            )
         })?;
         self.active_serial_output = Some(serial_output);
         Ok(SnapshotV2LoadSuccess::new(
@@ -21294,14 +22161,18 @@ where
             serial_config,
             entropy_config,
             balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
             storage_configs,
             expected_transport,
             cancellation,
         } = request;
-        preflight_native_v2_balloon_capture(
+        preflight_native_v2_memory_hotplug_capture(
             &serial_config,
             balloon_config,
             entropy_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
             &storage_configs,
             expected_transport,
         )
@@ -21360,8 +22231,10 @@ where
                     let state = capture_and_recover_native_v2_state(
                         session,
                         input,
-                        NativeV2SnapshotCaptureProfile::Balloon {
+                        NativeV2SnapshotCaptureProfile::MemoryHotplug {
                             serial,
+                            memory_hotplug_config,
+                            memory_hotplug_requested_size_mib,
                             balloon_config,
                             entropy_config,
                             storage_configs,
@@ -21371,10 +22244,10 @@ where
                         Box::new(writer),
                         &cancellation,
                         |encoded| {
-                            NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(encoded)
-                                .map(
-                                    NativeV2BalloonSnapshotCandidateState::into_current_artifact_state,
-                                )
+                            NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
+                                encoded,
+                            )
+                                .map(NativeV2MemoryHotplugSnapshotCandidateState::into_current_artifact_state)
                                 .map_err(|source| {
                                     NativeV2SnapshotCaptureError::CandidateState { source }
                                 })
@@ -22659,13 +23532,14 @@ mod tests {
     use bangbang_runtime::snapshot::{
         SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend, SnapshotMemoryBackendType,
         SnapshotType, SnapshotV1ControllerCommit, SnapshotV2ControllerCommit,
+        SnapshotV2ControllerCommitProductConfigs,
     };
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotPublicationOutcome,
         NativeV2BalloonSnapshotCandidateState, NativeV2EntropySnapshotCandidateState,
-        NativeV2MemoryHotplugSnapshotCandidateState, NativeV2SnapshotArtifactProfile,
-        PreparedNativeSnapshotState, SnapshotArtifactOutputs, SnapshotArtifactPaths,
-        SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
+        NativeV2MemoryHotplugSnapshotCandidateState, NativeV2MemoryHotplugSnapshotPreparation,
+        NativeV2SnapshotArtifactProfile, PreparedNativeSnapshotState, SnapshotArtifactOutputs,
+        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_artifact::{
@@ -22797,16 +23671,16 @@ mod tests {
         ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
         ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
         ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessSnapshotV2BalloonLoadRequest,
-        ProcessSnapshotV2EntropyLoadRequest, ProcessSnapshotV2MultiBlockLoadRequest,
-        ProcessSnapshotV2MultiBlockLoadSuccess, ProcessSnapshotV2RootLoadCompletion,
-        ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess,
-        ProcessSnapshotV2SerialLoadRequest, ProcessSnapshotV2StorageLoadRequest,
-        ProcessSnapshotV2StorageLoadSuccess, ProcessVmm, ProcessVmnetAuthority,
-        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
-        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
-        require_native_v1_composite_record, snapshot_destination_machine_config,
-        vsock_capture_error_from_boot_run_loop_command,
+        ProcessSnapshotV2EntropyLoadRequest, ProcessSnapshotV2MemoryHotplugLoadRequest,
+        ProcessSnapshotV2MultiBlockLoadRequest, ProcessSnapshotV2MultiBlockLoadSuccess,
+        ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
+        ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2SerialLoadRequest,
+        ProcessSnapshotV2StorageLoadRequest, ProcessSnapshotV2StorageLoadSuccess, ProcessVmm,
+        ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
+        SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
+        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        native_v2_platform_capture_is_terminal, require_native_v1_composite_record,
+        snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -23936,6 +24810,8 @@ mod tests {
             serial_config,
             entropy_config,
             balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
             storage_configs,
             expected_transport: transport,
             cancellation: _,
@@ -23943,12 +24819,14 @@ mod tests {
         let has_block = !storage_configs.drives().is_empty();
         let has_pmem = !storage_configs.pmem().is_empty();
         session.native_snapshot_publication_count += 1;
-        let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
-            .expect("fake v2 publication memory range should validate");
-        let layout = GuestMemoryLayout::new(vec![range])
-            .expect("fake v2 publication memory layout should validate");
-        let memory =
-            GuestMemory::allocate(&layout).expect("fake v2 publication memory should allocate");
+        let memory_hotplug = memory_hotplug_config.map(|config| {
+            fake_native_v2_memory_hotplug_state_for_request(
+                transport,
+                config,
+                memory_hotplug_requested_size_mib,
+            )
+        });
+        let memory = fake_native_v2_publication_memory(memory_hotplug.as_ref());
 
         destination
             .publish(|mut writer| {
@@ -23985,7 +24863,7 @@ mod tests {
                 .expect("fake serial state should capture")
                 .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
                 .expect("fake serial state should encode");
-                let mut components = Vec::with_capacity(3);
+                let mut components = Vec::with_capacity(6);
                 components.push(SnapshotV2Component::new(
                     NATIVE_V2_MEMORY_COMPONENT_KEY,
                     SnapshotV2ComponentDisposition::Semantic,
@@ -24027,8 +24905,20 @@ mod tests {
                         balloon,
                     ));
                 }
+                let memory_hotplug = memory_hotplug.as_ref().map(|state| {
+                    state
+                        .encode(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION)
+                        .expect("fake virtio-mem state should encode")
+                });
+                if let Some(memory_hotplug) = &memory_hotplug {
+                    components.push(SnapshotV2Component::new(
+                        NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+                        SnapshotV2ComponentDisposition::Semantic,
+                        memory_hotplug,
+                    ));
+                }
                 let encoded = encode_snapshot_v2_state_with_compatibility_version(
-                    NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
                     &[],
                     &components,
                 )
@@ -24039,13 +24929,15 @@ mod tests {
                         },
                     )
                 })?;
-                NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(encoded)
-                    .map(NativeV2BalloonSnapshotCandidateState::into_current_artifact_state)
-                    .map_err(|source| {
-                        NativeV2SnapshotPublicationProducerError::Capture(
-                            NativeV2SnapshotCaptureError::CandidateState { source },
-                        )
-                    })
+                NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
+                    encoded,
+                )
+                .map(NativeV2MemoryHotplugSnapshotCandidateState::into_current_artifact_state)
+                .map_err(|source| {
+                    NativeV2SnapshotPublicationProducerError::Capture(
+                        NativeV2SnapshotCaptureError::CandidateState { source },
+                    )
+                })
             })
             .map_err(|source| NativeV2SnapshotPublicationError::Transaction(Box::new(source)))
     }
@@ -25253,6 +26145,148 @@ mod tests {
                     serial_config,
                     entropy_config,
                     balloon_config,
+                    input.resume_vm(),
+                );
+            let session = match self.result {
+                FakeSnapshotLoadResult::ResumeFailure => FakeSession::with_resume_result(
+                    77,
+                    BackendError::Hypervisor("private-resume-sentinel".to_owned()),
+                ),
+                FakeSnapshotLoadResult::Success | FakeSnapshotLoadResult::Terminal => {
+                    FakeSession::new(77)
+                }
+            };
+            Ok(SnapshotV2LoadSuccess::new(session, commit))
+        }
+
+        fn load_prepared_snapshot_v2_memory_hotplug(
+            &mut self,
+            request: ProcessSnapshotV2MemoryHotplugLoadRequest<'_>,
+        ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+            let ProcessSnapshotV2MemoryHotplugLoadRequest {
+                controller,
+                vmnet_authority,
+                #[cfg(target_os = "macos")]
+                    contained_restore_authority: _,
+                pci_enabled,
+                input,
+                candidate,
+                memory: _,
+                cancellation,
+            } = request;
+            let expected_transport = if pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            };
+            if candidate
+                .device_graph()
+                .is_some_and(|graph| graph.transport_kind() != expected_transport)
+                || candidate
+                    .entropy()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+                || candidate
+                    .balloon()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+                || candidate
+                    .memory_hotplug()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+            {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
+            let drive_configs = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::block_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = DriveConfigInput::new(
+                        config.drive_id(),
+                        config.drive_id(),
+                        config.selector(),
+                        config.is_root(),
+                    )
+                    .with_is_read_only(config.is_read_only())
+                    .with_cache_type(config.cache_type())
+                    .with_io_engine(config.io_engine());
+                    if let Some(partuuid) = config.partuuid() {
+                        input = input.with_partuuid(partuuid);
+                    }
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    input.validate()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let pmem_configs = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::pmem_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = PmemConfigInput::new(config.pmem_id(), config.selector())
+                        .with_root_device(config.is_root())
+                        .with_read_only(config.is_read_only());
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    PmemConfig::try_from(input)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let storage_configs = candidate
+                .device_graph()
+                .map(|_| CaptureReadyStorageConfigs::new(drive_configs, pmem_configs));
+            let mut serial_input = SerialConfigInput::new();
+            if let Some(selector) = candidate.serial().endpoint_intent().configured_selector() {
+                serial_input = serial_input.with_serial_out_path(selector);
+            }
+            if let Some(rate_limiter) = candidate.serial().rate_limiter() {
+                serial_input = serial_input.with_rate_limiter(rate_limiter);
+            }
+            let serial_config = serial_input
+                .validate()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let entropy_config = candidate.entropy().map(SnapshotV2EntropyState::config);
+            let balloon_config = candidate.balloon().map(SnapshotV2BalloonState::config);
+            let memory_hotplug = match candidate
+                .prepare()
+                .map_err(NativeV2SnapshotLoadError::MemoryHotplugPreparation)?
+            {
+                NativeV2MemoryHotplugSnapshotPreparation::Compatible(_) => None,
+                NativeV2MemoryHotplugSnapshotPreparation::Prepared(candidate) => {
+                    Some(candidate.topology().controller())
+                }
+            };
+            if !cancellation.try_seal_commit() {
+                return Err(NativeV2SnapshotLoadError::Cancelled);
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.last_vmnet_authority = Some(vmnet_authority);
+            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            if self.result == FakeSnapshotLoadResult::Terminal {
+                return Err(NativeV2SnapshotLoadError::ProcessTerminal);
+            }
+
+            let boot_source = BootSourceConfigInput::new("/private/restored-vmlinux")
+                .validate()
+                .expect("fake restored boot source should validate");
+            let machine =
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages());
+            let commit =
+                SnapshotV2ControllerCommit::with_serial_storage_entropy_balloon_and_memory_hotplug_configs(
+                    machine,
+                    boot_source,
+                    SnapshotV2ControllerCommitProductConfigs::new(
+                        storage_configs,
+                        serial_config,
+                        entropy_config,
+                        balloon_config,
+                        memory_hotplug,
+                    ),
                     input.resume_vm(),
                 );
             let session = match self.result {
@@ -28975,6 +30009,95 @@ mod tests {
         .expect("fake native-v2 virtio-mem fixture should decode")
     }
 
+    fn fake_native_v2_memory_hotplug_state_for_request(
+        transport: SnapshotV2DeviceTransportKind,
+        config: MemoryHotplugConfig,
+        requested_size_mib: u64,
+    ) -> SnapshotV2MemoryHotplugState {
+        const MIB: u64 = 1024 * 1024;
+
+        let fixture = fake_native_v2_memory_hotplug_state(transport);
+        assert_eq!(
+            fixture.config(),
+            config,
+            "fake publication fixture must match the requested virtio-mem configuration"
+        );
+        let requested_size = requested_size_mib
+            .checked_mul(MIB)
+            .expect("fake requested virtio-mem size should fit bytes");
+        SnapshotV2MemoryHotplugState::try_new(
+            config,
+            fixture.config_space().with_requested_size(requested_size),
+            fixture.active_queue(),
+            fixture.plugged_bitmap().to_vec(),
+            fixture.virtio().clone(),
+            fixture.transport().clone(),
+        )
+        .expect("fake request-specific virtio-mem state should validate")
+    }
+
+    fn fake_native_v2_publication_memory(
+        memory_hotplug: Option<&SnapshotV2MemoryHotplugState>,
+    ) -> GuestMemory {
+        const BASE_START: u64 = 0x8000_0000;
+        const BASE_SIZE: u64 = 16 * 1024;
+        const BASE_ALIGNMENT: u64 = 16 * 1024;
+
+        let mut base_start = BASE_START;
+        let mut base_end = BASE_START + BASE_SIZE;
+        if let Some(state) = memory_hotplug {
+            for queue in state.virtio().queues() {
+                if queue.size() == 0 {
+                    continue;
+                }
+                let descriptor_size = u64::from(queue.size()) * 16;
+                let available_size = u64::from(queue.size()) * 2 + 6;
+                let used_size = u64::from(queue.size()) * 8 + 6;
+                for (start, size) in [
+                    (queue.descriptor_table().raw_value(), descriptor_size),
+                    (queue.driver_ring().raw_value(), available_size),
+                    (queue.device_ring().raw_value(), used_size),
+                ] {
+                    base_start = base_start.min(start & !(BASE_ALIGNMENT - 1));
+                    base_end = base_end.max(
+                        start
+                            .checked_add(size)
+                            .and_then(|end| end.checked_add(BASE_ALIGNMENT - 1))
+                            .expect("fake queue range should fit")
+                            & !(BASE_ALIGNMENT - 1),
+                    );
+                }
+            }
+        }
+
+        let mut ranges = vec![
+            GuestMemoryRange::new(GuestAddress::new(base_start), base_end - base_start)
+                .expect("fake base-memory range should validate"),
+        ];
+        if let Some(state) = memory_hotplug {
+            let config_space = state.config_space();
+            for plugged in state.plugged_ranges() {
+                let start = plugged
+                    .start_block()
+                    .checked_mul(config_space.block_size())
+                    .and_then(|offset| config_space.addr().checked_add(offset))
+                    .expect("fake plugged-memory start should fit");
+                let size = plugged
+                    .block_count()
+                    .checked_mul(config_space.block_size())
+                    .expect("fake plugged-memory size should fit");
+                ranges.push(
+                    GuestMemoryRange::new(GuestAddress::new(start), size)
+                        .expect("fake plugged-memory range should validate"),
+                );
+            }
+        }
+        ranges.sort_by_key(|range| range.start());
+        let layout =
+            GuestMemoryLayout::new(ranges).expect("fake v2 publication memory should validate");
+        GuestMemory::allocate(&layout).expect("fake v2 publication memory should allocate")
+    }
+
     fn fixture_hex_bytes(hex: &str) -> Vec<u8> {
         let hex = hex.trim();
         assert!(hex.len().is_multiple_of(2));
@@ -29016,15 +30139,17 @@ mod tests {
         expected_transport: SnapshotV2DeviceTransportKind,
         cancellation: NativeV2SnapshotCaptureCancellation,
     ) -> NativeV2SnapshotPublicationRequest {
-        NativeV2SnapshotPublicationRequest::new(
-            native_v2_test_capture_input(),
-            SerialConfig::default(),
+        NativeV2SnapshotPublicationRequest {
+            input: native_v2_test_capture_input(),
+            serial_config: SerialConfig::default(),
             entropy_config,
-            None,
+            balloon_config: None,
+            memory_hotplug_config: None,
+            memory_hotplug_requested_size_mib: 0,
             storage_configs,
             expected_transport,
             cancellation,
-        )
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -29174,15 +30299,17 @@ mod tests {
         let mut session = FakeSession::new(0);
         publish_fake_native_v2_snapshot(
             &mut session,
-            NativeV2SnapshotPublicationRequest::new(
-                native_v2_test_capture_input(),
-                SerialConfig::default(),
-                None,
-                None,
-                native_v2_root_storage_configs(),
-                transport,
-                NativeV2SnapshotCaptureCancellation::default(),
-            ),
+            NativeV2SnapshotPublicationRequest {
+                input: native_v2_test_capture_input(),
+                serial_config: SerialConfig::default(),
+                entropy_config: None,
+                balloon_config: None,
+                memory_hotplug_config: None,
+                memory_hotplug_requested_size_mib: 0,
+                storage_configs: native_v2_root_storage_configs(),
+                expected_transport: transport,
+                cancellation: NativeV2SnapshotCaptureCancellation::default(),
+            },
             NativeV2SnapshotPublicationDestination::Paths(paths.clone()),
         )
         .expect("native-v2 load fixture should publish");
@@ -29209,15 +30336,17 @@ mod tests {
         let balloon_config = fake_native_v2_balloon_state(transport).config();
         publish_fake_native_v2_snapshot(
             &mut session,
-            NativeV2SnapshotPublicationRequest::new(
-                native_v2_test_capture_input(),
-                SerialConfig::default(),
-                None,
-                Some(balloon_config),
-                native_v2_root_storage_configs(),
-                transport,
-                NativeV2SnapshotCaptureCancellation::default(),
-            ),
+            NativeV2SnapshotPublicationRequest {
+                input: native_v2_test_capture_input(),
+                serial_config: SerialConfig::default(),
+                entropy_config: None,
+                balloon_config: Some(balloon_config),
+                memory_hotplug_config: None,
+                memory_hotplug_requested_size_mib: 0,
+                storage_configs: native_v2_root_storage_configs(),
+                expected_transport: transport,
+                cancellation: NativeV2SnapshotCaptureCancellation::default(),
+            },
             NativeV2SnapshotPublicationDestination::Paths(paths.clone()),
         )
         .expect("native-v2 balloon load fixture should publish");
@@ -30381,7 +31510,7 @@ mod tests {
         .expect("exact minor-nine state should encode");
         let state = NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(encoded)
             .expect("exact minor-nine candidate should validate")
-            .into_current_artifact_state();
+            .into_compatible_artifact_state();
         assert_eq!(
             state
                 .v2_profile()
@@ -30400,7 +31529,7 @@ mod tests {
     }
 
     #[test]
-    fn native_v2_process_preflight_explicitly_rejects_exact_minor_ten_profile() {
+    fn native_v2_process_preflight_routes_exact_minor_ten_to_hvf_decode() {
         let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
             .expect("exact minor-ten fixture range should validate");
         let layout = GuestMemoryLayout::new(vec![range])
@@ -30448,7 +31577,7 @@ mod tests {
         let state =
             NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(encoded)
                 .expect("exact minor-ten candidate should validate")
-                .into_compatible_artifact_state();
+                .into_current_artifact_state();
         assert_eq!(
             state
                 .v2_profile()
@@ -30462,9 +31591,7 @@ mod tests {
                 &prepared,
                 NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10,
             ),
-            Err(NativeV2SnapshotLoadError::Preflight(
-                VmmActionError::SnapshotUnsupported
-            ))
+            Err(NativeV2SnapshotLoadError::Decode(_))
         ));
     }
 
@@ -36759,8 +37886,11 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn runtime_snapshot_create_policy_still_rejects_memory_hotplug_before_session_barrier() {
+    fn runtime_snapshot_create_policy_admits_memory_hotplug_without_session_barrier() {
+        let directory = TempSnapshotDirectory::new("native-v2-memory-hotplug-policy");
+        let paths = directory.paths();
         let mut vmm = configured_vmm(FakeStarter::success(177));
         vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
             .expect("memory-hotplug should configure");
@@ -36770,16 +37900,33 @@ mod tests {
             .expect("memory-hotplug instance should pause");
 
         assert_eq!(
-            vmm.handle_action(snapshot_create_action(SnapshotType::Full)),
-            Err(VmmActionError::SnapshotUnsupported)
+            vmm.handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                paths.state(),
+                paths.memory(),
+            ))),
+            Ok(VmmData::Empty)
         );
         let session = vmm
             .started_session
             .as_ref()
-            .expect("rejected memory-hotplug snapshot should retain its session");
+            .expect("published memory-hotplug snapshot should retain its session");
         assert_eq!(session.snapshot_create_barrier_count, 0);
-        assert_eq!(session.native_snapshot_publication_count, 0);
-        assert_eq!(session.native_snapshot_producer_count, 0);
+        assert_eq!(session.native_snapshot_publication_count, 1);
+        assert_eq!(session.native_snapshot_producer_count, 1);
+        let (candidate, _) = load_native_snapshot_artifacts(&paths)
+            .expect("published memory-hotplug snapshot should load")
+            .into_current_v2_candidate()
+            .expect("published memory-hotplug snapshot should retain exact 2.10");
+        let memory_hotplug = candidate
+            .memory_hotplug()
+            .expect("published memory-hotplug snapshot should contain kind 11");
+        assert_eq!(memory_hotplug.config(), memory_hotplug_config());
+        assert_eq!(memory_hotplug.config_space().requested_size(), 0);
+        memory_hotplug
+            .validate_memory_binding(candidate.memory_binding())
+            .expect("published memory-hotplug binding should close");
+        directory.assert_no_staging();
     }
 
     #[test]
@@ -37544,66 +38691,84 @@ mod tests {
         ] {
             for has_entropy in [false, true] {
                 for has_balloon in [false, true] {
-                    for (transport, pci_enabled) in [
-                        (SnapshotV2DeviceTransportKind::Mmio, false),
-                        (SnapshotV2DeviceTransportKind::Pci, true),
-                    ] {
-                        let product = match (has_entropy, has_balloon) {
-                            (false, false) => case.to_owned(),
-                            (true, false) => format!("{case}-entropy"),
-                            (false, true) => format!("{case}-balloon"),
-                            (true, true) => format!("{case}-entropy-balloon"),
-                        };
-                        let directory = TempSnapshotDirectory::new(&format!(
-                            "native-v2-{product}-{transport:?}"
-                        ));
-                        let paths = directory.paths();
-                        let mut source = configured_vmm(FakeStarter::success(190));
-                        source.pci_enabled = pci_enabled;
-                        let block_is_root = has_block && !pci_enabled;
-                        let pmem_is_root =
-                            has_pmem && (has_block || !pci_enabled) && !block_is_root;
-                        if has_block {
+                    for has_memory_hotplug in [false, true] {
+                        for (transport, pci_enabled) in [
+                            (SnapshotV2DeviceTransportKind::Mmio, false),
+                            (SnapshotV2DeviceTransportKind::Pci, true),
+                        ] {
+                            let mut product = match (has_entropy, has_balloon) {
+                                (false, false) => case.to_owned(),
+                                (true, false) => format!("{case}-entropy"),
+                                (false, true) => format!("{case}-balloon"),
+                                (true, true) => format!("{case}-entropy-balloon"),
+                            };
+                            if has_memory_hotplug {
+                                product.push_str("-memory-hotplug");
+                            }
+                            let directory = TempSnapshotDirectory::new(&format!(
+                                "native-v2-{product}-{transport:?}"
+                            ));
+                            let paths = directory.paths();
+                            let mut source = configured_vmm(FakeStarter::success(190));
+                            source.pci_enabled = pci_enabled;
+                            let block_is_root = has_block && !pci_enabled;
+                            let pmem_is_root =
+                                has_pmem && (has_block || !pci_enabled) && !block_is_root;
+                            if has_block {
+                                source
+                                    .handle_action(VmmAction::PutDrive(
+                                        DriveConfigInput::new(
+                                            "rootfs",
+                                            "rootfs",
+                                            "/private/rootfs.ext4",
+                                            block_is_root,
+                                        )
+                                        .with_is_read_only(true)
+                                        .with_io_engine(DriveIoEngine::Sync),
+                                    ))
+                                    .expect("public storage block should configure");
+                            }
+                            if has_pmem {
+                                source
+                                    .handle_action(VmmAction::PutPmem(
+                                        PmemConfigInput::new("pmem0", "/private/pmem0.img")
+                                            .with_root_device(pmem_is_root),
+                                    ))
+                                    .expect("public storage pmem should configure");
+                            }
+                            if has_entropy {
+                                source
+                                    .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+                                    .expect("public entropy should configure");
+                            }
+                            if has_balloon {
+                                source
+                                    .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(
+                                        64, false,
+                                    )))
+                                    .expect("public balloon should configure");
+                            }
+                            if has_memory_hotplug {
+                                source
+                                    .handle_action(VmmAction::PutMemoryHotplug(
+                                        memory_hotplug_config_input(),
+                                    ))
+                                    .expect("public virtio-mem should configure");
+                            }
                             source
-                                .handle_action(VmmAction::PutDrive(
-                                    DriveConfigInput::new(
-                                        "rootfs",
-                                        "rootfs",
-                                        "/private/rootfs.ext4",
-                                        block_is_root,
-                                    )
-                                    .with_is_read_only(true)
-                                    .with_io_engine(DriveIoEngine::Sync),
-                                ))
-                                .expect("public storage block should configure");
-                        }
-                        if has_pmem {
+                                .handle_action(VmmAction::InstanceStart)
+                                .expect("public exact-2.10 source should start");
+                            if has_memory_hotplug {
+                                source
+                                    .handle_action(VmmAction::PatchMemoryHotplug(
+                                        memory_hotplug_size_update_input(128),
+                                    ))
+                                    .expect("public virtio-mem requested size should update");
+                            }
                             source
-                                .handle_action(VmmAction::PutPmem(
-                                    PmemConfigInput::new("pmem0", "/private/pmem0.img")
-                                        .with_root_device(pmem_is_root),
-                                ))
-                                .expect("public storage pmem should configure");
-                        }
-                        if has_entropy {
+                                .handle_action(VmmAction::Pause)
+                                .expect("public exact-2.10 source should pause");
                             source
-                                .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
-                                .expect("public entropy should configure");
-                        }
-                        if has_balloon {
-                            source
-                                .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(
-                                    64, false,
-                                )))
-                                .expect("public balloon should configure");
-                        }
-                        source
-                            .handle_action(VmmAction::InstanceStart)
-                            .expect("public exact-2.9 source should start");
-                        source
-                            .handle_action(VmmAction::Pause)
-                            .expect("public exact-2.9 source should pause");
-                        source
                             .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
                                 SnapshotType::Full,
                                 paths.state(),
@@ -37615,42 +38780,55 @@ mod tests {
                                 )
                             });
 
-                        let loaded = load_native_snapshot_artifacts(&paths)
-                            .expect("public exact-2.9 balloon-profile pair should load");
-                        let (candidate, _) = loaded
-                            .into_current_v2_candidate()
-                            .expect("public pair should retain the exact current candidate");
-                        assert_eq!(
-                            candidate.version(),
-                            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
-                        );
-                        assert_eq!(candidate.entropy().is_some(), has_entropy);
-                        if let Some(entropy) = candidate.entropy() {
-                            assert_eq!(entropy.transport().kind(), transport);
-                        }
-                        assert_eq!(candidate.balloon().is_some(), has_balloon);
-                        if let Some(balloon) = candidate.balloon() {
-                            assert_eq!(balloon.transport().kind(), transport);
-                        }
-                        match candidate.device_graph() {
-                            Some(graph) => {
-                                assert_eq!(graph.transport_kind(), transport);
-                                assert_eq!(graph.block_records().len(), usize::from(has_block));
-                                assert_eq!(graph.pmem_records().len(), usize::from(has_pmem));
+                            let loaded = load_native_snapshot_artifacts(&paths)
+                                .expect("public exact-2.10 pair should load");
+                            let (candidate, _) = loaded
+                                .into_current_v2_candidate()
+                                .expect("public pair should retain the exact current candidate");
+                            assert_eq!(
+                                candidate.version(),
+                                NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+                            );
+                            assert_eq!(candidate.entropy().is_some(), has_entropy);
+                            if let Some(entropy) = candidate.entropy() {
+                                assert_eq!(entropy.transport().kind(), transport);
                             }
-                            None => assert!(!has_block && !has_pmem),
-                        }
+                            assert_eq!(candidate.balloon().is_some(), has_balloon);
+                            if let Some(balloon) = candidate.balloon() {
+                                assert_eq!(balloon.transport().kind(), transport);
+                            }
+                            assert_eq!(candidate.memory_hotplug().is_some(), has_memory_hotplug);
+                            if let Some(memory_hotplug) = candidate.memory_hotplug() {
+                                assert_eq!(memory_hotplug.transport().kind(), transport);
+                                assert_eq!(memory_hotplug.config(), memory_hotplug_config());
+                                assert_eq!(
+                                    memory_hotplug.config_space().requested_size(),
+                                    128 * 1024 * 1024
+                                );
+                                memory_hotplug
+                                    .validate_memory_binding(candidate.memory_binding())
+                                    .expect("public virtio-mem memory binding should close");
+                            }
+                            match candidate.device_graph() {
+                                Some(graph) => {
+                                    assert_eq!(graph.transport_kind(), transport);
+                                    assert_eq!(graph.block_records().len(), usize::from(has_block));
+                                    assert_eq!(graph.pmem_records().len(), usize::from(has_pmem));
+                                }
+                                None => assert!(!has_block && !has_pmem),
+                            }
 
-                        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
-                        let calls = starter.calls();
-                        let mut destination = ProcessVmm::with_starter(
-                            format!("native-v2-{product}-{transport:?}-destination"),
-                            "0.1.0",
-                            "bangbang",
-                            starter,
-                        );
-                        destination.pci_enabled = pci_enabled;
-                        destination
+                            let starter =
+                                FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+                            let calls = starter.calls();
+                            let mut destination = ProcessVmm::with_starter(
+                                format!("native-v2-{product}-{transport:?}-destination"),
+                                "0.1.0",
+                                "bangbang",
+                                starter,
+                            );
+                            destination.pci_enabled = pci_enabled;
+                            destination
                             .handle_action(VmmAction::LoadSnapshot(SnapshotLoadInput::new(
                                 paths.state(),
                                 SnapshotMemoryBackend::new(
@@ -37663,33 +38841,44 @@ mod tests {
                                     "{product} {transport:?} public load should succeed: {error}"
                                 )
                             });
-                        assert_eq!(calls.load(Ordering::SeqCst), 1);
-                        assert_eq!(destination.instance_info().state, InstanceState::Paused);
-                        assert_eq!(destination.drive_configs().len(), usize::from(has_block));
-                        assert_eq!(
-                            destination.controller.pmem_configs().len(),
-                            usize::from(has_pmem)
-                        );
-                        assert_eq!(
-                            destination.controller.entropy_config().is_some(),
-                            has_entropy
-                        );
-                        assert_eq!(
-                            destination.controller.balloon_config().is_some(),
-                            has_balloon
-                        );
-                        if has_entropy || has_balloon {
-                            let peer_starter =
-                                FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
-                            let peer_calls = peer_starter.calls();
-                            let mut peer = ProcessVmm::with_starter(
-                                format!("native-v2-{product}-{transport:?}-same-process-peer"),
-                                "0.1.0",
-                                "bangbang",
-                                peer_starter,
+                            assert_eq!(calls.load(Ordering::SeqCst), 1);
+                            assert_eq!(destination.instance_info().state, InstanceState::Paused);
+                            assert_eq!(destination.drive_configs().len(), usize::from(has_block));
+                            assert_eq!(
+                                destination.controller.pmem_configs().len(),
+                                usize::from(has_pmem)
                             );
-                            peer.pci_enabled = pci_enabled;
-                            peer.handle_action(VmmAction::LoadSnapshot(
+                            assert_eq!(
+                                destination.controller.entropy_config().is_some(),
+                                has_entropy
+                            );
+                            assert_eq!(
+                                destination.controller.balloon_config().is_some(),
+                                has_balloon
+                            );
+                            assert_eq!(
+                                destination.controller.memory_hotplug_config().is_some(),
+                                has_memory_hotplug
+                            );
+                            assert_eq!(
+                                destination
+                                    .controller
+                                    .memory_hotplug_status()
+                                    .map(|status| status.requested_size_mib()),
+                                has_memory_hotplug.then_some(128)
+                            );
+                            if has_entropy || has_balloon || has_memory_hotplug {
+                                let peer_starter =
+                                    FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+                                let peer_calls = peer_starter.calls();
+                                let mut peer = ProcessVmm::with_starter(
+                                    format!("native-v2-{product}-{transport:?}-same-process-peer"),
+                                    "0.1.0",
+                                    "bangbang",
+                                    peer_starter,
+                                );
+                                peer.pci_enabled = pci_enabled;
+                                peer.handle_action(VmmAction::LoadSnapshot(
                             SnapshotLoadInput::new(
                                 paths.state(),
                                 SnapshotMemoryBackend::new(
@@ -37704,29 +38893,38 @@ mod tests {
                                 "{product} {transport:?} same-process peer load should succeed: {error}"
                             )
                         });
-                            assert_eq!(peer_calls.load(Ordering::SeqCst), 1);
-                            assert_eq!(calls.load(Ordering::SeqCst), 1);
-                            assert_eq!(peer.instance_info().state, InstanceState::Running);
-                            assert_eq!(
-                                destination.instance_info().state,
-                                InstanceState::Paused,
-                                "peer load must not change the first destination"
-                            );
-                            assert_eq!(peer.drive_configs(), destination.drive_configs());
-                            assert_eq!(
-                                peer.controller.pmem_configs(),
-                                destination.controller.pmem_configs()
-                            );
-                            assert_eq!(
-                                peer.controller.entropy_config(),
-                                destination.controller.entropy_config()
-                            );
-                            assert_eq!(
-                                peer.controller.balloon_config(),
-                                destination.controller.balloon_config()
-                            );
+                                assert_eq!(peer_calls.load(Ordering::SeqCst), 1);
+                                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                                assert_eq!(peer.instance_info().state, InstanceState::Running);
+                                assert_eq!(
+                                    destination.instance_info().state,
+                                    InstanceState::Paused,
+                                    "peer load must not change the first destination"
+                                );
+                                assert_eq!(peer.drive_configs(), destination.drive_configs());
+                                assert_eq!(
+                                    peer.controller.pmem_configs(),
+                                    destination.controller.pmem_configs()
+                                );
+                                assert_eq!(
+                                    peer.controller.entropy_config(),
+                                    destination.controller.entropy_config()
+                                );
+                                assert_eq!(
+                                    peer.controller.balloon_config(),
+                                    destination.controller.balloon_config()
+                                );
+                                assert_eq!(
+                                    peer.controller.memory_hotplug_config(),
+                                    destination.controller.memory_hotplug_config()
+                                );
+                                assert_eq!(
+                                    peer.controller.memory_hotplug_status(),
+                                    destination.controller.memory_hotplug_status()
+                                );
+                            }
+                            directory.assert_no_staging();
                         }
-                        directory.assert_no_staging();
                     }
                 }
             }
@@ -37965,7 +39163,9 @@ mod tests {
     #[test]
     #[ignore = "requires the signed native_v2_process integration group"]
     fn signed_native_v2_process_publishes_recaptures_and_resumes_private_pair() {
-        use bangbang_hvf::{HvfArm64StableVcpuDisposition, decode_hvf_snapshot_v2_balloon_state};
+        use bangbang_hvf::{
+            HvfArm64StableVcpuDisposition, decode_hvf_snapshot_v2_memory_hotplug_state,
+        };
         use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
 
         const ARM64_IMAGE_HEADER_SIZE: usize = 64;
@@ -38035,7 +39235,7 @@ mod tests {
                 .expect("native-v2 load should retain structural bytes"),
         )
         .expect("real process native-v2 state should decode structurally");
-        let first_state = decode_hvf_snapshot_v2_balloon_state(&first_structural)
+        let first_state = decode_hvf_snapshot_v2_memory_hotplug_state(&first_structural)
             .expect("real process native-v2 serial state should cross-validate");
         let first_platform = first_state.platform();
         assert_eq!(first_platform.topology().members().len(), 2);
@@ -38075,6 +39275,10 @@ mod tests {
             SnapshotV2DeviceTransportKind::Mmio
         );
         assert_eq!(first_balloon.config().stats_polling_interval_s(), 5);
+        assert!(
+            first_state.memory_hotplug().is_none(),
+            "unconfigured virtio-mem must remain absent from the current profile"
+        );
         drop(first_state);
         drop(first);
         first_directory.assert_no_staging();
@@ -38171,13 +39375,13 @@ mod tests {
             Ok(VmmData::Empty)
         );
         let recaptured = load_native_snapshot_artifacts(&recaptured_paths)
-            .expect("restored exact-2.9 destination should publish again");
+            .expect("restored exact-2.10 destination should publish again");
         assert_eq!(
             recaptured
                 .state()
                 .v2_profile()
                 .expect("recaptured destination should retain a closed profile"),
-            NativeV2SnapshotArtifactProfile::BalloonStateV2_9
+            NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
         );
         recaptured_directory.assert_no_staging();
         drop(paused_destination);
@@ -46226,9 +47430,10 @@ mod tests {
                 "v2-storage-normalize",
                 "v2-storage-transport",
                 "v2-entropy",
-                "v2-balloon-platform",
-                "v2-balloon-compose",
-                "v2-balloon-encode",
+                "v2-memory-hotplug",
+                "v2-memory-hotplug-platform",
+                "v2-memory-hotplug-compose",
+                "v2-memory-hotplug-encode",
                 "v2-recover",
                 "v2-published",
                 "aux-drop",
@@ -46302,12 +47507,12 @@ mod tests {
                 ),
                 &paths,
             )
-            .expect("mutated UART state should publish as complete exact-2.9 state");
+            .expect("mutated UART state should publish as complete exact-2.10 state");
         assert_eq!(outcome.family(), NativeSnapshotArtifactFamily::V2);
         let (candidate, _) = load_native_snapshot_artifacts(&paths)
             .expect("mutated UART pair should load")
             .into_current_v2_candidate()
-            .expect("mutated UART pair should close as exact 2.9");
+            .expect("mutated UART pair should close as exact 2.10");
         assert_eq!(candidate.serial().device().receive_bytes(), b"x");
         assert_eq!(
             events
@@ -46322,9 +47527,10 @@ mod tests {
                 "v2-storage-normalize",
                 "v2-storage-transport",
                 "v2-entropy",
-                "v2-balloon-platform",
-                "v2-balloon-compose",
-                "v2-balloon-encode",
+                "v2-memory-hotplug",
+                "v2-memory-hotplug-platform",
+                "v2-memory-hotplug-compose",
+                "v2-memory-hotplug-encode",
                 "v2-recover",
                 "v2-published",
                 "aux-drop",

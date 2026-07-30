@@ -1356,12 +1356,58 @@ pub(super) fn load_prepared_native_snapshot_memory_file_macos(
                     ),
                 )
             })?;
-            load_snapshot_v2_memory_file(&decoded, memory_file).map_err(|source| {
+            if state.v2_profile().map_err(|source| {
                 load_error(
-                    SnapshotArtifactLoadStage::MemoryLoad,
-                    SnapshotArtifactLoadFailure::MemoryV2(source),
+                    SnapshotArtifactLoadStage::StateDecode,
+                    SnapshotArtifactLoadFailure::NativeState(source),
                 )
-            })?
+            })? == NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
+            {
+                let candidate =
+                    NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
+                        bytes.clone(),
+                    )
+                    .map_err(|source| {
+                        load_error(
+                            SnapshotArtifactLoadStage::StateDecode,
+                            SnapshotArtifactLoadFailure::NativeState(
+                                NativeSnapshotArtifactStateError::CurrentV2Profile(source),
+                            ),
+                        )
+                    })?;
+                match candidate.prepare().map_err(|source| {
+                    load_error(
+                        SnapshotArtifactLoadStage::StateDecode,
+                        SnapshotArtifactLoadFailure::MemoryHotplugPreparation(source),
+                    )
+                })? {
+                    NativeV2MemoryHotplugSnapshotPreparation::Compatible(_) => {
+                        load_snapshot_v2_memory_file(&decoded, memory_file).map_err(|source| {
+                            load_error(
+                                SnapshotArtifactLoadStage::MemoryLoad,
+                                SnapshotArtifactLoadFailure::MemoryV2(source),
+                            )
+                        })?
+                    }
+                    NativeV2MemoryHotplugSnapshotPreparation::Prepared(prepared) => prepared
+                        .materialize_memory_file(memory_file)
+                        .map(MaterializedNativeV2MemoryHotplugSnapshotCandidateState::into_parts)
+                        .map(|(_, _, _, _, _, _, memory)| memory)
+                        .map_err(|source| {
+                            load_error(
+                                SnapshotArtifactLoadStage::MemoryLoad,
+                                SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(source),
+                            )
+                        })?,
+                }
+            } else {
+                load_snapshot_v2_memory_file(&decoded, memory_file).map_err(|source| {
+                    load_error(
+                        SnapshotArtifactLoadStage::MemoryLoad,
+                        SnapshotArtifactLoadFailure::MemoryV2(source),
+                    )
+                })?
+            }
         }
     };
     Ok(LoadedNativeSnapshotArtifacts { state, memory })

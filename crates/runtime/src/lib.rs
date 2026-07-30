@@ -1546,6 +1546,7 @@ impl VmmController {
             serial_config,
             entropy_config,
             balloon_config,
+            memory_hotplug,
             resume_requested,
         ) = commit.into_parts();
         self.machine_config = machine_config;
@@ -1556,6 +1557,10 @@ impl VmmController {
         self.serial_config = serial_config;
         self.entropy_config = entropy_config;
         self.balloon_config = balloon_config;
+        self.memory_hotplug_config = memory_hotplug.map(|projection| projection.config());
+        self.memory_hotplug_requested_size_mib = memory_hotplug
+            .map(|projection| projection.requested_size_mib())
+            .unwrap_or(0);
         self.snapshot_load_history_fresh = false;
         self.instance_info.state = InstanceState::Paused;
         resume_requested
