@@ -1822,9 +1822,9 @@ fn run_production_memory_hotplug_snapshot_continuation(
             );
         }
         for shutdown in [
-            MemoryHotplugSnapshotShutdown::GracefulCancellation,
-            MemoryHotplugSnapshotShutdown::WorkerFirst,
-            MemoryHotplugSnapshotShutdown::LauncherFirst,
+            SnapshotContinuationShutdown::GracefulCancellation,
+            SnapshotContinuationShutdown::WorkerFirst,
+            SnapshotContinuationShutdown::LauncherFirst,
         ] {
             current = run_production_memory_hotplug_paused_shutdown_case(
                 bundle,
@@ -2225,23 +2225,16 @@ fn run_production_memory_hotplug_malformed_case(
     ));
 }
 
-#[derive(Debug, Clone, Copy)]
-enum MemoryHotplugSnapshotShutdown {
-    GracefulCancellation,
-    WorkerFirst,
-    LauncherFirst,
-}
-
 fn run_production_memory_hotplug_paused_shutdown_case(
     bundle: &Path,
     artifacts: SnapshotArtifactSet,
-    shutdown: MemoryHotplugSnapshotShutdown,
+    shutdown: SnapshotContinuationShutdown,
     baseline_sessions: &[PathBuf],
 ) -> SnapshotArtifactSet {
     let name = match shutdown {
-        MemoryHotplugSnapshotShutdown::GracefulCancellation => "memory-hotplug-cancellation",
-        MemoryHotplugSnapshotShutdown::WorkerFirst => "memory-hotplug-worker-first",
-        MemoryHotplugSnapshotShutdown::LauncherFirst => "memory-hotplug-launcher-first",
+        SnapshotContinuationShutdown::GracefulCancellation => "memory-hotplug-cancellation",
+        SnapshotContinuationShutdown::WorkerFirst => "memory-hotplug-worker-first",
+        SnapshotContinuationShutdown::LauncherFirst => "memory-hotplug-launcher-first",
     };
     let fixture = SnapshotContinuationInputGrantFixture::new(name, artifacts, false);
     let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
@@ -2281,20 +2274,20 @@ fn run_production_memory_hotplug_paused_shutdown_case(
     assert_eq!(session_entries().len(), baseline_sessions.len() + 1);
 
     let status = match shutdown {
-        MemoryHotplugSnapshotShutdown::GracefulCancellation => {
+        SnapshotContinuationShutdown::GracefulCancellation => {
             let launcher =
                 i32::try_from(running.child.id()).expect("memory-hotplug launcher PID should fit");
             // SAFETY: The unreaped launcher owns this exact PID.
             assert_eq!(unsafe { libc::kill(launcher, libc::SIGTERM) }, 0);
             running.wait("Paused memory-hotplug restoration cancellation")
         }
-        MemoryHotplugSnapshotShutdown::WorkerFirst => {
+        SnapshotContinuationShutdown::WorkerFirst => {
             let worker = only_worker_pid(&running.child);
             // SAFETY: The worker is the sole live child of the unreaped launcher.
             assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
             running.wait("Paused memory-hotplug worker-first death")
         }
-        MemoryHotplugSnapshotShutdown::LauncherFirst => {
+        SnapshotContinuationShutdown::LauncherFirst => {
             let worker = only_worker_pid(&running.child);
             let worker_exit = ProcessExitWatch::new(worker);
             let launcher =
@@ -2311,16 +2304,16 @@ fn run_production_memory_hotplug_paused_shutdown_case(
         }
     };
     match shutdown {
-        MemoryHotplugSnapshotShutdown::GracefulCancellation => {
+        SnapshotContinuationShutdown::GracefulCancellation => {
             assert!(
                 status.success(),
                 "memory-hotplug cancellation should be graceful"
             );
         }
-        MemoryHotplugSnapshotShutdown::WorkerFirst => {
+        SnapshotContinuationShutdown::WorkerFirst => {
             assert_eq!(status.code(), Some(128 + libc::SIGKILL));
         }
-        MemoryHotplugSnapshotShutdown::LauncherFirst => {
+        SnapshotContinuationShutdown::LauncherFirst => {
             assert_eq!(status.signal(), Some(libc::SIGKILL));
         }
     }
