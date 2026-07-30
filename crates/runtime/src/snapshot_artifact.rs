@@ -62,8 +62,11 @@ use crate::snapshot_memory_hotplug_v2_10::{
     SnapshotV2MemoryHotplugState, SnapshotV2MemoryHotplugStateDecodeError,
 };
 use crate::snapshot_memory_v2::{
-    SnapshotV2MemoryBinding, SnapshotV2MemoryLoadError, SnapshotV2MemoryStateError,
-    decode_snapshot_v2_memory_binding,
+    SnapshotV2MemoryBinding, SnapshotV2MemoryHotplugMaterializationError,
+    SnapshotV2MemoryHotplugMaterializationStage, SnapshotV2MemoryLoadError,
+    SnapshotV2MemoryStateError, decode_snapshot_v2_memory_binding,
+    materialize_snapshot_v2_memory_hotplug_file,
+    materialize_snapshot_v2_memory_hotplug_file_with_cancel,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory_v2::{
@@ -1048,6 +1051,61 @@ impl PreparedNativeV2MemoryHotplugSnapshotCandidateState {
         &self.topology
     }
 
+    /// Materializes the exact candidate from one adopted memory descriptor.
+    pub fn materialize_memory_file(
+        self,
+        file: File,
+    ) -> Result<
+        MaterializedNativeV2MemoryHotplugSnapshotCandidateState,
+        SnapshotV2MemoryHotplugMaterializationError,
+    > {
+        let memory = materialize_snapshot_v2_memory_hotplug_file(&self.topology, file)?;
+        Ok(self.with_materialized_memory(memory))
+    }
+
+    /// Materializes the exact candidate with stable cancellation checkpoints.
+    pub fn materialize_memory_file_with_cancel<C>(
+        self,
+        file: File,
+        is_cancelled: C,
+    ) -> Result<
+        MaterializedNativeV2MemoryHotplugSnapshotCandidateState,
+        SnapshotV2MemoryHotplugMaterializationError,
+    >
+    where
+        C: FnMut(SnapshotV2MemoryHotplugMaterializationStage) -> bool,
+    {
+        let memory = materialize_snapshot_v2_memory_hotplug_file_with_cancel(
+            &self.topology,
+            file,
+            is_cancelled,
+        )?;
+        Ok(self.with_materialized_memory(memory))
+    }
+
+    fn with_materialized_memory(
+        self,
+        memory: GuestMemory,
+    ) -> MaterializedNativeV2MemoryHotplugSnapshotCandidateState {
+        let Self {
+            bytes,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            topology,
+        } = self;
+        MaterializedNativeV2MemoryHotplugSnapshotCandidateState {
+            bytes,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            topology,
+            memory,
+        }
+    }
+
     /// Consumes the candidate into its exact still-detached components.
     pub fn into_parts(self) -> PreparedNativeV2MemoryHotplugSnapshotCandidateParts {
         (
@@ -1071,6 +1129,108 @@ impl fmt::Debug for PreparedNativeV2MemoryHotplugSnapshotCandidateState {
             .field("has_balloon", &self.balloon.is_some())
             .field("state", &REDACTED)
             .field("memory_topology", &REDACTED)
+            .field("serial", &REDACTED)
+            .finish()
+    }
+}
+
+/// One unpublished exact-2.10 candidate with fully materialized mixed memory.
+///
+/// Exact encoded state, optional product components, prepared topology, and
+/// destination memory remain attached until the later platform-planning
+/// boundary consumes this value.
+pub struct MaterializedNativeV2MemoryHotplugSnapshotCandidateState {
+    bytes: Vec<u8>,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+    balloon: Option<SnapshotV2BalloonState>,
+    topology: PreparedSnapshotV2MemoryHotplugTopology,
+    memory: GuestMemory,
+}
+
+/// Owned exact components of one materialized memory-bearing 2.10 candidate.
+pub type MaterializedNativeV2MemoryHotplugSnapshotCandidateParts = (
+    Vec<u8>,
+    Option<SnapshotV2StorageDeviceGraph>,
+    SnapshotV2SerialState,
+    Option<SnapshotV2EntropyState>,
+    Option<SnapshotV2BalloonState>,
+    PreparedSnapshotV2MemoryHotplugTopology,
+    GuestMemory,
+);
+
+impl MaterializedNativeV2MemoryHotplugSnapshotCandidateState {
+    /// Returns the exact candidate compatibility version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+    }
+
+    /// Returns the unchanged immutable encoded state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the exact binding attached to the materialized topology.
+    pub const fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
+        self.topology.memory().binding()
+    }
+
+    /// Returns the optional unchanged profile-3 storage graph.
+    pub const fn device_graph(&self) -> Option<&SnapshotV2StorageDeviceGraph> {
+        self.device_graph.as_ref()
+    }
+
+    /// Returns the required unchanged exact-2.7 serial state.
+    pub const fn serial(&self) -> &SnapshotV2SerialState {
+        &self.serial
+    }
+
+    /// Returns the optional unchanged exact-2.8 entropy state.
+    pub const fn entropy(&self) -> Option<&SnapshotV2EntropyState> {
+        self.entropy.as_ref()
+    }
+
+    /// Returns the optional unchanged exact-2.9 balloon state.
+    pub const fn balloon(&self) -> Option<&SnapshotV2BalloonState> {
+        self.balloon.as_ref()
+    }
+
+    /// Returns the complete prepared kind-1/kind-11 topology.
+    pub const fn topology(&self) -> &PreparedSnapshotV2MemoryHotplugTopology {
+        &self.topology
+    }
+
+    /// Returns the mixed private-base/shared-aperture guest-memory owner.
+    pub const fn memory(&self) -> &GuestMemory {
+        &self.memory
+    }
+
+    /// Consumes the candidate into one inseparable exact-parts handoff.
+    pub fn into_parts(self) -> MaterializedNativeV2MemoryHotplugSnapshotCandidateParts {
+        (
+            self.bytes,
+            self.device_graph,
+            self.serial,
+            self.entropy,
+            self.balloon,
+            self.topology,
+            self.memory,
+        )
+    }
+}
+
+impl fmt::Debug for MaterializedNativeV2MemoryHotplugSnapshotCandidateState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MaterializedNativeV2MemoryHotplugSnapshotCandidateState")
+            .field("version", &self.version())
+            .field("has_storage", &self.device_graph.is_some())
+            .field("has_entropy", &self.entropy.is_some())
+            .field("has_balloon", &self.balloon.is_some())
+            .field("state", &REDACTED)
+            .field("memory_topology", &REDACTED)
+            .field("memory", &REDACTED)
             .field("serial", &REDACTED)
             .finish()
     }

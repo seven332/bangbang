@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
+use std::sync::Weak;
+#[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 
 use crate::memory_dirty::{GuestMemoryDirtyTracker, GuestMemoryDirtyTrackerError};
@@ -488,6 +490,21 @@ pub struct GuestMemory {
     access_profile: GuestMemoryAccessProfile,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct GuestMemoryOwnerProbe {
+    mappings: Vec<Weak<GuestMemoryMapping>>,
+}
+
+#[cfg(test)]
+impl GuestMemoryOwnerProbe {
+    pub(crate) fn all_released(&self) -> bool {
+        self.mappings
+            .iter()
+            .all(|mapping| mapping.strong_count() == 0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuestMemoryAccessProfile {
     Eager,
@@ -564,6 +581,40 @@ impl fmt::Debug for GuestMemoryAtomicU64 {
 }
 
 impl GuestMemory {
+    /// Constructs an internal eager owner before its first region is attached.
+    ///
+    /// This is intentionally narrower than [`GuestMemoryLayout`]: public
+    /// allocation still rejects empty layouts, while transactional builders
+    /// can accumulate reservations and active views without a placeholder
+    /// mapping.
+    pub(crate) fn empty_with_backing(backing: GuestMemoryBacking) -> Self {
+        Self {
+            regions: Vec::new(),
+            shared_reservations: Vec::new(),
+            dirty_tracker: None,
+            backing,
+            access_profile: GuestMemoryAccessProfile::Eager,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_owner_probe(&self) -> Result<GuestMemoryOwnerProbe, TryReserveError> {
+        let mut mappings = Vec::new();
+        mappings.try_reserve_exact(self.regions.len())?;
+        mappings.extend(
+            self.regions
+                .iter()
+                .map(|region| Arc::downgrade(&region.mapping)),
+        );
+        mappings.try_reserve_exact(self.shared_reservations.len())?;
+        mappings.extend(
+            self.shared_reservations
+                .iter()
+                .map(|region| Arc::downgrade(&region.mapping)),
+        );
+        Ok(GuestMemoryOwnerProbe { mappings })
+    }
+
     pub fn allocate(layout: &GuestMemoryLayout) -> Result<Self, GuestMemoryAllocationError> {
         Self::allocate_with_backing(layout, GuestMemoryBacking::Anonymous)
     }

@@ -42,9 +42,11 @@ use std::fs;
 #[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader, Cursor, Seek, SeekFrom, Write};
 #[cfg(target_os = "macos")]
+use std::os::fd::AsFd;
+#[cfg(target_os = "macos")]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "macos")]
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, symlink};
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixListener;
 #[cfg(target_os = "macos")]
@@ -771,6 +773,7 @@ fn exact_minor_nine_candidate_rejects_balloon_cardinality_payload_and_version_mi
 #[cfg(target_os = "macos")]
 #[test]
 fn exact_minor_ten_products_prepare_or_preserve_every_optional_component_product() {
+    let directory = TestDirectory::new("mixed-products");
     let storage_payload = fixture_bytes(include_str!(
         "../snapshot_device_v2_6/fixtures/block-root-mmio.hex"
     ));
@@ -789,33 +792,67 @@ fn exact_minor_ten_products_prepare_or_preserve_every_optional_component_product
     )
     .expect("base exact 2.10 memory should encode internally");
 
+    let inactive_mmio_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex"
+    ));
+    let inactive_mmio_state = SnapshotV2MemoryHotplugState::decode(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &inactive_mmio_payload,
+    )
+    .expect("inactive MMIO exact 2.10 fixture should decode");
+    let active_pci_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/active-pci.hex"
+    ));
+    let active_pci_state = SnapshotV2MemoryHotplugState::decode(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &active_pci_payload,
+    )
+    .expect("active PCI exact 2.10 fixture should decode");
+    let (active_config, active_config_space, active_queue, active_bitmap, active_virtio, _) =
+        active_pci_state.clone().into_parts();
+    let (_, _, _, _, _, inactive_mmio_transport) = inactive_mmio_state.clone().into_parts();
+    let active_mmio_state = SnapshotV2MemoryHotplugState::try_new(
+        active_config,
+        active_config_space,
+        active_queue,
+        active_bitmap,
+        active_virtio,
+        inactive_mmio_transport,
+    )
+    .expect("active MMIO exact 2.10 state should validate");
+    let active_mmio_payload = active_mmio_state
+        .encode(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION)
+        .expect("active MMIO exact 2.10 state should encode");
+
     let mut profiles = Vec::new();
-    for payload in [
-        fixture_bytes(include_str!(
-            "../snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex"
-        )),
-        fixture_bytes(include_str!(
-            "../snapshot_memory_hotplug_v2_10/fixtures/active-pci.hex"
-        )),
+    for (payload, state) in [
+        (inactive_mmio_payload, inactive_mmio_state),
+        (active_mmio_payload, active_mmio_state),
+        (active_pci_payload, active_pci_state),
     ] {
-        let state = SnapshotV2MemoryHotplugState::decode(
-            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
-            &payload,
-        )
-        .expect("exact 2.10 virtio-mem fixture should decode");
         let memory = test_v2_memory_with_hotplug(&state);
+        let mut image = Cursor::new(Vec::new());
         let binding = write_snapshot_v2_memory_image_with_compatibility_version(
             &memory,
-            &mut Cursor::new(Vec::new()),
+            &mut image,
             NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
         )
         .expect("dynamic exact 2.10 memory should encode internally");
-        profiles.push((payload, state, binding));
+        profiles.push((payload, state, binding, image.into_inner()));
     }
 
     let mut prepared_count = 0;
     let mut compatible_count = 0;
-    for (memory_hotplug_payload, memory_hotplug_state, hotplug_binding) in &profiles {
+    let mut materialized_count = 0;
+    for (
+        profile_index,
+        (memory_hotplug_payload, memory_hotplug_state, hotplug_binding, memory_image),
+    ) in profiles.iter().enumerate()
+    {
+        let image_path = directory
+            .path
+            .join(format!("memory-profile-{profile_index}.snap"));
+        fs::write(&image_path, memory_image).expect("profile memory image should write");
         for with_storage in [false, true] {
             for with_entropy in [false, true] {
                 for with_balloon in [false, true] {
@@ -922,6 +959,33 @@ fn exact_minor_ten_products_prepare_or_preserve_every_optional_component_product
                             let prepared_debug = format!("{prepared:?}");
                             assert!(prepared_debug.contains(REDACTED));
                             assert!(!prepared_debug.contains("BANGME2"));
+
+                            let materialized = prepared_memory_hotplug_candidate(bytes.clone())
+                                .materialize_memory_file(
+                                    File::open(&image_path)
+                                        .expect("profile image should open read-only"),
+                                )
+                                .expect("every exact optional product should materialize");
+                            assert_eq!(materialized.bytes(), bytes);
+                            assert_eq!(materialized.memory_binding(), binding);
+                            assert_eq!(materialized.device_graph(), expected_device_graph.as_ref());
+                            assert_eq!(materialized.serial(), &expected_serial);
+                            assert_eq!(materialized.entropy(), expected_entropy.as_ref());
+                            assert_eq!(materialized.balloon(), expected_balloon.as_ref());
+                            assert_eq!(materialized.topology().state(), memory_hotplug_state);
+                            assert!(
+                                materialized
+                                    .memory()
+                                    .dirty_tracker()
+                                    .expect("materialized product should track dirty pages")
+                                    .dirty_pages()
+                                    .expect("materialized product dirty pages should query")
+                                    .is_empty()
+                            );
+                            let materialized_debug = format!("{materialized:?}");
+                            assert!(materialized_debug.contains(REDACTED));
+                            assert!(!materialized_debug.contains("BANGME2"));
+                            materialized_count += 1;
                             prepared_count += 1;
                         } else {
                             let compatible_candidate = preparation
@@ -958,8 +1022,699 @@ fn exact_minor_ten_products_prepare_or_preserve_every_optional_component_product
             }
         }
     }
-    assert_eq!(prepared_count, 16);
-    assert_eq!(compatible_count, 16);
+    assert_eq!(prepared_count, 24);
+    assert_eq!(compatible_count, 24);
+    assert_eq!(materialized_count, 24);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_ten_materialization_preserves_bytes_ownership_and_clean_isolation() {
+    let directory = TestDirectory::new("mixed-memory");
+    let memory_hotplug_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/active-pci.hex"
+    ));
+    let state = SnapshotV2MemoryHotplugState::decode(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &memory_hotplug_payload,
+    )
+    .expect("active exact 2.10 virtio-mem fixture should decode");
+    let mut source_memory = test_v2_memory_with_hotplug(&state);
+    let source_ranges = source_memory
+        .regions()
+        .iter()
+        .map(|region| region.range())
+        .collect::<Vec<_>>();
+    for (region_index, range) in source_ranges.iter().copied().enumerate() {
+        let length = usize::try_from(range.size()).expect("fixture range should fit usize");
+        let bytes = (0..length)
+            .map(|byte_index| {
+                u8::try_from((region_index * 73 + byte_index) % 251)
+                    .expect("fixture byte should fit")
+            })
+            .collect::<Vec<_>>();
+        source_memory
+            .write_slice(&bytes, range.start())
+            .expect("fixture bytes should write");
+    }
+    let source_tracker = source_memory
+        .enable_dirty_tracking()
+        .expect("source fixture dirty tracking should enable");
+    assert_eq!(source_tracker.clear_quiesced(), 1);
+    assert_eq!(source_tracker.clear_quiesced(), 2);
+    source_memory
+        .write_slice(&[0x3c], source_ranges[0].start())
+        .expect("source fixture should record a later dirty epoch");
+    assert_eq!(source_tracker.epoch(), 2);
+    assert!(
+        !source_tracker
+            .dirty_pages()
+            .expect("source fixture dirty pages should query")
+            .is_empty()
+    );
+
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &source_memory,
+        &mut image,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("mixed exact 2.10 memory should encode");
+    let image = image.into_inner();
+    let state_bytes = memory_hotplug_v2_10_state(
+        &binding,
+        None,
+        &[],
+        &[],
+        &[(
+            NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            memory_hotplug_payload.as_slice(),
+        )],
+    )
+    .expect("mixed exact 2.10 state should encode");
+
+    let source_path = directory.path.join("memory.snap");
+    let retained_path = directory.path.join("retained.snap");
+    fs::write(&source_path, &image).expect("source image should write");
+    let adopted = File::open(&source_path).expect("source image should open read-only");
+    fs::rename(&source_path, &retained_path).expect("opened source path should move");
+    fs::write(&source_path, vec![0xa5; image.len()])
+        .expect("replacement path should contain unrelated bytes");
+
+    let first = prepared_memory_hotplug_candidate(state_bytes.clone())
+        .materialize_memory_file(adopted)
+        .expect("adopted descriptor should materialize despite path replacement");
+    let second = prepared_memory_hotplug_candidate(state_bytes.clone())
+        .materialize_memory_file(
+            File::open(&retained_path).expect("retained source should reopen read-only"),
+        )
+        .expect("same image should materialize independently");
+
+    assert_eq!(first.bytes(), state_bytes);
+    assert_eq!(first.memory_binding(), &binding);
+    assert_eq!(first.topology().state(), &state);
+    let aperture = GuestMemoryRange::new(
+        GuestAddress::new(state.config_space().addr()),
+        state.config_space().region_size(),
+    )
+    .expect("fixture aperture should validate");
+    let first_reservation = first
+        .memory()
+        .shared_reservation_capture_state(aperture)
+        .expect("first shared reservation should exist");
+    let second_reservation = second
+        .memory()
+        .shared_reservation_capture_state(aperture)
+        .expect("second shared reservation should exist");
+    assert_ne!(
+        first_reservation.mapping_identity(),
+        second_reservation.mapping_identity()
+    );
+
+    for classified in first.topology().memory().classified_extents() {
+        if classified.class()
+            == crate::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugExtentClass::Base
+        {
+            let region = first
+                .memory()
+                .regions()
+                .iter()
+                .find(|region| region.range() == classified.extent().range())
+                .expect("every base extent should remain an active region");
+            assert_eq!(region.backing(), GuestMemoryRegionBacking::PrivateFile);
+        }
+    }
+    for range in first.topology().plugged_ranges() {
+        let region = first
+            .memory()
+            .regions()
+            .iter()
+            .find(|region| region.range() == *range)
+            .expect("every canonical plugged range should be active");
+        assert_eq!(region.backing(), GuestMemoryRegionBacking::Shared);
+        assert_eq!(
+            region.mapping_identity(),
+            first_reservation.mapping_identity()
+        );
+    }
+
+    for range in source_ranges {
+        let length = usize::try_from(range.size()).expect("fixture range should fit usize");
+        let mut expected = vec![0; length];
+        let mut first_actual = vec![0; length];
+        let mut second_actual = vec![0; length];
+        source_memory
+            .read_slice(&mut expected, range.start())
+            .expect("source bytes should read");
+        first
+            .memory()
+            .read_slice(&mut first_actual, range.start())
+            .expect("first materialized bytes should read");
+        second
+            .memory()
+            .read_slice(&mut second_actual, range.start())
+            .expect("second materialized bytes should read");
+        assert_eq!(first_actual, expected);
+        assert_eq!(second_actual, expected);
+    }
+
+    let offline = (0..state.config_space().region_size() / state.config_space().block_size())
+        .map(|block| {
+            GuestAddress::new(
+                state.config_space().addr() + block * state.config_space().block_size(),
+            )
+        })
+        .find(|address| {
+            !first
+                .topology()
+                .plugged_ranges()
+                .iter()
+                .any(|range| range.contains(*address))
+        })
+        .expect("active fixture should retain at least one offline block");
+    assert!(
+        first.memory().read_slice(&mut [0], offline).is_err(),
+        "offline aperture bytes must remain inaccessible"
+    );
+    for materialized in [&first, &second] {
+        let tracker = materialized
+            .memory()
+            .dirty_tracker()
+            .expect("materialized memory should have a dirty tracker");
+        assert_eq!(tracker.epoch(), 0);
+        assert!(
+            tracker
+                .dirty_pages()
+                .expect("clean dirty pages should query")
+                .is_empty()
+        );
+    }
+
+    let debug = format!("{first:?}");
+    assert!(debug.contains(REDACTED));
+    assert!(!debug.contains("BANGME2"));
+    assert!(!debug.contains(&state.config_space().addr().to_string()));
+
+    let (_, _, _, _, _, first_topology, mut first_memory) = first.into_parts();
+    let base_range = first_topology
+        .memory()
+        .classified_extents()
+        .find(|classified| {
+            classified.class()
+                == crate::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugExtentClass::Base
+        })
+        .expect("mixed fixture should contain base memory")
+        .extent()
+        .range();
+    let mut second_base_before = [0_u8; 1];
+    second
+        .memory()
+        .read_slice(&mut second_base_before, base_range.start())
+        .expect("second base byte should read");
+    first_memory
+        .write_slice(&[second_base_before[0] ^ 0xff], base_range.start())
+        .expect("first private base byte should accept a COW write");
+    let mut second_base_after = [0_u8; 1];
+    second
+        .memory()
+        .read_slice(&mut second_base_after, base_range.start())
+        .expect("second base byte should remain readable");
+    assert_eq!(second_base_after, second_base_before);
+
+    let dynamic_range = *first_topology
+        .plugged_ranges()
+        .first()
+        .expect("active fixture should contain plugged memory");
+    let mut second_before = [0_u8; 1];
+    second
+        .memory()
+        .read_slice(&mut second_before, dynamic_range.start())
+        .expect("second dynamic byte should read");
+    first_memory
+        .write_slice(&[second_before[0] ^ 0xff], dynamic_range.start())
+        .expect("first dynamic byte should mutate independently");
+    let mut second_after = [0_u8; 1];
+    second
+        .memory()
+        .read_slice(&mut second_after, dynamic_range.start())
+        .expect("second dynamic byte should remain readable");
+    assert_eq!(second_after, second_before);
+
+    let tracker = first_memory
+        .dirty_tracker()
+        .expect("first dirty tracker should remain attached");
+    assert!(
+        !tracker
+            .dirty_pages()
+            .expect("dirty pages should query")
+            .is_empty()
+    );
+    assert_eq!(tracker.clear_quiesced(), 1);
+    assert!(
+        tracker
+            .dirty_pages()
+            .expect("cleared dirty pages should query")
+            .is_empty()
+    );
+    first_memory
+        .remove_region(dynamic_range)
+        .expect("dynamic view should remove");
+    assert!(!tracker.contains_range(dynamic_range));
+    first_memory
+        .insert_region(dynamic_range)
+        .expect("dynamic view should reinsert from the retained reservation");
+    assert!(tracker.contains_range(dynamic_range));
+    assert!(
+        !tracker
+            .dirty_pages()
+            .expect("reinserted dirty pages should query")
+            .is_empty(),
+        "reinserted dynamic memory must be conservatively dirty"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_ten_materialization_cancels_at_every_accumulated_stage_and_retries() {
+    let directory = TestDirectory::new("mixed-cancel");
+    let memory_hotplug_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/active-pci.hex"
+    ));
+    let state = SnapshotV2MemoryHotplugState::decode(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &memory_hotplug_payload,
+    )
+    .expect("active exact 2.10 virtio-mem fixture should decode");
+    let memory = test_v2_memory_with_hotplug(&state);
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("mixed exact 2.10 memory should encode");
+    let state_bytes = memory_hotplug_v2_10_state(
+        &binding,
+        None,
+        &[],
+        &[],
+        &[(
+            NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            memory_hotplug_payload.as_slice(),
+        )],
+    )
+    .expect("mixed exact 2.10 state should encode");
+    let source_path = directory.path.join("memory.snap");
+    fs::write(&source_path, image.into_inner()).expect("source image should write");
+
+    let stages = [
+        SnapshotV2MemoryHotplugMaterializationStage::SourceValidation,
+        SnapshotV2MemoryHotplugMaterializationStage::BaseInventory,
+        SnapshotV2MemoryHotplugMaterializationStage::BaseMappings,
+        SnapshotV2MemoryHotplugMaterializationStage::BaseStability,
+        SnapshotV2MemoryHotplugMaterializationStage::ApertureReservation,
+        SnapshotV2MemoryHotplugMaterializationStage::PluggedViews,
+        SnapshotV2MemoryHotplugMaterializationStage::CopyBuffer,
+        SnapshotV2MemoryHotplugMaterializationStage::DynamicCopy,
+        SnapshotV2MemoryHotplugMaterializationStage::DirtyTracking,
+        SnapshotV2MemoryHotplugMaterializationStage::FinalStability,
+        SnapshotV2MemoryHotplugMaterializationStage::Complete,
+    ];
+    for target in stages {
+        let error = prepared_memory_hotplug_candidate(state_bytes.clone())
+            .materialize_memory_file_with_cancel(
+                File::open(&source_path).expect("source should reopen read-only"),
+                |stage| stage == target,
+            )
+            .expect_err("targeted checkpoint should cancel");
+        assert!(matches!(
+            error,
+            SnapshotV2MemoryHotplugMaterializationError::Cancelled { stage }
+                if stage == target
+        ));
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains(&state.config_space().addr().to_string()));
+        assert!(!diagnostic.contains("memory.snap"));
+    }
+
+    for (target, target_occurrence) in [
+        (SnapshotV2MemoryHotplugMaterializationStage::PluggedViews, 2),
+        (SnapshotV2MemoryHotplugMaterializationStage::DynamicCopy, 2),
+    ] {
+        let mut occurrence = 0;
+        let error = prepared_memory_hotplug_candidate(state_bytes.clone())
+            .materialize_memory_file_with_cancel(
+                File::open(&source_path).expect("source should reopen read-only"),
+                |stage| {
+                    if stage == target {
+                        occurrence += 1;
+                    }
+                    stage == target && occurrence == target_occurrence
+                },
+            )
+            .expect_err("later repeated checkpoint should cancel");
+        assert!(matches!(
+            error,
+            SnapshotV2MemoryHotplugMaterializationError::Cancelled { stage }
+                if stage == target
+        ));
+        assert_eq!(occurrence, target_occurrence);
+    }
+
+    prepared_memory_hotplug_candidate(state_bytes)
+        .materialize_memory_file(
+            File::open(&source_path).expect("source should reopen after every rollback"),
+        )
+        .expect("a fresh transaction should succeed after every cancellation");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_ten_materialization_detects_both_mutation_windows_and_short_reads() {
+    let directory = TestDirectory::new("mixed-mutate");
+    let memory_hotplug_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/active-pci.hex"
+    ));
+    let state = SnapshotV2MemoryHotplugState::decode(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &memory_hotplug_payload,
+    )
+    .expect("active exact 2.10 virtio-mem fixture should decode");
+    let memory = test_v2_memory_with_hotplug(&state);
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("mixed exact 2.10 memory should encode");
+    let image = image.into_inner();
+    let state_bytes = memory_hotplug_v2_10_state(
+        &binding,
+        None,
+        &[],
+        &[],
+        &[(
+            NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            memory_hotplug_payload.as_slice(),
+        )],
+    )
+    .expect("mixed exact 2.10 state should encode");
+
+    for target in [
+        SnapshotV2MemoryHotplugMaterializationStage::BaseStability,
+        SnapshotV2MemoryHotplugMaterializationStage::FinalStability,
+    ] {
+        let source_path = directory.path.join(format!("mutation-{target:?}.snap"));
+        fs::write(&source_path, &image).expect("source image should write");
+        let adopted = File::open(&source_path).expect("source should open read-only");
+        let writable = fs::OpenOptions::new()
+            .write(true)
+            .open(&source_path)
+            .expect("test mutation handle should open");
+        let mut mutated = false;
+        let error = prepared_memory_hotplug_candidate(state_bytes.clone())
+            .materialize_memory_file_with_cancel(adopted, |stage| {
+                if stage == target && !mutated {
+                    writable
+                        .write_at(&[0x5a], binding.extents()[0].file_offset())
+                        .expect("test source mutation should write");
+                    mutated = true;
+                }
+                false
+            })
+            .expect_err("source mutation should fail the adjacent stability gate");
+        assert!(matches!(
+            error,
+            SnapshotV2MemoryHotplugMaterializationError::Source { stage, .. }
+                if stage == target
+        ));
+    }
+
+    let short_path = directory.path.join("short.snap");
+    fs::write(&short_path, &image).expect("short-read source should write");
+    let adopted = File::open(&short_path).expect("short-read source should open read-only");
+    let writable = fs::OpenOptions::new()
+        .write(true)
+        .open(&short_path)
+        .expect("truncate handle should open");
+    let mut truncated = false;
+    let error = prepared_memory_hotplug_candidate(state_bytes)
+        .materialize_memory_file_with_cancel(adopted, |stage| {
+            if stage == SnapshotV2MemoryHotplugMaterializationStage::DynamicCopy && !truncated {
+                writable
+                    .set_len(0)
+                    .expect("test source truncation should succeed");
+                truncated = true;
+            }
+            false
+        })
+        .expect_err("truncation during positional copy should fail");
+    assert!(matches!(
+        error,
+        SnapshotV2MemoryHotplugMaterializationError::Read {
+            stage: SnapshotV2MemoryHotplugMaterializationStage::DynamicCopy,
+            kind: io::ErrorKind::UnexpectedEof,
+        }
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_ten_dynamic_only_materialization_uses_no_placeholder_or_private_mapping() {
+    let directory = TestDirectory::new("mixed-dynamic");
+    let memory_hotplug_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex"
+    ));
+    let state = SnapshotV2MemoryHotplugState::decode(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &memory_hotplug_payload,
+    )
+    .expect("inactive exact 2.10 virtio-mem fixture should decode");
+    let memory = test_v2_memory_with_hotplug_data_only(&state);
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("dynamic-only exact 2.10 memory should encode");
+    let state_bytes = memory_hotplug_v2_10_state(
+        &binding,
+        None,
+        &[],
+        &[],
+        &[(
+            NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            memory_hotplug_payload.as_slice(),
+        )],
+    )
+    .expect("dynamic-only exact 2.10 state should encode");
+    let source_path = directory.path.join("memory.snap");
+    fs::write(&source_path, image.into_inner()).expect("source image should write");
+
+    let materialized = prepared_memory_hotplug_candidate(state_bytes)
+        .materialize_memory_file(
+            File::open(&source_path).expect("dynamic-only source should open read-only"),
+        )
+        .expect("dynamic-only topology should materialize");
+    assert_eq!(
+        materialized.memory().regions().len(),
+        materialized.topology().plugged_ranges().len()
+    );
+    assert!(
+        materialized
+            .memory()
+            .regions()
+            .iter()
+            .all(|region| region.backing() == GuestMemoryRegionBacking::Shared)
+    );
+    assert!(
+        materialized
+            .memory()
+            .dirty_tracker()
+            .expect("dynamic-only dirty tracker should exist")
+            .dirty_pages()
+            .expect("dynamic-only dirty pages should query")
+            .is_empty()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_ten_fresh_process_uses_distinct_unlinked_backing_and_independent_bytes() {
+    let directory = TestDirectory::new("mixed-process");
+    let memory_hotplug_payload = fixture_bytes(include_str!(
+        "../snapshot_memory_hotplug_v2_10/fixtures/active-pci.hex"
+    ));
+    let state = SnapshotV2MemoryHotplugState::decode(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        &memory_hotplug_payload,
+    )
+    .expect("active exact 2.10 virtio-mem fixture should decode");
+    let memory = test_v2_memory_with_hotplug(&state);
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("mixed exact 2.10 memory should encode");
+    let state_bytes = memory_hotplug_v2_10_state(
+        &binding,
+        None,
+        &[],
+        &[],
+        &[(
+            NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            memory_hotplug_payload.as_slice(),
+        )],
+    )
+    .expect("mixed exact 2.10 state should encode");
+    let state_path = directory.path.join("state.snap");
+    let memory_path = directory.path.join("memory.snap");
+    fs::write(&state_path, &state_bytes).expect("child state should write");
+    fs::write(&memory_path, image.into_inner()).expect("child memory should write");
+
+    let parent = prepared_memory_hotplug_candidate(state_bytes)
+        .materialize_memory_file(
+            File::open(&memory_path).expect("parent source should open read-only"),
+        )
+        .expect("parent memory should materialize");
+    let aperture = GuestMemoryRange::new(
+        GuestAddress::new(state.config_space().addr()),
+        state.config_space().region_size(),
+    )
+    .expect("fixture aperture should validate");
+    let parent_metadata = shared_reservation_metadata(parent.memory(), aperture);
+    assert_eq!(parent_metadata.nlink(), 0);
+
+    let executable = std::env::current_exe().expect("test executable should resolve");
+    let mut child = Command::new(executable)
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("snapshot_artifact::tests::mixed_memory_materialization_child")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env("BANGBANG_MIXED_STATE", &state_path)
+        .env("BANGBANG_MIXED_MEMORY", &memory_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("mixed-memory child should spawn");
+    let mut child_stdin = child.stdin.take().expect("child stdin should exist");
+    let mut child_stdout = BufReader::new(child.stdout.take().expect("child stdout should exist"));
+    let child_identity = loop {
+        let mut line = String::new();
+        let count = child_stdout
+            .read_line(&mut line)
+            .expect("child ready output should read");
+        assert_ne!(count, 0, "child exited before publishing its identity");
+        let Some(marker) = line.find("mixed-child:ready ") else {
+            continue;
+        };
+        let values = line[marker + "mixed-child:ready ".len()..]
+            .split_whitespace()
+            .map(|value| value.parse::<u64>().expect("child identity should parse"))
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 4);
+        break (values[0], values[1], values[2], values[3]);
+    };
+    assert_eq!(child_identity.2, 0);
+    assert_ne!(
+        (parent_metadata.dev(), parent_metadata.ino()),
+        (child_identity.0, child_identity.1),
+        "concurrently live fresh-process reservations must be different unlinked objects"
+    );
+    assert_eq!(child_identity.3, 0);
+
+    let (_, _, _, _, _, topology, mut parent_memory) = parent.into_parts();
+    let dynamic_start = topology
+        .plugged_ranges()
+        .first()
+        .expect("active fixture should contain plugged memory")
+        .start();
+    parent_memory
+        .write_slice(&[0x5a], dynamic_start)
+        .expect("parent destination byte should mutate");
+    child_stdin
+        .write_all(&[1])
+        .expect("child continuation signal should write");
+    drop(child_stdin);
+    let mut remainder = String::new();
+    child_stdout
+        .read_to_string(&mut remainder)
+        .expect("child completion output should read");
+    let status = child.wait().expect("mixed-memory child should wait");
+    assert!(status.success(), "{remainder}");
+    assert!(
+        remainder.contains("mixed-child:byte 0"),
+        "child destination should not observe parent mutation: {remainder}"
+    );
+    let mut source_byte = [0_u8; 1];
+    File::open(&memory_path)
+        .expect("source should reopen read-only")
+        .read_exact_at(&mut source_byte, binding.extents()[1].file_offset())
+        .expect("source sentinel should read");
+    assert_eq!(source_byte, [0]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "launched by the mixed-memory fresh-process parent"]
+fn mixed_memory_materialization_child() {
+    let Some(state_path) = std::env::var_os("BANGBANG_MIXED_STATE") else {
+        return;
+    };
+    let Some(memory_path) = std::env::var_os("BANGBANG_MIXED_MEMORY") else {
+        return;
+    };
+    let state_bytes = fs::read(state_path).expect("child state should read");
+    let materialized = prepared_memory_hotplug_candidate(state_bytes)
+        .materialize_memory_file(
+            File::open(memory_path).expect("child source should open read-only"),
+        )
+        .expect("child memory should materialize");
+    let config = materialized.topology().state().config_space();
+    let aperture = GuestMemoryRange::new(GuestAddress::new(config.addr()), config.region_size())
+        .expect("child aperture should validate");
+    let metadata = shared_reservation_metadata(materialized.memory(), aperture);
+    let dynamic_start = materialized
+        .topology()
+        .plugged_ranges()
+        .first()
+        .expect("child should contain plugged memory")
+        .start();
+    let mut byte = [0_u8; 1];
+    materialized
+        .memory()
+        .read_slice(&mut byte, dynamic_start)
+        .expect("child destination byte should read");
+    println!(
+        "mixed-child:ready {} {} {} {}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.nlink(),
+        byte[0]
+    );
+    io::stdout()
+        .flush()
+        .expect("child ready signal should flush");
+    let mut start = [0_u8; 1];
+    io::stdin()
+        .read_exact(&mut start)
+        .expect("parent continuation signal should arrive");
+    materialized
+        .memory()
+        .read_slice(&mut byte, dynamic_start)
+        .expect("child destination byte should remain readable");
+    println!("mixed-child:byte {}", byte[0]);
 }
 
 #[cfg(target_os = "macos")]
@@ -3775,6 +4530,41 @@ fn memory_hotplug_v2_10_state(
         &components,
     )
     .map_err(|source| source.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn prepared_memory_hotplug_candidate(
+    bytes: Vec<u8>,
+) -> PreparedNativeV2MemoryHotplugSnapshotCandidateState {
+    let preparation =
+        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(bytes)
+            .expect("exact 2.10 candidate should validate")
+            .prepare()
+            .expect("exact 2.10 topology should prepare");
+    match preparation {
+        NativeV2MemoryHotplugSnapshotPreparation::Prepared(candidate) => Some(candidate),
+        NativeV2MemoryHotplugSnapshotPreparation::Compatible(_) => None,
+    }
+    .expect("kind-11 fixture should produce a prepared candidate")
+}
+
+#[cfg(target_os = "macos")]
+fn shared_reservation_metadata(memory: &GuestMemory, aperture: GuestMemoryRange) -> fs::Metadata {
+    let reservation = memory
+        .shared_export_regions()
+        .find(|region| region.range() == aperture)
+        .expect("shared aperture reservation should be exportable");
+    let backing = reservation
+        .try_clone_shared_backing()
+        .expect("shared reservation descriptor should duplicate")
+        .expect("reservation should be descriptor-backed");
+    let descriptor = backing
+        .as_fd()
+        .try_clone_to_owned()
+        .expect("reservation descriptor should duplicate for inspection");
+    File::from(descriptor)
+        .metadata()
+        .expect("reservation descriptor metadata should inspect")
 }
 
 #[cfg(target_os = "macos")]

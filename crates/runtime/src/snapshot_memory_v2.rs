@@ -26,6 +26,14 @@ use crate::snapshot_format_v2::{
 };
 use crate::snapshot_memory_hotplug_v2_10::NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION;
 
+mod materialize;
+
+pub use materialize::{
+    SnapshotV2MemoryHotplugMaterializationError, SnapshotV2MemoryHotplugMaterializationStage,
+    materialize_snapshot_v2_memory_hotplug_file,
+    materialize_snapshot_v2_memory_hotplug_file_with_cancel,
+};
+
 /// Fixed magic shared by the v2 state binding and memory-image prefix.
 pub const NATIVE_V2_MEMORY_MAGIC: [u8; 8] = *b"BANGM2A\0";
 
@@ -842,20 +850,7 @@ fn load_snapshot_v2_memory_binding_from_file_with_hook(
     file: File,
     mut hook: impl FnMut(SnapshotV2MemoryLoadStage, &File),
 ) -> Result<GuestMemory, SnapshotV2MemoryLoadError> {
-    let before = inspect_file(&file)?;
-    if before.length != binding.file_length() {
-        return Err(SnapshotV2MemoryLoadError::FileLengthMismatch);
-    }
-    hook(SnapshotV2MemoryLoadStage::Preflight, &file);
-
-    verify_memory_metadata(binding, &file)?;
-    hook(SnapshotV2MemoryLoadStage::Metadata, &file);
-    let after_metadata = inspect_file(&file)?;
-    if after_metadata != before {
-        return Err(SnapshotV2MemoryLoadError::SourceChanged);
-    }
-
-    let file = Arc::new(file);
+    let source = ValidatedSnapshotV2MemorySource::new_with_hook(binding, file, &mut hook)?;
     let mut ranges = Vec::new();
     ranges
         .try_reserve_exact(binding.extents().len())
@@ -868,17 +863,59 @@ fn load_snapshot_v2_memory_binding_from_file_with_hook(
     );
     let memory = GuestMemory::from_private_file_ranges(
         &ranges,
-        Arc::clone(&file),
+        Arc::clone(source.file()),
         GuestMemoryBacking::Anonymous,
     )
     .map_err(|source| SnapshotV2MemoryLoadError::Mapping { source })?;
-    hook(SnapshotV2MemoryLoadStage::Mapping, file.as_ref());
-    let after_mapping = inspect_file(file.as_ref())?;
-    if after_mapping != before {
+    hook(SnapshotV2MemoryLoadStage::Mapping, source.file().as_ref());
+    if let Err(error) = source.verify_unchanged() {
         drop(memory);
-        return Err(SnapshotV2MemoryLoadError::SourceChanged);
+        return Err(error);
     }
     Ok(memory)
+}
+
+struct ValidatedSnapshotV2MemorySource {
+    file: Arc<File>,
+    facts: FileFacts,
+}
+
+impl ValidatedSnapshotV2MemorySource {
+    fn new_with_hook(
+        binding: &SnapshotV2MemoryBinding,
+        file: File,
+        mut hook: impl FnMut(SnapshotV2MemoryLoadStage, &File),
+    ) -> Result<Self, SnapshotV2MemoryLoadError> {
+        let facts = inspect_file(&file)?;
+        if facts.length != binding.file_length() {
+            return Err(SnapshotV2MemoryLoadError::FileLengthMismatch);
+        }
+        hook(SnapshotV2MemoryLoadStage::Preflight, &file);
+
+        verify_memory_metadata(binding, &file)?;
+        hook(SnapshotV2MemoryLoadStage::Metadata, &file);
+        let after_metadata = inspect_file(&file)?;
+        if after_metadata != facts {
+            return Err(SnapshotV2MemoryLoadError::SourceChanged);
+        }
+
+        Ok(Self {
+            file: Arc::new(file),
+            facts,
+        })
+    }
+
+    fn file(&self) -> &Arc<File> {
+        &self.file
+    }
+
+    fn verify_unchanged(&self) -> Result<(), SnapshotV2MemoryLoadError> {
+        if inspect_file(self.file.as_ref())? == self.facts {
+            Ok(())
+        } else {
+            Err(SnapshotV2MemoryLoadError::SourceChanged)
+        }
+    }
 }
 
 /// Verifies one transaction-owned native-v2 staging descriptor without mapping it.
