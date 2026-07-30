@@ -3665,30 +3665,37 @@ pub struct RestoredHvfSnapshotV2MemoryHotplugMmioOwners {
 }
 
 impl RestoredHvfSnapshotV2MemoryHotplugMmioOwners {
+    /// Returns the complete Paused destination session.
     pub const fn session(&self) -> &OwnedHvfArm64BootSession {
         &self.session
     }
 
+    /// Returns the exact normalized portable virtio-mem state.
     pub const fn state(&self) -> &SnapshotV2MemoryHotplugState {
         &self.state
     }
 
+    /// Returns the exact public memory-hotplug controller projection.
     pub const fn controller(&self) -> SnapshotV2MemoryHotplugControllerProjection {
         self.controller
     }
 
+    /// Returns restored storage configuration when present.
     pub const fn storage_configs(&self) -> Option<&CaptureReadyStorageConfigs> {
         self.storage_configs.as_ref()
     }
 
+    /// Returns the exact public entropy configuration when present.
     pub const fn entropy_config(&self) -> Option<EntropyConfig> {
         self.entropy_config
     }
 
+    /// Returns the exact public balloon configuration when present.
     pub const fn balloon_config(&self) -> Option<BalloonConfig> {
         self.balloon_config
     }
 
+    /// Consumes the complete unpublished owner graph.
     pub fn into_parts(
         self,
     ) -> (
@@ -3889,10 +3896,12 @@ impl HvfSnapshotV2MemoryHotplugMmioRestoreError {
         }
     }
 
+    /// Returns the aggregate transition at which reconstruction stopped.
     pub const fn stage(&self) -> HvfSnapshotV2MemoryHotplugMmioRestoreStage {
         self.stage
     }
 
+    /// Returns whether reverse cleanup did not complete.
     pub fn has_incomplete_cleanup(&self) -> bool {
         self.cleanup.is_some()
             || matches!(
@@ -3917,6 +3926,7 @@ impl HvfSnapshotV2MemoryHotplugMmioRestoreError {
             )
     }
 
+    /// Returns whether retry safety cannot be proven.
     pub fn is_terminal(&self) -> bool {
         self.committed
             || self.has_incomplete_cleanup()

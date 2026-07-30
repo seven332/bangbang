@@ -561,34 +561,43 @@ pub struct PreparedSnapshotV2MemoryHotplugMmioHandler {
 }
 
 impl PreparedSnapshotV2MemoryHotplugMmioHandler {
+    /// Returns the exact normalized portable state this handler must retain.
     pub const fn expected_state(&self) -> &SnapshotV2MemoryHotplugState {
         &self.expected_state
     }
 
+    /// Returns the public controller projection reconstructed with the device.
     pub const fn controller(&self) -> SnapshotV2MemoryHotplugControllerProjection {
         self.controller
     }
 
+    /// Returns canonical shared-aperture ranges retained as plugged memory.
     pub fn plugged_ranges(&self) -> &[GuestMemoryRange] {
         &self.plugged_ranges
     }
 
+    /// Returns the descriptor, available, and used ranges for an active queue.
     pub const fn queue_ranges(&self) -> Option<[GuestMemoryRange; 3]> {
         self.queue_ranges
     }
 
+    /// Returns the exact retained MMIO region.
     pub const fn region(&self) -> MmioRegion {
         self.region
     }
 
+    /// Returns the exact retained guest interrupt line.
     pub const fn interrupt_line(&self) -> GuestInterruptLine {
         self.interrupt_line
     }
 
+    /// Returns the fully restored, still-unpublished register handler.
     pub const fn handler(&self) -> &VirtioMemMmioHandler {
         &self.handler
     }
 
+    /// Consumes the value into portable state, controller and memory proofs,
+    /// placement, and the inert handler.
     pub fn into_parts(
         self,
     ) -> (
@@ -624,15 +633,25 @@ impl fmt::Debug for PreparedSnapshotV2MemoryHotplugMmioHandler {
 /// Failure while materializing a checked topology as an inert MMIO handler.
 #[doc(hidden)]
 pub enum SnapshotV2MemoryHotplugMmioHandlerError {
+    /// The checked topology selects PCI rather than MMIO.
     WrongTransport,
+    /// The retained active queue cursors could not be reconstructed.
     QueueContinuation(VirtioMemQueueBuildError),
+    /// The retained active queue does not resolve against destination memory.
     QueueMemory(VirtioMemQueueCaptureError),
+    /// The canonical plugged-range device inventory could not be rebuilt.
     Device,
+    /// The retained common MMIO transport state is invalid.
     RetainedTransport(SnapshotV2RootTransportRestoreError),
+    /// The exact virtio-mem register handler could not be constructed.
     Handler(VirtioMmioRegisterHandlerError),
+    /// The retained transport state could not be applied to the handler.
     Transport,
+    /// The restored live handler could not be captured.
     Capture(VirtioMemDeviceCaptureError),
+    /// The restored handler capture could not be normalized.
     Normalize(SnapshotV2MemoryHotplugStateCaptureError),
+    /// The normalized restored handler differs from the decoded input.
     StateMismatch,
 }
 
