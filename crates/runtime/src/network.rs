@@ -543,6 +543,25 @@ pub struct NetworkInterfaceConfig {
 }
 
 impl NetworkInterfaceConfig {
+    /// Fallibly copies this validated configuration without reparsing typed
+    /// guest state.
+    pub fn try_clone(&self) -> Result<Self, TryReserveError> {
+        let mut iface_id = String::new();
+        iface_id.try_reserve_exact(self.iface_id.len())?;
+        iface_id.push_str(&self.iface_id);
+        let mut host_dev_name = String::new();
+        host_dev_name.try_reserve_exact(self.host_dev_name.len())?;
+        host_dev_name.push_str(&self.host_dev_name);
+        Ok(Self {
+            iface_id,
+            host_dev_name,
+            guest_mac: self.guest_mac,
+            mtu: self.mtu,
+            rx_rate_limiter: self.rx_rate_limiter,
+            tx_rate_limiter: self.tx_rate_limiter,
+        })
+    }
+
     pub fn iface_id(&self) -> &str {
         &self.iface_id
     }
