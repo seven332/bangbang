@@ -9,19 +9,23 @@ use std::fmt;
 use std::iter::FusedIterator;
 
 use crate::interrupt::GuestInterruptLine;
-use crate::memory::{GuestAddress, GuestMemoryRange, aarch64};
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryRange, aarch64};
 use crate::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
     VIRTIO_FEATURE_VERSION_1, VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_DEVICE_ID,
-    VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE, VIRTIO_MEM_QUEUE_SIZE, VirtioMemConfigSpace,
-    VirtioMemDeviceCaptureState, VirtioMemMmioCaptureState, VirtioMemPciCaptureState,
+    VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE, VIRTIO_MEM_QUEUE_SIZE, VIRTIO_MEM_QUEUE_SIZES,
+    VirtioMemConfigSpace, VirtioMemDevice, VirtioMemDeviceCaptureError,
+    VirtioMemDeviceCaptureState, VirtioMemMmioCaptureState, VirtioMemMmioHandler,
+    VirtioMemPciCaptureState, VirtioMemQueue, VirtioMemQueueBuildError, VirtioMemQueueCaptureError,
 };
 use crate::mmio::MmioRegion;
 use crate::pci::PciSbdf;
 use crate::snapshot_device_v2::{
-    SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport, SnapshotV2VirtioState,
+    SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport,
+    SnapshotV2RootTransportRestoreError, SnapshotV2VirtioState,
     capture_mmio_common_for_device_with_config_status_gate, capture_mmio_transport,
     capture_pci_common_for_device, capture_pci_transport_parts,
+    restore_mmio_transport_state_for_device_with_config_status_gate,
 };
 use crate::snapshot_device_v2_5::{
     queue_ranges, validate_mmio, validate_pci, validate_virtio_with_queue_size,
@@ -29,6 +33,7 @@ use crate::snapshot_device_v2_5::{
 use crate::snapshot_format::SnapshotFormatVersion;
 use crate::snapshot_memory_v2::{SnapshotV2MemoryBinding, SnapshotV2MemoryExtent};
 use crate::storage_capture::StorageDeviceOrigin;
+use crate::virtio_mmio::{VirtioMmioQueueState, VirtioMmioRegisterHandlerError};
 
 mod codec;
 
@@ -420,6 +425,114 @@ impl PreparedSnapshotV2MemoryHotplugTopology {
             self.controller,
         )
     }
+
+    /// Consumes one checked MMIO topology into a complete inert register
+    /// handler against the destination mixed-memory owner.
+    ///
+    /// The returned value owns no dispatcher registration, notifier,
+    /// interrupt route, platform slot, mapper, metrics registry, or VM
+    /// authority.
+    #[doc(hidden)]
+    pub fn into_mmio_handler(
+        self,
+        destination_memory: &GuestMemory,
+    ) -> Result<PreparedSnapshotV2MemoryHotplugMmioHandler, SnapshotV2MemoryHotplugMmioHandlerError>
+    {
+        let Self {
+            memory: _,
+            plugged_ranges,
+            queue_ranges,
+            state,
+            controller,
+        } = self;
+        let SnapshotV2DeviceTransport::Mmio(mmio) = state.transport() else {
+            return Err(SnapshotV2MemoryHotplugMmioHandlerError::WrongTransport);
+        };
+        let queue_state = state.virtio().queues().first().ok_or(
+            SnapshotV2MemoryHotplugMmioHandlerError::QueueContinuation(
+                VirtioMemQueueBuildError::QueueNotReady,
+            ),
+        )?;
+        let transport_queue = VirtioMmioQueueState::from_parts(
+            queue_state.max_size(),
+            queue_state.size(),
+            queue_state.ready(),
+            queue_state.descriptor_table(),
+            queue_state.driver_ring(),
+            queue_state.device_ring(),
+        );
+        let active_queue = state
+            .active_queue()
+            .map(|cursor| {
+                let queue = VirtioMemQueue::from_snapshot_state(
+                    &transport_queue,
+                    cursor.next_available(),
+                    cursor.next_used(),
+                )
+                .map_err(SnapshotV2MemoryHotplugMmioHandlerError::QueueContinuation)?;
+                queue
+                    .validate_snapshot_state(&transport_queue, destination_memory)
+                    .map_err(SnapshotV2MemoryHotplugMmioHandlerError::QueueMemory)?;
+                Ok(queue)
+            })
+            .transpose()?;
+        let activation_is_active = active_queue.is_some();
+        let device = VirtioMemDevice::from_snapshot_parts(
+            active_queue,
+            state
+                .plugged_ranges()
+                .map(|range| (range.start_block(), range.block_count())),
+        )
+        .map_err(|_| SnapshotV2MemoryHotplugMmioHandlerError::Device)?;
+        let retained = restore_mmio_transport_state_for_device_with_config_status_gate(
+            VIRTIO_MEM_DEVICE_ID,
+            state.virtio(),
+            mmio,
+            true,
+        )
+        .map_err(SnapshotV2MemoryHotplugMmioHandlerError::RetainedTransport)?;
+        let registers = *retained.device_registers();
+        let mut handler =
+            VirtioMemMmioHandler::with_vendor_id_and_config_generation_and_device_config_and_activation(
+                registers.device_id(),
+                registers.vendor_id(),
+                registers.device_features(),
+                registers.config_generation(),
+                &VIRTIO_MEM_QUEUE_SIZES,
+                state.config_space(),
+                device,
+            )
+            .map_err(SnapshotV2MemoryHotplugMmioHandlerError::Handler)?;
+        handler
+            .restore_transport_state(&retained, activation_is_active)
+            .map_err(|_| SnapshotV2MemoryHotplugMmioHandlerError::Transport)?;
+
+        let region = mmio.region();
+        let interrupt_line = mmio.interrupt_line();
+        let captured = handler
+            .capture_memory_hotplug_state(state.config(), destination_memory)
+            .map_err(SnapshotV2MemoryHotplugMmioHandlerError::Capture)?;
+        let normalized = SnapshotV2MemoryHotplugState::try_from_mmio_capture(
+            state.config(),
+            region,
+            interrupt_line,
+            &captured,
+        )
+        .map_err(SnapshotV2MemoryHotplugMmioHandlerError::Normalize)?;
+        if normalized != state {
+            return Err(SnapshotV2MemoryHotplugMmioHandlerError::StateMismatch);
+        }
+
+        Ok(PreparedSnapshotV2MemoryHotplugMmioHandler {
+            expected_state: state,
+            controller,
+            plugged_ranges,
+            queue_ranges,
+            region,
+            interrupt_line,
+            handler,
+        })
+    }
 }
 
 impl fmt::Debug for PreparedSnapshotV2MemoryHotplugTopology {
@@ -432,6 +545,131 @@ impl fmt::Debug for PreparedSnapshotV2MemoryHotplugTopology {
             .field("has_queue_ranges", &self.queue_ranges.is_some())
             .field("topology", &REDACTED)
             .finish()
+    }
+}
+
+/// One checked, complete, and still-unpublished MMIO virtio-mem handler.
+#[doc(hidden)]
+pub struct PreparedSnapshotV2MemoryHotplugMmioHandler {
+    expected_state: SnapshotV2MemoryHotplugState,
+    controller: SnapshotV2MemoryHotplugControllerProjection,
+    plugged_ranges: Vec<GuestMemoryRange>,
+    queue_ranges: Option<[GuestMemoryRange; 3]>,
+    region: MmioRegion,
+    interrupt_line: GuestInterruptLine,
+    handler: VirtioMemMmioHandler,
+}
+
+impl PreparedSnapshotV2MemoryHotplugMmioHandler {
+    pub const fn expected_state(&self) -> &SnapshotV2MemoryHotplugState {
+        &self.expected_state
+    }
+
+    pub const fn controller(&self) -> SnapshotV2MemoryHotplugControllerProjection {
+        self.controller
+    }
+
+    pub fn plugged_ranges(&self) -> &[GuestMemoryRange] {
+        &self.plugged_ranges
+    }
+
+    pub const fn queue_ranges(&self) -> Option<[GuestMemoryRange; 3]> {
+        self.queue_ranges
+    }
+
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    pub const fn interrupt_line(&self) -> GuestInterruptLine {
+        self.interrupt_line
+    }
+
+    pub const fn handler(&self) -> &VirtioMemMmioHandler {
+        &self.handler
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        SnapshotV2MemoryHotplugState,
+        SnapshotV2MemoryHotplugControllerProjection,
+        Vec<GuestMemoryRange>,
+        Option<[GuestMemoryRange; 3]>,
+        MmioRegion,
+        GuestInterruptLine,
+        VirtioMemMmioHandler,
+    ) {
+        (
+            self.expected_state,
+            self.controller,
+            self.plugged_ranges,
+            self.queue_ranges,
+            self.region,
+            self.interrupt_line,
+            self.handler,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2MemoryHotplugMmioHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2MemoryHotplugMmioHandler")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Failure while materializing a checked topology as an inert MMIO handler.
+#[doc(hidden)]
+pub enum SnapshotV2MemoryHotplugMmioHandlerError {
+    WrongTransport,
+    QueueContinuation(VirtioMemQueueBuildError),
+    QueueMemory(VirtioMemQueueCaptureError),
+    Device,
+    RetainedTransport(SnapshotV2RootTransportRestoreError),
+    Handler(VirtioMmioRegisterHandlerError),
+    Transport,
+    Capture(VirtioMemDeviceCaptureError),
+    Normalize(SnapshotV2MemoryHotplugStateCaptureError),
+    StateMismatch,
+}
+
+impl fmt::Debug for SnapshotV2MemoryHotplugMmioHandlerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2MemoryHotplugMmioHandlerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::WrongTransport => "native-v2 virtio-mem plan does not select MMIO",
+            Self::QueueContinuation(_) => "native-v2 virtio-mem queue continuation is invalid",
+            Self::QueueMemory(_) => "native-v2 virtio-mem queue memory is invalid",
+            Self::Device => "native-v2 virtio-mem device reconstruction failed",
+            Self::RetainedTransport(_) => "native-v2 virtio-mem retained MMIO transport is invalid",
+            Self::Handler(_) => "native-v2 virtio-mem MMIO handler construction failed",
+            Self::Transport => "native-v2 virtio-mem MMIO transport restoration failed",
+            Self::Capture(_) => "native-v2 virtio-mem restored handler capture failed",
+            Self::Normalize(_) => "native-v2 virtio-mem restored handler normalization failed",
+            Self::StateMismatch => "native-v2 virtio-mem restored handler state diverged",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2MemoryHotplugMmioHandlerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueContinuation(source) => Some(source),
+            Self::QueueMemory(source) => Some(source),
+            Self::RetainedTransport(source) => Some(source),
+            Self::Handler(source) => Some(source),
+            Self::Capture(source) => Some(source),
+            Self::Normalize(source) => Some(source),
+            Self::WrongTransport | Self::Device | Self::Transport | Self::StateMismatch => None,
+        }
     }
 }
 

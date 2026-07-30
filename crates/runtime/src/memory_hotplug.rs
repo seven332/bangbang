@@ -640,6 +640,13 @@ pub struct VirtioMemMmioDeviceRegistration {
 }
 
 impl VirtioMemMmioDeviceRegistration {
+    /// Reconstructs registration metadata for a checked, already retained
+    /// MMIO region without publishing it.
+    #[doc(hidden)]
+    pub const fn from_restored(region: MmioRegion) -> Self {
+        Self { region }
+    }
+
     pub const fn region(self) -> MmioRegion {
         self.region
     }
@@ -1995,17 +2002,26 @@ impl VirtioMemQueue {
     pub fn from_mmio_queue_state(
         queue: &VirtioMmioQueueState,
     ) -> Result<Self, VirtioMemQueueBuildError> {
+        Self::from_snapshot_state(queue, 0, 0)
+    }
+
+    pub(crate) fn from_snapshot_state(
+        queue: &VirtioMmioQueueState,
+        next_available: u16,
+        next_used: u16,
+    ) -> Result<Self, VirtioMemQueueBuildError> {
         if !queue.ready() {
             return Err(VirtioMemQueueBuildError::QueueNotReady);
         }
 
-        let available = VirtqueueAvailableRing::new(
+        let available = VirtqueueAvailableRing::with_next_avail(
             queue.descriptor_table(),
             queue.driver_ring(),
             queue.size(),
+            next_available,
         )
         .map_err(|source| VirtioMemQueueBuildError::AvailableRing { source })?;
-        let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
+        let used = VirtqueueUsedRing::with_next_used(queue.device_ring(), queue.size(), next_used)
             .map_err(|source| VirtioMemQueueBuildError::UsedRing { source })?;
 
         Ok(Self { available, used })
@@ -2088,6 +2104,14 @@ impl VirtioMemQueue {
             next_available: self.available.next_avail(),
             next_used: self.used.next_used(),
         })
+    }
+
+    pub(crate) fn validate_snapshot_state(
+        &self,
+        transport: &VirtioMmioQueueState,
+        memory: &GuestMemory,
+    ) -> Result<(), VirtioMemQueueCaptureError> {
+        self.capture_state(transport, memory).map(|_| ())
     }
 
     #[cfg(test)]
@@ -2897,6 +2921,35 @@ impl VirtioMemDevice {
         }
     }
 
+    pub(crate) fn from_snapshot_parts<I>(
+        active_queue: Option<VirtioMemQueue>,
+        plugged_ranges: I,
+    ) -> Result<Self, VirtioMemDeviceRestoreError>
+    where
+        I: ExactSizeIterator<Item = (u64, u64)>,
+    {
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(plugged_ranges.len())
+            .map_err(|source| VirtioMemDeviceRestoreError::Allocation { source })?;
+        let mut previous_end = None;
+        for (range_index, (start_block, block_count)) in plugged_ranges.enumerate() {
+            let range = VirtioMemBlockRange::new(start_block, block_count)
+                .ok_or(VirtioMemDeviceRestoreError::PluggedRangeInvalid { range_index })?;
+            if previous_end.is_some_and(|end| range.start() <= end) {
+                return Err(VirtioMemDeviceRestoreError::PluggedRangeInvalid { range_index });
+            }
+            previous_end = Some(range.end());
+            ranges.push(range);
+        }
+
+        Ok(Self {
+            active_queue,
+            plugged_blocks: VirtioMemPluggedBlocks { ranges },
+            metrics: SharedMemoryHotplugDeviceMetrics::default(),
+        })
+    }
+
     pub fn shared_metrics(&self) -> SharedMemoryHotplugDeviceMetrics {
         self.metrics.clone()
     }
@@ -3162,6 +3215,37 @@ impl VirtioMemDevice {
 impl Default for VirtioMemDevice {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum VirtioMemDeviceRestoreError {
+    Allocation { source: TryReserveError },
+    PluggedRangeInvalid { range_index: usize },
+}
+
+impl fmt::Display for VirtioMemDeviceRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Allocation { .. } => {
+                formatter.write_str("failed to reserve restored virtio-mem plugged ranges")
+            }
+            Self::PluggedRangeInvalid { range_index } => {
+                write!(
+                    formatter,
+                    "restored virtio-mem plugged range {range_index} is invalid"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioMemDeviceRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Allocation { source } => Some(source),
+            Self::PluggedRangeInvalid { .. } => None,
+        }
     }
 }
 

@@ -703,7 +703,7 @@ fn normalize_capture_ranges(ranges: &mut Vec<GuestMemoryRange>) -> bool {
 /// The plan classifies private Base memory as static HVF mappings and active
 /// shared virtio-mem views as dynamic mappings. It retains no host address,
 /// descriptor, mapper, or VM authority.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HvfSnapshotV2MemoryHotplugMappingPlan {
     static_ranges: Vec<GuestMemoryRange>,
     dynamic_ranges: Vec<GuestMemoryRange>,
@@ -760,6 +760,21 @@ impl HvfSnapshotV2MemoryHotplugMappingPlan {
     /// Returns the clean materialization epoch.
     pub const fn dirty_epoch(&self) -> u64 {
         self.dirty_epoch
+    }
+
+    pub(crate) fn matches_capture(&self, capture: &HvfVirtioMemMappingCaptureState) -> bool {
+        capture.reservation() == self.reservation
+            && capture.active_ranges() == self.dynamic_ranges
+            && capture.active_bytes() == self.active_bytes
+            && capture.offline_bytes() == self.offline_bytes
+            && capture.current_memory_bytes() == self.current_memory_bytes
+            && capture
+                .current_memory_bytes()
+                .checked_sub(capture.active_bytes())
+                == Some(self.base_bytes)
+            && capture.guest_dirty_tracking()
+            && capture.hvf_dirty_tracking()
+            && capture.dirty_epoch() == Some(self.dirty_epoch)
     }
 }
 
@@ -1049,6 +1064,99 @@ fn checked_range_bytes(
     })
 }
 
+fn validate_snapshot_v2_memory_hotplug_mapping(
+    memory: &GuestMemory,
+    plan: &HvfSnapshotV2MemoryHotplugMappingPlan,
+    permissions: HvfMemoryPermissions,
+    page_size: u64,
+) -> Result<Vec<HvfMemoryMapRequest>, HvfGuestMemoryMappingError> {
+    const INVALID_PLAN: HvfGuestMemoryMappingError = HvfGuestMemoryMappingError::InvalidState(
+        "native-v2 memory-hotplug mapping plan no longer matches guest memory",
+    );
+
+    if plan.dirty_page_size != page_size || plan.dirty_epoch != 0 {
+        return Err(INVALID_PLAN);
+    }
+    let aperture = plan.reservation.range();
+    let reservation = memory
+        .shared_reservation_capture_state(aperture)
+        .map_err(|_| INVALID_PLAN)?;
+    if reservation != plan.reservation {
+        return Err(INVALID_PLAN);
+    }
+
+    let requests = validated_map_requests(memory, permissions, page_size)?;
+    let expected_region_count = plan
+        .static_ranges
+        .len()
+        .checked_add(plan.dynamic_ranges.len())
+        .ok_or(INVALID_PLAN)?;
+    if requests.len() != expected_region_count || memory.regions().len() != expected_region_count {
+        return Err(INVALID_PLAN);
+    }
+
+    let mut static_index = 0;
+    let mut dynamic_index = 0;
+    for region in memory.regions() {
+        let range = region.range();
+        if range.overlaps(aperture) {
+            if range.start() < aperture.start()
+                || range.end_exclusive() > aperture.end_exclusive()
+                || plan.dynamic_ranges.get(dynamic_index) != Some(&range)
+                || region.backing() != GuestMemoryRegionBacking::Shared
+                || region.mapping_identity() != reservation.mapping_identity()
+                || region.validate_shared_backing().ok() != Some(true)
+            {
+                return Err(INVALID_PLAN);
+            }
+            dynamic_index += 1;
+        } else {
+            if plan.static_ranges.get(static_index) != Some(&range)
+                || region.backing() != GuestMemoryRegionBacking::PrivateFile
+            {
+                return Err(INVALID_PLAN);
+            }
+            static_index += 1;
+        }
+    }
+    if static_index != plan.static_ranges.len() || dynamic_index != plan.dynamic_ranges.len() {
+        return Err(INVALID_PLAN);
+    }
+
+    let dirty = memory.dirty_tracker().ok_or(INVALID_PLAN)?;
+    if dirty.page_size() != plan.dirty_page_size
+        || dirty.epoch() != plan.dirty_epoch
+        || memory
+            .regions()
+            .iter()
+            .any(|region| !dirty.contains_range(region.range()))
+        || !dirty.dirty_pages().map_err(|_| INVALID_PLAN)?.is_empty()
+    {
+        return Err(INVALID_PLAN);
+    }
+
+    let base_bytes = plan.static_ranges.iter().try_fold(0_u64, |bytes, range| {
+        bytes.checked_add(range.size()).ok_or(INVALID_PLAN)
+    })?;
+    let active_bytes = plan.dynamic_ranges.iter().try_fold(0_u64, |bytes, range| {
+        bytes.checked_add(range.size()).ok_or(INVALID_PLAN)
+    })?;
+    let offline_bytes = aperture
+        .size()
+        .checked_sub(active_bytes)
+        .ok_or(INVALID_PLAN)?;
+    let current_memory_bytes = base_bytes.checked_add(active_bytes).ok_or(INVALID_PLAN)?;
+    if base_bytes != plan.base_bytes
+        || active_bytes != plan.active_bytes
+        || offline_bytes != plan.offline_bytes
+        || current_memory_bytes != plan.current_memory_bytes
+        || memory.total_size() != current_memory_bytes
+    {
+        return Err(INVALID_PLAN);
+    }
+    Ok(requests)
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HvfSnapshotV2MemoryHotplugMappingPlanFailureStage {
@@ -1176,6 +1284,32 @@ impl HvfGuestMemoryMapping {
         }
     }
 
+    pub(crate) fn map_snapshot_v2_memory_hotplug_with_mapper(
+        memory: GuestMemory,
+        plan: &HvfSnapshotV2MemoryHotplugMappingPlan,
+        permissions: HvfMemoryPermissions,
+        mapper: Arc<dyn HvfMemoryMapper>,
+    ) -> Result<Self, Box<FailedGuestMemoryMapping>> {
+        let mut mapping = Self {
+            memory: Some(memory),
+            state: HvfGuestMemoryMappingState {
+                host_memory: Vec::new(),
+                host_memory_should_flush: false,
+                host_memory_flushed: false,
+                mapped_regions: Vec::new(),
+                dynamic_regions: Vec::new(),
+                mapper,
+                dirty_write_tracker: None,
+                protection_poisoned: false,
+            },
+        };
+
+        match mapping.map_snapshot_v2_memory_hotplug(plan, permissions) {
+            Ok(()) => Ok(mapping),
+            Err(error) => Err(Box::new(FailedGuestMemoryMapping { mapping, error })),
+        }
+    }
+
     pub(crate) fn map_lazy_with_mapper(
         regions: &[GuestMemoryRegion],
         permissions: HvfMemoryPermissions,
@@ -1218,6 +1352,7 @@ impl HvfGuestMemoryMapping {
                 .map_err(|source| HvfGuestMemoryMappingError::DirtyWriteTrackingStop { source })?;
         }
         let failures = self.state.unmap_mapped_regions();
+        self.state.sync_dynamic_regions_to_mapped_regions();
         if !failures.is_empty() {
             return Err(HvfGuestMemoryMappingError::UnmapFailed { failures });
         }
@@ -1232,7 +1367,7 @@ impl HvfGuestMemoryMapping {
     }
 
     #[cfg(test)]
-    fn has_dynamic_regions(&self) -> bool {
+    pub(crate) fn has_dynamic_regions(&self) -> bool {
         self.state.has_dynamic_regions()
     }
 
@@ -1532,6 +1667,21 @@ impl HvfGuestMemoryMapping {
                 "guest memory owner is missing",
             ))?;
         self.state.map_all(memory, permissions)
+    }
+
+    fn map_snapshot_v2_memory_hotplug(
+        &mut self,
+        plan: &HvfSnapshotV2MemoryHotplugMappingPlan,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "guest memory owner is missing",
+            ))?;
+        self.state
+            .map_snapshot_v2_memory_hotplug(memory, plan, permissions)
     }
 
     fn map_lazy_all(
@@ -2049,6 +2199,46 @@ impl HvfGuestMemoryMappingState {
         Ok(())
     }
 
+    fn map_snapshot_v2_memory_hotplug(
+        &mut self,
+        memory: &GuestMemory,
+        plan: &HvfSnapshotV2MemoryHotplugMappingPlan,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let page_size = host_page_size()?;
+        let requests =
+            validate_snapshot_v2_memory_hotplug_mapping(memory, plan, permissions, page_size)?;
+        self.mapped_regions
+            .try_reserve_exact(requests.len())
+            .map_err(
+                |source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source },
+            )?;
+        self.dynamic_regions
+            .try_reserve_exact(plan.dynamic_ranges.len())
+            .map_err(
+                |source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source },
+            )?;
+
+        let aperture = plan.reservation.range();
+        for request in requests {
+            let mapped_region = request.mapped_region(permissions);
+            if let Err(source) = self.mapper.map_region(request, permissions) {
+                let cleanup_failures = self.unmap_mapped_regions();
+                self.sync_dynamic_regions_to_mapped_regions();
+                return Err(HvfGuestMemoryMappingError::MapFailed {
+                    range: request.range,
+                    source,
+                    cleanup_failures,
+                });
+            }
+            self.mapped_regions.push(mapped_region);
+            if request.range.overlaps(aperture) {
+                self.dynamic_regions.push(request.range);
+            }
+        }
+        Ok(())
+    }
+
     fn map_regions(
         &mut self,
         regions: &[GuestMemoryRegion],
@@ -2126,6 +2316,14 @@ impl HvfGuestMemoryMappingState {
         }
 
         failures
+    }
+
+    fn sync_dynamic_regions_to_mapped_regions(&mut self) {
+        self.dynamic_regions.retain(|range| {
+            self.mapped_regions
+                .iter()
+                .any(|mapped| mapped.range == *range)
+        });
     }
 
     fn flush_host_memory(&mut self) -> Result<(), HvfGuestMemoryMappingError> {

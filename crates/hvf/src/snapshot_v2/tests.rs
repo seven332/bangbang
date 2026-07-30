@@ -775,7 +775,7 @@ pub(crate) fn product_memory_hotplug_fixture(
     .expect("relocated virtio-mem fixture should decode")
 }
 
-fn product_serial_fixture() -> SnapshotV2SerialState {
+pub(crate) fn product_serial_fixture() -> SnapshotV2SerialState {
     SnapshotV2SerialState::decode(
         NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
         &fixture_bytes(SERIAL_CONFIGURED_FIXTURE_HEX),

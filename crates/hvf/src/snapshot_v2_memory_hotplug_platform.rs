@@ -82,7 +82,7 @@ pub enum HvfSnapshotV2MemoryHotplugProductKind {
     SerialBalloonStorageEntropyMemoryHotplug,
 }
 
-enum HvfSnapshotV2MemoryHotplugPreparedProductParts {
+pub(crate) enum HvfSnapshotV2MemoryHotplugPreparedProductParts {
     Base {
         topology: PreparedSnapshotV2MemoryHotplugTopology,
         memory: GuestMemory,
@@ -363,6 +363,10 @@ impl HvfSnapshotV2MemoryHotplugPreparedProduct {
             | HvfSnapshotV2MemoryHotplugPreparedProductParts::StorageEntropy { .. } => None,
         }
     }
+
+    pub(crate) fn into_parts(self) -> HvfSnapshotV2MemoryHotplugPreparedProductParts {
+        self.parts
+    }
 }
 
 impl fmt::Debug for HvfSnapshotV2MemoryHotplugPreparedProduct {
@@ -546,6 +550,18 @@ pub struct HvfSnapshotV2MemoryHotplugMmioPlatformPlan {
     vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2MemoryHotplugMmioPlatformPlanParts {
+    pub(crate) product: HvfSnapshotV2MemoryHotplugPreparedProduct,
+    pub(crate) mapping: HvfSnapshotV2MemoryHotplugMappingPlan,
+    pub(crate) balloon: Option<HvfSnapshotV2BalloonMmioEndpointPlan>,
+    pub(crate) storage: Option<HvfSnapshotV2StorageMmioPlatformPlan>,
+    pub(crate) entropy: Option<HvfSnapshotV2MemoryHotplugEntropyMmioEndpointPlan>,
+    pub(crate) memory_hotplug: HvfSnapshotV2MemoryHotplugMmioEndpointPlan,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 impl HvfSnapshotV2MemoryHotplugMmioPlatformPlan {
     pub const fn kind(&self) -> HvfSnapshotV2MemoryHotplugProductKind {
         self.product.kind()
@@ -581,6 +597,20 @@ impl HvfSnapshotV2MemoryHotplugMmioPlatformPlan {
 
     pub const fn vmclock_interrupt(&self) -> GuestInterruptLine {
         self.vmclock_interrupt
+    }
+
+    pub(crate) fn into_parts(self) -> HvfSnapshotV2MemoryHotplugMmioPlatformPlanParts {
+        HvfSnapshotV2MemoryHotplugMmioPlatformPlanParts {
+            product: self.product,
+            mapping: self.mapping,
+            balloon: self.balloon,
+            storage: self.storage,
+            entropy: self.entropy,
+            memory_hotplug: self.memory_hotplug,
+            serial_interrupt: self.serial_interrupt,
+            vmgenid_interrupt: self.vmgenid_interrupt,
+            vmclock_interrupt: self.vmclock_interrupt,
+        }
     }
 }
 
@@ -946,6 +976,7 @@ fn validate_product_profile_and_binding(
     product: &HvfSnapshotV2MemoryHotplugPreparedProduct,
 ) -> Result<(), PrepareHvfSnapshotV2MemoryHotplugPlatformPlanError> {
     if !platform.machine().fdt().is_product_process_profile()
+        || !platform.machine().machine().track_dirty_pages()
         || platform.time().rtc_layout()
             != RtcMmioLayout::new(PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID)
     {
@@ -1825,12 +1856,17 @@ mod tests {
     use std::fs::{self, File, OpenOptions};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
+    use bangbang_runtime::BackendError;
     use bangbang_runtime::balloon::VirtioBalloonQueueLayout;
     use bangbang_runtime::block::{BlockFileBacking, BlockMmioLayout};
     use bangbang_runtime::memory::{GuestMemoryLayout, aarch64};
     use bangbang_runtime::pmem::{PmemFileBacking, PmemMmioLayout};
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
     use bangbang_runtime::snapshot_balloon_v2_9::{
         NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, SnapshotV2BalloonRestorePlan,
         SnapshotV2BalloonState,
@@ -1858,19 +1894,24 @@ mod tests {
     use super::*;
     use crate::gic::{HvfGicInterruptRange, HvfGicRegion};
     use crate::memory::{
-        HvfSnapshotV2MemoryHotplugMappingPlanFailureStage,
+        HvfGuestMemoryMapping, HvfMappedGuestMemoryRegion, HvfMemoryMapRequest, HvfMemoryMapper,
+        HvfMemoryPermissions, HvfSnapshotV2MemoryHotplugMappingPlanFailureStage,
         PrepareHvfSnapshotV2MemoryHotplugMappingPlanError,
         prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan_with_failure,
     };
     use crate::snapshot_bundle::HvfSnapshotV1CompatibilityState;
     use crate::snapshot_v2::{
-        HvfSnapshotV2GlobalState, HvfSnapshotV2MemoryHotplugPlatformState, HvfSnapshotV2TimeState,
+        HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState,
+        HvfSnapshotV2MemoryHotplugPlatformState, HvfSnapshotV2TimeState,
         tests::{
             FIXTURE_MEMORY_MIB, memory_hotplug_active_ranges, memory_hotplug_capture_fixture,
             memory_hotplug_product_entropy_fixture, product_balloon_fixture,
-            product_memory_hotplug_fixture, product_storage_fixture, try_exact_minor_ten_platform,
+            product_memory_hotplug_fixture, product_serial_fixture, product_storage_fixture,
+            try_exact_minor_ten_platform,
         },
     };
+    use crate::snapshot_v2_platform::HvfSnapshotV2RestoredSerialShell;
+    use crate::startup::{HvfSnapshotV2MemoryHotplugMmioRestoreFault, OwnedHvfArm64BootSession};
 
     const MIB: u64 = 1024 * 1024;
     const COMPONENT_HEADER_BYTES: usize = 64;
@@ -1900,6 +1941,101 @@ mod tests {
     const ENTROPY_DATA_BUFFER: GuestAddress = GuestAddress::new(0x8007_0000);
     static NEXT_IMAGE: AtomicU64 = AtomicU64::new(0);
     static NEXT_BACKING: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug, Default)]
+    struct MemoryHotplugMappingTestMapper {
+        state: Mutex<MemoryHotplugMappingTestMapperState>,
+    }
+
+    impl MemoryHotplugMappingTestMapper {
+        fn failing(fail_map_on: Option<usize>, fail_unmap_on: Option<usize>) -> Self {
+            Self {
+                state: Mutex::new(MemoryHotplugMappingTestMapperState {
+                    fail_map_on,
+                    fail_unmap_on,
+                    ..MemoryHotplugMappingTestMapperState::default()
+                }),
+            }
+        }
+
+        fn mapped_ranges(&self) -> Vec<GuestMemoryRange> {
+            self.state
+                .lock()
+                .expect("mapping test state should not be poisoned")
+                .mapped_ranges
+                .clone()
+        }
+
+        fn unmapped_ranges(&self) -> Vec<GuestMemoryRange> {
+            self.state
+                .lock()
+                .expect("mapping test state should not be poisoned")
+                .unmapped_ranges
+                .clone()
+        }
+
+        fn allow_unmaps(&self) {
+            self.state
+                .lock()
+                .expect("mapping test state should not be poisoned")
+                .fail_unmap_on = None;
+        }
+    }
+
+    impl HvfMemoryMapper for MemoryHotplugMappingTestMapper {
+        fn map_region(
+            &self,
+            request: HvfMemoryMapRequest,
+            _permissions: HvfMemoryPermissions,
+        ) -> Result<(), BackendError> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("mapping test state should not be poisoned");
+            state.mapped_ranges.push(request.range());
+            if state.fail_map_on == Some(state.mapped_ranges.len()) {
+                Err(BackendError::Hypervisor(
+                    "injected mixed map failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unmap_region(
+            &self,
+            mapped_region: HvfMappedGuestMemoryRegion,
+        ) -> Result<(), BackendError> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("mapping test state should not be poisoned");
+            state.unmapped_ranges.push(mapped_region.range);
+            if state.fail_unmap_on == Some(state.unmapped_ranges.len()) {
+                Err(BackendError::Hypervisor(
+                    "injected mixed unmap failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn protect_region(
+            &self,
+            _range: GuestMemoryRange,
+            _permissions: HvfMemoryPermissions,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MemoryHotplugMappingTestMapperState {
+        mapped_ranges: Vec<GuestMemoryRange>,
+        unmapped_ranges: Vec<GuestMemoryRange>,
+        fail_map_on: Option<usize>,
+        fail_unmap_on: Option<usize>,
+    }
 
     struct TestImage {
         path: PathBuf,
@@ -1966,6 +2102,26 @@ mod tests {
             .expect("exact-2.10 platform should validate")
             .platform()
             .clone();
+        let (memory_binding, machine, global, stable, vcpus, time) = platform.into_parts();
+        let machine = HvfSnapshotV2MachineState::try_new(
+            machine.machine().with_track_dirty_pages(true),
+            machine.boot().clone(),
+            machine.fdt(),
+            machine.cpu_template().cloned(),
+        )
+        .expect("tracked exact-2.10 machine should validate");
+        let platform = HvfSnapshotV2MemoryHotplugPlatformState::try_new(
+            memory_binding,
+            machine,
+            global,
+            stable,
+            vcpus,
+            time,
+            Some(memory_hotplug_capture_fixture(state.clone())),
+        )
+        .expect("tracked exact-2.10 platform should validate")
+        .platform()
+        .clone();
         let topology = PreparedSnapshotV2MemoryHotplugTopology::prepare(state, binding)
             .expect("memory-hotplug topology should prepare");
         let memory = materialize_snapshot_v2_memory_hotplug_file(
@@ -2818,6 +2974,25 @@ mod tests {
             );
             assert_eq!(plan.mapping().base_bytes(), FIXTURE_MEMORY_MIB * MIB);
             assert_eq!(plan.mapping().dirty_epoch(), 0);
+
+            let serial = product_serial_fixture();
+            let shell = HvfSnapshotV2RestoredSerialShell::new(
+                SerialMmioDevice::from_capture_state_with_shared_output(
+                    SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                    serial.device().clone(),
+                ),
+            );
+            let error =
+                OwnedHvfArm64BootSession::restore_snapshot_v2_memory_hotplug_mmio_with_fault(
+                    platform,
+                    shell,
+                    None,
+                    plan,
+                    HvfSnapshotV2MemoryHotplugMmioRestoreFault::InterruptSetup,
+                )
+                .expect_err("all eight MMIO product tags should reach owner preflight");
+            assert!(!error.is_terminal());
+            assert!(!error.has_incomplete_cleanup());
         }
     }
 
@@ -3161,5 +3336,191 @@ mod tests {
             assert!(diagnostics.contains("<redacted>"));
             assert!(!diagnostics.contains(&plan.reservation().range().start().to_string()));
         }
+    }
+
+    #[test]
+    fn mixed_mapping_materializes_static_and_dynamic_owners_and_survives_remap() {
+        let fixture = materialized_fixture(product_memory_hotplug_fixture(
+            SnapshotV2DeviceTransportKind::Mmio,
+        ));
+        let MaterializedFixture {
+            platform: _,
+            topology,
+            memory,
+            _image,
+        } = fixture;
+        let config = topology.state().config();
+        let plan = prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan(
+            &topology,
+            &memory,
+            FIXTURE_MEMORY_MIB * MIB,
+        )
+        .expect("mixed mapping should plan");
+        let restored = topology
+            .into_mmio_handler(&memory)
+            .expect("inactive MMIO handler should reconstruct");
+        let expected_ranges = memory
+            .regions()
+            .iter()
+            .map(|region| region.range())
+            .collect::<Vec<_>>();
+        let mapper = Arc::new(MemoryHotplugMappingTestMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_snapshot_v2_memory_hotplug_with_mapper(
+            memory,
+            &plan,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("mixed mapping should materialize");
+
+        assert_eq!(mapper.mapped_ranges(), expected_ranges);
+        assert!(mapping.has_dynamic_regions());
+        mapping
+            .start_dirty_write_tracking()
+            .expect("restored mixed mapping should start HVF dirty tracking");
+        let capture = restored
+            .handler()
+            .capture_memory_hotplug_state(
+                config,
+                mapping
+                    .memory()
+                    .expect("restored mapping should retain guest memory"),
+            )
+            .expect("restored virtio-mem handler should capture");
+        let mapping_capture = mapping
+            .capture_virtio_mem_mapping_state(capture.device())
+            .expect("restored owners should close over the mapping proof");
+        assert!(plan.matches_capture(&mapping_capture));
+
+        let dynamic_range = plan.dynamic_ranges()[0];
+        mapping
+            .unmap_dynamic_region(dynamic_range)
+            .expect("restored dynamic owner should unplug");
+        mapping
+            .map_dynamic_region(dynamic_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect("restored dynamic owner should remap");
+        let remapped_capture = mapping
+            .capture_virtio_mem_mapping_state(capture.device())
+            .expect("remapped owners should close over the original proof");
+        assert!(plan.matches_capture(&remapped_capture));
+
+        mapping.unmap_all().expect("mixed mapping should unmap");
+        assert!(!mapping.has_mapped_regions());
+        assert!(!mapping.has_dynamic_regions());
+    }
+
+    #[test]
+    fn mixed_mapping_rolls_back_every_map_boundary_in_reverse_order() {
+        let region_count = {
+            let fixture = materialized_fixture(product_memory_hotplug_fixture(
+                SnapshotV2DeviceTransportKind::Mmio,
+            ));
+            fixture.memory.regions().len()
+        };
+        assert!(region_count >= 3);
+
+        for fail_map_on in 1..=region_count {
+            let fixture = materialized_fixture(product_memory_hotplug_fixture(
+                SnapshotV2DeviceTransportKind::Mmio,
+            ));
+            let plan = prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan(
+                &fixture.topology,
+                &fixture.memory,
+                FIXTURE_MEMORY_MIB * MIB,
+            )
+            .expect("mixed mapping should plan");
+            let expected_ranges = fixture
+                .memory
+                .regions()
+                .iter()
+                .map(|region| region.range())
+                .collect::<Vec<_>>();
+            let mapper = Arc::new(MemoryHotplugMappingTestMapper::failing(
+                Some(fail_map_on),
+                None,
+            ));
+            let failure = HvfGuestMemoryMapping::map_snapshot_v2_memory_hotplug_with_mapper(
+                fixture.memory,
+                &plan,
+                HvfMemoryPermissions::GUEST_RAM,
+                mapper.clone(),
+            )
+            .expect_err("injected map boundary should fail");
+            let mut expected_unmaps = expected_ranges[..fail_map_on - 1].to_vec();
+            expected_unmaps.reverse();
+
+            assert_eq!(
+                mapper.mapped_ranges(),
+                expected_ranges[..fail_map_on].to_vec()
+            );
+            assert_eq!(mapper.unmapped_ranges(), expected_unmaps);
+            assert!(matches!(
+                failure.error,
+                crate::memory::HvfGuestMemoryMappingError::MapFailed {
+                    range,
+                    ref cleanup_failures,
+                    ..
+                } if range == expected_ranges[fail_map_on - 1] && cleanup_failures.is_empty()
+            ));
+            assert!(!failure.mapping.has_mapped_regions());
+            assert!(!failure.mapping.has_dynamic_regions());
+        }
+    }
+
+    #[test]
+    fn mixed_mapping_retains_only_failed_cleanup_owners_until_retry() {
+        let fixture = materialized_fixture(product_memory_hotplug_fixture(
+            SnapshotV2DeviceTransportKind::Mmio,
+        ));
+        let plan = prepare_hvf_snapshot_v2_memory_hotplug_mapping_plan(
+            &fixture.topology,
+            &fixture.memory,
+            FIXTURE_MEMORY_MIB * MIB,
+        )
+        .expect("mixed mapping should plan");
+        let region_count = fixture.memory.regions().len();
+        assert!(region_count >= 3);
+        let expected_ranges = fixture
+            .memory
+            .regions()
+            .iter()
+            .map(|region| region.range())
+            .collect::<Vec<_>>();
+        let retained_dynamic_range = expected_ranges[region_count - 2];
+        assert!(plan.dynamic_ranges().contains(&retained_dynamic_range));
+        let mapper = Arc::new(MemoryHotplugMappingTestMapper::failing(
+            Some(region_count),
+            Some(1),
+        ));
+        let mut failure = HvfGuestMemoryMapping::map_snapshot_v2_memory_hotplug_with_mapper(
+            fixture.memory,
+            &plan,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect_err("map plus reverse-cleanup failure should retain authority");
+
+        assert!(matches!(
+            failure.error,
+            crate::memory::HvfGuestMemoryMappingError::MapFailed {
+                ref cleanup_failures,
+                ..
+            } if cleanup_failures.len() == 1
+                && cleanup_failures[0].range() == retained_dynamic_range
+        ));
+        assert!(failure.mapping.has_mapped_regions());
+        assert!(failure.mapping.has_dynamic_regions());
+
+        mapper.allow_unmaps();
+        failure
+            .mapping
+            .unmap_all()
+            .expect("retained cleanup owner should retry");
+        assert!(!failure.mapping.has_mapped_regions());
+        assert!(!failure.mapping.has_dynamic_regions());
+        assert_eq!(
+            mapper.unmapped_ranges().last(),
+            Some(&retained_dynamic_range)
+        );
     }
 }
