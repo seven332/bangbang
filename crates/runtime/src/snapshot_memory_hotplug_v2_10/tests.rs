@@ -273,6 +273,36 @@ fn binding_for_ranges(
     .expect("binding fixture should encode")
 }
 
+fn destination_memory_for_ranges(ranges: Vec<GuestMemoryRange>) -> GuestMemory {
+    let layout = GuestMemoryLayout::new(ranges).expect("destination layout should validate");
+    GuestMemory::allocate(&layout).expect("destination memory should allocate")
+}
+
+fn set_queue_indices(
+    memory: &mut GuestMemory,
+    driver_ring: GuestAddress,
+    device_ring: GuestAddress,
+    index: u16,
+) {
+    let index_offset = 2;
+    memory
+        .write_slice(
+            &index.to_le_bytes(),
+            driver_ring
+                .checked_add(index_offset)
+                .expect("available-ring index address should fit"),
+        )
+        .expect("available-ring index should write");
+    memory
+        .write_slice(
+            &index.to_le_bytes(),
+            device_ring
+                .checked_add(index_offset)
+                .expect("used-ring index address should fit"),
+        )
+        .expect("used-ring index should write");
+}
+
 #[test]
 fn kind_one_binding_closes_fragmented_plugged_unions_and_rejects_hostile_coverage() {
     let state = inactive_mmio_state();
@@ -481,6 +511,156 @@ fn prepared_topology_preserves_ordered_partition_ranges_and_controller_projectio
         assert!(diagnostic.contains(REDACTED));
         assert!(!diagnostic.contains(&sentinel));
     }
+}
+
+#[test]
+fn inactive_mmio_topology_reconstructs_an_exact_handler_with_fresh_metrics() {
+    let state = inactive_mmio_state();
+    let ranges = vec![
+        plugged_guest_test_range(&state, 1, 2),
+        plugged_guest_test_range(&state, 5, 3),
+    ];
+    let binding = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        ranges.clone(),
+    );
+    let memory = destination_memory_for_ranges(ranges);
+
+    let prepared = PreparedSnapshotV2MemoryHotplugTopology::prepare(state.clone(), binding)
+        .expect("inactive MMIO topology should prepare")
+        .into_mmio_handler(&memory)
+        .expect("inactive MMIO handler should reconstruct");
+
+    assert_eq!(prepared.expected_state(), &state);
+    assert_eq!(prepared.controller().config(), state.config());
+    assert_eq!(prepared.controller().requested_size_mib(), 128);
+    assert_eq!(
+        prepared.plugged_ranges(),
+        [
+            plugged_guest_test_range(&state, 1, 2),
+            plugged_guest_test_range(&state, 5, 3),
+        ]
+    );
+    assert_eq!(prepared.queue_ranges(), None);
+    assert_eq!(prepared.region(), mmio_transport().region());
+    assert_eq!(prepared.interrupt_line(), mmio_transport().interrupt_line());
+    assert!(
+        prepared
+            .handler()
+            .shared_memory_hotplug_metrics()
+            .snapshot()
+            .is_empty()
+    );
+}
+
+#[test]
+fn active_mmio_topology_restores_nonzero_queue_cursors_and_rejects_memory_drift() {
+    let state = active_mmio_state();
+    let queue = state
+        .virtio()
+        .queues()
+        .first()
+        .expect("active fixture should retain one queue");
+    let ranges = vec![
+        test_range(0x10_0000, 0x50_000),
+        plugged_guest_test_range(&state, 0, 1),
+        plugged_guest_test_range(&state, 7, 2),
+        plugged_guest_test_range(&state, 127, 1),
+    ];
+    let binding = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        ranges.clone(),
+    );
+    let prepared = PreparedSnapshotV2MemoryHotplugTopology::prepare(state.clone(), binding)
+        .expect("active MMIO topology should prepare");
+
+    let unmapped_queue_memory = destination_memory_for_ranges(ranges[1..].to_vec());
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare(
+            state.clone(),
+            binding_for_ranges(
+                NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                ranges.clone(),
+            ),
+        )
+        .expect("active MMIO topology should prepare")
+        .into_mmio_handler(&unmapped_queue_memory),
+        Err(SnapshotV2MemoryHotplugMmioHandlerError::QueueMemory(_))
+    ));
+
+    let mismatched_indices_memory = destination_memory_for_ranges(ranges.clone());
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare(
+            state.clone(),
+            binding_for_ranges(
+                NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                ranges.clone(),
+            ),
+        )
+        .expect("active MMIO topology should prepare")
+        .into_mmio_handler(&mismatched_indices_memory),
+        Err(SnapshotV2MemoryHotplugMmioHandlerError::QueueMemory(
+            VirtioMemQueueCaptureError::UsedCursorMismatch
+        ))
+    ));
+
+    let mut memory = destination_memory_for_ranges(ranges);
+    set_queue_indices(
+        &mut memory,
+        queue.driver_ring(),
+        queue.device_ring(),
+        state
+            .active_queue()
+            .expect("active fixture should retain queue cursors")
+            .next_used(),
+    );
+    let restored = prepared
+        .into_mmio_handler(&memory)
+        .expect("active MMIO handler should reconstruct");
+    let captured = restored
+        .handler()
+        .capture_memory_hotplug_state(state.config(), &memory)
+        .expect("restored active handler should capture");
+    let normalized = SnapshotV2MemoryHotplugState::try_from_mmio_capture(
+        state.config(),
+        restored.region(),
+        restored.interrupt_line(),
+        &captured,
+    )
+    .expect("restored active capture should normalize");
+
+    assert_eq!(normalized, state);
+    assert!(restored.queue_ranges().is_some());
+    assert!(
+        restored
+            .handler()
+            .shared_memory_hotplug_metrics()
+            .snapshot()
+            .is_empty()
+    );
+}
+
+#[test]
+fn pci_topology_cannot_materialize_an_mmio_handler() {
+    let state = active_pci_state();
+    let ranges = vec![
+        test_range(0x10_0000, 0x50_000),
+        plugged_guest_test_range(&state, 0, 1),
+        plugged_guest_test_range(&state, 7, 2),
+        plugged_guest_test_range(&state, 127, 1),
+    ];
+    let binding = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        ranges.clone(),
+    );
+    let memory = destination_memory_for_ranges(ranges);
+
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare(state, binding)
+            .expect("PCI topology should prepare")
+            .into_mmio_handler(&memory),
+        Err(SnapshotV2MemoryHotplugMmioHandlerError::WrongTransport)
+    ));
 }
 
 #[test]

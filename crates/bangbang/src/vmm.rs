@@ -36760,6 +36760,29 @@ mod tests {
     }
 
     #[test]
+    fn runtime_snapshot_create_policy_still_rejects_memory_hotplug_before_session_barrier() {
+        let mut vmm = configured_vmm(FakeStarter::success(177));
+        vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("memory-hotplug should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("memory-hotplug instance should start");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("memory-hotplug instance should pause");
+
+        assert_eq!(
+            vmm.handle_action(snapshot_create_action(SnapshotType::Full)),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("rejected memory-hotplug snapshot should retain its session");
+        assert_eq!(session.snapshot_create_barrier_count, 0);
+        assert_eq!(session.native_snapshot_publication_count, 0);
+        assert_eq!(session.native_snapshot_producer_count, 0);
+    }
+
+    #[test]
     fn broad_snapshot_profile_runs_complete_storage_preflight_before_profile_rejection() {
         let state_path = missing_temp_child_path("broad-storage.state");
         let memory_path = state_path.with_file_name("broad-storage.memory");

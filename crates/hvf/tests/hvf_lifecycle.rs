@@ -14581,6 +14581,656 @@ fn capture_ready_memory_hotplug_traverses_signed_mmio_and_pci_owners() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn restores_signed_memory_hotplug_only_mmio_owners_and_rolls_back_faults() {
+    use std::io::Cursor;
+
+    use bangbang_hvf::{
+        HvfArm64BootMemoryHotplugDeviceConfig, HvfArm64BootSerialDeviceConfig,
+        HvfArm64BootSessionConfig, HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BootState,
+        HvfSnapshotV2MemoryHotplugMmioProcessConfig, HvfSnapshotV2MemoryHotplugMmioRestoreFault,
+        HvfSnapshotV2MemoryHotplugPreparedProduct, HvfSnapshotV2MemoryHotplugState,
+        HvfSnapshotV2NativePath, HvfSnapshotV2RestoredSerialShell,
+        HvfSnapshotV2StorageMmioProcessConfig, OwnedHvfArm64BootSession,
+        prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::entropy::EntropyMmioLayout;
+    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, VirtioMemMmioLayout};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot_memory_hotplug_v2_10::PreparedSnapshotV2MemoryHotplugTopology;
+    use bangbang_runtime::snapshot_memory_v2::materialize_snapshot_v2_memory_hotplug_file;
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("restore-memory-hotplug-only-kernel", &image)
+        .expect("memory-hotplug-only kernel should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("memory-hotplug-only boot source should configure");
+    controller
+        .handle_action(VmmAction::PutMachineConfig(
+            MachineConfigInput::new(1, 128).with_track_dirty_pages(true),
+        ))
+        .expect("memory-hotplug-only dirty tracking should configure");
+    controller
+        .handle_action(VmmAction::PutMemoryHotplug(MemoryHotplugConfigInput::new(
+            128, 2, 128,
+        )))
+        .expect("memory-hotplug-only device should configure");
+    let memory_hotplug_config = controller
+        .memory_hotplug_config()
+        .expect("memory-hotplug-only config should exist");
+    let requested_size_mib = controller
+        .memory_hotplug_status()
+        .expect("memory-hotplug-only status should exist")
+        .requested_size_mib();
+
+    let block_layout = BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
+    let pmem_layout = PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500));
+    let balloon_layout = bangbang_runtime::balloon::BalloonMmioLayout::new(
+        GuestAddress::new(0x4000_6000),
+        MmioRegionId::new(3000),
+    );
+    let entropy_layout =
+        EntropyMmioLayout::new(GuestAddress::new(0x4000_7000), MmioRegionId::new(3001));
+    let memory_hotplug_layout =
+        VirtioMemMmioLayout::new(GuestAddress::new(0x4000_8000), MmioRegionId::new(4001));
+    let session_config = HvfArm64BootSessionConfig::new(
+        block_layout,
+        pmem_layout,
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
+    )
+    .with_memory_hotplug_device(HvfArm64BootMemoryHotplugDeviceConfig::new(
+        memory_hotplug_layout,
+    ))
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+    ));
+    let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+        .expect("signed memory-hotplug-only source should prepare");
+    let guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("memory-hotplug-only source should quiesce");
+    let memory_hotplug_capture = source
+        .capture_ready_memory_hotplug_state(Some(memory_hotplug_config), &guard)
+        .expect("memory-hotplug-only source should capture")
+        .expect("memory-hotplug-only source should retain its device")
+        .try_to_snapshot_v2(requested_size_mib)
+        .expect("memory-hotplug-only capture should convert");
+    let serial = SnapshotV2SerialState::try_from_capture_ready(
+        source
+            .capture_ready_serial_state(controller.serial_config().clone(), &guard)
+            .expect("memory-hotplug-only serial should capture"),
+    )
+    .expect("memory-hotplug-only serial capture should convert");
+    drop(guard);
+
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("memory-hotplug-only source should pause");
+    let boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+            .expect("memory-hotplug-only kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("memory-hotplug-only boot metadata should validate");
+    let mut memory_writer = Cursor::new(Vec::new());
+    let platform = source
+        .capture_snapshot_v2_memory_hotplug_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            Some(memory_hotplug_capture),
+            &mut memory_writer,
+            |_| false,
+        )
+        .expect("exact-2.10 memory-hotplug-only platform should capture");
+    HvfSnapshotV2MemoryHotplugState::try_new(platform.clone(), None, serial.clone(), None, None)
+        .expect("memory-hotplug-only exact-2.10 product should compose");
+    let memory_image = TempFile::new("restore-memory-hotplug-only-image", memory_writer.get_ref())
+        .expect("memory-hotplug-only image should persist");
+    source
+        .shutdown()
+        .expect("signed memory-hotplug-only source should shut down");
+
+    let platform_state = platform.platform().clone();
+    let portable_state = platform
+        .memory_hotplug()
+        .expect("captured exact-2.10 platform should retain memory-hotplug")
+        .clone();
+    let process = HvfSnapshotV2MemoryHotplugMmioProcessConfig::new(
+        balloon_layout,
+        HvfSnapshotV2StorageMmioProcessConfig::new(block_layout, pmem_layout),
+        entropy_layout,
+        memory_hotplug_layout,
+    );
+    let prepare_plan = || {
+        let topology = PreparedSnapshotV2MemoryHotplugTopology::prepare(
+            portable_state.clone(),
+            platform_state.memory().clone(),
+        )
+        .expect("memory-hotplug-only topology should prepare");
+        let memory = materialize_snapshot_v2_memory_hotplug_file(
+            &topology,
+            std::fs::File::open(memory_image.path())
+                .expect("memory-hotplug-only image should reopen"),
+        )
+        .expect("memory-hotplug-only destination should materialize");
+        prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan(
+            &platform_state,
+            HvfSnapshotV2MemoryHotplugPreparedProduct::serial_memory_hotplug(topology, memory),
+            process,
+        )
+        .expect("memory-hotplug-only owner plan should prepare")
+    };
+    let restored_shell = || {
+        HvfSnapshotV2RestoredSerialShell::new(
+            SerialMmioDevice::from_capture_state_with_shared_output(
+                SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                serial.device().clone(),
+            ),
+        )
+    };
+
+    for fault in [
+        HvfSnapshotV2MemoryHotplugMmioRestoreFault::InterruptSetup,
+        HvfSnapshotV2MemoryHotplugMmioRestoreFault::Platform,
+        HvfSnapshotV2MemoryHotplugMmioRestoreFault::Registration,
+        HvfSnapshotV2MemoryHotplugMmioRestoreFault::MemoryHotplugInsertion,
+        HvfSnapshotV2MemoryHotplugMmioRestoreFault::Recapture,
+        HvfSnapshotV2MemoryHotplugMmioRestoreFault::SessionAssembly,
+    ] {
+        let error = OwnedHvfArm64BootSession::restore_snapshot_v2_memory_hotplug_mmio_with_fault(
+            platform_state.clone(),
+            restored_shell(),
+            None,
+            prepare_plan(),
+            fault,
+        )
+        .expect_err("injected memory-hotplug-only owner fault should reject");
+        assert!(
+            !error.has_incomplete_cleanup(),
+            "{fault:?} should roll back cleanly: {error:?}"
+        );
+        assert_eq!(
+            error.is_terminal(),
+            fault != HvfSnapshotV2MemoryHotplugMmioRestoreFault::InterruptSetup
+        );
+        let diagnostics = format!("{error:?} {error}");
+        assert!(diagnostics.contains("<redacted>"));
+        assert!(!diagnostics.contains("1073774592"));
+    }
+
+    let mut destination_mapping_identities = Vec::new();
+    for _ in 0..2 {
+        let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_memory_hotplug_mmio(
+            platform_state.clone(),
+            restored_shell(),
+            None,
+            prepare_plan(),
+        )
+        .unwrap_or_else(|error| {
+            let source = std::error::Error::source(&error);
+            let detail = source.and_then(std::error::Error::source);
+            panic!(
+                "memory-hotplug-only owners should restore: {error:?}, source={source:?}, detail={detail:?}"
+            )
+        });
+        assert_eq!(owners.state(), &portable_state);
+        assert_eq!(owners.controller().config(), memory_hotplug_config);
+        assert_eq!(owners.controller().requested_size_mib(), requested_size_mib);
+        assert!(owners.storage_configs().is_none());
+        assert!(owners.entropy_config().is_none());
+        assert!(owners.balloon_config().is_none());
+        assert!(
+            owners
+                .session()
+                .shared_memory_hotplug_device_metrics()
+                .expect("restored memory-hotplug metrics should exist")
+                .snapshot()
+                .is_empty()
+        );
+
+        let (mut restored, state, controller, storage, entropy, balloon) = owners.into_parts();
+        assert_eq!(state, portable_state);
+        assert!(storage.is_none());
+        assert!(entropy.is_none());
+        assert!(balloon.is_none());
+        assert!(restored.runtime_resources().memory_hotplug_device.is_some());
+        let guard = restored
+            .quiesce_limiter_retry_wakeups()
+            .expect("restored memory-hotplug-only owner should quiesce");
+        let recaptured = restored
+            .capture_ready_memory_hotplug_state(Some(controller.config()), &guard)
+            .expect("restored memory-hotplug-only owner should capture")
+            .expect("restored memory-hotplug-only device should exist")
+            .try_to_snapshot_v2(controller.requested_size_mib())
+            .expect("restored memory-hotplug-only capture should convert");
+        assert_eq!(recaptured.state(), &portable_state);
+        destination_mapping_identities.push(recaptured.mapping().mapping_identity());
+        drop(guard);
+        restored
+            .shutdown()
+            .expect("restored memory-hotplug-only destination should shut down");
+    }
+    assert_ne!(
+        destination_mapping_identities[0],
+        destination_mapping_identities[1]
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn restores_signed_all_optional_memory_hotplug_mmio_owners_and_rolls_back_prefixes() {
+    use std::io::Cursor;
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig,
+        HvfArm64BootMemoryHotplugDeviceConfig, HvfArm64BootSerialDeviceConfig,
+        HvfArm64BootSessionConfig, HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BootState,
+        HvfSnapshotV2MemoryHotplugMmioProcessConfig, HvfSnapshotV2MemoryHotplugMmioRestoreFault,
+        HvfSnapshotV2MemoryHotplugPreparedProduct, HvfSnapshotV2MemoryHotplugState,
+        HvfSnapshotV2NativePath, HvfSnapshotV2RestoredSerialShell,
+        HvfSnapshotV2StorageMmioProcessConfig, OwnedHvfArm64BootSession,
+        prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::balloon::{
+        BalloonConfigInput, BalloonMmioLayout, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE,
+    };
+    use bangbang_runtime::block::{
+        BlockFileBacking, BlockMmioLayout, DriveConfigInput, DriveIoEngine,
+    };
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::entropy::{EntropyConfigInput, EntropyMmioLayout};
+    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, VirtioMemMmioLayout};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonRestorePlan;
+    use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageRestorePlan;
+    use bangbang_runtime::snapshot_entropy_v2_8::SnapshotV2EntropyRestorePlan;
+    use bangbang_runtime::snapshot_memory_hotplug_v2_10::PreparedSnapshotV2MemoryHotplugTopology;
+    use bangbang_runtime::snapshot_memory_v2::materialize_snapshot_v2_memory_hotplug_file;
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("restore-all-memory-hotplug-kernel", &image)
+        .expect("all-optional memory-hotplug kernel should create");
+    let root = TempFile::new_len("restore-all-memory-hotplug-root", 4096)
+        .expect("all-optional memory-hotplug root should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("all-optional memory-hotplug boot source should configure");
+    controller
+        .handle_action(VmmAction::PutMachineConfig(
+            MachineConfigInput::new(1, 128).with_track_dirty_pages(true),
+        ))
+        .expect("all-optional memory-hotplug dirty tracking should configure");
+    controller
+        .handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", root.path(), true)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("all-optional memory-hotplug root should configure");
+    controller
+        .handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(8, true)
+                .with_stats_polling_interval_s(1)
+                .with_free_page_hinting(true)
+                .with_free_page_reporting(true),
+        ))
+        .expect("all-optional memory-hotplug balloon should configure");
+    controller
+        .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+        .expect("all-optional memory-hotplug entropy should configure");
+    controller
+        .handle_action(VmmAction::PutMemoryHotplug(MemoryHotplugConfigInput::new(
+            128, 2, 128,
+        )))
+        .expect("all-optional memory-hotplug device should configure");
+    let balloon_config = controller
+        .balloon_config()
+        .expect("all-optional balloon config should exist");
+    let entropy_config = controller
+        .entropy_config()
+        .expect("all-optional entropy config should exist");
+    let memory_hotplug_config = controller
+        .memory_hotplug_config()
+        .expect("all-optional memory-hotplug config should exist");
+    let requested_size_mib = controller
+        .memory_hotplug_status()
+        .expect("all-optional memory-hotplug status should exist")
+        .requested_size_mib();
+
+    let block_layout = BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
+    let pmem_layout = PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500));
+    let balloon_layout =
+        BalloonMmioLayout::new(GuestAddress::new(0x4000_6000), MmioRegionId::new(3000));
+    let entropy_layout =
+        EntropyMmioLayout::new(GuestAddress::new(0x4000_7000), MmioRegionId::new(3001));
+    let memory_hotplug_layout =
+        VirtioMemMmioLayout::new(GuestAddress::new(0x4000_8000), MmioRegionId::new(4001));
+    let session_config = HvfArm64BootSessionConfig::new(
+        block_layout,
+        pmem_layout,
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
+    )
+    .with_balloon_device(HvfArm64BootBalloonDeviceConfig::new(balloon_layout))
+    .with_entropy_device(HvfArm64BootEntropyDeviceConfig::new(entropy_layout))
+    .with_memory_hotplug_device(HvfArm64BootMemoryHotplugDeviceConfig::new(
+        memory_hotplug_layout,
+    ))
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+    ));
+    let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+        .expect("signed all-optional memory-hotplug source should prepare");
+    let source_configs =
+        CaptureReadyStorageConfigs::new(controller.drive_configs().to_vec(), Vec::new());
+    let capture_now = Instant::now();
+    let guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("all-optional memory-hotplug source should quiesce");
+    let graph = source
+        .capture_snapshot_v2_storage_device_graph_at(&source_configs, &guard, capture_now)
+        .expect("all-optional storage graph should capture");
+    let balloon = source
+        .capture_ready_balloon_state(Some(balloon_config), &guard)
+        .expect("all-optional balloon should capture")
+        .expect("all-optional balloon should exist")
+        .try_to_snapshot_v2()
+        .expect("all-optional balloon capture should convert");
+    let entropy = source
+        .capture_ready_entropy_state_at(Some(entropy_config), &guard, capture_now)
+        .expect("all-optional entropy should capture")
+        .expect("all-optional entropy should exist")
+        .try_to_snapshot_v2()
+        .expect("all-optional entropy capture should convert");
+    let memory_hotplug_capture = source
+        .capture_ready_memory_hotplug_state(Some(memory_hotplug_config), &guard)
+        .expect("all-optional memory-hotplug should capture")
+        .expect("all-optional memory-hotplug should exist")
+        .try_to_snapshot_v2(requested_size_mib)
+        .expect("all-optional memory-hotplug capture should convert");
+    let serial = SnapshotV2SerialState::try_from_capture_ready(
+        source
+            .capture_ready_serial_state(controller.serial_config().clone(), &guard)
+            .expect("all-optional serial should capture"),
+    )
+    .expect("all-optional serial capture should convert");
+    drop(guard);
+
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("all-optional memory-hotplug source should pause");
+    let boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+            .expect("all-optional memory-hotplug kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("all-optional memory-hotplug boot metadata should validate");
+    let mut memory_writer = Cursor::new(Vec::new());
+    let platform = source
+        .capture_snapshot_v2_memory_hotplug_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            Some(memory_hotplug_capture),
+            &mut memory_writer,
+            |_| false,
+        )
+        .expect("all-optional exact-2.10 platform should capture");
+    HvfSnapshotV2MemoryHotplugState::try_new(
+        platform.clone(),
+        Some(graph.clone()),
+        serial.clone(),
+        Some(entropy.clone()),
+        Some(balloon.clone()),
+    )
+    .expect("all-optional exact-2.10 product should compose");
+    let memory_image = TempFile::new("restore-all-memory-hotplug-image", memory_writer.get_ref())
+        .expect("all-optional memory-hotplug image should persist");
+    source
+        .shutdown()
+        .expect("signed all-optional memory-hotplug source should shut down");
+
+    let platform_state = platform.platform().clone();
+    let portable_state = platform
+        .memory_hotplug()
+        .expect("all-optional platform should retain memory-hotplug")
+        .clone();
+    let process = HvfSnapshotV2MemoryHotplugMmioProcessConfig::new(
+        balloon_layout,
+        HvfSnapshotV2StorageMmioProcessConfig::new(block_layout, pmem_layout),
+        entropy_layout,
+        memory_hotplug_layout,
+    );
+    let prepare_plan = || {
+        let topology = PreparedSnapshotV2MemoryHotplugTopology::prepare(
+            portable_state.clone(),
+            platform_state.memory().clone(),
+        )
+        .expect("all-optional memory-hotplug topology should prepare");
+        let memory = materialize_snapshot_v2_memory_hotplug_file(
+            &topology,
+            std::fs::File::open(memory_image.path())
+                .expect("all-optional memory-hotplug image should reopen"),
+        )
+        .expect("all-optional memory-hotplug destination should materialize");
+        let restore_now = Instant::now();
+        let balloon_plan = SnapshotV2BalloonRestorePlan::prepare(balloon.clone(), &memory)
+            .expect("all-optional balloon restore plan should prepare");
+        let entropy_plan =
+            SnapshotV2EntropyRestorePlan::prepare(entropy.clone(), &memory, restore_now)
+                .expect("all-optional entropy restore plan should prepare");
+        let backing = BlockFileBacking::open_snapshot(
+            std::path::Path::new(graph.block_records()[0].config().selector()),
+            graph.block_records()[0].config().is_read_only(),
+        )
+        .expect("all-optional block backing should reopen")
+        .0;
+        let bundle = SnapshotV2StorageRestorePlan::prepare(graph.clone(), &memory, restore_now)
+            .expect("all-optional storage restore plan should prepare")
+            .prepare_backings(vec![backing], Vec::new(), || false)
+            .expect("all-optional storage backing bundle should prepare");
+        prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan(
+            &platform_state,
+            HvfSnapshotV2MemoryHotplugPreparedProduct::
+                serial_balloon_storage_entropy_memory_hotplug(
+                    topology,
+                    memory,
+                    balloon_plan,
+                    bundle,
+                    entropy_plan,
+                ),
+            process,
+        )
+        .expect("all-optional memory-hotplug owner plan should prepare")
+    };
+    let restored_shell = || {
+        HvfSnapshotV2RestoredSerialShell::new(
+            SerialMmioDevice::from_capture_state_with_shared_output(
+                SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                serial.device().clone(),
+            ),
+        )
+    };
+
+    for fault in [
+        HvfSnapshotV2MemoryHotplugMmioRestoreFault::BalloonPublication,
+        HvfSnapshotV2MemoryHotplugMmioRestoreFault::StoragePublication,
+        HvfSnapshotV2MemoryHotplugMmioRestoreFault::EntropyPublication,
+    ] {
+        let error = OwnedHvfArm64BootSession::restore_snapshot_v2_memory_hotplug_mmio_with_fault(
+            platform_state.clone(),
+            restored_shell(),
+            None,
+            prepare_plan(),
+            fault,
+        )
+        .expect_err("injected all-optional publication fault should reject");
+        assert!(error.is_terminal());
+        assert!(
+            !error.has_incomplete_cleanup(),
+            "{fault:?} should roll back cleanly: {error:?}"
+        );
+    }
+
+    let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_memory_hotplug_mmio(
+        platform_state.clone(),
+        restored_shell(),
+        None,
+        prepare_plan(),
+    )
+    .unwrap_or_else(|error| {
+        let source = std::error::Error::source(&error);
+        let detail = source.and_then(std::error::Error::source);
+        panic!(
+            "all-optional memory-hotplug owners should restore: {error:?}, source={source:?}, detail={detail:?}"
+        )
+    });
+    assert_eq!(owners.state(), &portable_state);
+    assert_eq!(owners.balloon_config(), Some(balloon_config));
+    assert_eq!(owners.entropy_config(), Some(entropy_config));
+    assert_eq!(
+        owners
+            .storage_configs()
+            .expect("restored all-optional storage configs should exist"),
+        &source_configs
+    );
+    assert!(
+        owners
+            .session()
+            .shared_memory_hotplug_device_metrics()
+            .expect("restored all-optional memory-hotplug metrics should exist")
+            .snapshot()
+            .is_empty()
+    );
+    assert!(
+        owners
+            .session()
+            .shared_balloon_device_metrics()
+            .snapshot()
+            .is_empty()
+    );
+    assert!(
+        owners
+            .session()
+            .shared_entropy_device_metrics()
+            .snapshot()
+            .is_empty()
+    );
+
+    let (mut restored, state, controller, storage, returned_entropy, returned_balloon) =
+        owners.into_parts();
+    assert_eq!(state, portable_state);
+    assert_eq!(returned_entropy, Some(entropy_config));
+    assert_eq!(returned_balloon, Some(balloon_config));
+    let storage = storage.expect("restored all-optional storage configs should remain");
+    assert_eq!(restored.runtime_resources().block_devices.len(), 1);
+    assert!(restored.runtime_resources().balloon_device.is_some());
+    assert!(restored.runtime_resources().entropy_device.is_some());
+    assert!(restored.runtime_resources().memory_hotplug_device.is_some());
+
+    let guard = restored
+        .quiesce_limiter_retry_wakeups()
+        .expect("restored all-optional owners should quiesce");
+    let recaptured_memory_hotplug = restored
+        .capture_ready_memory_hotplug_state(Some(controller.config()), &guard)
+        .expect("restored all-optional memory-hotplug should capture")
+        .expect("restored all-optional memory-hotplug should exist")
+        .try_to_snapshot_v2(controller.requested_size_mib())
+        .expect("restored all-optional memory-hotplug capture should convert");
+    assert_eq!(recaptured_memory_hotplug.state(), &portable_state);
+    let recaptured_balloon = restored
+        .capture_ready_balloon_state(Some(balloon_config), &guard)
+        .expect("restored all-optional balloon should capture")
+        .expect("restored all-optional balloon should exist")
+        .try_to_snapshot_v2()
+        .expect("restored all-optional balloon capture should convert");
+    assert_eq!(recaptured_balloon.config(), balloon.config());
+    assert_eq!(
+        recaptured_balloon.config_space().num_pages(),
+        balloon.config_space().num_pages()
+    );
+    assert_eq!(
+        recaptured_balloon.config_space().actual_pages(),
+        balloon.config_space().actual_pages()
+    );
+    assert_eq!(
+        recaptured_balloon.config_space().free_page_hint_cmd_id(),
+        VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+    );
+    assert_eq!(recaptured_balloon.accounting(), balloon.accounting());
+    assert_eq!(recaptured_balloon.virtio(), balloon.virtio());
+    assert_eq!(recaptured_balloon.transport(), balloon.transport());
+    assert_eq!(
+        recaptured_balloon.continuation().active_queues(),
+        balloon.continuation().active_queues()
+    );
+    let recaptured_entropy = restored
+        .capture_ready_entropy_state_at(Some(entropy_config), &guard, capture_now)
+        .expect("restored all-optional entropy should capture")
+        .expect("restored all-optional entropy should exist")
+        .try_to_snapshot_v2()
+        .expect("restored all-optional entropy capture should convert");
+    assert_eq!(recaptured_entropy, entropy);
+    let recaptured_graph = restored
+        .capture_snapshot_v2_storage_device_graph_at(&storage, &guard, capture_now)
+        .expect("restored all-optional storage graph should capture");
+    assert_eq!(recaptured_graph, graph);
+    drop(guard);
+    restored
+        .shutdown()
+        .expect("restored all-optional destination should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn guest_write_to_writable_pmem_is_visible_before_any_pmem_flush() {
     use std::os::unix::fs::FileExt;
 

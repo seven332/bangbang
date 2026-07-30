@@ -17,8 +17,9 @@ use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
 use crate::lazy_host_fault::{HvfLazyGuestMemoryConsumer, HvfLazyPageResolver};
 use crate::memory::{
     HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping, HvfMemoryMapper,
-    HvfMemoryPermissions, HvfPmemFlushExecutor, HvfVirtioMemMappingCaptureError,
-    HvfVirtioMemMappingCaptureState, HvfVirtioMemMutationExecutor, RealHvfMemoryMapper,
+    HvfMemoryPermissions, HvfPmemFlushExecutor, HvfSnapshotV2MemoryHotplugMappingPlan,
+    HvfVirtioMemMappingCaptureError, HvfVirtioMemMappingCaptureState, HvfVirtioMemMutationExecutor,
+    RealHvfMemoryMapper,
 };
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
 use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError};
@@ -97,6 +98,36 @@ impl HvfBackend {
         }
 
         self.map_guest_memory_with_configured_mapper(memory, permissions)
+    }
+
+    pub(crate) fn map_snapshot_v2_memory_hotplug(
+        &mut self,
+        memory: GuestMemory,
+        plan: &HvfSnapshotV2MemoryHotplugMappingPlan,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        if !Self::is_supported_target() {
+            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        }
+
+        self.validate_guest_memory_mapping_state()?;
+        match HvfGuestMemoryMapping::map_snapshot_v2_memory_hotplug_with_mapper(
+            memory,
+            plan,
+            permissions,
+            Arc::clone(&self.memory_mapper),
+        ) {
+            Ok(mapping) => {
+                self.guest_memory = Some(mapping);
+                Ok(())
+            }
+            Err(failed_mapping) => {
+                if failed_mapping.mapping.has_mapped_regions() {
+                    self.guest_memory = Some(failed_mapping.mapping);
+                }
+                Err(failed_mapping.error)
+            }
+        }
     }
 
     /// Map resolver-owned anonymous memory and force first guest accesses to

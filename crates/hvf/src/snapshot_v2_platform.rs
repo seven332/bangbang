@@ -57,7 +57,9 @@ use crate::gic::{
     HvfGicError, HvfGicInterruptLineAllocator, HvfGicMetadata, HvfGicMsiConfiguration,
     HvfGicSpiSignalError, HvfGicSpiSignaler, HvfInterruptLineAllocationError,
 };
-use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
+use crate::memory::{
+    HvfGuestMemoryMappingError, HvfMemoryPermissions, HvfSnapshotV2MemoryHotplugMappingPlan,
+};
 use crate::pvtime::HvfArm64PvTimeAccountingConfig;
 use crate::runner::{HvfArm64SnapshotV2VcpuRestore, HvfVcpuRunStepOutcome, HvfVcpuRunnerError};
 use crate::session_vcpu::{
@@ -463,6 +465,18 @@ pub(crate) struct HvfSnapshotV2BalloonMmioShellPlan<'a> {
     pub(crate) vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2MemoryHotplugMmioShellPlan<'a> {
+    pub(crate) balloon_interrupt: Option<GuestInterruptLine>,
+    pub(crate) command_line: Option<&'a str>,
+    pub(crate) block_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
+    pub(crate) pmem_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
+    pub(crate) entropy_interrupt: Option<GuestInterruptLine>,
+    pub(crate) memory_hotplug_interrupt: GuestInterruptLine,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 pub(crate) struct HvfSnapshotV2StoragePciShellPlan<'a> {
     pub(crate) command_line: &'a str,
     pub(crate) pci: &'a HvfSnapshotV2StoragePciHostPlan,
@@ -506,6 +520,10 @@ enum HvfSnapshotV2ProcessShellRestore<'a> {
     BalloonMmio {
         shell: HvfSnapshotV2ProcessSerialShell,
         plan: HvfSnapshotV2BalloonMmioShellPlan<'a>,
+    },
+    MemoryHotplugMmio {
+        shell: HvfSnapshotV2ProcessSerialShell,
+        plan: HvfSnapshotV2MemoryHotplugMmioShellPlan<'a>,
     },
     StoragePci {
         shell: HvfSnapshotV2ProcessSerialShell,
@@ -1622,6 +1640,44 @@ fn restore_hvf_snapshot_v2_platform_with_shell(
     memory: GuestMemory,
     process_shell: Option<HvfSnapshotV2ProcessShellRestore<'_>>,
 ) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
+        state,
+        memory,
+        process_shell,
+        HvfSnapshotV2MemoryMappingRestore::Ordinary,
+    )
+}
+
+pub(crate) fn restore_hvf_snapshot_v2_serial_memory_hotplug_mmio_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2RestoredSerialShell,
+    plan: HvfSnapshotV2MemoryHotplugMmioShellPlan<'_>,
+    mapping: &HvfSnapshotV2MemoryHotplugMappingPlan,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::MemoryHotplugMmio {
+            shell: shell.into(),
+            plan,
+        }),
+        HvfSnapshotV2MemoryMappingRestore::MemoryHotplug(mapping),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum HvfSnapshotV2MemoryMappingRestore<'a> {
+    Ordinary,
+    MemoryHotplug(&'a HvfSnapshotV2MemoryHotplugMappingPlan),
+}
+
+fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    process_shell: Option<HvfSnapshotV2ProcessShellRestore<'_>>,
+    mapping: HvfSnapshotV2MemoryMappingRestore<'_>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
     debug_assert!(cleanup_sequence(RestoreOwnership::Empty).is_empty());
     let mut cleanup = Vec::new();
     if cleanup.try_reserve_exact(2).is_err() {
@@ -1717,7 +1773,15 @@ fn restore_hvf_snapshot_v2_platform_with_shell(
             cleanup,
         ));
     }
-    if let Err(source) = backend.map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM) {
+    let mapped = match mapping {
+        HvfSnapshotV2MemoryMappingRestore::Ordinary => {
+            backend.map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        }
+        HvfSnapshotV2MemoryMappingRestore::MemoryHotplug(plan) => {
+            backend.map_snapshot_v2_memory_hotplug(memory, plan, HvfMemoryPermissions::GUEST_RAM)
+        }
+    };
+    if let Err(source) = mapped {
         return Err(failed_restore(
             HvfSnapshotV2PlatformRestoreStage::Memory,
             HvfSnapshotV2PlatformRestoreFailure::MapMemory(source),
@@ -2763,6 +2827,67 @@ fn prepare_process_shell(
                         .allocate()
                         .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
                         != entropy_interrupt
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
+                }
+                let block_plan = match plan.command_line {
+                    Some(command_line) => HvfSnapshotV2ProcessBlockFdtPlan::StorageMmio {
+                        command_line,
+                        block_records: plan.block_records,
+                        pmem_records: plan.pmem_records,
+                    },
+                    None => HvfSnapshotV2ProcessBlockFdtPlan::None,
+                };
+                (
+                    shell,
+                    block_plan,
+                    true,
+                    false,
+                    Some((
+                        plan.serial_interrupt,
+                        plan.vmgenid_interrupt,
+                        plan.vmclock_interrupt,
+                    )),
+                )
+            }
+            HvfSnapshotV2ProcessShellRestore::MemoryHotplugMmio { shell, plan } => {
+                let storage_count = plan.block_records.len() + plan.pmem_records.len();
+                if gic.msi.is_some() || plan.command_line.is_some() != (storage_count != 0) {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                        mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                    });
+                }
+                if let Some(balloon_interrupt) = plan.balloon_interrupt
+                    && allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != balloon_interrupt
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
+                }
+                for record in plan.block_records.iter().chain(plan.pmem_records) {
+                    if allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != record.interrupt_line()
+                    {
+                        return Err(
+                            HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
+                        );
+                    }
+                }
+                if let Some(entropy_interrupt) = plan.entropy_interrupt
+                    && allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != entropy_interrupt
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
+                }
+                if allocator
+                    .allocate()
+                    .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                    != plan.memory_hotplug_interrupt
                 {
                     return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
                 }
