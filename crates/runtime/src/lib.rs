@@ -47,6 +47,7 @@ pub mod snapshot_format_v2;
 pub mod snapshot_memory;
 pub mod snapshot_memory_hotplug_v2_10;
 pub mod snapshot_memory_v2;
+pub mod snapshot_network_restore_v2_11;
 pub mod snapshot_network_v2_11;
 pub mod snapshot_restore;
 pub mod snapshot_serial_v2_7;

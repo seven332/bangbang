@@ -939,6 +939,129 @@ fn exact_minor_eleven_candidate_closes_every_optional_component_product() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn exact_minor_eleven_network_candidate_prepares_complete_owner_free_handoff() {
+    let network_payload = fixture_bytes(include_str!(
+        "../snapshot_network_v2_11/fixtures/inactive-mmio.hex"
+    ));
+    let candidate = exact_minor_eleven_candidate(Some(&network_payload));
+    let expected_bytes = candidate.bytes().to_vec();
+    let expected_binding = candidate.memory_binding().clone();
+    let expected_serial = candidate.serial().clone();
+    let network = candidate
+        .network()
+        .expect("fixture candidate should contain network state")
+        .clone();
+    let overrides = network
+        .interfaces()
+        .iter()
+        .map(|interface| SnapshotNetworkOverride::new(interface.iface_id(), "vmnet:shared"))
+        .collect::<Vec<_>>();
+
+    let preparation = candidate
+        .prepare(&overrides)
+        .expect("complete explicit override set should prepare");
+    assert!(preparation.compatible().is_none());
+    let prepared = preparation
+        .prepared()
+        .expect("network-bearing candidate should be prepared");
+    assert_eq!(prepared.bytes(), expected_bytes);
+    assert_eq!(prepared.memory_binding(), &expected_binding);
+    assert_eq!(prepared.serial(), &expected_serial);
+    assert!(prepared.device_graph().is_none());
+    assert!(prepared.entropy().is_none());
+    assert!(prepared.balloon().is_none());
+    assert!(prepared.memory_hotplug().is_none());
+    assert_eq!(
+        prepared.topology().interfaces().len(),
+        network.interfaces().len()
+    );
+    assert_eq!(prepared.manifest().len(), network.interfaces().len());
+    assert_eq!(
+        prepared.manifest().overrides().count(),
+        network.interfaces().len()
+    );
+    for (index, (entry, source)) in prepared
+        .topology()
+        .interfaces()
+        .iter()
+        .zip(network.interfaces())
+        .enumerate()
+    {
+        assert_eq!(entry.source_index(), u16::try_from(index).unwrap());
+        assert_eq!(entry.portable(), source);
+        assert_eq!(entry.controller().host_dev_name(), "vmnet:shared");
+        assert!(prepared.manifest().is_overridden(entry.resource_key()));
+    }
+    let debug = format!("{preparation:?} {prepared:?}");
+    assert!(debug.contains(REDACTED));
+    assert!(!debug.contains("vmnet:shared"));
+    assert!(!debug.contains(network.interfaces()[0].iface_id()));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_eleven_network_free_candidate_requires_empty_overrides() {
+    let compatible = exact_minor_eleven_candidate(None);
+    let expected_bytes = compatible.bytes().to_vec();
+    let preparation = compatible
+        .prepare(&[])
+        .expect("network-free candidate should preserve its compatible path");
+    assert!(preparation.prepared().is_none());
+    assert_eq!(
+        preparation
+            .compatible()
+            .expect("network-free candidate should remain compatible")
+            .bytes(),
+        expected_bytes
+    );
+
+    let error = exact_minor_eleven_candidate(None)
+        .prepare(&[SnapshotNetworkOverride::new(
+            "private-interface",
+            "vmnet:private-selector",
+        )])
+        .expect_err("override without saved network state must fail");
+    assert!(matches!(
+        error,
+        NativeV2NetworkSnapshotPreparationError::OverridesWithoutNetwork
+    ));
+    let diagnostic = format!("{error:?} {error}");
+    assert!(!diagnostic.contains("private-interface"));
+    assert!(!diagnostic.contains("private-selector"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_eleven_candidate_propagates_stable_network_cancellation() {
+    let network_payload = fixture_bytes(include_str!(
+        "../snapshot_network_v2_11/fixtures/inactive-mmio.hex"
+    ));
+    let candidate = exact_minor_eleven_candidate(Some(&network_payload));
+    let overrides = candidate
+        .network()
+        .expect("fixture candidate should contain network state")
+        .interfaces()
+        .iter()
+        .map(|interface| SnapshotNetworkOverride::new(interface.iface_id(), "vmnet:shared"))
+        .collect::<Vec<_>>();
+    let error = candidate
+        .prepare_with_cancel(&overrides, |stage| {
+            stage == SnapshotV2NetworkRestorePreparationStage::Completion
+        })
+        .expect_err("completion cancellation must prevent publication");
+
+    assert!(matches!(
+        error,
+        NativeV2NetworkSnapshotPreparationError::Topology(
+            SnapshotV2NetworkRestorePreparationError::Cancelled {
+                stage: SnapshotV2NetworkRestorePreparationStage::Completion,
+            }
+        )
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn exact_minor_eleven_candidate_rejects_invalid_or_non_singleton_network_components() {
     let memory = test_v2_memory();
     let mut image = Cursor::new(Vec::new());
@@ -2548,6 +2671,57 @@ fn fixture_bytes(hex: &str) -> Vec<u8> {
             u8::from_str_radix(pair, 16).expect("fixture hex should decode")
         })
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn exact_minor_eleven_candidate(
+    network_payload: Option<&[u8]>,
+) -> NativeV2NetworkSnapshotCandidateState {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact-2.11 memory should encode internally");
+    let binding_payload = binding.encode().expect("memory binding should encode");
+    let serial_device = SerialMmioDevice::discarding()
+        .capture_state()
+        .expect("fixture serial device should capture");
+    let serial_payload = SnapshotV2SerialState::try_from_capture_ready(
+        CaptureReadySerialState::new(SerialConfig::default(), serial_device),
+    )
+    .expect("fixture serial state should validate")
+    .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+    .expect("fixture serial state should encode");
+
+    let memory_component = SnapshotV2Component::new(
+        NATIVE_V2_MEMORY_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &binding_payload,
+    );
+    let serial_component = SnapshotV2Component::new(
+        NATIVE_V2_SERIAL_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &serial_payload,
+    );
+    let mut components = vec![memory_component, serial_component];
+    if let Some(network_payload) = network_payload {
+        components.push(SnapshotV2Component::new(
+            NATIVE_V2_NETWORK_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            network_payload,
+        ));
+    }
+    let bytes = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("exact-2.11 candidate should encode");
+    NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(bytes)
+        .expect("exact-2.11 candidate should close")
 }
 
 #[cfg(target_os = "macos")]

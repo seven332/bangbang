@@ -1667,6 +1667,20 @@ config space, queue, common virtio, transport, and a compact plugged bitmap
 bound to exact memory extents while restoring one fresh shared aperture and
 destination-local mapping, dirty, notifier, interrupt, dispatcher, route,
 metrics, and cleanup owners. Network, vsock, and MMDS restore remain excluded.
+An internal exact native-v2 2.11 preparation seam now closes network destination
+values without activating that public restore path. It requires exactly one
+explicit `network_overrides` entry for every saved interface, including
+MMDS-only interfaces; validates and copies the complete set before macOS
+authority policy; canonicalizes it to saved interface order; and retains
+owner-free controller/MMDS projections plus exact packet-I/O resource keys.
+Captured host-device selectors remain inert source state and never select a
+destination. This is deliberately stricter than Firecracker v1.16.0, which
+updates the first matching decoded network record for each supplied override,
+allows partial and repeated override vectors, and otherwise falls back to the
+captured TAP name. Bangbang accepts an explicit replacement equal to the
+captured string, but still treats it as an explicit binding. Public native-v2
+create/load remains at exact 2.10 and continues to reject network restore until
+the later owner, platform, activation, and signed-evidence slices complete.
 Exact 2.9 retains optional balloon, exact 2.8 retains optional entropy, exact
 2.7 retains serial with optional profile-3 storage, exact 2.6 retains the storage-only profile-3
 graph, exact 2.5 retains its block-only profile-2 graph, exact 2.4 retains its singleton

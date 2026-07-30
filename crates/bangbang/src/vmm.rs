@@ -168,9 +168,10 @@ use bangbang_runtime::snapshot_artifact::{
     NativeV2NetworkSnapshotCandidateState, NativeV2SerialSnapshotCandidateState,
     NativeV2SnapshotArtifactProfile, NativeV2SnapshotCandidateState,
     NativeV2SnapshotCandidateStateError, NativeV2StorageSnapshotCandidateState,
-    PreparedNativeSnapshotState, SnapshotArtifactLoadError, SnapshotArtifactOutput,
-    SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotCommitDurability,
-    SnapshotMemoryStagingWriter, SnapshotPublicationOutcome, SnapshotPublicationTransactionError,
+    PreparedNativeSnapshotState, PreparedNativeV2NetworkSnapshotCandidateState,
+    SnapshotArtifactLoadError, SnapshotArtifactOutput, SnapshotArtifactOutputs,
+    SnapshotArtifactPaths, SnapshotCommitDurability, SnapshotMemoryStagingWriter,
+    SnapshotPublicationOutcome, SnapshotPublicationTransactionError,
     load_prepared_native_snapshot_memory_file, load_prepared_native_snapshot_memory_path,
     load_snapshot_artifacts, prepare_native_snapshot_state_file,
     prepare_native_snapshot_state_path, prepare_snapshot_state_file, prepare_snapshot_state_path,
@@ -18416,6 +18417,168 @@ impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
     }
 }
 
+/// Value-only exact-2.11 network restore plan before any provider access.
+///
+/// The plan retains the complete owner-free runtime candidate, parsed macOS
+/// destination grammar, and immutable process authority. It owns no backend,
+/// descriptor, provider, callback, metric, MMDS owner, or platform resource.
+pub(crate) struct PreparedProcessSnapshotV2NetworkRestorePlan {
+    candidate: PreparedNativeV2NetworkSnapshotCandidateState,
+    vmnet_configs: Vec<VmnetInterfaceConfig>,
+    all_mmds: bool,
+    authority: ProcessVmnetAuthority,
+}
+
+pub(crate) type PreparedProcessSnapshotV2NetworkRestorePlanParts = (
+    PreparedNativeV2NetworkSnapshotCandidateState,
+    Vec<VmnetInterfaceConfig>,
+    bool,
+    ProcessVmnetAuthority,
+);
+
+impl PreparedProcessSnapshotV2NetworkRestorePlan {
+    pub(crate) const fn candidate(&self) -> &PreparedNativeV2NetworkSnapshotCandidateState {
+        &self.candidate
+    }
+
+    pub(crate) fn vmnet_configs(&self) -> &[VmnetInterfaceConfig] {
+        &self.vmnet_configs
+    }
+
+    pub(crate) const fn all_mmds(&self) -> bool {
+        self.all_mmds
+    }
+
+    pub(crate) const fn authority(&self) -> ProcessVmnetAuthority {
+        self.authority
+    }
+
+    pub(crate) fn into_parts(self) -> PreparedProcessSnapshotV2NetworkRestorePlanParts {
+        (
+            self.candidate,
+            self.vmnet_configs,
+            self.all_mmds,
+            self.authority,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedProcessSnapshotV2NetworkRestorePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProcessSnapshotV2NetworkRestorePlan")
+            .field("interface_count", &self.vmnet_configs.len())
+            .field("all_mmds", &self.all_mmds)
+            .field("authority", &self.authority)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+enum ProcessSnapshotV2NetworkRestorePlanError {
+    Allocation {
+        source: TryReserveError,
+    },
+    Selector {
+        source: VmnetHostDeviceNameConfigError,
+    },
+    Authority(ProcessVmnetAuthorityValidationError),
+}
+
+impl fmt::Debug for ProcessSnapshotV2NetworkRestorePlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Allocation { .. } => "ProcessSnapshotV2NetworkRestorePlanError::Allocation",
+            Self::Selector { .. } => "ProcessSnapshotV2NetworkRestorePlanError::Selector",
+            Self::Authority(source) => {
+                let _ = source;
+                "ProcessSnapshotV2NetworkRestorePlanError::Authority"
+            }
+        })
+    }
+}
+
+impl fmt::Display for ProcessSnapshotV2NetworkRestorePlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Allocation { .. } => "failed to allocate exact-2.11 network restore value plan",
+            Self::Selector { .. } => "exact-2.11 network restore destination selector is invalid",
+            Self::Authority(_) => "exact-2.11 network restore destination authority is invalid",
+        })
+    }
+}
+
+impl std::error::Error for ProcessSnapshotV2NetworkRestorePlanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Allocation { source } => Some(source),
+            Self::Selector { source } => Some(source),
+            Self::Authority(_) => None,
+        }
+    }
+}
+
+fn prepare_process_snapshot_v2_network_restore_plan(
+    candidate: PreparedNativeV2NetworkSnapshotCandidateState,
+    authority: ProcessVmnetAuthority,
+) -> Result<PreparedProcessSnapshotV2NetworkRestorePlan, ProcessSnapshotV2NetworkRestorePlanError> {
+    let interfaces = candidate.topology().interfaces();
+    let mut vmnet_configs = Vec::new();
+    vmnet_configs
+        .try_reserve_exact(interfaces.len())
+        .map_err(|source| ProcessSnapshotV2NetworkRestorePlanError::Allocation { source })?;
+    for interface in interfaces {
+        let vmnet =
+            VmnetInterfaceConfig::from_host_dev_name(interface.controller().host_dev_name())
+                .map_err(|source| ProcessSnapshotV2NetworkRestorePlanError::Selector { source })?;
+        vmnet_configs.push(vmnet);
+    }
+
+    let all_mmds = !interfaces.is_empty()
+        && interfaces
+            .iter()
+            .all(|interface| interface.mmds_stack().is_some());
+    validate_process_vmnet_authority_for_resolved_configs(
+        vmnet_configs.len(),
+        all_mmds,
+        authority,
+        &vmnet_configs,
+    )
+    .map_err(ProcessSnapshotV2NetworkRestorePlanError::Authority)?;
+
+    Ok(PreparedProcessSnapshotV2NetworkRestorePlan {
+        candidate,
+        vmnet_configs,
+        all_mmds,
+        authority,
+    })
+}
+
+type ProcessSnapshotV2NetworkRestorePlanBuilder = fn(
+    PreparedNativeV2NetworkSnapshotCandidateState,
+    ProcessVmnetAuthority,
+) -> Result<
+    PreparedProcessSnapshotV2NetworkRestorePlan,
+    ProcessSnapshotV2NetworkRestorePlanError,
+>;
+
+const _: ProcessSnapshotV2NetworkRestorePlanBuilder =
+    prepare_process_snapshot_v2_network_restore_plan;
+const _: fn(
+    &PreparedProcessSnapshotV2NetworkRestorePlan,
+) -> &PreparedNativeV2NetworkSnapshotCandidateState =
+    PreparedProcessSnapshotV2NetworkRestorePlan::candidate;
+const _: fn(&PreparedProcessSnapshotV2NetworkRestorePlan) -> &[VmnetInterfaceConfig] =
+    PreparedProcessSnapshotV2NetworkRestorePlan::vmnet_configs;
+const _: fn(&PreparedProcessSnapshotV2NetworkRestorePlan) -> bool =
+    PreparedProcessSnapshotV2NetworkRestorePlan::all_mmds;
+const _: fn(&PreparedProcessSnapshotV2NetworkRestorePlan) -> ProcessVmnetAuthority =
+    PreparedProcessSnapshotV2NetworkRestorePlan::authority;
+const _: fn(
+    PreparedProcessSnapshotV2NetworkRestorePlan,
+) -> PreparedProcessSnapshotV2NetworkRestorePlanParts =
+    PreparedProcessSnapshotV2NetworkRestorePlan::into_parts;
+
 #[derive(Debug)]
 enum ProcessVmnetAuthorityValidationError {
     Provider(ProcessNetworkPacketIoProviderBuildError),
@@ -18469,19 +18632,64 @@ fn validate_process_vmnet_authority_for_configs(
     all_mmds: bool,
     authority: ProcessVmnetAuthority,
 ) -> Result<(), ProcessVmnetAuthorityValidationError> {
-    validate_network_interface_count(configs.len()).map_err(|source| {
+    let required_authority = required_process_vmnet_authority(configs.len(), all_mmds, authority)?;
+    for config in configs {
+        let vmnet =
+            VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name()).map_err(|source| {
+                ProcessVmnetAuthorityValidationError::Provider(
+                    ProcessNetworkPacketIoProviderBuildError::HostDeviceName { source },
+                )
+            })?;
+        if let Some(authority) = required_authority
+            && !vmnet_authority_allows(authority, &vmnet)
+        {
+            return Err(ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized);
+        }
+    }
+    Ok(())
+}
+
+fn validate_process_vmnet_authority_for_resolved_configs(
+    interface_count: usize,
+    all_mmds: bool,
+    authority: ProcessVmnetAuthority,
+    vmnet_configs: &[VmnetInterfaceConfig],
+) -> Result<(), ProcessVmnetAuthorityValidationError> {
+    if interface_count != vmnet_configs.len() {
+        return Err(ProcessVmnetAuthorityValidationError::Provider(
+            ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch,
+        ));
+    }
+    let required_authority =
+        required_process_vmnet_authority(interface_count, all_mmds, authority)?;
+    if let Some(authority) = required_authority
+        && vmnet_configs
+            .iter()
+            .any(|vmnet| !vmnet_authority_allows(authority, vmnet))
+    {
+        return Err(ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized);
+    }
+    Ok(())
+}
+
+fn required_process_vmnet_authority(
+    interface_count: usize,
+    all_mmds: bool,
+    authority: ProcessVmnetAuthority,
+) -> Result<Option<VmnetAuthority>, ProcessVmnetAuthorityValidationError> {
+    validate_network_interface_count(interface_count).map_err(|source| {
         ProcessVmnetAuthorityValidationError::Provider(
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source },
         )
     })?;
     let contained_authority = authority.contained_authority();
 
-    let required_authority = match (all_mmds, configs.is_empty()) {
+    let required_authority = match (all_mmds, interface_count == 0) {
         (true, _) | (_, true) => None,
         (false, false) => contained_authority,
     };
     if let Some(authority) = required_authority
-        && configs.len()
+        && interface_count
             > usize::from(
                 authority
                     .max_interfaces()
@@ -18490,22 +18698,7 @@ fn validate_process_vmnet_authority_for_configs(
     {
         return Err(ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized);
     }
-
-    for config in configs {
-        let vmnet =
-            VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name()).map_err(|source| {
-                ProcessVmnetAuthorityValidationError::Provider(
-                    ProcessNetworkPacketIoProviderBuildError::HostDeviceName { source },
-                )
-            })?;
-        let Some(authority) = required_authority else {
-            continue;
-        };
-        if !vmnet_authority_allows(authority, &vmnet) {
-            return Err(ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized);
-        }
-    }
-    Ok(())
+    Ok(required_authority)
 }
 
 fn vmnet_authority_allows(authority: VmnetAuthority, vmnet: &VmnetInterfaceConfig) -> bool {
@@ -24444,9 +24637,10 @@ mod tests {
         SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
     use bangbang_runtime::mmds::{
-        MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsVersion,
+        DEFAULT_MMDS_IPV4_ADDRESS, DEFAULT_MMDS_MAC_ADDRESS, MMDS_GUEST_TCP_PORT, MmdsConfig,
+        MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsVersion,
     };
-    use bangbang_runtime::mmio::MmioRegion;
+    use bangbang_runtime::mmio::{MmioRegion, MmioRegionId};
     use bangbang_runtime::network::{
         GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkDeviceProfile, NetworkInterfaceConfig,
         NetworkInterfaceConfigError, NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
@@ -24473,16 +24667,17 @@ mod tests {
     };
     use bangbang_runtime::snapshot::{
         SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend, SnapshotMemoryBackendType,
-        SnapshotType, SnapshotV1ControllerCommit, SnapshotV2ControllerCommit,
-        SnapshotV2ControllerCommitProductConfigs,
+        SnapshotNetworkOverride, SnapshotType, SnapshotV1ControllerCommit,
+        SnapshotV2ControllerCommit, SnapshotV2ControllerCommitProductConfigs,
     };
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotPublicationOutcome,
         NativeV2BalloonSnapshotCandidateState, NativeV2EntropySnapshotCandidateState,
         NativeV2MemoryHotplugSnapshotCandidateState, NativeV2MemoryHotplugSnapshotPreparation,
-        NativeV2NetworkSnapshotCandidateState, NativeV2SnapshotArtifactProfile,
-        PreparedNativeSnapshotState, SnapshotArtifactOutputs, SnapshotArtifactPaths,
-        SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
+        NativeV2NetworkSnapshotCandidateState, NativeV2NetworkSnapshotPreparation,
+        NativeV2SnapshotArtifactProfile, PreparedNativeSnapshotState,
+        PreparedNativeV2NetworkSnapshotCandidateState, SnapshotArtifactOutputs,
+        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_artifact::{
@@ -24498,7 +24693,8 @@ mod tests {
     use bangbang_runtime::snapshot_commit::SnapshotCommitRecord;
     use bangbang_runtime::snapshot_device_v2::{
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
-        SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransportKind,
+        SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport,
+        SnapshotV2DeviceTransportKind, SnapshotV2MmioDeviceState,
     };
     use bangbang_runtime::snapshot_device_v2_5::{
         NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
@@ -24527,7 +24723,9 @@ mod tests {
         write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
     };
     use bangbang_runtime::snapshot_network_v2_11::{
-        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, SnapshotV2NetworkState,
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, SnapshotV2MmdsInterfaceState,
+        SnapshotV2MmdsState, SnapshotV2NetworkBackendClass, SnapshotV2NetworkInterfaceState,
+        SnapshotV2NetworkInterfaceStateParts, SnapshotV2NetworkState,
         SnapshotV2NetworkStateBuildError,
     };
     use bangbang_runtime::snapshot_serial_v2_7::{
@@ -24565,7 +24763,7 @@ mod tests {
     use crate::host_network::vmnet::{
         VmnetError, VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceDescriptor,
         VmnetInterfaceDescriptorError, VmnetInterfaceParameters, VmnetInterfaceStartDisposition,
-        VmnetInterfaceStartError, VmnetOperation, VmnetPacketAvailableCallback,
+        VmnetInterfaceStartError, VmnetMode, VmnetOperation, VmnetPacketAvailableCallback,
         VmnetPacketIoBackend, VmnetPacketIoError, VmnetReadPacket, VmnetStartedInterface,
         VmnetStatus, VmnetWritePacket,
     };
@@ -24621,13 +24819,14 @@ mod tests {
         ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
         ProcessSnapshotV2BalloonLoadRequest, ProcessSnapshotV2EntropyLoadRequest,
         ProcessSnapshotV2MemoryHotplugLoadRequest, ProcessSnapshotV2MultiBlockLoadRequest,
-        ProcessSnapshotV2MultiBlockLoadSuccess, ProcessSnapshotV2RootLoadCompletion,
-        ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess,
-        ProcessSnapshotV2SerialLoadRequest, ProcessSnapshotV2StorageLoadRequest,
-        ProcessSnapshotV2StorageLoadSuccess, ProcessVmm, ProcessVmnetAuthority,
-        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
-        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
+        ProcessSnapshotV2MultiBlockLoadSuccess, ProcessSnapshotV2NetworkRestorePlanError,
+        ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
+        ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2SerialLoadRequest,
+        ProcessSnapshotV2StorageLoadRequest, ProcessSnapshotV2StorageLoadSuccess, ProcessVmm,
+        ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
+        SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
+        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        native_v2_platform_capture_is_terminal, prepare_process_snapshot_v2_network_restore_plan,
         require_native_v1_composite_record, snapshot_destination_machine_config,
         vsock_capture_error_from_boot_run_loop_command,
     };
@@ -31275,6 +31474,184 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn copied_inactive_mmio_network_interface(
+        source: &SnapshotV2NetworkInterfaceState,
+        index: usize,
+        backend: SnapshotV2NetworkBackendClass,
+    ) -> SnapshotV2NetworkInterfaceState {
+        let SnapshotV2DeviceTransport::Mmio(mmio) = source.transport() else {
+            panic!("partial-MMDS fixture source must use MMIO");
+        };
+        let offset = u64::try_from(index).expect("fixture interface index should fit")
+            * VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
+        let region = MmioRegion::new(
+            MmioRegionId::new(
+                mmio.region()
+                    .id()
+                    .raw_value()
+                    .checked_add(u64::try_from(index).unwrap())
+                    .expect("fixture region ID should fit"),
+            ),
+            GuestAddress::new(
+                mmio.region()
+                    .range()
+                    .start()
+                    .raw_value()
+                    .checked_add(offset)
+                    .expect("fixture MMIO placement should fit"),
+            ),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("fixture MMIO region should validate");
+        let transport = SnapshotV2DeviceTransport::Mmio(SnapshotV2MmioDeviceState::from_parts(
+            mmio.device_feature_select(),
+            mmio.driver_feature_select(),
+            mmio.queue_select(),
+            region,
+            GuestInterruptLine::new(
+                mmio.interrupt_line()
+                    .raw_value()
+                    .checked_add(u32::try_from(index).unwrap())
+                    .expect("fixture interrupt should fit"),
+            )
+            .expect("fixture interrupt should validate"),
+        ));
+        let guest_mac = GuestMacAddress::from_bytes([
+            0x02,
+            0,
+            0,
+            0,
+            0x40,
+            u8::try_from(index).expect("fixture MAC index should fit"),
+        ]);
+        let profile = NetworkDeviceProfile::new(Some(guest_mac), source.requested_mtu());
+
+        SnapshotV2NetworkInterfaceState::try_from_parts(SnapshotV2NetworkInterfaceStateParts {
+            iface_id: format!("eth{index}"),
+            captured_selector: format!("captured{index}"),
+            requested_guest_mac: Some(guest_mac),
+            requested_mtu: source.requested_mtu(),
+            profile,
+            backend,
+            local: source.local().clone(),
+            virtio: source.virtio().clone(),
+            rx_limiter: source.rx_limiter(),
+            tx_limiter: source.tx_limiter(),
+            transport,
+        })
+        .expect("copied network interface should validate")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fake_partial_mmds_network_state() -> SnapshotV2NetworkState {
+        let base = fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio);
+        let source = &base.interfaces()[0];
+        let interfaces = (0..2)
+            .map(|index| {
+                copied_inactive_mmio_network_interface(
+                    source,
+                    index,
+                    SnapshotV2NetworkBackendClass::Vmnet,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mmds = SnapshotV2MmdsState::new(
+            MmdsVersion::V2,
+            Some(DEFAULT_MMDS_IPV4_ADDRESS),
+            true,
+            vec![SnapshotV2MmdsInterfaceState::new(
+                0,
+                DEFAULT_MMDS_MAC_ADDRESS,
+                DEFAULT_MMDS_IPV4_ADDRESS,
+                MMDS_GUEST_TCP_PORT,
+            )],
+        );
+
+        SnapshotV2NetworkState::try_new(interfaces, Some(mmds))
+            .expect("partial-MMDS network state should validate")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepared_native_v2_network_restore_candidate(
+        state: SnapshotV2NetworkState,
+        selectors: &[&str],
+    ) -> PreparedNativeV2NetworkSnapshotCandidateState {
+        assert_eq!(selectors.len(), state.interfaces().len());
+        let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
+            .expect("exact-2.11 fixture memory range should validate");
+        let layout = GuestMemoryLayout::new(vec![range])
+            .expect("exact-2.11 fixture memory layout should validate");
+        let memory =
+            GuestMemory::allocate(&layout).expect("exact-2.11 fixture memory should allocate");
+        let mut image = Cursor::new(Vec::new());
+        let binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+            &memory,
+            &mut image,
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            |_| false,
+        )
+        .expect("exact-2.11 fixture memory should encode")
+        .encode()
+        .expect("exact-2.11 fixture binding should encode");
+        let serial_device = SerialMmioDevice::discarding()
+            .capture_state()
+            .expect("exact-2.11 fixture serial device should capture");
+        let serial = SnapshotV2SerialState::try_from_capture_ready(CaptureReadySerialState::new(
+            SerialConfig::default(),
+            serial_device,
+        ))
+        .expect("exact-2.11 fixture serial state should validate")
+        .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+        .expect("exact-2.11 fixture serial state should encode");
+        let network = state
+            .encode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION)
+            .expect("exact-2.11 fixture network state should encode");
+        let components = [
+            SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &binding,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_SERIAL_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &serial,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_NETWORK_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &network,
+            ),
+        ];
+        let encoded = encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            &[],
+            &components,
+        )
+        .expect("exact-2.11 fixture candidate should encode");
+        let candidate = NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(encoded)
+            .expect("exact-2.11 fixture candidate should validate");
+        let overrides = state
+            .interfaces()
+            .iter()
+            .zip(selectors)
+            .map(|(interface, selector)| {
+                SnapshotNetworkOverride::new(interface.iface_id(), *selector)
+            })
+            .collect::<Vec<_>>();
+
+        match candidate
+            .prepare(&overrides)
+            .expect("exact-2.11 fixture candidate should prepare")
+        {
+            NativeV2NetworkSnapshotPreparation::Prepared(candidate) => candidate,
+            NativeV2NetworkSnapshotPreparation::Compatible(_) => {
+                panic!("network-bearing fixture must not remain compatible")
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn fake_native_v2_network_capture_profile(
         transport: SnapshotV2DeviceTransportKind,
     ) -> (
@@ -34582,6 +34959,242 @@ mod tests {
         );
         assert_eq!(provider.entries.len(), 1);
         assert_eq!(provider.reserved_macs, [realized]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_process_value_plan_parses_direct_modes_in_saved_order() {
+        for (selector, expected_mode, expected_bridge) in [
+            ("vmnet:host", VmnetMode::Host, None),
+            ("vmnet:shared", VmnetMode::Shared, None),
+            (
+                "vmnet:bridged:private-bridge",
+                VmnetMode::Bridged,
+                Some("private-bridge"),
+            ),
+        ] {
+            let candidate = prepared_native_v2_network_restore_candidate(
+                fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio),
+                &[selector],
+            );
+            let expected_bytes = candidate.bytes().to_vec();
+            let plan = prepare_process_snapshot_v2_network_restore_plan(
+                candidate,
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("direct value plan should accept every supported vmnet mode");
+
+            assert_eq!(plan.candidate().bytes(), expected_bytes);
+            assert_eq!(plan.vmnet_configs().len(), 1);
+            assert_eq!(plan.vmnet_configs()[0].mode(), expected_mode);
+            assert_eq!(
+                plan.vmnet_configs()[0].bridged_interface_name(),
+                expected_bridge
+            );
+            assert!(!plan.all_mmds());
+            assert_eq!(plan.authority(), ProcessVmnetAuthority::Direct);
+            let debug = format!("{plan:?}");
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains(selector));
+            assert!(!debug.contains("private-bridge"));
+
+            let (candidate, vmnet, all_mmds, authority) = plan.into_parts();
+            assert_eq!(candidate.bytes(), expected_bytes);
+            assert_eq!(vmnet.len(), 1);
+            assert!(!all_mmds);
+            assert_eq!(authority, ProcessVmnetAuthority::Direct);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_contained_value_plan_enforces_mode_bridge_and_count_policy() {
+        for (selector, authority) in [
+            (
+                "vmnet:host",
+                VmnetAuthority::try_new(true, false, 1, &[])
+                    .expect("host-only authority should validate"),
+            ),
+            (
+                "vmnet:shared",
+                VmnetAuthority::try_new(false, true, 1, &[])
+                    .expect("shared-only authority should validate"),
+            ),
+            (
+                "vmnet:bridged:private-bridge",
+                VmnetAuthority::try_new(false, false, 1, &["private-bridge"])
+                    .expect("bridge-only authority should validate"),
+            ),
+        ] {
+            let plan = prepare_process_snapshot_v2_network_restore_plan(
+                prepared_native_v2_network_restore_candidate(
+                    fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio),
+                    &[selector],
+                ),
+                contained_vmnet_authority_for_session(0x61, authority),
+            )
+            .expect("matching contained vmnet authority should prepare");
+            assert!(!plan.all_mmds());
+            assert_eq!(plan.vmnet_configs().len(), 1);
+        }
+
+        for (selector, authority) in [
+            ("vmnet:host", VmnetAuthority::denied()),
+            (
+                "vmnet:shared",
+                VmnetAuthority::try_new(true, false, 1, &[])
+                    .expect("host-only authority should validate"),
+            ),
+            (
+                "vmnet:bridged:other-bridge",
+                VmnetAuthority::try_new(false, false, 1, &["private-bridge"])
+                    .expect("bridge-only authority should validate"),
+            ),
+        ] {
+            let error = prepare_process_snapshot_v2_network_restore_plan(
+                prepared_native_v2_network_restore_candidate(
+                    fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio),
+                    &[selector],
+                ),
+                contained_vmnet_authority_for_session(0x62, authority),
+            )
+            .expect_err("mismatched contained vmnet authority must fail");
+            assert!(matches!(
+                error,
+                ProcessSnapshotV2NetworkRestorePlanError::Authority(
+                    super::ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized
+                )
+            ));
+        }
+
+        let partial = fake_partial_mmds_network_state();
+        let one_shared = VmnetAuthority::try_new(false, true, 1, &[])
+            .expect("one-interface shared authority should validate");
+        let error = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(
+                partial,
+                &["vmnet:shared", "vmnet:shared"],
+            ),
+            contained_vmnet_authority_for_session(0x63, one_shared),
+        )
+        .expect_err("partial MMDS still needs capacity for both vmnet interfaces");
+        assert!(matches!(
+            error,
+            ProcessSnapshotV2NetworkRestorePlanError::Authority(
+                super::ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized
+            )
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_mmds_value_plan_distinguishes_absent_partial_and_all() {
+        let shared_two = VmnetAuthority::try_new(false, true, 2, &[])
+            .expect("two-interface shared authority should validate");
+        let partial = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(
+                fake_partial_mmds_network_state(),
+                &["vmnet:shared", "vmnet:shared"],
+            ),
+            contained_vmnet_authority_for_session(0x64, shared_two),
+        )
+        .expect("partial-MMDS destination should prepare with vmnet authority");
+        assert!(!partial.all_mmds());
+        assert!(
+            partial.candidate().topology().interfaces()[0]
+                .mmds_stack()
+                .is_some()
+        );
+        assert!(
+            partial.candidate().topology().interfaces()[1]
+                .mmds_stack()
+                .is_none()
+        );
+
+        let absent = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(
+                fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio),
+                &["vmnet:shared"],
+            ),
+            contained_vmnet_authority_for_session(
+                0x65,
+                VmnetAuthority::try_new(false, true, 1, &[])
+                    .expect("shared authority should validate"),
+            ),
+        )
+        .expect("MMDS-absent destination should prepare with vmnet authority");
+        assert!(!absent.all_mmds());
+        assert!(
+            absent.candidate().topology().interfaces()[0]
+                .mmds_stack()
+                .is_none()
+        );
+
+        let all = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(
+                fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Pci),
+                &["vmnet:bridged:ungranted-private-bridge"],
+            ),
+            contained_vmnet_authority_for_session(0x66, VmnetAuthority::denied()),
+        )
+        .expect("all-MMDS destination should not consume vmnet authority");
+        assert!(all.all_mmds());
+        assert!(
+            all.candidate().topology().interfaces()[0]
+                .mmds_stack()
+                .is_some()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_value_failures_are_redacted_before_every_provider_seam() {
+        let selector_error = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(
+                fake_partial_mmds_network_state(),
+                &["vmnet:shared", "private-invalid-selector"],
+            ),
+            contained_vmnet_authority_for_session(0x67, VmnetAuthority::denied()),
+        )
+        .expect_err("invalid selector must fail before contained policy");
+        assert!(matches!(
+            selector_error,
+            ProcessSnapshotV2NetworkRestorePlanError::Selector { .. }
+        ));
+
+        let all_mmds_selector_error = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(
+                fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Pci),
+                &["private-all-mmds-invalid-selector"],
+            ),
+            contained_vmnet_authority_for_session(0x68, VmnetAuthority::denied()),
+        )
+        .expect_err("all-MMDS destinations still require valid selector grammar");
+        assert!(matches!(
+            all_mmds_selector_error,
+            ProcessSnapshotV2NetworkRestorePlanError::Selector { .. }
+        ));
+
+        let authority_error = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(
+                fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio),
+                &["vmnet:shared"],
+            ),
+            contained_vmnet_authority_for_session(0x69, VmnetAuthority::denied()),
+        )
+        .expect_err("contained authority must reject host networking");
+        assert!(matches!(
+            authority_error,
+            ProcessSnapshotV2NetworkRestorePlanError::Authority(_)
+        ));
+
+        let diagnostic = format!(
+            "{selector_error:?} {selector_error} {all_mmds_selector_error:?} \
+             {all_mmds_selector_error} {authority_error:?} {authority_error}"
+        );
+        assert!(!diagnostic.contains("private-invalid-selector"));
+        assert!(!diagnostic.contains("private-all-mmds-invalid-selector"));
+        assert!(!diagnostic.contains("ungranted-private-bridge"));
     }
 
     #[test]

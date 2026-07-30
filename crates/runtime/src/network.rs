@@ -567,6 +567,38 @@ impl NetworkInterfaceConfig {
         self.tx_rate_limiter
     }
 
+    /// Builds a controller projection from already typed snapshot fields.
+    ///
+    /// The caller supplies owned, fallibly copied identifiers. This keeps
+    /// snapshot restore from formatting a typed guest MAC back through an
+    /// untrusted string while retaining the ordinary controller validation.
+    pub(crate) fn try_from_snapshot_projection(
+        iface_id: String,
+        host_dev_name: String,
+        guest_mac: Option<GuestMacAddress>,
+        mtu: Option<u16>,
+        rx_rate_limiter: Option<NetworkRateLimiterConfig>,
+        tx_rate_limiter: Option<NetworkRateLimiterConfig>,
+    ) -> Result<Self, NetworkInterfaceConfigError> {
+        validate_interface_id(InterfaceIdSource::Path, &iface_id)?;
+        if host_dev_name.is_empty() {
+            return Err(NetworkInterfaceConfigError::EmptyHostDeviceName);
+        }
+        if let Some(mtu) = mtu
+            && !(VIRTIO_NET_MIN_MTU..=VIRTIO_NET_MAX_MTU).contains(&mtu)
+        {
+            return Err(NetworkInterfaceConfigError::InvalidMtu { mtu });
+        }
+        Ok(Self {
+            iface_id,
+            host_dev_name,
+            guest_mac,
+            mtu,
+            rx_rate_limiter: rx_rate_limiter.and_then(NetworkRateLimiterConfig::normalized),
+            tx_rate_limiter: tx_rate_limiter.and_then(NetworkRateLimiterConfig::normalized),
+        })
+    }
+
     fn updated(&self, update: &NetworkInterfaceUpdate) -> Self {
         Self {
             iface_id: self.iface_id.clone(),

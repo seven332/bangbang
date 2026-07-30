@@ -626,6 +626,12 @@ pub struct SnapshotV2NetworkState {
     mmds: Option<SnapshotV2MmdsState>,
 }
 
+/// Owned parts of one validated exact-2.11 network aggregate.
+pub type SnapshotV2NetworkStateParts = (
+    Vec<SnapshotV2NetworkInterfaceState>,
+    Option<SnapshotV2MmdsState>,
+);
+
 impl SnapshotV2NetworkState {
     /// Validates and retains one complete aggregate.
     pub fn try_new(
@@ -643,6 +649,11 @@ impl SnapshotV2NetworkState {
 
     pub const fn mmds(&self) -> Option<&SnapshotV2MmdsState> {
         self.mmds.as_ref()
+    }
+
+    /// Consumes the aggregate without changing interface or MMDS order.
+    pub fn into_parts(self) -> SnapshotV2NetworkStateParts {
+        (self.interfaces, self.mmds)
     }
 
     pub const fn compatibility_version(&self) -> SnapshotFormatVersion {
