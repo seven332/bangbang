@@ -17211,9 +17211,16 @@ impl OwnedHvfArm64BootSession {
                         )),
                     )
                 })?;
-                let registration = standalone_registration.unwrap_or_else(|| {
-                    std::process::abort();
-                });
+                let registration = match standalone_registration {
+                    Some(registration) => registration,
+                    None => {
+                        return Err(HvfSnapshotV2MemoryHotplugMmioRestoreError::after_session(
+                            session,
+                            HvfSnapshotV2MemoryHotplugMmioRestoreStage::Product,
+                            HvfSnapshotV2MemoryHotplugMmioRestoreFailure::Product,
+                        ));
+                    }
+                };
                 if let Some(balloon) = balloon {
                     session =
                         Self::attach_snapshot_v2_balloon_mmio(session, balloon, registration, None)
