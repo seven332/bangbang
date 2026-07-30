@@ -6,6 +6,10 @@ use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRan
 use crate::memory_hotplug::{
     MemoryHotplugConfigInput, VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_QUEUE_SIZE,
 };
+use crate::message_interrupt::{
+    GuestMessage, GuestMessageInterrupt, GuestMessageInterruptRegistry,
+    GuestMessageInterruptSignalError,
+};
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::{
     PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO, PCI_SEGMENT_ZERO,
@@ -25,10 +29,12 @@ use crate::virtio::{
 };
 use crate::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
 use crate::virtio_pci::{
-    VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VirtioPciEndpointPhase,
+    VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VirtioPciEndpointError,
+    VirtioPciEndpointPhase,
 };
 
 use std::io::Cursor;
+use std::sync::Arc;
 
 const HEALTHY_DRIVER_OK: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
     | VIRTIO_DEVICE_STATUS_DRIVER
@@ -41,6 +47,40 @@ const DIRECTORY_PAYLOAD_OFFSET: usize = 8;
 const DIRECTORY_LENGTH_OFFSET: usize = 16;
 const INACTIVE_MMIO_FIXTURE_HEX: &str = include_str!("fixtures/inactive-mmio.hex");
 const ACTIVE_PCI_FIXTURE_HEX: &str = include_str!("fixtures/active-pci.hex");
+
+#[derive(Debug)]
+struct TestMessageRoute(GuestMessage);
+
+impl GuestMessageInterrupt for TestMessageRoute {
+    fn matches(&self, message: GuestMessage) -> bool {
+        self.0 == message
+    }
+
+    fn signal(&self, message: GuestMessage) -> Result<(), GuestMessageInterruptSignalError> {
+        if self.matches(message) {
+            Ok(())
+        } else {
+            Err(GuestMessageInterruptSignalError::new(
+                "test route rejected an unknown message",
+                false,
+            ))
+        }
+    }
+}
+
+fn memory_hotplug_message_registry(route_count: usize) -> GuestMessageInterruptRegistry {
+    let messages = [
+        GuestMessage::new(0x0800_0040, 64),
+        GuestMessage::new(0x0800_0040, 96),
+    ];
+    let routes: Vec<Arc<dyn GuestMessageInterrupt>> = messages
+        .into_iter()
+        .take(route_count)
+        .map(|message| Arc::new(TestMessageRoute(message)) as Arc<dyn GuestMessageInterrupt>)
+        .collect();
+    GuestMessageInterruptRegistry::new(routes)
+        .expect("memory-hotplug message registry should validate")
+}
 
 fn config(total_size_mib: u64, block_size_mib: u64, slot_size_mib: u64) -> MemoryHotplugConfig {
     MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(
@@ -638,6 +678,199 @@ fn active_mmio_topology_restores_nonzero_queue_cursors_and_rejects_memory_drift(
             .snapshot()
             .is_empty()
     );
+}
+
+#[test]
+fn inactive_pci_topology_reconstructs_an_exact_retained_endpoint() {
+    let state = inactive_pci_state();
+    let ranges = vec![
+        plugged_guest_test_range(&state, 1, 2),
+        plugged_guest_test_range(&state, 5, 3),
+    ];
+    let binding = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        ranges.clone(),
+    );
+    let memory = destination_memory_for_ranges(ranges);
+    let expected_pci = match state.transport() {
+        SnapshotV2DeviceTransport::Pci(pci) => pci,
+        SnapshotV2DeviceTransport::Mmio(_) => panic!("fixture should select PCI"),
+    };
+
+    let prepared = PreparedSnapshotV2MemoryHotplugTopology::prepare(state.clone(), binding)
+        .expect("inactive PCI topology should prepare")
+        .into_pci_endpoint(
+            &memory,
+            MmioRegionId::new(700),
+            memory_hotplug_message_registry(2),
+        )
+        .expect("inactive PCI endpoint should reconstruct");
+
+    assert_eq!(prepared.expected_state(), &state);
+    assert_eq!(prepared.controller().config(), state.config());
+    assert_eq!(prepared.controller().requested_size_mib(), 128);
+    assert_eq!(
+        prepared.plugged_ranges(),
+        [
+            plugged_guest_test_range(&state, 1, 2),
+            plugged_guest_test_range(&state, 5, 3),
+        ]
+    );
+    assert_eq!(prepared.queue_ranges(), None);
+    assert_eq!(prepared.origin(), StorageDeviceOrigin::Startup);
+    assert_eq!(prepared.endpoint().sbdf(), expected_pci.sbdf());
+    assert_eq!(prepared.endpoint().bar_range(), expected_pci.bar_range());
+    assert_eq!(prepared.endpoint().region_id(), MmioRegionId::new(700));
+    assert!(prepared.shared_metrics().snapshot().is_empty());
+
+    let diagnostics = format!("{prepared:?}");
+    assert!(diagnostics.contains(REDACTED));
+    assert!(!diagnostics.contains(&expected_pci.bar_range().start().to_string()));
+}
+
+#[test]
+fn active_pci_topology_restores_nonzero_queue_cursors_and_rejects_memory_drift() {
+    let state = active_pci_state();
+    let queue = state
+        .virtio()
+        .queues()
+        .first()
+        .expect("active fixture should retain one queue");
+    let ranges = vec![
+        test_range(0x10_0000, 0x50_000),
+        plugged_guest_test_range(&state, 0, 1),
+        plugged_guest_test_range(&state, 7, 2),
+        plugged_guest_test_range(&state, 127, 1),
+    ];
+
+    let unmapped_queue_memory = destination_memory_for_ranges(ranges[1..].to_vec());
+    let unmapped_error = PreparedSnapshotV2MemoryHotplugTopology::prepare(
+        state.clone(),
+        binding_for_ranges(
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            ranges.clone(),
+        ),
+    )
+    .expect("active PCI topology should prepare")
+    .into_pci_endpoint(
+        &unmapped_queue_memory,
+        MmioRegionId::new(700),
+        memory_hotplug_message_registry(2),
+    )
+    .expect_err("unmapped PCI queue must reject");
+    assert!(matches!(
+        unmapped_error,
+        SnapshotV2MemoryHotplugPciEndpointError::QueueMemory(_)
+    ));
+
+    let mismatched_indices_memory = destination_memory_for_ranges(ranges.clone());
+    let cursor_error = PreparedSnapshotV2MemoryHotplugTopology::prepare(
+        state.clone(),
+        binding_for_ranges(
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            ranges.clone(),
+        ),
+    )
+    .expect("active PCI topology should prepare")
+    .into_pci_endpoint(
+        &mismatched_indices_memory,
+        MmioRegionId::new(700),
+        memory_hotplug_message_registry(2),
+    )
+    .expect_err("mismatched PCI queue cursors must reject");
+    assert!(matches!(
+        cursor_error,
+        SnapshotV2MemoryHotplugPciEndpointError::QueueMemory(
+            VirtioMemQueueCaptureError::UsedCursorMismatch
+        )
+    ));
+
+    let mut memory = destination_memory_for_ranges(ranges.clone());
+    set_queue_indices(
+        &mut memory,
+        queue.driver_ring(),
+        queue.device_ring(),
+        state
+            .active_queue()
+            .expect("active fixture should retain queue cursors")
+            .next_used(),
+    );
+    let prepared = PreparedSnapshotV2MemoryHotplugTopology::prepare(
+        state.clone(),
+        binding_for_ranges(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, ranges),
+    )
+    .expect("active PCI topology should prepare")
+    .into_pci_endpoint(
+        &memory,
+        MmioRegionId::new(700),
+        memory_hotplug_message_registry(2),
+    )
+    .expect("active PCI endpoint should reconstruct");
+
+    assert_eq!(prepared.expected_state(), &state);
+    assert!(prepared.queue_ranges().is_some());
+    assert!(prepared.shared_metrics().snapshot().is_empty());
+}
+
+#[test]
+fn pci_endpoint_materialization_rejects_wrong_transport_and_route_geometry() {
+    let mmio = inactive_mmio_state();
+    let mmio_ranges = vec![
+        plugged_guest_test_range(&mmio, 1, 2),
+        plugged_guest_test_range(&mmio, 5, 3),
+    ];
+    let memory = destination_memory_for_ranges(mmio_ranges.clone());
+    let wrong_transport = PreparedSnapshotV2MemoryHotplugTopology::prepare(
+        mmio,
+        binding_for_ranges(
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            mmio_ranges,
+        ),
+    )
+    .expect("MMIO topology should prepare")
+    .into_pci_endpoint(
+        &memory,
+        MmioRegionId::new(700),
+        memory_hotplug_message_registry(2),
+    )
+    .expect_err("MMIO topology must not materialize a PCI endpoint");
+    assert!(matches!(
+        wrong_transport,
+        SnapshotV2MemoryHotplugPciEndpointError::WrongTransport
+    ));
+
+    let pci = inactive_pci_state();
+    let pci_ranges = vec![
+        plugged_guest_test_range(&pci, 1, 2),
+        plugged_guest_test_range(&pci, 5, 3),
+    ];
+    let memory = destination_memory_for_ranges(pci_ranges.clone());
+    let route_error = PreparedSnapshotV2MemoryHotplugTopology::prepare(
+        pci,
+        binding_for_ranges(
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            pci_ranges,
+        ),
+    )
+    .expect("PCI topology should prepare")
+    .into_pci_endpoint(
+        &memory,
+        MmioRegionId::new(700),
+        memory_hotplug_message_registry(1),
+    )
+    .expect_err("one route cannot satisfy virtio-mem MSI-X");
+    assert!(matches!(
+        route_error,
+        SnapshotV2MemoryHotplugPciEndpointError::Endpoint(
+            VirtioPciEndpointError::MessageRouteCount {
+                expected: 2,
+                actual: 1
+            }
+        )
+    ));
+    let diagnostics = format!("{route_error:?} {route_error}");
+    assert!(diagnostics.contains(REDACTED));
+    assert!(!diagnostics.contains(&PCI_BAR64_START.to_string()));
 }
 
 #[test]

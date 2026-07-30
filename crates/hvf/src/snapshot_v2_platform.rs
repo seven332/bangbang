@@ -1666,6 +1666,42 @@ pub(crate) fn restore_hvf_snapshot_v2_serial_memory_hotplug_mmio_process_platfor
     )
 }
 
+pub(crate) fn restore_hvf_snapshot_v2_serial_memory_hotplug_pci_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2RestoredSerialShell,
+    process: HvfSnapshotV2SerialOnlyProcessConfig,
+    mapping: &HvfSnapshotV2MemoryHotplugMappingPlan,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::SerialOnly {
+            shell: shell.into(),
+            process,
+        }),
+        HvfSnapshotV2MemoryMappingRestore::MemoryHotplug(mapping),
+    )
+}
+
+pub(crate) fn restore_hvf_snapshot_v2_serial_storage_memory_hotplug_pci_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2RestoredSerialShell,
+    plan: HvfSnapshotV2StoragePciShellPlan<'_>,
+    mapping: &HvfSnapshotV2MemoryHotplugMappingPlan,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::StoragePci {
+            shell: shell.into(),
+            plan,
+        }),
+        HvfSnapshotV2MemoryMappingRestore::MemoryHotplug(mapping),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum HvfSnapshotV2MemoryMappingRestore<'a> {
     Ordinary,

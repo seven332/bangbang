@@ -114,7 +114,7 @@ use bangbang_runtime::snapshot_device::{
 };
 use bangbang_runtime::snapshot_device_v2::{
     NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, PreparedSnapshotV2PciRoot,
-    PreparedSnapshotV2RootBlock, PreparedSnapshotV2RootTransport,
+    PreparedSnapshotV2RootBlock, PreparedSnapshotV2RootTransport, SnapshotV2DeviceTransport,
     SnapshotV2RootTransportRestoreError,
 };
 use bangbang_runtime::snapshot_device_v2_5::{
@@ -140,9 +140,10 @@ use bangbang_runtime::snapshot_entropy_v2_8::{
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
 use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
-    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+    NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2MemoryHotplugTopology,
     SnapshotV2MemoryHotplugControllerProjection, SnapshotV2MemoryHotplugMmioHandlerError,
-    SnapshotV2MemoryHotplugState, SnapshotV2MemoryHotplugStateCaptureError,
+    SnapshotV2MemoryHotplugPciEndpointError, SnapshotV2MemoryHotplugState,
+    SnapshotV2MemoryHotplugStateCaptureError,
 };
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
@@ -268,7 +269,8 @@ use crate::snapshot_v2_entropy_platform::{
 };
 use crate::snapshot_v2_memory_hotplug_platform::{
     HvfSnapshotV2MemoryHotplugMmioPlatformPlan, HvfSnapshotV2MemoryHotplugMmioPlatformPlanParts,
-    HvfSnapshotV2MemoryHotplugPreparedProductParts,
+    HvfSnapshotV2MemoryHotplugPciEndpointPlan, HvfSnapshotV2MemoryHotplugPciPlatformPlan,
+    HvfSnapshotV2MemoryHotplugPciPlatformPlanParts, HvfSnapshotV2MemoryHotplugPreparedProductParts,
 };
 use crate::snapshot_v2_multi_block_platform::{
     HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockPlatformPlanParts,
@@ -288,8 +290,10 @@ use crate::snapshot_v2_platform::{
     restore_hvf_snapshot_v2_serial_balloon_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_entropy_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_memory_hotplug_mmio_process_platform,
+    restore_hvf_snapshot_v2_serial_memory_hotplug_pci_process_platform,
     restore_hvf_snapshot_v2_serial_only_process_platform,
     restore_hvf_snapshot_v2_serial_storage_entropy_mmio_process_platform,
+    restore_hvf_snapshot_v2_serial_storage_memory_hotplug_pci_process_platform,
     restore_hvf_snapshot_v2_serial_storage_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_storage_pci_process_platform,
     restore_hvf_snapshot_v2_storage_mmio_process_platform,
@@ -3542,6 +3546,10 @@ enum HvfSnapshotV2StorageProcessShell {
         interrupts: HvfSnapshotV2MemoryHotplugMmioInterruptPlan,
         mapping: HvfSnapshotV2MemoryHotplugMappingPlan,
     },
+    RestoredMemoryHotplugPci {
+        shell: HvfSnapshotV2RestoredSerialShell,
+        mapping: HvfSnapshotV2MemoryHotplugMappingPlan,
+    },
 }
 
 enum HvfSnapshotV2SerialProcessShell {
@@ -3560,6 +3568,11 @@ enum HvfSnapshotV2SerialProcessShell {
     MemoryHotplugMmio {
         shell: HvfSnapshotV2RestoredSerialShell,
         interrupts: HvfSnapshotV2MemoryHotplugMmioInterruptPlan,
+        mapping: HvfSnapshotV2MemoryHotplugMappingPlan,
+    },
+    MemoryHotplugPci {
+        shell: HvfSnapshotV2RestoredSerialShell,
+        process: HvfSnapshotV2SerialOnlyProcessConfig,
         mapping: HvfSnapshotV2MemoryHotplugMappingPlan,
     },
 }
@@ -3587,6 +3600,7 @@ impl HvfSnapshotV2SerialProcessShell {
     const fn pci_enabled(&self) -> bool {
         match self {
             Self::SerialOnly { process, .. } => process.pci_enabled(),
+            Self::MemoryHotplugPci { process, .. } => process.pci_enabled(),
             Self::EntropyMmio { .. }
             | Self::BalloonMmio { .. }
             | Self::MemoryHotplugMmio { .. } => false,
@@ -4567,6 +4581,431 @@ impl fmt::Display for HvfSnapshotV2BalloonPciRestoreError {
 }
 
 impl std::error::Error for HvfSnapshotV2BalloonPciRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.failure.as_ref())
+    }
+}
+
+/// One complete, still-unpublished exact-2.10 PCI virtio-mem product.
+#[doc(hidden)]
+pub struct RestoredHvfSnapshotV2MemoryHotplugPciOwners {
+    session: OwnedHvfArm64BootSession,
+    state: SnapshotV2MemoryHotplugState,
+    controller: SnapshotV2MemoryHotplugControllerProjection,
+    storage_configs: Option<CaptureReadyStorageConfigs>,
+    entropy_config: Option<EntropyConfig>,
+    balloon_config: Option<BalloonConfig>,
+}
+
+impl RestoredHvfSnapshotV2MemoryHotplugPciOwners {
+    /// Returns the complete Paused destination session.
+    pub const fn session(&self) -> &OwnedHvfArm64BootSession {
+        &self.session
+    }
+
+    /// Returns the exact normalized portable virtio-mem state.
+    pub const fn state(&self) -> &SnapshotV2MemoryHotplugState {
+        &self.state
+    }
+
+    /// Returns the exact public memory-hotplug controller projection.
+    pub const fn controller(&self) -> SnapshotV2MemoryHotplugControllerProjection {
+        self.controller
+    }
+
+    /// Returns restored storage configuration when present.
+    pub const fn storage_configs(&self) -> Option<&CaptureReadyStorageConfigs> {
+        self.storage_configs.as_ref()
+    }
+
+    /// Returns the exact public entropy configuration when present.
+    pub const fn entropy_config(&self) -> Option<EntropyConfig> {
+        self.entropy_config
+    }
+
+    /// Returns the exact public balloon configuration when present.
+    pub const fn balloon_config(&self) -> Option<BalloonConfig> {
+        self.balloon_config
+    }
+
+    /// Consumes the complete unpublished owner graph.
+    pub fn into_parts(
+        self,
+    ) -> (
+        OwnedHvfArm64BootSession,
+        SnapshotV2MemoryHotplugState,
+        SnapshotV2MemoryHotplugControllerProjection,
+        Option<CaptureReadyStorageConfigs>,
+        Option<EntropyConfig>,
+        Option<BalloonConfig>,
+    ) {
+        (
+            self.session,
+            self.state,
+            self.controller,
+            self.storage_configs,
+            self.entropy_config,
+            self.balloon_config,
+        )
+    }
+}
+
+impl fmt::Debug for RestoredHvfSnapshotV2MemoryHotplugPciOwners {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoredHvfSnapshotV2MemoryHotplugPciOwners")
+            .field("has_storage", &self.storage_configs.is_some())
+            .field("has_entropy", &self.entropy_config.is_some())
+            .field("has_balloon", &self.balloon_config.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Deterministic exact-2.10 PCI owner fault used by rollback tests.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2MemoryHotplugPciRestoreFault {
+    Platform,
+    RegistryCreation,
+    RegistryRelease,
+    EndpointPreparation,
+    BalloonPublication,
+    StoragePublication,
+    EntropyPublication,
+    MemoryHotplugPublication,
+    ManagerInsertion,
+    Recapture,
+    SessionAssembly,
+}
+
+/// Stage at which exact-2.10 PCI virtio-mem reconstruction stopped.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2MemoryHotplugPciRestoreStage {
+    Product,
+    Platform,
+    Registry,
+    Endpoint,
+    BalloonPublication,
+    StoragePublication,
+    EntropyPublication,
+    MemoryHotplugPublication,
+    ManagerInsertion,
+    Recapture,
+    SessionAssembly,
+}
+
+/// Primary exact-2.10 PCI virtio-mem reconstruction failure.
+#[doc(hidden)]
+pub enum HvfSnapshotV2MemoryHotplugPciRestoreFailure {
+    Product,
+    SerialPlatform(Box<HvfSnapshotV2SerialOnlyRestoreError>),
+    StoragePlatform(Box<HvfSnapshotV2StoragePciRestoreError>),
+    BalloonPlatform(Box<HvfSnapshotV2BalloonPciRestoreError>),
+    EntropyPlatform(Box<HvfSnapshotV2EntropyPciRestoreError>),
+    PciData(HvfArm64BootPciDataError),
+    GuestMemory {
+        source: HvfGuestMemoryMappingError,
+        cleanup: Option<GuestMessageInterruptResourcesError>,
+    },
+    Endpoint {
+        source: SnapshotV2MemoryHotplugPciEndpointError,
+        cleanup: Option<GuestMessageInterruptResourcesError>,
+    },
+    RegistryCleanup {
+        cleanup: Option<GuestMessageInterruptResourcesError>,
+    },
+    DispatcherUnavailable {
+        cleanup: Option<GuestMessageInterruptResourcesError>,
+    },
+    Publication(VirtioPciPublicationError),
+    Quiescence(HvfArm64BootLimiterRetryWakeupQuiescenceError),
+    Capture(HvfArm64BootMemoryHotplugCaptureError),
+    Normalize(HvfArm64BootMemoryHotplugSnapshotV2CaptureError),
+    StateMismatch,
+    MappingMismatch,
+    Injected(HvfSnapshotV2MemoryHotplugPciRestoreFault),
+}
+
+impl HvfSnapshotV2MemoryHotplugPciRestoreFailure {
+    fn interrupt_cleanup_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::Endpoint {
+                cleanup: Some(_),
+                ..
+            } | Self::GuestMemory {
+                cleanup: Some(_),
+                ..
+            } | Self::RegistryCleanup { cleanup: Some(_) }
+                | Self::DispatcherUnavailable { cleanup: Some(_) }
+        )
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2MemoryHotplugPciRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Product => "product",
+            Self::SerialPlatform(_) => "serial-platform",
+            Self::StoragePlatform(_) => "storage-platform",
+            Self::BalloonPlatform(_) => "balloon-platform",
+            Self::EntropyPlatform(_) => "entropy-platform",
+            Self::PciData(_) => "pci-data",
+            Self::GuestMemory { .. } => "guest-memory",
+            Self::Endpoint { .. } => "endpoint",
+            Self::RegistryCleanup { .. } => "registry",
+            Self::DispatcherUnavailable { .. } => "dispatcher",
+            Self::Publication(_) => "publication",
+            Self::Quiescence(_) => "quiescence",
+            Self::Capture(_) => "capture",
+            Self::Normalize(_) => "normalization",
+            Self::StateMismatch => "state-mismatch",
+            Self::MappingMismatch => "mapping-mismatch",
+            Self::Injected(fault) => match fault {
+                HvfSnapshotV2MemoryHotplugPciRestoreFault::Platform
+                | HvfSnapshotV2MemoryHotplugPciRestoreFault::RegistryCreation
+                | HvfSnapshotV2MemoryHotplugPciRestoreFault::RegistryRelease
+                | HvfSnapshotV2MemoryHotplugPciRestoreFault::EndpointPreparation
+                | HvfSnapshotV2MemoryHotplugPciRestoreFault::BalloonPublication
+                | HvfSnapshotV2MemoryHotplugPciRestoreFault::StoragePublication
+                | HvfSnapshotV2MemoryHotplugPciRestoreFault::EntropyPublication
+                | HvfSnapshotV2MemoryHotplugPciRestoreFault::MemoryHotplugPublication
+                | HvfSnapshotV2MemoryHotplugPciRestoreFault::ManagerInsertion
+                | HvfSnapshotV2MemoryHotplugPciRestoreFault::Recapture
+                | HvfSnapshotV2MemoryHotplugPciRestoreFault::SessionAssembly => "injected",
+            },
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2MemoryHotplugPciRestoreFailure")
+            .field("kind", &kind)
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2MemoryHotplugPciRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Product => "exact-2.10 PCI virtio-mem product plan diverged",
+            Self::SerialPlatform(_) => "virtio-mem PCI serial platform reconstruction failed",
+            Self::StoragePlatform(_) => "virtio-mem PCI storage publication failed",
+            Self::BalloonPlatform(_) => "virtio-mem PCI balloon publication failed",
+            Self::EntropyPlatform(_) => "virtio-mem PCI entropy publication failed",
+            Self::PciData(_) => "exact-2.10 PCI virtio-mem manager is unavailable",
+            Self::GuestMemory { .. } => "exact-2.10 PCI destination memory is unavailable",
+            Self::Endpoint { .. } => "exact-2.10 virtio-mem endpoint reconstruction failed",
+            Self::RegistryCleanup { .. } => "exact-2.10 virtio-mem registry transaction failed",
+            Self::DispatcherUnavailable { .. } => {
+                "exact-2.10 virtio-mem PCI dispatcher is unavailable"
+            }
+            Self::Publication(_) => "exact-2.10 virtio-mem endpoint publication failed",
+            Self::Quiescence(_) => "exact-2.10 PCI destination quiescence failed",
+            Self::Capture(_) => "exact-2.10 PCI virtio-mem live capture failed",
+            Self::Normalize(_) => "exact-2.10 PCI virtio-mem normalization failed",
+            Self::StateMismatch => "exact-2.10 PCI virtio-mem portable state diverged",
+            Self::MappingMismatch => "exact-2.10 PCI virtio-mem mapping state diverged",
+            Self::Injected(_) => "exact-2.10 PCI rollback fault was injected",
+        })
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2MemoryHotplugPciRestoreFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SerialPlatform(source) => Some(source.as_ref()),
+            Self::StoragePlatform(source) => Some(source.as_ref()),
+            Self::BalloonPlatform(source) => Some(source.as_ref()),
+            Self::EntropyPlatform(source) => Some(source.as_ref()),
+            Self::PciData(source) => Some(source),
+            Self::GuestMemory { source, .. } => Some(source),
+            Self::Endpoint { source, .. } => Some(source),
+            Self::Publication(source) => Some(source),
+            Self::Quiescence(source) => Some(source),
+            Self::Capture(source) => Some(source),
+            Self::Normalize(source) => Some(source),
+            Self::Product
+            | Self::RegistryCleanup { .. }
+            | Self::DispatcherUnavailable { .. }
+            | Self::StateMismatch
+            | Self::MappingMismatch
+            | Self::Injected(_) => None,
+        }
+    }
+}
+
+/// Redacted exact-2.10 PCI virtio-mem failure and cleanup evidence.
+#[doc(hidden)]
+pub struct HvfSnapshotV2MemoryHotplugPciRestoreError {
+    stage: HvfSnapshotV2MemoryHotplugPciRestoreStage,
+    failure: Box<HvfSnapshotV2MemoryHotplugPciRestoreFailure>,
+    committed: bool,
+    cleanup: Option<Box<HvfArm64BootSessionShutdownError>>,
+}
+
+impl HvfSnapshotV2MemoryHotplugPciRestoreError {
+    fn preflight(
+        stage: HvfSnapshotV2MemoryHotplugPciRestoreStage,
+        failure: HvfSnapshotV2MemoryHotplugPciRestoreFailure,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            committed: false,
+            cleanup: None,
+        }
+    }
+
+    fn serial_platform(source: HvfSnapshotV2SerialOnlyRestoreError) -> Self {
+        Self {
+            stage: HvfSnapshotV2MemoryHotplugPciRestoreStage::Platform,
+            committed: source.is_terminal(),
+            failure: Box::new(HvfSnapshotV2MemoryHotplugPciRestoreFailure::SerialPlatform(
+                Box::new(source),
+            )),
+            cleanup: None,
+        }
+    }
+
+    fn storage_platform(source: HvfSnapshotV2StoragePciRestoreError) -> Self {
+        Self {
+            stage: HvfSnapshotV2MemoryHotplugPciRestoreStage::StoragePublication,
+            committed: source.is_terminal(),
+            failure: Box::new(
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::StoragePlatform(Box::new(source)),
+            ),
+            cleanup: None,
+        }
+    }
+
+    fn balloon_platform(source: HvfSnapshotV2BalloonPciRestoreError) -> Self {
+        Self {
+            stage: HvfSnapshotV2MemoryHotplugPciRestoreStage::BalloonPublication,
+            committed: source.is_terminal(),
+            failure: Box::new(
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::BalloonPlatform(Box::new(source)),
+            ),
+            cleanup: None,
+        }
+    }
+
+    fn entropy_platform(source: HvfSnapshotV2EntropyPciRestoreError) -> Self {
+        Self {
+            stage: HvfSnapshotV2MemoryHotplugPciRestoreStage::EntropyPublication,
+            committed: source.is_terminal(),
+            failure: Box::new(
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::EntropyPlatform(Box::new(source)),
+            ),
+            cleanup: None,
+        }
+    }
+
+    fn after_session(
+        mut session: OwnedHvfArm64BootSession,
+        stage: HvfSnapshotV2MemoryHotplugPciRestoreStage,
+        failure: HvfSnapshotV2MemoryHotplugPciRestoreFailure,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            committed: true,
+            cleanup: session.shutdown().err().map(Box::new),
+        }
+    }
+
+    /// Returns the aggregate transition at which reconstruction stopped.
+    pub const fn stage(&self) -> HvfSnapshotV2MemoryHotplugPciRestoreStage {
+        self.stage
+    }
+
+    /// Returns whether reverse cleanup did not complete.
+    pub fn has_incomplete_cleanup(&self) -> bool {
+        self.cleanup.is_some()
+            || self.failure.interrupt_cleanup_failed()
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::SerialPlatform(source)
+                    if source.has_incomplete_cleanup()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::StoragePlatform(source)
+                    if !source.cleanup_failures().is_empty()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::BalloonPlatform(source)
+                    if source.has_incomplete_cleanup()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::EntropyPlatform(source)
+                    if source.has_incomplete_cleanup()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Publication(
+                    VirtioPciPublicationError::Rollback { .. }
+                )
+            )
+    }
+
+    /// Returns whether retry safety cannot be proven.
+    pub fn is_terminal(&self) -> bool {
+        self.committed
+            || self.has_incomplete_cleanup()
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::SerialPlatform(source)
+                    if source.is_terminal()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::StoragePlatform(source)
+                    if source.is_terminal()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::BalloonPlatform(source)
+                    if source.is_terminal()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::EntropyPlatform(source)
+                    if source.is_terminal()
+            )
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2MemoryHotplugPciRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2MemoryHotplugPciRestoreError")
+            .field("stage", &self.stage)
+            .field("terminal", &self.is_terminal())
+            .field("cleanup_failed", &self.has_incomplete_cleanup())
+            .field("failure", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2MemoryHotplugPciRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.10 PCI virtio-mem reconstruction failed at {:?} ({})",
+            self.stage,
+            if self.is_terminal() {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2MemoryHotplugPciRestoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.failure.as_ref())
     }
@@ -14947,6 +15386,24 @@ fn snapshot_v2_balloon_pci_plan_matches(
             .is_ok_and(|count| count >= plan.route_count())
 }
 
+fn snapshot_v2_memory_hotplug_pci_plan_matches(
+    topology: &PreparedSnapshotV2MemoryHotplugTopology,
+    plan: HvfSnapshotV2MemoryHotplugPciEndpointPlan,
+) -> bool {
+    let SnapshotV2DeviceTransport::Pci(transport) = topology.state().transport() else {
+        return false;
+    };
+    transport.origin() == StorageDeviceOrigin::Startup
+        && transport.origin() == plan.origin()
+        && transport.sbdf() == plan.sbdf()
+        && transport.bar_range() == plan.bar_range()
+        && transport.phase() == VirtioPciEndpointPhase::Active
+        && plan.route_count() == VIRTIO_MEM_QUEUE_SIZES.len().saturating_add(1)
+        && plan.route_count() == 2
+        && usize::try_from(plan.msi_interrupt_count())
+            .is_ok_and(|count| count >= plan.route_count())
+}
+
 fn validate_snapshot_v2_multi_block_mmio_resource_plan(
     bundle: &PreparedSnapshotV2MultiBlockMmioBundle,
     plan: &HvfSnapshotV2MultiBlockPlatformPlanParts,
@@ -16265,6 +16722,13 @@ impl OwnedHvfArm64BootSession {
                     vmclock_interrupt: interrupts.vmclock,
                 },
                 &mapping,
+            ),
+            HvfSnapshotV2SerialProcessShell::MemoryHotplugPci {
+                shell,
+                process,
+                mapping,
+            } => restore_hvf_snapshot_v2_serial_memory_hotplug_pci_process_platform(
+                state, memory, shell, process, &mapping,
             ),
         }
         .map_err(HvfSnapshotV2SerialOnlyRestoreError::Platform)?;
@@ -18072,6 +18536,709 @@ impl OwnedHvfArm64BootSession {
         Ok(session)
     }
 
+    /// Reconstructs one closed exact-2.10 PCI virtio-mem product without
+    /// publishing a controller or public load path.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_memory_hotplug_pci(
+        state: HvfSnapshotV2PlatformState,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        plan: HvfSnapshotV2MemoryHotplugPciPlatformPlan,
+    ) -> Result<
+        RestoredHvfSnapshotV2MemoryHotplugPciOwners,
+        HvfSnapshotV2MemoryHotplugPciRestoreError,
+    > {
+        Self::restore_snapshot_v2_memory_hotplug_pci_inner(
+            state,
+            process_shell,
+            serial_input,
+            plan,
+            None,
+        )
+    }
+
+    /// Reconstructs exact-2.10 PCI virtio-mem owners with one deterministic
+    /// aggregate rollback fault.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_memory_hotplug_pci_with_fault(
+        state: HvfSnapshotV2PlatformState,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        plan: HvfSnapshotV2MemoryHotplugPciPlatformPlan,
+        fault: HvfSnapshotV2MemoryHotplugPciRestoreFault,
+    ) -> Result<
+        RestoredHvfSnapshotV2MemoryHotplugPciOwners,
+        HvfSnapshotV2MemoryHotplugPciRestoreError,
+    > {
+        Self::restore_snapshot_v2_memory_hotplug_pci_inner(
+            state,
+            process_shell,
+            serial_input,
+            plan,
+            Some(fault),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn restore_snapshot_v2_memory_hotplug_pci_inner(
+        state: HvfSnapshotV2PlatformState,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        plan: HvfSnapshotV2MemoryHotplugPciPlatformPlan,
+        fault: Option<HvfSnapshotV2MemoryHotplugPciRestoreFault>,
+    ) -> Result<
+        RestoredHvfSnapshotV2MemoryHotplugPciOwners,
+        HvfSnapshotV2MemoryHotplugPciRestoreError,
+    > {
+        let HvfSnapshotV2MemoryHotplugPciPlatformPlanParts {
+            product,
+            mapping,
+            balloon: balloon_endpoint,
+            storage: storage_platform,
+            entropy: entropy_endpoint,
+            memory_hotplug: memory_hotplug_endpoint,
+            host,
+            msi,
+            endpoint_count,
+            route_demand,
+            serial_interrupt,
+            vmgenid_interrupt,
+            vmclock_interrupt,
+        } = plan.into_parts();
+        let expected_host = Arm64PciAddressPlan::firecracker_v1_16()
+            .map(bangbang_runtime::fdt::Arm64FdtPciHost::from_address_plan)
+            .map_err(|_| {
+                HvfSnapshotV2MemoryHotplugPciRestoreError::preflight(
+                    HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product,
+                )
+            })?;
+        let storage_count = storage_platform
+            .as_ref()
+            .map_or(0, |storage| storage.pci().record_count());
+        let storage_route_demand = storage_platform
+            .as_ref()
+            .map_or(0, |storage| storage.pci().route_demand());
+        let balloon_route_demand =
+            balloon_endpoint.map_or(0, HvfSnapshotV2BalloonPciEndpointPlan::route_count);
+        let entropy_route_demand =
+            entropy_endpoint.map_or(0, HvfSnapshotV2EntropyPciEndpointPlan::route_count);
+        let expected_route_demand = balloon_route_demand
+            .checked_add(storage_route_demand)
+            .and_then(|count| count.checked_add(entropy_route_demand))
+            .and_then(|count| count.checked_add(memory_hotplug_endpoint.route_count()));
+        let preceding_entropy = usize::from(balloon_endpoint.is_some()).checked_add(storage_count);
+        let expected_endpoint_count = preceding_entropy
+            .and_then(|count| count.checked_add(usize::from(entropy_endpoint.is_some())))
+            .and_then(|count| count.checked_add(1));
+        let fixed_interrupts_are_distinct = serial_interrupt != vmgenid_interrupt
+            && serial_interrupt != vmclock_interrupt
+            && vmgenid_interrupt != vmclock_interrupt;
+        let platform_matches = expected_host == host
+            && state.global().compatibility().gic_metadata().msi == Some(msi)
+            && memory_hotplug_endpoint.origin() == StorageDeviceOrigin::Startup
+            && memory_hotplug_endpoint.route_count() == 2
+            && memory_hotplug_endpoint.msi_interrupt_count() == msi.interrupt_range.count
+            && expected_route_demand == Some(route_demand)
+            && expected_endpoint_count == Some(endpoint_count)
+            && usize::try_from(msi.interrupt_range.count).is_ok_and(|count| route_demand <= count)
+            && fixed_interrupts_are_distinct
+            && balloon_endpoint
+                .is_none_or(|balloon| balloon.msi_interrupt_count() == msi.interrupt_range.count)
+            && storage_platform.as_ref().is_none_or(|storage| {
+                storage.pci().host() == host
+                    && storage.pci().msi() == msi
+                    && storage.serial_interrupt() == serial_interrupt
+                    && storage.vmgenid_interrupt() == vmgenid_interrupt
+                    && storage.vmclock_interrupt() == vmclock_interrupt
+            })
+            && entropy_endpoint.is_none_or(|entropy| {
+                Some(entropy.preceding_endpoint_count()) == preceding_entropy
+                    && entropy.msi_interrupt_count() == msi.interrupt_range.count
+            });
+        if !platform_matches {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::preflight(
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product,
+            ));
+        }
+
+        let (topology, memory, balloon, storage_bundle, entropy) = match product.into_parts() {
+            HvfSnapshotV2MemoryHotplugPreparedProductParts::Base { topology, memory } => {
+                (topology, memory, None, None, None)
+            }
+            HvfSnapshotV2MemoryHotplugPreparedProductParts::Storage {
+                topology,
+                memory,
+                storage,
+            } => (topology, memory, None, Some(storage), None),
+            HvfSnapshotV2MemoryHotplugPreparedProductParts::Entropy {
+                topology,
+                memory,
+                entropy,
+            } => (topology, memory, None, None, Some(entropy)),
+            HvfSnapshotV2MemoryHotplugPreparedProductParts::StorageEntropy {
+                topology,
+                memory,
+                storage,
+                entropy,
+            } => (topology, memory, None, Some(storage), Some(entropy)),
+            HvfSnapshotV2MemoryHotplugPreparedProductParts::Balloon {
+                topology,
+                memory,
+                balloon,
+            } => (topology, memory, Some(balloon), None, None),
+            HvfSnapshotV2MemoryHotplugPreparedProductParts::BalloonStorage {
+                topology,
+                memory,
+                balloon,
+                storage,
+            } => (topology, memory, Some(balloon), Some(storage), None),
+            HvfSnapshotV2MemoryHotplugPreparedProductParts::BalloonEntropy {
+                topology,
+                memory,
+                balloon,
+                entropy,
+            } => (topology, memory, Some(balloon), None, Some(entropy)),
+            HvfSnapshotV2MemoryHotplugPreparedProductParts::BalloonStorageEntropy {
+                topology,
+                memory,
+                balloon,
+                storage,
+                entropy,
+            } => (
+                topology,
+                memory,
+                Some(balloon),
+                Some(storage),
+                Some(entropy),
+            ),
+        };
+        let has_balloon = balloon.is_some();
+        let has_storage = storage_bundle.is_some();
+        let has_entropy = entropy.is_some();
+        let product_matches = has_balloon == balloon_endpoint.is_some()
+            && has_storage == storage_platform.is_some()
+            && has_entropy == entropy_endpoint.is_some()
+            && snapshot_v2_memory_hotplug_pci_plan_matches(&topology, memory_hotplug_endpoint)
+            && balloon
+                .as_ref()
+                .zip(balloon_endpoint)
+                .is_none_or(|(balloon, endpoint)| {
+                    snapshot_v2_balloon_pci_plan_matches(balloon, endpoint)
+                })
+            && entropy
+                .as_ref()
+                .zip(entropy_endpoint)
+                .is_none_or(|(entropy, endpoint)| {
+                    snapshot_v2_entropy_pci_plan_matches(entropy, endpoint)
+                })
+            && (fault != Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::BalloonPublication)
+                || has_balloon)
+            && (fault != Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::StoragePublication)
+                || has_storage)
+            && (fault != Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::EntropyPublication)
+                || has_entropy);
+        if !product_matches {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::preflight(
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product,
+            ));
+        }
+
+        let balloon_config = balloon.as_ref().map(SnapshotV2BalloonRestorePlan::config);
+        let entropy_config = entropy.as_ref().map(SnapshotV2EntropyRestorePlan::config);
+        let (mut session, mut storage_configs) = match (storage_bundle, storage_platform) {
+            (None, None) => {
+                let mut session = Self::restore_snapshot_v2_serial_only_inner(
+                    state,
+                    memory,
+                    HvfSnapshotV2SerialProcessShell::MemoryHotplugPci {
+                        shell: process_shell,
+                        process:
+                            HvfSnapshotV2SerialOnlyProcessConfig::with_exact_pci_msi_interrupt_count(
+                                memory_hotplug_endpoint.msi_interrupt_count(),
+                            ),
+                        mapping: mapping.clone(),
+                    },
+                    serial_input,
+                )
+                .map_err(HvfSnapshotV2MemoryHotplugPciRestoreError::serial_platform)?;
+                if let Some(balloon) = balloon {
+                    let Some(endpoint) = balloon_endpoint else {
+                        return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                            session,
+                            HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                            HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product,
+                        ));
+                    };
+                    session =
+                        Self::attach_snapshot_v2_balloon_pci(session, endpoint, balloon, None)
+                            .map_err(HvfSnapshotV2MemoryHotplugPciRestoreError::balloon_platform)?;
+                }
+                (session, None)
+            }
+            (Some(bundle), Some(storage_plan)) => {
+                let publication = match (balloon_endpoint, balloon) {
+                    (Some(endpoint), Some(balloon)) => {
+                        HvfSnapshotV2StoragePciPublicationInput::balloon(endpoint, balloon, None)
+                    }
+                    (None, None) => HvfSnapshotV2StoragePciPublicationInput::empty(),
+                    _ => {
+                        return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::preflight(
+                            HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                            HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product,
+                        ));
+                    }
+                };
+                let restored = Self::restore_snapshot_v2_storage_pci_inner(
+                    state,
+                    memory,
+                    HvfSnapshotV2StorageProcessShell::RestoredMemoryHotplugPci {
+                        shell: process_shell,
+                        mapping: mapping.clone(),
+                    },
+                    serial_input,
+                    bundle,
+                    storage_plan,
+                    publication,
+                )
+                .map_err(HvfSnapshotV2MemoryHotplugPciRestoreError::storage_platform)?;
+                let (session, configs) = restored.into_parts();
+                (session, Some(configs))
+            }
+            (None, Some(_)) | (Some(_), None) => {
+                return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::preflight(
+                    HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product,
+                ));
+            }
+        };
+
+        if fault == Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::Platform) {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::Platform,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Injected(
+                    HvfSnapshotV2MemoryHotplugPciRestoreFault::Platform,
+                ),
+            ));
+        }
+        if fault == Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::BalloonPublication) {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::BalloonPublication,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Injected(
+                    HvfSnapshotV2MemoryHotplugPciRestoreFault::BalloonPublication,
+                ),
+            ));
+        }
+        if fault == Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::StoragePublication) {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::StoragePublication,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Injected(
+                    HvfSnapshotV2MemoryHotplugPciRestoreFault::StoragePublication,
+                ),
+            ));
+        }
+
+        if let Some(entropy) = entropy {
+            let Some(endpoint) = entropy_endpoint else {
+                return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product,
+                ));
+            };
+            let restored = Self::attach_snapshot_v2_entropy_pci(
+                session,
+                endpoint,
+                entropy,
+                storage_configs,
+                false,
+                VirtioRngOsEntropySource::new,
+                usize::from(has_balloon),
+            )
+            .map_err(HvfSnapshotV2MemoryHotplugPciRestoreError::entropy_platform)?;
+            let (restored_session, restored_entropy_config, restored_storage_configs) =
+                restored.into_parts();
+            session = restored_session;
+            storage_configs = restored_storage_configs;
+            if Some(restored_entropy_config) != entropy_config {
+                return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2MemoryHotplugPciRestoreStage::EntropyPublication,
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product,
+                ));
+            }
+        }
+        if fault == Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::EntropyPublication) {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::EntropyPublication,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Injected(
+                    HvfSnapshotV2MemoryHotplugPciRestoreFault::EntropyPublication,
+                ),
+            ));
+        }
+
+        let preceding_endpoint_count = endpoint_count.saturating_sub(1);
+        let prefix_matches = endpoint_count > 0
+            && session.pci_data_devices.as_ref().is_some_and(|manager| {
+                manager.balloon.is_some() == has_balloon
+                    && manager.block.len().saturating_add(manager.pmem.len()) == storage_count
+                    && manager.entropy.is_some() == has_entropy
+                    && manager.network.is_empty()
+                    && manager.vsock.is_none()
+                    && manager.memory_hotplug.is_none()
+                    && manager.endpoint_count() == preceding_endpoint_count
+                    && manager.msi_interrupts.as_ref().is_some_and(|interrupts| {
+                        interrupts.lease_count()
+                            == usize::try_from(memory_hotplug_endpoint.msi_interrupt_count())
+                                .unwrap_or(0)
+                    })
+            });
+        if !prefix_matches {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::ManagerInsertion,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product,
+            ));
+        }
+        let (restored_session, expected_state, controller) =
+            Self::attach_snapshot_v2_memory_hotplug_pci(
+                session,
+                memory_hotplug_endpoint,
+                topology,
+                preceding_endpoint_count,
+                fault,
+            )?;
+        session = restored_session;
+
+        if fault == Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::Recapture) {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::Recapture,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Injected(
+                    HvfSnapshotV2MemoryHotplugPciRestoreFault::Recapture,
+                ),
+            ));
+        }
+        let recaptured = {
+            let guard = session
+                .quiesce_limiter_retry_wakeups()
+                .map_err(HvfSnapshotV2MemoryHotplugPciRestoreFailure::Quiescence);
+            match guard {
+                Ok(guard) => {
+                    let captured = session
+                        .capture_ready_memory_hotplug_state(Some(controller.config()), &guard)
+                        .map_err(HvfSnapshotV2MemoryHotplugPciRestoreFailure::Capture)
+                        .and_then(|captured| {
+                            captured.ok_or(HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product)
+                        })
+                        .and_then(|captured| {
+                            captured
+                                .try_to_snapshot_v2(controller.requested_size_mib())
+                                .map_err(HvfSnapshotV2MemoryHotplugPciRestoreFailure::Normalize)
+                        });
+                    drop(guard);
+                    captured
+                }
+                Err(failure) => Err(failure),
+            }
+        };
+        let recaptured = match recaptured {
+            Ok(recaptured) => recaptured,
+            Err(failure) => {
+                return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2MemoryHotplugPciRestoreStage::Recapture,
+                    failure,
+                ));
+            }
+        };
+        if recaptured.state() != &expected_state {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::Recapture,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::StateMismatch,
+            ));
+        }
+        if !mapping.matches_capture(recaptured.mapping()) {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::Recapture,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::MappingMismatch,
+            ));
+        }
+        drop(recaptured);
+
+        if fault == Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::SessionAssembly) {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::SessionAssembly,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Injected(
+                    HvfSnapshotV2MemoryHotplugPciRestoreFault::SessionAssembly,
+                ),
+            ));
+        }
+        Ok(RestoredHvfSnapshotV2MemoryHotplugPciOwners {
+            session,
+            state: expected_state,
+            controller,
+            storage_configs,
+            entropy_config,
+            balloon_config,
+        })
+    }
+
+    fn attach_snapshot_v2_memory_hotplug_pci(
+        mut session: OwnedHvfArm64BootSession,
+        endpoint_plan: HvfSnapshotV2MemoryHotplugPciEndpointPlan,
+        topology: PreparedSnapshotV2MemoryHotplugTopology,
+        preceding_endpoint_count: usize,
+        fault: Option<HvfSnapshotV2MemoryHotplugPciRestoreFault>,
+    ) -> Result<
+        (
+            OwnedHvfArm64BootSession,
+            SnapshotV2MemoryHotplugState,
+            SnapshotV2MemoryHotplugControllerProjection,
+        ),
+        HvfSnapshotV2MemoryHotplugPciRestoreError,
+    > {
+        let owner_is_vacant = session.runtime_resources.memory_hotplug_device.is_none()
+            && session
+                .runtime_resources
+                .pci_memory_hotplug_device
+                .is_none()
+            && session.memory_hotplug_interrupt_line.is_none()
+            && endpoint_plan.origin() == StorageDeviceOrigin::Startup
+            && endpoint_plan.route_count() == 2
+            && session.pci_data_devices.as_ref().is_some_and(|manager| {
+                manager.memory_hotplug.is_none()
+                    && manager.endpoint_count() == preceding_endpoint_count
+                    && manager.msi_interrupts.as_ref().is_some_and(|interrupts| {
+                        interrupts.lease_count()
+                            == usize::try_from(endpoint_plan.msi_interrupt_count()).unwrap_or(0)
+                    })
+            });
+        if !owner_is_vacant {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::ManagerInsertion,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product,
+            ));
+        }
+        if fault == Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::RegistryCreation) {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::Registry,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Injected(
+                    HvfSnapshotV2MemoryHotplugPciRestoreFault::RegistryCreation,
+                ),
+            ));
+        }
+        let mut interrupts = match session.pci_data_devices.as_ref() {
+            Some(manager) => match manager.shared_msi_registry() {
+                Ok(interrupts) => interrupts,
+                Err(source) => {
+                    return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                        session,
+                        HvfSnapshotV2MemoryHotplugPciRestoreStage::Registry,
+                        HvfSnapshotV2MemoryHotplugPciRestoreFailure::PciData(source),
+                    ));
+                }
+            },
+            None => {
+                return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::Product,
+                ));
+            }
+        };
+        if fault == Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::RegistryRelease) {
+            let cleanup = interrupts.release().err();
+            let failure = cleanup.map_or_else(
+                || {
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::Injected(
+                        HvfSnapshotV2MemoryHotplugPciRestoreFault::RegistryRelease,
+                    )
+                },
+                |cleanup| HvfSnapshotV2MemoryHotplugPciRestoreFailure::RegistryCleanup {
+                    cleanup: Some(cleanup),
+                },
+            );
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::Registry,
+                failure,
+            ));
+        }
+        if fault == Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::EndpointPreparation) {
+            let cleanup = interrupts.release().err();
+            let failure = cleanup.map_or_else(
+                || {
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::Injected(
+                        HvfSnapshotV2MemoryHotplugPciRestoreFault::EndpointPreparation,
+                    )
+                },
+                |cleanup| HvfSnapshotV2MemoryHotplugPciRestoreFailure::RegistryCleanup {
+                    cleanup: Some(cleanup),
+                },
+            );
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::Endpoint,
+                failure,
+            ));
+        }
+
+        let prepared = match session.backend.mapped_guest_memory() {
+            Ok(memory) => topology.into_pci_endpoint(
+                memory,
+                endpoint_plan.bar_region_id(),
+                interrupts.registry(),
+            ),
+            Err(source) => {
+                let cleanup = interrupts.release().err();
+                return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2MemoryHotplugPciRestoreStage::Endpoint,
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::GuestMemory { source, cleanup },
+                ));
+            }
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(source) => {
+                let cleanup = interrupts.release().err();
+                return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2MemoryHotplugPciRestoreStage::Endpoint,
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::Endpoint { source, cleanup },
+                ));
+            }
+        };
+        if prepared.origin() != endpoint_plan.origin()
+            || prepared.endpoint().sbdf() != endpoint_plan.sbdf()
+            || prepared.endpoint().bar_range() != endpoint_plan.bar_range()
+            || prepared.endpoint().region_id() != endpoint_plan.bar_region_id()
+        {
+            drop(prepared);
+            let cleanup = interrupts.release().err();
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::RegistryCleanup { cleanup },
+            ));
+        }
+        if fault == Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::MemoryHotplugPublication) {
+            drop(prepared);
+            let cleanup = interrupts.release().err();
+            let failure = cleanup.map_or_else(
+                || {
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::Injected(
+                        HvfSnapshotV2MemoryHotplugPciRestoreFault::MemoryHotplugPublication,
+                    )
+                },
+                |cleanup| HvfSnapshotV2MemoryHotplugPciRestoreFailure::RegistryCleanup {
+                    cleanup: Some(cleanup),
+                },
+            );
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::MemoryHotplugPublication,
+                failure,
+            ));
+        }
+        let (expected_state, controller, _plugged_ranges, _queue_ranges, origin, metrics, endpoint) =
+            prepared.into_parts();
+        if origin != StorageDeviceOrigin::Startup {
+            drop(endpoint);
+            let cleanup = interrupts.release().err();
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::RegistryCleanup { cleanup },
+            ));
+        }
+
+        let (dispatcher_owner, segment) = match session.pci_data_devices.as_ref() {
+            Some(manager) => (
+                Arc::clone(&manager.dispatcher),
+                manager.validation.segment().clone(),
+            ),
+            None => {
+                drop(endpoint);
+                let cleanup = interrupts.release().err();
+                return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::RegistryCleanup { cleanup },
+                ));
+            }
+        };
+        let mut dispatcher = match dispatcher_owner.lock() {
+            Ok(dispatcher) => dispatcher,
+            Err(_) => {
+                drop(endpoint);
+                let cleanup = interrupts.release().err();
+                return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2MemoryHotplugPciRestoreStage::MemoryHotplugPublication,
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::DispatcherUnavailable { cleanup },
+                ));
+            }
+        };
+        let publication = match session.pci_data_devices.as_mut() {
+            Some(manager) => endpoint
+                .publish(
+                    manager.validation.bar_allocator_mut(),
+                    segment,
+                    &mut dispatcher,
+                    interrupts,
+                )
+                .map(|published| {
+                    manager.memory_hotplug = Some(HvfArm64BootPciMemoryHotplugDevice {
+                        published,
+                        queue_deliveries: 0,
+                        metrics: metrics.clone(),
+                    });
+                }),
+            None => {
+                drop(dispatcher);
+                drop(endpoint);
+                let cleanup = interrupts.release().err();
+                return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2MemoryHotplugPciRestoreStage::Product,
+                    HvfSnapshotV2MemoryHotplugPciRestoreFailure::RegistryCleanup { cleanup },
+                ));
+            }
+        };
+        drop(dispatcher);
+        if let Err(source) = publication {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::MemoryHotplugPublication,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Publication(source),
+            ));
+        }
+        session.memory_hotplug_device_metrics = Some(metrics);
+        if fault == Some(HvfSnapshotV2MemoryHotplugPciRestoreFault::ManagerInsertion) {
+            return Err(HvfSnapshotV2MemoryHotplugPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2MemoryHotplugPciRestoreStage::ManagerInsertion,
+                HvfSnapshotV2MemoryHotplugPciRestoreFailure::Injected(
+                    HvfSnapshotV2MemoryHotplugPciRestoreFault::ManagerInsertion,
+                ),
+            ));
+        }
+        Ok((session, expected_state, controller))
+    }
+
     /// Reconstructs one exact-2.8 serial plus MMIO entropy destination.
     #[doc(hidden)]
     pub fn restore_snapshot_v2_serial_entropy_mmio(
@@ -19713,6 +20880,15 @@ impl OwnedHvfArm64BootSession {
                 },
                 &mapping,
             ),
+            HvfSnapshotV2StorageProcessShell::RestoredMemoryHotplugPci { .. } => {
+                return Err(
+                    HvfSnapshotV2StorageMmioRestoreError::with_prepared_bundle_abort(
+                        HvfSnapshotV2StorageMmioRestoreStage::ResourcePlan,
+                        HvfSnapshotV2StorageMmioRestoreFailure::ResourcePlan,
+                        prepared_owner.bundle,
+                    ),
+                );
+            }
         };
         let mut platform = match restored {
             Ok(platform) => platform,
@@ -20486,6 +21662,11 @@ impl OwnedHvfArm64BootSession {
             HvfSnapshotV2StorageProcessShell::Restored(shell) => {
                 restore_hvf_snapshot_v2_serial_storage_pci_process_platform(
                     state, memory, shell, shell_plan,
+                )
+            }
+            HvfSnapshotV2StorageProcessShell::RestoredMemoryHotplugPci { shell, mapping } => {
+                restore_hvf_snapshot_v2_serial_storage_memory_hotplug_pci_process_platform(
+                    state, memory, shell, shell_plan, &mapping,
                 )
             }
             HvfSnapshotV2StorageProcessShell::RestoredEntropyMmio { .. }
