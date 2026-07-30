@@ -9,6 +9,7 @@ use crate::snapshot_device_v2::{
     SnapshotV2DeviceGraph, SnapshotV2DeviceKey,
 };
 use crate::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
+use crate::snapshot_network_v2_11::SnapshotV2NetworkState;
 use crate::snapshot_serial_v2_7::SnapshotV2SerialState;
 
 /// Maximum number of logical resources in one snapshot restore transaction.
@@ -129,6 +130,21 @@ fn validate_public_id(value: &str) -> Result<(), SnapshotRestorePublicIdError> {
     Ok(())
 }
 
+fn checked_native_v2_network_resource_count(
+    storage_count: usize,
+    serial_count: usize,
+    network_count: usize,
+) -> Result<usize, SnapshotRestoreManifestError> {
+    let resource_count = storage_count
+        .checked_add(serial_count)
+        .and_then(|count| count.checked_add(network_count))
+        .ok_or(SnapshotRestoreManifestError::TooManyResources)?;
+    if resource_count > MAX_SNAPSHOT_RESTORE_RESOURCES {
+        return Err(SnapshotRestoreManifestError::TooManyResources);
+    }
+    Ok(resource_count)
+}
+
 /// Closed logical class of one snapshot restore resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SnapshotRestoreResourceClass {
@@ -140,11 +156,13 @@ pub enum SnapshotRestoreResourceClass {
     VsockEndpoint,
     /// Destination output for the restored singleton serial device.
     SerialSink,
+    /// Fresh packet-I/O owner for one restored network interface.
+    NetworkPacketIo,
 }
 
 impl SnapshotRestoreResourceClass {
     const fn accepts_override(self) -> bool {
-        matches!(self, Self::VsockEndpoint)
+        matches!(self, Self::VsockEndpoint | Self::NetworkPacketIo)
     }
 }
 
@@ -227,9 +245,10 @@ pub struct SnapshotRestoreManifest {
 impl SnapshotRestoreManifest {
     /// Builds and validates one canonical logical manifest.
     ///
-    /// `overrides` contains value-free exact resource keys whose already
-    /// normalized destination differs from captured state. The final manifest
-    /// retains only canonical resource indices, never another public-ID copy.
+    /// `overrides` contains value-free exact resource keys with an explicit
+    /// destination binding. A binding may deliberately name the same logical
+    /// selector as captured state. The final manifest retains only canonical
+    /// resource indices, never another public-ID copy.
     pub fn try_new(
         resources: Vec<SnapshotRestoreResourceKey>,
         overrides: Vec<SnapshotRestoreResourceKey>,
@@ -350,6 +369,81 @@ impl SnapshotRestoreManifest {
             ));
         }
         Self::try_new(resources, Vec::new())
+    }
+
+    /// Derives the complete exact-2.11 storage, configured-serial, and network
+    /// resource set.
+    ///
+    /// Every network interface has one explicit destination binding even when
+    /// the caller deliberately selects the captured logical name. Network keys
+    /// use stable kind 4 and configuration-order instances. The unchanged
+    /// 64-entry limit applies to the aggregate rather than to each component's
+    /// independent maximum.
+    pub fn try_from_native_v2_network_state(
+        graph: Option<&SnapshotV2StorageDeviceGraph>,
+        serial: &SnapshotV2SerialState,
+        network: Option<&SnapshotV2NetworkState>,
+    ) -> Result<Self, SnapshotRestoreManifestError> {
+        let storage_count = graph.map_or(0, SnapshotV2StorageDeviceGraph::record_count);
+        let serial_count = usize::from(serial.endpoint_intent().configured_selector().is_some());
+        let network_count = network.map_or(0, |state| state.interfaces().len());
+        let resource_count =
+            checked_native_v2_network_resource_count(storage_count, serial_count, network_count)?;
+
+        let mut resources = Vec::new();
+        resources
+            .try_reserve_exact(resource_count)
+            .map_err(|source| SnapshotRestoreManifestError::AllocationFailed { source })?;
+        if let Some(graph) = graph {
+            for record in graph.block_records() {
+                let public_id = SnapshotRestorePublicId::try_from(record.config().drive_id())
+                    .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+                resources.push(SnapshotRestoreResourceKey::new(
+                    record.key(),
+                    public_id,
+                    SnapshotRestoreResourceClass::BlockBacking,
+                ));
+            }
+            for record in graph.pmem_records() {
+                let public_id = SnapshotRestorePublicId::try_from(record.config().pmem_id())
+                    .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+                resources.push(SnapshotRestoreResourceKey::new(
+                    record.key(),
+                    public_id,
+                    SnapshotRestoreResourceClass::PmemBacking,
+                ));
+            }
+        }
+        if serial_count == 1 {
+            let public_id = SnapshotRestorePublicId::try_from(NATIVE_V2_SERIAL_RESTORE_PUBLIC_ID)
+                .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+            resources.push(SnapshotRestoreResourceKey::new(
+                SnapshotV2DeviceKey::serial(),
+                public_id,
+                SnapshotRestoreResourceClass::SerialSink,
+            ));
+        }
+
+        let mut overrides = Vec::new();
+        overrides
+            .try_reserve_exact(network_count)
+            .map_err(|source| SnapshotRestoreManifestError::AllocationFailed { source })?;
+        if let Some(network) = network {
+            for (index, interface) in network.interfaces().iter().enumerate() {
+                let instance = u32::try_from(index)
+                    .map_err(|_| SnapshotRestoreManifestError::TooManyResources)?;
+                let public_id = SnapshotRestorePublicId::try_from(interface.iface_id())
+                    .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+                let key = SnapshotRestoreResourceKey::new(
+                    SnapshotV2DeviceKey::network(instance),
+                    public_id,
+                    SnapshotRestoreResourceClass::NetworkPacketIo,
+                );
+                overrides.push(key.clone());
+                resources.push(key);
+            }
+        }
+        Self::try_new(resources, overrides)
     }
 
     fn try_new_with_reserve(
@@ -934,6 +1028,7 @@ mod tests {
     use super::*;
     use crate::snapshot_device_v2::snapshot_v2_device_key_for_test;
     use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+    use crate::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
     use crate::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
 
     const DEFAULT_SERIAL_HEX: &str = include_str!("snapshot_serial_v2_7/fixtures/default.hex");
@@ -941,6 +1036,7 @@ mod tests {
         include_str!("snapshot_serial_v2_7/fixtures/configured.hex");
     const MIXED_STORAGE_HEX: &str =
         include_str!("snapshot_device_v2_6/fixtures/mixed-pmem-root-pci.hex");
+    const NETWORK_HEX: &str = include_str!("snapshot_network_v2_11/fixtures/inactive-mmio.hex");
 
     fn public_id(value: impl Into<String>) -> SnapshotRestorePublicId {
         SnapshotRestorePublicId::try_from(value.into())
@@ -967,7 +1063,7 @@ mod tests {
     }
 
     fn decode_hex(value: &str) -> Vec<u8> {
-        let value = value.trim();
+        let value = value.split_whitespace().collect::<String>();
         assert!(value.len().is_multiple_of(2));
         value
             .as_bytes()
@@ -1000,6 +1096,14 @@ mod tests {
             &decode_hex(MIXED_STORAGE_HEX),
         )
         .expect("storage fixture should decode")
+    }
+
+    fn network_state() -> SnapshotV2NetworkState {
+        SnapshotV2NetworkState::decode(
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            &decode_hex(NETWORK_HEX),
+        )
+        .expect("network fixture should decode")
     }
 
     fn maximum_keys() -> Vec<SnapshotRestoreResourceKey> {
@@ -1224,6 +1328,188 @@ mod tests {
                 .resource_class(),
             SnapshotRestoreResourceClass::SerialSink
         );
+    }
+
+    #[test]
+    fn exact_2_11_manifest_closes_storage_serial_and_network_resources() {
+        let graph = storage_graph();
+        let serial = serial_state(true);
+        let network = network_state();
+        let manifest = SnapshotRestoreManifest::try_from_native_v2_network_state(
+            Some(&graph),
+            &serial,
+            Some(&network),
+        )
+        .expect("mixed exact-2.11 manifest should validate");
+
+        assert_eq!(
+            manifest.len(),
+            graph.record_count() + 1 + network.interfaces().len()
+        );
+        assert_eq!(
+            manifest
+                .resources()
+                .iter()
+                .filter(|resource| {
+                    matches!(
+                        resource.resource_class(),
+                        SnapshotRestoreResourceClass::BlockBacking
+                            | SnapshotRestoreResourceClass::PmemBacking
+                    )
+                })
+                .count(),
+            graph.record_count()
+        );
+        let serial_resource = manifest
+            .resources()
+            .iter()
+            .find(|resource| resource.resource_class() == SnapshotRestoreResourceClass::SerialSink)
+            .expect("configured serial resource should exist");
+        assert_eq!(
+            serial_resource.public_id().as_str(),
+            NATIVE_V2_SERIAL_RESTORE_PUBLIC_ID
+        );
+
+        let network_resources = manifest
+            .resources()
+            .iter()
+            .filter(|resource| {
+                resource.resource_class() == SnapshotRestoreResourceClass::NetworkPacketIo
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(network_resources.len(), network.interfaces().len());
+        assert_eq!(manifest.overrides().collect::<Vec<_>>(), network_resources);
+        for (index, (resource, interface)) in network_resources
+            .iter()
+            .zip(network.interfaces())
+            .enumerate()
+        {
+            assert_eq!(resource.device_key().kind(), 4);
+            assert_eq!(
+                resource.device_key().instance(),
+                u32::try_from(index).unwrap()
+            );
+            assert_eq!(resource.public_id().as_str(), interface.iface_id());
+            assert!(manifest.is_overridden(resource));
+        }
+
+        let without_network =
+            SnapshotRestoreManifest::try_from_native_v2_network_state(Some(&graph), &serial, None)
+                .expect("network-free exact-2.11 manifest should validate");
+        let exact_2_7 =
+            SnapshotRestoreManifest::try_from_native_v2_serial_state(Some(&graph), &serial)
+                .expect("equivalent exact-2.7 manifest should validate");
+        assert_eq!(without_network.resources(), exact_2_7.resources());
+        assert_eq!(without_network.overrides().count(), 0);
+    }
+
+    #[test]
+    fn exact_2_11_manifest_applies_one_aggregate_resource_ceiling() {
+        assert_eq!(
+            checked_native_v2_network_resource_count(48, 0, 16)
+                .expect("storage plus network at the aggregate ceiling should fit"),
+            MAX_SNAPSHOT_RESTORE_RESOURCES
+        );
+        assert_eq!(
+            checked_native_v2_network_resource_count(47, 1, 16)
+                .expect("storage, serial, and network at the aggregate ceiling should fit"),
+            MAX_SNAPSHOT_RESTORE_RESOURCES
+        );
+        assert!(matches!(
+            checked_native_v2_network_resource_count(48, 1, 16),
+            Err(SnapshotRestoreManifestError::TooManyResources)
+        ));
+        assert!(matches!(
+            checked_native_v2_network_resource_count(usize::MAX, 1, 1),
+            Err(SnapshotRestoreManifestError::TooManyResources)
+        ));
+    }
+
+    #[test]
+    fn network_override_membership_accepts_explicit_same_destination_identity() {
+        let network = key(
+            4,
+            0,
+            "network-secret",
+            SnapshotRestoreResourceClass::NetworkPacketIo,
+        );
+        let manifest =
+            SnapshotRestoreManifest::try_new(vec![network.clone()], vec![network.clone()])
+                .expect("explicit network binding should validate even when identity is unchanged");
+
+        assert!(manifest.is_overridden(&network));
+        assert_eq!(manifest.overrides().collect::<Vec<_>>(), [&network]);
+        let debug = format!("{manifest:?} {network:?}");
+        assert!(!debug.contains("network-secret"));
+    }
+
+    #[test]
+    fn network_bindings_reject_alias_class_extra_duplicate_missing_reuse_and_unconsumed() {
+        let network = key(4, 0, "eth0", SnapshotRestoreResourceClass::NetworkPacketIo);
+        let manifest =
+            SnapshotRestoreManifest::try_new(vec![network.clone()], vec![network.clone()])
+                .expect("network manifest should validate");
+        let mut bindings = manifest
+            .try_into_bindings()
+            .expect("network binding slots should allocate");
+
+        let alias = key(4, 1, "eth0", SnapshotRestoreResourceClass::NetworkPacketIo);
+        let alias_rejection = bindings
+            .bind(&alias, "alias")
+            .expect_err("same public ID under another device key must be extra");
+        assert_eq!(
+            alias_rejection.reason(),
+            SnapshotRestoreBindingRejectionReason::ExtraBinding
+        );
+        assert_eq!(alias_rejection.into_value(), "alias");
+
+        let wrong_class = SnapshotRestoreResourceKey::new(
+            network.device_key(),
+            network.public_id().clone(),
+            SnapshotRestoreResourceClass::VsockEndpoint,
+        );
+        let class_rejection = bindings
+            .bind(&wrong_class, "class")
+            .expect_err("network resource class swap must fail");
+        assert_eq!(
+            class_rejection.reason(),
+            SnapshotRestoreBindingRejectionReason::WrongClass
+        );
+        assert_eq!(class_rejection.into_value(), "class");
+
+        let incomplete = bindings
+            .complete()
+            .expect_err("missing network value must fail completion");
+        assert_eq!(incomplete.missing_count(), 1);
+        let mut bindings = incomplete.into_bindings();
+        bindings
+            .bind(&network, "owner")
+            .expect("exact network owner should bind");
+        let duplicate = bindings
+            .bind(&network, "duplicate")
+            .expect_err("duplicate network owner must fail");
+        assert_eq!(
+            duplicate.reason(),
+            SnapshotRestoreBindingRejectionReason::DuplicateBinding
+        );
+        assert_eq!(duplicate.into_value(), "duplicate");
+
+        let prepared = bindings
+            .complete()
+            .expect("complete network owner set should prepare");
+        let unconsumed = prepared
+            .finish()
+            .expect_err("unconsumed network owner must fail");
+        assert_eq!(unconsumed.unconsumed_count(), 1);
+        let mut prepared = unconsumed.into_bindings();
+        assert_eq!(prepared.take(&network), Ok("owner"));
+        assert_eq!(
+            prepared.take(&network),
+            Err(SnapshotRestoreTakeError::AlreadyTaken)
+        );
+        prepared
+            .finish()
+            .expect("consumed network owner set should finish");
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::memory::GuestMemory;
+use crate::snapshot::SnapshotNetworkOverride;
 use crate::snapshot_balloon_v2_9::{
     NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, SnapshotV2BalloonState,
     SnapshotV2BalloonStateDecodeError,
@@ -72,10 +73,15 @@ use crate::snapshot_memory_v2::{
 use crate::snapshot_memory_v2::{
     load_snapshot_v2_memory_file, verify_snapshot_v2_memory_image_output,
 };
+use crate::snapshot_network_restore_v2_11::{
+    PreparedSnapshotV2NetworkRestoreTopology, SnapshotV2NetworkRestorePreparationError,
+    SnapshotV2NetworkRestorePreparationStage,
+};
 use crate::snapshot_network_v2_11::{
     NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, SnapshotV2NetworkState,
     SnapshotV2NetworkStateDecodeError,
 };
+use crate::snapshot_restore::{SnapshotRestoreManifest, SnapshotRestoreManifestError};
 use crate::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
     SnapshotV2SerialStateDecodeError,
@@ -1439,6 +1445,201 @@ pub type NativeV2NetworkSnapshotCandidateParts = (
     Option<SnapshotV2NetworkState>,
 );
 
+/// Exact-2.11 network preparation outcome before any host operation.
+pub enum NativeV2NetworkSnapshotPreparation {
+    /// The original candidate has no network component and no caller
+    /// overrides, so its compatible internal path remains unchanged.
+    Compatible(NativeV2NetworkSnapshotCandidateState),
+    /// The network-bearing candidate has a complete resource manifest and
+    /// immutable owner-free destination topology.
+    Prepared(PreparedNativeV2NetworkSnapshotCandidateState),
+}
+
+impl NativeV2NetworkSnapshotPreparation {
+    /// Returns the unchanged network-free candidate, when applicable.
+    pub const fn compatible(&self) -> Option<&NativeV2NetworkSnapshotCandidateState> {
+        match self {
+            Self::Compatible(candidate) => Some(candidate),
+            Self::Prepared(_) => None,
+        }
+    }
+
+    /// Returns the prepared network-bearing candidate, when applicable.
+    pub const fn prepared(&self) -> Option<&PreparedNativeV2NetworkSnapshotCandidateState> {
+        match self {
+            Self::Compatible(_) => None,
+            Self::Prepared(candidate) => Some(candidate),
+        }
+    }
+}
+
+impl fmt::Debug for NativeV2NetworkSnapshotPreparation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let outcome = match self {
+            Self::Compatible(_) => "compatible",
+            Self::Prepared(_) => "prepared",
+        };
+        formatter
+            .debug_struct("NativeV2NetworkSnapshotPreparation")
+            .field("outcome", &outcome)
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// One network-bearing exact-2.11 candidate with owner-free restore topology.
+///
+/// All retained components came from the same immutable encoded state. This
+/// value owns no descriptor, provider, packet-I/O owner, callback, metric,
+/// datastore, platform slot, or VM authority.
+pub struct PreparedNativeV2NetworkSnapshotCandidateState {
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+    balloon: Option<SnapshotV2BalloonState>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+    topology: PreparedSnapshotV2NetworkRestoreTopology,
+    manifest: SnapshotRestoreManifest,
+}
+
+/// Owned exact components of one prepared network-bearing 2.11 candidate.
+pub type PreparedNativeV2NetworkSnapshotCandidateParts = (
+    Vec<u8>,
+    SnapshotV2MemoryBinding,
+    Option<SnapshotV2StorageDeviceGraph>,
+    SnapshotV2SerialState,
+    Option<SnapshotV2EntropyState>,
+    Option<SnapshotV2BalloonState>,
+    Option<SnapshotV2MemoryHotplugState>,
+    PreparedSnapshotV2NetworkRestoreTopology,
+    SnapshotRestoreManifest,
+);
+
+impl PreparedNativeV2NetworkSnapshotCandidateState {
+    /// Returns the exact candidate compatibility version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+    }
+
+    /// Returns the unchanged immutable encoded state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the memory commitment derived from the same bytes.
+    pub const fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.binding
+    }
+
+    /// Returns the optional unchanged exact-2.6 storage graph.
+    pub const fn device_graph(&self) -> Option<&SnapshotV2StorageDeviceGraph> {
+        self.device_graph.as_ref()
+    }
+
+    /// Returns the required unchanged exact-2.7 serial state.
+    pub const fn serial(&self) -> &SnapshotV2SerialState {
+        &self.serial
+    }
+
+    /// Returns the optional unchanged exact-2.8 entropy state.
+    pub const fn entropy(&self) -> Option<&SnapshotV2EntropyState> {
+        self.entropy.as_ref()
+    }
+
+    /// Returns the optional unchanged exact-2.9 balloon state.
+    pub const fn balloon(&self) -> Option<&SnapshotV2BalloonState> {
+        self.balloon.as_ref()
+    }
+
+    /// Returns the optional unchanged exact-2.10 virtio-mem state.
+    pub const fn memory_hotplug(&self) -> Option<&SnapshotV2MemoryHotplugState> {
+        self.memory_hotplug.as_ref()
+    }
+
+    /// Returns the immutable owner-free network/MMDS topology.
+    pub const fn topology(&self) -> &PreparedSnapshotV2NetworkRestoreTopology {
+        &self.topology
+    }
+
+    /// Returns the complete storage, serial, and network resource manifest.
+    pub const fn manifest(&self) -> &SnapshotRestoreManifest {
+        &self.manifest
+    }
+
+    /// Consumes the candidate into its exact still-detached components.
+    pub fn into_parts(self) -> PreparedNativeV2NetworkSnapshotCandidateParts {
+        (
+            self.bytes,
+            self.binding,
+            self.device_graph,
+            self.serial,
+            self.entropy,
+            self.balloon,
+            self.memory_hotplug,
+            self.topology,
+            self.manifest,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedNativeV2NetworkSnapshotCandidateState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedNativeV2NetworkSnapshotCandidateState")
+            .field("version", &self.version())
+            .field("has_storage", &self.device_graph.is_some())
+            .field("has_entropy", &self.entropy.is_some())
+            .field("has_balloon", &self.balloon.is_some())
+            .field("has_memory_hotplug", &self.memory_hotplug.is_some())
+            .field("state", &REDACTED)
+            .field("memory_binding", &REDACTED)
+            .field("serial", &REDACTED)
+            .field("network_topology", &REDACTED)
+            .field("manifest", &REDACTED)
+            .finish()
+    }
+}
+
+/// Failure while preparing one exact-2.11 network artifact candidate.
+pub enum NativeV2NetworkSnapshotPreparationError {
+    /// Caller overrides were supplied without a saved network component.
+    OverridesWithoutNetwork,
+    /// The complete restore resource manifest could not be derived.
+    Manifest(SnapshotRestoreManifestError),
+    /// The owner-free destination topology could not be prepared.
+    Topology(SnapshotV2NetworkRestorePreparationError),
+}
+
+impl fmt::Debug for NativeV2NetworkSnapshotPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for NativeV2NetworkSnapshotPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::OverridesWithoutNetwork => {
+                "native-v2 network overrides require saved network state"
+            }
+            Self::Manifest(_) => "native-v2 network restore manifest is invalid",
+            Self::Topology(_) => "native-v2 network restore topology is invalid",
+        })
+    }
+}
+
+impl std::error::Error for NativeV2NetworkSnapshotPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OverridesWithoutNetwork => None,
+            Self::Manifest(source) => Some(source),
+            Self::Topology(source) => Some(source),
+        }
+    }
+}
+
 impl NativeV2NetworkSnapshotCandidateState {
     /// Validates and retains one exact native-v2 2.11 state.
     pub fn from_network_state_v2_11(
@@ -1501,6 +1702,73 @@ impl NativeV2NetworkSnapshotCandidateState {
     /// Returns the optional exact-2.11 network/MMDS aggregate.
     pub const fn network(&self) -> Option<&SnapshotV2NetworkState> {
         self.network.as_ref()
+    }
+
+    /// Prepares a complete exact-2.11 network restore candidate.
+    ///
+    /// A network-free candidate is preserved unchanged only when the caller
+    /// also supplies no network overrides.
+    pub fn prepare(
+        self,
+        overrides: &[SnapshotNetworkOverride],
+    ) -> Result<NativeV2NetworkSnapshotPreparation, NativeV2NetworkSnapshotPreparationError> {
+        self.prepare_with_cancel(overrides, |_| false)
+    }
+
+    /// Prepares with stable owner-free topology cancellation checkpoints.
+    pub fn prepare_with_cancel<C>(
+        self,
+        overrides: &[SnapshotNetworkOverride],
+        is_cancelled: C,
+    ) -> Result<NativeV2NetworkSnapshotPreparation, NativeV2NetworkSnapshotPreparationError>
+    where
+        C: FnMut(SnapshotV2NetworkRestorePreparationStage) -> bool,
+    {
+        if self.network.is_none() {
+            if overrides.is_empty() {
+                return Ok(NativeV2NetworkSnapshotPreparation::Compatible(self));
+            }
+            return Err(NativeV2NetworkSnapshotPreparationError::OverridesWithoutNetwork);
+        }
+
+        let Self {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network,
+        } = self;
+        let network =
+            network.ok_or(NativeV2NetworkSnapshotPreparationError::OverridesWithoutNetwork)?;
+        let manifest = SnapshotRestoreManifest::try_from_native_v2_network_state(
+            device_graph.as_ref(),
+            &serial,
+            Some(&network),
+        )
+        .map_err(NativeV2NetworkSnapshotPreparationError::Manifest)?;
+        let topology = PreparedSnapshotV2NetworkRestoreTopology::prepare_with_cancel(
+            network,
+            overrides,
+            is_cancelled,
+        )
+        .map_err(NativeV2NetworkSnapshotPreparationError::Topology)?;
+
+        Ok(NativeV2NetworkSnapshotPreparation::Prepared(
+            PreparedNativeV2NetworkSnapshotCandidateState {
+                bytes,
+                binding,
+                device_graph,
+                serial,
+                entropy,
+                balloon,
+                memory_hotplug,
+                topology,
+                manifest,
+            },
+        ))
     }
 
     /// Consumes the candidate into its inseparable exact components.
