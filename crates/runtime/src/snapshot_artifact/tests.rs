@@ -141,8 +141,8 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
     assert_eq!(
         state
             .v2_profile()
-            .expect("current state should classify as exact balloon profile"),
-        NativeV2SnapshotArtifactProfile::BalloonStateV2_9
+            .expect("current state should classify as exact virtio-mem profile"),
+        NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
     );
     assert!(state.v1_record().is_none());
     let debug = format!("{state:?}");
@@ -620,14 +620,10 @@ fn exact_minor_nine_candidate_classifies_all_optional_component_combinations_and
                 )
                 .expect("exact 2.9 fixture should encode");
 
-                let current = NativeSnapshotArtifactState::from_current_v2(bytes.clone())
-                    .expect("exact 2.9 should have current publication authority");
-                assert_eq!(
-                    current
-                        .v2_profile()
-                        .expect("current exact 2.9 state should classify"),
-                    NativeV2SnapshotArtifactProfile::BalloonStateV2_9
-                );
+                assert!(matches!(
+                    NativeSnapshotArtifactState::from_current_v2(bytes.clone()),
+                    Err(NativeSnapshotArtifactStateError::CurrentV2Profile(_))
+                ));
                 let compatible = NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone())
                     .expect("public compatible file loading should admit exact 2.9");
                 assert_eq!(
@@ -653,16 +649,20 @@ fn exact_minor_nine_candidate_classifies_all_optional_component_combinations_and
                 assert!(debug.contains(REDACTED));
                 assert!(!debug.contains("BANGBL2"));
 
-                let compatible = candidate.into_current_artifact_state();
+                let compatible = candidate.into_compatible_artifact_state();
                 assert_eq!(
                     compatible
                         .v2_profile()
-                        .expect("current exact 2.9 state should classify"),
+                        .expect("compatible exact 2.9 state should classify"),
                     NativeV2SnapshotArtifactProfile::BalloonStateV2_9
                 );
-                compatible
-                    .validate_for_publication()
-                    .expect("exact 2.9 candidate should retain publication authority");
+                assert!(matches!(
+                    compatible.validate_for_publication(),
+                    Err(NativeSnapshotArtifactStateError::NonCurrentV2Publication {
+                        state: NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                        memory: NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                    })
+                ));
             }
         }
     }
@@ -898,18 +898,23 @@ fn exact_minor_ten_products_prepare_or_preserve_every_optional_component_product
                         )
                         .expect("exact 2.10 product should encode");
 
-                        assert!(matches!(
-                            NativeSnapshotArtifactState::from_current_v2(bytes.clone()),
-                            Err(NativeSnapshotArtifactStateError::CurrentV2Profile(_))
-                        ));
-                        assert!(matches!(
-                            NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone()),
-                            Err(NativeSnapshotArtifactStateError::Format(
-                                NativeSnapshotFormatError::NativeV2(
-                                    SnapshotV2DecodeError::UnsupportedVersion { .. }
-                                )
-                            ))
-                        ));
+                        let current = NativeSnapshotArtifactState::from_current_v2(bytes.clone())
+                            .expect("exact 2.10 should have current publication authority");
+                        assert_eq!(
+                            current
+                                .v2_profile()
+                                .expect("current exact 2.10 state should classify"),
+                            NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
+                        );
+                        let compatible =
+                            NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone())
+                                .expect("public compatible loading should admit exact 2.10");
+                        assert_eq!(
+                            compatible
+                                .v2_profile()
+                                .expect("compatible exact 2.10 state should classify"),
+                            NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
+                        );
 
                         let candidate =
                             NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
@@ -1002,21 +1007,17 @@ fn exact_minor_ten_products_prepare_or_preserve_every_optional_component_product
                             NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
                                 bytes,
                             )
-                            .expect("exact 2.10 compatibility candidate should validate")
-                            .into_compatible_artifact_state();
+                            .expect("exact 2.10 current candidate should validate")
+                            .into_current_artifact_state();
                         assert_eq!(
                             compatible
                                 .v2_profile()
-                                .expect("internal exact 2.10 state should classify"),
+                                .expect("current exact 2.10 state should classify"),
                             NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
                         );
-                        assert!(matches!(
-                            compatible.validate_for_publication(),
-                            Err(NativeSnapshotArtifactStateError::NonCurrentV2Publication {
-                                state: NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
-                                memory: NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
-                            })
-                        ));
+                        compatible
+                            .validate_for_publication()
+                            .expect("exact 2.10 candidate should retain publication authority");
                     }
                 }
             }

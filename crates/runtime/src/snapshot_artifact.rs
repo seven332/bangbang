@@ -220,8 +220,8 @@ impl NativeSnapshotArtifactState {
 
     /// Validates exact current-version native-v2 bytes for publication.
     pub fn from_current_v2(bytes: Vec<u8>) -> Result<Self, NativeSnapshotArtifactStateError> {
-        NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(bytes)
-            .map(NativeV2BalloonSnapshotCandidateState::into_current_artifact_state)
+        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(bytes)
+            .map(NativeV2MemoryHotplugSnapshotCandidateState::into_current_artifact_state)
             .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)
     }
 
@@ -353,7 +353,7 @@ impl NativeSnapshotArtifactState {
         };
         if *version == NATIVE_V2_SNAPSHOT_VERSION && binding.version() == NATIVE_V2_SNAPSHOT_VERSION
         {
-            let (actual_binding, _, _, _, _) = decode_balloon_state_v2_9(bytes)
+            let (actual_binding, _, _, _, _, _) = decode_memory_hotplug_state_v2_10(bytes)
                 .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
             if &actual_binding == binding {
                 Ok(())
@@ -806,7 +806,7 @@ impl fmt::Debug for NativeV2EntropySnapshotCandidateState {
 /// The required unchanged serial singleton, independently optional unchanged
 /// profile-3 storage graph and entropy singleton, optional balloon singleton,
 /// and memory binding are all derived from the same immutable bytes. This
-/// candidate that can enter current-public publication authority.
+/// candidate retained as the exact-2.9 compatibility handoff.
 pub struct NativeV2BalloonSnapshotCandidateState {
     bytes: Vec<u8>,
     binding: SnapshotV2MemoryBinding,
@@ -888,8 +888,8 @@ impl NativeV2BalloonSnapshotCandidateState {
         )
     }
 
-    /// Consumes this exact current candidate into artifact authority.
-    pub fn into_current_artifact_state(self) -> NativeSnapshotArtifactState {
+    /// Consumes this exact 2.9 candidate into compatible artifact authority.
+    pub fn into_compatible_artifact_state(self) -> NativeSnapshotArtifactState {
         let (bytes, binding, _, _, _, _) = self.into_parts();
         NativeSnapshotArtifactState {
             inner: NativeSnapshotArtifactStateInner::V2 {
@@ -920,9 +920,8 @@ impl fmt::Debug for NativeV2BalloonSnapshotCandidateState {
 ///
 /// Required serial, independently optional unchanged profile-3 storage,
 /// entropy and balloon state, optional virtio-mem state, and the memory
-/// binding are all derived from the same immutable bytes. This candidate can
-/// enter compatible internal artifact authority only; it cannot enter current
-/// publication or load authority while the public writer remains exact 2.9.
+/// binding are all derived from the same immutable bytes. This is the exact
+/// current candidate that can enter public publication authority.
 pub struct NativeV2MemoryHotplugSnapshotCandidateState {
     bytes: Vec<u8>,
     binding: SnapshotV2MemoryBinding,
@@ -1376,8 +1375,8 @@ impl NativeV2MemoryHotplugSnapshotCandidateState {
         )
     }
 
-    /// Consumes this exact 2.10 candidate into compatible artifact authority.
-    pub fn into_compatible_artifact_state(self) -> NativeSnapshotArtifactState {
+    /// Consumes this exact current candidate into artifact authority.
+    pub fn into_current_artifact_state(self) -> NativeSnapshotArtifactState {
         let (bytes, binding, _, _, _, _, _) = self.into_parts();
         NativeSnapshotArtifactState {
             inner: NativeSnapshotArtifactStateInner::V2 {
@@ -2984,6 +2983,8 @@ pub enum SnapshotArtifactLoadFailure {
     Memory(SnapshotMemoryLoadError),
     NativeState(NativeSnapshotArtifactStateError),
     MemoryV2(SnapshotV2MemoryLoadError),
+    MemoryHotplugPreparation(NativeV2MemoryHotplugSnapshotPreparationError),
+    MemoryHotplugMaterialization(SnapshotV2MemoryHotplugMaterializationError),
 }
 
 impl fmt::Display for SnapshotArtifactLoadFailure {
@@ -3013,6 +3014,12 @@ impl fmt::Display for SnapshotArtifactLoadFailure {
             Self::MemoryV2(source) => {
                 write!(f, "invalid native-v2 snapshot memory image: {source}")
             }
+            Self::MemoryHotplugPreparation(source) => {
+                write!(f, "invalid native-v2 virtio-mem topology: {source}")
+            }
+            Self::MemoryHotplugMaterialization(source) => {
+                write!(f, "invalid native-v2 virtio-mem memory image: {source}")
+            }
         }
     }
 }
@@ -3025,6 +3032,8 @@ impl std::error::Error for SnapshotArtifactLoadFailure {
             Self::Memory(source) => Some(source),
             Self::NativeState(source) => Some(source),
             Self::MemoryV2(source) => Some(source),
+            Self::MemoryHotplugPreparation(source) => Some(source),
+            Self::MemoryHotplugMaterialization(source) => Some(source),
             Self::UnsupportedPlatform
             | Self::InvalidFinalPath { .. }
             | Self::NotRegularFile { .. }
@@ -3214,11 +3223,11 @@ impl LoadedNativeSnapshotArtifacts {
         Ok((candidate, memory))
     }
 
-    /// Consumes one exact current 2.9 pair into the balloon load handoff.
+    /// Consumes one exact retained 2.9 pair into the balloon load handoff.
     ///
     /// The state bytes are neither reopened nor re-encoded, and the already
     /// loaded guest memory remains bound to the candidate derived from them.
-    pub fn into_current_v2_candidate(
+    pub fn into_v2_9_candidate(
         self,
     ) -> Result<
         (NativeV2BalloonSnapshotCandidateState, GuestMemory),
@@ -3234,6 +3243,31 @@ impl LoadedNativeSnapshotArtifacts {
         })?;
         let candidate = NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(bytes)
             .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
+        debug_assert_eq!(candidate.memory_binding(), &binding);
+        Ok((candidate, memory))
+    }
+
+    /// Consumes one exact current 2.10 pair into the virtio-mem load handoff.
+    ///
+    /// The state bytes are neither reopened nor re-encoded, and the already
+    /// loaded guest memory remains bound to the candidate derived from them.
+    pub fn into_current_v2_candidate(
+        self,
+    ) -> Result<
+        (NativeV2MemoryHotplugSnapshotCandidateState, GuestMemory),
+        NativeSnapshotArtifactStateError,
+    > {
+        let actual = self.family();
+        let (state, memory) = self.into_parts();
+        let (bytes, binding) = state.into_v2_parts().map_err(|_| {
+            NativeSnapshotArtifactStateError::UnexpectedFamily {
+                expected: NativeSnapshotArtifactFamily::V2,
+                actual,
+            }
+        })?;
+        let candidate =
+            NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(bytes)
+                .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
         debug_assert_eq!(candidate.memory_binding(), &binding);
         Ok((candidate, memory))
     }

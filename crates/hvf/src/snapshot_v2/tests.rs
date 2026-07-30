@@ -2038,6 +2038,13 @@ fn exact_minor_ten_memory_hotplug_encodes_all_sixteen_mmio_and_pci_products() {
                 NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
             )
             .expect("exact-2.10 state should decode structurally");
+            let decoded = decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{transport:?} storage={has_storage} entropy={has_entropy} balloon={has_balloon} memory-hotplug={has_memory_hotplug} exact-2.10 decode failed: {error}"
+                    )
+                });
+            assert_eq!(decoded, original);
             assert_eq!(
                 structural.metadata().component_count(),
                 8 + u32::from(has_storage)

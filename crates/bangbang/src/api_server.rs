@@ -2307,11 +2307,15 @@ mod tests {
     };
     use bangbang_runtime::snapshot::{
         SnapshotLoadInput, SnapshotV1ControllerCommit, SnapshotV2ControllerCommit,
+        SnapshotV2ControllerCommitProductConfigs,
     };
+    #[cfg(target_os = "macos")]
+    use bangbang_runtime::snapshot_artifact::load_native_snapshot_artifacts;
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactState,
-        NativeSnapshotPublicationOutcome, NativeV2BalloonSnapshotCandidateState,
-        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_native_snapshot_artifacts_with,
+        NativeSnapshotPublicationOutcome, NativeV2MemoryHotplugSnapshotCandidateState,
+        NativeV2MemoryHotplugSnapshotPreparation, SnapshotArtifactPaths,
+        SnapshotPublicationOutcome, publish_native_snapshot_artifacts_with,
         publish_snapshot_artifacts_with,
     };
     use bangbang_runtime::snapshot_balloon_v2_9::{
@@ -2324,10 +2328,14 @@ mod tests {
     };
     use bangbang_runtime::snapshot_format_v2::{
         NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
-        NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component,
-        SnapshotV2ComponentDisposition, encode_snapshot_v2_state_with_compatibility_version,
+        NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+        NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
+        encode_snapshot_v2_state_with_compatibility_version,
     };
     use bangbang_runtime::snapshot_memory::write_snapshot_memory_image;
+    use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, SnapshotV2MemoryHotplugState,
+    };
     use bangbang_runtime::snapshot_memory_v2::{
         SnapshotV2MemoryBinding, write_snapshot_v2_memory_image_with_cancel,
     };
@@ -2345,12 +2353,12 @@ mod tests {
         NativeV2SnapshotCaptureError, NativeV2SnapshotLoadError, NativeV2SnapshotPublicationError,
         NativeV2SnapshotPublicationProducerError, NativeV2SnapshotPublicationRequest,
         ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessSnapshotV2BalloonLoadRequest,
-        ProcessSnapshotV2EntropyLoadRequest, ProcessSnapshotV2MultiBlockLoadRequest,
-        ProcessSnapshotV2MultiBlockLoadSuccess, ProcessSnapshotV2RootLoadCompletion,
-        ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess,
-        ProcessSnapshotV2SerialLoadRequest, ProcessSnapshotV2StorageLoadRequest,
-        ProcessSnapshotV2StorageLoadSuccess, ProcessVmm, ProcessVmnetAuthority,
-        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
+        ProcessSnapshotV2EntropyLoadRequest, ProcessSnapshotV2MemoryHotplugLoadRequest,
+        ProcessSnapshotV2MultiBlockLoadRequest, ProcessSnapshotV2MultiBlockLoadSuccess,
+        ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
+        ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2SerialLoadRequest,
+        ProcessSnapshotV2StorageLoadRequest, ProcessSnapshotV2StorageLoadSuccess, ProcessVmm,
+        ProcessVmnetAuthority, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
     };
     use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
 
@@ -2885,6 +2893,8 @@ mod tests {
                 serial_config,
                 entropy_config: _,
                 balloon_config,
+                memory_hotplug_config,
+                memory_hotplug_requested_size_mib,
                 storage_configs: _,
                 expected_transport,
                 cancellation,
@@ -2892,12 +2902,14 @@ mod tests {
             if let Some(snapshot_gate) = &self.snapshot_gate {
                 snapshot_gate.enter_and_wait(&cancellation);
             }
-            let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
-                .map_err(|_| NativeV2SnapshotPublicationError::ConfigurationUnavailable)?;
-            let layout = GuestMemoryLayout::new(vec![range])
-                .map_err(|_| NativeV2SnapshotPublicationError::ConfigurationUnavailable)?;
-            let memory = GuestMemory::allocate(&layout)
-                .map_err(|_| NativeV2SnapshotPublicationError::ConfigurationUnavailable)?;
+            let memory_hotplug = memory_hotplug_config.map(|config| {
+                fake_native_v2_memory_hotplug_state_for_request(
+                    expected_transport,
+                    config,
+                    memory_hotplug_requested_size_mib,
+                )
+            });
+            let memory = fake_native_v2_publication_memory(memory_hotplug.as_ref());
 
             publish_native_snapshot_artifacts_with(paths, |mut writer| {
                 let binding =
@@ -2916,6 +2928,7 @@ mod tests {
                     expected_transport,
                     serial_config,
                     balloon_config,
+                    memory_hotplug.as_ref(),
                 ))
             })
             .map_err(Box::new)
@@ -3474,6 +3487,122 @@ mod tests {
                 commit,
             ))
         }
+
+        fn load_prepared_snapshot_v2_memory_hotplug(
+            &mut self,
+            request: ProcessSnapshotV2MemoryHotplugLoadRequest<'_>,
+        ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+            let ProcessSnapshotV2MemoryHotplugLoadRequest {
+                controller: _,
+                vmnet_authority: _,
+                #[cfg(target_os = "macos")]
+                    contained_restore_authority: _,
+                pci_enabled: _,
+                input,
+                candidate,
+                memory: _,
+                cancellation,
+            } = request;
+            if !self.snapshot_operations_succeed {
+                return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                    BackendError::InvalidState("test snapshot load failed"),
+                ));
+            }
+            let boot_source = BootSourceConfigInput::new("/private/fake-api-restored-vmlinux")
+                .validate()
+                .map_err(|_| {
+                    NativeV2SnapshotLoadError::ProcessPreparation(BackendError::InvalidState(
+                        "fake snapshot boot configuration failed",
+                    ))
+                })?;
+            let drives = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::block_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = DriveConfigInput::new(
+                        config.drive_id(),
+                        config.drive_id(),
+                        config.selector(),
+                        config.is_root(),
+                    )
+                    .with_is_read_only(config.is_read_only())
+                    .with_cache_type(config.cache_type())
+                    .with_io_engine(config.io_engine());
+                    if let Some(partuuid) = config.partuuid() {
+                        input = input.with_partuuid(partuuid);
+                    }
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    input.validate()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let pmem = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::pmem_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = PmemConfigInput::new(config.pmem_id(), config.selector())
+                        .with_root_device(config.is_root())
+                        .with_read_only(config.is_read_only());
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    PmemConfig::try_from(input)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let storage_configs = candidate
+                .device_graph()
+                .map(|_| CaptureReadyStorageConfigs::new(drives, pmem));
+            let mut serial_input = SerialConfigInput::new();
+            if let Some(selector) = candidate.serial().endpoint_intent().configured_selector() {
+                serial_input = serial_input.with_serial_out_path(selector);
+            }
+            if let Some(rate_limiter) = candidate.serial().rate_limiter() {
+                serial_input = serial_input.with_rate_limiter(rate_limiter);
+            }
+            let serial_config = serial_input
+                .validate()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let entropy_config = candidate.entropy().map(|state| state.config());
+            let balloon_config = candidate.balloon().map(|state| state.config());
+            let memory_hotplug = match candidate
+                .prepare()
+                .map_err(NativeV2SnapshotLoadError::MemoryHotplugPreparation)?
+            {
+                NativeV2MemoryHotplugSnapshotPreparation::Compatible(_) => None,
+                NativeV2MemoryHotplugSnapshotPreparation::Prepared(candidate) => {
+                    Some(candidate.topology().controller())
+                }
+            };
+            if !cancellation.try_seal_commit() {
+                return Err(NativeV2SnapshotLoadError::Cancelled);
+            }
+            let machine =
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages());
+            let commit =
+                SnapshotV2ControllerCommit::with_serial_storage_entropy_balloon_and_memory_hotplug_configs(
+                    machine,
+                    boot_source,
+                    SnapshotV2ControllerCommitProductConfigs::new(
+                        storage_configs,
+                        serial_config,
+                        entropy_config,
+                        balloon_config,
+                        memory_hotplug,
+                    ),
+                    input.resume_vm(),
+                );
+            Ok(SnapshotV2LoadSuccess::new(
+                TestSession::without_boot_run_loop_status(),
+                commit,
+            ))
+        }
     }
 
     fn test_controller() -> ProcessVmm<TestInstanceStarter> {
@@ -3551,6 +3680,7 @@ mod tests {
         transport: SnapshotV2DeviceTransportKind,
         serial_config: SerialConfig,
         balloon_config: Option<BalloonConfig>,
+        memory_hotplug: Option<&SnapshotV2MemoryHotplugState>,
     ) -> NativeSnapshotArtifactState {
         let fixture = match transport {
             SnapshotV2DeviceTransportKind::Mmio => {
@@ -3620,15 +3750,146 @@ mod tests {
                 balloon,
             ));
         }
+        let memory_hotplug = memory_hotplug.map(|state| {
+            state
+                .encode(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION)
+                .expect("native-v2 fixture virtio-mem should encode")
+        });
+        if let Some(memory_hotplug) = &memory_hotplug {
+            components.push(SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                memory_hotplug,
+            ));
+        }
         let encoded = encode_snapshot_v2_state_with_compatibility_version(
-            NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
             &[],
             &components,
         )
         .expect("native-v2 fixture state should encode");
-        NativeV2BalloonSnapshotCandidateState::from_balloon_state_v2_9(encoded)
+        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(encoded)
             .expect("native-v2 fixture candidate should close")
             .into_current_artifact_state()
+    }
+
+    fn fake_native_v2_memory_hotplug_state_for_request(
+        transport: SnapshotV2DeviceTransportKind,
+        config: MemoryHotplugConfig,
+        requested_size_mib: u64,
+    ) -> SnapshotV2MemoryHotplugState {
+        const MIB: u64 = 1024 * 1024;
+
+        let hex = match transport {
+            SnapshotV2DeviceTransportKind::Mmio => include_str!(
+                "../../runtime/src/snapshot_memory_hotplug_v2_10/fixtures/inactive-mmio.hex"
+            ),
+            SnapshotV2DeviceTransportKind::Pci => include_str!(
+                "../../runtime/src/snapshot_memory_hotplug_v2_10/fixtures/active-pci.hex"
+            ),
+        };
+        let fixture = SnapshotV2MemoryHotplugState::decode(
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            &decode_fixture_hex(hex),
+        )
+        .expect("native-v2 fixture virtio-mem should decode");
+        assert_eq!(
+            fixture.config(),
+            config,
+            "native-v2 fixture must match the requested virtio-mem configuration"
+        );
+        SnapshotV2MemoryHotplugState::try_new(
+            config,
+            fixture.config_space().with_requested_size(
+                requested_size_mib
+                    .checked_mul(MIB)
+                    .expect("requested virtio-mem size should fit bytes"),
+            ),
+            fixture.active_queue(),
+            fixture.plugged_bitmap().to_vec(),
+            fixture.virtio().clone(),
+            fixture.transport().clone(),
+        )
+        .expect("request-specific native-v2 virtio-mem state should validate")
+    }
+
+    fn fake_native_v2_publication_memory(
+        memory_hotplug: Option<&SnapshotV2MemoryHotplugState>,
+    ) -> GuestMemory {
+        const BASE_START: u64 = 0x8000_0000;
+        const BASE_SIZE: u64 = 16 * 1024;
+        const BASE_ALIGNMENT: u64 = 16 * 1024;
+
+        let mut base_start = BASE_START;
+        let mut base_end = BASE_START + BASE_SIZE;
+        if let Some(state) = memory_hotplug {
+            for queue in state.virtio().queues() {
+                if queue.size() == 0 {
+                    continue;
+                }
+                for (start, size) in [
+                    (
+                        queue.descriptor_table().raw_value(),
+                        u64::from(queue.size()) * 16,
+                    ),
+                    (
+                        queue.driver_ring().raw_value(),
+                        u64::from(queue.size()) * 2 + 6,
+                    ),
+                    (
+                        queue.device_ring().raw_value(),
+                        u64::from(queue.size()) * 8 + 6,
+                    ),
+                ] {
+                    base_start = base_start.min(start & !(BASE_ALIGNMENT - 1));
+                    base_end = base_end.max(
+                        start
+                            .checked_add(size)
+                            .and_then(|end| end.checked_add(BASE_ALIGNMENT - 1))
+                            .expect("native-v2 fixture queue range should fit")
+                            & !(BASE_ALIGNMENT - 1),
+                    );
+                }
+            }
+        }
+
+        let mut ranges = vec![
+            GuestMemoryRange::new(GuestAddress::new(base_start), base_end - base_start)
+                .expect("native-v2 fixture base memory should validate"),
+        ];
+        if let Some(state) = memory_hotplug {
+            let config_space = state.config_space();
+            for plugged in state.plugged_ranges() {
+                let start = plugged
+                    .start_block()
+                    .checked_mul(config_space.block_size())
+                    .and_then(|offset| config_space.addr().checked_add(offset))
+                    .expect("native-v2 fixture plugged-memory start should fit");
+                let size = plugged
+                    .block_count()
+                    .checked_mul(config_space.block_size())
+                    .expect("native-v2 fixture plugged-memory size should fit");
+                ranges.push(
+                    GuestMemoryRange::new(GuestAddress::new(start), size)
+                        .expect("native-v2 fixture plugged memory should validate"),
+                );
+            }
+        }
+        ranges.sort_by_key(|range| range.start());
+        let layout =
+            GuestMemoryLayout::new(ranges).expect("native-v2 fixture memory should validate");
+        GuestMemory::allocate(&layout).expect("native-v2 fixture memory should allocate")
+    }
+
+    fn decode_fixture_hex(hex: &str) -> Vec<u8> {
+        let hex = hex.split_whitespace().collect::<String>();
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
+                u8::from_str_radix(pair, 16).expect("fixture hex should decode")
+            })
+            .collect()
     }
 
     fn fake_native_v2_balloon_state(
@@ -3675,6 +3936,7 @@ mod tests {
                 &binding,
                 SnapshotV2DeviceTransportKind::Mmio,
                 SerialConfig::default(),
+                None,
                 None,
             ))
         })
@@ -8140,6 +8402,19 @@ mod tests {
                 .with_io_engine(DriveIoEngine::Sync),
         ))
         .expect("snapshot root should configure");
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body(
+                    "PUT",
+                    "/hotplug/memory",
+                    r#"{"total_size_mib":1024,"block_size_mib":2,"slot_size_mib":128}"#,
+                )
+                .as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
         let metrics_path =
             unique_socket_path("snapshot-public-create-metrics").with_extension("out");
         let metrics_body = serde_json::json!({"metrics_path": metrics_path}).to_string();
@@ -8154,6 +8429,14 @@ mod tests {
         assert!(
             put_action_over_socket(&mut vmm, "sps", "InstanceStart")
                 .starts_with("HTTP/1.1 204 No Content\r\n")
+        );
+        assert!(
+            request_over_socket(
+                &mut vmm,
+                "spm",
+                &request_with_body("PATCH", "/hotplug/memory", r#"{"requested_size_mib":128}"#,),
+            )
+            .starts_with("HTTP/1.1 204 No Content\r\n")
         );
         assert!(
             request_over_socket(
@@ -8178,6 +8461,22 @@ mod tests {
         assert!(memory_path.exists());
         let state_before = fs::read(&state_path).expect("committed state should read");
         let memory_before = fs::read(&memory_path).expect("committed memory should read");
+        let (candidate, _) =
+            load_native_snapshot_artifacts(&SnapshotArtifactPaths::new(&state_path, &memory_path))
+                .expect("public exact-2.10 virtio-mem pair should load")
+                .into_current_v2_candidate()
+                .expect("public pair should retain its exact current candidate");
+        let memory_hotplug = candidate
+            .memory_hotplug()
+            .expect("public exact-2.10 pair should contain kind 11");
+        assert_eq!(memory_hotplug.config().total_size_mib(), 1024);
+        assert_eq!(
+            memory_hotplug.config_space().requested_size(),
+            128 * 1024 * 1024
+        );
+        memory_hotplug
+            .validate_memory_binding(candidate.memory_binding())
+            .expect("public exact-2.10 virtio-mem binding should close");
 
         let flush = put_action_over_socket(&mut vmm, "spf", "FlushMetrics");
         assert!(flush.starts_with("HTTP/1.1 204 No Content\r\n"));
@@ -8208,6 +8507,41 @@ mod tests {
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::Paused
+        );
+
+        let mut restored = test_controller_with_starter(TestInstanceStarter::snapshot_success());
+        let load_body = serde_json::json!({
+            "snapshot_path": state_path,
+            "mem_backend": {
+                "backend_path": memory_path,
+                "backend_type": "File",
+            },
+        })
+        .to_string();
+        let load_response = request_over_socket(
+            &mut restored,
+            "spl",
+            &request_with_body("PUT", "/snapshot/load", &load_body),
+        );
+        assert!(load_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            restored.instance_info().state,
+            bangbang_runtime::InstanceState::Paused
+        );
+        let status_response = request_over_socket(
+            &mut restored,
+            "spg",
+            "GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(
+            status_response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "{status_response}"
+        );
+        assert!(
+            status_response.contains(
+                r#"{"block_size_mib":2,"plugged_size_mib":0,"requested_size_mib":128,"slot_size_mib":128,"total_size_mib":1024}"#
+            ),
+            "{status_response}"
         );
 
         fs::remove_file(state_path).expect("state fixture should clean up");

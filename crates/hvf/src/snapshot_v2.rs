@@ -52,7 +52,7 @@ use bangbang_runtime::snapshot_format_v2::{
 };
 use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
     NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, SnapshotV2MemoryHotplugState,
-    SnapshotV2MemoryHotplugStateEncodeError,
+    SnapshotV2MemoryHotplugStateDecodeError, SnapshotV2MemoryHotplugStateEncodeError,
 };
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError, SnapshotV2MemoryStateError,
@@ -1603,6 +1603,27 @@ impl HvfSnapshotV2MemoryHotplugState {
     pub const fn memory_hotplug(&self) -> Option<&SnapshotV2MemoryHotplugState> {
         self.memory_hotplug.as_ref()
     }
+
+    /// Consumes the exact-2.10 product into its checked components.
+    pub fn into_parts(
+        self,
+    ) -> (
+        HvfSnapshotV2PlatformState,
+        Option<SnapshotV2StorageDeviceGraph>,
+        SnapshotV2SerialState,
+        Option<SnapshotV2EntropyState>,
+        Option<SnapshotV2BalloonState>,
+        Option<SnapshotV2MemoryHotplugState>,
+    ) {
+        (
+            self.platform,
+            self.device_graph,
+            self.serial,
+            self.entropy,
+            self.balloon,
+            self.memory_hotplug,
+        )
+    }
 }
 
 impl fmt::Debug for HvfSnapshotV2MemoryHotplugState {
@@ -2695,6 +2716,8 @@ pub enum HvfSnapshotV2DecodeError {
     EntropyState(SnapshotV2EntropyStateDecodeError),
     /// Exact-2.9 balloon component decoding failed.
     BalloonState(SnapshotV2BalloonStateDecodeError),
+    /// Exact-2.10 virtio-mem component decoding failed.
+    MemoryHotplugState(SnapshotV2MemoryHotplugStateDecodeError),
     /// Nested mandatory-vCPU decoding failed.
     Mandatory(HvfSnapshotV1DecodeError),
     /// A complete locally valid graph failed cross-validation.
@@ -2732,6 +2755,7 @@ impl fmt::Display for HvfSnapshotV2DecodeError {
             Self::SerialState(_) => "native-v2 HVF serial state is invalid",
             Self::EntropyState(_) => "native-v2 HVF entropy state is invalid",
             Self::BalloonState(_) => "native-v2 HVF balloon state is invalid",
+            Self::MemoryHotplugState(_) => "native-v2 HVF virtio-mem state is invalid",
             Self::Mandatory(_) => "native-v2 HVF mandatory vCPU state is invalid",
             Self::Build(_) => "native-v2 HVF platform graph is inconsistent",
         };
@@ -2750,6 +2774,7 @@ impl std::error::Error for HvfSnapshotV2DecodeError {
             Self::SerialState(source) => Some(source),
             Self::EntropyState(source) => Some(source),
             Self::BalloonState(source) => Some(source),
+            Self::MemoryHotplugState(source) => Some(source),
             Self::Mandatory(source) => Some(source),
             Self::Build(source) => Some(source),
             _ => None,
@@ -3265,7 +3290,98 @@ pub fn decode_hvf_snapshot_v2_balloon_state(
         .map_err(HvfSnapshotV2DecodeError::Build)
 }
 
+/// Decodes and cross-validates one exact native-v2 2.10 virtio-mem
+/// composition, including products that omit kind 11.
+pub fn decode_hvf_snapshot_v2_memory_hotplug_state(
+    state: &SnapshotV2State<'_>,
+) -> Result<HvfSnapshotV2MemoryHotplugState, HvfSnapshotV2DecodeError> {
+    if state.metadata().version() != NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION {
+        return Err(HvfSnapshotV2DecodeError::UnsupportedProfile);
+    }
+    let (
+        vcpu_count,
+        includes_device_graph,
+        includes_entropy,
+        includes_balloon,
+        includes_memory_hotplug,
+    ) = scan_memory_hotplug_component_profile(state)?;
+    let platform = decode_hvf_snapshot_v2_platform_components_unvalidated(state, vcpu_count, true)?;
+    let device_graph = includes_device_graph
+        .then(|| {
+            SnapshotV2StorageDeviceGraph::decode(
+                NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                component_payload(state, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)?,
+            )
+            .map_err(HvfSnapshotV2DecodeError::StorageDeviceGraph)
+        })
+        .transpose()?;
+    let serial = SnapshotV2SerialState::decode(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        component_payload(state, NATIVE_V2_SERIAL_COMPONENT_KEY)?,
+    )
+    .map_err(HvfSnapshotV2DecodeError::SerialState)?;
+    let entropy = includes_entropy
+        .then(|| {
+            SnapshotV2EntropyState::decode(
+                NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                component_payload(state, NATIVE_V2_ENTROPY_COMPONENT_KEY)?,
+            )
+            .map_err(HvfSnapshotV2DecodeError::EntropyState)
+        })
+        .transpose()?;
+    let balloon = includes_balloon
+        .then(|| {
+            SnapshotV2BalloonState::decode(
+                NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                component_payload(state, NATIVE_V2_BALLOON_COMPONENT_KEY)?,
+            )
+            .map_err(HvfSnapshotV2DecodeError::BalloonState)
+        })
+        .transpose()?;
+    let memory_hotplug = includes_memory_hotplug
+        .then(|| {
+            SnapshotV2MemoryHotplugState::decode(
+                NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                component_payload(state, NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY)?,
+            )
+            .map_err(HvfSnapshotV2DecodeError::MemoryHotplugState)
+        })
+        .transpose()?;
+    validate_platform_with_memory_hotplug(&platform, memory_hotplug.as_ref())
+        .map_err(HvfSnapshotV2DecodeError::Build)?;
+    validate_product_placement(
+        &platform,
+        device_graph.as_ref(),
+        entropy.as_ref(),
+        balloon.as_ref(),
+        memory_hotplug.as_ref(),
+    )
+    .map_err(HvfSnapshotV2DecodeError::Build)?;
+    Ok(HvfSnapshotV2MemoryHotplugState {
+        platform,
+        device_graph,
+        serial,
+        entropy,
+        balloon,
+        memory_hotplug,
+    })
+}
+
 fn decode_hvf_snapshot_v2_platform_components(
+    state: &SnapshotV2State<'_>,
+    vcpu_count: usize,
+    product_process_profile: bool,
+) -> Result<HvfSnapshotV2PlatformState, HvfSnapshotV2DecodeError> {
+    let platform = decode_hvf_snapshot_v2_platform_components_unvalidated(
+        state,
+        vcpu_count,
+        product_process_profile,
+    )?;
+    validate_platform(&platform).map_err(HvfSnapshotV2DecodeError::Build)?;
+    Ok(platform)
+}
+
+fn decode_hvf_snapshot_v2_platform_components_unvalidated(
     state: &SnapshotV2State<'_>,
     vcpu_count: usize,
     product_process_profile: bool,
@@ -3295,8 +3411,14 @@ fn decode_hvf_snapshot_v2_platform_components(
         );
         vcpus.push(decode_platform_vcpu(component_payload(state, key)?)?);
     }
-    HvfSnapshotV2PlatformState::try_new(memory, machine, global, topology, vcpus, time)
-        .map_err(HvfSnapshotV2DecodeError::Build)
+    Ok(HvfSnapshotV2PlatformState {
+        memory,
+        machine,
+        global,
+        topology,
+        vcpus,
+        time,
+    })
 }
 
 fn scan_component_profile(
@@ -3631,6 +3753,130 @@ fn scan_balloon_component_profile(
         includes_device_graph,
         includes_entropy,
         includes_balloon,
+    ))
+}
+
+fn scan_memory_hotplug_component_profile(
+    state: &SnapshotV2State<'_>,
+) -> Result<(usize, bool, bool, bool, bool), HvfSnapshotV2DecodeError> {
+    let mut components = state.components().peekable();
+    for expected in [
+        NATIVE_V2_MEMORY_COMPONENT_KEY,
+        NATIVE_V2_MACHINE_COMPONENT_KEY,
+        NATIVE_V2_GLOBAL_COMPONENT_KEY,
+        NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
+    ] {
+        let component = components
+            .next()
+            .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+        if component.disposition() != SnapshotV2ComponentDisposition::Semantic
+            || component.key() != expected
+        {
+            return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+        }
+    }
+
+    let mut vcpu_count = 0_usize;
+    while components
+        .peek()
+        .is_some_and(|component| component.key().kind() == NATIVE_V2_VCPU_COMPONENT_KIND)
+    {
+        if vcpu_count >= usize::from(MAX_SUPPORTED_VCPUS) {
+            return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+        }
+        let component = components
+            .next()
+            .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+        let instance = u32::try_from(vcpu_count)
+            .map_err(|_| HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+        if component.disposition() != SnapshotV2ComponentDisposition::Semantic
+            || component.key() != native_v2_vcpu_component_key(instance)
+        {
+            return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+        }
+        vcpu_count = vcpu_count
+            .checked_add(1)
+            .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+    }
+    if vcpu_count == 0 {
+        return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+    }
+
+    let time = components
+        .next()
+        .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+    if time.disposition() != SnapshotV2ComponentDisposition::Semantic
+        || time.key() != NATIVE_V2_TIME_COMPONENT_KEY
+    {
+        return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+    }
+
+    let includes_device_graph = components
+        .peek()
+        .is_some_and(|component| component.key() == NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY);
+    if includes_device_graph {
+        let graph = components
+            .next()
+            .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+        if graph.disposition() != SnapshotV2ComponentDisposition::Semantic {
+            return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+        }
+    }
+
+    let serial = components
+        .next()
+        .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+    if serial.disposition() != SnapshotV2ComponentDisposition::Semantic
+        || serial.key() != NATIVE_V2_SERIAL_COMPONENT_KEY
+    {
+        return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+    }
+
+    let includes_entropy = components
+        .peek()
+        .is_some_and(|component| component.key() == NATIVE_V2_ENTROPY_COMPONENT_KEY);
+    if includes_entropy {
+        let entropy = components
+            .next()
+            .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+        if entropy.disposition() != SnapshotV2ComponentDisposition::Semantic {
+            return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+        }
+    }
+
+    let includes_balloon = components
+        .peek()
+        .is_some_and(|component| component.key() == NATIVE_V2_BALLOON_COMPONENT_KEY);
+    if includes_balloon {
+        let balloon = components
+            .next()
+            .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+        if balloon.disposition() != SnapshotV2ComponentDisposition::Semantic {
+            return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+        }
+    }
+
+    let includes_memory_hotplug = components
+        .peek()
+        .is_some_and(|component| component.key() == NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY);
+    if includes_memory_hotplug {
+        let memory_hotplug = components
+            .next()
+            .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+        if memory_hotplug.disposition() != SnapshotV2ComponentDisposition::Semantic {
+            return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+        }
+    }
+    if components.next().is_some() {
+        return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+    }
+
+    Ok((
+        vcpu_count,
+        includes_device_graph,
+        includes_entropy,
+        includes_balloon,
+        includes_memory_hotplug,
     ))
 }
 
