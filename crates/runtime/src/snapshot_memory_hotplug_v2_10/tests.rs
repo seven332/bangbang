@@ -2,7 +2,7 @@ use super::codec::{self, ReservePolicy};
 use super::*;
 
 use crate::interrupt::GuestInterruptLine;
-use crate::memory::{GuestAddress, GuestMemoryRange};
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
 use crate::memory_hotplug::{
     MemoryHotplugConfigInput, VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_QUEUE_SIZE,
 };
@@ -17,6 +17,7 @@ use crate::snapshot_device_v2::{
     SnapshotV2PciMsixStateParts, SnapshotV2PciMsixTableEntry, SnapshotV2PciWritableByte,
     SnapshotV2VirtioQueueState, SnapshotV2VirtioStateParts,
 };
+use crate::snapshot_memory_v2::write_snapshot_v2_memory_image_with_compatibility_version;
 use crate::storage_capture::StorageDeviceOrigin;
 use crate::virtio::{
     VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK,
@@ -26,6 +27,8 @@ use crate::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
 use crate::virtio_pci::{
     VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VirtioPciEndpointPhase,
 };
+
+use std::io::Cursor;
 
 const HEALTHY_DRIVER_OK: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
     | VIRTIO_DEVICE_STATUS_DRIVER
@@ -242,6 +245,107 @@ fn inactive_pci_state() -> SnapshotV2MemoryHotplugState {
         SnapshotV2DeviceTransport::Pci(pci_transport()),
     )
     .expect("inactive PCI state should validate")
+}
+
+fn binding_for_ranges(
+    version: SnapshotFormatVersion,
+    ranges: Vec<GuestMemoryRange>,
+) -> SnapshotV2MemoryBinding {
+    let layout = GuestMemoryLayout::new(ranges).expect("binding fixture layout should validate");
+    let memory = GuestMemory::allocate(&layout).expect("binding fixture memory should allocate");
+    write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut Cursor::new(Vec::new()),
+        version,
+    )
+    .expect("binding fixture should encode")
+}
+
+#[test]
+fn kind_one_binding_closes_fragmented_plugged_unions_and_rejects_hostile_coverage() {
+    let state = inactive_mmio_state();
+    let config_space = state.config_space();
+    let block_size = config_space.block_size();
+    let first_start = config_space
+        .addr()
+        .checked_add(block_size)
+        .expect("first plugged start should fit");
+    let second_start = config_space
+        .addr()
+        .checked_add(5 * block_size)
+        .expect("second plugged start should fit");
+    let range = |start, length| {
+        GuestMemoryRange::new(GuestAddress::new(start), length)
+            .expect("binding fixture range should validate")
+    };
+    let fragmented = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![
+            range(first_start, block_size),
+            range(first_start + block_size, block_size),
+            range(second_start, 3 * block_size),
+        ],
+    );
+    state
+        .validate_memory_binding(&fragmented)
+        .expect("union-equivalent source fragmentation should validate");
+
+    let missing = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![
+            range(first_start, block_size),
+            range(second_start, 3 * block_size),
+        ],
+    );
+    assert_eq!(
+        state.validate_memory_binding(&missing),
+        Err(SnapshotV2MemoryHotplugBindingError::Coverage)
+    );
+
+    let extra = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![
+            range(config_space.addr(), block_size),
+            range(first_start, 2 * block_size),
+            range(second_start, 3 * block_size),
+        ],
+    );
+    assert_eq!(
+        state.validate_memory_binding(&extra),
+        Err(SnapshotV2MemoryHotplugBindingError::Coverage)
+    );
+
+    let crossing = binding_for_ranges(
+        NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        vec![range(config_space.addr() - 16_384, 32_768)],
+    );
+    assert_eq!(
+        state.validate_memory_binding(&crossing),
+        Err(SnapshotV2MemoryHotplugBindingError::BoundaryCrossing)
+    );
+
+    let wrong_version = binding_for_ranges(
+        SnapshotFormatVersion::new(2, 9, 0),
+        vec![
+            range(first_start, 2 * block_size),
+            range(second_start, 3 * block_size),
+        ],
+    );
+    assert_eq!(
+        state.validate_memory_binding(&wrong_version),
+        Err(SnapshotV2MemoryHotplugBindingError::Version)
+    );
+
+    for error in [
+        SnapshotV2MemoryHotplugBindingError::Version,
+        SnapshotV2MemoryHotplugBindingError::Overflow,
+        SnapshotV2MemoryHotplugBindingError::BoundaryCrossing,
+        SnapshotV2MemoryHotplugBindingError::Coverage,
+    ] {
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains(&config_space.addr().to_string()));
+        assert!(!diagnostics.contains(&first_start.to_string()));
+    }
 }
 
 fn section_offset(bytes: &[u8], index: usize) -> usize {

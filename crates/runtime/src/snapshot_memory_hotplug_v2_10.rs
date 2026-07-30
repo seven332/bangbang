@@ -27,6 +27,7 @@ use crate::snapshot_device_v2_5::{
     queue_ranges, validate_mmio, validate_pci, validate_virtio_with_queue_size,
 };
 use crate::snapshot_format::SnapshotFormatVersion;
+use crate::snapshot_memory_v2::SnapshotV2MemoryBinding;
 use crate::storage_capture::StorageDeviceOrigin;
 
 mod codec;
@@ -337,6 +338,84 @@ impl SnapshotV2MemoryHotplugState {
             &self.plugged_bitmap,
             configured_block_count(self.config_space).unwrap_or(0),
         )
+    }
+
+    /// Closes this portable plugged topology against one exact-2.10 kind-1
+    /// memory binding.
+    ///
+    /// Extents outside the aperture remain platform-owned. Every extent that
+    /// touches the aperture must be wholly contained by it, and the contained
+    /// extent union must exactly equal the canonical plugged-range union.
+    pub fn validate_memory_binding(
+        &self,
+        binding: &SnapshotV2MemoryBinding,
+    ) -> Result<(), SnapshotV2MemoryHotplugBindingError> {
+        if binding.version() != NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION {
+            return Err(SnapshotV2MemoryHotplugBindingError::Version);
+        }
+
+        let aperture_start = self.config_space.addr();
+        let aperture_end = aperture_start
+            .checked_add(self.config_space.region_size())
+            .ok_or(SnapshotV2MemoryHotplugBindingError::Overflow)?;
+        for extent in binding.extents() {
+            let range = extent.range();
+            let start = range.start().raw_value();
+            let end = range.end_exclusive().raw_value();
+            let outside = end <= aperture_start || start >= aperture_end;
+            let inside = start >= aperture_start && end <= aperture_end;
+            if !outside && !inside {
+                return Err(SnapshotV2MemoryHotplugBindingError::BoundaryCrossing);
+            }
+        }
+
+        let mut actual = binding.extents().iter().filter_map(|extent| {
+            let range = extent.range();
+            let start = range.start().raw_value();
+            let end = range.end_exclusive().raw_value();
+            (start >= aperture_start && end <= aperture_end).then_some((start, end))
+        });
+        let block_size = self.config_space.block_size();
+        let mut plugged = self.plugged_ranges().map(|range| {
+            let offset = range
+                .start_block()
+                .checked_mul(block_size)
+                .ok_or(SnapshotV2MemoryHotplugBindingError::Overflow)?;
+            let length = range
+                .block_count()
+                .checked_mul(block_size)
+                .ok_or(SnapshotV2MemoryHotplugBindingError::Overflow)?;
+            let start = aperture_start
+                .checked_add(offset)
+                .ok_or(SnapshotV2MemoryHotplugBindingError::Overflow)?;
+            let end = start
+                .checked_add(length)
+                .ok_or(SnapshotV2MemoryHotplugBindingError::Overflow)?;
+            Ok::<_, SnapshotV2MemoryHotplugBindingError>((start, end))
+        });
+        let mut actual_cursor = actual.next();
+        let mut plugged_cursor = plugged.next().transpose()?;
+        loop {
+            match (actual_cursor, plugged_cursor) {
+                (None, None) => return Ok(()),
+                (Some((actual_start, actual_end)), Some((plugged_start, plugged_end)))
+                    if actual_start == plugged_start =>
+                {
+                    let covered_end = actual_end.min(plugged_end);
+                    actual_cursor = if covered_end == actual_end {
+                        actual.next()
+                    } else {
+                        Some((covered_end, actual_end))
+                    };
+                    plugged_cursor = if covered_end == plugged_end {
+                        plugged.next().transpose()?
+                    } else {
+                        Some((covered_end, plugged_end))
+                    };
+                }
+                _ => return Err(SnapshotV2MemoryHotplugBindingError::Coverage),
+            }
+        }
     }
 
     /// Returns common virtio continuation state.
@@ -658,6 +737,32 @@ fn count_ranges(bitmap: &[u8], block_count: usize) -> usize {
         })
         .count()
 }
+
+/// Failure while closing exact-2.10 kind-1 memory extents against kind 11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2MemoryHotplugBindingError {
+    /// Kind 1 is not in the exact-2.10 compatibility context.
+    Version,
+    /// Aperture or plugged-range arithmetic overflowed.
+    Overflow,
+    /// One extent crosses an aperture boundary.
+    BoundaryCrossing,
+    /// In-aperture extents and plugged ranges have different GPA unions.
+    Coverage,
+}
+
+impl fmt::Display for SnapshotV2MemoryHotplugBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Version => "native-v2 virtio-mem binding version is invalid",
+            Self::Overflow => "native-v2 virtio-mem binding arithmetic overflowed",
+            Self::BoundaryCrossing => "native-v2 virtio-mem binding crosses the memory aperture",
+            Self::Coverage => "native-v2 virtio-mem binding coverage is invalid",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2MemoryHotplugBindingError {}
 
 /// Failure while converting one trusted live capture into exact-2.10 state.
 #[derive(Clone, Copy, PartialEq, Eq)]
