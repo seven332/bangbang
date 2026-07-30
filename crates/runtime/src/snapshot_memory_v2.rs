@@ -24,7 +24,7 @@ use crate::snapshot_format_v2::{
     SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
     encode_snapshot_v2_state,
 };
-use crate::snapshot_memory_hotplug_v2_10::NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION;
+use crate::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
 
 mod materialize;
 
@@ -1323,9 +1323,8 @@ fn decode_binding(bytes: &[u8]) -> Result<SnapshotV2MemoryBinding, SnapshotV2Mem
 fn validate_memory_version(
     version: SnapshotFormatVersion,
 ) -> Result<(), SnapshotV2MemoryBindingError> {
-    if version.major() == NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION.major()
-        && (1..=NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION.minor())
-            .contains(&version.minor())
+    if version.major() == NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION.major()
+        && (1..=NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION.minor()).contains(&version.minor())
     {
         Ok(())
     } else {
