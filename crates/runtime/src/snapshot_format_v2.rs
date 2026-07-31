@@ -12,6 +12,7 @@ use crate::snapshot_format::{SnapshotArchitecture, SnapshotFormatVersion, Snapsh
 use crate::snapshot_memory_hotplug_v2_10::NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
+use crate::snapshot_vsock_v2_12::NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
 
 pub(crate) const NATIVE_V2_ARM64_MAGIC: [u8; 8] = *b"BANGV2A\0";
 const MAGIC_OFFSET: usize = 0;
@@ -49,7 +50,7 @@ pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVers
 
 /// Newest compatibility version understood through an explicit internal seam.
 const NATIVE_V2_LATEST_KNOWN_COMPATIBILITY_VERSION: SnapshotFormatVersion =
-    NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
+    NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
 
 /// Exact native-v2 version of the complete legacy device-free platform profile.
 ///
@@ -104,6 +105,13 @@ const _: () = assert!(
         && NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION.minor()
             == NATIVE_V2_SNAPSHOT_VERSION.minor()
         && NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION.patch()
+            == NATIVE_V2_SNAPSHOT_VERSION.patch()
+);
+const _: () = assert!(
+    NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
+        && NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.minor()
+            == NATIVE_V2_SNAPSHOT_VERSION.minor() + 1
+        && NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.patch()
             == NATIVE_V2_SNAPSHOT_VERSION.patch()
 );
 
@@ -180,6 +188,10 @@ const PRODUCTION_SEMANTIC_COMPONENTS: &[CatalogEntry] = &[
     CatalogEntry {
         id: NATIVE_V2_NETWORK_COMPONENT_KEY.kind,
         introduced_minor: 11,
+    },
+    CatalogEntry {
+        id: NATIVE_V2_VSOCK_COMPONENT_KEY.kind,
+        introduced_minor: 12,
     },
 ];
 
@@ -298,6 +310,13 @@ pub const NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY: SnapshotV2ComponentKey =
 /// permits at most one semantic instance-zero component.
 pub const NATIVE_V2_NETWORK_COMPONENT_KEY: SnapshotV2ComponentKey =
     SnapshotV2ComponentKey::new(12, 0);
+
+/// Canonical identity of the optional singleton native-v2 vsock state.
+///
+/// This semantic component is introduced by exact 2.12. Public product
+/// profiles remain at 2.11 until the later activation slice.
+pub const NATIVE_V2_VSOCK_COMPONENT_KEY: SnapshotV2ComponentKey =
+    SnapshotV2ComponentKey::new(13, 0);
 
 impl fmt::Debug for SnapshotV2ComponentKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

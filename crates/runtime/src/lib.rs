@@ -51,6 +51,7 @@ pub mod snapshot_network_restore_v2_11;
 pub mod snapshot_network_v2_11;
 pub mod snapshot_restore;
 pub mod snapshot_serial_v2_7;
+pub mod snapshot_vsock_v2_12;
 pub mod startup;
 pub mod storage_capture;
 pub(crate) mod token_bucket;

@@ -196,6 +196,20 @@ impl VsockBackendSelector {
         })
     }
 
+    pub(crate) fn try_from_string(path: String) -> Result<Self, VsockBackendSelectorError> {
+        if path.is_empty() {
+            return Err(VsockBackendSelectorError::Empty);
+        }
+        if has_control_character(&path) {
+            return Err(VsockBackendSelectorError::ControlCharacter);
+        }
+        unix_socket_address(Path::new(&path))
+            .map_err(|_| VsockBackendSelectorError::InvalidSocketAddress)?;
+        Ok(Self {
+            path: PathBuf::from(path),
+        })
+    }
+
     /// Returns the logical selector. The value does not grant path access.
     pub fn path(&self) -> &Path {
         &self.path

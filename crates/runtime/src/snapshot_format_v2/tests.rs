@@ -10,6 +10,7 @@ use crate::snapshot_format::{
 use crate::snapshot_memory_hotplug_v2_10::NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
+use crate::snapshot_vsock_v2_12::NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
 
 use super::*;
 
@@ -208,7 +209,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn public_writer_is_network_eleven_while_earlier_revisions_remain_stable() {
+fn public_writer_stays_network_eleven_while_internal_vsock_twelve_is_dormant() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -230,6 +231,12 @@ fn public_writer_is_network_eleven_while_earlier_revisions_remain_stable() {
     assert_eq!(
         NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
         SnapshotFormatVersion::new(2, 11, 0)
+    );
+    assert_eq!(NATIVE_V2_VSOCK_COMPONENT_KEY.kind(), 13);
+    assert_eq!(NATIVE_V2_VSOCK_COMPONENT_KEY.instance(), 0);
+    assert_eq!(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        SnapshotFormatVersion::new(2, 12, 0)
     );
     assert_eq!(
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
@@ -587,19 +594,70 @@ fn public_writer_is_network_eleven_while_earlier_revisions_remain_stable() {
         Err(SnapshotV2DecodeError::UnknownSemanticComponent)
     );
 
-    let future = SnapshotFormatVersion::new(2, 12, 0);
+    let vsock = SnapshotV2Component::new(
+        NATIVE_V2_VSOCK_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        b"vsock",
+    );
+    assert!(matches!(
+        encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            &[],
+            &[vsock],
+        ),
+        Err(SnapshotV2EncodeError::UnknownSemanticComponent)
+    ));
+    let vsock_state = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &[network, vsock],
+    )
+    .expect("explicit exact 2.12 should admit dormant vsock state");
+    let decoded_vsock = decode_snapshot_v2_state_with_compatibility_version(
+        &vsock_state,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("explicit exact 2.12 should decode dormant vsock state");
+    assert_eq!(
+        decoded_vsock.metadata().version(),
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        decoded_vsock.component(NATIVE_V2_VSOCK_COMPONENT_KEY),
+        Some(vsock)
+    );
+    assert!(matches!(
+        decode_snapshot_v2_state(&vsock_state),
+        Err(SnapshotV2DecodeError::UnsupportedVersion { .. })
+    ));
+    assert!(matches!(
+        decode_native_snapshot_state(&vsock_state),
+        Err(NativeSnapshotFormatError::NativeV2(
+            SnapshotV2DecodeError::UnsupportedVersion { .. }
+        ))
+    ));
+    let downgraded_vsock = with_u16_field_and_checksum(&vsock_state, VERSION_MINOR_OFFSET, 11);
+    assert_eq!(
+        decode_snapshot_v2_state_with_compatibility_version(
+            &downgraded_vsock,
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        ),
+        Err(SnapshotV2DecodeError::UnknownSemanticComponent)
+    );
+
+    let future = SnapshotFormatVersion::new(2, 13, 0);
     assert!(matches!(
         encode_snapshot_v2_state_with_compatibility_version(future, &[], &[]),
         Err(SnapshotV2EncodeError::UnsupportedVersion {
             requested,
-            maximum: NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            maximum: NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         }) if requested == future
     ));
     assert_eq!(
         decode_snapshot_v2_state_with_compatibility_version(&EMPTY_V2_FIXTURE, future),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
             found: future,
-            supported: NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         })
     );
 }

@@ -25,6 +25,12 @@ pub const MAX_SNAPSHOT_RESTORE_PUBLIC_ID_BYTES: usize = NATIVE_V2_DEVICE_GRAPH_M
 /// Stable public identity of the singleton configured serial restore sink.
 pub const NATIVE_V2_SERIAL_RESTORE_PUBLIC_ID: &str = "serial0";
 
+/// Stable snapshot-resource identity of the singleton vsock endpoint.
+///
+/// This internal restore identity is not the deprecated Firecracker API
+/// `vsock_id` field.
+pub const NATIVE_V2_VSOCK_RESTORE_PUBLIC_ID: &str = "vsock0";
+
 const REDACTED: &str = "<redacted>";
 
 const _: () =
