@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::memory::GuestMemory;
-use crate::snapshot::SnapshotNetworkOverride;
+use crate::snapshot::{SnapshotNetworkOverride, SnapshotVsockOverride};
 use crate::snapshot_balloon_v2_9::{
     NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, SnapshotV2BalloonState,
     SnapshotV2BalloonStateDecodeError,
@@ -86,6 +86,10 @@ use crate::snapshot_restore::{SnapshotRestoreManifest, SnapshotRestoreManifestEr
 use crate::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
     SnapshotV2SerialStateDecodeError,
+};
+use crate::snapshot_vsock_restore_v2_12::{
+    PreparedSnapshotV2VsockRestoreTopology, SnapshotV2VsockRestorePreparationError,
+    SnapshotV2VsockRestorePreparationStage,
 };
 use crate::snapshot_vsock_v2_12::{
     NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION, SnapshotV2VsockState,
@@ -1876,6 +1880,191 @@ impl fmt::Debug for NativeV2NetworkSnapshotCandidateState {
     }
 }
 
+/// Stable exact-2.12 preparation checkpoints delegated to owner-free device
+/// topology producers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeV2VsockSnapshotPreparationStage {
+    /// One checkpoint in optional vsock topology preparation.
+    Vsock(SnapshotV2VsockRestorePreparationStage),
+    /// One checkpoint in optional network topology preparation.
+    Network(SnapshotV2NetworkRestorePreparationStage),
+}
+
+/// One prepared exact-2.12 candidate with complete owner-free topology.
+///
+/// This value owns no descriptor, provider, socket, packet-I/O owner, callback,
+/// metric, datastore, platform slot, VM, vCPU, or HVF authority.
+pub struct PreparedNativeV2VsockSnapshotCandidateState {
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+    balloon: Option<SnapshotV2BalloonState>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+    network_topology: PreparedSnapshotV2NetworkRestoreTopology,
+    vsock_topology: Option<PreparedSnapshotV2VsockRestoreTopology>,
+    manifest: SnapshotRestoreManifest,
+}
+
+/// Owned exact components of one prepared native-v2 2.12 candidate.
+pub type PreparedNativeV2VsockSnapshotCandidateParts = (
+    Vec<u8>,
+    SnapshotV2MemoryBinding,
+    Option<SnapshotV2StorageDeviceGraph>,
+    SnapshotV2SerialState,
+    Option<SnapshotV2EntropyState>,
+    Option<SnapshotV2BalloonState>,
+    Option<SnapshotV2MemoryHotplugState>,
+    PreparedSnapshotV2NetworkRestoreTopology,
+    Option<PreparedSnapshotV2VsockRestoreTopology>,
+    SnapshotRestoreManifest,
+);
+
+impl PreparedNativeV2VsockSnapshotCandidateState {
+    /// Returns the exact candidate compatibility version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+    }
+
+    /// Returns the unchanged immutable encoded state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the memory commitment derived from the same bytes.
+    pub const fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.binding
+    }
+
+    /// Returns optional unchanged exact-2.6 storage.
+    pub const fn device_graph(&self) -> Option<&SnapshotV2StorageDeviceGraph> {
+        self.device_graph.as_ref()
+    }
+
+    /// Returns required unchanged exact-2.7 serial state.
+    pub const fn serial(&self) -> &SnapshotV2SerialState {
+        &self.serial
+    }
+
+    /// Returns optional unchanged exact-2.8 entropy state.
+    pub const fn entropy(&self) -> Option<&SnapshotV2EntropyState> {
+        self.entropy.as_ref()
+    }
+
+    /// Returns optional unchanged exact-2.9 balloon state.
+    pub const fn balloon(&self) -> Option<&SnapshotV2BalloonState> {
+        self.balloon.as_ref()
+    }
+
+    /// Returns optional unchanged exact-2.10 virtio-mem state.
+    pub const fn memory_hotplug(&self) -> Option<&SnapshotV2MemoryHotplugState> {
+        self.memory_hotplug.as_ref()
+    }
+
+    /// Returns immutable exact-2.11 network/MMDS destination topology.
+    pub const fn network_topology(&self) -> &PreparedSnapshotV2NetworkRestoreTopology {
+        &self.network_topology
+    }
+
+    /// Returns optional immutable exact-2.12 vsock destination topology.
+    pub const fn vsock_topology(&self) -> Option<&PreparedSnapshotV2VsockRestoreTopology> {
+        self.vsock_topology.as_ref()
+    }
+
+    /// Returns the complete storage, serial, network, and vsock manifest.
+    pub const fn manifest(&self) -> &SnapshotRestoreManifest {
+        &self.manifest
+    }
+
+    /// Consumes the candidate into exact still-owner-free parts.
+    pub fn into_parts(self) -> PreparedNativeV2VsockSnapshotCandidateParts {
+        (
+            self.bytes,
+            self.binding,
+            self.device_graph,
+            self.serial,
+            self.entropy,
+            self.balloon,
+            self.memory_hotplug,
+            self.network_topology,
+            self.vsock_topology,
+            self.manifest,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedNativeV2VsockSnapshotCandidateState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedNativeV2VsockSnapshotCandidateState")
+            .field("version", &self.version())
+            .field("has_storage", &self.device_graph.is_some())
+            .field("has_entropy", &self.entropy.is_some())
+            .field("has_balloon", &self.balloon.is_some())
+            .field("has_memory_hotplug", &self.memory_hotplug.is_some())
+            .field(
+                "network_interface_count",
+                &self.network_topology.interfaces().len(),
+            )
+            .field("has_vsock", &self.vsock_topology.is_some())
+            .field("state", &REDACTED)
+            .field("memory_binding", &REDACTED)
+            .field("serial", &REDACTED)
+            .field("network_topology", &REDACTED)
+            .field("vsock_topology", &REDACTED)
+            .field("manifest", &REDACTED)
+            .finish()
+    }
+}
+
+/// Failure while preparing one exact-2.12 artifact candidate.
+pub enum NativeV2VsockSnapshotPreparationError {
+    /// Caller network overrides were supplied without saved network state.
+    NetworkOverridesWithoutDevice,
+    /// Saved product placement and selected destination transport disagree.
+    DestinationTransport,
+    /// Owner-free vsock topology preparation failed.
+    Vsock(SnapshotV2VsockRestorePreparationError),
+    /// The complete restore resource manifest could not be derived.
+    Manifest(SnapshotRestoreManifestError),
+    /// Owner-free network topology preparation failed.
+    Network(SnapshotV2NetworkRestorePreparationError),
+}
+
+impl fmt::Debug for NativeV2VsockSnapshotPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for NativeV2VsockSnapshotPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NetworkOverridesWithoutDevice => {
+                "native-v2 network overrides require saved network state"
+            }
+            Self::DestinationTransport => {
+                "native-v2 vsock candidate destination transport is inconsistent"
+            }
+            Self::Vsock(_) => "native-v2 vsock restore topology is invalid",
+            Self::Manifest(_) => "native-v2 vsock restore manifest is invalid",
+            Self::Network(_) => "native-v2 network restore topology is invalid",
+        })
+    }
+}
+
+impl std::error::Error for NativeV2VsockSnapshotPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Vsock(source) => Some(source),
+            Self::Manifest(source) => Some(source),
+            Self::Network(source) => Some(source),
+            Self::NetworkOverridesWithoutDevice | Self::DestinationTransport => None,
+        }
+    }
+}
+
 /// One closed explicit exact native-v2 2.12 vsock candidate.
 ///
 /// This owner-free value validates all unchanged earlier components and the
@@ -1975,6 +2164,107 @@ impl NativeV2VsockSnapshotCandidateState {
     /// Returns optional exact-2.12 vsock state.
     pub const fn vsock(&self) -> Option<&SnapshotV2VsockState> {
         self.vsock.as_ref()
+    }
+
+    /// Prepares the complete exact-2.12 owner-free restore candidate.
+    pub fn prepare(
+        self,
+        destination_memory: &GuestMemory,
+        transport_kind: SnapshotV2DeviceTransportKind,
+        network_overrides: &[SnapshotNetworkOverride],
+        requested_vsock_override: Option<&SnapshotVsockOverride>,
+    ) -> Result<PreparedNativeV2VsockSnapshotCandidateState, NativeV2VsockSnapshotPreparationError>
+    {
+        self.prepare_with_cancel(
+            destination_memory,
+            transport_kind,
+            network_overrides,
+            requested_vsock_override,
+            |_| false,
+        )
+    }
+
+    /// Prepares with stable owner-free device-topology cancellation.
+    ///
+    /// Vsock selectors resolve before this method invokes the caller callback
+    /// for either the vsock or network topology.
+    pub fn prepare_with_cancel<C>(
+        self,
+        destination_memory: &GuestMemory,
+        transport_kind: SnapshotV2DeviceTransportKind,
+        network_overrides: &[SnapshotNetworkOverride],
+        requested_vsock_override: Option<&SnapshotVsockOverride>,
+        mut is_cancelled: C,
+    ) -> Result<PreparedNativeV2VsockSnapshotCandidateState, NativeV2VsockSnapshotPreparationError>
+    where
+        C: FnMut(NativeV2VsockSnapshotPreparationStage) -> bool,
+    {
+        let Self {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network,
+            vsock,
+        } = self;
+        let vsock_topology = PreparedSnapshotV2VsockRestoreTopology::prepare_optional_with_cancel(
+            vsock,
+            requested_vsock_override,
+            transport_kind,
+            destination_memory,
+            |stage| is_cancelled(NativeV2VsockSnapshotPreparationStage::Vsock(stage)),
+        )
+        .map_err(NativeV2VsockSnapshotPreparationError::Vsock)?;
+        let manifest = SnapshotRestoreManifest::try_from_native_v2_vsock_state(
+            device_graph.as_ref(),
+            &serial,
+            network.as_ref(),
+            vsock_topology.as_ref().map(|topology| {
+                (
+                    topology.request().resource_key(),
+                    topology.request().is_overridden(),
+                )
+            }),
+        )
+        .map_err(NativeV2VsockSnapshotPreparationError::Manifest)?;
+        let network_topology = match network {
+            Some(network) => {
+                let topology = PreparedSnapshotV2NetworkRestoreTopology::prepare_with_cancel(
+                    network,
+                    network_overrides,
+                    |stage| is_cancelled(NativeV2VsockSnapshotPreparationStage::Network(stage)),
+                )
+                .map_err(NativeV2VsockSnapshotPreparationError::Network)?;
+                if topology.transport_kind() != transport_kind {
+                    return Err(NativeV2VsockSnapshotPreparationError::DestinationTransport);
+                }
+                topology
+            }
+            None => {
+                if !network_overrides.is_empty() {
+                    return Err(
+                        NativeV2VsockSnapshotPreparationError::NetworkOverridesWithoutDevice,
+                    );
+                }
+                PreparedSnapshotV2NetworkRestoreTopology::empty(transport_kind)
+            }
+        };
+
+        Ok(PreparedNativeV2VsockSnapshotCandidateState {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network_topology,
+            vsock_topology,
+            manifest,
+        })
     }
 
     /// Consumes the candidate into its inseparable exact components.

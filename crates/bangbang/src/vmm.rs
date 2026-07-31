@@ -168,9 +168,10 @@ use bangbang_runtime::serial::{
     SerialStdioRestorationError, SharedSerialOutput, SharedSerialOutputBuffer,
 };
 use bangbang_runtime::snapshot::{
-    SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackendType, SnapshotV1ControllerCommit,
-    SnapshotV2ControllerCommit, SnapshotV2ControllerCommitProductConfigs,
-    SnapshotV2NetworkControllerCommitProductConfigs,
+    SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackendType, SnapshotNetworkOverride,
+    SnapshotV1ControllerCommit, SnapshotV2ControllerCommit,
+    SnapshotV2ControllerCommitProductConfigs, SnapshotV2NetworkControllerCommitProductConfigs,
+    SnapshotVsockOverride,
 };
 #[cfg(target_os = "macos")]
 use bangbang_runtime::snapshot_artifact::SnapshotStagingTracker;
@@ -184,7 +185,8 @@ use bangbang_runtime::snapshot_artifact::{
     NativeV2SerialSnapshotCandidateState, NativeV2SnapshotArtifactProfile,
     NativeV2SnapshotCandidateState, NativeV2SnapshotCandidateStateError,
     NativeV2StorageSnapshotCandidateState, NativeV2VsockSnapshotCandidateState,
-    PreparedNativeSnapshotState, PreparedNativeV2NetworkSnapshotCandidateState,
+    NativeV2VsockSnapshotPreparationError, PreparedNativeSnapshotState,
+    PreparedNativeV2NetworkSnapshotCandidateState, PreparedNativeV2VsockSnapshotCandidateState,
     SnapshotArtifactLoadError, SnapshotArtifactOutput, SnapshotArtifactOutputs,
     SnapshotArtifactPaths, SnapshotCommitDurability, SnapshotMemoryStagingWriter,
     SnapshotPublicationOutcome, SnapshotPublicationTransactionError,
@@ -20243,6 +20245,36 @@ const _: fn(
 ) -> PreparedProcessSnapshotV2NetworkRestorePlanParts =
     PreparedProcessSnapshotV2NetworkRestorePlan::into_parts;
 
+fn prepare_process_snapshot_v2_vsock_candidate(
+    candidate: NativeV2VsockSnapshotCandidateState,
+    destination_memory: &GuestMemory,
+    transport_kind: SnapshotV2DeviceTransportKind,
+    network_overrides: &[SnapshotNetworkOverride],
+    vsock_override: Option<&SnapshotVsockOverride>,
+) -> Result<PreparedNativeV2VsockSnapshotCandidateState, NativeV2VsockSnapshotPreparationError> {
+    candidate.prepare(
+        destination_memory,
+        transport_kind,
+        network_overrides,
+        vsock_override,
+    )
+}
+
+type ProcessSnapshotV2VsockCandidatePreparer = fn(
+    NativeV2VsockSnapshotCandidateState,
+    &GuestMemory,
+    SnapshotV2DeviceTransportKind,
+    &[SnapshotNetworkOverride],
+    Option<&SnapshotVsockOverride>,
+) -> Result<
+    PreparedNativeV2VsockSnapshotCandidateState,
+    NativeV2VsockSnapshotPreparationError,
+>;
+
+// Keep the exact-2.12 value-only pre-access gate type-checked without
+// activating public load/restore dispatch or acquiring host authority.
+const _: ProcessSnapshotV2VsockCandidatePreparer = prepare_process_snapshot_v2_vsock_candidate;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessSnapshotV2NetworkRestoreResourceDisposition {
     Retryable,
@@ -29511,6 +29543,7 @@ fn default_hvf_boot_session_config(serial_output: SharedSerialOutput) -> HvfArm6
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::fmt;
     use std::fs::{self, File, OpenOptions, remove_file};
@@ -29603,7 +29636,8 @@ mod tests {
         SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend, SnapshotMemoryBackendType,
         SnapshotNetworkOverride, SnapshotType, SnapshotV1ControllerCommit,
         SnapshotV2ControllerCommit, SnapshotV2ControllerCommitProductConfigs,
-        SnapshotV2NetworkControllerCommitProductConfigs,
+        SnapshotV2NetworkControllerCommitProductConfigs, SnapshotVsockOverride,
+        SnapshotVsockSelectorError,
     };
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotPublicationOutcome,
@@ -29611,7 +29645,8 @@ mod tests {
         NativeV2MemoryHotplugSnapshotCandidateState, NativeV2MemoryHotplugSnapshotPreparation,
         NativeV2NetworkSnapshotCandidateState, NativeV2NetworkSnapshotPreparation,
         NativeV2SnapshotArtifactProfile, NativeV2VsockSnapshotCandidateState,
-        PreparedNativeSnapshotState, PreparedNativeV2NetworkSnapshotCandidateState,
+        NativeV2VsockSnapshotPreparationError, PreparedNativeSnapshotState,
+        PreparedNativeV2NetworkSnapshotCandidateState, PreparedNativeV2VsockSnapshotCandidateState,
         SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotPublicationOutcome,
         publish_snapshot_artifacts_with,
     };
@@ -29660,6 +29695,7 @@ mod tests {
         SnapshotV2MemoryBinding, write_snapshot_v2_memory_image_with_cancel,
         write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
     };
+    use bangbang_runtime::snapshot_network_restore_v2_11::SnapshotV2NetworkRestorePreparationError;
     use bangbang_runtime::snapshot_network_v2_11::{
         NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, SnapshotV2MmdsInterfaceState,
         SnapshotV2MmdsState, SnapshotV2NetworkBackendClass, SnapshotV2NetworkInterfaceState,
@@ -29670,6 +29706,7 @@ mod tests {
         NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialEndpointIntent,
         SnapshotV2SerialState,
     };
+    use bangbang_runtime::snapshot_vsock_restore_v2_12::SnapshotV2VsockRestorePreparationError;
     use bangbang_runtime::snapshot_vsock_v2_12::{
         NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION, SnapshotV2VsockState,
     };
@@ -29769,8 +29806,8 @@ mod tests {
         SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
         default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
         native_v2_platform_capture_is_terminal, prepare_process_snapshot_v2_network_restore_plan,
-        require_native_v1_composite_record, snapshot_destination_machine_config,
-        vsock_capture_error_from_boot_run_loop_command,
+        prepare_process_snapshot_v2_vsock_candidate, require_native_v1_composite_record,
+        snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -37048,6 +37085,171 @@ mod tests {
         .expect("fake native-v2 vsock fixture should decode")
     }
 
+    fn native_v2_vsock_pre_access_candidate(
+        network: Option<SnapshotV2NetworkState>,
+        vsock: Option<SnapshotV2VsockState>,
+    ) -> (NativeV2VsockSnapshotCandidateState, GuestMemory) {
+        let range = GuestMemoryRange::new(GuestAddress::new(0), 0x0040_0000)
+            .expect("exact-2.12 pre-access memory range should validate");
+        let layout = GuestMemoryLayout::new(vec![range])
+            .expect("exact-2.12 pre-access memory layout should validate");
+        let mut memory =
+            GuestMemory::allocate(&layout).expect("exact-2.12 pre-access memory should allocate");
+        if let Some(vsock) = vsock.as_ref()
+            && let Some(active) = vsock.active_queues()
+        {
+            for (queue, cursor) in
+                vsock
+                    .virtio()
+                    .queues()
+                    .iter()
+                    .zip([active.rx(), active.tx(), active.event()])
+            {
+                memory
+                    .write_slice(
+                        &cursor.next_available().to_le_bytes(),
+                        queue
+                            .driver_ring()
+                            .checked_add(2)
+                            .expect("available index should not overflow"),
+                    )
+                    .expect("available queue index should write");
+                memory
+                    .write_slice(
+                        &cursor.next_used().to_le_bytes(),
+                        queue
+                            .device_ring()
+                            .checked_add(2)
+                            .expect("used index should not overflow"),
+                    )
+                    .expect("used queue index should write");
+            }
+        }
+
+        let mut image = Cursor::new(Vec::new());
+        let binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+            &memory,
+            &mut image,
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+            |_| false,
+        )
+        .expect("exact-2.12 pre-access memory should encode")
+        .encode()
+        .expect("exact-2.12 pre-access binding should encode");
+        let serial_device = SerialMmioDevice::discarding()
+            .capture_state()
+            .expect("exact-2.12 pre-access serial device should capture");
+        let serial = SnapshotV2SerialState::try_from_capture_ready(CaptureReadySerialState::new(
+            SerialConfig::default(),
+            serial_device,
+        ))
+        .expect("exact-2.12 pre-access serial should validate")
+        .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+        .expect("exact-2.12 pre-access serial should encode");
+        let network = network.as_ref().map(|state| {
+            state
+                .encode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION)
+                .expect("exact-2.12 pre-access network should encode")
+        });
+        let vsock = vsock.as_ref().map(|state| {
+            state
+                .encode(NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION)
+                .expect("exact-2.12 pre-access vsock should encode")
+        });
+        let mut components = vec![
+            SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &binding,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_SERIAL_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &serial,
+            ),
+        ];
+        if let Some(network) = network.as_deref() {
+            components.push(SnapshotV2Component::new(
+                NATIVE_V2_NETWORK_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                network,
+            ));
+        }
+        if let Some(vsock) = vsock.as_deref() {
+            components.push(SnapshotV2Component::new(
+                NATIVE_V2_VSOCK_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                vsock,
+            ));
+        }
+        let encoded = encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+            &[],
+            &components,
+        )
+        .expect("exact-2.12 pre-access candidate should encode");
+        let candidate = NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(encoded)
+            .expect("exact-2.12 pre-access candidate should close");
+        (candidate, memory)
+    }
+
+    #[derive(Default)]
+    struct NativeV2VsockPreAccessHostSpies {
+        filesystem: Cell<u32>,
+        grant: Cell<u32>,
+        broker: Cell<u32>,
+        listener: Cell<u32>,
+        connector: Cell<u32>,
+        vm: Cell<u32>,
+        vcpu: Cell<u32>,
+        hvf: Cell<u32>,
+    }
+
+    impl NativeV2VsockPreAccessHostSpies {
+        fn record_post_preflight_access(&self) {
+            for counter in [
+                &self.filesystem,
+                &self.grant,
+                &self.broker,
+                &self.listener,
+                &self.connector,
+                &self.vm,
+                &self.vcpu,
+                &self.hvf,
+            ] {
+                counter.set(counter.get() + 1);
+            }
+        }
+
+        fn counts(&self) -> [u32; 8] {
+            [
+                self.filesystem.get(),
+                self.grant.get(),
+                self.broker.get(),
+                self.listener.get(),
+                self.connector.get(),
+                self.vm.get(),
+                self.vcpu.get(),
+                self.hvf.get(),
+            ]
+        }
+    }
+
+    fn rejected_native_v2_vsock_pre_access(
+        result: Result<
+            PreparedNativeV2VsockSnapshotCandidateState,
+            NativeV2VsockSnapshotPreparationError,
+        >,
+    ) -> NativeV2VsockSnapshotPreparationError {
+        let spies = NativeV2VsockPreAccessHostSpies::default();
+        let result = result.inspect(|_| {
+            spies.record_post_preflight_access();
+        });
+        let error = result.expect_err("malformed exact-2.12 state must fail pre-access");
+        assert_eq!(spies.counts(), [0; 8]);
+        error
+    }
+
     #[cfg(target_os = "macos")]
     fn copied_inactive_mmio_network_interface(
         source: &SnapshotV2NetworkInterfaceState,
@@ -38985,6 +39187,172 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(destination.instance_info().state, InstanceState::NotStarted);
         assert!(!format!("{error:?} {error}").contains("private-destination-selector"));
+    }
+
+    #[test]
+    fn native_v2_vsock_pre_access_gate_blocks_every_host_surface_on_rejection() {
+        let no_device_secret = "/private/no-device-vsock.sock";
+        let (candidate, memory) = native_v2_vsock_pre_access_candidate(None, None);
+        let no_device =
+            rejected_native_v2_vsock_pre_access(prepare_process_snapshot_v2_vsock_candidate(
+                candidate,
+                &memory,
+                SnapshotV2DeviceTransportKind::Mmio,
+                &[],
+                Some(&SnapshotVsockOverride::new(no_device_secret)),
+            ));
+        assert!(matches!(
+            no_device,
+            NativeV2VsockSnapshotPreparationError::Vsock(
+                SnapshotV2VsockRestorePreparationError::Selector(
+                    SnapshotVsockSelectorError::OverrideWithoutDevice
+                )
+            )
+        ));
+        assert!(!format!("{no_device:?} {no_device}").contains(no_device_secret));
+
+        let invalid_secret = "invalid\nprivate-vsock-selector";
+        let vsock = fake_native_v2_vsock_state(SnapshotV2DeviceTransportKind::Mmio);
+        let (candidate, memory) = native_v2_vsock_pre_access_candidate(None, Some(vsock));
+        let invalid_selector =
+            rejected_native_v2_vsock_pre_access(prepare_process_snapshot_v2_vsock_candidate(
+                candidate,
+                &memory,
+                SnapshotV2DeviceTransportKind::Mmio,
+                &[],
+                Some(&SnapshotVsockOverride::new(invalid_secret)),
+            ));
+        assert!(matches!(
+            invalid_selector,
+            NativeV2VsockSnapshotPreparationError::Vsock(
+                SnapshotV2VsockRestorePreparationError::Selector(
+                    SnapshotVsockSelectorError::InvalidOverride(_)
+                )
+            )
+        ));
+        assert!(!format!("{invalid_selector:?} {invalid_selector}").contains(invalid_secret));
+
+        let vsock = fake_native_v2_vsock_state(SnapshotV2DeviceTransportKind::Mmio);
+        let (candidate, memory) = native_v2_vsock_pre_access_candidate(None, Some(vsock));
+        let transport =
+            rejected_native_v2_vsock_pre_access(prepare_process_snapshot_v2_vsock_candidate(
+                candidate,
+                &memory,
+                SnapshotV2DeviceTransportKind::Pci,
+                &[],
+                None,
+            ));
+        assert!(matches!(
+            transport,
+            NativeV2VsockSnapshotPreparationError::Vsock(
+                SnapshotV2VsockRestorePreparationError::DestinationTransport
+            )
+        ));
+
+        let vsock = fake_native_v2_vsock_state(SnapshotV2DeviceTransportKind::Pci);
+        let (candidate, _) = native_v2_vsock_pre_access_candidate(None, Some(vsock.clone()));
+        let (_, blank_memory) = native_v2_vsock_pre_access_candidate(None, None);
+        let memory =
+            rejected_native_v2_vsock_pre_access(prepare_process_snapshot_v2_vsock_candidate(
+                candidate,
+                &blank_memory,
+                SnapshotV2DeviceTransportKind::Pci,
+                &[],
+                None,
+            ));
+        assert!(matches!(
+            memory,
+            NativeV2VsockSnapshotPreparationError::Vsock(
+                SnapshotV2VsockRestorePreparationError::Device(_)
+            )
+        ));
+
+        let (candidate, mut memory) =
+            native_v2_vsock_pre_access_candidate(None, Some(vsock.clone()));
+        let active = vsock
+            .active_queues()
+            .expect("active PCI fixture should retain queue cursors");
+        let queue = &vsock.virtio().queues()[0];
+        memory
+            .write_slice(
+                &active.rx().next_used().wrapping_add(1).to_le_bytes(),
+                queue
+                    .device_ring()
+                    .checked_add(2)
+                    .expect("used index should not overflow"),
+            )
+            .expect("hostile used index should write");
+        let queue =
+            rejected_native_v2_vsock_pre_access(prepare_process_snapshot_v2_vsock_candidate(
+                candidate,
+                &memory,
+                SnapshotV2DeviceTransportKind::Pci,
+                &[],
+                None,
+            ));
+        assert!(matches!(
+            queue,
+            NativeV2VsockSnapshotPreparationError::Vsock(
+                SnapshotV2VsockRestorePreparationError::Device(_)
+            )
+        ));
+
+        let network = fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio);
+        let (candidate, memory) = native_v2_vsock_pre_access_candidate(Some(network), None);
+        let manifest_and_network =
+            rejected_native_v2_vsock_pre_access(prepare_process_snapshot_v2_vsock_candidate(
+                candidate,
+                &memory,
+                SnapshotV2DeviceTransportKind::Mmio,
+                &[],
+                None,
+            ));
+        assert!(matches!(
+            manifest_and_network,
+            NativeV2VsockSnapshotPreparationError::Network(
+                SnapshotV2NetworkRestorePreparationError::MissingInterface
+            )
+        ));
+    }
+
+    #[test]
+    fn native_v2_vsock_pre_access_gate_reaches_only_value_handoff_when_valid() {
+        for transport in [
+            SnapshotV2DeviceTransportKind::Mmio,
+            SnapshotV2DeviceTransportKind::Pci,
+        ] {
+            let vsock = fake_native_v2_vsock_state(transport);
+            let (candidate, memory) = native_v2_vsock_pre_access_candidate(None, Some(vsock));
+            let host_spies = NativeV2VsockPreAccessHostSpies::default();
+            let handoff_count = Cell::new(0);
+            let prepared = prepare_process_snapshot_v2_vsock_candidate(
+                candidate,
+                &memory,
+                transport,
+                &[],
+                None,
+            )
+            .inspect(|_| {
+                handoff_count.set(handoff_count.get() + 1);
+            })
+            .unwrap_or_else(|error| {
+                panic!("valid {transport:?} pre-access candidate should prepare: {error}")
+            });
+
+            assert_eq!(handoff_count.get(), 1);
+            assert_eq!(host_spies.counts(), [0; 8]);
+            assert_eq!(
+                prepared.version(),
+                NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+            );
+            assert_eq!(
+                prepared
+                    .vsock_topology()
+                    .expect("valid fixture should retain vsock topology")
+                    .transport_kind(),
+                transport
+            );
+        }
     }
 
     #[test]
