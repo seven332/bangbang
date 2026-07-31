@@ -469,7 +469,7 @@ pub(crate) fn validate_vsock_state(
     if selector.is_empty()
         || selector.len() > NATIVE_V2_VSOCK_MAX_SELECTOR_BYTES
         || selector.chars().any(char::is_control)
-        || VsockBackendSelector::try_from_path(state.backend_selector.path()).is_err()
+        || state.backend_selector.validate().is_err()
     {
         return Err(SnapshotV2VsockStateBuildError::BackendSelector);
     }
