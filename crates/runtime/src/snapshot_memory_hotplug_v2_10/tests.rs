@@ -430,6 +430,71 @@ fn kind_one_binding_closes_fragmented_plugged_unions_and_rejects_hostile_coverag
     }
 }
 
+#[test]
+fn prepared_topology_accepts_an_exact_later_container_version_only_when_requested() {
+    let state = inactive_mmio_state();
+    let config_space = state.config_space();
+    let block_size = config_space.block_size();
+    let first_start = config_space.addr() + block_size;
+    let second_start = config_space.addr() + 5 * block_size;
+    let range = |start, length| {
+        GuestMemoryRange::new(GuestAddress::new(start), length)
+            .expect("later-container binding range should validate")
+    };
+    let version = crate::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
+    let binding = binding_for_ranges(
+        version,
+        vec![
+            range(first_start, 2 * block_size),
+            range(second_start, 3 * block_size),
+        ],
+    );
+
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare(state.clone(), binding.clone()),
+        Err(SnapshotV2MemoryHotplugPreparationError::Binding(
+            SnapshotV2MemoryHotplugBindingError::Version
+        ))
+    ));
+    let prepared = PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
+        state.clone(),
+        binding.clone(),
+        version,
+    )
+    .expect("unchanged exact-2.10 topology should close inside the exact-2.11 container");
+    assert_eq!(prepared.state(), &state);
+    assert_eq!(prepared.memory().binding(), &binding);
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
+            state,
+            binding,
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+        ),
+        Err(SnapshotV2MemoryHotplugPreparationError::Binding(
+            SnapshotV2MemoryHotplugBindingError::Version
+        ))
+    ));
+
+    let older_version = SnapshotFormatVersion::new(2, 9, 0);
+    let older_binding = binding_for_ranges(
+        older_version,
+        vec![
+            range(first_start, 2 * block_size),
+            range(second_start, 3 * block_size),
+        ],
+    );
+    assert!(matches!(
+        PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
+            inactive_mmio_state(),
+            older_binding,
+            older_version,
+        ),
+        Err(SnapshotV2MemoryHotplugPreparationError::Binding(
+            SnapshotV2MemoryHotplugBindingError::Version
+        ))
+    ));
+}
+
 fn test_range(start: u64, size: u64) -> GuestMemoryRange {
     GuestMemoryRange::new(GuestAddress::new(start), size)
         .expect("test guest-memory range should validate")

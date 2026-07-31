@@ -1178,6 +1178,11 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler>
         })
     }
 
+    /// Returns the reconstructed endpoint before exact resource publication.
+    pub const fn endpoint(&self) -> &VirtioPciEndpoint<C, A> {
+        &self.endpoint
+    }
+
     pub const fn sbdf(&self) -> PciSbdf {
         self.sbdf
     }

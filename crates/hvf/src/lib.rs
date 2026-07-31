@@ -278,7 +278,9 @@ pub use startup::{
     HvfSnapshotV2MultiBlockPciRestoreError, HvfSnapshotV2MultiBlockPciRestoreFailure,
     HvfSnapshotV2MultiBlockPciRestoreStage, HvfSnapshotV2NetworkMmioMemoryInput,
     HvfSnapshotV2NetworkMmioRestoreDisposition, HvfSnapshotV2NetworkMmioRestoreError,
-    HvfSnapshotV2NetworkMmioRestoreStage, HvfSnapshotV2RootRestoreCleanupFailure,
+    HvfSnapshotV2NetworkMmioRestoreStage, HvfSnapshotV2NetworkPciMemoryInput,
+    HvfSnapshotV2NetworkPciRestoreDisposition, HvfSnapshotV2NetworkPciRestoreError,
+    HvfSnapshotV2NetworkPciRestoreStage, HvfSnapshotV2RootRestoreCleanupFailure,
     HvfSnapshotV2RootRestoreError, HvfSnapshotV2RootRestoreFailure, HvfSnapshotV2RootRestoreStage,
     HvfSnapshotV2SerialOnlyRestoreError, HvfSnapshotV2StorageMmioRestoreCleanupFailure,
     HvfSnapshotV2StorageMmioRestoreError, HvfSnapshotV2StorageMmioRestoreFailure,
@@ -290,8 +292,8 @@ pub use startup::{
     RestoredHvfSnapshotV2EntropyMmioOwners, RestoredHvfSnapshotV2EntropyPciOwners,
     RestoredHvfSnapshotV2MemoryHotplugMmioOwners, RestoredHvfSnapshotV2MemoryHotplugPciOwners,
     RestoredHvfSnapshotV2MultiBlockMmioOwners, RestoredHvfSnapshotV2MultiBlockPciOwners,
-    RestoredHvfSnapshotV2NetworkMmioOwners, RestoredHvfSnapshotV2StorageMmioOwners,
-    RestoredHvfSnapshotV2StoragePciOwners,
+    RestoredHvfSnapshotV2NetworkMmioOwners, RestoredHvfSnapshotV2NetworkPciOwners,
+    RestoredHvfSnapshotV2StorageMmioOwners, RestoredHvfSnapshotV2StoragePciOwners,
 };
 pub use topology::{
     HvfVcpuTopology, HvfVcpuTopologyAllocation, HvfVcpuTopologyCreateStage, HvfVcpuTopologyError,

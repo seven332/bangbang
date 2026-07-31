@@ -10,7 +10,7 @@ use device_tree::{DeviceTree, Node};
 
 use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::boot::canonical_process_root_block_command_line;
-use bangbang_runtime::fdt::ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET;
+use bangbang_runtime::fdt::{ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET, Arm64FdtPciHost};
 use bangbang_runtime::interrupt::GuestInterruptLine;
 use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange, aarch64,
@@ -55,7 +55,7 @@ use crate::cpu_template::HvfArm64CpuTemplateError;
 use crate::dirty::HvfDirtyWriteTrackerStartError;
 use crate::gic::{
     HvfGicError, HvfGicInterruptLineAllocator, HvfGicMetadata, HvfGicMsiConfiguration,
-    HvfGicSpiSignalError, HvfGicSpiSignaler, HvfInterruptLineAllocationError,
+    HvfGicMsiMetadata, HvfGicSpiSignalError, HvfGicSpiSignaler, HvfInterruptLineAllocationError,
 };
 use crate::memory::{
     HvfGuestMemoryMappingError, HvfMemoryPermissions, HvfSnapshotV2MemoryHotplugMappingPlan,
@@ -498,6 +498,18 @@ pub(crate) struct HvfSnapshotV2StoragePciShellPlan<'a> {
     pub(crate) vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2NetworkPciShellPlan<'a> {
+    pub(crate) storage: Option<HvfSnapshotV2StoragePciShellPlan<'a>>,
+    pub(crate) host: Arm64FdtPciHost,
+    pub(crate) msi: HvfGicMsiMetadata,
+    pub(crate) endpoint_count: usize,
+    pub(crate) route_demand: usize,
+    pub(crate) memory_hotplug: bool,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 enum HvfSnapshotV2ProcessShellRestore<'a> {
     DeviceFree(HvfSnapshotV2ProcessSerialShell),
     SerialOnly {
@@ -541,6 +553,10 @@ enum HvfSnapshotV2ProcessShellRestore<'a> {
     NetworkMmio {
         shell: HvfSnapshotV2ProcessSerialShell,
         plan: HvfSnapshotV2NetworkMmioShellPlan<'a>,
+    },
+    NetworkPci {
+        shell: HvfSnapshotV2ProcessSerialShell,
+        plan: HvfSnapshotV2NetworkPciShellPlan<'a>,
     },
     StoragePci {
         shell: HvfSnapshotV2ProcessSerialShell,
@@ -1703,6 +1719,36 @@ pub(crate) fn restore_hvf_snapshot_v2_serial_network_mmio_process_platform(
         state,
         memory,
         Some(HvfSnapshotV2ProcessShellRestore::NetworkMmio {
+            shell: shell.into(),
+            plan,
+        }),
+        mapping.map_or(
+            HvfSnapshotV2MemoryMappingRestore::Ordinary,
+            HvfSnapshotV2MemoryMappingRestore::MemoryHotplug,
+        ),
+    )
+}
+
+pub(crate) fn restore_hvf_snapshot_v2_serial_network_pci_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2RestoredSerialShell,
+    plan: HvfSnapshotV2NetworkPciShellPlan<'_>,
+    mapping: Option<&HvfSnapshotV2MemoryHotplugMappingPlan>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    if mapping.is_some() != plan.memory_hotplug {
+        return Err(HvfSnapshotV2PlatformRestoreError::new(
+            HvfSnapshotV2PlatformRestoreStage::Preflight,
+            HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+            },
+            Vec::new(),
+        ));
+    }
+    restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::NetworkPci {
             shell: shell.into(),
             plan,
         }),
@@ -3128,6 +3174,55 @@ fn prepare_process_shell(
                         pmem_records: plan.pmem_records,
                     },
                     None => HvfSnapshotV2ProcessBlockFdtPlan::None,
+                };
+                (
+                    shell,
+                    block_plan,
+                    true,
+                    false,
+                    Some((
+                        plan.serial_interrupt,
+                        plan.vmgenid_interrupt,
+                        plan.vmclock_interrupt,
+                    )),
+                )
+            }
+            HvfSnapshotV2ProcessShellRestore::NetworkPci { shell, plan } => {
+                let canonical_host = Arm64PciAddressPlan::firecracker_v1_16()
+                    .map(Arm64FdtPciHost::from_address_plan)
+                    .ok();
+                if plan.endpoint_count == 0
+                    || plan.route_demand == 0
+                    || canonical_host != Some(plan.host)
+                    || gic.msi != Some(plan.msi)
+                    || !usize::try_from(plan.msi.interrupt_range.count)
+                        .is_ok_and(|count| plan.route_demand <= count)
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                        mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                    });
+                }
+                let block_plan = match plan.storage {
+                    Some(storage)
+                        if storage.pci.record_count() != 0
+                            && storage.pci.route_demand() != 0
+                            && storage.pci.host() == plan.host
+                            && storage.pci.msi() == plan.msi
+                            && storage.serial_interrupt == plan.serial_interrupt
+                            && storage.vmgenid_interrupt == plan.vmgenid_interrupt
+                            && storage.vmclock_interrupt == plan.vmclock_interrupt =>
+                    {
+                        HvfSnapshotV2ProcessBlockFdtPlan::StoragePci {
+                            command_line: storage.command_line,
+                            pci: storage.pci,
+                        }
+                    }
+                    None => HvfSnapshotV2ProcessBlockFdtPlan::None,
+                    Some(_) => {
+                        return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                            mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                        });
+                    }
                 };
                 (
                     shell,
