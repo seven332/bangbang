@@ -724,6 +724,169 @@ enum NetworkProductBase<'a> {
     MemoryHotplug(&'a MemoryHotplugNetworkProduct),
 }
 
+pub(crate) enum HvfSnapshotV2NetworkPreparedMemoryProduct {
+    Static {
+        binding: SnapshotV2MemoryBinding,
+        network: PreparedSnapshotV2NetworkRestoreTopology,
+    },
+    MemoryHotplug {
+        topology: Box<PreparedSnapshotV2MemoryHotplugTopology>,
+        memory: GuestMemory,
+        network: PreparedSnapshotV2NetworkRestoreTopology,
+    },
+}
+
+pub(crate) struct HvfSnapshotV2NetworkPreparedOwnerParts {
+    pub(crate) kind: HvfSnapshotV2NetworkProductKind,
+    pub(crate) memory: HvfSnapshotV2NetworkPreparedMemoryProduct,
+    pub(crate) storage: Option<PreparedSnapshotV2StorageBundle>,
+    pub(crate) entropy: Option<SnapshotV2EntropyRestorePlan>,
+    pub(crate) balloon: Option<SnapshotV2BalloonRestorePlan>,
+}
+
+impl HvfSnapshotV2NetworkPreparedProduct {
+    pub(crate) fn into_owner_parts(self) -> HvfSnapshotV2NetworkPreparedOwnerParts {
+        let kind = self.kind();
+        let (memory, storage, entropy, balloon) = match self.parts {
+            HvfSnapshotV2NetworkPreparedProductParts::Network(base) => {
+                (static_memory_product(base), None, None, None)
+            }
+            HvfSnapshotV2NetworkPreparedProductParts::StorageNetwork { base, storage } => {
+                (static_memory_product(base), Some(storage), None, None)
+            }
+            HvfSnapshotV2NetworkPreparedProductParts::EntropyNetwork { base, entropy } => {
+                (static_memory_product(base), None, Some(entropy), None)
+            }
+            HvfSnapshotV2NetworkPreparedProductParts::StorageEntropyNetwork {
+                base,
+                storage,
+                entropy,
+            } => (
+                static_memory_product(base),
+                Some(storage),
+                Some(entropy),
+                None,
+            ),
+            HvfSnapshotV2NetworkPreparedProductParts::BalloonNetwork { base, balloon } => {
+                (static_memory_product(base), None, None, Some(balloon))
+            }
+            HvfSnapshotV2NetworkPreparedProductParts::BalloonStorageNetwork {
+                base,
+                balloon,
+                storage,
+            } => (
+                static_memory_product(base),
+                Some(storage),
+                None,
+                Some(balloon),
+            ),
+            HvfSnapshotV2NetworkPreparedProductParts::BalloonEntropyNetwork {
+                base,
+                balloon,
+                entropy,
+            } => (
+                static_memory_product(base),
+                None,
+                Some(entropy),
+                Some(balloon),
+            ),
+            HvfSnapshotV2NetworkPreparedProductParts::BalloonStorageEntropyNetwork {
+                base,
+                balloon,
+                storage,
+                entropy,
+            } => (
+                static_memory_product(base),
+                Some(storage),
+                Some(entropy),
+                Some(balloon),
+            ),
+            HvfSnapshotV2NetworkPreparedProductParts::NetworkMemoryHotplug(base) => {
+                (hotplug_memory_product(base), None, None, None)
+            }
+            HvfSnapshotV2NetworkPreparedProductParts::StorageNetworkMemoryHotplug {
+                base,
+                storage,
+            } => (hotplug_memory_product(base), Some(storage), None, None),
+            HvfSnapshotV2NetworkPreparedProductParts::EntropyNetworkMemoryHotplug {
+                base,
+                entropy,
+            } => (hotplug_memory_product(base), None, Some(entropy), None),
+            HvfSnapshotV2NetworkPreparedProductParts::StorageEntropyNetworkMemoryHotplug {
+                base,
+                storage,
+                entropy,
+            } => (
+                hotplug_memory_product(base),
+                Some(storage),
+                Some(entropy),
+                None,
+            ),
+            HvfSnapshotV2NetworkPreparedProductParts::BalloonNetworkMemoryHotplug {
+                base,
+                balloon,
+            } => (hotplug_memory_product(base), None, None, Some(balloon)),
+            HvfSnapshotV2NetworkPreparedProductParts::BalloonStorageNetworkMemoryHotplug {
+                base,
+                balloon,
+                storage,
+            } => (
+                hotplug_memory_product(base),
+                Some(storage),
+                None,
+                Some(balloon),
+            ),
+            HvfSnapshotV2NetworkPreparedProductParts::BalloonEntropyNetworkMemoryHotplug {
+                base,
+                balloon,
+                entropy,
+            } => (
+                hotplug_memory_product(base),
+                None,
+                Some(entropy),
+                Some(balloon),
+            ),
+            HvfSnapshotV2NetworkPreparedProductParts::BalloonStorageEntropyNetworkMemoryHotplug {
+                base,
+                balloon,
+                storage,
+                entropy,
+            } => (
+                hotplug_memory_product(base),
+                Some(storage),
+                Some(entropy),
+                Some(balloon),
+            ),
+        };
+        HvfSnapshotV2NetworkPreparedOwnerParts {
+            kind,
+            memory,
+            storage,
+            entropy,
+            balloon,
+        }
+    }
+}
+
+fn static_memory_product(
+    product: StaticNetworkProduct,
+) -> HvfSnapshotV2NetworkPreparedMemoryProduct {
+    HvfSnapshotV2NetworkPreparedMemoryProduct::Static {
+        binding: product.binding,
+        network: product.network,
+    }
+}
+
+fn hotplug_memory_product(
+    product: MemoryHotplugNetworkProduct,
+) -> HvfSnapshotV2NetworkPreparedMemoryProduct {
+    HvfSnapshotV2NetworkPreparedMemoryProduct::MemoryHotplug {
+        topology: Box::new(product.topology),
+        memory: product.memory,
+        network: product.network,
+    }
+}
+
 impl fmt::Debug for HvfSnapshotV2NetworkPreparedProduct {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -801,6 +964,48 @@ pub struct HvfSnapshotV2NetworkMmioEndpointPlan {
     region: MmioRegion,
     interrupt_line: GuestInterruptLine,
     fdt_device: Arm64FdtVirtioMmioDevice,
+}
+
+/// Borrowed process-resource projection used for host-free identity preflight.
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct HvfSnapshotV2NetworkProcessResourceIdentity<'a> {
+    source_index: u16,
+    resource_key: &'a SnapshotRestoreResourceKey,
+    controller: &'a bangbang_runtime::network::NetworkInterfaceConfig,
+    profile: bangbang_runtime::network::NetworkDeviceProfile,
+    backend: bangbang_runtime::snapshot_network_v2_11::SnapshotV2NetworkBackendClass,
+    mmds_stack: Option<SnapshotV2MmdsInterfaceState>,
+}
+
+impl<'a> HvfSnapshotV2NetworkProcessResourceIdentity<'a> {
+    pub const fn new(
+        source_index: u16,
+        resource_key: &'a SnapshotRestoreResourceKey,
+        controller: &'a bangbang_runtime::network::NetworkInterfaceConfig,
+        profile: bangbang_runtime::network::NetworkDeviceProfile,
+        backend: bangbang_runtime::snapshot_network_v2_11::SnapshotV2NetworkBackendClass,
+        mmds_stack: Option<SnapshotV2MmdsInterfaceState>,
+    ) -> Self {
+        Self {
+            source_index,
+            resource_key,
+            controller,
+            profile,
+            backend,
+            mmds_stack,
+        }
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2NetworkProcessResourceIdentity<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2NetworkProcessResourceIdentity")
+            .field("source_index", &self.source_index)
+            .field("state", &REDACTED)
+            .finish()
+    }
 }
 
 impl HvfSnapshotV2NetworkMmioEndpointPlan {
@@ -1072,6 +1277,41 @@ impl HvfSnapshotV2NetworkMmioPlatformPlan {
     pub const fn vmclock_interrupt(&self) -> GuestInterruptLine {
         self.vmclock_interrupt
     }
+
+    /// Proves that a separately retained process resource blueprint still
+    /// describes this exact saved-order MMIO product. This performs no host
+    /// operation and retains no caller borrow.
+    #[doc(hidden)]
+    pub fn preflight_process_resource_identity<'a>(
+        &self,
+        resources: impl ExactSizeIterator<Item = HvfSnapshotV2NetworkProcessResourceIdentity<'a>>,
+        mmds_state: Option<&bangbang_runtime::snapshot_network_v2_11::SnapshotV2MmdsState>,
+        mmds_controller: Option<&bangbang_runtime::mmds::MmdsConfig>,
+    ) -> bool {
+        let topology = self.product.network();
+        if resources.len() != self.network.len()
+            || topology.interfaces().len() != self.network.len()
+            || topology.mmds_state() != mmds_state
+            || topology.mmds_controller() != mmds_controller
+        {
+            return false;
+        }
+        resources.zip(topology.interfaces()).zip(&self.network).all(
+            |((resource, interface), endpoint)| {
+                resource.source_index == interface.source_index()
+                    && resource.source_index == endpoint.source_index()
+                    && resource.resource_key == interface.resource_key()
+                    && resource.resource_key == endpoint.resource_key()
+                    && resource.resource_key.resource_class()
+                        == SnapshotRestoreResourceClass::NetworkPacketIo
+                    && resource.controller == interface.controller()
+                    && resource.profile == interface.portable().profile()
+                    && resource.backend == interface.portable().backend()
+                    && resource.mmds_stack == interface.mmds_stack()
+                    && resource.mmds_stack == endpoint.mmds_stack()
+            },
+        )
+    }
 }
 
 impl fmt::Debug for HvfSnapshotV2NetworkMmioPlatformPlan {
@@ -1082,6 +1322,36 @@ impl fmt::Debug for HvfSnapshotV2NetworkMmioPlatformPlan {
             .field("interface_count", &self.network.len())
             .field("state", &REDACTED)
             .finish()
+    }
+}
+
+pub(crate) struct HvfSnapshotV2NetworkMmioPlatformOwnerParts {
+    pub(crate) product: HvfSnapshotV2NetworkPreparedProduct,
+    pub(crate) mapping: Option<HvfSnapshotV2MemoryHotplugMappingPlan>,
+    pub(crate) balloon: Option<HvfSnapshotV2BalloonMmioEndpointPlan>,
+    pub(crate) storage: Option<HvfSnapshotV2StorageMmioPlatformPlan>,
+    pub(crate) network: Vec<HvfSnapshotV2NetworkMmioEndpointPlan>,
+    pub(crate) entropy: Option<HvfSnapshotV2NetworkAuxiliaryMmioEndpointPlan>,
+    pub(crate) memory_hotplug: Option<HvfSnapshotV2NetworkAuxiliaryMmioEndpointPlan>,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
+impl HvfSnapshotV2NetworkMmioPlatformPlan {
+    pub(crate) fn into_owner_parts(self) -> HvfSnapshotV2NetworkMmioPlatformOwnerParts {
+        HvfSnapshotV2NetworkMmioPlatformOwnerParts {
+            product: self.product,
+            mapping: self.mapping,
+            balloon: self.balloon,
+            storage: self.storage,
+            network: self.network,
+            entropy: self.entropy,
+            memory_hotplug: self.memory_hotplug,
+            serial_interrupt: self.serial_interrupt,
+            vmgenid_interrupt: self.vmgenid_interrupt,
+            vmclock_interrupt: self.vmclock_interrupt,
+        }
     }
 }
 
@@ -3790,6 +4060,21 @@ mod fixture_identity_tests {
                 plan.serial_interrupt().raw_value(),
                 first_interrupt + u32::try_from(device_count).unwrap(),
             );
+            let owner_parts = plan.into_owner_parts();
+            assert_eq!(owner_parts.storage.is_some(), has_storage);
+            assert_eq!(owner_parts.entropy.is_some(), has_entropy);
+            assert_eq!(owner_parts.memory_hotplug.is_some(), has_memory_hotplug);
+            let product_parts = owner_parts.product.into_owner_parts();
+            assert_eq!(product_parts.storage.is_some(), has_storage);
+            assert_eq!(product_parts.entropy.is_some(), has_entropy);
+            assert_eq!(product_parts.balloon.is_some(), has_balloon);
+            assert_eq!(
+                matches!(
+                    product_parts.memory,
+                    HvfSnapshotV2NetworkPreparedMemoryProduct::MemoryHotplug { .. }
+                ),
+                has_memory_hotplug
+            );
         }
     }
 
@@ -4393,6 +4678,51 @@ mod tests {
             plan.vmclock_interrupt(),
             platform.time().vmclock().interrupt_line(),
         );
+    }
+
+    #[test]
+    fn mmio_process_resource_preflight_closes_saved_order_identity() {
+        let (platform, state) = network_fixture(SnapshotV2DeviceTransportKind::Mmio);
+        let process = mmio_process(&state);
+        let process_topology = network_topology(state.clone());
+        let product = HvfSnapshotV2NetworkPreparedProduct::serial_network(
+            platform.memory().clone(),
+            network_topology(state),
+        );
+        let plan = prepare_hvf_snapshot_v2_network_mmio_platform_plan(&platform, product, process)
+            .expect("network-only MMIO product should plan");
+
+        let identities = process_topology.interfaces().iter().map(|interface| {
+            HvfSnapshotV2NetworkProcessResourceIdentity::new(
+                interface.source_index(),
+                interface.resource_key(),
+                interface.controller(),
+                interface.portable().profile(),
+                interface.portable().backend(),
+                interface.mmds_stack(),
+            )
+        });
+        assert!(plan.preflight_process_resource_identity(
+            identities,
+            process_topology.mmds_state(),
+            process_topology.mmds_controller(),
+        ));
+
+        let wrong_order = process_topology.interfaces().iter().map(|interface| {
+            HvfSnapshotV2NetworkProcessResourceIdentity::new(
+                interface.source_index().saturating_add(1),
+                interface.resource_key(),
+                interface.controller(),
+                interface.portable().profile(),
+                interface.portable().backend(),
+                interface.mmds_stack(),
+            )
+        });
+        assert!(!plan.preflight_process_resource_identity(
+            wrong_order,
+            process_topology.mmds_state(),
+            process_topology.mmds_controller(),
+        ));
     }
 
     #[test]

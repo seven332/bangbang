@@ -54,8 +54,11 @@ use bangbang_hvf::{
     HvfSnapshotV2MemoryHotplugPreparedProduct, HvfSnapshotV2MemoryHotplugState,
     HvfSnapshotV2MultiBlockMmioRestoreError, HvfSnapshotV2MultiBlockPciRestoreError,
     HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockProcessConfig,
-    HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2NetworkPlatformState,
-    HvfSnapshotV2NetworkState, HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformState,
+    HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2NetworkMmioMemoryInput,
+    HvfSnapshotV2NetworkMmioPlatformPlan, HvfSnapshotV2NetworkMmioRestoreDisposition,
+    HvfSnapshotV2NetworkMmioRestoreError, HvfSnapshotV2NetworkPlatformState,
+    HvfSnapshotV2NetworkProcessResourceIdentity, HvfSnapshotV2NetworkState,
+    HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformState,
     HvfSnapshotV2RestoredSerialShell, HvfSnapshotV2RootProcessConfig,
     HvfSnapshotV2RootResourcePlan, HvfSnapshotV2RootRestoreError,
     HvfSnapshotV2SerialOnlyProcessConfig, HvfSnapshotV2SerialOnlyRestoreError,
@@ -70,16 +73,16 @@ use bangbang_hvf::{
     PrepareHvfSnapshotV2MultiBlockPlatformPlanError, PrepareHvfSnapshotV2RootPlanError,
     PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
     PrepareHvfSnapshotV2StoragePciPlatformPlanError, PreparedHvfArm64BootPciNetworkRemoval,
-    PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2Platform,
-    decode_hvf_snapshot_v2_balloon_state, decode_hvf_snapshot_v2_entropy_state,
-    decode_hvf_snapshot_v2_memory_hotplug_state, decode_hvf_snapshot_v2_multi_block_state,
-    decode_hvf_snapshot_v2_platform_state, decode_hvf_snapshot_v2_serial_state,
-    decode_hvf_snapshot_v2_state, decode_hvf_snapshot_v2_storage_state,
-    encode_hvf_snapshot_v2_balloon_state, encode_hvf_snapshot_v2_entropy_state,
-    encode_hvf_snapshot_v2_memory_hotplug_state, encode_hvf_snapshot_v2_multi_block_state,
-    encode_hvf_snapshot_v2_network_state, encode_hvf_snapshot_v2_serial_state,
-    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
-    prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2NetworkMmioOwners,
+    RestoredHvfSnapshotV2Platform, decode_hvf_snapshot_v2_balloon_state,
+    decode_hvf_snapshot_v2_entropy_state, decode_hvf_snapshot_v2_memory_hotplug_state,
+    decode_hvf_snapshot_v2_multi_block_state, decode_hvf_snapshot_v2_platform_state,
+    decode_hvf_snapshot_v2_serial_state, decode_hvf_snapshot_v2_state,
+    decode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_balloon_state,
+    encode_hvf_snapshot_v2_entropy_state, encode_hvf_snapshot_v2_memory_hotplug_state,
+    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_network_state,
+    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
+    encode_hvf_snapshot_v2_storage_state, prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
     prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_pci_platform_plan,
@@ -152,8 +155,8 @@ use bangbang_runtime::pmem::{
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{
     CaptureReadySerialState, SerialConfig, SerialConfigError, SerialConfigInput, SerialMmioDevice,
-    SerialOutputFile, SerialStdio, SerialStdioRestoration, SerialStdioRestorationError,
-    SharedSerialOutput, SharedSerialOutputBuffer,
+    SerialOutputFile, SerialStdio, SerialStdioInput, SerialStdioRestoration,
+    SerialStdioRestorationError, SharedSerialOutput, SharedSerialOutputBuffer,
 };
 use bangbang_runtime::snapshot::{
     SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackendType, SnapshotV1ControllerCommit,
@@ -16514,10 +16517,6 @@ pub(crate) struct ProcessCaptureReadyNetworkInterfaceState {
     hvf: HvfArm64BootNetworkInterfaceCaptureState,
 }
 
-#[expect(
-    dead_code,
-    reason = "encoding-independent network handoff accessors are consumed by #1490"
-)]
 impl ProcessCaptureReadyNetworkInterfaceState {
     pub(crate) const fn provider_generation(&self) -> u64 {
         self.provider_generation
@@ -16561,10 +16560,6 @@ pub(crate) struct ProcessCaptureReadyMmdsState {
     metrics: MmdsMetrics,
 }
 
-#[expect(
-    dead_code,
-    reason = "encoding-independent MMDS handoff accessors are consumed by #1490"
-)]
 impl ProcessCaptureReadyMmdsState {
     pub(crate) const fn config(&self) -> &MmdsConfig {
         &self.config
@@ -17771,16 +17766,42 @@ where
         mmds_metrics: Option<&SharedMmdsMetrics>,
         now: Instant,
     ) -> Result<PreparedProcessNetworkCapture, ProcessCaptureReadyNetworkError> {
+        self.prepare_capture_for_owner_with_optional_mmds(
+            owner,
+            configs,
+            mmds_config,
+            Some(mmds_state),
+            mmds_metrics,
+            now,
+        )
+    }
+
+    fn prepare_capture_for_owner_with_optional_mmds(
+        &self,
+        owner: ProcessVmnetAuthority,
+        configs: &[NetworkInterfaceConfig],
+        mmds_config: Option<&MmdsConfig>,
+        mmds_state: Option<&MmdsStateHandle>,
+        mmds_metrics: Option<&SharedMmdsMetrics>,
+        now: Instant,
+    ) -> Result<PreparedProcessNetworkCapture, ProcessCaptureReadyNetworkError> {
         self.validate_capture_authority(configs, owner)?;
         if self.entries.len() != configs.len() {
             return Err(ProcessCaptureReadyNetworkError::InventoryMismatch);
         }
         let live_mmds_config = mmds_state
-            .config()
-            .map_err(|source| ProcessCaptureReadyNetworkError::MmdsState { source })?;
-        let mmds = match (mmds_config, self.mmds_detour.as_ref(), mmds_metrics) {
-            (None, None, None) if live_mmds_config.is_none() => None,
-            (Some(config), Some(detour), Some(metrics)) => {
+            .map(MmdsStateHandle::config)
+            .transpose()
+            .map_err(|source| ProcessCaptureReadyNetworkError::MmdsState { source })?
+            .flatten();
+        let mmds = match (
+            mmds_config,
+            mmds_state,
+            self.mmds_detour.as_ref(),
+            mmds_metrics,
+        ) {
+            (None, None | Some(_), None, None) if live_mmds_config.is_none() => None,
+            (Some(config), Some(mmds_state), Some(detour), Some(metrics)) => {
                 if !detour.mmds_state.shares_state_with(mmds_state)
                     || !detour.metrics.shares_state_with(metrics)
                     || detour.mmds_ipv4_address != config.effective_ipv4_address()
@@ -17898,14 +17919,16 @@ where
             {
                 return Err(ProcessCaptureReadyNetworkError::MmdsMismatch);
             }
-            let mmds_stack = match (stack, mmds_metrics) {
-                (Some(stack), Some(metrics)) => Some(
+            let mmds_stack = match (stack, mmds_state, mmds_metrics) {
+                (Some(stack), Some(mmds_state), Some(metrics)) => Some(
                     stack
                         .capture_descriptor(mmds_state, metrics)
                         .map_err(|source| ProcessCaptureReadyNetworkError::MmdsStack { source })?,
                 ),
-                (None, _) => None,
-                (Some(_), None) => return Err(ProcessCaptureReadyNetworkError::MmdsMismatch),
+                (None, _, _) => None,
+                (Some(_), None, _) | (Some(_), _, None) => {
+                    return Err(ProcessCaptureReadyNetworkError::MmdsMismatch);
+                }
             };
             let provider_cached_rx_len = entry.packet_io.capture_cached_rx_len();
             let provider_retry_after = entry.packet_io.packet_retry_after_at(now);
@@ -18575,23 +18598,95 @@ impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
     }
 }
 
-/// Value-only exact-2.11 network restore plan before any provider access.
-///
-/// The plan retains the complete owner-free runtime candidate, parsed macOS
-/// destination grammar, and immutable process authority. It owns no backend,
-/// descriptor, provider, callback, metric, MMDS owner, or platform resource.
-pub(crate) struct PreparedProcessSnapshotV2NetworkRestorePlan {
-    candidate: PreparedNativeV2NetworkSnapshotCandidateState,
+/// One owner-free packet-I/O projection retained beside the move-only
+/// exact-2.11 candidate.
+pub(crate) struct PreparedProcessSnapshotV2NetworkResourceInterface {
+    source_index: u16,
+    resource_key: SnapshotRestoreResourceKey,
+    controller: NetworkInterfaceConfig,
+    profile: NetworkDeviceProfile,
+    backend: SnapshotV2NetworkBackendClass,
+    mmds_stack: Option<SnapshotV2MmdsInterfaceState>,
+}
+
+/// Pure process resource blueprint that can be consumed only after the
+/// original candidate has moved into platform planning.
+pub(crate) struct PreparedProcessSnapshotV2NetworkResourcePlan {
+    interfaces: Vec<PreparedProcessSnapshotV2NetworkResourceInterface>,
+    mmds_state: Option<SnapshotV2MmdsState>,
+    mmds_controller: Option<MmdsConfig>,
     vmnet_configs: Vec<VmnetInterfaceConfig>,
     all_mmds: bool,
     authority: ProcessVmnetAuthority,
 }
 
+impl PreparedProcessSnapshotV2NetworkResourcePlan {
+    pub(crate) fn interface_count(&self) -> usize {
+        self.interfaces.len()
+    }
+
+    pub(crate) fn resource_keys(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &SnapshotRestoreResourceKey> {
+        self.interfaces
+            .iter()
+            .map(|interface| &interface.resource_key)
+    }
+
+    pub(crate) fn controllers(&self) -> impl ExactSizeIterator<Item = &NetworkInterfaceConfig> {
+        self.interfaces
+            .iter()
+            .map(|interface| &interface.controller)
+    }
+
+    pub(crate) const fn authority(&self) -> ProcessVmnetAuthority {
+        self.authority
+    }
+
+    fn matches_mmio_platform_plan(&self, plan: &HvfSnapshotV2NetworkMmioPlatformPlan) -> bool {
+        plan.preflight_process_resource_identity(
+            self.interfaces.iter().map(|interface| {
+                HvfSnapshotV2NetworkProcessResourceIdentity::new(
+                    interface.source_index,
+                    &interface.resource_key,
+                    &interface.controller,
+                    interface.profile,
+                    interface.backend,
+                    interface.mmds_stack,
+                )
+            }),
+            self.mmds_state.as_ref(),
+            self.mmds_controller.as_ref(),
+        )
+    }
+}
+
+impl fmt::Debug for PreparedProcessSnapshotV2NetworkResourcePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProcessSnapshotV2NetworkResourcePlan")
+            .field("interface_count", &self.interfaces.len())
+            .field("all_mmds", &self.all_mmds)
+            .field("authority", &self.authority)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Value-only exact-2.11 network restore plan before any provider access.
+///
+/// The plan retains the complete owner-free runtime candidate and an
+/// independently owned, bounded process resource blueprint. It owns no
+/// backend, descriptor, provider, callback, metric, MMDS owner, or platform
+/// resource.
+pub(crate) struct PreparedProcessSnapshotV2NetworkRestorePlan {
+    candidate: PreparedNativeV2NetworkSnapshotCandidateState,
+    resources: PreparedProcessSnapshotV2NetworkResourcePlan,
+}
+
 pub(crate) type PreparedProcessSnapshotV2NetworkRestorePlanParts = (
     PreparedNativeV2NetworkSnapshotCandidateState,
-    Vec<VmnetInterfaceConfig>,
-    bool,
-    ProcessVmnetAuthority,
+    PreparedProcessSnapshotV2NetworkResourcePlan,
 );
 
 impl PreparedProcessSnapshotV2NetworkRestorePlan {
@@ -18600,24 +18695,23 @@ impl PreparedProcessSnapshotV2NetworkRestorePlan {
     }
 
     pub(crate) fn vmnet_configs(&self) -> &[VmnetInterfaceConfig] {
-        &self.vmnet_configs
+        &self.resources.vmnet_configs
     }
 
     pub(crate) const fn all_mmds(&self) -> bool {
-        self.all_mmds
+        self.resources.all_mmds
     }
 
     pub(crate) const fn authority(&self) -> ProcessVmnetAuthority {
-        self.authority
+        self.resources.authority
+    }
+
+    pub(crate) const fn resources(&self) -> &PreparedProcessSnapshotV2NetworkResourcePlan {
+        &self.resources
     }
 
     pub(crate) fn into_parts(self) -> PreparedProcessSnapshotV2NetworkRestorePlanParts {
-        (
-            self.candidate,
-            self.vmnet_configs,
-            self.all_mmds,
-            self.authority,
-        )
+        (self.candidate, self.resources)
     }
 }
 
@@ -18625,9 +18719,9 @@ impl fmt::Debug for PreparedProcessSnapshotV2NetworkRestorePlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedProcessSnapshotV2NetworkRestorePlan")
-            .field("interface_count", &self.vmnet_configs.len())
-            .field("all_mmds", &self.all_mmds)
-            .field("authority", &self.authority)
+            .field("interface_count", &self.resources.interfaces.len())
+            .field("all_mmds", &self.resources.all_mmds)
+            .field("authority", &self.resources.authority)
             .field("state", &"<redacted>")
             .finish()
     }
@@ -18640,6 +18734,7 @@ enum ProcessSnapshotV2NetworkRestorePlanError {
     Selector {
         source: VmnetHostDeviceNameConfigError,
     },
+    CandidateMismatch,
     Authority(ProcessVmnetAuthorityValidationError),
 }
 
@@ -18648,6 +18743,9 @@ impl fmt::Debug for ProcessSnapshotV2NetworkRestorePlanError {
         formatter.write_str(match self {
             Self::Allocation { .. } => "ProcessSnapshotV2NetworkRestorePlanError::Allocation",
             Self::Selector { .. } => "ProcessSnapshotV2NetworkRestorePlanError::Selector",
+            Self::CandidateMismatch => {
+                "ProcessSnapshotV2NetworkRestorePlanError::CandidateMismatch"
+            }
             Self::Authority(source) => {
                 let _ = source;
                 "ProcessSnapshotV2NetworkRestorePlanError::Authority"
@@ -18661,6 +18759,9 @@ impl fmt::Display for ProcessSnapshotV2NetworkRestorePlanError {
         formatter.write_str(match self {
             Self::Allocation { .. } => "failed to allocate exact-2.11 network restore value plan",
             Self::Selector { .. } => "exact-2.11 network restore destination selector is invalid",
+            Self::CandidateMismatch => {
+                "exact-2.11 network restore resource identity is inconsistent"
+            }
             Self::Authority(_) => "exact-2.11 network restore destination authority is invalid",
         })
     }
@@ -18671,7 +18772,7 @@ impl std::error::Error for ProcessSnapshotV2NetworkRestorePlanError {
         match self {
             Self::Allocation { source } => Some(source),
             Self::Selector { source } => Some(source),
-            Self::Authority(_) => None,
+            Self::CandidateMismatch | Self::Authority(_) => None,
         }
     }
 }
@@ -18704,11 +18805,50 @@ fn prepare_process_snapshot_v2_network_restore_plan(
     )
     .map_err(ProcessSnapshotV2NetworkRestorePlanError::Authority)?;
 
-    Ok(PreparedProcessSnapshotV2NetworkRestorePlan {
-        candidate,
+    let mut resource_interfaces = Vec::new();
+    resource_interfaces
+        .try_reserve_exact(interfaces.len())
+        .map_err(|source| ProcessSnapshotV2NetworkRestorePlanError::Allocation { source })?;
+    for interface in interfaces {
+        if interface.resource_key().resource_class()
+            != SnapshotRestoreResourceClass::NetworkPacketIo
+            || !candidate.manifest().is_overridden(interface.resource_key())
+            || candidate
+                .manifest()
+                .resources()
+                .binary_search(interface.resource_key())
+                .is_err()
+        {
+            return Err(ProcessSnapshotV2NetworkRestorePlanError::CandidateMismatch);
+        }
+        let resource_key = interface
+            .resource_key()
+            .try_clone()
+            .map_err(|source| ProcessSnapshotV2NetworkRestorePlanError::Allocation { source })?;
+        let controller = interface
+            .controller()
+            .try_clone()
+            .map_err(|source| ProcessSnapshotV2NetworkRestorePlanError::Allocation { source })?;
+        resource_interfaces.push(PreparedProcessSnapshotV2NetworkResourceInterface {
+            source_index: interface.source_index(),
+            resource_key,
+            controller,
+            profile: interface.portable().profile(),
+            backend: interface.portable().backend(),
+            mmds_stack: interface.mmds_stack(),
+        });
+    }
+    let resources = PreparedProcessSnapshotV2NetworkResourcePlan {
+        interfaces: resource_interfaces,
+        mmds_state: candidate.topology().mmds_state().cloned(),
+        mmds_controller: candidate.topology().mmds_controller().cloned(),
         vmnet_configs,
         all_mmds,
         authority,
+    };
+    Ok(PreparedProcessSnapshotV2NetworkRestorePlan {
+        candidate,
+        resources,
     })
 }
 
@@ -18732,6 +18872,10 @@ const _: fn(&PreparedProcessSnapshotV2NetworkRestorePlan) -> bool =
     PreparedProcessSnapshotV2NetworkRestorePlan::all_mmds;
 const _: fn(&PreparedProcessSnapshotV2NetworkRestorePlan) -> ProcessVmnetAuthority =
     PreparedProcessSnapshotV2NetworkRestorePlan::authority;
+const _: fn(
+    &PreparedProcessSnapshotV2NetworkRestorePlan,
+) -> &PreparedProcessSnapshotV2NetworkResourcePlan =
+    PreparedProcessSnapshotV2NetworkRestorePlan::resources;
 const _: fn(
     PreparedProcessSnapshotV2NetworkRestorePlan,
 ) -> PreparedProcessSnapshotV2NetworkRestorePlanParts =
@@ -19007,13 +19151,16 @@ pub(crate) struct PreparedProcessSnapshotV2NetworkRestoreBatch<B>
 where
     B: ProcessVmnetBackend,
 {
-    candidate: Option<PreparedNativeV2NetworkSnapshotCandidateState>,
+    resource_interfaces: Vec<PreparedProcessSnapshotV2NetworkResourceInterface>,
     provider: Option<ProcessNetworkPacketIoRegistry<B>>,
     bindings:
         Option<PreparedSnapshotRestoreBindings<PreparedProcessSnapshotV2NetworkRestoreResource>>,
     mmds_state: Option<MmdsStateHandle>,
     mmds_metrics: Option<SharedMmdsMetrics>,
+    expected_mmds_state: Option<SnapshotV2MmdsState>,
+    expected_mmds_controller: Option<MmdsConfig>,
     network_metrics: SharedNetworkInterfaceMetricsRegistry,
+    authority: ProcessVmnetAuthority,
     resource_count: usize,
 }
 
@@ -19021,8 +19168,33 @@ impl<B> PreparedProcessSnapshotV2NetworkRestoreBatch<B>
 where
     B: ProcessVmnetBackend,
 {
-    pub(crate) const fn candidate(&self) -> Option<&PreparedNativeV2NetworkSnapshotCandidateState> {
-        self.candidate.as_ref()
+    fn resource_interfaces(&self) -> &[PreparedProcessSnapshotV2NetworkResourceInterface] {
+        &self.resource_interfaces
+    }
+
+    const fn expected_mmds_state(&self) -> Option<&SnapshotV2MmdsState> {
+        self.expected_mmds_state.as_ref()
+    }
+
+    const fn expected_mmds_controller(&self) -> Option<&MmdsConfig> {
+        self.expected_mmds_controller.as_ref()
+    }
+
+    fn matches_platform_plan(&self, plan: &HvfSnapshotV2NetworkMmioPlatformPlan) -> bool {
+        plan.preflight_process_resource_identity(
+            self.resource_interfaces.iter().map(|interface| {
+                HvfSnapshotV2NetworkProcessResourceIdentity::new(
+                    interface.source_index,
+                    &interface.resource_key,
+                    &interface.controller,
+                    interface.profile,
+                    interface.backend,
+                    interface.mmds_stack,
+                )
+            }),
+            self.expected_mmds_state(),
+            self.expected_mmds_controller(),
+        )
     }
 
     pub(crate) const fn provider(&self) -> Option<&ProcessNetworkPacketIoRegistry<B>> {
@@ -19041,10 +19213,63 @@ where
         &self.network_metrics
     }
 
+    pub(crate) const fn authority(&self) -> ProcessVmnetAuthority {
+        self.authority
+    }
+
     pub(crate) fn remaining_count(&self) -> usize {
         self.bindings
             .as_ref()
             .map_or(0, PreparedSnapshotRestoreBindings::remaining_count)
+    }
+
+    fn device_profiles(
+        &self,
+    ) -> Result<Vec<NetworkDeviceProfile>, ProcessSnapshotV2NetworkRestoreResourceError> {
+        let mut profiles = Vec::new();
+        profiles
+            .try_reserve_exact(self.resource_interfaces.len())
+            .map_err(|_| {
+                process_snapshot_v2_network_restore_allocation_error(
+                    ProcessSnapshotV2NetworkRestoreResourceStage::Take,
+                    ProcessSnapshotV2NetworkRestoreAllocation::ProviderEntries,
+                )
+            })?;
+        profiles.extend(
+            self.resource_interfaces
+                .iter()
+                .map(|interface| interface.profile),
+        );
+        Ok(profiles)
+    }
+
+    fn resource_matches(
+        &self,
+        index: usize,
+        resource: &PreparedProcessSnapshotV2NetworkRestoreResource,
+    ) -> bool {
+        let Some(expected) = self.resource_interfaces.get(index) else {
+            return false;
+        };
+        let Some(provider) = self.provider() else {
+            return false;
+        };
+        let publication = resource.publication();
+        publication.registry_id == provider.registry_id
+            && publication.owner == self.authority
+            && publication.iface_id == expected.controller.iface_id()
+            && resource.device_profile() == expected.profile
+            && resource._metrics_lease.belongs_to(&self.network_metrics)
+            && resource._metrics_lease.iface_id() == expected.controller.iface_id()
+            && provider.entries.iter().any(|entry| {
+                entry.registry_id == publication.registry_id
+                    && entry.owner == publication.owner
+                    && entry.generation == publication.generation
+                    && entry.iface_id == publication.iface_id
+                    && entry.device_profile == expected.profile
+                    && entry.packet_io.is_vmnet()
+                        == matches!(expected.backend, SnapshotV2NetworkBackendClass::Vmnet)
+            })
     }
 
     pub(crate) fn take(
@@ -19135,21 +19360,6 @@ where
             };
             return Err(error.with_cleanup_uncertain(cleanup_uncertain));
         }
-        let candidate = match self.candidate.take() {
-            Some(candidate) => candidate,
-            None => {
-                let cleanup_uncertain = self
-                    .provider
-                    .as_mut()
-                    .is_some_and(ProcessNetworkPacketIoRegistry::abort_all);
-                self.provider = None;
-                return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
-                    ProcessSnapshotV2NetworkRestoreResourceStage::Finish,
-                    ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
-                )
-                .with_cleanup_uncertain(cleanup_uncertain));
-            }
-        };
         let provider = match self.provider.take() {
             Some(provider) => provider,
             None => {
@@ -19160,11 +19370,14 @@ where
             }
         };
         Ok(PreparedProcessSnapshotV2NetworkRestoreCompletion {
-            candidate,
-            provider,
+            resource_interfaces: std::mem::take(&mut self.resource_interfaces),
+            provider: Some(provider),
             mmds_state: self.mmds_state.take(),
             mmds_metrics: self.mmds_metrics.take(),
+            expected_mmds_state: self.expected_mmds_state.take(),
+            expected_mmds_controller: self.expected_mmds_controller.take(),
             network_metrics: self.network_metrics.clone(),
+            authority: self.authority,
         })
     }
 }
@@ -19176,9 +19389,10 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedProcessSnapshotV2NetworkRestoreBatch")
-            .field("resource_count", &self.resource_count)
+            .field("resource_count", &self.resource_interfaces().len())
             .field("remaining_count", &self.remaining_count())
             .field("mmds", &self.mmds_state.as_ref().map(|_| "<fresh>"))
+            .field("authority", &self.authority())
             .field("state", &"<redacted>")
             .finish()
     }
@@ -19199,23 +19413,37 @@ pub(crate) struct PreparedProcessSnapshotV2NetworkRestoreCompletion<B>
 where
     B: ProcessVmnetBackend,
 {
-    candidate: PreparedNativeV2NetworkSnapshotCandidateState,
-    provider: ProcessNetworkPacketIoRegistry<B>,
+    resource_interfaces: Vec<PreparedProcessSnapshotV2NetworkResourceInterface>,
+    provider: Option<ProcessNetworkPacketIoRegistry<B>>,
     mmds_state: Option<MmdsStateHandle>,
     mmds_metrics: Option<SharedMmdsMetrics>,
+    expected_mmds_state: Option<SnapshotV2MmdsState>,
+    expected_mmds_controller: Option<MmdsConfig>,
     network_metrics: SharedNetworkInterfaceMetricsRegistry,
+    authority: ProcessVmnetAuthority,
 }
+
+type PreparedProcessSnapshotV2NetworkRestoreCompletionParts<B> = (
+    Vec<PreparedProcessSnapshotV2NetworkResourceInterface>,
+    ProcessNetworkPacketIoRegistry<B>,
+    Option<MmdsStateHandle>,
+    Option<SharedMmdsMetrics>,
+    Option<SnapshotV2MmdsState>,
+    Option<MmdsConfig>,
+    SharedNetworkInterfaceMetricsRegistry,
+    ProcessVmnetAuthority,
+);
 
 impl<B> PreparedProcessSnapshotV2NetworkRestoreCompletion<B>
 where
     B: ProcessVmnetBackend,
 {
-    pub(crate) const fn candidate(&self) -> &PreparedNativeV2NetworkSnapshotCandidateState {
-        &self.candidate
+    fn resource_interfaces(&self) -> &[PreparedProcessSnapshotV2NetworkResourceInterface] {
+        &self.resource_interfaces
     }
 
-    pub(crate) const fn provider(&self) -> &ProcessNetworkPacketIoRegistry<B> {
-        &self.provider
+    pub(crate) const fn provider(&self) -> Option<&ProcessNetworkPacketIoRegistry<B>> {
+        self.provider.as_ref()
     }
 
     pub(crate) const fn mmds_state(&self) -> Option<&MmdsStateHandle> {
@@ -19226,8 +19454,118 @@ where
         self.mmds_metrics.as_ref()
     }
 
+    fn expected_mmds_state(&self) -> Option<&SnapshotV2MmdsState> {
+        self.expected_mmds_state.as_ref()
+    }
+
+    fn expected_mmds_controller(&self) -> Option<&MmdsConfig> {
+        self.expected_mmds_controller.as_ref()
+    }
+
     pub(crate) const fn network_metrics(&self) -> &SharedNetworkInterfaceMetricsRegistry {
         &self.network_metrics
+    }
+
+    pub(crate) const fn authority(&self) -> ProcessVmnetAuthority {
+        self.authority
+    }
+
+    fn configs_match(&self, configs: &[NetworkInterfaceConfig]) -> bool {
+        self.resource_interfaces.len() == configs.len()
+            && self
+                .resource_interfaces
+                .iter()
+                .zip(configs)
+                .all(|(resource, config)| &resource.controller == config)
+    }
+
+    fn resources_match(
+        &self,
+        resources: &[PreparedProcessSnapshotV2NetworkRestoreResource],
+    ) -> bool {
+        let Some(provider) = self.provider() else {
+            return false;
+        };
+        self.resource_interfaces.len() == resources.len()
+            && self
+                .resource_interfaces
+                .iter()
+                .zip(resources)
+                .all(|(expected, resource)| {
+                    let publication = resource.publication();
+                    publication.registry_id == provider.registry_id
+                        && publication.owner == self.authority
+                        && publication.iface_id == expected.controller.iface_id()
+                        && resource.device_profile() == expected.profile
+                        && resource._metrics_lease.belongs_to(&self.network_metrics)
+                        && resource._metrics_lease.iface_id() == expected.controller.iface_id()
+                        && provider.entries.iter().any(|entry| {
+                            entry.registry_id == publication.registry_id
+                                && entry.owner == publication.owner
+                                && entry.generation == publication.generation
+                                && entry.iface_id == publication.iface_id
+                                && entry.device_profile == expected.profile
+                                && entry.packet_io.is_vmnet()
+                                    == matches!(
+                                        expected.backend,
+                                        SnapshotV2NetworkBackendClass::Vmnet
+                                    )
+                        })
+                })
+    }
+
+    pub(crate) fn abort(mut self) -> Result<(), ProcessSnapshotV2NetworkRestoreResourceError> {
+        let cleanup_uncertain = self
+            .provider
+            .as_mut()
+            .is_some_and(ProcessNetworkPacketIoRegistry::abort_all);
+        self.provider = None;
+        if cleanup_uncertain {
+            Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Finish,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(
+                    ProcessNetworkPacketIoProviderBuildError::CleanupUncertain,
+                ),
+            )
+            .with_cleanup_uncertain(true))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn into_parts(
+        mut self,
+    ) -> Result<
+        PreparedProcessSnapshotV2NetworkRestoreCompletionParts<B>,
+        ProcessSnapshotV2NetworkRestoreResourceError,
+    > {
+        let Some(provider) = self.provider.take() else {
+            return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+                ProcessSnapshotV2NetworkRestoreResourceStage::Finish,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::Consumed,
+            ));
+        };
+        Ok((
+            std::mem::take(&mut self.resource_interfaces),
+            provider,
+            self.mmds_state.take(),
+            self.mmds_metrics.take(),
+            self.expected_mmds_state.take(),
+            self.expected_mmds_controller.take(),
+            self.network_metrics.clone(),
+            self.authority,
+        ))
+    }
+}
+
+impl<B> Drop for PreparedProcessSnapshotV2NetworkRestoreCompletion<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn drop(&mut self) {
+        if let Some(provider) = self.provider.as_mut() {
+            let _ = provider.abort_all();
+        }
     }
 }
 
@@ -19239,6 +19577,7 @@ where
         formatter
             .debug_struct("PreparedProcessSnapshotV2NetworkRestoreCompletion")
             .field("mmds", &self.mmds_state.as_ref().map(|_| "<fresh>"))
+            .field("authority", &self.authority())
             .field("state", &"<redacted>")
             .finish()
     }
@@ -19259,10 +19598,6 @@ const _: fn(
     PreparedProcessSnapshotV2NetworkRestoreResource::publication;
 const _: fn(&PreparedProcessSnapshotV2NetworkRestoreResource) -> NetworkDeviceProfile =
     PreparedProcessSnapshotV2NetworkRestoreResource::device_profile;
-const _: fn(
-    &SystemPreparedProcessSnapshotV2NetworkRestoreBatch,
-) -> Option<&PreparedNativeV2NetworkSnapshotCandidateState> =
-    SystemPreparedProcessSnapshotV2NetworkRestoreBatch::candidate;
 const _: fn(
     &SystemPreparedProcessSnapshotV2NetworkRestoreBatch,
 ) -> Option<&ProcessNetworkPacketIoProvider> =
@@ -19296,11 +19631,7 @@ const _: fn(
 > = SystemPreparedProcessSnapshotV2NetworkRestoreBatch::finish;
 const _: fn(
     &SystemPreparedProcessSnapshotV2NetworkRestoreCompletion,
-) -> &PreparedNativeV2NetworkSnapshotCandidateState =
-    SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::candidate;
-const _: fn(
-    &SystemPreparedProcessSnapshotV2NetworkRestoreCompletion,
-) -> &ProcessNetworkPacketIoProvider =
+) -> Option<&ProcessNetworkPacketIoProvider> =
     SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::provider;
 const _: fn(&SystemPreparedProcessSnapshotV2NetworkRestoreCompletion) -> Option<&MmdsStateHandle> =
     SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::mmds_state;
@@ -19312,6 +19643,16 @@ const _: fn(
     &SystemPreparedProcessSnapshotV2NetworkRestoreCompletion,
 ) -> &SharedNetworkInterfaceMetricsRegistry =
     SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::network_metrics;
+const _: fn(
+    SystemPreparedProcessSnapshotV2NetworkRestoreCompletion,
+) -> Result<(), ProcessSnapshotV2NetworkRestoreResourceError> =
+    SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::abort;
+const _: fn(
+    SystemPreparedProcessSnapshotV2NetworkRestoreCompletion,
+) -> Result<
+    PreparedProcessSnapshotV2NetworkRestoreCompletionParts<SystemVmnetInterfaceBackend>,
+    ProcessSnapshotV2NetworkRestoreResourceError,
+> = SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::into_parts;
 
 fn process_snapshot_v2_network_restore_allocation_error(
     stage: ProcessSnapshotV2NetworkRestoreResourceStage,
@@ -19341,7 +19682,7 @@ where
 }
 
 fn prepare_process_snapshot_v2_network_restore_resources<C>(
-    plan: PreparedProcessSnapshotV2NetworkRestorePlan,
+    plan: PreparedProcessSnapshotV2NetworkResourcePlan,
     destination_instance_id: &str,
     mmds_data_store_limit_bytes: usize,
     cancelled: C,
@@ -19363,7 +19704,7 @@ where
 }
 
 fn prepare_process_snapshot_v2_network_restore_resources_with_factory<B, F, C>(
-    plan: PreparedProcessSnapshotV2NetworkRestorePlan,
+    plan: impl ProcessSnapshotV2NetworkResourcePlanInput,
     destination_instance_id: &str,
     mmds_data_store_limit_bytes: usize,
     factory: &mut F,
@@ -19388,7 +19729,7 @@ where
 }
 
 fn prepare_process_snapshot_v2_network_restore_resources_with_factory_and_allocation<B, F, A, C>(
-    plan: PreparedProcessSnapshotV2NetworkRestorePlan,
+    plan: impl ProcessSnapshotV2NetworkResourcePlanInput,
     destination_instance_id: &str,
     mmds_data_store_limit_bytes: usize,
     factory: &mut F,
@@ -19404,15 +19745,25 @@ where
     A: FnMut(ProcessSnapshotV2NetworkRestoreAllocation) -> bool,
     C: FnMut(ProcessSnapshotV2NetworkRestoreResourceStage) -> bool,
 {
+    let plan = plan.into_resource_plan();
+    let resource_count = plan.interface_count();
+    debug_assert_eq!(plan.resource_keys().len(), resource_count);
+    debug_assert_eq!(plan.controllers().len(), resource_count);
+    debug_assert_eq!(plan.authority(), plan.authority);
     if cancelled(ProcessSnapshotV2NetworkRestoreResourceStage::Start) {
         return Err(ProcessSnapshotV2NetworkRestoreResourceError::retryable(
             ProcessSnapshotV2NetworkRestoreResourceStage::Start,
             ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled,
         ));
     }
-    let (candidate, vmnet_configs, all_mmds, authority) = plan.into_parts();
-    let interfaces = candidate.topology().interfaces();
-    let resource_count = interfaces.len();
+    let PreparedProcessSnapshotV2NetworkResourcePlan {
+        interfaces,
+        mmds_state: expected_mmds_state,
+        mmds_controller: expected_mmds_controller,
+        vmnet_configs,
+        all_mmds,
+        authority,
+    } = plan;
     if interfaces.is_empty() || interfaces.len() != vmnet_configs.len() {
         return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
             ProcessSnapshotV2NetworkRestoreResourceStage::Start,
@@ -19444,11 +19795,10 @@ where
             ProcessSnapshotV2NetworkRestoreAllocation::OverrideKeys,
         )
     })?;
-    for interface in interfaces {
-        let key = interface.resource_key();
+    for (index, interface) in interfaces.iter().enumerate() {
+        let key = &interface.resource_key;
         if key.resource_class() != SnapshotRestoreResourceClass::NetworkPacketIo
-            || !candidate.manifest().is_overridden(key)
-            || candidate.manifest().resources().binary_search(key).is_err()
+            || usize::from(interface.source_index) != index
         {
             return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
                 ProcessSnapshotV2NetworkRestoreResourceStage::Bindings,
@@ -19510,7 +19860,7 @@ where
 
     let topology_all_mmds = interfaces
         .iter()
-        .all(|interface| interface.mmds_stack().is_some());
+        .all(|interface| interface.mmds_stack.is_some());
     if all_mmds != topology_all_mmds {
         return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
             ProcessSnapshotV2NetworkRestoreResourceStage::Start,
@@ -19537,21 +19887,21 @@ where
             )
         })?;
     for (interface, resolved_vmnet) in interfaces.iter().zip(&vmnet_configs) {
-        let expected_profile = interface.portable().profile();
+        let expected_profile = interface.profile;
         let reparsed =
-            VmnetInterfaceConfig::from_host_dev_name(interface.controller().host_dev_name())
+            VmnetInterfaceConfig::from_host_dev_name(interface.controller.host_dev_name())
                 .map_err(|_| {
                     ProcessSnapshotV2NetworkRestoreResourceError::terminal(
                         ProcessSnapshotV2NetworkRestoreResourceStage::Start,
                         ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
                     )
                 })?;
-        if interface.portable().backend() != expected_class
+        if interface.backend != expected_class
             || &reparsed != resolved_vmnet
             || matches!(expected_class, SnapshotV2NetworkBackendClass::Vmnet)
                 && expected_profile.guest_mac().is_none()
             || matches!(expected_class, SnapshotV2NetworkBackendClass::MmdsOnly)
-                && expected_profile != NetworkDeviceProfile::from_config(interface.controller())
+                && expected_profile != NetworkDeviceProfile::from_config(&interface.controller)
         {
             return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
                 ProcessSnapshotV2NetworkRestoreResourceStage::Start,
@@ -19585,7 +19935,7 @@ where
     let network_metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(
         interfaces
             .iter()
-            .map(|interface| interface.controller().iface_id()),
+            .map(|interface| interface.controller.iface_id()),
         bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT,
     )
     .map_err(|source| {
@@ -19608,10 +19958,10 @@ where
                 ProcessSnapshotV2NetworkRestoreAllocation::MetricsLeases,
             )
         })?;
-    for interface in interfaces {
+    for interface in &interfaces {
         metrics_leases.push(
             network_metrics
-                .claim_interface_lease(interface.controller().iface_id())
+                .claim_interface_lease(interface.controller.iface_id())
                 .map_err(|source| {
                     ProcessSnapshotV2NetworkRestoreResourceError::retryable(
                         ProcessSnapshotV2NetworkRestoreResourceStage::Metrics,
@@ -19628,7 +19978,9 @@ where
     }
 
     let (mmds_state, mmds_metrics, mmds_detour) = prepare_fresh_process_snapshot_v2_network_mmds(
-        &candidate,
+        expected_mmds_state.as_ref(),
+        expected_mmds_controller.as_ref(),
+        &interfaces,
         destination_instance_id,
         mmds_data_store_limit_bytes,
         &mut allocation_failed,
@@ -19682,7 +20034,7 @@ where
         authority,
         interfaces
             .iter()
-            .filter_map(|interface| interface.portable().profile().guest_mac()),
+            .filter_map(|interface| interface.profile.guest_mac()),
     )
     .map_err(|source| {
         ProcessSnapshotV2NetworkRestoreResourceError::provider(
@@ -19706,15 +20058,15 @@ where
                 ),
             ));
         }
-        let expected_profile = interface.portable().profile();
-        let expected_class = match interface.portable().backend() {
+        let expected_profile = interface.profile;
+        let expected_class = match interface.backend {
             SnapshotV2NetworkBackendClass::MmdsOnly => ProcessNetworkPacketIoEntryClass::MmdsOnly,
             SnapshotV2NetworkBackendClass::Vmnet => ProcessNetworkPacketIoEntryClass::Vmnet,
         };
-        let class = provider.class_for_interface(interface.controller().iface_id());
+        let class = provider.class_for_interface(interface.controller.iface_id());
         debug_assert_eq!(class, expected_class);
         let prepared = match provider.prepare_resolved_entry_with_factory(
-            interface.controller(),
+            &interface.controller,
             provider_vmnet,
             class,
             expected_profile.guest_mac().is_some(),
@@ -19754,7 +20106,7 @@ where
             _metrics_lease: metrics_lease,
             device_profile,
         };
-        if let Err(rejection) = bindings.bind(interface.resource_key(), resource) {
+        if let Err(rejection) = bindings.bind(&interface.resource_key, resource) {
             let reason = rejection.reason();
             let rejected = rejection.into_value();
             let cleanup_uncertain = provider.abort_all();
@@ -19803,14 +20155,36 @@ where
     }
 
     Ok(PreparedProcessSnapshotV2NetworkRestoreBatch {
-        candidate: Some(candidate),
+        resource_interfaces: interfaces,
         provider: Some(provider),
         bindings: Some(bindings),
         mmds_state,
         mmds_metrics,
+        expected_mmds_state,
+        expected_mmds_controller,
         network_metrics,
+        authority,
         resource_count,
     })
+}
+
+trait ProcessSnapshotV2NetworkResourcePlanInput {
+    fn into_resource_plan(self) -> PreparedProcessSnapshotV2NetworkResourcePlan;
+}
+
+impl ProcessSnapshotV2NetworkResourcePlanInput for PreparedProcessSnapshotV2NetworkResourcePlan {
+    fn into_resource_plan(self) -> PreparedProcessSnapshotV2NetworkResourcePlan {
+        self
+    }
+}
+
+#[cfg(test)]
+impl ProcessSnapshotV2NetworkResourcePlanInput for PreparedProcessSnapshotV2NetworkRestorePlan {
+    fn into_resource_plan(self) -> PreparedProcessSnapshotV2NetworkResourcePlan {
+        let (candidate, resources) = self.into_parts();
+        drop(candidate);
+        resources
+    }
 }
 
 type PreparedProcessSnapshotV2NetworkMmds = (
@@ -19820,7 +20194,9 @@ type PreparedProcessSnapshotV2NetworkMmds = (
 );
 
 fn prepare_fresh_process_snapshot_v2_network_mmds<A>(
-    candidate: &PreparedNativeV2NetworkSnapshotCandidateState,
+    expected_state: Option<&SnapshotV2MmdsState>,
+    config: Option<&MmdsConfig>,
+    interfaces: &[PreparedProcessSnapshotV2NetworkResourceInterface],
     destination_instance_id: &str,
     mmds_data_store_limit_bytes: usize,
     allocation_failed: &mut A,
@@ -19828,13 +20204,11 @@ fn prepare_fresh_process_snapshot_v2_network_mmds<A>(
 where
     A: FnMut(ProcessSnapshotV2NetworkRestoreAllocation) -> bool,
 {
-    let topology = candidate.topology();
-    let Some(config) = topology.mmds_controller() else {
-        if topology.mmds_state().is_some()
-            || topology
-                .interfaces()
+    let Some(config) = config else {
+        if expected_state.is_some()
+            || interfaces
                 .iter()
-                .any(|interface| interface.mmds_stack().is_some())
+                .any(|interface| interface.mmds_stack.is_some())
         {
             return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
                 ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
@@ -19843,7 +20217,7 @@ where
         }
         return Ok((None, None, None));
     };
-    if topology.mmds_state().is_none() {
+    if expected_state.is_none() {
         return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
             ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
             ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
@@ -19887,20 +20261,20 @@ where
         ProcessSnapshotV2NetworkRestoreAllocation::MmdsControllers,
     )?;
     controllers
-        .try_reserve_exact(topology.interfaces().len())
+        .try_reserve_exact(interfaces.len())
         .map_err(|_| {
             process_snapshot_v2_network_restore_allocation_error(
                 ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
                 ProcessSnapshotV2NetworkRestoreAllocation::MmdsControllers,
             )
         })?;
-    for interface in topology.interfaces() {
+    for interface in interfaces {
         check_process_snapshot_v2_network_restore_allocation(
             allocation_failed,
             ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
             ProcessSnapshotV2NetworkRestoreAllocation::MmdsControllerCopy,
         )?;
-        controllers.push(interface.controller().try_clone().map_err(|_| {
+        controllers.push(interface.controller.try_clone().map_err(|_| {
             process_snapshot_v2_network_restore_allocation_error(
                 ProcessSnapshotV2NetworkRestoreResourceStage::Mmds,
                 ProcessSnapshotV2NetworkRestoreAllocation::MmdsControllerCopy,
@@ -19956,7 +20330,7 @@ where
 }
 
 type ProcessSnapshotV2NetworkRestoreResourceBuilder = fn(
-    PreparedProcessSnapshotV2NetworkRestorePlan,
+    PreparedProcessSnapshotV2NetworkResourcePlan,
     &str,
     usize,
     fn(ProcessSnapshotV2NetworkRestoreResourceStage) -> bool,
@@ -19969,6 +20343,705 @@ const _: ProcessSnapshotV2NetworkRestoreResourceBuilder =
     prepare_process_snapshot_v2_network_restore_resources::<
         fn(ProcessSnapshotV2NetworkRestoreResourceStage) -> bool,
     >;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessSnapshotV2NetworkMmioRestoreStage {
+    ResourcePreparation,
+    ResourceTake { index: usize },
+    ProviderFinish,
+    HvfConstruction,
+    CompleteRecapture,
+    Assembly,
+    GateCommit,
+    Cleanup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessSnapshotV2NetworkMmioRestoreDisposition {
+    Retryable,
+    Terminal,
+    TerminalCleanup,
+}
+
+/// Bounded process-level failure for the still-private exact-2.11 MMIO
+/// reconstruction transaction.
+struct ProcessSnapshotV2NetworkMmioRestoreError {
+    stage: ProcessSnapshotV2NetworkMmioRestoreStage,
+    disposition: ProcessSnapshotV2NetworkMmioRestoreDisposition,
+}
+
+impl ProcessSnapshotV2NetworkMmioRestoreError {
+    const fn retryable(stage: ProcessSnapshotV2NetworkMmioRestoreStage) -> Self {
+        Self {
+            stage,
+            disposition: ProcessSnapshotV2NetworkMmioRestoreDisposition::Retryable,
+        }
+    }
+
+    const fn terminal(
+        stage: ProcessSnapshotV2NetworkMmioRestoreStage,
+        cleanup_uncertain: bool,
+    ) -> Self {
+        Self {
+            stage,
+            disposition: if cleanup_uncertain {
+                ProcessSnapshotV2NetworkMmioRestoreDisposition::TerminalCleanup
+            } else {
+                ProcessSnapshotV2NetworkMmioRestoreDisposition::Terminal
+            },
+        }
+    }
+
+    fn from_resource(
+        stage: ProcessSnapshotV2NetworkMmioRestoreStage,
+        source: &ProcessSnapshotV2NetworkRestoreResourceError,
+    ) -> Self {
+        if source.cleanup_uncertain {
+            return Self::terminal(stage, true);
+        }
+        match source.disposition() {
+            ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable => Self::retryable(stage),
+            ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal => {
+                Self::terminal(stage, false)
+            }
+        }
+    }
+
+    fn from_hvf(
+        source: &HvfSnapshotV2NetworkMmioRestoreError,
+        process_cleanup_uncertain: bool,
+    ) -> Self {
+        if source.has_incomplete_cleanup() || process_cleanup_uncertain {
+            return Self::terminal(
+                ProcessSnapshotV2NetworkMmioRestoreStage::HvfConstruction,
+                true,
+            );
+        }
+        match source.disposition() {
+            HvfSnapshotV2NetworkMmioRestoreDisposition::Retryable => {
+                Self::retryable(ProcessSnapshotV2NetworkMmioRestoreStage::HvfConstruction)
+            }
+            HvfSnapshotV2NetworkMmioRestoreDisposition::Terminal
+            | HvfSnapshotV2NetworkMmioRestoreDisposition::TerminalCleanup => Self::terminal(
+                ProcessSnapshotV2NetworkMmioRestoreStage::HvfConstruction,
+                false,
+            ),
+        }
+    }
+}
+
+impl fmt::Debug for ProcessSnapshotV2NetworkMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessSnapshotV2NetworkMmioRestoreError")
+            .field("stage", &self.stage)
+            .field("disposition", &self.disposition)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for ProcessSnapshotV2NetworkMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.11 process MMIO network reconstruction failed at {:?} ({:?})",
+            self.stage, self.disposition
+        )
+    }
+}
+
+impl std::error::Error for ProcessSnapshotV2NetworkMmioRestoreError {}
+
+/// Complete unpublished process/HVF exact-2.11 MMIO network owner graph.
+///
+/// Field order is the fallback cleanup order: HVF session and scheduler,
+/// provider/MMDS completion, then the saved-order publication receipts and
+/// metrics leases.
+struct RestoredProcessSnapshotV2NetworkMmioOwners<B>
+where
+    B: ProcessVmnetBackend,
+{
+    hvf: Option<RestoredHvfSnapshotV2NetworkMmioOwners>,
+    completion: Option<PreparedProcessSnapshotV2NetworkRestoreCompletion<B>>,
+    resources: Vec<PreparedProcessSnapshotV2NetworkRestoreResource>,
+}
+
+impl<B> RestoredProcessSnapshotV2NetworkMmioOwners<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn shutdown(&mut self) -> Result<(), ProcessSnapshotV2NetworkMmioRestoreError> {
+        let hvf_cleanup_uncertain = self
+            .hvf
+            .as_mut()
+            .is_some_and(|hvf| hvf.session_mut().shutdown().is_err());
+        self.hvf = None;
+        let process_cleanup_uncertain = self
+            .completion
+            .take()
+            .is_some_and(|completion| completion.abort().is_err());
+        self.resources.clear();
+        if hvf_cleanup_uncertain || process_cleanup_uncertain {
+            Err(ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+                ProcessSnapshotV2NetworkMmioRestoreStage::Cleanup,
+                true,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<B> Drop for RestoredProcessSnapshotV2NetworkMmioOwners<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+impl<B> fmt::Debug for RestoredProcessSnapshotV2NetworkMmioOwners<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoredProcessSnapshotV2NetworkMmioOwners")
+            .field("interface_count", &self.resources.len())
+            .field(
+                "retry_publication_committed",
+                &self.hvf.as_ref().is_some_and(
+                    RestoredHvfSnapshotV2NetworkMmioOwners::retry_publication_is_committed,
+                ),
+            )
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+fn abort_completed_process_snapshot_v2_network_resources<B>(
+    completion: PreparedProcessSnapshotV2NetworkRestoreCompletion<B>,
+    resources: Vec<PreparedProcessSnapshotV2NetworkRestoreResource>,
+) -> bool
+where
+    B: ProcessVmnetBackend,
+{
+    let cleanup_uncertain = completion.abort().is_err();
+    drop(resources);
+    cleanup_uncertain
+}
+
+fn abort_unfinished_process_snapshot_v2_network_resources<B>(
+    mut batch: PreparedProcessSnapshotV2NetworkRestoreBatch<B>,
+    resources: Vec<PreparedProcessSnapshotV2NetworkRestoreResource>,
+) -> bool
+where
+    B: ProcessVmnetBackend,
+{
+    let cleanup_uncertain = batch
+        .provider
+        .as_mut()
+        .is_some_and(ProcessNetworkPacketIoRegistry::abort_all);
+    batch.provider = None;
+    batch.bindings = None;
+    drop(batch);
+    drop(resources);
+    cleanup_uncertain
+}
+
+fn abort_staged_process_snapshot_v2_network_mmio<B>(
+    mut hvf: RestoredHvfSnapshotV2NetworkMmioOwners,
+    completion: PreparedProcessSnapshotV2NetworkRestoreCompletion<B>,
+    resources: Vec<PreparedProcessSnapshotV2NetworkRestoreResource>,
+) -> bool
+where
+    B: ProcessVmnetBackend,
+{
+    let hvf_cleanup_uncertain = hvf.session_mut().shutdown().is_err();
+    drop(hvf);
+    let process_cleanup_uncertain =
+        abort_completed_process_snapshot_v2_network_resources(completion, resources);
+    hvf_cleanup_uncertain || process_cleanup_uncertain
+}
+
+fn restored_process_snapshot_v2_network_mmio_is_equivalent<B>(
+    hvf: &RestoredHvfSnapshotV2NetworkMmioOwners,
+    completion: &PreparedProcessSnapshotV2NetworkRestoreCompletion<B>,
+    resources: &[PreparedProcessSnapshotV2NetworkRestoreResource],
+    now: Instant,
+) -> Result<(), ()>
+where
+    B: ProcessVmnetBackend,
+{
+    if !completion.configs_match(hvf.configs())
+        || !completion.resources_match(resources)
+        || completion.expected_mmds_state() != hvf.mmds_state()
+        || completion.expected_mmds_controller() != hvf.mmds_config()
+        || !completion
+            .network_metrics()
+            .shares_state_with(&hvf.session().shared_network_interface_metrics())
+    {
+        return Err(());
+    }
+
+    let Some(provider) = completion.provider() else {
+        return Err(());
+    };
+    if provider.readiness_wake.is_some() || provider.readiness_bridge.is_some() {
+        return Err(());
+    }
+    match (
+        completion.mmds_state(),
+        completion.mmds_metrics(),
+        hvf.mmds_config(),
+    ) {
+        (None, None, None) => {}
+        (Some(state), Some(metrics), Some(config)) => {
+            let state_is_fresh = state
+                .with(|state| {
+                    state.config() == Some(config)
+                        && state.data_store_present()
+                        && state.get_data().is_err()
+                })
+                .map_err(|_| ())?;
+            if !state_is_fresh || !metrics.snapshot().is_empty() {
+                return Err(());
+            }
+        }
+        _ => return Err(()),
+    }
+
+    let publication_guard = provider
+        .quiesce_capture_publication_for_owner(completion.authority())
+        .map_err(|_| ())?;
+    let limiter_guard = hvf
+        .session()
+        .quiesce_limiter_retry_wakeups()
+        .map_err(|_| ())?;
+    let prepared = provider
+        .prepare_capture_for_owner_with_optional_mmds(
+            completion.authority(),
+            hvf.configs(),
+            hvf.mmds_config(),
+            completion.mmds_state(),
+            completion.mmds_metrics(),
+            now,
+        )
+        .map_err(|_| ())?;
+    let metrics = hvf
+        .session()
+        .shared_network_interface_metrics()
+        .capture_state()
+        .map_err(|_| ())?;
+    let captured_hvf = hvf
+        .session()
+        .capture_ready_network_state_at(&prepared.hvf_configs, &limiter_guard, now)
+        .map_err(|_| ())?;
+    let captured =
+        compose_process_capture_ready_network_state(hvf.configs(), prepared, metrics, captured_hvf)
+            .map_err(|_| ())?;
+
+    if captured.interfaces().len() != resources.len()
+        || captured
+            .interfaces()
+            .iter()
+            .zip(resources)
+            .any(|(captured, resource)| {
+                captured.provider_generation() != resource.publication().generation
+                    || captured.metrics_generation() != resource._metrics_lease.generation()
+            })
+        || captured.source_work_normalized()
+        || !captured.aggregate_metrics().is_empty()
+        || captured
+            .interfaces()
+            .iter()
+            .any(|interface| !interface.metrics().is_empty())
+        || captured
+            .mmds()
+            .is_some_and(|mmds| !mmds.metrics().is_empty())
+    {
+        return Err(());
+    }
+    let portable =
+        convert_process_capture_ready_network_state(captured, SnapshotV2DeviceTransportKind::Mmio)
+            .map_err(|_| ())?
+            .ok_or(())?;
+    if portable.interfaces() != hvf.expected() || portable.mmds() != hvf.mmds_state() {
+        return Err(());
+    }
+    drop(limiter_guard);
+    drop(publication_guard);
+    Ok(())
+}
+
+fn prepared_process_snapshot_v2_network_batch_is_fresh<B>(
+    batch: &PreparedProcessSnapshotV2NetworkRestoreBatch<B>,
+) -> bool
+where
+    B: ProcessVmnetBackend,
+{
+    let Some(provider) = batch.provider() else {
+        return false;
+    };
+    if provider.owner != batch.authority()
+        || provider.entries.len() != batch.resource_interfaces().len()
+        || provider.readiness_wake.is_some()
+        || provider.readiness_bridge.is_some()
+        || provider.entries.iter().any(|entry| {
+            entry.registry_id != provider.registry_id
+                || entry.owner != provider.owner
+                || entry.generation >= provider.next_generation
+        })
+    {
+        return false;
+    }
+    let Ok(metrics) = batch.network_metrics().capture_state() else {
+        return false;
+    };
+    if metrics.entries().len() != batch.resource_interfaces().len()
+        || !metrics.aggregate().is_empty()
+        || metrics
+            .entries()
+            .iter()
+            .any(|entry| !entry.metrics().is_empty())
+    {
+        return false;
+    }
+    match (
+        batch.mmds_state(),
+        batch.mmds_metrics(),
+        batch.expected_mmds_controller(),
+    ) {
+        (None, None, None) => true,
+        (Some(state), Some(metrics), Some(config)) => {
+            metrics.snapshot().is_empty()
+                && state
+                    .with(|state| {
+                        state.config() == Some(config)
+                            && state.data_store_present()
+                            && state.get_data().is_err()
+                    })
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn restore_process_snapshot_v2_network_mmio_with_factory<B, F, C>(
+    platform: HvfSnapshotV2PlatformState,
+    memory: HvfSnapshotV2NetworkMmioMemoryInput,
+    process_shell: HvfSnapshotV2RestoredSerialShell,
+    serial_input: Option<SerialStdioInput>,
+    platform_plan: HvfSnapshotV2NetworkMmioPlatformPlan,
+    resource_plan: PreparedProcessSnapshotV2NetworkResourcePlan,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    factory: &mut F,
+    now: Instant,
+    mut cancelled: C,
+) -> Result<RestoredProcessSnapshotV2NetworkMmioOwners<B>, ProcessSnapshotV2NetworkMmioRestoreError>
+where
+    B: ProcessVmnetBackend,
+    F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    C: FnMut(ProcessSnapshotV2NetworkMmioRestoreStage) -> bool,
+{
+    if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation)
+        || !resource_plan.matches_mmio_platform_plan(&platform_plan)
+    {
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::retryable(
+            ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation,
+        ));
+    }
+
+    let mut batch = {
+        let mut resource_cancelled =
+            |_| cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation);
+        prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            resource_plan,
+            destination_instance_id,
+            mmds_data_store_limit_bytes,
+            factory,
+            &mut resource_cancelled,
+        )
+        .map_err(|source| {
+            ProcessSnapshotV2NetworkMmioRestoreError::from_resource(
+                ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation,
+                &source,
+            )
+        })?
+    };
+    if !batch.matches_platform_plan(&platform_plan)
+        || !prepared_process_snapshot_v2_network_batch_is_fresh(&batch)
+    {
+        let cleanup_uncertain = batch.abort().is_err();
+        return Err(if cleanup_uncertain {
+            ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+                ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation,
+                true,
+            )
+        } else {
+            ProcessSnapshotV2NetworkMmioRestoreError::retryable(
+                ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation,
+            )
+        });
+    }
+
+    let profiles = match batch.device_profiles() {
+        Ok(profiles) => profiles,
+        Err(source) => {
+            let cleanup_uncertain = batch.abort().is_err();
+            if cleanup_uncertain {
+                return Err(ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+                    ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation,
+                    true,
+                ));
+            }
+            return Err(ProcessSnapshotV2NetworkMmioRestoreError::from_resource(
+                ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation,
+                &source,
+            ));
+        }
+    };
+    let mut resources = Vec::new();
+    if resources
+        .try_reserve_exact(batch.resource_interfaces().len())
+        .is_err()
+    {
+        let cleanup_uncertain = batch.abort().is_err();
+        return Err(if cleanup_uncertain {
+            ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+                ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation,
+                true,
+            )
+        } else {
+            ProcessSnapshotV2NetworkMmioRestoreError::retryable(
+                ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation,
+            )
+        });
+    }
+    for index in 0..batch.resource_interfaces().len() {
+        let stage = ProcessSnapshotV2NetworkMmioRestoreStage::ResourceTake { index };
+        if cancelled(stage) {
+            let cleanup_uncertain =
+                abort_unfinished_process_snapshot_v2_network_resources(batch, resources);
+            return Err(if cleanup_uncertain {
+                ProcessSnapshotV2NetworkMmioRestoreError::terminal(stage, true)
+            } else {
+                ProcessSnapshotV2NetworkMmioRestoreError::retryable(stage)
+            });
+        }
+        let Some(endpoint) = platform_plan.network().get(index) else {
+            let cleanup_uncertain =
+                abort_unfinished_process_snapshot_v2_network_resources(batch, resources);
+            return Err(if cleanup_uncertain {
+                ProcessSnapshotV2NetworkMmioRestoreError::terminal(stage, true)
+            } else {
+                ProcessSnapshotV2NetworkMmioRestoreError::retryable(stage)
+            });
+        };
+        let resource = match batch.take(endpoint.resource_key()) {
+            Ok(resource) => resource,
+            Err(_) => {
+                let cleanup_uncertain =
+                    abort_unfinished_process_snapshot_v2_network_resources(batch, resources);
+                return Err(if cleanup_uncertain {
+                    ProcessSnapshotV2NetworkMmioRestoreError::terminal(stage, true)
+                } else {
+                    ProcessSnapshotV2NetworkMmioRestoreError::retryable(stage)
+                });
+            }
+        };
+        if !batch.resource_matches(index, &resource) {
+            resources.push(resource);
+            let cleanup_uncertain =
+                abort_unfinished_process_snapshot_v2_network_resources(batch, resources);
+            return Err(if cleanup_uncertain {
+                ProcessSnapshotV2NetworkMmioRestoreError::terminal(stage, true)
+            } else {
+                ProcessSnapshotV2NetworkMmioRestoreError::retryable(stage)
+            });
+        }
+        resources.push(resource);
+    }
+    if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::ProviderFinish) {
+        let cleanup_uncertain =
+            abort_unfinished_process_snapshot_v2_network_resources(batch, resources);
+        return Err(if cleanup_uncertain {
+            ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+                ProcessSnapshotV2NetworkMmioRestoreStage::ProviderFinish,
+                true,
+            )
+        } else {
+            ProcessSnapshotV2NetworkMmioRestoreError::retryable(
+                ProcessSnapshotV2NetworkMmioRestoreStage::ProviderFinish,
+            )
+        });
+    }
+    let completion = match batch.finish() {
+        Ok(completion) => completion,
+        Err(source) => {
+            drop(resources);
+            return Err(ProcessSnapshotV2NetworkMmioRestoreError::from_resource(
+                ProcessSnapshotV2NetworkMmioRestoreStage::ProviderFinish,
+                &source,
+            ));
+        }
+    };
+    if !completion.resources_match(&resources) {
+        let cleanup_uncertain =
+            abort_completed_process_snapshot_v2_network_resources(completion, resources);
+        return Err(if cleanup_uncertain {
+            ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+                ProcessSnapshotV2NetworkMmioRestoreStage::ProviderFinish,
+                true,
+            )
+        } else {
+            ProcessSnapshotV2NetworkMmioRestoreError::retryable(
+                ProcessSnapshotV2NetworkMmioRestoreStage::ProviderFinish,
+            )
+        });
+    }
+    if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::HvfConstruction) {
+        let cleanup_uncertain =
+            abort_completed_process_snapshot_v2_network_resources(completion, resources);
+        return Err(if cleanup_uncertain {
+            ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+                ProcessSnapshotV2NetworkMmioRestoreStage::HvfConstruction,
+                true,
+            )
+        } else {
+            ProcessSnapshotV2NetworkMmioRestoreError::retryable(
+                ProcessSnapshotV2NetworkMmioRestoreStage::HvfConstruction,
+            )
+        });
+    }
+
+    let staged_hvf = match OwnedHvfArm64BootSession::restore_snapshot_v2_network_mmio(
+        platform,
+        memory,
+        process_shell,
+        serial_input,
+        platform_plan,
+        profiles,
+        completion.network_metrics().clone(),
+        now,
+    ) {
+        Ok(staged_hvf) => staged_hvf,
+        Err(source) => {
+            let cleanup_uncertain =
+                abort_completed_process_snapshot_v2_network_resources(completion, resources);
+            return Err(ProcessSnapshotV2NetworkMmioRestoreError::from_hvf(
+                &source,
+                cleanup_uncertain,
+            ));
+        }
+    };
+
+    if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::CompleteRecapture)
+        || restored_process_snapshot_v2_network_mmio_is_equivalent(
+            &staged_hvf,
+            &completion,
+            &resources,
+            now,
+        )
+        .is_err()
+    {
+        let cleanup_uncertain =
+            abort_staged_process_snapshot_v2_network_mmio(staged_hvf, completion, resources);
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+            ProcessSnapshotV2NetworkMmioRestoreStage::CompleteRecapture,
+            cleanup_uncertain,
+        ));
+    }
+
+    if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::Assembly) {
+        let cleanup_uncertain =
+            abort_staged_process_snapshot_v2_network_mmio(staged_hvf, completion, resources);
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+            ProcessSnapshotV2NetworkMmioRestoreStage::Assembly,
+            cleanup_uncertain,
+        ));
+    }
+    let mut owners = RestoredProcessSnapshotV2NetworkMmioOwners {
+        hvf: Some(staged_hvf),
+        completion: Some(completion),
+        resources,
+    };
+    let owner_graph_is_complete = match (&owners.hvf, &owners.completion) {
+        (Some(hvf), Some(completion)) => {
+            !owners.resources.is_empty()
+                && hvf.configs().len() == owners.resources.len()
+                && completion.resource_interfaces().len() == owners.resources.len()
+        }
+        _ => false,
+    };
+    if !owner_graph_is_complete {
+        let cleanup_uncertain = owners.shutdown().is_err();
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+            ProcessSnapshotV2NetworkMmioRestoreStage::Assembly,
+            cleanup_uncertain,
+        ));
+    }
+
+    if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::GateCommit) {
+        let cleanup_uncertain = owners.shutdown().is_err();
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+            ProcessSnapshotV2NetworkMmioRestoreStage::GateCommit,
+            cleanup_uncertain,
+        ));
+    }
+    let Some(staged_hvf) = owners.hvf.take() else {
+        let cleanup_uncertain = owners.shutdown().is_err();
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+            ProcessSnapshotV2NetworkMmioRestoreStage::GateCommit,
+            cleanup_uncertain,
+        ));
+    };
+    owners.hvf = Some(staged_hvf.commit_retry_publication());
+    Ok(owners)
+}
+
+type SystemRestoredProcessSnapshotV2NetworkMmioOwners =
+    RestoredProcessSnapshotV2NetworkMmioOwners<SystemVmnetInterfaceBackend>;
+
+#[expect(
+    dead_code,
+    reason = "public exact-2.11 load remains disabled until its activation slice"
+)]
+#[allow(clippy::too_many_arguments)]
+fn restore_process_snapshot_v2_network_mmio(
+    platform: HvfSnapshotV2PlatformState,
+    memory: HvfSnapshotV2NetworkMmioMemoryInput,
+    process_shell: HvfSnapshotV2RestoredSerialShell,
+    serial_input: Option<SerialStdioInput>,
+    platform_plan: HvfSnapshotV2NetworkMmioPlatformPlan,
+    resource_plan: PreparedProcessSnapshotV2NetworkResourcePlan,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    now: Instant,
+    cancelled: impl FnMut(ProcessSnapshotV2NetworkMmioRestoreStage) -> bool,
+) -> Result<
+    SystemRestoredProcessSnapshotV2NetworkMmioOwners,
+    ProcessSnapshotV2NetworkMmioRestoreError,
+> {
+    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+    restore_process_snapshot_v2_network_mmio_with_factory(
+        platform,
+        memory,
+        process_shell,
+        serial_input,
+        platform_plan,
+        resource_plan,
+        destination_instance_id,
+        mmds_data_store_limit_bytes,
+        &mut factory,
+        now,
+        cancelled,
+    )
+}
 
 #[derive(Debug)]
 enum ProcessVmnetAuthorityValidationError {
@@ -36554,11 +37627,11 @@ mod tests {
             assert!(!debug.contains(selector));
             assert!(!debug.contains("private-bridge"));
 
-            let (candidate, vmnet, all_mmds, authority) = plan.into_parts();
+            let (candidate, resources) = plan.into_parts();
             assert_eq!(candidate.bytes(), expected_bytes);
-            assert_eq!(vmnet.len(), 1);
-            assert!(!all_mmds);
-            assert_eq!(authority, ProcessVmnetAuthority::Direct);
+            assert_eq!(resources.vmnet_configs.len(), 1);
+            assert!(!resources.all_mmds);
+            assert_eq!(resources.authority, ProcessVmnetAuthority::Direct);
         }
     }
 
@@ -36808,16 +37881,7 @@ mod tests {
                 .get("eth0"),
             Some(&expected_profile)
         );
-        assert_eq!(
-            batch
-                .candidate()
-                .expect("batch should retain candidate")
-                .topology()
-                .interfaces()[0]
-                .controller()
-                .guest_mac(),
-            None
-        );
+        assert_eq!(batch.resource_interfaces()[0].controller.guest_mac(), None);
         let metrics = batch
             .network_metrics()
             .capture_state()
@@ -36837,7 +37901,14 @@ mod tests {
         let completion = batch
             .finish()
             .expect("fully consumed network restore batch should finish");
-        assert_eq!(completion.provider().entries.len(), 1);
+        assert_eq!(
+            completion
+                .provider()
+                .expect("completed batch should retain its provider")
+                .entries
+                .len(),
+            1
+        );
         assert_eq!(
             completion
                 .network_metrics()
@@ -36862,7 +37933,27 @@ mod tests {
                 .entries()
                 .is_empty()
         );
-        drop(completion);
+        let (
+            interfaces,
+            mut provider,
+            mmds_state,
+            mmds_metrics,
+            expected_mmds_state,
+            expected_mmds_controller,
+            decomposed_metrics,
+            authority,
+        ) = completion
+            .into_parts()
+            .expect("completed batch should decompose exactly once");
+        assert_eq!(interfaces.len(), 1);
+        assert_eq!(provider.entries.len(), 1);
+        assert!(mmds_state.is_none());
+        assert!(mmds_metrics.is_none());
+        assert!(expected_mmds_state.is_none());
+        assert!(expected_mmds_controller.is_none());
+        assert!(decomposed_metrics.capture_state().is_ok());
+        assert_eq!(authority, ProcessVmnetAuthority::Direct);
+        assert!(!provider.abort_all());
         assert_eq!(
             recorded_events(&events),
             [
@@ -36872,6 +37963,107 @@ mod tests {
                 "stop:eth0".to_string(),
             ]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_eleven_completed_restore_abort_is_clean_and_retryable() {
+        let state = fake_vmnet_network_state_without_requested_mac();
+        let expected_mac = state.interfaces()[0]
+            .profile()
+            .guest_mac()
+            .expect("vmnet snapshot profile should retain a realized MAC");
+        let prepare = || {
+            prepare_process_snapshot_v2_network_restore_plan(
+                prepared_native_v2_network_restore_candidate(state.clone(), &["vmnet:shared"]),
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("network restore value plan should prepare")
+        };
+
+        let plan = prepare();
+        let key = plan.candidate().topology().interfaces()[0]
+            .resource_key()
+            .clone();
+        let mut factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(expected_mac);
+        let events = factory.events();
+        let mut batch = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-completed-abort",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("network resource batch should prepare");
+        let resource = batch
+            .take(&key)
+            .expect("saved-order resource should be taken exactly once");
+        let completion = batch
+            .finish()
+            .expect("fully consumed resource batch should finish");
+        let configs = completion
+            .resource_interfaces()
+            .iter()
+            .map(|interface| interface.controller.clone())
+            .collect::<Vec<_>>();
+        let capture = completion
+            .provider()
+            .expect("completed batch should retain its provider")
+            .prepare_capture_for_owner_with_optional_mmds(
+                completion.authority(),
+                &configs,
+                None,
+                None,
+                None,
+                Instant::now(),
+            )
+            .expect("no-MMDS completion should prepare capture without synthetic MMDS owners");
+        assert!(capture.mmds.is_none());
+        assert_eq!(capture.entries.len(), 1);
+        assert_eq!(capture.hvf_configs.len(), 1);
+        let metrics = completion.network_metrics().clone();
+        completion
+            .abort()
+            .expect("confirmed provider cleanup should keep completed abort retryable");
+        assert_eq!(
+            metrics
+                .capture_state()
+                .expect("retained lease should remain inspectable")
+                .entries()
+                .len(),
+            1
+        );
+        drop(resource);
+        assert!(
+            metrics
+                .capture_state()
+                .expect("released lease should remain inspectable")
+                .entries()
+                .is_empty()
+        );
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+
+        let mut retry_factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(expected_mac);
+        super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            prepare(),
+            "private-completed-abort-retry",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut retry_factory,
+            |_| false,
+        )
+        .expect("same state should prepare again after confirmed completed abort")
+        .abort()
+        .expect("retry batch should abort cleanly");
     }
 
     #[cfg(target_os = "macos")]
@@ -44154,6 +45346,363 @@ mod tests {
         assert_eq!(
             fs::read(paths.memory()).expect("replacement memory should remain"),
             b"replacement memory"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires the signed native_v2_process integration group"]
+    fn signed_exact_minor_eleven_process_mmio_owner_transaction_is_atomic_and_retryable() {
+        use bangbang_hvf::{
+            HvfSnapshotV2NetworkMmioProcessConfig, HvfSnapshotV2NetworkPreparedProduct,
+            prepare_hvf_snapshot_v2_network_mmio_platform_plan,
+        };
+        use bangbang_runtime::balloon::BalloonMmioLayout;
+        use bangbang_runtime::entropy::EntropyMmioLayout;
+        use bangbang_runtime::memory_hotplug::VirtioMemMmioLayout;
+        use bangbang_runtime::snapshot_memory_v2::load_snapshot_v2_memory_path;
+
+        const ARM64_IMAGE_HEADER_SIZE: usize = 64;
+        const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
+        const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
+        const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+        const ARM64_BRANCH_TO_SELF: u32 = 0x1400_0000;
+
+        let mut image = vec![0_u8; ARM64_IMAGE_HEADER_SIZE];
+        image[..4].copy_from_slice(&ARM64_BRANCH_TO_SELF.to_le_bytes());
+        image[ARM64_IMAGE_SIZE_OFFSET..ARM64_IMAGE_SIZE_OFFSET + 8]
+            .copy_from_slice(&(ARM64_IMAGE_HEADER_SIZE as u64).to_le_bytes());
+        image[ARM64_IMAGE_MAGIC_OFFSET..ARM64_IMAGE_MAGIC_OFFSET + 4]
+            .copy_from_slice(&ARM64_IMAGE_MAGIC.to_le_bytes());
+        let kernel =
+            TempFilePath::create_with_bytes("signed-exact-2-11-process-network-kernel", &image);
+
+        let mut controller = VmmController::new("exact-2-11-process-source", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(
+                MachineConfigInput::new(1, 16).with_track_dirty_pages(true),
+            ))
+            .expect("network source machine should configure");
+        controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                kernel.path(),
+            )))
+            .expect("network source boot metadata should configure");
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
+                    .with_guest_mac("02:00:00:00:00:01")
+                    .with_mtu(1400),
+            ))
+            .expect("network source interface should configure");
+
+        let configs = controller.network_interface_configs().to_vec();
+        let profiles = configs
+            .iter()
+            .map(NetworkDeviceProfile::from_config)
+            .collect::<Vec<_>>();
+        let expected_mac = profiles[0]
+            .guest_mac()
+            .expect("saved vmnet profile should retain its requested MAC");
+        let mut source = super::OwnedHvfArm64BootSession::new(
+            &controller,
+            default_hvf_boot_session_config(SharedSerialOutput::from(
+                SharedSerialOutputBuffer::default(),
+            )),
+        )
+        .expect("signed exact-2.11 source should prepare");
+        let capture_configs = configs
+            .iter()
+            .zip(&profiles)
+            .map(|(config, profile)| {
+                super::HvfArm64BootNetworkCaptureConfig::new(
+                    config.clone(),
+                    *profile,
+                    None,
+                    None,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let capture_now = Instant::now();
+        let guard = source
+            .quiesce_limiter_retry_wakeups()
+            .expect("network source publishers should quiesce");
+        let captured = source
+            .capture_ready_network_state_at(&capture_configs, &guard, capture_now)
+            .expect("network source should capture");
+        let serial = SnapshotV2SerialState::try_from_capture_ready(
+            source
+                .capture_ready_serial_state(controller.serial_config().clone(), &guard)
+                .expect("network source serial should capture"),
+        )
+        .expect("network source serial should convert");
+        drop(guard);
+        let interfaces = captured
+            .interfaces()
+            .iter()
+            .map(|captured| {
+                let super::HvfArm64BootNetworkTransportCaptureState::Mmio {
+                    region,
+                    interrupt_line,
+                    state,
+                } = captured.transport()
+                else {
+                    panic!("network source should use MMIO");
+                };
+                SnapshotV2NetworkInterfaceState::try_from_mmio_capture(
+                    captured.config(),
+                    SnapshotV2NetworkBackendClass::Vmnet,
+                    *region,
+                    *interrupt_line,
+                    state,
+                )
+                .expect("portable network interface should convert")
+            })
+            .collect::<Vec<_>>();
+        let network = SnapshotV2NetworkState::try_new(interfaces, None)
+            .expect("portable network state should validate");
+        let overrides = vec![SnapshotNetworkOverride::new("eth0", "vmnet:shared")];
+
+        source
+            .pause_for_snapshot_v2_capture()
+            .expect("network source should pause");
+        let boot = super::HvfSnapshotV2BootState::try_new(
+            super::HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+                .expect("network source kernel path should validate"),
+            None,
+            None,
+        )
+        .expect("network source boot state should validate");
+        let mut memory_output = Cursor::new(Vec::new());
+        let network_platform = source
+            .capture_snapshot_v2_network_platform_with_cancel(
+                super::HvfArm64BootSnapshotV2CaptureInput::new(boot),
+                None,
+                &mut memory_output,
+                |_| false,
+            )
+            .expect("network source platform should capture");
+        let encoded = super::encode_hvf_snapshot_v2_network_state(
+            &super::HvfSnapshotV2NetworkState::try_new(
+                network_platform.clone(),
+                None,
+                serial,
+                None,
+                None,
+                Some(network),
+            )
+            .expect("network-only exact-2.11 product should compose"),
+        )
+        .expect("network-only exact-2.11 product should encode");
+        let platform = network_platform.platform().clone();
+        source
+            .shutdown()
+            .expect("signed exact-2.11 source should shut down");
+        drop(source);
+        let memory_image = TempFilePath::create_with_bytes(
+            "signed-exact-2-11-process-network-memory",
+            &memory_output.into_inner(),
+        );
+
+        let process = HvfSnapshotV2NetworkMmioProcessConfig::new(
+            BalloonMmioLayout::new(DEFAULT_BALLOON_MMIO_BASE, DEFAULT_BALLOON_MMIO_REGION_ID),
+            super::HvfSnapshotV2StorageMmioProcessConfig::new(
+                BlockMmioLayout::new(DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID),
+                PmemMmioLayout::new(DEFAULT_PMEM_MMIO_BASE, DEFAULT_PMEM_MMIO_REGION_ID),
+            ),
+            NetworkMmioLayout::new(DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID),
+            EntropyMmioLayout::new(DEFAULT_ENTROPY_MMIO_BASE, DEFAULT_ENTROPY_MMIO_REGION_ID),
+            VirtioMemMmioLayout::new(
+                DEFAULT_MEMORY_HOTPLUG_MMIO_BASE,
+                DEFAULT_MEMORY_HOTPLUG_MMIO_REGION_ID,
+            ),
+        );
+        let make_restore_inputs = || {
+            let candidate =
+                NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(encoded.clone())
+                    .expect("exact-2.11 candidate should decode");
+            let prepared = match candidate
+                .prepare(&overrides)
+                .expect("exact-2.11 destination topology should prepare")
+            {
+                NativeV2NetworkSnapshotPreparation::Prepared(prepared) => prepared,
+                NativeV2NetworkSnapshotPreparation::Compatible(_) => {
+                    panic!("network-bearing candidate must not remain compatible")
+                }
+            };
+            let plan = prepare_process_snapshot_v2_network_restore_plan(
+                prepared,
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("exact-2.11 process value plan should prepare");
+            let (candidate, resource_plan) = plan.into_parts();
+            let (
+                bytes,
+                binding,
+                storage,
+                serial,
+                entropy,
+                balloon,
+                memory_hotplug,
+                topology,
+                manifest,
+            ) = candidate.into_parts();
+            assert!(storage.is_none());
+            assert!(entropy.is_none());
+            assert!(balloon.is_none());
+            assert!(memory_hotplug.is_none());
+            assert_eq!(topology.interfaces().len(), 1);
+            let platform_plan = prepare_hvf_snapshot_v2_network_mmio_platform_plan(
+                &platform,
+                HvfSnapshotV2NetworkPreparedProduct::serial_network(binding, topology),
+                process,
+            )
+            .expect("exact-2.11 MMIO platform plan should prepare");
+            let structural = decode_snapshot_v2_state_with_compatibility_version(
+                &encoded,
+                NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("exact-2.11 state should decode structurally");
+            let memory = load_snapshot_v2_memory_path(&structural, memory_image.path())
+                .expect("exact-2.11 destination memory should map privately");
+            let shell = super::HvfSnapshotV2RestoredSerialShell::new(
+                SerialMmioDevice::from_capture_state_with_shared_output(
+                    SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                    serial.device().clone(),
+                ),
+            );
+            drop((bytes, serial, manifest));
+            (memory, shell, platform_plan, resource_plan)
+        };
+
+        for (cancel_stage, expected_disposition) in [
+            (
+                super::ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation,
+                super::ProcessSnapshotV2NetworkMmioRestoreDisposition::Retryable,
+            ),
+            (
+                super::ProcessSnapshotV2NetworkMmioRestoreStage::ResourceTake { index: 0 },
+                super::ProcessSnapshotV2NetworkMmioRestoreDisposition::Retryable,
+            ),
+            (
+                super::ProcessSnapshotV2NetworkMmioRestoreStage::ProviderFinish,
+                super::ProcessSnapshotV2NetworkMmioRestoreDisposition::Retryable,
+            ),
+            (
+                super::ProcessSnapshotV2NetworkMmioRestoreStage::HvfConstruction,
+                super::ProcessSnapshotV2NetworkMmioRestoreDisposition::Retryable,
+            ),
+            (
+                super::ProcessSnapshotV2NetworkMmioRestoreStage::CompleteRecapture,
+                super::ProcessSnapshotV2NetworkMmioRestoreDisposition::Terminal,
+            ),
+            (
+                super::ProcessSnapshotV2NetworkMmioRestoreStage::Assembly,
+                super::ProcessSnapshotV2NetworkMmioRestoreDisposition::Terminal,
+            ),
+            (
+                super::ProcessSnapshotV2NetworkMmioRestoreStage::GateCommit,
+                super::ProcessSnapshotV2NetworkMmioRestoreDisposition::Terminal,
+            ),
+        ] {
+            let (memory, shell, platform_plan, resource_plan) = make_restore_inputs();
+            let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+                .with_next_realized_mac(expected_mac)
+                .with_next_effective_mtu(1400);
+            let events = factory.events();
+            let error = super::restore_process_snapshot_v2_network_mmio_with_factory(
+                platform.clone(),
+                super::HvfSnapshotV2NetworkMmioMemoryInput::Static(memory),
+                shell,
+                None,
+                platform_plan,
+                resource_plan,
+                "exact-2-11-cancelled-destination",
+                bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                &mut factory,
+                Instant::now(),
+                |stage| stage == cancel_stage,
+            )
+            .expect_err("injected process owner cancellation should reject");
+            assert_eq!(error.stage, cancel_stage);
+            assert_eq!(error.disposition, expected_disposition);
+            let diagnostics = format!("{error:?} {error}");
+            assert!(diagnostics.contains("<redacted>"));
+            assert!(!diagnostics.contains("eth0"));
+            assert!(!diagnostics.contains("vmnet:shared"));
+            assert!(!diagnostics.contains("exact-2-11-cancelled-destination"));
+            let events = recorded_events(&events);
+            if matches!(
+                cancel_stage,
+                super::ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation
+            ) {
+                assert!(events.is_empty());
+            } else {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.starts_with("start:"))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.starts_with("stop:"))
+                        .count(),
+                    1
+                );
+            }
+        }
+
+        let (memory, shell, platform_plan, resource_plan) = make_restore_inputs();
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_mac)
+            .with_next_effective_mtu(1400);
+        let events = factory.events();
+        let mut owners = super::restore_process_snapshot_v2_network_mmio_with_factory(
+            platform,
+            super::HvfSnapshotV2NetworkMmioMemoryInput::Static(memory),
+            shell,
+            None,
+            platform_plan,
+            resource_plan,
+            "exact-2-11-committed-destination",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            Instant::now(),
+            |_| false,
+        )
+        .expect("complete process/HVF owner graph should commit");
+        assert_eq!(owners.resources.len(), 1);
+        assert!(owners.completion.is_some());
+        assert!(owners.hvf.as_ref().is_some_and(
+            super::RestoredHvfSnapshotV2NetworkMmioOwners::retry_publication_is_committed
+        ));
+        let diagnostics = format!("{owners:?}");
+        assert!(diagnostics.contains("<redacted>"));
+        assert!(!diagnostics.contains("eth0"));
+        assert!(!diagnostics.contains("vmnet:shared"));
+        assert_eq!(
+            recorded_events(&events)
+                .iter()
+                .filter(|event| event.starts_with("stop:"))
+                .count(),
+            0
+        );
+        owners
+            .shutdown()
+            .expect("committed process/HVF owner graph should shut down");
+        owners
+            .shutdown()
+            .expect("repeated process/HVF shutdown should be idempotent");
+        assert_eq!(
+            recorded_events(&events)
+                .iter()
+                .filter(|event| event.starts_with("stop:"))
+                .count(),
+            1
         );
     }
 

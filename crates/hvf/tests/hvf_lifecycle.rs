@@ -19680,6 +19680,427 @@ fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'sta
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn restores_signed_exact_2_11_mmio_network_owner_graph_at_exact_capacity() {
+    use std::io::Cursor;
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootNetworkCaptureConfig, HvfArm64BootNetworkTransportCaptureState,
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BootState, HvfSnapshotV2NativePath,
+        HvfSnapshotV2NetworkMmioMemoryInput, HvfSnapshotV2NetworkMmioProcessConfig,
+        HvfSnapshotV2NetworkMmioRestoreDisposition, HvfSnapshotV2NetworkMmioRestoreStage,
+        HvfSnapshotV2NetworkPreparedProduct, HvfSnapshotV2NetworkState,
+        HvfSnapshotV2RestoredSerialShell, HvfSnapshotV2StorageMmioProcessConfig,
+        OwnedHvfArm64BootSession, prepare_hvf_snapshot_v2_network_mmio_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::balloon::BalloonMmioLayout;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::entropy::EntropyMmioLayout;
+    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::memory_hotplug::VirtioMemMmioLayout;
+    use bangbang_runtime::metrics::SharedNetworkInterfaceMetricsRegistry;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::{
+        NetworkDeviceProfile, NetworkInterfaceConfigInput, NetworkMmioLayout,
+        NetworkRateLimiterConfig, NetworkTokenBucketConfig,
+    };
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot::SnapshotNetworkOverride;
+    use bangbang_runtime::snapshot_network_restore_v2_11::PreparedSnapshotV2NetworkRestoreTopology;
+    use bangbang_runtime::snapshot_network_v2_11::{
+        SnapshotV2NetworkBackendClass, SnapshotV2NetworkInterfaceState, SnapshotV2NetworkState,
+    };
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("restore-network-mmio-kernel", &image)
+        .expect("network restore kernel should create");
+    let limiter = NetworkRateLimiterConfig::new(
+        Some(NetworkTokenBucketConfig::new(4096, Some(8192), 100)),
+        Some(NetworkTokenBucketConfig::new(64, None, 100)),
+    );
+    let block_layout = BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
+    let pmem_layout = PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500));
+    let network_layout =
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000));
+    let balloon_layout =
+        BalloonMmioLayout::new(GuestAddress::new(0x4000_8000), MmioRegionId::new(4000));
+    let entropy_layout =
+        EntropyMmioLayout::new(GuestAddress::new(0x4000_7000), MmioRegionId::new(3001));
+    let memory_hotplug_layout =
+        VirtioMemMmioLayout::new(GuestAddress::new(0x4000_9000), MmioRegionId::new(5000));
+    let process = HvfSnapshotV2NetworkMmioProcessConfig::new(
+        balloon_layout,
+        HvfSnapshotV2StorageMmioProcessConfig::new(block_layout, pmem_layout),
+        network_layout,
+        entropy_layout,
+        memory_hotplug_layout,
+    );
+
+    for interface_count in [1_usize, 16] {
+        let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                kernel.path(),
+            )))
+            .expect("network restore boot source should configure");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(
+                MachineConfigInput::new(1, 128).with_track_dirty_pages(true),
+            ))
+            .expect("network restore dirty tracking should configure");
+        for index in 0..interface_count {
+            let iface_id = format!("eth{index}");
+            let selector = format!("private-network-backend-{index}");
+            let guest_mac = format!("02:00:00:00:01:{index:02x}");
+            controller
+                .handle_action(VmmAction::PutNetworkInterface(
+                    NetworkInterfaceConfigInput::new(iface_id.clone(), iface_id, selector)
+                        .with_guest_mac(guest_mac)
+                        .with_mtu(1400)
+                        .with_rx_rate_limiter(limiter)
+                        .with_tx_rate_limiter(limiter),
+                ))
+                .expect("network restore interface should configure");
+        }
+        let configs = controller.network_interface_configs().to_vec();
+        let profiles = configs
+            .iter()
+            .map(NetworkDeviceProfile::from_config)
+            .collect::<Vec<_>>();
+        let session_config = HvfArm64BootSessionConfig::new(
+            block_layout,
+            pmem_layout,
+            network_layout,
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            bangbang_runtime::rtc::RtcMmioLayout::new(
+                GuestAddress::new(0x4000_1000),
+                MmioRegionId::new(10),
+            ),
+        )
+        .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+            MmioRegionId::new(20),
+            GuestAddress::new(0x4000_2000),
+            SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+        ));
+        let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+            .expect("signed network source should prepare");
+        let capture_configs = configs
+            .iter()
+            .zip(&profiles)
+            .map(|(config, profile)| {
+                HvfArm64BootNetworkCaptureConfig::new(config.clone(), *profile, None, None, false)
+            })
+            .collect::<Vec<_>>();
+        let capture_now = Instant::now();
+        let guard = source
+            .quiesce_limiter_retry_wakeups()
+            .expect("network source publishers should quiesce");
+        let captured = source
+            .capture_ready_network_state_at(&capture_configs, &guard, capture_now)
+            .expect("network source should capture");
+        let serial = SnapshotV2SerialState::try_from_capture_ready(
+            source
+                .capture_ready_serial_state(controller.serial_config().clone(), &guard)
+                .expect("network product serial should capture"),
+        )
+        .expect("network product serial capture should convert");
+        drop(guard);
+        let mut interfaces = Vec::new();
+        interfaces
+            .try_reserve_exact(interface_count)
+            .expect("portable network inventory should reserve");
+        for captured in captured.interfaces() {
+            let HvfArm64BootNetworkTransportCaptureState::Mmio {
+                region,
+                interrupt_line,
+                state,
+            } = captured.transport()
+            else {
+                panic!("network source should use MMIO");
+            };
+            interfaces.push(
+                SnapshotV2NetworkInterfaceState::try_from_mmio_capture(
+                    captured.config(),
+                    SnapshotV2NetworkBackendClass::Vmnet,
+                    *region,
+                    *interrupt_line,
+                    state,
+                )
+                .expect("portable network interface should convert"),
+            );
+        }
+        let network = SnapshotV2NetworkState::try_new(interfaces, None)
+            .expect("portable network aggregate should validate");
+        let overrides = network
+            .interfaces()
+            .iter()
+            .map(|interface| SnapshotNetworkOverride::new(interface.iface_id(), "vmnet:shared"))
+            .collect::<Vec<_>>();
+        source
+            .pause_for_snapshot_v2_capture()
+            .expect("network source should pause");
+        let boot = HvfSnapshotV2BootState::try_new(
+            HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+                .expect("network kernel path should validate"),
+            None,
+            None,
+        )
+        .expect("network boot metadata should validate");
+        let mut memory_writer = Cursor::new(Vec::new());
+        let network_platform = source
+            .capture_snapshot_v2_network_platform_with_cancel(
+                HvfArm64BootSnapshotV2CaptureInput::new(boot),
+                None,
+                &mut memory_writer,
+                |_| false,
+            )
+            .expect("exact-2.11 network platform should capture");
+        HvfSnapshotV2NetworkState::try_new(
+            network_platform.clone(),
+            None,
+            serial.clone(),
+            None,
+            None,
+            Some(network.clone()),
+        )
+        .expect("network-only exact-2.11 product should compose");
+        assert!(network_platform.memory_hotplug().is_none());
+        let platform = network_platform.platform().clone();
+        let cancellation_stages = if interface_count == 1 {
+            vec![
+                HvfSnapshotV2NetworkMmioRestoreStage::Product,
+                HvfSnapshotV2NetworkMmioRestoreStage::Handler { index: 0 },
+                HvfSnapshotV2NetworkMmioRestoreStage::InterruptSetup,
+                HvfSnapshotV2NetworkMmioRestoreStage::Platform,
+                HvfSnapshotV2NetworkMmioRestoreStage::Registration { index: 0 },
+                HvfSnapshotV2NetworkMmioRestoreStage::RetryScheduler,
+                HvfSnapshotV2NetworkMmioRestoreStage::RetryDeadline,
+                HvfSnapshotV2NetworkMmioRestoreStage::Recapture,
+                HvfSnapshotV2NetworkMmioRestoreStage::Assembly,
+            ]
+        } else {
+            let mut stages = Vec::new();
+            stages
+                .try_reserve_exact(interface_count + 1)
+                .expect("network registration cancellation inventory should reserve");
+            stages.extend(
+                (0..interface_count)
+                    .map(|index| HvfSnapshotV2NetworkMmioRestoreStage::Registration { index }),
+            );
+            stages.push(HvfSnapshotV2NetworkMmioRestoreStage::RetryScheduler);
+            stages
+        };
+        let mut destination_memories = Vec::new();
+        destination_memories
+            .try_reserve_exact(cancellation_stages.len() + 2)
+            .expect("network destination inventory should reserve");
+        for _ in 0..cancellation_stages.len() + 2 {
+            destination_memories.push(copy_signed_session_guest_memory(&source));
+        }
+        source
+            .shutdown()
+            .expect("signed network source should shut down");
+
+        let prepare_plan = || {
+            let topology =
+                PreparedSnapshotV2NetworkRestoreTopology::prepare(network.clone(), &overrides)
+                    .expect("destination network topology should prepare");
+            prepare_hvf_snapshot_v2_network_mmio_platform_plan(
+                &platform,
+                HvfSnapshotV2NetworkPreparedProduct::serial_network(
+                    platform.memory().clone(),
+                    topology,
+                ),
+                process,
+            )
+            .expect("network MMIO platform plan should prepare")
+        };
+        let restored_shell = || {
+            HvfSnapshotV2RestoredSerialShell::new(
+                SerialMmioDevice::from_capture_state_with_shared_output(
+                    SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                    serial.device().clone(),
+                ),
+            )
+        };
+        let fresh_metrics = || {
+            SharedNetworkInterfaceMetricsRegistry::from_interface_ids(
+                configs.iter().map(|config| config.iface_id()),
+            )
+        };
+        let restore_now = Instant::now();
+        for cancel_stage in cancellation_stages {
+            let destination = destination_memories.remove(0);
+            let error = OwnedHvfArm64BootSession::restore_snapshot_v2_network_mmio_with_cancel(
+                platform.clone(),
+                HvfSnapshotV2NetworkMmioMemoryInput::Static(destination),
+                restored_shell(),
+                None,
+                prepare_plan(),
+                profiles.clone(),
+                fresh_metrics(),
+                restore_now,
+                |stage| stage == cancel_stage,
+            )
+            .expect_err("injected network owner cancellation should reject");
+            assert_eq!(error.stage(), cancel_stage);
+            assert_eq!(
+                error.disposition(),
+                if matches!(
+                    cancel_stage,
+                    HvfSnapshotV2NetworkMmioRestoreStage::Product
+                        | HvfSnapshotV2NetworkMmioRestoreStage::Handler { .. }
+                        | HvfSnapshotV2NetworkMmioRestoreStage::InterruptSetup
+                        | HvfSnapshotV2NetworkMmioRestoreStage::Platform
+                ) {
+                    HvfSnapshotV2NetworkMmioRestoreDisposition::Retryable
+                } else {
+                    HvfSnapshotV2NetworkMmioRestoreDisposition::Terminal
+                }
+            );
+            assert!(
+                !error.has_incomplete_cleanup(),
+                "{cancel_stage:?} should roll back completely: {error:?}"
+            );
+            let diagnostics = format!("{error:?} {error}");
+            assert!(diagnostics.contains("<redacted>"));
+            assert!(!diagnostics.contains("eth0"));
+            assert!(!diagnostics.contains("vmnet:shared"));
+        }
+
+        let premature_destination = destination_memories.remove(0);
+        let premature_owners = OwnedHvfArm64BootSession::restore_snapshot_v2_network_mmio(
+            platform.clone(),
+            HvfSnapshotV2NetworkMmioMemoryInput::Static(premature_destination),
+            restored_shell(),
+            None,
+            prepare_plan(),
+            profiles.clone(),
+            fresh_metrics(),
+            restore_now,
+        )
+        .expect("premature extraction owner should restore");
+        let extraction_error = match premature_owners.into_session() {
+            Ok(mut session) => {
+                let _ = session.shutdown();
+                panic!("uncommitted network owner must not release its session");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            extraction_error.stage(),
+            HvfSnapshotV2NetworkMmioRestoreStage::Assembly
+        );
+        assert_eq!(
+            extraction_error.disposition(),
+            HvfSnapshotV2NetworkMmioRestoreDisposition::Terminal
+        );
+        assert!(!extraction_error.has_incomplete_cleanup());
+
+        let destination = destination_memories.remove(0);
+        assert!(destination_memories.is_empty());
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(
+            configs.iter().map(|config| config.iface_id()),
+        );
+        let plan = prepare_plan();
+        let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_network_mmio(
+            platform,
+            HvfSnapshotV2NetworkMmioMemoryInput::Static(destination),
+            restored_shell(),
+            None,
+            plan,
+            profiles.clone(),
+            metrics,
+            restore_now,
+        )
+        .unwrap_or_else(|error| panic!("exact-capacity network owners should restore: {error:?}"));
+        assert_eq!(owners.configs().len(), interface_count);
+        assert_eq!(owners.expected().len(), interface_count);
+        assert!(owners.mmds_state().is_none());
+        assert!(owners.mmds_config().is_none());
+        assert!(!owners.retry_publication_is_committed());
+        assert_eq!(
+            owners.session().runtime_resources().network_devices.len(),
+            interface_count
+        );
+        let fresh_metrics = owners
+            .session()
+            .shared_network_interface_metrics()
+            .capture_state()
+            .expect("fresh restored network metrics should capture");
+        assert_eq!(fresh_metrics.entries().len(), interface_count);
+        assert!(
+            fresh_metrics
+                .entries()
+                .iter()
+                .all(|entry| entry.metrics().is_empty())
+        );
+        assert!(fresh_metrics.aggregate().is_empty());
+        let recapture_configs = owners
+            .configs()
+            .iter()
+            .zip(&profiles)
+            .map(|(config, profile)| {
+                HvfArm64BootNetworkCaptureConfig::new(config.clone(), *profile, None, None, false)
+            })
+            .collect::<Vec<_>>();
+        let guard = owners
+            .session()
+            .quiesce_limiter_retry_wakeups()
+            .expect("restored network publishers should quiesce");
+        let recaptured = owners
+            .session()
+            .capture_ready_network_state_at(&recapture_configs, &guard, restore_now)
+            .expect("restored network graph should recapture");
+        for (captured, expected) in recaptured.interfaces().iter().zip(owners.expected()) {
+            let HvfArm64BootNetworkTransportCaptureState::Mmio {
+                region,
+                interrupt_line,
+                state,
+            } = captured.transport()
+            else {
+                panic!("restored network should remain MMIO");
+            };
+            let portable = SnapshotV2NetworkInterfaceState::try_from_mmio_capture(
+                captured.config(),
+                expected.backend(),
+                *region,
+                *interrupt_line,
+                state,
+            )
+            .expect("restored network recapture should convert");
+            assert_eq!(&portable, expected);
+        }
+        drop(guard);
+
+        let owners = owners.commit_retry_publication();
+        assert!(owners.retry_publication_is_committed());
+        let mut restored = owners
+            .into_session()
+            .expect("committed network owner should release its session");
+        restored
+            .shutdown()
+            .expect("restored network destination should shut down");
+        restored
+            .shutdown()
+            .expect("restored network destination shutdown should be idempotent");
+    }
+}
+
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[test]
 fn requires_macos_apple_silicon() {

@@ -71,6 +71,7 @@ use bangbang_runtime::metrics::{
     SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
     SharedVsockDeviceMetrics,
 };
+use bangbang_runtime::mmds::MmdsConfig;
 use bangbang_runtime::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId,
     MmioRegionRequest, MmioRegistrationError, MmioRegistrationLease, MmioRegistrationOwner,
@@ -149,7 +150,10 @@ use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
     write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
 };
-use bangbang_runtime::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
+use bangbang_runtime::snapshot_network_v2_11::{
+    NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, SnapshotV2MmdsState,
+    SnapshotV2NetworkInterfaceState,
+};
 use bangbang_runtime::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
 use bangbang_runtime::startup::{
     ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonDevice, Arm64BootBalloonNotificationDispatch,
@@ -163,17 +167,18 @@ use bangbang_runtime::startup::{
     Arm64BootMemoryHotplugCaptureError, Arm64BootMemoryHotplugDevice,
     Arm64BootMemoryHotplugDeviceConfig as RuntimeArm64BootMemoryHotplugDeviceConfig,
     Arm64BootMemoryHotplugNotificationDispatch, Arm64BootMemoryHotplugNotificationDispatchError,
-    Arm64BootMemoryHotplugNotificationDispatches, Arm64BootNetworkInterface,
-    Arm64BootNetworkNotificationDispatch, Arm64BootNetworkNotificationDispatchError,
-    Arm64BootNetworkNotificationDispatches, Arm64BootNetworkPacketIoProvider,
-    Arm64BootPciValidationConfig, Arm64BootPciValidationResources, Arm64BootPmemDevice,
-    Arm64BootPmemFlushProvider, Arm64BootPmemNotificationDispatch,
-    Arm64BootPmemNotificationDispatchError, Arm64BootPmemNotificationDispatches,
-    Arm64BootPvTimeState, Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResourceParts,
-    Arm64BootResources, Arm64BootRtcDeviceConfig as RuntimeArm64BootRtcDeviceConfig,
-    Arm64BootRuntimeResources, Arm64BootSerialCaptureError,
-    Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig, Arm64BootSerialRuntimeError,
-    Arm64BootVmClockDevice, Arm64BootVmGenIdDevice, Arm64BootVmGenIdReplacementError,
+    Arm64BootMemoryHotplugNotificationDispatches, Arm64BootNetworkDevice,
+    Arm64BootNetworkInterface, Arm64BootNetworkNotificationDispatch,
+    Arm64BootNetworkNotificationDispatchError, Arm64BootNetworkNotificationDispatches,
+    Arm64BootNetworkPacketIoProvider, Arm64BootPciValidationConfig,
+    Arm64BootPciValidationResources, Arm64BootPmemDevice, Arm64BootPmemFlushProvider,
+    Arm64BootPmemNotificationDispatch, Arm64BootPmemNotificationDispatchError,
+    Arm64BootPmemNotificationDispatches, Arm64BootPvTimeState, Arm64BootResourceConfig,
+    Arm64BootResourceError, Arm64BootResourceParts, Arm64BootResources,
+    Arm64BootRtcDeviceConfig as RuntimeArm64BootRtcDeviceConfig, Arm64BootRuntimeResources,
+    Arm64BootSerialCaptureError, Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
+    Arm64BootSerialRuntimeError, Arm64BootVmClockDevice, Arm64BootVmGenIdDevice,
+    Arm64BootVmGenIdReplacementError,
     Arm64BootVsockCaptureError as RuntimeArm64BootVsockCaptureError, Arm64BootVsockDevice,
     Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
     Arm64BootVsockNotificationDispatches,
@@ -278,21 +283,26 @@ use crate::snapshot_v2_multi_block_platform::{
     HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockPlatformPlanParts,
     HvfSnapshotV2MultiBlockTransportPlan,
 };
+use crate::snapshot_v2_network_platform::{
+    HvfSnapshotV2NetworkMmioPlatformOwnerParts, HvfSnapshotV2NetworkMmioPlatformPlan,
+    HvfSnapshotV2NetworkPreparedMemoryProduct, HvfSnapshotV2NetworkPreparedOwnerParts,
+};
 use crate::snapshot_v2_platform::{
     HvfSnapshotV2BalloonMmioShellPlan, HvfSnapshotV2DefaultProcessShell,
     HvfSnapshotV2MemoryHotplugMmioShellPlan, HvfSnapshotV2MultiBlockMmioShellPlan,
-    HvfSnapshotV2MultiBlockPciShellPlan, HvfSnapshotV2PlatformRestoreError,
-    HvfSnapshotV2PlatformShutdownError, HvfSnapshotV2RestoredSerialShell,
-    HvfSnapshotV2RootResourcePlan, HvfSnapshotV2RootTransportPlan,
-    HvfSnapshotV2SerialOnlyProcessConfig, HvfSnapshotV2StorageMmioShellPlan,
-    HvfSnapshotV2StoragePciShellPlan, RestoredHvfSnapshotV2Platform,
-    restore_hvf_snapshot_v2_multi_block_mmio_process_platform,
+    HvfSnapshotV2MultiBlockPciShellPlan, HvfSnapshotV2NetworkMmioShellPlan,
+    HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformShutdownError,
+    HvfSnapshotV2RestoredSerialShell, HvfSnapshotV2RootResourcePlan,
+    HvfSnapshotV2RootTransportPlan, HvfSnapshotV2SerialOnlyProcessConfig,
+    HvfSnapshotV2StorageMmioShellPlan, HvfSnapshotV2StoragePciShellPlan,
+    RestoredHvfSnapshotV2Platform, restore_hvf_snapshot_v2_multi_block_mmio_process_platform,
     restore_hvf_snapshot_v2_multi_block_pci_process_platform,
     restore_hvf_snapshot_v2_root_process_platform,
     restore_hvf_snapshot_v2_serial_balloon_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_entropy_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_memory_hotplug_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_memory_hotplug_pci_process_platform,
+    restore_hvf_snapshot_v2_serial_network_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_only_process_platform,
     restore_hvf_snapshot_v2_serial_storage_entropy_mmio_process_platform,
     restore_hvf_snapshot_v2_serial_storage_memory_hotplug_pci_process_platform,
@@ -3548,6 +3558,11 @@ enum HvfSnapshotV2StorageProcessShell {
         interrupts: HvfSnapshotV2MemoryHotplugMmioInterruptPlan,
         mapping: HvfSnapshotV2MemoryHotplugMappingPlan,
     },
+    RestoredNetworkMmio {
+        shell: HvfSnapshotV2RestoredSerialShell,
+        interrupts: HvfSnapshotV2NetworkMmioInterruptPlan,
+        mapping: Option<HvfSnapshotV2MemoryHotplugMappingPlan>,
+    },
     RestoredMemoryHotplugPci {
         shell: HvfSnapshotV2RestoredSerialShell,
         mapping: HvfSnapshotV2MemoryHotplugMappingPlan,
@@ -3571,6 +3586,11 @@ enum HvfSnapshotV2SerialProcessShell {
         shell: HvfSnapshotV2RestoredSerialShell,
         interrupts: HvfSnapshotV2MemoryHotplugMmioInterruptPlan,
         mapping: HvfSnapshotV2MemoryHotplugMappingPlan,
+    },
+    NetworkMmio {
+        shell: HvfSnapshotV2RestoredSerialShell,
+        interrupts: HvfSnapshotV2NetworkMmioInterruptPlan,
+        mapping: Option<HvfSnapshotV2MemoryHotplugMappingPlan>,
     },
     MemoryHotplugPci {
         shell: HvfSnapshotV2RestoredSerialShell,
@@ -3598,6 +3618,16 @@ struct HvfSnapshotV2MemoryHotplugMmioInterruptPlan {
     vmclock: GuestInterruptLine,
 }
 
+struct HvfSnapshotV2NetworkMmioInterruptPlan {
+    balloon: Option<GuestInterruptLine>,
+    network: Vec<GuestInterruptLine>,
+    entropy: Option<GuestInterruptLine>,
+    memory_hotplug: Option<GuestInterruptLine>,
+    serial: GuestInterruptLine,
+    vmgenid: GuestInterruptLine,
+    vmclock: GuestInterruptLine,
+}
+
 impl HvfSnapshotV2SerialProcessShell {
     const fn pci_enabled(&self) -> bool {
         match self {
@@ -3605,8 +3635,253 @@ impl HvfSnapshotV2SerialProcessShell {
             Self::MemoryHotplugPci { process, .. } => process.pci_enabled(),
             Self::EntropyMmio { .. }
             | Self::BalloonMmio { .. }
-            | Self::MemoryHotplugMmio { .. } => false,
+            | Self::MemoryHotplugMmio { .. }
+            | Self::NetworkMmio { .. } => false,
         }
+    }
+}
+
+/// Typed guest-memory handoff for one exact-2.11 MMIO network product.
+#[doc(hidden)]
+pub enum HvfSnapshotV2NetworkMmioMemoryInput {
+    /// The caller-owned image for a static-memory product.
+    Static(GuestMemory),
+    /// Selects the image retained by a mixed-memory virtio-mem product.
+    ProductOwned,
+}
+
+impl fmt::Debug for HvfSnapshotV2NetworkMmioMemoryInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2NetworkMmioMemoryInput")
+            .field(
+                "kind",
+                &match self {
+                    Self::Static(_) => "static",
+                    Self::ProductOwned => "product-owned",
+                },
+            )
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Stable aggregate stage for exact-2.11 MMIO network reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum HvfSnapshotV2NetworkMmioRestoreStage {
+    Product,
+    Handler { index: usize },
+    InterruptSetup,
+    Platform,
+    Registration { index: usize },
+    Entropy,
+    MemoryHotplug,
+    RetryScheduler,
+    RetryDeadline,
+    Recapture,
+    Assembly,
+}
+
+/// Whether an exact-2.11 MMIO reconstruction failure may be retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum HvfSnapshotV2NetworkMmioRestoreDisposition {
+    Retryable,
+    Terminal,
+    TerminalCleanup,
+}
+
+/// Bounded, redacted exact-2.11 MMIO aggregate reconstruction error.
+#[doc(hidden)]
+pub struct HvfSnapshotV2NetworkMmioRestoreError {
+    stage: HvfSnapshotV2NetworkMmioRestoreStage,
+    disposition: HvfSnapshotV2NetworkMmioRestoreDisposition,
+}
+
+impl HvfSnapshotV2NetworkMmioRestoreError {
+    fn preflight(stage: HvfSnapshotV2NetworkMmioRestoreStage) -> Self {
+        Self {
+            stage,
+            disposition: HvfSnapshotV2NetworkMmioRestoreDisposition::Retryable,
+        }
+    }
+
+    fn committed(stage: HvfSnapshotV2NetworkMmioRestoreStage, cleanup_failed: bool) -> Self {
+        Self {
+            stage,
+            disposition: if cleanup_failed {
+                HvfSnapshotV2NetworkMmioRestoreDisposition::TerminalCleanup
+            } else {
+                HvfSnapshotV2NetworkMmioRestoreDisposition::Terminal
+            },
+        }
+    }
+
+    fn after_session(
+        mut session: OwnedHvfArm64BootSession,
+        stage: HvfSnapshotV2NetworkMmioRestoreStage,
+    ) -> Self {
+        Self::committed(stage, session.shutdown().is_err())
+    }
+
+    pub const fn stage(&self) -> HvfSnapshotV2NetworkMmioRestoreStage {
+        self.stage
+    }
+
+    pub const fn disposition(&self) -> HvfSnapshotV2NetworkMmioRestoreDisposition {
+        self.disposition
+    }
+
+    pub const fn is_terminal(&self) -> bool {
+        !matches!(
+            self.disposition,
+            HvfSnapshotV2NetworkMmioRestoreDisposition::Retryable
+        )
+    }
+
+    pub const fn has_incomplete_cleanup(&self) -> bool {
+        matches!(
+            self.disposition,
+            HvfSnapshotV2NetworkMmioRestoreDisposition::TerminalCleanup
+        )
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2NetworkMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2NetworkMmioRestoreError")
+            .field("stage", &self.stage)
+            .field("disposition", &self.disposition)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2NetworkMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.11 MMIO network reconstruction failed at {:?} ({:?})",
+            self.stage, self.disposition
+        )
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2NetworkMmioRestoreError {}
+
+/// Complete exact-2.11 MMIO owner graph with retry publication still gated.
+#[doc(hidden)]
+pub struct RestoredHvfSnapshotV2NetworkMmioOwners {
+    session: OwnedHvfArm64BootSession,
+    configs: Vec<NetworkInterfaceConfig>,
+    expected: Vec<SnapshotV2NetworkInterfaceState>,
+    mmds_state: Option<SnapshotV2MmdsState>,
+    mmds_config: Option<MmdsConfig>,
+    storage_configs: Option<CaptureReadyStorageConfigs>,
+    entropy_config: Option<EntropyConfig>,
+    balloon_config: Option<BalloonConfig>,
+    memory_hotplug_state: Option<SnapshotV2MemoryHotplugState>,
+    memory_hotplug_controller: Option<SnapshotV2MemoryHotplugControllerProjection>,
+    retry_publication_gate: Option<HvfArm64BootLimiterRetryWakeupSchedulerPublicationGate>,
+}
+
+impl RestoredHvfSnapshotV2NetworkMmioOwners {
+    pub const fn session(&self) -> &OwnedHvfArm64BootSession {
+        &self.session
+    }
+
+    pub fn session_mut(&mut self) -> &mut OwnedHvfArm64BootSession {
+        &mut self.session
+    }
+
+    pub fn configs(&self) -> &[NetworkInterfaceConfig] {
+        &self.configs
+    }
+
+    pub fn expected(&self) -> &[SnapshotV2NetworkInterfaceState] {
+        &self.expected
+    }
+
+    pub const fn mmds_state(&self) -> Option<&SnapshotV2MmdsState> {
+        self.mmds_state.as_ref()
+    }
+
+    pub const fn mmds_config(&self) -> Option<&MmdsConfig> {
+        self.mmds_config.as_ref()
+    }
+
+    pub const fn storage_configs(&self) -> Option<&CaptureReadyStorageConfigs> {
+        self.storage_configs.as_ref()
+    }
+
+    pub const fn entropy_config(&self) -> Option<EntropyConfig> {
+        self.entropy_config
+    }
+
+    pub const fn balloon_config(&self) -> Option<BalloonConfig> {
+        self.balloon_config
+    }
+
+    pub const fn memory_hotplug_state(&self) -> Option<&SnapshotV2MemoryHotplugState> {
+        self.memory_hotplug_state.as_ref()
+    }
+
+    pub const fn memory_hotplug_controller(
+        &self,
+    ) -> Option<&SnapshotV2MemoryHotplugControllerProjection> {
+        self.memory_hotplug_controller.as_ref()
+    }
+
+    pub const fn retry_publication_is_committed(&self) -> bool {
+        self.retry_publication_gate.is_none()
+    }
+
+    /// Opens retry wake publication after the process-level equivalence gate.
+    pub fn commit_retry_publication(mut self) -> Self {
+        if let Some(gate) = self.retry_publication_gate.take() {
+            gate.commit();
+        }
+        self
+    }
+
+    /// Explicitly tears down the unpublished owner graph while the
+    /// construction gate is still retained.
+    pub fn shutdown(mut self) -> Result<(), HvfArm64BootSessionShutdownError> {
+        self.session.shutdown()
+    }
+
+    /// Extracts the ordinary session only after the process-level owner has
+    /// explicitly committed retry publication.
+    ///
+    /// A premature extraction attempt tears down the unpublished session and
+    /// reports an assembly-stage failure.
+    pub fn into_session(
+        mut self,
+    ) -> Result<OwnedHvfArm64BootSession, HvfSnapshotV2NetworkMmioRestoreError> {
+        if self.retry_publication_gate.is_some() {
+            let cleanup_failed = self.session.shutdown().is_err();
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::committed(
+                HvfSnapshotV2NetworkMmioRestoreStage::Assembly,
+                cleanup_failed,
+            ));
+        }
+        Ok(self.session)
+    }
+}
+
+impl fmt::Debug for RestoredHvfSnapshotV2NetworkMmioOwners {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoredHvfSnapshotV2NetworkMmioOwners")
+            .field("interface_count", &self.configs.len())
+            .field(
+                "retry_publication_committed",
+                &self.retry_publication_is_committed(),
+            )
+            .field("state", &"<redacted>")
+            .finish()
     }
 }
 
@@ -7376,7 +7651,41 @@ impl HvfArm64BootLimiterRetryWakeupScheduler {
         wakeup_token: HvfArm64BootLimiterRetryWakeupToken,
         cancel_vcpu_run: impl Fn() -> R + Send + 'static,
     ) -> Result<Self, io::Error> {
-        let shared = Arc::new(HvfArm64BootLimiterRetryWakeupSchedulerShared::default());
+        Self::start_with_cancellation_state(thread_name, wakeup_token, cancel_vcpu_run, false)
+            .map(|(scheduler, _shared)| scheduler)
+    }
+
+    fn start_with_cancellation_and_publication_gate<R>(
+        thread_name: &'static str,
+        wakeup_token: HvfArm64BootLimiterRetryWakeupToken,
+        cancel_vcpu_run: impl Fn() -> R + Send + 'static,
+    ) -> Result<(Self, HvfArm64BootLimiterRetryWakeupSchedulerPublicationGate), io::Error> {
+        Self::start_with_cancellation_state(thread_name, wakeup_token, cancel_vcpu_run, true).map(
+            |(scheduler, shared)| {
+                (
+                    scheduler,
+                    HvfArm64BootLimiterRetryWakeupSchedulerPublicationGate {
+                        shared: Some(shared),
+                    },
+                )
+            },
+        )
+    }
+
+    fn start_with_cancellation_state<R>(
+        thread_name: &'static str,
+        wakeup_token: HvfArm64BootLimiterRetryWakeupToken,
+        cancel_vcpu_run: impl Fn() -> R + Send + 'static,
+        construction_publication_blocked: bool,
+    ) -> Result<(Self, Arc<HvfArm64BootLimiterRetryWakeupSchedulerShared>), io::Error> {
+        let shared = Arc::new(HvfArm64BootLimiterRetryWakeupSchedulerShared {
+            state: Mutex::new(HvfArm64BootLimiterRetryWakeupSchedulerState {
+                construction_publication_blocked,
+                ..HvfArm64BootLimiterRetryWakeupSchedulerState::default()
+            }),
+            condvar: Condvar::new(),
+        });
+        let result = Arc::clone(&shared);
         let thread_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name(thread_name.to_owned())
@@ -7384,10 +7693,13 @@ impl HvfArm64BootLimiterRetryWakeupScheduler {
                 run_limiter_retry_wakeup_scheduler(thread_shared, wakeup_token, cancel_vcpu_run);
             })?;
 
-        Ok(Self {
-            shared,
-            thread: Some(thread),
-        })
+        Ok((
+            Self {
+                shared,
+                thread: Some(thread),
+            },
+            result,
+        ))
     }
 
     fn schedule_after(&self, retry_after: Option<Duration>) {
@@ -7510,6 +7822,7 @@ struct HvfArm64BootLimiterRetryWakeupSchedulerState {
     status: HvfArm64BootLimiterRetryWakeupSchedulerStatus,
     publication_in_flight: bool,
     deferred_publication: bool,
+    construction_publication_blocked: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -7524,6 +7837,23 @@ enum HvfArm64BootLimiterRetryWakeupSchedulerStatus {
 enum HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceError {
     AlreadyQuiesced,
     Stopped,
+}
+
+#[derive(Debug)]
+#[must_use = "retry wakeup publication remains blocked until the gate is committed"]
+struct HvfArm64BootLimiterRetryWakeupSchedulerPublicationGate {
+    shared: Option<Arc<HvfArm64BootLimiterRetryWakeupSchedulerShared>>,
+}
+
+impl HvfArm64BootLimiterRetryWakeupSchedulerPublicationGate {
+    fn commit(mut self) {
+        let Some(shared) = self.shared.take() else {
+            return;
+        };
+        let mut state = lock_limiter_retry_wakeup_state(&shared);
+        state.construction_publication_blocked = false;
+        shared.condvar.notify_all();
+    }
 }
 
 #[derive(Debug)]
@@ -11981,7 +12311,8 @@ fn hvf_arm64_boot_snapshot_v2_platform_profile(
         | NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
         | NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION
         | NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
-        | NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION => {
+        | NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
+        | NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION => {
             Some(HvfArm64BootSnapshotV2PlatformProfile::ProductProcess)
         }
         _ => None,
@@ -12438,6 +12769,10 @@ fn wait_to_publish_limiter_retry_wakeup(
                 continue;
             }
             HvfArm64BootLimiterRetryWakeupSchedulerStatus::Stopped => return false,
+        }
+        if state.construction_publication_blocked {
+            state = wait_limiter_retry_wakeup_state(&shared, state);
+            continue;
         }
 
         let now = Instant::now();
@@ -16760,6 +17095,28 @@ impl OwnedHvfArm64BootSession {
                 },
                 &mapping,
             ),
+            HvfSnapshotV2SerialProcessShell::NetworkMmio {
+                shell,
+                interrupts,
+                mapping,
+            } => restore_hvf_snapshot_v2_serial_network_mmio_process_platform(
+                state,
+                memory,
+                shell,
+                HvfSnapshotV2NetworkMmioShellPlan {
+                    balloon_interrupt: interrupts.balloon,
+                    command_line: None,
+                    block_records: &[],
+                    network_interrupts: &interrupts.network,
+                    pmem_records: &[],
+                    entropy_interrupt: interrupts.entropy,
+                    memory_hotplug_interrupt: interrupts.memory_hotplug,
+                    serial_interrupt: interrupts.serial,
+                    vmgenid_interrupt: interrupts.vmgenid,
+                    vmclock_interrupt: interrupts.vmclock,
+                },
+                mapping.as_ref(),
+            ),
             HvfSnapshotV2SerialProcessShell::MemoryHotplugPci {
                 shell,
                 process,
@@ -16975,6 +17332,774 @@ impl OwnedHvfArm64BootSession {
             };
 
         Ok(session)
+    }
+
+    /// Reconstructs one complete exact-2.11 MMIO network owner graph while
+    /// keeping retry wake publication closed for the process-level check.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_snapshot_v2_network_mmio(
+        state: HvfSnapshotV2PlatformState,
+        memory_input: HvfSnapshotV2NetworkMmioMemoryInput,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        plan: HvfSnapshotV2NetworkMmioPlatformPlan,
+        profiles: Vec<NetworkDeviceProfile>,
+        network_metrics: SharedNetworkInterfaceMetricsRegistry,
+        now: Instant,
+    ) -> Result<RestoredHvfSnapshotV2NetworkMmioOwners, HvfSnapshotV2NetworkMmioRestoreError> {
+        Self::restore_snapshot_v2_network_mmio_with_cancel(
+            state,
+            memory_input,
+            process_shell,
+            serial_input,
+            plan,
+            profiles,
+            network_metrics,
+            now,
+            |_| false,
+        )
+    }
+
+    /// Reconstructs with stable cancellation checkpoints for rollback
+    /// certification.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_snapshot_v2_network_mmio_with_cancel<C>(
+        state: HvfSnapshotV2PlatformState,
+        memory_input: HvfSnapshotV2NetworkMmioMemoryInput,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        plan: HvfSnapshotV2NetworkMmioPlatformPlan,
+        profiles: Vec<NetworkDeviceProfile>,
+        network_metrics: SharedNetworkInterfaceMetricsRegistry,
+        now: Instant,
+        cancelled: C,
+    ) -> Result<RestoredHvfSnapshotV2NetworkMmioOwners, HvfSnapshotV2NetworkMmioRestoreError>
+    where
+        C: FnMut(HvfSnapshotV2NetworkMmioRestoreStage) -> bool,
+    {
+        Self::restore_snapshot_v2_network_mmio_inner(
+            state,
+            memory_input,
+            process_shell,
+            serial_input,
+            plan,
+            profiles,
+            network_metrics,
+            now,
+            cancelled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn restore_snapshot_v2_network_mmio_inner<C>(
+        state: HvfSnapshotV2PlatformState,
+        memory_input: HvfSnapshotV2NetworkMmioMemoryInput,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        plan: HvfSnapshotV2NetworkMmioPlatformPlan,
+        profiles: Vec<NetworkDeviceProfile>,
+        network_metrics: SharedNetworkInterfaceMetricsRegistry,
+        now: Instant,
+        mut cancelled: C,
+    ) -> Result<RestoredHvfSnapshotV2NetworkMmioOwners, HvfSnapshotV2NetworkMmioRestoreError>
+    where
+        C: FnMut(HvfSnapshotV2NetworkMmioRestoreStage) -> bool,
+    {
+        if cancelled(HvfSnapshotV2NetworkMmioRestoreStage::Product) {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                HvfSnapshotV2NetworkMmioRestoreStage::Product,
+            ));
+        }
+        let HvfSnapshotV2NetworkMmioPlatformOwnerParts {
+            product,
+            mapping,
+            balloon: balloon_endpoint,
+            storage: storage_platform,
+            network: network_endpoints,
+            entropy: entropy_endpoint,
+            memory_hotplug: memory_hotplug_endpoint,
+            serial_interrupt,
+            vmgenid_interrupt,
+            vmclock_interrupt,
+        } = plan.into_owner_parts();
+        let HvfSnapshotV2NetworkPreparedOwnerParts {
+            kind: _kind,
+            memory: product_memory,
+            storage: storage_bundle,
+            entropy,
+            balloon,
+        } = product.into_owner_parts();
+        if balloon.is_some() != balloon_endpoint.is_some()
+            || storage_bundle.is_some() != storage_platform.is_some()
+            || entropy.is_some() != entropy_endpoint.is_some()
+            || network_endpoints.is_empty()
+            || network_endpoints.len() != profiles.len()
+        {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                HvfSnapshotV2NetworkMmioRestoreStage::Product,
+            ));
+        }
+
+        let (memory, expected_binding, network, memory_hotplug) =
+            match (product_memory, memory_input) {
+                (
+                    HvfSnapshotV2NetworkPreparedMemoryProduct::Static { binding, network },
+                    HvfSnapshotV2NetworkMmioMemoryInput::Static(memory),
+                ) if mapping.is_none() && memory_hotplug_endpoint.is_none() => {
+                    (memory, binding, network, None)
+                }
+                (
+                    HvfSnapshotV2NetworkPreparedMemoryProduct::MemoryHotplug {
+                        topology,
+                        memory,
+                        network,
+                    },
+                    HvfSnapshotV2NetworkMmioMemoryInput::ProductOwned,
+                ) if mapping.is_some() && memory_hotplug_endpoint.is_some() => {
+                    let binding = topology.memory().binding().clone();
+                    (memory, binding, network, Some(*topology))
+                }
+                _ => {
+                    return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                        HvfSnapshotV2NetworkMmioRestoreStage::Product,
+                    ));
+                }
+            };
+
+        let (interfaces, mmds_state, mmds_config) = network.into_parts();
+        if interfaces.len() != network_endpoints.len() {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                HvfSnapshotV2NetworkMmioRestoreStage::Product,
+            ));
+        }
+        let aggregate_metrics = network_metrics.aggregate();
+        let mut handlers = Vec::new();
+        let mut runtime_devices = Vec::new();
+        let mut network_fdt_devices = Vec::new();
+        let mut network_interrupts = Vec::new();
+        let mut configs = Vec::new();
+        let mut expected = Vec::new();
+        let mut capture_configs = Vec::new();
+        let interface_count = interfaces.len();
+        let network_capacity_ok = handlers.try_reserve_exact(interface_count).is_ok()
+            && runtime_devices.try_reserve_exact(interface_count).is_ok()
+            && network_fdt_devices
+                .try_reserve_exact(interface_count)
+                .is_ok()
+            && network_interrupts
+                .try_reserve_exact(interface_count)
+                .is_ok()
+            && configs.try_reserve_exact(interface_count).is_ok()
+            && expected.try_reserve_exact(interface_count).is_ok()
+            && capture_configs.try_reserve_exact(interface_count).is_ok();
+        if !network_capacity_ok {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                HvfSnapshotV2NetworkMmioRestoreStage::Product,
+            ));
+        }
+
+        let mut earliest_retry_deadline = None;
+        for (index, ((interface, endpoint), profile)) in interfaces
+            .into_iter()
+            .zip(network_endpoints)
+            .zip(profiles)
+            .enumerate()
+        {
+            if cancelled(HvfSnapshotV2NetworkMmioRestoreStage::Handler { index }) {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Handler { index },
+                ));
+            }
+            if interface.source_index() != endpoint.source_index()
+                || interface.resource_key() != endpoint.resource_key()
+                || interface.mmds_stack() != endpoint.mmds_stack()
+            {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Handler { index },
+                ));
+            }
+            let Some(interface_metrics) =
+                network_metrics.per_interface(interface.controller().iface_id())
+            else {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Handler { index },
+                ));
+            };
+            let handler = interface
+                .into_mmio_handler(
+                    &memory,
+                    profile,
+                    interface_metrics,
+                    aggregate_metrics.clone(),
+                    now,
+                )
+                .map_err(|_| {
+                    HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                        HvfSnapshotV2NetworkMmioRestoreStage::Handler { index },
+                    )
+                })?;
+            if handler.source_index() != endpoint.source_index()
+                || handler.resource_key() != endpoint.resource_key()
+                || handler.mmds_stack() != endpoint.mmds_stack()
+                || handler.queue_ranges() != endpoint.queue_ranges()
+                || handler.region() != endpoint.region()
+                || handler.interrupt_line() != endpoint.interrupt_line()
+                || handler.registration().region() != endpoint.region()
+            {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Handler { index },
+                ));
+            }
+            earliest_retry_deadline = match (earliest_retry_deadline, handler.retry_deadline()) {
+                (None, deadline) => deadline,
+                (deadline, None) => deadline,
+                (Some(current), Some(candidate)) => Some(current.min(candidate)),
+            };
+            let config = handler.controller().try_clone().map_err(|_| {
+                HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Handler { index },
+                )
+            })?;
+            network_fdt_devices.push(endpoint.fdt_device());
+            network_interrupts.push(endpoint.interrupt_line());
+            capture_configs.push(HvfArm64BootNetworkCaptureConfig::new(
+                config, profile, None, None, false,
+            ));
+            handlers.push(handler);
+        }
+
+        let balloon_config = balloon.as_ref().map(SnapshotV2BalloonRestorePlan::config);
+        let balloon = balloon
+            .map(SnapshotV2BalloonRestorePlan::into_mmio_handler)
+            .transpose()
+            .map_err(|_| {
+                HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Product,
+                )
+            })?;
+        if balloon
+            .as_ref()
+            .zip(balloon_endpoint)
+            .is_some_and(|(handler, endpoint)| {
+                handler.region() != endpoint.region()
+                    || handler.interrupt_line() != endpoint.interrupt_line()
+            })
+        {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                HvfSnapshotV2NetworkMmioRestoreStage::Product,
+            ));
+        }
+
+        let entropy_config = entropy.as_ref().map(SnapshotV2EntropyRestorePlan::config);
+        let entropy = entropy
+            .map(SnapshotV2EntropyRestorePlan::into_mmio_handler)
+            .transpose()
+            .map_err(|_| {
+                HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Product,
+                )
+            })?;
+        if entropy
+            .as_ref()
+            .zip(entropy_endpoint)
+            .is_some_and(|(handler, endpoint)| {
+                handler.region() != endpoint.region()
+                    || handler.interrupt_line() != endpoint.interrupt_line()
+            })
+        {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                HvfSnapshotV2NetworkMmioRestoreStage::Product,
+            ));
+        }
+
+        let memory_hotplug = memory_hotplug
+            .map(|topology| topology.into_mmio_handler(&memory))
+            .transpose()
+            .map_err(|_| {
+                HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Product,
+                )
+            })?;
+        if memory_hotplug
+            .as_ref()
+            .zip(memory_hotplug_endpoint)
+            .is_some_and(|(handler, endpoint)| {
+                handler.region() != endpoint.region()
+                    || handler.interrupt_line() != endpoint.interrupt_line()
+            })
+            || memory_hotplug.is_some() != memory_hotplug_endpoint.is_some()
+        {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                HvfSnapshotV2NetworkMmioRestoreStage::Product,
+            ));
+        }
+
+        if cancelled(HvfSnapshotV2NetworkMmioRestoreStage::InterruptSetup) {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                HvfSnapshotV2NetworkMmioRestoreStage::InterruptSetup,
+            ));
+        }
+        let signaler =
+            HvfGicSpiSignaler::from_metadata(&state.global().compatibility().gic_metadata())
+                .map_err(|_| {
+                    HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                        HvfSnapshotV2NetworkMmioRestoreStage::InterruptSetup,
+                    )
+                })?;
+        let mut validated_interrupts = Vec::new();
+        let interrupt_count = usize::from(balloon_endpoint.is_some())
+            .checked_add(network_interrupts.len())
+            .and_then(|count| count.checked_add(usize::from(entropy_endpoint.is_some())))
+            .and_then(|count| count.checked_add(usize::from(memory_hotplug_endpoint.is_some())))
+            .ok_or_else(|| {
+                HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Product,
+                )
+            })?;
+        validated_interrupts
+            .try_reserve_exact(interrupt_count)
+            .map_err(|_| {
+                HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Product,
+                )
+            })?;
+        for interrupt in balloon_endpoint
+            .map(|endpoint| endpoint.interrupt_line())
+            .into_iter()
+            .chain(network_interrupts.iter().copied())
+            .chain(entropy_endpoint.map(|endpoint| endpoint.interrupt_line()))
+            .chain(memory_hotplug_endpoint.map(|endpoint| endpoint.interrupt_line()))
+        {
+            if validated_interrupts.contains(&interrupt) {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::InterruptSetup,
+                ));
+            }
+            signaler.validate_line(interrupt).map_err(|_| {
+                HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::InterruptSetup,
+                )
+            })?;
+            validated_interrupts.push(interrupt);
+        }
+
+        let additional_registration_capacity = interface_count
+            .checked_add(usize::from(entropy.is_some()))
+            .and_then(|count| count.checked_add(usize::from(memory_hotplug.is_some())))
+            .ok_or_else(|| {
+                HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Product,
+                )
+            })?;
+        let interrupts = HvfSnapshotV2NetworkMmioInterruptPlan {
+            balloon: balloon_endpoint.map(|endpoint| endpoint.interrupt_line()),
+            network: network_interrupts.clone(),
+            entropy: entropy_endpoint.map(|endpoint| endpoint.interrupt_line()),
+            memory_hotplug: memory_hotplug_endpoint.map(|endpoint| endpoint.interrupt_line()),
+            serial: serial_interrupt,
+            vmgenid: vmgenid_interrupt,
+            vmclock: vmclock_interrupt,
+        };
+        if cancelled(HvfSnapshotV2NetworkMmioRestoreStage::Platform) {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                HvfSnapshotV2NetworkMmioRestoreStage::Platform,
+            ));
+        }
+        let shell = HvfSnapshotV2StorageProcessShell::RestoredNetworkMmio {
+            shell: process_shell,
+            interrupts,
+            mapping: mapping.clone(),
+        };
+        let (mut session, mut storage_configs) = match (storage_bundle, storage_platform) {
+            (Some(bundle), Some(storage_plan)) => {
+                let restored = Self::restore_snapshot_v2_storage_mmio_inner(
+                    state,
+                    memory,
+                    shell,
+                    serial_input,
+                    bundle,
+                    storage_plan,
+                    HvfSnapshotV2StorageMmioPublicationInput::memory_hotplug(
+                        balloon,
+                        additional_registration_capacity,
+                    ),
+                )
+                .map_err(|source| {
+                    HvfSnapshotV2NetworkMmioRestoreError::committed(
+                        HvfSnapshotV2NetworkMmioRestoreStage::Platform,
+                        source.has_incomplete_cleanup(),
+                    )
+                })?;
+                let (session, configs) = restored.into_parts();
+                (session, Some(configs))
+            }
+            (None, None) => {
+                let (shell, interrupts, mapping) = match shell {
+                    HvfSnapshotV2StorageProcessShell::RestoredNetworkMmio {
+                        shell,
+                        interrupts,
+                        mapping,
+                    } => (shell, interrupts, mapping),
+                    _ => {
+                        return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                            HvfSnapshotV2NetworkMmioRestoreStage::Platform,
+                        ));
+                    }
+                };
+                let session = Self::restore_snapshot_v2_serial_only_inner(
+                    state,
+                    memory,
+                    HvfSnapshotV2SerialProcessShell::NetworkMmio {
+                        shell,
+                        interrupts,
+                        mapping,
+                    },
+                    serial_input,
+                )
+                .map_err(|source| {
+                    HvfSnapshotV2NetworkMmioRestoreError::committed(
+                        HvfSnapshotV2NetworkMmioRestoreStage::Platform,
+                        source.has_incomplete_cleanup(),
+                    )
+                })?;
+                let Some(registration_capacity) =
+                    additional_registration_capacity.checked_add(usize::from(balloon.is_some()))
+                else {
+                    return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                        session,
+                        HvfSnapshotV2NetworkMmioRestoreStage::Assembly,
+                    ));
+                };
+                let registration =
+                    match PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix::try_with_capacity(
+                        registration_capacity,
+                    ) {
+                        Ok(registration) => registration,
+                        Err(_) => {
+                            return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                                session,
+                                HvfSnapshotV2NetworkMmioRestoreStage::Assembly,
+                            ));
+                        }
+                    };
+                let mut session = if let Some(balloon) = balloon {
+                    Self::attach_snapshot_v2_balloon_mmio(session, balloon, registration, None)
+                        .map_err(|source| {
+                            HvfSnapshotV2NetworkMmioRestoreError::committed(
+                                HvfSnapshotV2NetworkMmioRestoreStage::Platform,
+                                source.has_incomplete_cleanup(),
+                            )
+                        })?
+                } else {
+                    let PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix { owner, leases } =
+                        registration;
+                    let mut session = session;
+                    session.restored_snapshot_v2_mmio_registrations =
+                        Some(HvfSnapshotV2MultiBlockMmioRegistrations {
+                            owner,
+                            leases,
+                            pmem_ranges: Vec::new(),
+                        });
+                    session
+                };
+                session.network_interface_metrics = network_metrics.clone();
+                (session, None)
+            }
+            (None, Some(_)) | (Some(_), None) => {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Product,
+                ));
+            }
+        };
+        session.network_interface_metrics = network_metrics;
+        if session.restored_snapshot_v2_memory_binding.as_ref() != Some(&expected_binding)
+            || !session.runtime_resources.network_devices.is_empty()
+            || !session.runtime_resources.pci_network_devices.is_empty()
+            || !session.network_interrupt_lines.is_empty()
+            || session.network_retry_wakeup_scheduler.thread.is_some()
+            || session
+                .restored_snapshot_v2_mmio_registrations
+                .as_ref()
+                .is_none_or(|registrations| {
+                    registrations
+                        .leases
+                        .len()
+                        .checked_add(interface_count)
+                        .is_none_or(|required| required > registrations.leases.capacity())
+                })
+        {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2NetworkMmioRestoreStage::Assembly,
+            ));
+        }
+
+        for (index, (handler, fdt_device)) in
+            handlers.into_iter().zip(network_fdt_devices).enumerate()
+        {
+            if cancelled(HvfSnapshotV2NetworkMmioRestoreStage::Registration { index }) {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2NetworkMmioRestoreStage::Registration { index },
+                ));
+            }
+            let (
+                _source_index,
+                _resource_key,
+                controller,
+                expected_state,
+                _mmds_stack,
+                _queue_ranges,
+                _retry,
+                _retry_deadline,
+                region,
+                _interrupt_line,
+                registration,
+                handler,
+            ) = handler.into_parts();
+            let request = [MmioRegionRequest::new(
+                region.range().start(),
+                region.range().size(),
+            )];
+            let dispatcher_owner = Arc::clone(&session.mmio_dispatcher);
+            let registration_result = {
+                let registrations = session.restored_snapshot_v2_mmio_registrations.as_ref();
+                match (registrations, dispatcher_owner.lock()) {
+                    (Some(registrations), Ok(mut dispatcher)) => dispatcher
+                        .validate_owned_handler(region.id(), &request)
+                        .and_then(|()| {
+                            dispatcher.register_owned_handler(
+                                &registrations.owner,
+                                region.id(),
+                                &request,
+                                handler,
+                            )
+                        })
+                        .ok(),
+                    (None, _) | (_, Err(_)) => None,
+                }
+            };
+            let Some(lease) = registration_result else {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2NetworkMmioRestoreStage::Registration { index },
+                ));
+            };
+            let retained = session
+                .restored_snapshot_v2_mmio_registrations
+                .as_mut()
+                .is_some_and(|registrations| {
+                    registrations.leases.push(lease);
+                    registrations.leases.last().is_some_and(|lease| {
+                        lease.region_id() == region.id() && lease.regions() == [region]
+                    })
+                });
+            if !retained {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2NetworkMmioRestoreStage::Registration { index },
+                ));
+            }
+            configs.push(controller);
+            expected.push(expected_state);
+            runtime_devices.push(Arm64BootNetworkDevice {
+                registration,
+                fdt_device,
+            });
+        }
+        session.runtime_resources.network_devices = runtime_devices;
+        session.network_interrupt_lines = network_interrupts;
+
+        if entropy.is_some() && cancelled(HvfSnapshotV2NetworkMmioRestoreStage::Entropy) {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2NetworkMmioRestoreStage::Entropy,
+            ));
+        }
+        if let Some(entropy) = entropy {
+            let restored = Self::attach_snapshot_v2_entropy_mmio(
+                session,
+                entropy,
+                storage_configs,
+                false,
+                VirtioRngOsEntropySource::new,
+            )
+            .map_err(|source| {
+                HvfSnapshotV2NetworkMmioRestoreError::committed(
+                    HvfSnapshotV2NetworkMmioRestoreStage::Entropy,
+                    source.has_incomplete_cleanup(),
+                )
+            })?;
+            let (restored_session, restored_config, restored_storage_configs) =
+                restored.into_parts();
+            session = restored_session;
+            storage_configs = restored_storage_configs;
+            if Some(restored_config) != entropy_config {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2NetworkMmioRestoreStage::Entropy,
+                ));
+            }
+        }
+
+        if memory_hotplug.is_some()
+            && cancelled(HvfSnapshotV2NetworkMmioRestoreStage::MemoryHotplug)
+        {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2NetworkMmioRestoreStage::MemoryHotplug,
+            ));
+        }
+        let (memory_hotplug_state, memory_hotplug_controller) =
+            if let Some(memory_hotplug) = memory_hotplug {
+                let (
+                    expected_state,
+                    controller,
+                    _plugged_ranges,
+                    _queue_ranges,
+                    region,
+                    interrupt_line,
+                    handler,
+                ) = memory_hotplug.into_parts();
+                let Some(endpoint) = memory_hotplug_endpoint else {
+                    return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                        session,
+                        HvfSnapshotV2NetworkMmioRestoreStage::MemoryHotplug,
+                    ));
+                };
+                session = Self::attach_snapshot_v2_memory_hotplug_mmio(
+                    session,
+                    region,
+                    interrupt_line,
+                    endpoint.fdt_device(),
+                    handler,
+                    None,
+                )
+                .map_err(|source| {
+                    HvfSnapshotV2NetworkMmioRestoreError::committed(
+                        HvfSnapshotV2NetworkMmioRestoreStage::MemoryHotplug,
+                        source.has_incomplete_cleanup(),
+                    )
+                })?;
+                (Some(expected_state), Some(controller))
+            } else {
+                (None, None)
+            };
+
+        if cancelled(HvfSnapshotV2NetworkMmioRestoreStage::RetryScheduler) {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2NetworkMmioRestoreStage::RetryScheduler,
+            ));
+        }
+        session.network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let vcpu_control = session.runner.control();
+        let scheduler_result =
+            HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation_and_publication_gate(
+                NETWORK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+                session.network_retry_wakeup.clone(),
+                move || vcpu_control.request_wakeup(),
+            );
+        let (scheduler, retry_publication_gate) = match scheduler_result {
+            Ok(result) => result,
+            Err(_) => {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2NetworkMmioRestoreStage::RetryScheduler,
+                ));
+            }
+        };
+        session.network_retry_wakeup_scheduler = scheduler;
+        if cancelled(HvfSnapshotV2NetworkMmioRestoreStage::RetryDeadline) {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2NetworkMmioRestoreStage::RetryDeadline,
+            ));
+        }
+        session
+            .network_retry_wakeup_scheduler
+            .schedule_deadline(earliest_retry_deadline);
+
+        if cancelled(HvfSnapshotV2NetworkMmioRestoreStage::Recapture) {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2NetworkMmioRestoreStage::Recapture,
+            ));
+        }
+        let guard = match session.quiesce_limiter_retry_wakeups() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2NetworkMmioRestoreStage::Recapture,
+                ));
+            }
+        };
+        let captured = match session.capture_ready_network_state_at(&capture_configs, &guard, now) {
+            Ok(captured) => captured,
+            Err(_) => {
+                drop(guard);
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2NetworkMmioRestoreStage::Recapture,
+                ));
+            }
+        };
+        if captured.source_work_normalized()
+            || captured.interfaces().len() != expected.len()
+            || captured
+                .interfaces()
+                .iter()
+                .zip(expected.iter())
+                .any(|(captured, expected)| {
+                    let HvfArm64BootNetworkTransportCaptureState::Mmio {
+                        region,
+                        interrupt_line,
+                        state,
+                    } = captured.transport()
+                    else {
+                        return true;
+                    };
+                    SnapshotV2NetworkInterfaceState::try_from_mmio_capture(
+                        captured.config(),
+                        expected.backend(),
+                        *region,
+                        *interrupt_line,
+                        state,
+                    )
+                    .ok()
+                    .is_none_or(|actual| actual != *expected)
+                })
+        {
+            drop(guard);
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2NetworkMmioRestoreStage::Recapture,
+            ));
+        }
+        drop(guard);
+
+        if cancelled(HvfSnapshotV2NetworkMmioRestoreStage::Assembly) {
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2NetworkMmioRestoreStage::Assembly,
+            ));
+        }
+        Ok(RestoredHvfSnapshotV2NetworkMmioOwners {
+            session,
+            configs,
+            expected,
+            mmds_state,
+            mmds_config,
+            storage_configs,
+            entropy_config,
+            balloon_config,
+            memory_hotplug_state,
+            memory_hotplug_controller,
+            retry_publication_gate: Some(retry_publication_gate),
+        })
     }
 
     /// Reconstructs one closed exact-2.9 serial plus MMIO balloon product
@@ -20917,6 +22042,28 @@ impl OwnedHvfArm64BootSession {
                 },
                 &mapping,
             ),
+            HvfSnapshotV2StorageProcessShell::RestoredNetworkMmio {
+                shell,
+                interrupts,
+                mapping,
+            } => restore_hvf_snapshot_v2_serial_network_mmio_process_platform(
+                state,
+                memory,
+                shell,
+                HvfSnapshotV2NetworkMmioShellPlan {
+                    balloon_interrupt: interrupts.balloon,
+                    command_line: Some(&prepared_owner.command_line),
+                    block_records: &prepared_owner.planned_block_records,
+                    network_interrupts: &interrupts.network,
+                    pmem_records: &prepared_owner.planned_pmem_records,
+                    entropy_interrupt: interrupts.entropy,
+                    memory_hotplug_interrupt: interrupts.memory_hotplug,
+                    serial_interrupt: interrupts.serial,
+                    vmgenid_interrupt: interrupts.vmgenid,
+                    vmclock_interrupt: interrupts.vmclock,
+                },
+                mapping.as_ref(),
+            ),
             HvfSnapshotV2StorageProcessShell::RestoredMemoryHotplugPci { .. } => {
                 return Err(
                     HvfSnapshotV2StorageMmioRestoreError::with_prepared_bundle_abort(
@@ -21708,7 +22855,8 @@ impl OwnedHvfArm64BootSession {
             }
             HvfSnapshotV2StorageProcessShell::RestoredEntropyMmio { .. }
             | HvfSnapshotV2StorageProcessShell::RestoredBalloonMmio { .. }
-            | HvfSnapshotV2StorageProcessShell::RestoredMemoryHotplugMmio { .. } => {
+            | HvfSnapshotV2StorageProcessShell::RestoredMemoryHotplugMmio { .. }
+            | HvfSnapshotV2StorageProcessShell::RestoredNetworkMmio { .. } => {
                 return Err(
                     HvfSnapshotV2StoragePciRestoreError::with_prepared_bundle_abort(
                         HvfSnapshotV2StoragePciRestoreStage::ResourcePlan,
@@ -24104,6 +25252,7 @@ impl OwnedHvfArm64BootSession {
         let had_balloon = self.runtime_resources.balloon_device.is_some();
         let had_entropy = self.runtime_resources.entropy_device.is_some();
         let had_memory_hotplug = self.runtime_resources.memory_hotplug_device.is_some();
+        let had_network = !self.runtime_resources.network_devices.is_empty();
         let Some(registrations) = self.restored_snapshot_v2_mmio_registrations.as_mut() else {
             return Ok(());
         };
@@ -24142,6 +25291,8 @@ impl OwnedHvfArm64BootSession {
         self.runtime_resources.block_devices.clear();
         self.runtime_resources.pmem_mmio_devices.clear();
         self.runtime_resources.pmem_devices.clear();
+        self.runtime_resources.network_devices.clear();
+        self.network_interrupt_lines.clear();
         self.runtime_resources.balloon_device = None;
         self.balloon_interrupt_line = None;
         self.runtime_resources.entropy_device = None;
@@ -24149,6 +25300,7 @@ impl OwnedHvfArm64BootSession {
         self.runtime_resources.memory_hotplug_device = None;
         self.memory_hotplug_interrupt_line = None;
         self.entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        self.network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         self.entropy_source = VirtioRngOsEntropySource::new();
         if had_entropy {
             self.entropy_device_metrics = SharedEntropyDeviceMetrics::default();
@@ -24158,6 +25310,9 @@ impl OwnedHvfArm64BootSession {
         }
         if had_memory_hotplug {
             self.memory_hotplug_device_metrics = None;
+        }
+        if had_network {
+            self.network_interface_metrics = SharedNetworkInterfaceMetricsRegistry::default();
         }
         self.restored_snapshot_v2_mmio_registrations = None;
         Ok(())
@@ -33752,6 +34907,50 @@ mod tests {
         while state.publication_in_flight {
             state = super::wait_limiter_retry_wakeup_state(&scheduler.shared, state);
         }
+    }
+
+    #[test]
+    fn limiter_retry_construction_gate_blocks_publication_until_commit() {
+        let wakeup_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let (publication_sender, publication_receiver) = mpsc::channel();
+        let (mut scheduler, gate) =
+            HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation_and_publication_gate(
+                "bangbang-hvf-test-limiter-retry-construction-gate",
+                wakeup_token.clone(),
+                move || {
+                    publication_sender
+                        .send(())
+                        .expect("test should observe retry wakeup publication");
+                },
+            )
+            .expect("gated retry wakeup scheduler should start");
+
+        scheduler.schedule_after(Some(Duration::ZERO));
+        let guard = scheduler
+            .quiesce()
+            .expect("construction-gated scheduler should still quiesce normally");
+        assert_eq!(
+            publication_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        {
+            let state = super::lock_limiter_retry_wakeup_state(&scheduler.shared);
+            assert!(state.construction_publication_blocked);
+            assert!(!state.publication_in_flight);
+        }
+        drop(guard);
+        assert_eq!(
+            publication_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        gate.commit();
+        publication_receiver
+            .recv()
+            .expect("committing the gate should publish the overdue retry");
+        wait_for_limiter_retry_publication_idle(&scheduler);
+        assert!(wakeup_token.take_wakeup_request());
+        scheduler.stop();
     }
 
     #[test]
@@ -44587,6 +45786,8 @@ mod tests {
         use bangbang_runtime::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_format::NATIVE_V1_SNAPSHOT_VERSION;
         use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
+        use bangbang_runtime::snapshot_memory_hotplug_v2_10::NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION;
+        use bangbang_runtime::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
 
         assert_eq!(
@@ -44600,6 +45801,8 @@ mod tests {
             NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
             NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
             NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
         ] {
             assert_eq!(
                 hvf_arm64_boot_snapshot_v2_platform_profile(version),

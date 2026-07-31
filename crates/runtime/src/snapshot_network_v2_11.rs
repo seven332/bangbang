@@ -30,8 +30,9 @@ use crate::snapshot_device_v2::{
     SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
     SnapshotV2InterruptIntent, SnapshotV2MmioDeviceState, SnapshotV2PciDeviceState,
     SnapshotV2VirtioQueueState, SnapshotV2VirtioState,
-    capture_mmio_common_for_device_with_queue_count_and_config_status_gate, capture_mmio_transport,
-    capture_pci_common_for_device_with_queue_count, capture_pci_transport_parts_with_queue_count,
+    capture_mmio_common_for_device_with_queue_count_and_config_status_gate,
+    capture_mmio_transport_parts, capture_pci_common_for_device_with_queue_count,
+    capture_pci_transport_parts_with_queue_count,
 };
 use crate::snapshot_device_v2_5::queue_ranges;
 use crate::snapshot_format::SnapshotFormatVersion;
@@ -39,7 +40,7 @@ use crate::storage_capture::StorageDeviceOrigin;
 use crate::virtio::{
     VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET,
     VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FAILED,
-    VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT,
+    VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT, VirtioInterruptIntent,
 };
 use crate::virtio_mmio::{VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_VERSION_1_FEATURE};
 use crate::virtio_pci::{
@@ -410,7 +411,7 @@ impl SnapshotV2NetworkInterfaceState {
         captured: &VirtioNetworkMmioCaptureState,
     ) -> Result<Self, SnapshotV2NetworkStateCaptureError> {
         let device = captured.device();
-        let virtio = capture_mmio_common_for_device_with_queue_count_and_config_status_gate(
+        let mut virtio = capture_mmio_common_for_device_with_queue_count_and_config_status_gate(
             captured.transport(),
             VIRTIO_NET_DEVICE_ID,
             device.available_features(),
@@ -418,9 +419,52 @@ impl SnapshotV2NetworkInterfaceState {
             true,
         )
         .map_err(capture_common_error)?;
-        let transport = capture_mmio_transport(region, interrupt_line, captured.transport())
-            .map(SnapshotV2DeviceTransport::Mmio)
-            .map_err(capture_common_error)?;
+        let coarse_queue = virtio
+            .interrupt_intents()
+            .iter()
+            .any(|intent| matches!(intent, SnapshotV2InterruptIntent::Queue { .. }));
+        let coarse_configuration = virtio
+            .interrupt_intents()
+            .contains(&SnapshotV2InterruptIntent::Configuration);
+        let mut interrupt_intents = Vec::new();
+        interrupt_intents
+            .try_reserve_exact(captured.interrupt_intents().len())
+            .map_err(|_| SnapshotV2NetworkStateCaptureError::Allocation)?;
+        interrupt_intents.extend(
+            captured
+                .interrupt_intents()
+                .iter()
+                .map(|intent| match intent {
+                    VirtioInterruptIntent::Queue { queue_index } => {
+                        SnapshotV2InterruptIntent::Queue {
+                            queue_index: *queue_index,
+                        }
+                    }
+                    VirtioInterruptIntent::Configuration => {
+                        SnapshotV2InterruptIntent::Configuration
+                    }
+                }),
+        );
+        interrupt_intents.sort_unstable();
+        let exact_queue = interrupt_intents
+            .iter()
+            .any(|intent| matches!(intent, SnapshotV2InterruptIntent::Queue { .. }));
+        let exact_configuration =
+            interrupt_intents.contains(&SnapshotV2InterruptIntent::Configuration);
+        if coarse_queue != exact_queue
+            || coarse_configuration != exact_configuration
+            || interrupt_intents
+                .windows(2)
+                .any(|window| matches!(window, [left, right] if left == right))
+        {
+            return Err(SnapshotV2NetworkStateCaptureError::Device);
+        }
+        virtio.replace_interrupt_intents(interrupt_intents);
+        let transport = SnapshotV2DeviceTransport::Mmio(capture_mmio_transport_parts(
+            region,
+            interrupt_line,
+            captured.transport(),
+        ));
         capture_network_interface(config, backend, device, virtio, transport)
     }
 
@@ -521,6 +565,23 @@ impl SnapshotV2NetworkInterfaceState {
 
     pub const fn transport(&self) -> &SnapshotV2DeviceTransport {
         &self.transport
+    }
+
+    /// Consumes this record into its still-detached portable fields.
+    pub fn into_parts(self) -> SnapshotV2NetworkInterfaceStateParts {
+        SnapshotV2NetworkInterfaceStateParts {
+            iface_id: self.iface_id,
+            captured_selector: self.captured_selector,
+            requested_guest_mac: self.requested_guest_mac,
+            requested_mtu: self.requested_mtu,
+            profile: self.profile,
+            backend: self.backend,
+            local: self.local,
+            virtio: self.virtio,
+            rx_limiter: self.rx_limiter,
+            tx_limiter: self.tx_limiter,
+            transport: self.transport,
+        }
     }
 }
 

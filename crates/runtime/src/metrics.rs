@@ -4147,6 +4147,36 @@ pub struct NetworkInterfaceMetricsLease {
     registered: bool,
 }
 
+impl NetworkInterfaceMetricsLease {
+    /// Returns whether this exact generation lease belongs to `registry`.
+    #[doc(hidden)]
+    pub fn belongs_to(&self, registry: &SharedNetworkInterfaceMetricsRegistry) -> bool {
+        self.registered
+            && Arc::ptr_eq(&self.registry.aggregate.inner, &registry.aggregate.inner)
+            && Arc::ptr_eq(&self.registry.per_interface, &registry.per_interface)
+            && lock_network_metrics_registry(&registry.per_interface)
+                .entries
+                .iter()
+                .any(|entry| {
+                    entry.generation == self.generation
+                        && entry.iface_id == self.iface_id
+                        && entry.lease_claimed
+                })
+    }
+
+    /// Returns the leased interface identity without transferring ownership.
+    #[doc(hidden)]
+    pub fn iface_id(&self) -> &str {
+        &self.iface_id
+    }
+
+    /// Returns the exact metrics generation held by this lease.
+    #[doc(hidden)]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 impl fmt::Debug for PreparedNetworkInterfaceMetrics {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -4277,6 +4307,14 @@ impl Default for SharedNetworkInterfaceMetricsRegistry {
 }
 
 impl SharedNetworkInterfaceMetricsRegistry {
+    /// Returns whether two handles share the complete aggregate and
+    /// per-interface registry identity.
+    #[doc(hidden)]
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.aggregate.inner, &other.aggregate.inner)
+            && Arc::ptr_eq(&self.per_interface, &other.per_interface)
+    }
+
     pub fn from_interface_ids<'a>(iface_ids: impl IntoIterator<Item = &'a str>) -> Self {
         let mut entries = Vec::new();
         for iface_id in iface_ids {
@@ -10377,6 +10415,13 @@ mod tests {
         let lease = registry
             .claim_interface_lease("eth1")
             .expect("startup interface metrics should have exact ownership");
+        let foreign_registry =
+            SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(["eth1"], 1)
+                .expect("foreign startup metrics registry should allocate");
+        assert!(lease.belongs_to(&registry));
+        assert!(!lease.belongs_to(&foreign_registry));
+        assert_eq!(lease.iface_id(), "eth1");
+        assert_eq!(lease.generation(), 1);
         assert_eq!(
             registry.claim_interface_lease("eth1").unwrap_err(),
             NetworkInterfaceMetricsRegistryError::LeaseAlreadyClaimed
