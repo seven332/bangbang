@@ -459,7 +459,8 @@ fn explicit_minor_four_through_internal_eleven_memory_images_round_trip() {
             &[component],
         )
         .expect("minor-eleven memory state should encode internally");
-    assert!(crate::snapshot_format_v2::decode_snapshot_v2_state(&state_bytes).is_err());
+    crate::snapshot_format_v2::decode_snapshot_v2_state(&state_bytes)
+        .expect("minor-eleven memory state should decode through the public current reader");
     let state = crate::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version(
         &state_bytes,
         NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,

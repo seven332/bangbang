@@ -9,6 +9,8 @@ use crate::block::{DriveConfig, DriveConfigs};
 use crate::boot::BootSourceConfig;
 use crate::entropy::EntropyConfig;
 use crate::machine::MachineConfig;
+use crate::mmds::MmdsStateHandle;
+use crate::network::NetworkInterfaceConfigs;
 use crate::pmem::PmemConfigs;
 use crate::serial::SerialConfig;
 use crate::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugControllerProjection;
@@ -26,6 +28,8 @@ type SnapshotV2ControllerCommitParts = (
     Option<EntropyConfig>,
     Option<BalloonConfig>,
     Option<SnapshotV2MemoryHotplugControllerProjection>,
+    NetworkInterfaceConfigs,
+    Option<MmdsStateHandle>,
     bool,
 );
 
@@ -38,6 +42,39 @@ pub struct SnapshotV2ControllerCommitProductConfigs {
     entropy_config: Option<EntropyConfig>,
     balloon_config: Option<BalloonConfig>,
     memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
+}
+
+/// Complete current exact-2.11 controller product, including destination-only
+/// network selectors and the optional fresh MMDS owner.
+#[doc(hidden)]
+pub struct SnapshotV2NetworkControllerCommitProductConfigs {
+    product: SnapshotV2ControllerCommitProductConfigs,
+    network_configs: NetworkInterfaceConfigs,
+    mmds_state: Option<MmdsStateHandle>,
+}
+
+impl SnapshotV2NetworkControllerCommitProductConfigs {
+    /// Closes all exact-2.11 controller projections before publication.
+    pub fn new(
+        product: SnapshotV2ControllerCommitProductConfigs,
+        network_configs: NetworkInterfaceConfigs,
+        mmds_state: Option<MmdsStateHandle>,
+    ) -> Self {
+        Self {
+            product,
+            network_configs,
+            mmds_state,
+        }
+    }
+}
+
+impl fmt::Debug for SnapshotV2NetworkControllerCommitProductConfigs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotV2NetworkControllerCommitProductConfigs")
+            .field("configuration", &REDACTED)
+            .finish()
+    }
 }
 
 impl SnapshotV2ControllerCommitProductConfigs {
@@ -124,6 +161,8 @@ pub struct SnapshotV2ControllerCommit {
     entropy_config: Option<EntropyConfig>,
     balloon_config: Option<BalloonConfig>,
     memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
+    network_configs: NetworkInterfaceConfigs,
+    mmds_state: Option<MmdsStateHandle>,
     resume_requested: bool,
 }
 
@@ -143,6 +182,8 @@ impl SnapshotV2ControllerCommit {
             entropy_config: None,
             balloon_config: None,
             memory_hotplug: None,
+            network_configs: NetworkInterfaceConfigs::new(),
+            mmds_state: None,
             resume_requested,
         }
     }
@@ -164,6 +205,8 @@ impl SnapshotV2ControllerCommit {
             entropy_config: None,
             balloon_config: None,
             memory_hotplug: None,
+            network_configs: NetworkInterfaceConfigs::new(),
+            mmds_state: None,
             resume_requested,
         })
     }
@@ -186,6 +229,8 @@ impl SnapshotV2ControllerCommit {
             entropy_config: None,
             balloon_config: None,
             memory_hotplug: None,
+            network_configs: NetworkInterfaceConfigs::new(),
+            mmds_state: None,
             resume_requested,
         }
     }
@@ -209,6 +254,8 @@ impl SnapshotV2ControllerCommit {
             entropy_config: None,
             balloon_config: None,
             memory_hotplug: None,
+            network_configs: NetworkInterfaceConfigs::new(),
+            mmds_state: None,
             resume_requested,
         }
     }
@@ -230,6 +277,8 @@ impl SnapshotV2ControllerCommit {
             entropy_config: None,
             balloon_config: None,
             memory_hotplug: None,
+            network_configs: NetworkInterfaceConfigs::new(),
+            mmds_state: None,
             resume_requested,
         }
     }
@@ -254,6 +303,8 @@ impl SnapshotV2ControllerCommit {
             entropy_config: None,
             balloon_config: None,
             memory_hotplug: None,
+            network_configs: NetworkInterfaceConfigs::new(),
+            mmds_state: None,
             resume_requested,
         }
     }
@@ -281,6 +332,8 @@ impl SnapshotV2ControllerCommit {
             entropy_config,
             balloon_config: None,
             memory_hotplug: None,
+            network_configs: NetworkInterfaceConfigs::new(),
+            mmds_state: None,
             resume_requested,
         }
     }
@@ -309,6 +362,8 @@ impl SnapshotV2ControllerCommit {
             entropy_config,
             balloon_config,
             memory_hotplug: None,
+            network_configs: NetworkInterfaceConfigs::new(),
+            mmds_state: None,
             resume_requested,
         }
     }
@@ -341,6 +396,48 @@ impl SnapshotV2ControllerCommit {
             entropy_config,
             balloon_config,
             memory_hotplug,
+            network_configs: NetworkInterfaceConfigs::new(),
+            mmds_state: None,
+            resume_requested,
+        }
+    }
+
+    /// Retains current exact-2.11 serial, optional prior products, complete
+    /// override-resolved network configuration, and a fresh optional MMDS
+    /// handle as one atomic destination value.
+    #[doc(hidden)]
+    pub fn with_network_product_configs(
+        machine_config: MachineConfig,
+        boot_source_config: BootSourceConfig,
+        configs: SnapshotV2NetworkControllerCommitProductConfigs,
+        resume_requested: bool,
+    ) -> Self {
+        let SnapshotV2NetworkControllerCommitProductConfigs {
+            product:
+                SnapshotV2ControllerCommitProductConfigs {
+                    storage_configs,
+                    serial_config,
+                    entropy_config,
+                    balloon_config,
+                    memory_hotplug,
+                },
+            network_configs,
+            mmds_state,
+        } = configs;
+        let (drive_configs, pmem_configs) = storage_configs
+            .map(CaptureReadyStorageConfigs::into_parts)
+            .unwrap_or_default();
+        Self {
+            machine_config,
+            boot_source_config,
+            drive_configs: DriveConfigs::from_validated(drive_configs),
+            pmem_configs: PmemConfigs::from_validated(pmem_configs),
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug,
+            network_configs,
+            mmds_state,
             resume_requested,
         }
     }
@@ -359,6 +456,8 @@ impl SnapshotV2ControllerCommit {
             self.entropy_config,
             self.balloon_config,
             self.memory_hotplug,
+            self.network_configs,
+            self.mmds_state,
             self.resume_requested,
         )
     }
@@ -797,7 +896,6 @@ pub(crate) enum SnapshotV2CreateRejection {
 pub(crate) enum SnapshotV2LoadRejection {
     MemoryBackend,
     LoadClockRealtime,
-    LoadNetworkOverrides,
     LoadVsockOverride,
     DeprecatedFields,
     MachineProfile,
@@ -1072,9 +1170,6 @@ pub(crate) fn classify_v2_load_request(
     }
     if input.clock_realtime {
         return Err(SnapshotV2LoadRejection::LoadClockRealtime);
-    }
-    if !input.network_overrides.is_empty() {
-        return Err(SnapshotV2LoadRejection::LoadNetworkOverrides);
     }
     if input.vsock_override.is_some() {
         return Err(SnapshotV2LoadRejection::LoadVsockOverride);
@@ -1651,6 +1746,15 @@ mod tests {
             ),
             Ok(())
         );
+        assert_eq!(
+            classify_v2_load(
+                &file_load()
+                    .with_network_overrides(vec![SnapshotNetworkOverride::new("eth0", "tap0")]),
+                true,
+                clean_v2_load_profile(),
+            ),
+            Ok(())
+        );
 
         let request_cases = [
             (
@@ -1663,11 +1767,6 @@ mod tests {
             (
                 file_load().with_clock_realtime(true),
                 SnapshotV2LoadRejection::LoadClockRealtime,
-            ),
-            (
-                file_load()
-                    .with_network_overrides(vec![SnapshotNetworkOverride::new("eth0", "tap0")]),
-                SnapshotV2LoadRejection::LoadNetworkOverrides,
             ),
             (
                 file_load().with_vsock_override(SnapshotVsockOverride::new("vsock")),

@@ -3815,6 +3815,17 @@ pub struct RestoredHvfSnapshotV2NetworkMmioOwners {
     retry_publication_gate: Option<HvfArm64BootLimiterRetryWakeupSchedulerPublicationGate>,
 }
 
+/// Live exact-2.11 MMIO destination parts after retry publication commits.
+#[doc(hidden)]
+pub type RestoredHvfSnapshotV2NetworkMmioDestinationParts = (
+    OwnedHvfArm64BootSession,
+    Vec<NetworkInterfaceConfig>,
+    Option<CaptureReadyStorageConfigs>,
+    Option<EntropyConfig>,
+    Option<BalloonConfig>,
+    Option<SnapshotV2MemoryHotplugControllerProjection>,
+);
+
 impl RestoredHvfSnapshotV2NetworkMmioOwners {
     pub const fn session(&self) -> &OwnedHvfArm64BootSession {
         &self.session
@@ -3896,6 +3907,31 @@ impl RestoredHvfSnapshotV2NetworkMmioOwners {
             ));
         }
         Ok(self.session)
+    }
+
+    /// Extracts the complete live destination projection only after the
+    /// process-level retry-publication gate has committed.
+    pub fn into_destination_parts(
+        mut self,
+    ) -> Result<
+        RestoredHvfSnapshotV2NetworkMmioDestinationParts,
+        HvfSnapshotV2NetworkMmioRestoreError,
+    > {
+        if self.retry_publication_gate.is_some() {
+            let cleanup_failed = self.session.shutdown().is_err();
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::committed(
+                HvfSnapshotV2NetworkMmioRestoreStage::Assembly,
+                cleanup_failed,
+            ));
+        }
+        Ok((
+            self.session,
+            self.configs,
+            self.storage_configs,
+            self.entropy_config,
+            self.balloon_config,
+            self.memory_hotplug_controller,
+        ))
     }
 }
 
@@ -4058,6 +4094,17 @@ pub struct RestoredHvfSnapshotV2NetworkPciOwners {
     retry_publication_gate: Option<HvfArm64BootLimiterRetryWakeupSchedulerPublicationGate>,
 }
 
+/// Live exact-2.11 PCI destination parts after retry publication commits.
+#[doc(hidden)]
+pub type RestoredHvfSnapshotV2NetworkPciDestinationParts = (
+    OwnedHvfArm64BootSession,
+    Vec<NetworkInterfaceConfig>,
+    Option<CaptureReadyStorageConfigs>,
+    Option<EntropyConfig>,
+    Option<BalloonConfig>,
+    Option<SnapshotV2MemoryHotplugControllerProjection>,
+);
+
 impl RestoredHvfSnapshotV2NetworkPciOwners {
     pub const fn session(&self) -> &OwnedHvfArm64BootSession {
         &self.session
@@ -4131,6 +4178,29 @@ impl RestoredHvfSnapshotV2NetworkPciOwners {
             ));
         }
         Ok(self.session)
+    }
+
+    /// Extracts the complete live destination projection only after the
+    /// process-level retry-publication gate has committed.
+    pub fn into_destination_parts(
+        mut self,
+    ) -> Result<RestoredHvfSnapshotV2NetworkPciDestinationParts, HvfSnapshotV2NetworkPciRestoreError>
+    {
+        if self.retry_publication_gate.is_some() {
+            let cleanup_failed = self.session.shutdown().is_err();
+            return Err(HvfSnapshotV2NetworkPciRestoreError::committed(
+                HvfSnapshotV2NetworkPciRestoreStage::Assembly,
+                cleanup_failed,
+            ));
+        }
+        Ok((
+            self.session,
+            self.configs,
+            self.storage_configs,
+            self.entropy_config,
+            self.balloon_config,
+            self.memory_hotplug_controller,
+        ))
     }
 }
 
@@ -17002,8 +17072,7 @@ fn publish_snapshot_v2_network_pci_batch(
         fault,
     } = input;
     let interface_count = interfaces.len();
-    if interface_count == 0
-        || interface_count != endpoints.len()
+    if interface_count != endpoints.len()
         || interface_count != profiles.len()
         || manager
             .network
@@ -18074,7 +18143,6 @@ impl OwnedHvfArm64BootSession {
         if balloon.is_some() != balloon_endpoint.is_some()
             || storage_bundle.is_some() != storage_platform.is_some()
             || entropy.is_some() != entropy_endpoint.is_some()
-            || network_endpoints.is_empty()
             || network_endpoints.len() != profiles.len()
         {
             return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
@@ -18847,10 +18915,8 @@ impl OwnedHvfArm64BootSession {
             || storage_bundle.is_some() != storage_platform.is_some()
             || entropy.is_some() != entropy_endpoint.is_some()
             || mapping.is_some() != memory_hotplug_endpoint.is_some()
-            || network_endpoints.is_empty()
             || network_endpoints.len() != profiles.len()
-            || endpoint_count == 0
-            || route_demand == 0
+            || (endpoint_count == 0) != (route_demand == 0)
             || !usize::try_from(msi.interrupt_range.count).is_ok_and(|count| route_demand <= count)
         {
             return Err(HvfSnapshotV2NetworkPciRestoreError::preflight(

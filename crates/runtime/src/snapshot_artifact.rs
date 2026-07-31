@@ -23,7 +23,7 @@ use crate::snapshot_commit::{SnapshotCommitError, SnapshotCommitRecord};
 use crate::snapshot_commit::{decode_snapshot_commit_envelope, encode_snapshot_commit_envelope};
 use crate::snapshot_device_v2::{
     NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
-    SnapshotV2DeviceGraphDecodeError,
+    SnapshotV2DeviceGraphDecodeError, SnapshotV2DeviceTransportKind,
 };
 use crate::snapshot_device_v2_5::{
     NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
@@ -232,8 +232,8 @@ impl NativeSnapshotArtifactState {
 
     /// Validates exact current-version native-v2 bytes for publication.
     pub fn from_current_v2(bytes: Vec<u8>) -> Result<Self, NativeSnapshotArtifactStateError> {
-        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(bytes)
-            .map(NativeV2MemoryHotplugSnapshotCandidateState::into_current_artifact_state)
+        NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(bytes)
+            .map(NativeV2NetworkSnapshotCandidateState::into_current_artifact_state)
             .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)
     }
 
@@ -365,7 +365,7 @@ impl NativeSnapshotArtifactState {
         };
         if *version == NATIVE_V2_SNAPSHOT_VERSION && binding.version() == NATIVE_V2_SNAPSHOT_VERSION
         {
-            let (actual_binding, _, _, _, _, _) = decode_memory_hotplug_state_v2_10(bytes)
+            let (actual_binding, _, _, _, _, _, _) = decode_network_state_v2_11(bytes)
                 .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
             if &actual_binding == binding {
                 Ok(())
@@ -1387,8 +1387,8 @@ impl NativeV2MemoryHotplugSnapshotCandidateState {
         )
     }
 
-    /// Consumes this exact current candidate into artifact authority.
-    pub fn into_current_artifact_state(self) -> NativeSnapshotArtifactState {
+    /// Consumes this exact retained candidate into compatible artifact authority.
+    pub fn into_compatible_artifact_state(self) -> NativeSnapshotArtifactState {
         let (bytes, binding, _, _, _, _, _) = self.into_parts();
         NativeSnapshotArtifactState {
             inner: NativeSnapshotArtifactStateInner::V2 {
@@ -1420,8 +1420,7 @@ impl fmt::Debug for NativeV2MemoryHotplugSnapshotCandidateState {
 ///
 /// Required serial and independently optional unchanged storage, entropy,
 /// balloon, virtio-mem, and network/MMDS state are all decoded from the same
-/// immutable byte vector. This candidate is internal compatibility authority
-/// only while public output remains exact 2.10.
+/// immutable byte vector.
 pub struct NativeV2NetworkSnapshotCandidateState {
     bytes: Vec<u8>,
     binding: SnapshotV2MemoryBinding,
@@ -1469,6 +1468,58 @@ impl NativeV2NetworkSnapshotPreparation {
         match self {
             Self::Compatible(_) => None,
             Self::Prepared(candidate) => Some(candidate),
+        }
+    }
+
+    /// Closes either preparation outcome for one selected destination
+    /// transport without changing or re-encoding the immutable artifact.
+    #[doc(hidden)]
+    pub fn into_prepared_for_transport(
+        self,
+        transport_kind: SnapshotV2DeviceTransportKind,
+    ) -> Result<
+        PreparedNativeV2NetworkSnapshotCandidateState,
+        NativeV2NetworkSnapshotPreparationError,
+    > {
+        match self {
+            Self::Prepared(prepared) => {
+                if prepared.topology.transport_kind() != transport_kind {
+                    return Err(NativeV2NetworkSnapshotPreparationError::DestinationTransport);
+                }
+                Ok(prepared)
+            }
+            Self::Compatible(candidate) => {
+                let NativeV2NetworkSnapshotCandidateState {
+                    bytes,
+                    binding,
+                    device_graph,
+                    serial,
+                    entropy,
+                    balloon,
+                    memory_hotplug,
+                    network,
+                } = candidate;
+                if network.is_some() {
+                    return Err(NativeV2NetworkSnapshotPreparationError::DestinationTransport);
+                }
+                let manifest = SnapshotRestoreManifest::try_from_native_v2_network_state(
+                    device_graph.as_ref(),
+                    &serial,
+                    None,
+                )
+                .map_err(NativeV2NetworkSnapshotPreparationError::Manifest)?;
+                Ok(PreparedNativeV2NetworkSnapshotCandidateState {
+                    bytes,
+                    binding,
+                    device_graph,
+                    serial,
+                    entropy,
+                    balloon,
+                    memory_hotplug,
+                    topology: PreparedSnapshotV2NetworkRestoreTopology::empty(transport_kind),
+                    manifest,
+                })
+            }
         }
     }
 }
@@ -1606,6 +1657,8 @@ impl fmt::Debug for PreparedNativeV2NetworkSnapshotCandidateState {
 pub enum NativeV2NetworkSnapshotPreparationError {
     /// Caller overrides were supplied without a saved network component.
     OverridesWithoutNetwork,
+    /// Saved product placement and selected destination transport disagree.
+    DestinationTransport,
     /// The complete restore resource manifest could not be derived.
     Manifest(SnapshotRestoreManifestError),
     /// The owner-free destination topology could not be prepared.
@@ -1624,6 +1677,7 @@ impl fmt::Display for NativeV2NetworkSnapshotPreparationError {
             Self::OverridesWithoutNetwork => {
                 "native-v2 network overrides require saved network state"
             }
+            Self::DestinationTransport => "native-v2 network destination transport is inconsistent",
             Self::Manifest(_) => "native-v2 network restore manifest is invalid",
             Self::Topology(_) => "native-v2 network restore topology is invalid",
         })
@@ -1633,7 +1687,7 @@ impl fmt::Display for NativeV2NetworkSnapshotPreparationError {
 impl std::error::Error for NativeV2NetworkSnapshotPreparationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::OverridesWithoutNetwork => None,
+            Self::OverridesWithoutNetwork | Self::DestinationTransport => None,
             Self::Manifest(source) => Some(source),
             Self::Topology(source) => Some(source),
         }
@@ -1785,8 +1839,8 @@ impl NativeV2NetworkSnapshotCandidateState {
         )
     }
 
-    /// Consumes this candidate into compatible internal artifact authority.
-    pub fn into_compatible_artifact_state(self) -> NativeSnapshotArtifactState {
+    /// Consumes this exact current candidate into artifact authority.
+    pub fn into_current_artifact_state(self) -> NativeSnapshotArtifactState {
         let (bytes, binding, _, _, _, _, _, _) = self.into_parts();
         NativeSnapshotArtifactState {
             inner: NativeSnapshotArtifactStateInner::V2 {
@@ -3855,11 +3909,11 @@ impl LoadedNativeSnapshotArtifacts {
         Ok((candidate, memory))
     }
 
-    /// Consumes one exact current 2.10 pair into the virtio-mem load handoff.
+    /// Consumes one exact retained 2.10 pair into the virtio-mem load handoff.
     ///
     /// The state bytes are neither reopened nor re-encoded, and the already
     /// loaded guest memory remains bound to the candidate derived from them.
-    pub fn into_current_v2_candidate(
+    pub fn into_v2_10_candidate(
         self,
     ) -> Result<
         (NativeV2MemoryHotplugSnapshotCandidateState, GuestMemory),
@@ -3876,6 +3930,40 @@ impl LoadedNativeSnapshotArtifacts {
         let candidate =
             NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(bytes)
                 .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
+        debug_assert_eq!(candidate.memory_binding(), &binding);
+        Ok((candidate, memory))
+    }
+
+    /// Consumes one exact current 2.11 pair into the network load handoff.
+    ///
+    /// The state bytes are neither reopened nor re-encoded, and the already
+    /// loaded guest memory remains bound to the candidate derived from them.
+    pub fn into_current_v2_candidate(
+        self,
+    ) -> Result<
+        (NativeV2NetworkSnapshotCandidateState, GuestMemory),
+        NativeSnapshotArtifactStateError,
+    > {
+        self.into_v2_11_candidate()
+    }
+
+    /// Consumes one exact 2.11 pair into the network load handoff.
+    pub fn into_v2_11_candidate(
+        self,
+    ) -> Result<
+        (NativeV2NetworkSnapshotCandidateState, GuestMemory),
+        NativeSnapshotArtifactStateError,
+    > {
+        let actual = self.family();
+        let (state, memory) = self.into_parts();
+        let (bytes, binding) = state.into_v2_parts().map_err(|_| {
+            NativeSnapshotArtifactStateError::UnexpectedFamily {
+                expected: NativeSnapshotArtifactFamily::V2,
+                actual,
+            }
+        })?;
+        let candidate = NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(bytes)
+            .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
         debug_assert_eq!(candidate.memory_binding(), &binding);
         Ok((candidate, memory))
     }

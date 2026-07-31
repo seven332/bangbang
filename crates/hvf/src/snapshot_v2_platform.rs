@@ -79,7 +79,7 @@ use crate::snapshot_v2_storage_platform::{
 };
 use crate::startup::{
     HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage,
-    HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
+    HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError, PCI_ENDPOINT_SLOT_COUNT,
     capture_hvf_snapshot_v2_time_state, pci_root_restore_bar_region_id,
     pci_root_restore_gic_msi_configuration, replace_vmgenid_and_signal_with,
     update_vmclock_and_signal_with,
@@ -3102,10 +3102,7 @@ fn prepare_process_shell(
             }
             HvfSnapshotV2ProcessShellRestore::NetworkMmio { shell, plan } => {
                 let storage_count = plan.block_records.len() + plan.pmem_records.len();
-                if gic.msi.is_some()
-                    || plan.network_interrupts.is_empty()
-                    || plan.command_line.is_some() != (storage_count != 0)
-                {
+                if gic.msi.is_some() || plan.command_line.is_some() != (storage_count != 0) {
                     return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
                         mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
                     });
@@ -3191,8 +3188,8 @@ fn prepare_process_shell(
                 let canonical_host = Arm64PciAddressPlan::firecracker_v1_16()
                     .map(Arm64FdtPciHost::from_address_plan)
                     .ok();
-                if plan.endpoint_count == 0
-                    || plan.route_demand == 0
+                if plan.endpoint_count > PCI_ENDPOINT_SLOT_COUNT
+                    || (plan.endpoint_count == 0) != (plan.route_demand == 0)
                     || canonical_host != Some(plan.host)
                     || gic.msi != Some(plan.msi)
                     || !usize::try_from(plan.msi.interrupt_range.count)
@@ -5676,6 +5673,41 @@ pub(crate) mod tests {
             ),
             Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity)
         ));
+    }
+
+    #[test]
+    fn network_mmio_shell_accepts_an_empty_internal_network_product() {
+        let state = product_process_platform_fixture();
+        let (serial, _, vmgenid, vmclock) = fixture_shell_devices(&state);
+        let shell_plan = HvfSnapshotV2NetworkMmioShellPlan {
+            balloon_interrupt: None,
+            command_line: None,
+            block_records: &[],
+            network_interrupts: &[],
+            pmem_records: &[],
+            entropy_interrupt: None,
+            memory_hotplug_interrupt: None,
+            serial_interrupt: serial.interrupt_line,
+            vmgenid_interrupt: vmgenid.interrupt_line,
+            vmclock_interrupt: vmclock.interrupt_line,
+        };
+
+        let (_dispatcher, device) = prepare_process_shell(
+            Some(HvfSnapshotV2ProcessShellRestore::NetworkMmio {
+                shell: restored_serial_shell().into(),
+                plan: shell_plan,
+            }),
+            &state,
+            b"authenticated product FDT bytes are not reparsed",
+        )
+        .expect("zero-network exact-2.11 shell should prepare");
+        assert_eq!(
+            device
+                .expect("restored serial metadata should exist")
+                .fdt_device
+                .interrupt_line,
+            serial.interrupt_line,
+        );
     }
 
     #[test]

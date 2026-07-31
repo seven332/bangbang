@@ -19,8 +19,8 @@ use crate::network::{
 };
 use crate::snapshot::SnapshotNetworkOverride;
 use crate::snapshot_device_v2::{
-    SnapshotV2DeviceKey, SnapshotV2DeviceTransport, range_is_wholly_contained,
-    restore_mmio_transport_state_for_device_with_config_status_gate,
+    SnapshotV2DeviceKey, SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
+    range_is_wholly_contained, restore_mmio_transport_state_for_device_with_config_status_gate,
 };
 use crate::snapshot_device_v2_5::queue_ranges;
 use crate::snapshot_network_v2_11::{
@@ -815,12 +815,25 @@ impl std::error::Error for SnapshotV2NetworkPciEndpointError {
 /// datastore, token, session, device, platform slot, or VM authority.
 #[derive(PartialEq, Eq)]
 pub struct PreparedSnapshotV2NetworkRestoreTopology {
+    transport_kind: SnapshotV2DeviceTransportKind,
     interfaces: Vec<PreparedSnapshotV2NetworkRestoreInterface>,
     mmds_state: Option<SnapshotV2MmdsState>,
     mmds_controller: Option<MmdsConfig>,
 }
 
 impl PreparedSnapshotV2NetworkRestoreTopology {
+    /// Constructs the internal network-free form for one current exact-2.11
+    /// destination. Portable kind-12 state itself remains non-empty.
+    #[doc(hidden)]
+    pub fn empty(transport_kind: SnapshotV2DeviceTransportKind) -> Self {
+        Self {
+            transport_kind,
+            interfaces: Vec::new(),
+            mmds_state: None,
+            mmds_controller: None,
+        }
+    }
+
     /// Resolves one complete explicit override vector.
     pub fn prepare(
         state: SnapshotV2NetworkState,
@@ -844,6 +857,12 @@ impl PreparedSnapshotV2NetworkRestoreTopology {
     /// Returns interfaces in immutable saved configuration order.
     pub fn interfaces(&self) -> &[PreparedSnapshotV2NetworkRestoreInterface] {
         &self.interfaces
+    }
+
+    /// Returns the exact aggregate device transport, including for the
+    /// network-free internal form.
+    pub const fn transport_kind(&self) -> SnapshotV2DeviceTransportKind {
+        self.transport_kind
     }
 
     /// Returns the unchanged portable MMDS continuation.
@@ -1054,6 +1073,10 @@ where
     }
 
     let interfaces = state.interfaces();
+    let transport_kind = interfaces
+        .first()
+        .map(|interface| interface.transport().kind())
+        .ok_or(SnapshotV2NetworkRestorePreparationError::Controller)?;
     let mut destinations = Vec::new();
     allocation.reserve(
         &mut destinations,
@@ -1197,6 +1220,7 @@ where
         SnapshotV2NetworkRestorePreparationStage::Completion,
     )?;
     Ok(PreparedSnapshotV2NetworkRestoreTopology {
+        transport_kind,
         interfaces: prepared_interfaces,
         mmds_state,
         mmds_controller,
