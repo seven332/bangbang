@@ -1460,6 +1460,18 @@ pub(super) fn load_prepared_native_snapshot_memory_file_macos(
                         )?,
                     }
                 }
+                NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
+                    return Err(load_error(
+                        SnapshotArtifactLoadStage::StateDecode,
+                        SnapshotArtifactLoadFailure::NativeState(
+                            NativeSnapshotArtifactStateError::CurrentV2Profile(
+                                NativeV2SnapshotCandidateStateError::UnexpectedVersion {
+                                    found: NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+                                },
+                            ),
+                        ),
+                    ));
+                }
                 _ => load_snapshot_v2_memory_file(&decoded, memory_file).map_err(|source| {
                     load_error(
                         SnapshotArtifactLoadStage::MemoryLoad,

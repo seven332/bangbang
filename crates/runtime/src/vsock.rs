@@ -7386,6 +7386,28 @@ impl VirtioVsockDeviceCaptureState {
         self.host_local_port_cursor
     }
 
+    /// Consumes the resource-free capture into its durable device fields.
+    #[doc(hidden)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        u64,
+        u64,
+        u64,
+        Option<VirtioVsockActiveQueuesCaptureState>,
+        VsockBackendSelector,
+        VsockHostLocalPortCursor,
+    ) {
+        (
+            self.guest_cid,
+            self.available_features,
+            self.negotiated_features,
+            self.active_queues,
+            self.backend_selector,
+            self.host_local_port_cursor,
+        )
+    }
+
     fn validate_intrinsic(&self) -> Result<(), VirtioVsockDeviceCaptureError> {
         let guest_cid = u32::try_from(self.guest_cid)
             .map_err(|_| VirtioVsockDeviceCaptureError::GuestCidInvalid)?;
@@ -7532,6 +7554,12 @@ impl VirtioVsockMmioCaptureState {
         &self.transport
     }
 
+    /// Consumes the checked MMIO capture into device and transport state.
+    #[doc(hidden)]
+    pub fn into_parts(self) -> (VirtioVsockDeviceCaptureState, VirtioMmioTransportState) {
+        (self.device, self.transport)
+    }
+
     pub fn reconstruct_snapshot_device(
         &self,
         memory: &GuestMemory,
@@ -7613,6 +7641,12 @@ impl VirtioVsockPciCaptureState {
 
     pub const fn transport(&self) -> &VirtioPciTransportState {
         &self.transport
+    }
+
+    /// Consumes the checked PCI capture into device and transport state.
+    #[doc(hidden)]
+    pub fn into_parts(self) -> (VirtioVsockDeviceCaptureState, VirtioPciTransportState) {
+        (self.device, self.transport)
     }
 
     /// Rebuilds validated device/config components for later PCI placement.

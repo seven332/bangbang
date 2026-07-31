@@ -68,7 +68,8 @@ use bangbang_hvf::{
     HvfSnapshotV2SerialState, HvfSnapshotV2State, HvfSnapshotV2StorageEntropyPciPlatformPlan,
     HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioProcessConfig,
     HvfSnapshotV2StorageMmioRestoreError, HvfSnapshotV2StoragePciPlatformPlan,
-    HvfSnapshotV2StoragePciRestoreError, HvfSnapshotV2StorageState, HvfVcpuRunControl,
+    HvfSnapshotV2StoragePciRestoreError, HvfSnapshotV2StorageState,
+    HvfSnapshotV2VsockPlatformState, HvfSnapshotV2VsockState, HvfVcpuRunControl,
     HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
     PrepareHvfSnapshotV1LoadError, PrepareHvfSnapshotV2BalloonPlatformPlanError,
     PrepareHvfSnapshotV2EntropyPciPlatformPlanError,
@@ -86,7 +87,8 @@ use bangbang_hvf::{
     encode_hvf_snapshot_v2_entropy_state, encode_hvf_snapshot_v2_memory_hotplug_state,
     encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_network_state,
     encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
-    encode_hvf_snapshot_v2_storage_state, prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    encode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_vsock_state,
+    prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
     prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_pci_platform_plan,
@@ -181,14 +183,14 @@ use bangbang_runtime::snapshot_artifact::{
     NativeV2NetworkSnapshotCandidateState, NativeV2NetworkSnapshotPreparationError,
     NativeV2SerialSnapshotCandidateState, NativeV2SnapshotArtifactProfile,
     NativeV2SnapshotCandidateState, NativeV2SnapshotCandidateStateError,
-    NativeV2StorageSnapshotCandidateState, PreparedNativeSnapshotState,
-    PreparedNativeV2NetworkSnapshotCandidateState, SnapshotArtifactLoadError,
-    SnapshotArtifactOutput, SnapshotArtifactOutputs, SnapshotArtifactPaths,
-    SnapshotCommitDurability, SnapshotMemoryStagingWriter, SnapshotPublicationOutcome,
-    SnapshotPublicationTransactionError, load_prepared_native_snapshot_memory_file,
-    load_prepared_native_snapshot_memory_path, load_snapshot_artifacts,
-    prepare_native_snapshot_state_file, prepare_native_snapshot_state_path,
-    prepare_snapshot_state_file, prepare_snapshot_state_path,
+    NativeV2StorageSnapshotCandidateState, NativeV2VsockSnapshotCandidateState,
+    PreparedNativeSnapshotState, PreparedNativeV2NetworkSnapshotCandidateState,
+    SnapshotArtifactLoadError, SnapshotArtifactOutput, SnapshotArtifactOutputs,
+    SnapshotArtifactPaths, SnapshotCommitDurability, SnapshotMemoryStagingWriter,
+    SnapshotPublicationOutcome, SnapshotPublicationTransactionError,
+    load_prepared_native_snapshot_memory_file, load_prepared_native_snapshot_memory_path,
+    load_snapshot_artifacts, prepare_native_snapshot_state_file,
+    prepare_native_snapshot_state_path, prepare_snapshot_state_file, prepare_snapshot_state_path,
     publish_native_snapshot_artifacts_to_with, publish_native_snapshot_artifacts_with,
     publish_snapshot_artifacts_to_with, publish_snapshot_artifacts_with,
 };
@@ -248,6 +250,9 @@ use bangbang_runtime::snapshot_restore::{
 use bangbang_runtime::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
     SnapshotV2SerialStateCaptureError,
+};
+use bangbang_runtime::snapshot_vsock_v2_12::{
+    SnapshotV2VsockState, SnapshotV2VsockStateCaptureError,
 };
 use bangbang_runtime::startup::{
     Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice,
@@ -874,6 +879,20 @@ enum NativeV2SnapshotCaptureProfile {
         mmds_state: MmdsStateHandle,
         expected_transport: SnapshotV2DeviceTransportKind,
     },
+    Vsock {
+        serial: SnapshotV2SerialState,
+        memory_hotplug_config: Option<MemoryHotplugConfig>,
+        memory_hotplug_requested_size_mib: u64,
+        balloon_config: Option<BalloonConfig>,
+        entropy_config: Option<EntropyConfig>,
+        storage_configs: CaptureReadyStorageConfigs,
+        network_configs: Vec<NetworkInterfaceConfig>,
+        mmds_config: Option<MmdsConfig>,
+        mmds_state: MmdsStateHandle,
+        vsock_config: Option<VsockConfig>,
+        expected_vsock_metrics: SharedVsockDeviceMetrics,
+        expected_transport: SnapshotV2DeviceTransportKind,
+    },
 }
 
 struct NativeV2RootCandidateProductProfile {
@@ -960,6 +979,21 @@ struct NativeV2NetworkCandidateProductProfile {
     network_configs: Vec<NetworkInterfaceConfig>,
     mmds_config: Option<MmdsConfig>,
     mmds_state: MmdsStateHandle,
+    expected_transport: SnapshotV2DeviceTransportKind,
+}
+
+struct NativeV2VsockCandidateProductProfile {
+    input: HvfArm64BootSnapshotV2CaptureInput,
+    serial_config: SerialConfig,
+    entropy_config: Option<EntropyConfig>,
+    balloon_config: Option<BalloonConfig>,
+    memory_hotplug_config: Option<MemoryHotplugConfig>,
+    memory_hotplug_requested_size_mib: u64,
+    storage_configs: CaptureReadyStorageConfigs,
+    network_configs: Vec<NetworkInterfaceConfig>,
+    mmds_config: Option<MmdsConfig>,
+    mmds_state: MmdsStateHandle,
+    vsock_config: Option<VsockConfig>,
     expected_transport: SnapshotV2DeviceTransportKind,
 }
 
@@ -1249,6 +1283,29 @@ pub(crate) enum NativeV2NetworkCandidateProfileError {
     IncompatibleProcessMode,
 }
 
+#[derive(Debug)]
+pub(crate) struct NativeV2VsockCandidateProfileError {
+    source: NativeV2NetworkCandidateProfileError,
+}
+
+impl From<NativeV2NetworkCandidateProfileError> for NativeV2VsockCandidateProfileError {
+    fn from(source: NativeV2NetworkCandidateProfileError) -> Self {
+        Self { source }
+    }
+}
+
+impl fmt::Display for NativeV2VsockCandidateProfileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for NativeV2VsockCandidateProfileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl fmt::Display for NativeV2NetworkCandidateProfileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1386,6 +1443,40 @@ enum NativeV2NetworkCandidateProcessError {
     Transaction(Box<NativeV2SnapshotPublicationTransactionError>),
 }
 
+#[derive(Debug)]
+enum NativeV2VsockCandidateProcessError {
+    Profile(NativeV2VsockCandidateProfileError),
+    SessionUnavailable,
+    Transaction(Box<NativeV2SnapshotPublicationTransactionError>),
+}
+
+impl fmt::Display for NativeV2VsockCandidateProcessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Profile(source) => {
+                write!(
+                    formatter,
+                    "native-v2 vsock candidate profile rejected: {source}"
+                )
+            }
+            Self::SessionUnavailable => {
+                formatter.write_str("native-v2 vsock candidate boot session is unavailable")
+            }
+            Self::Transaction(_) => formatter.write_str("native-v2 vsock candidate capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for NativeV2VsockCandidateProcessError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Profile(source) => Some(source),
+            Self::Transaction(source) => Some(source),
+            Self::SessionUnavailable => None,
+        }
+    }
+}
+
 impl fmt::Display for NativeV2NetworkCandidateProcessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1478,6 +1569,7 @@ pub(crate) enum NativeV2SnapshotCaptureStage {
     Balloon,
     MemoryHotplug,
     Network,
+    Vsock,
     Device(HvfArm64BootStorageCaptureStage),
     Memory(SnapshotV2MemoryIoStage),
     Encode,
@@ -1493,6 +1585,7 @@ impl fmt::Display for NativeV2SnapshotCaptureStage {
             Self::Balloon => formatter.write_str("balloon capture"),
             Self::MemoryHotplug => formatter.write_str("virtio-mem capture"),
             Self::Network => formatter.write_str("network capture"),
+            Self::Vsock => formatter.write_str("vsock capture"),
             Self::Device(stage) => write!(formatter, "device/{stage:?}"),
             Self::Memory(stage) => write!(formatter, "memory/{stage}"),
             Self::Encode => formatter.write_str("state encode"),
@@ -1542,6 +1635,9 @@ pub(crate) enum NativeV2SnapshotCaptureError {
     Network {
         source: NativeV2SnapshotNetworkCaptureError,
     },
+    Vsock {
+        source: NativeV2SnapshotVsockCaptureError,
+    },
     TopologyPause {
         source: HvfArm64BootVcpuError,
     },
@@ -1573,6 +1669,7 @@ impl NativeV2SnapshotCaptureError {
             Self::Root { source } => source.is_terminal(),
             Self::MultiBlock { source } => source.is_terminal(),
             Self::Storage { source } => source.is_terminal(),
+            Self::Vsock { source } => source.is_terminal(),
             Self::Platform { source } => native_v2_platform_capture_is_terminal(source),
             Self::Supervisor { .. }
             | Self::Auxiliary { .. }
@@ -1898,6 +1995,54 @@ pub(crate) enum NativeV2SnapshotNetworkCaptureError {
     },
 }
 
+#[derive(Debug)]
+pub(crate) enum NativeV2SnapshotVsockCaptureError {
+    Live {
+        source: HvfArm64BootVsockCaptureError,
+    },
+    State {
+        source: SnapshotV2VsockStateCaptureError,
+    },
+    Transport {
+        expected: SnapshotV2DeviceTransportKind,
+        actual: SnapshotV2DeviceTransportKind,
+    },
+}
+
+impl NativeV2SnapshotVsockCaptureError {
+    const fn is_terminal(&self) -> bool {
+        match self {
+            Self::Live { source } => source.is_terminal(),
+            Self::State { .. } | Self::Transport { .. } => false,
+        }
+    }
+}
+
+impl fmt::Display for NativeV2SnapshotVsockCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Live { source } => write!(formatter, "vsock owner capture failed: {source}"),
+            Self::State { source } => {
+                write!(formatter, "captured vsock state is invalid: {source}")
+            }
+            Self::Transport { expected, actual } => write!(
+                formatter,
+                "captured vsock transport {actual:?} does not match product transport {expected:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NativeV2SnapshotVsockCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Live { source } => Some(source),
+            Self::State { source } => Some(source),
+            Self::Transport { .. } => None,
+        }
+    }
+}
+
 impl fmt::Display for NativeV2SnapshotNetworkCaptureError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2004,6 +2149,9 @@ impl fmt::Display for NativeV2SnapshotCaptureError {
             Self::Network { source } => {
                 write!(formatter, "native-v2 network capture failed: {source}")
             }
+            Self::Vsock { source } => {
+                write!(formatter, "native-v2 vsock capture failed: {source}")
+            }
             Self::TopologyPause { source } => {
                 write!(formatter, "native-v2 topology pause failed: {source}")
             }
@@ -2047,6 +2195,7 @@ impl std::error::Error for NativeV2SnapshotCaptureError {
             Self::Balloon { source } => Some(source),
             Self::MemoryHotplug { source } => Some(source),
             Self::Network { source } => Some(source),
+            Self::Vsock { source } => Some(source),
             Self::TopologyPause { source } => Some(source),
             Self::Platform { source } => Some(source),
             Self::Encode { source } => Some(source),
@@ -7265,6 +7414,11 @@ where
                     return Err(NativeV2SnapshotLoadError::Cancelled);
                 }
             }
+            NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
         }
 
         let (state, state_id, memory_id) = prepared.into_parts();
@@ -7662,6 +7816,9 @@ where
                 self.started_session = Some(session);
                 Ok(self.controller.commit_snapshot_v2_load(controller_commit))
             }
+            NativeV2SnapshotArtifactProfile::VsockStateV2_12 => Err(
+                NativeV2SnapshotLoadError::Preflight(VmmActionError::SnapshotUnsupported),
+            ),
         }
     }
 
@@ -9028,6 +9185,113 @@ where
         })
     }
 
+    fn native_v2_vsock_candidate_product_profile(
+        &self,
+    ) -> Result<NativeV2VsockCandidateProductProfile, NativeV2VsockCandidateProfileError> {
+        self.starter
+            .preflight_snapshot_v2_root_process(self.pci_enabled)
+            .map_err(|_| NativeV2NetworkCandidateProfileError::IncompatibleProcessMode)?;
+
+        let boot = self
+            .controller
+            .boot_source_config()
+            .ok_or(NativeV2NetworkCandidateProfileError::MissingBootSource)?;
+        let kernel = HvfSnapshotV2NativePath::try_new(boot.kernel_image_path().as_os_str())
+            .map_err(|_| NativeV2NetworkCandidateProfileError::InvalidBootMetadata)?;
+        let initrd = boot
+            .initrd_path()
+            .map(|path| HvfSnapshotV2NativePath::try_new(path.as_os_str()))
+            .transpose()
+            .map_err(|_| NativeV2NetworkCandidateProfileError::InvalidBootMetadata)?;
+        let boot = HvfSnapshotV2BootState::try_new(kernel, initrd, boot.boot_args())
+            .map_err(|_| NativeV2NetworkCandidateProfileError::InvalidBootMetadata)?;
+
+        let drives = self.controller.drive_configs();
+        let pmem = self.controller.pmem_configs();
+        let storage_resource_count = drives
+            .len()
+            .checked_add(pmem.len())
+            .ok_or(NativeV2NetworkCandidateProfileError::TransportCapacity)?;
+        if storage_resource_count != 0 {
+            SnapshotV2StorageDeviceGraph::preflight_capture_configs(
+                NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                drives,
+                pmem,
+            )
+            .map_err(NativeV2NetworkCandidateProfileError::StorageProfile)?;
+        }
+        SnapshotV2SerialState::preflight_capture(
+            self.controller.serial_config(),
+            storage_resource_count,
+        )
+        .map_err(NativeV2NetworkCandidateProfileError::SerialProfile)?;
+
+        let entropy_config = self.controller.entropy_config();
+        let balloon_config = self.controller.balloon_config();
+        let memory_hotplug_config = self.controller.memory_hotplug_config();
+        let memory_hotplug_requested_size_mib = self
+            .controller
+            .memory_hotplug_status()
+            .map(|status| status.requested_size_mib())
+            .unwrap_or(0);
+        if let Some(config) = memory_hotplug_config {
+            config
+                .validate_size_update(MemoryHotplugSizeUpdateInput::new(
+                    memory_hotplug_requested_size_mib,
+                ))
+                .map_err(|_| NativeV2NetworkCandidateProfileError::RequestedSize)?;
+        } else if memory_hotplug_requested_size_mib != 0 {
+            return Err(NativeV2NetworkCandidateProfileError::RequestedSize.into());
+        }
+
+        let network_configs = self.controller.network_interface_configs().to_vec();
+        validate_network_interface_count(network_configs.len())
+            .map_err(|_| NativeV2NetworkCandidateProfileError::NetworkInventory)?;
+        let mmds_config = self
+            .controller
+            .mmds_config()
+            .map_err(NativeV2NetworkCandidateProfileError::MmdsState)?;
+        if network_configs.is_empty() && mmds_config.is_some()
+            || mmds_config
+                .as_ref()
+                .is_some_and(|config| !mmds_network_inventory_matches(config, &network_configs))
+        {
+            return Err(NativeV2NetworkCandidateProfileError::NetworkInventory.into());
+        }
+
+        let vsock_config = self.controller.vsock_config().cloned();
+        let endpoint_count = storage_resource_count
+            .checked_add(network_configs.len())
+            .and_then(|count| count.checked_add(usize::from(entropy_config.is_some())))
+            .and_then(|count| count.checked_add(usize::from(balloon_config.is_some())))
+            .and_then(|count| count.checked_add(usize::from(memory_hotplug_config.is_some())))
+            .and_then(|count| count.checked_add(usize::from(vsock_config.is_some())))
+            .ok_or(NativeV2NetworkCandidateProfileError::TransportCapacity)?;
+        let pci_capacity = usize::from(PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1);
+        if self.pci_enabled && endpoint_count > pci_capacity {
+            return Err(NativeV2NetworkCandidateProfileError::TransportCapacity.into());
+        }
+
+        Ok(NativeV2VsockCandidateProductProfile {
+            input: HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            serial_config: self.controller.serial_config().clone(),
+            entropy_config,
+            balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs: CaptureReadyStorageConfigs::new(drives.to_vec(), pmem.to_vec()),
+            network_configs,
+            mmds_config,
+            mmds_state: self.controller.mmds_state_handle(),
+            vsock_config,
+            expected_transport: if self.pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            },
+        })
+    }
+
     /// Publishes one strictly admitted paused source as a current native-v2
     /// 2.11 pair, including the network-free case.
     ///
@@ -9039,6 +9303,12 @@ where
         self.controller
             .preflight_create_snapshot_v2_request(input)
             .map_err(NativeV2SnapshotPublicationError::Preflight)?;
+        if self.controller.vsock_config().is_some() {
+            let cancellation = self.snapshot_capture_cancellation.clone();
+            let _serial = self
+                .preflight_snapshot_capture_ready(cancellation)
+                .map_err(SnapshotCaptureReadyPreflightError::into_native_v2)?;
+        }
         let NativeV2NetworkCandidateProductProfile {
             input: capture_input,
             serial_config,
@@ -9305,6 +9575,52 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
             })
             .map_err(NativeV2NetworkCandidateProcessError::Transaction)
     }
+
+    fn capture_native_v2_vsock_candidate(
+        &mut self,
+        output: BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: NativeV2SnapshotCaptureCancellation,
+    ) -> Result<NativeV2VsockSnapshotCandidateState, NativeV2VsockCandidateProcessError> {
+        let NativeV2VsockCandidateProductProfile {
+            input,
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs,
+            network_configs,
+            mmds_config,
+            mmds_state,
+            vsock_config,
+            expected_transport,
+        } = self
+            .native_v2_vsock_candidate_product_profile()
+            .map_err(NativeV2VsockCandidateProcessError::Profile)?;
+        let session = self
+            .started_session
+            .as_mut()
+            .and_then(HvfProcessSession::boot_mut)
+            .ok_or(NativeV2VsockCandidateProcessError::SessionUnavailable)?;
+        session
+            .capture_native_v2_vsock_candidate(NativeV2VsockCandidateCaptureRequest {
+                input,
+                serial_config,
+                balloon_config,
+                entropy_config,
+                memory_hotplug_config,
+                memory_hotplug_requested_size_mib,
+                storage_configs,
+                network_configs,
+                mmds_config,
+                mmds_state,
+                vsock_config,
+                expected_transport,
+                output,
+                cancellation,
+            })
+            .map_err(NativeV2VsockCandidateProcessError::Transaction)
+    }
 }
 
 // Keep the frozen, intentionally non-dispatched native-v1 writer type-checked
@@ -9344,6 +9660,15 @@ const _: fn(
 )
     -> Result<NativeV2NetworkSnapshotCandidateState, NativeV2NetworkCandidateProcessError> =
     ProcessVmm::<HvfInstanceStartExecutor>::capture_native_v2_network_candidate;
+
+// Keep the exact-2.12 vsock candidate seam type-checked while public create,
+// load, and artifact authority remain pinned to exact 2.11.
+const _: fn(
+    &mut ProcessVmm<HvfInstanceStartExecutor>,
+    BoxedNativeV2SnapshotMemoryOutput,
+    NativeV2SnapshotCaptureCancellation,
+) -> Result<NativeV2VsockSnapshotCandidateState, NativeV2VsockCandidateProcessError> =
+    ProcessVmm::<HvfInstanceStartExecutor>::capture_native_v2_vsock_candidate;
 
 #[cfg(target_os = "macos")]
 const _: fn(
@@ -9531,6 +9856,11 @@ impl HvfInstanceStartExecutor {
             NativeV2SnapshotArtifactProfile::NetworkStateV2_11 => {
                 NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
             }
+            NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
         };
         let structural = decode_snapshot_v2_state_with_compatibility_version(bytes, version)
             .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
@@ -9570,6 +9900,11 @@ impl HvfInstanceStartExecutor {
             NativeV2SnapshotArtifactProfile::NetworkStateV2_11 => {
                 decode_hvf_snapshot_v2_network_state(&structural)
                     .map_err(NativeV2SnapshotLoadError::Decode)?;
+            }
+            NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
             }
         }
         Ok(())
@@ -15745,6 +16080,23 @@ struct NativeV2NetworkCandidateCaptureRequest {
     cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
+struct NativeV2VsockCandidateCaptureRequest {
+    input: HvfArm64BootSnapshotV2CaptureInput,
+    serial_config: SerialConfig,
+    balloon_config: Option<BalloonConfig>,
+    entropy_config: Option<EntropyConfig>,
+    memory_hotplug_config: Option<MemoryHotplugConfig>,
+    memory_hotplug_requested_size_mib: u64,
+    storage_configs: CaptureReadyStorageConfigs,
+    network_configs: Vec<NetworkInterfaceConfig>,
+    mmds_config: Option<MmdsConfig>,
+    mmds_state: MmdsStateHandle,
+    vsock_config: Option<VsockConfig>,
+    expected_transport: SnapshotV2DeviceTransportKind,
+    output: BoxedNativeV2SnapshotMemoryOutput,
+    cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
 impl SnapshotCaptureCancellation {
     fn begin_operation(&self) -> bool {
         if self.state.shutdown_requested.load(Ordering::Acquire) {
@@ -15949,6 +16301,8 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     type MemoryHotplugState: Send + 'static;
     type NetworkPlatformState: Send + 'static;
     type NetworkState: Send + 'static;
+    type VsockPlatformState: Send + 'static;
+    type VsockState: Send + 'static;
 
     fn capture_native_v2_serial(
         &self,
@@ -15989,6 +16343,15 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
         guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
         now: Instant,
     ) -> Result<Option<SnapshotV2NetworkState>, NativeV2SnapshotNetworkCaptureError>;
+
+    fn capture_native_v2_vsock(
+        &mut self,
+        config: Option<VsockConfig>,
+        expected_metrics: &SharedVsockDeviceMetrics,
+        expected_transport: SnapshotV2DeviceTransportKind,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Option<SnapshotV2VsockState>, NativeV2SnapshotVsockCaptureError>;
 
     fn pause_native_v2_topology(&mut self) -> Result<(), HvfArm64BootVcpuError>;
 
@@ -16076,6 +16439,14 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
         output: &mut BoxedNativeV2SnapshotMemoryOutput,
         cancellation: &NativeV2SnapshotCaptureCancellation,
     ) -> Result<Self::NetworkPlatformState, HvfArm64BootSnapshotV2CaptureError>;
+
+    fn capture_native_v2_vsock_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<Self::MemoryHotplugCaptureState>,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::VsockPlatformState, HvfArm64BootSnapshotV2CaptureError>;
 
     fn compose_native_v2_root(
         &self,
@@ -16176,6 +16547,23 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     fn encode_native_v2_network(
         &self,
         state: &Self::NetworkState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn compose_native_v2_vsock(
+        &self,
+        platform: Self::VsockPlatformState,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+        network: Option<SnapshotV2NetworkState>,
+        vsock: Option<SnapshotV2VsockState>,
+    ) -> Result<Self::VsockState, HvfSnapshotV2BuildError>;
+
+    fn encode_native_v2_vsock(
+        &self,
+        state: &Self::VsockState,
     ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
 
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError>;
@@ -16748,6 +17136,8 @@ impl NativeV2SnapshotCaptureSession
     type MemoryHotplugState = HvfSnapshotV2MemoryHotplugState;
     type NetworkPlatformState = HvfSnapshotV2NetworkPlatformState;
     type NetworkState = HvfSnapshotV2NetworkState;
+    type VsockPlatformState = HvfSnapshotV2VsockPlatformState;
+    type VsockState = HvfSnapshotV2VsockState;
 
     fn capture_native_v2_serial(
         &self,
@@ -16857,6 +17247,32 @@ impl NativeV2SnapshotCaptureSession
             )
             .map_err(|source| NativeV2SnapshotNetworkCaptureError::Live { source })?;
         convert_process_capture_ready_network_state(captured, expected_transport)
+    }
+
+    fn capture_native_v2_vsock(
+        &mut self,
+        config: Option<VsockConfig>,
+        expected_metrics: &SharedVsockDeviceMetrics,
+        expected_transport: SnapshotV2DeviceTransportKind,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Option<SnapshotV2VsockState>, NativeV2SnapshotVsockCaptureError> {
+        let state = self
+            .capture_ready_vsock_state_with_cancel(config, expected_metrics, guard, cancellation)
+            .map_err(|source| NativeV2SnapshotVsockCaptureError::Live { source })?
+            .map(HvfArm64BootVsockCaptureState::try_into_snapshot_v2)
+            .transpose()
+            .map_err(|source| NativeV2SnapshotVsockCaptureError::State { source })?;
+        if let Some(state) = &state {
+            let actual = state.transport().kind();
+            if actual != expected_transport {
+                return Err(NativeV2SnapshotVsockCaptureError::Transport {
+                    expected: expected_transport,
+                    actual,
+                });
+            }
+        }
+        Ok(state)
     }
 
     fn pause_native_v2_topology(&mut self) -> Result<(), HvfArm64BootVcpuError> {
@@ -17094,6 +17510,19 @@ impl NativeV2SnapshotCaptureSession
             })
     }
 
+    fn capture_native_v2_vsock_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<Self::MemoryHotplugCaptureState>,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::VsockPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        self.session
+            .capture_snapshot_v2_vsock_platform_with_cancel(input, capture, output, |_| {
+                cancellation.is_cancelled()
+            })
+    }
+
     fn compose_native_v2_root(
         &self,
         platform: Self::PlatformState,
@@ -17225,6 +17654,26 @@ impl NativeV2SnapshotCaptureSession
         state: &Self::NetworkState,
     ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
         encode_hvf_snapshot_v2_network_state(state)
+    }
+
+    fn compose_native_v2_vsock(
+        &self,
+        platform: Self::VsockPlatformState,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+        network: Option<SnapshotV2NetworkState>,
+        vsock: Option<SnapshotV2VsockState>,
+    ) -> Result<Self::VsockState, HvfSnapshotV2BuildError> {
+        HvfSnapshotV2VsockState::try_new(platform, graph, serial, entropy, balloon, network, vsock)
+    }
+
+    fn encode_native_v2_vsock(
+        &self,
+        state: &Self::VsockState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+        encode_hvf_snapshot_v2_vsock_state(state)
     }
 
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
@@ -26097,6 +26546,51 @@ fn preflight_native_v2_network_capture(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn preflight_native_v2_vsock_capture(
+    serial_config: &SerialConfig,
+    balloon_config: Option<BalloonConfig>,
+    entropy_config: Option<EntropyConfig>,
+    memory_hotplug_config: Option<MemoryHotplugConfig>,
+    memory_hotplug_requested_size_mib: u64,
+    storage_configs: &CaptureReadyStorageConfigs,
+    network_configs: &[NetworkInterfaceConfig],
+    mmds_config: Option<&MmdsConfig>,
+    mmds_state: &MmdsStateHandle,
+    vsock_config: Option<&VsockConfig>,
+    expected_transport: SnapshotV2DeviceTransportKind,
+) -> Result<(), NativeV2SnapshotCaptureError> {
+    preflight_native_v2_network_capture(
+        serial_config,
+        balloon_config,
+        entropy_config,
+        memory_hotplug_config,
+        memory_hotplug_requested_size_mib,
+        storage_configs,
+        network_configs,
+        mmds_config,
+        mmds_state,
+        expected_transport,
+    )?;
+    let storage_count = storage_configs
+        .drives()
+        .len()
+        .checked_add(storage_configs.pmem().len())
+        .ok_or(NativeV2SnapshotCaptureError::TransportCapacity)?;
+    let endpoint_count = storage_count
+        .checked_add(network_configs.len())
+        .and_then(|count| count.checked_add(usize::from(balloon_config.is_some())))
+        .and_then(|count| count.checked_add(usize::from(entropy_config.is_some())))
+        .and_then(|count| count.checked_add(usize::from(memory_hotplug_config.is_some())))
+        .and_then(|count| count.checked_add(usize::from(vsock_config.is_some())))
+        .ok_or(NativeV2SnapshotCaptureError::TransportCapacity)?;
+    let pci_capacity = usize::from(PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1);
+    if expected_transport == SnapshotV2DeviceTransportKind::Pci && endpoint_count > pci_capacity {
+        return Err(NativeV2SnapshotCaptureError::TransportCapacity);
+    }
+    Ok(())
+}
+
 fn capture_canonical_native_v2_serial<S>(
     session: &S,
     serial_config: SerialConfig,
@@ -26632,6 +27126,129 @@ where
                     .map_err(|source| NativeV2SnapshotCaptureError::Compose { source })?;
                 session
                     .encode_native_v2_network(&state)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Encode { source })?
+            }
+            NativeV2SnapshotCaptureProfile::Vsock {
+                serial,
+                memory_hotplug_config,
+                memory_hotplug_requested_size_mib,
+                balloon_config,
+                entropy_config,
+                storage_configs,
+                network_configs,
+                mmds_config,
+                mmds_state,
+                vsock_config,
+                expected_vsock_metrics,
+                expected_transport,
+            } => {
+                let now = Instant::now();
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Balloon,
+                    ));
+                }
+                let balloon = session
+                    .capture_native_v2_balloon(balloon_config, expected_transport, guard, now)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Balloon { source })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Balloon,
+                    ));
+                }
+                let graph =
+                    if storage_configs.drives().is_empty() && storage_configs.pmem().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            session
+                                .capture_native_v2_storage(
+                                    &storage_configs,
+                                    expected_transport,
+                                    guard,
+                                    now,
+                                    cancellation,
+                                )
+                                .map_err(|source| match source {
+                                    NativeV2SnapshotStorageCaptureError::Cancelled { stage } => {
+                                        native_v2_snapshot_cancelled(
+                                            NativeV2SnapshotCaptureStage::Device(stage),
+                                        )
+                                    }
+                                    source => NativeV2SnapshotCaptureError::Storage { source },
+                                })?,
+                        )
+                    };
+                let entropy = session
+                    .capture_native_v2_entropy(entropy_config, expected_transport, guard, now)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Entropy { source })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::MemoryHotplug,
+                    ));
+                }
+                let memory_hotplug = session
+                    .capture_native_v2_memory_hotplug(
+                        memory_hotplug_config,
+                        memory_hotplug_requested_size_mib,
+                        expected_transport,
+                        guard,
+                    )
+                    .map_err(|source| NativeV2SnapshotCaptureError::MemoryHotplug { source })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Network,
+                    ));
+                }
+                let network = session
+                    .capture_native_v2_network(
+                        &network_configs,
+                        mmds_config.as_ref(),
+                        &mmds_state,
+                        expected_transport,
+                        guard,
+                        now,
+                    )
+                    .map_err(|source| NativeV2SnapshotCaptureError::Network { source })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Vsock,
+                    ));
+                }
+                let vsock = session
+                    .capture_native_v2_vsock(
+                        vsock_config,
+                        &expected_vsock_metrics,
+                        expected_transport,
+                        guard,
+                        cancellation,
+                    )
+                    .map_err(|source| NativeV2SnapshotCaptureError::Vsock { source })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Vsock,
+                    ));
+                }
+                let platform = session
+                    .capture_native_v2_vsock_platform(
+                        input,
+                        memory_hotplug,
+                        &mut output,
+                        cancellation,
+                    )
+                    .map_err(native_v2_platform_capture_error)?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Encode,
+                    ));
+                }
+                let state = session
+                    .compose_native_v2_vsock(
+                        platform, graph, serial, entropy, balloon, network, vsock,
+                    )
+                    .map_err(|source| NativeV2SnapshotCaptureError::Compose { source })?;
+                session
+                    .encode_native_v2_vsock(&state)
                     .map_err(|source| NativeV2SnapshotCaptureError::Encode { source })?
             }
         };
@@ -27393,6 +28010,165 @@ where
                     &cancellation,
                     |encoded| {
                         NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(encoded)
+                            .map_err(|source| NativeV2SnapshotCaptureError::CandidateState {
+                                source,
+                            })
+                    },
+                )
+                .map_err(native_v2_snapshot_transaction_error_before_staging)
+                .and_then(|state| {
+                    if cancellation.is_cancelled() || !cancellation.try_seal_commit() {
+                        Err(native_v2_snapshot_transaction_error_before_staging(
+                            native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::CommitSeal),
+                        ))
+                    } else {
+                        session.native_v2_candidate_commit_sealed();
+                        Ok(state)
+                    }
+                });
+
+                let terminal_capture = result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.producer())
+                    .is_some_and(|producer| producer.source().is_terminal());
+                if terminal_capture {
+                    preserve_terminal_result.store(true, Ordering::Release);
+                    terminal_status.record(BootRunLoopWorkerStatus::Failed(
+                        "terminal native-v2 capture failure".to_string(),
+                    ));
+                    terminal_admission.shutdown();
+                    terminal_pause_gate.shutdown();
+                    let _ = session.run_loop_control().request_stop();
+                }
+                drop(guard);
+                result
+            },
+            move || {
+                completion_cancellation.is_commit_sealed()
+                    || completion_terminal_result.load(Ordering::Acquire)
+            },
+        )
+        .map_err(native_v2_snapshot_publication_error_from_boot_run_loop_command)
+    }
+
+    fn capture_native_v2_vsock_candidate(
+        &self,
+        request: NativeV2VsockCandidateCaptureRequest,
+    ) -> Result<NativeV2VsockSnapshotCandidateState, Box<NativeV2SnapshotPublicationTransactionError>>
+    {
+        let NativeV2VsockCandidateCaptureRequest {
+            input,
+            serial_config,
+            balloon_config,
+            entropy_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs,
+            network_configs,
+            mmds_config,
+            mmds_state,
+            vsock_config,
+            expected_transport,
+            output,
+            cancellation,
+        } = request;
+        preflight_native_v2_vsock_capture(
+            &serial_config,
+            balloon_config,
+            entropy_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            &storage_configs,
+            &network_configs,
+            mmds_config.as_ref(),
+            &mmds_state,
+            vsock_config.as_ref(),
+            expected_transport,
+        )
+        .map_err(native_v2_snapshot_transaction_error_before_staging)?;
+        let expected_vsock_metrics = self.vsock_device_metrics.clone().ok_or_else(|| {
+            native_v2_snapshot_transaction_error_before_staging(
+                NativeV2SnapshotCaptureError::Vsock {
+                    source: NativeV2SnapshotVsockCaptureError::Live {
+                        source: HvfArm64BootVsockCaptureError::owner_unavailable(
+                            HvfArm64BootVsockCaptureDisposition::Terminal,
+                        ),
+                    },
+                },
+            )
+        })?;
+        let active_capture = self
+            .register_snapshot_capture_raw(cancellation.clone())
+            .map_err(|source| {
+                native_v2_snapshot_transaction_error_before_staging(
+                    NativeV2SnapshotCaptureError::Supervisor { source },
+                )
+            })?;
+        if !cancellation.begin_operation() {
+            return Err(native_v2_snapshot_transaction_error_before_staging(
+                native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Source),
+            ));
+        }
+        let completion_cancellation = cancellation.clone();
+        let preserve_terminal_result = Arc::new(AtomicBool::new(false));
+        let completion_terminal_result = Arc::clone(&preserve_terminal_result);
+        let terminal_status = Arc::clone(&self.status);
+        let terminal_admission = Arc::clone(&self.admission);
+        let terminal_pause_gate = Arc::clone(&self.pause_gate);
+
+        self.run_snapshot_quiesced_preserving_result_if(
+            move |session| {
+                let _active_capture = active_capture;
+                let guard = session
+                    .quiesce_snapshot_auxiliary_work()
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Auxiliary { source },
+                        )
+                    })?;
+                if cancellation.is_cancelled() {
+                    drop(guard);
+                    return Err(native_v2_snapshot_transaction_error_before_staging(
+                        native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Source),
+                    ));
+                }
+                let serial = session
+                    .capture_native_v2_serial(serial_config, &guard)
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Serial { source },
+                        )
+                    })?;
+                let serial =
+                    SnapshotV2SerialState::try_from_capture_ready(serial).map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::SerialState { source },
+                        )
+                    })?;
+
+                let result = capture_and_recover_native_v2_state(
+                    session,
+                    input,
+                    NativeV2SnapshotCaptureProfile::Vsock {
+                        serial,
+                        memory_hotplug_config,
+                        memory_hotplug_requested_size_mib,
+                        balloon_config,
+                        entropy_config,
+                        storage_configs,
+                        network_configs,
+                        mmds_config,
+                        mmds_state,
+                        vsock_config,
+                        expected_vsock_metrics,
+                        expected_transport,
+                    },
+                    &guard,
+                    output,
+                    &cancellation,
+                    |encoded| {
+                        NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(encoded)
                             .map_err(|source| NativeV2SnapshotCaptureError::CandidateState {
                                 source,
                             })
@@ -28834,9 +29610,10 @@ mod tests {
         NativeV2BalloonSnapshotCandidateState, NativeV2EntropySnapshotCandidateState,
         NativeV2MemoryHotplugSnapshotCandidateState, NativeV2MemoryHotplugSnapshotPreparation,
         NativeV2NetworkSnapshotCandidateState, NativeV2NetworkSnapshotPreparation,
-        NativeV2SnapshotArtifactProfile, PreparedNativeSnapshotState,
-        PreparedNativeV2NetworkSnapshotCandidateState, SnapshotArtifactOutputs,
-        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
+        NativeV2SnapshotArtifactProfile, NativeV2VsockSnapshotCandidateState,
+        PreparedNativeSnapshotState, PreparedNativeV2NetworkSnapshotCandidateState,
+        SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotPublicationOutcome,
+        publish_snapshot_artifacts_with,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_artifact::{
@@ -28869,8 +29646,9 @@ mod tests {
         NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
         NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
         NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
-        NATIVE_V2_NETWORK_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component,
-        SnapshotV2ComponentDisposition, decode_snapshot_v2_state_with_compatibility_version,
+        NATIVE_V2_NETWORK_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY,
+        NATIVE_V2_VSOCK_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
+        decode_snapshot_v2_state_with_compatibility_version,
         encode_snapshot_v2_state_with_compatibility_version,
     };
     use bangbang_runtime::snapshot_memory::{SnapshotMemoryBinding, write_snapshot_memory_image};
@@ -28891,6 +29669,9 @@ mod tests {
     use bangbang_runtime::snapshot_serial_v2_7::{
         NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialEndpointIntent,
         SnapshotV2SerialState,
+    };
+    use bangbang_runtime::snapshot_vsock_v2_12::{
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION, SnapshotV2VsockState,
     };
     use bangbang_runtime::startup::{
         Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkInterface,
@@ -28971,8 +29752,8 @@ mod tests {
         NativeV2SnapshotNetworkCaptureError, NativeV2SnapshotPublicationDestination,
         NativeV2SnapshotPublicationError, NativeV2SnapshotPublicationProducerError,
         NativeV2SnapshotPublicationRequest, NativeV2SnapshotRootCaptureError,
-        NativeV2SnapshotStorageCaptureError, NetworkPacketIoRunLoopSession,
-        NoopProcessNetworkTxPacketSink, PreparedNativeSnapshotLoad,
+        NativeV2SnapshotStorageCaptureError, NativeV2SnapshotVsockCaptureError,
+        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, PreparedNativeSnapshotLoad,
         ProcessCaptureReadyNetworkError, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
         ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
         ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
@@ -28994,8 +29775,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::{
         GrantAccess, HvfProcessSession, NativeV2NetworkCandidateCaptureRequest,
-        PreparedSnapshotRootBackingLease, SnapshotRootBackingLeaseError,
-        SnapshotRootSelectorPolicy,
+        NativeV2VsockCandidateCaptureRequest, PreparedSnapshotRootBackingLease,
+        SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -32237,6 +33018,24 @@ mod tests {
         network: Option<SnapshotV2NetworkState>,
     }
 
+    #[derive(Debug)]
+    struct FakeNativeV2VsockPlatformState {
+        binding: SnapshotV2MemoryBinding,
+        memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+    }
+
+    #[derive(Debug)]
+    struct FakeNativeV2VsockState {
+        binding: SnapshotV2MemoryBinding,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+        memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+        network: Option<SnapshotV2NetworkState>,
+        vsock: Option<SnapshotV2VsockState>,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FakeNativeV2RootFailure {
         Inventory,
@@ -32360,6 +33159,8 @@ mod tests {
         native_v2_balloon_state: Option<SnapshotV2BalloonState>,
         native_v2_memory_hotplug_state: Option<SnapshotV2MemoryHotplugState>,
         native_v2_network_state: Option<SnapshotV2NetworkState>,
+        native_v2_vsock_state: Option<SnapshotV2VsockState>,
+        native_v2_vsock_capture_error: Option<HvfArm64BootVsockCaptureError>,
         native_v2_pause_error: bool,
         native_v2_recovery_error: bool,
         native_v2_root_transport: Option<SnapshotV2DeviceTransportKind>,
@@ -32370,6 +33171,7 @@ mod tests {
         native_v2_cancel_during_balloon: Option<NativeV2SnapshotCaptureCancellation>,
         native_v2_cancel_during_memory_hotplug: Option<NativeV2SnapshotCaptureCancellation>,
         native_v2_cancel_during_network: Option<NativeV2SnapshotCaptureCancellation>,
+        native_v2_cancel_during_vsock: Option<NativeV2SnapshotCaptureCancellation>,
         native_v2_cancel_during_recovery: Option<NativeV2SnapshotCaptureCancellation>,
         native_v2_topology_generation: u64,
         native_v2_generation_events: Arc<Mutex<Vec<(&'static str, u64)>>>,
@@ -32436,6 +33238,8 @@ mod tests {
                 native_v2_balloon_state: None,
                 native_v2_memory_hotplug_state: None,
                 native_v2_network_state: None,
+                native_v2_vsock_state: None,
+                native_v2_vsock_capture_error: None,
                 native_v2_pause_error: false,
                 native_v2_recovery_error: false,
                 native_v2_root_transport: Some(SnapshotV2DeviceTransportKind::Mmio),
@@ -32446,6 +33250,7 @@ mod tests {
                 native_v2_cancel_during_balloon: None,
                 native_v2_cancel_during_memory_hotplug: None,
                 native_v2_cancel_during_network: None,
+                native_v2_cancel_during_vsock: None,
                 native_v2_cancel_during_recovery: None,
                 native_v2_topology_generation: 0,
                 native_v2_generation_events: Arc::default(),
@@ -32614,6 +33419,19 @@ mod tests {
             self
         }
 
+        fn with_native_v2_vsock_state(mut self, state: SnapshotV2VsockState) -> Self {
+            self.native_v2_vsock_state = Some(state);
+            self
+        }
+
+        fn with_native_v2_vsock_capture_error(
+            mut self,
+            source: HvfArm64BootVsockCaptureError,
+        ) -> Self {
+            self.native_v2_vsock_capture_error = Some(source);
+            self
+        }
+
         #[cfg(target_os = "macos")]
         const fn with_native_v2_pause_error(mut self) -> Self {
             self.native_v2_pause_error = true;
@@ -32683,6 +33501,15 @@ mod tests {
             cancellation: NativeV2SnapshotCaptureCancellation,
         ) -> Self {
             self.native_v2_cancel_during_network = Some(cancellation);
+            self
+        }
+
+        #[cfg(target_os = "macos")]
+        fn with_native_v2_cancel_during_vsock(
+            mut self,
+            cancellation: NativeV2SnapshotCaptureCancellation,
+        ) -> Self {
+            self.native_v2_cancel_during_vsock = Some(cancellation);
             self
         }
 
@@ -33303,6 +34130,8 @@ mod tests {
         type MemoryHotplugState = FakeNativeV2MemoryHotplugState;
         type NetworkPlatformState = FakeNativeV2NetworkPlatformState;
         type NetworkState = FakeNativeV2NetworkState;
+        type VsockPlatformState = FakeNativeV2VsockPlatformState;
+        type VsockState = FakeNativeV2VsockState;
 
         fn capture_native_v2_serial(
             &self,
@@ -33493,6 +34322,55 @@ mod tests {
                 }
             }
             if let Some(cancellation) = &self.native_v2_cancel_during_network {
+                cancellation.cancel();
+            }
+            Ok(state)
+        }
+
+        fn capture_native_v2_vsock(
+            &mut self,
+            config: Option<VsockConfig>,
+            expected_metrics: &SharedVsockDeviceMetrics,
+            expected_transport: SnapshotV2DeviceTransportKind,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+            _cancellation: &NativeV2SnapshotCaptureCancellation,
+        ) -> Result<Option<SnapshotV2VsockState>, NativeV2SnapshotVsockCaptureError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-vsock");
+            if !self
+                .vsock_device_metrics
+                .as_ref()
+                .is_some_and(|metrics| metrics.shares_state_with(expected_metrics))
+            {
+                return Err(NativeV2SnapshotVsockCaptureError::Live {
+                    source: HvfArm64BootVsockCaptureError::owner_unavailable(
+                        HvfArm64BootVsockCaptureDisposition::Terminal,
+                    ),
+                });
+            }
+            if let Some(source) = self.native_v2_vsock_capture_error {
+                return Err(NativeV2SnapshotVsockCaptureError::Live { source });
+            }
+            let state = self.native_v2_vsock_state.clone();
+            if state.is_some() != config.is_some() {
+                return Err(NativeV2SnapshotVsockCaptureError::Live {
+                    source: HvfArm64BootVsockCaptureError::owner_unavailable(
+                        HvfArm64BootVsockCaptureDisposition::Terminal,
+                    ),
+                });
+            }
+            if let Some(state) = &state {
+                let actual = state.transport().kind();
+                if actual != expected_transport {
+                    return Err(NativeV2SnapshotVsockCaptureError::Transport {
+                        expected: expected_transport,
+                        actual,
+                    });
+                }
+            }
+            if let Some(cancellation) = &self.native_v2_cancel_during_vsock {
                 cancellation.cancel();
             }
             Ok(state)
@@ -33958,6 +34836,45 @@ mod tests {
                 cancel.cancel();
             }
             Ok(FakeNativeV2NetworkPlatformState {
+                binding,
+                memory_hotplug: capture,
+            })
+        }
+
+        fn capture_native_v2_vsock_platform(
+            &mut self,
+            _input: HvfArm64BootSnapshotV2CaptureInput,
+            capture: Option<Self::MemoryHotplugCaptureState>,
+            output: &mut super::BoxedNativeV2SnapshotMemoryOutput,
+            cancellation: &NativeV2SnapshotCaptureCancellation,
+        ) -> Result<Self::VsockPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+            assert!(
+                !self.native_snapshot_panic,
+                "fake native-v2 snapshot capture panic"
+            );
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-vsock-platform");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("platform", self.native_v2_topology_generation));
+            let memory = self
+                .native_snapshot_memory
+                .as_ref()
+                .expect("fake native-v2 memory should be configured");
+            let binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+                memory,
+                output,
+                NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+                |_| cancellation.is_cancelled(),
+            )
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
+            if let Some(cancel) = &self.native_snapshot_cancel_before_seal {
+                cancel.cancel();
+            }
+            Ok(FakeNativeV2VsockPlatformState {
                 binding,
                 memory_hotplug: capture,
             })
@@ -34714,6 +35631,172 @@ mod tests {
             }
             encode_snapshot_v2_state_with_compatibility_version(
                 NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                &[],
+                &components,
+            )
+            .map_err(HvfSnapshotV2EncodeError::Container)
+        }
+
+        fn compose_native_v2_vsock(
+            &self,
+            platform: Self::VsockPlatformState,
+            graph: Option<SnapshotV2StorageDeviceGraph>,
+            serial: SnapshotV2SerialState,
+            entropy: Option<SnapshotV2EntropyState>,
+            balloon: Option<SnapshotV2BalloonState>,
+            network: Option<SnapshotV2NetworkState>,
+            vsock: Option<SnapshotV2VsockState>,
+        ) -> Result<Self::VsockState, HvfSnapshotV2BuildError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-vsock-compose");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("compose", self.native_v2_topology_generation));
+            Ok(FakeNativeV2VsockState {
+                binding: platform.binding,
+                graph,
+                serial,
+                entropy,
+                balloon,
+                memory_hotplug: platform.memory_hotplug,
+                network,
+                vsock,
+            })
+        }
+
+        fn encode_native_v2_vsock(
+            &self,
+            state: &Self::VsockState,
+        ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-vsock-encode");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("encode", self.native_v2_topology_generation));
+            let memory = state
+                .binding
+                .encode()
+                .map_err(HvfSnapshotV2EncodeError::Memory)?;
+            let graph = state
+                .graph
+                .as_ref()
+                .map(|graph| {
+                    graph
+                        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::StorageDeviceGraph)
+                })
+                .transpose()?;
+            let serial = state
+                .serial
+                .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+                .map_err(HvfSnapshotV2EncodeError::SerialState)?;
+            let entropy = state
+                .entropy
+                .as_ref()
+                .map(|entropy| {
+                    entropy
+                        .encode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::EntropyState)
+                })
+                .transpose()?;
+            let balloon = state
+                .balloon
+                .as_ref()
+                .map(|balloon| {
+                    balloon
+                        .encode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::BalloonState)
+                })
+                .transpose()?;
+            let memory_hotplug = state
+                .memory_hotplug
+                .as_ref()
+                .map(|memory_hotplug| {
+                    memory_hotplug
+                        .encode(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::MemoryHotplugState)
+                })
+                .transpose()?;
+            let network = state
+                .network
+                .as_ref()
+                .map(|network| {
+                    network
+                        .encode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::NetworkState)
+                })
+                .transpose()?;
+            let vsock = state
+                .vsock
+                .as_ref()
+                .map(|vsock| {
+                    vsock
+                        .encode(NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::VsockState)
+                })
+                .transpose()?;
+            let mut components = vec![SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &memory,
+            )];
+            if let Some(graph) = graph.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    graph,
+                ));
+            }
+            if !self.native_v2_invalid_candidate_state {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_SERIAL_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    &serial,
+                ));
+            }
+            if let Some(entropy) = entropy.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_ENTROPY_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    entropy,
+                ));
+            }
+            if let Some(balloon) = balloon.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_BALLOON_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    balloon,
+                ));
+            }
+            if let Some(memory_hotplug) = memory_hotplug.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    memory_hotplug,
+                ));
+            }
+            if let Some(network) = network.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_NETWORK_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    network,
+                ));
+            }
+            if let Some(vsock) = vsock.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_VSOCK_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    vsock,
+                ));
+            }
+            encode_snapshot_v2_state_with_compatibility_version(
+                NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
                 &[],
                 &components,
             )
@@ -35945,6 +37028,24 @@ mod tests {
             &fixture_hex_bytes(hex),
         )
         .expect("fake native-v2 network fixture should decode")
+    }
+
+    fn fake_native_v2_vsock_state(
+        transport: SnapshotV2DeviceTransportKind,
+    ) -> SnapshotV2VsockState {
+        let hex = match transport {
+            SnapshotV2DeviceTransportKind::Mmio => {
+                include_str!("../../runtime/src/snapshot_vsock_v2_12/fixtures/inactive-mmio.hex")
+            }
+            SnapshotV2DeviceTransportKind::Pci => {
+                include_str!("../../runtime/src/snapshot_vsock_v2_12/fixtures/active-pci.hex")
+            }
+        };
+        SnapshotV2VsockState::decode(
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+            &fixture_hex_bytes(hex),
+        )
+        .expect("fake native-v2 vsock fixture should decode")
     }
 
     #[cfg(target_os = "macos")]
@@ -37949,6 +39050,15 @@ mod tests {
                 NativeV2SnapshotArtifactProfile::NetworkStateV2_11,
             ),
             Err(NativeV2SnapshotLoadError::Decode(_))
+        ));
+        assert!(matches!(
+            HvfInstanceStartExecutor::default().validate_snapshot_v2_artifact_profile(
+                &prepared,
+                NativeV2SnapshotArtifactProfile::VsockStateV2_12,
+            ),
+            Err(NativeV2SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported
+            ))
         ));
     }
 
@@ -46326,6 +47436,61 @@ mod tests {
     }
 
     #[test]
+    fn public_exact_minor_eleven_configured_vsock_captures_before_unchanged_rejection() {
+        let state_path = missing_temp_child_path("public-vsock.state");
+        let memory_path = state_path.with_file_name("public-vsock.memory");
+        let parent = state_path
+            .parent()
+            .expect("missing public-vsock path should have a parent");
+        let mut vmm = configured_vmm(FakeStarter::success(161));
+        vmm.handle_action(VmmAction::PutVsock(VsockConfigInput::new(
+            42,
+            "/private/public-vsock.sock",
+        )))
+        .expect("public vsock should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("public vsock fake session should start");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("public vsock fake session should pause");
+
+        let error = vmm
+            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                &state_path,
+                &memory_path,
+            )))
+            .expect_err("public exact-2.11 should reject configured vsock after capture");
+
+        assert_eq!(error, VmmActionError::SnapshotUnsupported);
+        assert_eq!(
+            vmm.starter.snapshot_preflight_trace,
+            [
+                "storage",
+                "balloon",
+                "memory-hotplug",
+                "entropy",
+                "serial",
+                "network",
+                "vsock",
+            ]
+        );
+        assert_eq!(vmm.starter.snapshot_vsock_preflight_calls, 1);
+        assert_eq!(
+            vmm.starter.last_snapshot_vsock_config.as_ref(),
+            Some(&vmm.controller.vsock_config().cloned())
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("rejected public vsock snapshot should retain its paused session");
+        assert_eq!(session.native_snapshot_publication_count, 0);
+        assert_eq!(session.native_snapshot_producer_count, 0);
+        assert!(!state_path.exists());
+        assert!(!memory_path.exists());
+        assert!(!parent.exists());
+    }
+
+    #[test]
     fn aggregate_remaining_device_snapshot_preflight_failures_preserve_order_and_reuse() {
         #[derive(Clone, Copy)]
         enum FailureStage {
@@ -50837,6 +52002,10 @@ mod tests {
         assert_eq!(session.snapshot_create_barrier_count, 0);
         assert_eq!(session.native_snapshot_publication_count, 0);
         assert_eq!(session.native_snapshot_producer_count, 0);
+        assert!(
+            vmm.starter.snapshot_preflight_trace.is_empty(),
+            "no-vsock public rejection must retain product-first ordering"
+        );
         assert!(!state_path.exists());
         assert!(!memory_path.exists());
         assert!(!parent.exists());
@@ -54393,6 +55562,155 @@ mod tests {
     }
 
     #[test]
+    fn native_v2_vsock_candidate_profile_admits_all_sixty_four_products() {
+        for pci_enabled in [false, true] {
+            for mask in 0_u8..64 {
+                let has_storage = mask & 1 != 0;
+                let has_entropy = mask & 2 != 0;
+                let has_balloon = mask & 4 != 0;
+                let has_memory_hotplug = mask & 8 != 0;
+                let has_network = mask & 16 != 0;
+                let has_vsock = mask & 32 != 0;
+                let mut vmm = native_v2_entropy_candidate_profile_vmm(pci_enabled);
+                if has_storage {
+                    vmm.handle_action(VmmAction::PutDrive(
+                        DriveConfigInput::new(
+                            "rootfs",
+                            "rootfs",
+                            "/private/vsock-candidate-rootfs.ext4",
+                            true,
+                        )
+                        .with_is_read_only(true)
+                        .with_io_engine(DriveIoEngine::Sync),
+                    ))
+                    .expect("vsock candidate storage should configure");
+                }
+                if has_entropy {
+                    vmm.handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+                        .expect("vsock candidate entropy should configure");
+                }
+                if has_balloon {
+                    vmm.handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(64, false)))
+                        .expect("vsock candidate balloon should configure");
+                }
+                if has_memory_hotplug {
+                    vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+                        .expect("vsock candidate virtio-mem should configure");
+                }
+                if has_network {
+                    vmm.handle_action(VmmAction::PutNetworkInterface(
+                        NetworkInterfaceConfigInput::new(
+                            "eth0",
+                            "eth0",
+                            "private-vsock-network-selector",
+                        ),
+                    ))
+                    .expect("vsock candidate interface should configure");
+                }
+                if has_vsock {
+                    vmm.handle_action(VmmAction::PutVsock(VsockConfigInput::new(
+                        42,
+                        "/private/vsock-candidate.sock",
+                    )))
+                    .expect("vsock candidate device should configure");
+                }
+
+                let profile = vmm
+                    .native_v2_vsock_candidate_product_profile()
+                    .expect("supported vsock candidate profile should classify");
+                assert_eq!(
+                    profile.expected_transport,
+                    if pci_enabled {
+                        SnapshotV2DeviceTransportKind::Pci
+                    } else {
+                        SnapshotV2DeviceTransportKind::Mmio
+                    }
+                );
+                assert_eq!(
+                    !profile.storage_configs.drives().is_empty()
+                        || !profile.storage_configs.pmem().is_empty(),
+                    has_storage
+                );
+                assert_eq!(profile.entropy_config.is_some(), has_entropy);
+                assert_eq!(profile.balloon_config.is_some(), has_balloon);
+                assert_eq!(profile.memory_hotplug_config.is_some(), has_memory_hotplug);
+                assert_eq!(!profile.network_configs.is_empty(), has_network);
+                assert_eq!(profile.vsock_config.is_some(), has_vsock);
+                assert_eq!(profile.serial_config, SerialConfig::default());
+                assert!(format!("{:?}", profile.input).contains("<redacted>"));
+            }
+        }
+    }
+
+    #[test]
+    fn native_v2_vsock_candidate_profile_counts_vsock_at_pci_capacity_boundary() {
+        let mut vmm = native_v2_entropy_candidate_profile_vmm(true);
+        for index in 0..MAX_NETWORK_INTERFACE_COUNT {
+            vmm.handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new(
+                    format!("eth{index}"),
+                    format!("eth{index}"),
+                    format!("private-vsock-network-{index}"),
+                ),
+            ))
+            .expect("vsock candidate interface should configure");
+        }
+        let pci_capacity = usize::from(
+            bangbang_runtime::pci::PCI_LAST_ENDPOINT_DEVICE
+                - bangbang_runtime::pci::PCI_FIRST_ENDPOINT_DEVICE
+                + 1,
+        );
+        let boundary_drive_count = pci_capacity
+            .checked_sub(MAX_NETWORK_INTERFACE_COUNT + 1)
+            .expect("network and vsock should fit in the PCI endpoint aperture");
+        for index in 0..boundary_drive_count {
+            vmm.handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new(
+                    format!("drive{index}"),
+                    format!("drive{index}"),
+                    format!("/private/vsock-drive-{index}.img"),
+                    index == 0,
+                )
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+            ))
+            .expect("boundary vsock candidate drive should configure");
+        }
+        vmm.handle_action(VmmAction::PutVsock(VsockConfigInput::new(
+            42,
+            "/private/capacity-vsock.sock",
+        )))
+        .expect("boundary vsock should configure");
+        vmm.native_v2_vsock_candidate_product_profile()
+            .expect("vsock should occupy the final available PCI endpoint");
+
+        let overflow_index = boundary_drive_count;
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new(
+                format!("drive{overflow_index}"),
+                format!("drive{overflow_index}"),
+                format!("/private/vsock-drive-{overflow_index}.img"),
+                false,
+            )
+            .with_is_read_only(true)
+            .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("overflow vsock candidate drive should remain configurable");
+        let error = match vmm.native_v2_vsock_candidate_product_profile() {
+            Err(error) => error,
+            Ok(_) => panic!("vsock must move the exact PCI capacity boundary by one endpoint"),
+        };
+        assert!(matches!(
+            &error.source,
+            NativeV2NetworkCandidateProfileError::TransportCapacity
+        ));
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains("capacity-vsock.sock"));
+        assert!(!diagnostics.contains("vsock-drive"));
+        assert!(!diagnostics.contains("private-vsock-network"));
+    }
+
+    #[test]
     fn native_v2_network_candidate_profile_preserves_sixteen_interfaces_and_mmds_selection() {
         for selected_count in [1_usize, MAX_NETWORK_INTERFACE_COUNT] {
             let mut vmm = native_v2_entropy_candidate_profile_vmm(false);
@@ -55410,6 +56728,409 @@ mod tests {
                 assert_eq!(drop_count.load(Ordering::SeqCst), 1);
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_vsock_candidate_uses_retained_metrics_and_one_transaction() {
+        for transport in [
+            SnapshotV2DeviceTransportKind::Mmio,
+            SnapshotV2DeviceTransportKind::Pci,
+        ] {
+            for has_vsock in [false, true] {
+                let control = FakeRunLoopControl::default();
+                let drop_count = Arc::new(AtomicU64::new(0));
+                let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+                let metrics = SharedVsockDeviceMetrics::default();
+                let vsock = has_vsock.then(|| fake_native_v2_vsock_state(transport));
+                let vsock_config = vsock.as_ref().map(|state| {
+                    VsockConfigInput::new(
+                        u32::try_from(state.guest_cid()).expect("fixture CID should fit u32"),
+                        "/private/captured-vsock.sock",
+                    )
+                    .validate()
+                    .expect("fake vsock config should validate")
+                });
+                let mut session =
+                    FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+                        .with_native_snapshot_memory(1)
+                        .with_native_v2_root_transport(transport)
+                        .with_vsock_device_metrics(metrics.clone())
+                        .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                        .with_wait_for_stop(false)
+                        .with_wait_for_wakeup(true);
+                if let Some(vsock) = vsock {
+                    session = session.with_native_v2_vsock_state(vsock);
+                }
+                let events = session.native_snapshot_events();
+                let auxiliary = session.snapshot_auxiliary_quiescence();
+                let supervisor =
+                    BootRunLoopSupervisor::start(session, NonZeroUsize::new(97).expect("non-zero"))
+                        .expect("vsock candidate supervisor should start");
+                assert_eq!(max_steps_receiver.recv().expect("worker should start"), 97);
+                supervisor
+                    .pause()
+                    .expect("vsock candidate source should pause");
+
+                let candidate: NativeV2VsockSnapshotCandidateState = supervisor
+                    .capture_native_v2_vsock_candidate(NativeV2VsockCandidateCaptureRequest {
+                        input: native_v2_test_capture_input(),
+                        serial_config: SerialConfig::default(),
+                        balloon_config: None,
+                        entropy_config: None,
+                        memory_hotplug_config: None,
+                        memory_hotplug_requested_size_mib: 0,
+                        storage_configs: CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                        network_configs: Vec::new(),
+                        mmds_config: None,
+                        mmds_state: MmdsStateHandle::default(),
+                        vsock_config,
+                        expected_transport: transport,
+                        output: Box::new(Cursor::new(Vec::new())),
+                        cancellation: NativeV2SnapshotCaptureCancellation::default(),
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{transport:?} vsock={has_vsock} exact-2.12 candidate failed: {error}"
+                        )
+                    });
+
+                assert_eq!(
+                    candidate.version(),
+                    NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+                );
+                assert_eq!(candidate.vsock().is_some(), has_vsock);
+                assert_eq!(
+                    candidate.vsock().map(|state| state.transport().kind()),
+                    has_vsock.then_some(transport)
+                );
+                assert_eq!(
+                    decode_snapshot_v2_state_with_compatibility_version(
+                        candidate.bytes(),
+                        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+                    )
+                    .expect("exact-2.12 candidate should decode structurally")
+                    .metadata()
+                    .component_count(),
+                    2 + u32::from(has_vsock)
+                );
+                assert!(!format!("{candidate:?}").contains("captured-vsock"));
+                assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 1);
+                assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    events
+                        .lock()
+                        .expect("vsock candidate events should lock")
+                        .as_slice(),
+                    [
+                        "aux-acquire",
+                        "v2-serial",
+                        "v2-pause",
+                        "v2-balloon",
+                        "v2-entropy",
+                        "v2-memory-hotplug",
+                        "v2-network",
+                        "v2-vsock",
+                        "v2-vsock-platform",
+                        "v2-vsock-compose",
+                        "v2-vsock-encode",
+                        "v2-recover",
+                        "v2-candidate-sealed",
+                        "aux-drop",
+                    ]
+                );
+                assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+                drop(supervisor);
+                assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_vsock_transport_mismatch_recovers_without_stopping_worker() {
+        let expected_transport = SnapshotV2DeviceTransportKind::Mmio;
+        let actual_transport = SnapshotV2DeviceTransportKind::Pci;
+        let vsock = fake_native_v2_vsock_state(actual_transport);
+        let vsock_config = VsockConfigInput::new(
+            u32::try_from(vsock.guest_cid()).expect("fixture CID should fit u32"),
+            "/private/mismatched-vsock.sock",
+        )
+        .validate()
+        .expect("fake vsock config should validate");
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_v2_root_transport(expected_transport)
+            .with_native_v2_vsock_state(vsock)
+            .with_vsock_device_metrics(SharedVsockDeviceMetrics::default())
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(105).expect("non-zero"))
+                .expect("mismatched vsock supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 105);
+        supervisor
+            .pause()
+            .expect("mismatched vsock source should pause");
+
+        let error = supervisor
+            .capture_native_v2_vsock_candidate(NativeV2VsockCandidateCaptureRequest {
+                input: native_v2_test_capture_input(),
+                serial_config: SerialConfig::default(),
+                balloon_config: None,
+                entropy_config: None,
+                memory_hotplug_config: None,
+                memory_hotplug_requested_size_mib: 0,
+                storage_configs: CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                network_configs: Vec::new(),
+                mmds_config: None,
+                mmds_state: MmdsStateHandle::default(),
+                vsock_config: Some(vsock_config),
+                expected_transport,
+                output: Box::new(Cursor::new(Vec::new())),
+                cancellation: NativeV2SnapshotCaptureCancellation::default(),
+            })
+            .expect_err("mixed vsock transport should abort the candidate");
+        assert!(matches!(
+            error.producer().map(|producer| producer.source()),
+            Some(NativeV2SnapshotPublicationProducerError::Capture(
+                NativeV2SnapshotCaptureError::Vsock {
+                    source: NativeV2SnapshotVsockCaptureError::Transport {
+                        expected,
+                        actual,
+                    },
+                }
+            )) if *expected == expected_transport && *actual == actual_transport
+        ));
+        assert!(
+            events
+                .lock()
+                .expect("mismatched vsock events should lock")
+                .ends_with(&["v2-vsock", "v2-recover", "aux-drop"])
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains("mismatched-vsock.sock"));
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_vsock_live_cancellation_preserves_every_stage_and_disposition() {
+        let transport = SnapshotV2DeviceTransportKind::Mmio;
+        let vsock = fake_native_v2_vsock_state(transport);
+        let vsock_config = VsockConfigInput::new(
+            u32::try_from(vsock.guest_cid()).expect("fixture CID should fit u32"),
+            "/private/staged-vsock.sock",
+        )
+        .validate()
+        .expect("fake vsock config should validate");
+
+        for (index, stage) in [
+            HvfArm64BootVsockCaptureStage::Inventory,
+            HvfArm64BootVsockCaptureStage::Reset,
+            HvfArm64BootVsockCaptureStage::InterruptDelivery,
+            HvfArm64BootVsockCaptureStage::Capture,
+            HvfArm64BootVsockCaptureStage::Handoff,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = HvfArm64BootVsockCaptureError::cancelled(stage);
+            let control = FakeRunLoopControl::default();
+            let drop_count = Arc::new(AtomicU64::new(0));
+            let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+            let session =
+                FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+                    .with_native_snapshot_memory(1)
+                    .with_native_v2_root_transport(transport)
+                    .with_native_v2_vsock_state(vsock.clone())
+                    .with_native_v2_vsock_capture_error(source)
+                    .with_vsock_device_metrics(SharedVsockDeviceMetrics::default())
+                    .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                    .with_wait_for_stop(false)
+                    .with_wait_for_wakeup(true);
+            let supervisor = BootRunLoopSupervisor::start(
+                session,
+                NonZeroUsize::new(100 + index).expect("non-zero"),
+            )
+            .expect("staged vsock cancellation supervisor should start");
+            assert_eq!(
+                max_steps_receiver.recv().expect("worker should start"),
+                100 + index
+            );
+            supervisor
+                .pause()
+                .expect("staged vsock cancellation source should pause");
+
+            let error = supervisor
+                .capture_native_v2_vsock_candidate(NativeV2VsockCandidateCaptureRequest {
+                    input: native_v2_test_capture_input(),
+                    serial_config: SerialConfig::default(),
+                    balloon_config: None,
+                    entropy_config: None,
+                    memory_hotplug_config: None,
+                    memory_hotplug_requested_size_mib: 0,
+                    storage_configs: CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                    network_configs: Vec::new(),
+                    mmds_config: None,
+                    mmds_state: MmdsStateHandle::default(),
+                    vsock_config: Some(vsock_config.clone()),
+                    expected_transport: transport,
+                    output: Box::new(Cursor::new(Vec::new())),
+                    cancellation: NativeV2SnapshotCaptureCancellation::default(),
+                })
+                .expect_err("typed live cancellation should abort the candidate");
+            assert!(matches!(
+                error.producer().map(|producer| producer.source()),
+                Some(NativeV2SnapshotPublicationProducerError::Capture(
+                    NativeV2SnapshotCaptureError::Vsock {
+                        source: NativeV2SnapshotVsockCaptureError::Live {
+                            source: actual,
+                        },
+                    }
+                )) if *actual == source
+                    && actual.stage() == stage
+                    && actual.disposition()
+                        == HvfArm64BootVsockCaptureDisposition::Recoverable
+            ));
+            assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+            drop(supervisor);
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_vsock_cancellation_recovers_but_terminal_live_failure_stops_worker() {
+        let transport = SnapshotV2DeviceTransportKind::Mmio;
+        let vsock = fake_native_v2_vsock_state(transport);
+        let vsock_config = VsockConfigInput::new(
+            u32::try_from(vsock.guest_cid()).expect("fixture CID should fit u32"),
+            "/private/cancelled-vsock.sock",
+        )
+        .validate()
+        .expect("fake vsock config should validate");
+        let request = |output: BoxedNativeV2SnapshotMemoryOutput,
+                       cancellation: NativeV2SnapshotCaptureCancellation| {
+            NativeV2VsockCandidateCaptureRequest {
+                input: native_v2_test_capture_input(),
+                serial_config: SerialConfig::default(),
+                balloon_config: None,
+                entropy_config: None,
+                memory_hotplug_config: None,
+                memory_hotplug_requested_size_mib: 0,
+                storage_configs: CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                network_configs: Vec::new(),
+                mmds_config: None,
+                mmds_state: MmdsStateHandle::default(),
+                vsock_config: Some(vsock_config.clone()),
+                expected_transport: transport,
+                output,
+                cancellation,
+            }
+        };
+
+        let cancellation = NativeV2SnapshotCaptureCancellation::default();
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_v2_root_transport(transport)
+            .with_native_v2_vsock_state(vsock.clone())
+            .with_native_v2_cancel_during_vsock(cancellation.clone())
+            .with_vsock_device_metrics(SharedVsockDeviceMetrics::default())
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(98).expect("non-zero"))
+                .expect("vsock cancellation supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 98);
+        supervisor
+            .pause()
+            .expect("vsock cancellation source should pause");
+        let error = supervisor
+            .capture_native_v2_vsock_candidate(request(
+                Box::new(Cursor::new(Vec::new())),
+                cancellation,
+            ))
+            .expect_err("vsock cancellation should fail before memory capture");
+        assert!(matches!(
+            error.producer().map(|producer| producer.source()),
+            Some(NativeV2SnapshotPublicationProducerError::Capture(
+                NativeV2SnapshotCaptureError::Cancelled {
+                    stage: NativeV2SnapshotCaptureStage::Vsock,
+                }
+            ))
+        ));
+        assert!(
+            events
+                .lock()
+                .expect("vsock cancellation events should lock")
+                .ends_with(&["v2-vsock", "v2-recover", "aux-drop"])
+        );
+        supervisor
+            .capture_native_v2_vsock_candidate(request(
+                Box::new(Cursor::new(Vec::new())),
+                NativeV2SnapshotCaptureCancellation::default(),
+            ))
+            .expect("recovered vsock source should accept a fresh capture");
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+
+        let control = FakeRunLoopControl::default();
+        let control_observer = control.clone();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let terminal = HvfArm64BootVsockCaptureError::owner_unavailable(
+            HvfArm64BootVsockCaptureDisposition::Terminal,
+        );
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_v2_root_transport(transport)
+            .with_native_v2_vsock_capture_error(terminal)
+            .with_vsock_device_metrics(SharedVsockDeviceMetrics::default())
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(99).expect("non-zero"))
+                .expect("terminal vsock supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 99);
+        supervisor
+            .pause()
+            .expect("terminal vsock source should pause");
+        let error = supervisor
+            .capture_native_v2_vsock_candidate(request(
+                Box::new(Cursor::new(Vec::new())),
+                NativeV2SnapshotCaptureCancellation::default(),
+            ))
+            .expect_err("terminal live vsock capture should fail");
+        assert!(matches!(
+            error.producer().map(|producer| producer.source()),
+            Some(NativeV2SnapshotPublicationProducerError::Capture(
+                NativeV2SnapshotCaptureError::Vsock {
+                    source: NativeV2SnapshotVsockCaptureError::Live { source },
+                }
+            )) if *source == terminal
+        ));
+        assert_eq!(
+            supervisor.status(),
+            BootRunLoopWorkerStatus::Failed("terminal native-v2 capture failure".to_string())
+        );
+        assert!(control_observer.request_stop_count() >= 1);
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(target_os = "macos")]

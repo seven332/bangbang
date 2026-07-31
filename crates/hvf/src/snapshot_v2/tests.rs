@@ -7,6 +7,7 @@ use bangbang_runtime::memory::{
 use bangbang_runtime::pci::{PCI_BAR64_START, PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE};
 use bangbang_runtime::snapshot_artifact::{
     NativeV2MemoryHotplugSnapshotCandidateState, NativeV2NetworkSnapshotCandidateState,
+    NativeV2VsockSnapshotCandidateState,
 };
 use bangbang_runtime::snapshot_balloon_v2_9::{
     NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, NATIVE_V2_BALLOON_STATE_HEADER_BYTES,
@@ -47,6 +48,10 @@ use bangbang_runtime::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
     SnapshotV2SerialStateDecodeError,
 };
+use bangbang_runtime::snapshot_vsock_v2_12::{
+    NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION, NATIVE_V2_VSOCK_STATE_HEADER_BYTES,
+    NATIVE_V2_VSOCK_STATE_SECTION_ENTRY_BYTES, SnapshotV2VsockState,
+};
 use bangbang_runtime::virtio_pci::VIRTIO_PCI_CAPABILITY_BAR_SIZE;
 
 use super::*;
@@ -86,6 +91,10 @@ const NETWORK_INACTIVE_MMIO_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_network_v2_11/fixtures/inactive-mmio.hex");
 const NETWORK_ACTIVE_PCI_MMDS_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_network_v2_11/fixtures/active-pci-mmds.hex");
+const VSOCK_INACTIVE_MMIO_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_vsock_v2_12/fixtures/inactive-mmio.hex");
+const VSOCK_ACTIVE_PCI_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_vsock_v2_12/fixtures/active-pci.hex");
 const DETERMINISTIC_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.4-fixture-id!";
 const DETERMINISTIC_MULTI_BLOCK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.5-fixture-id!";
 const DETERMINISTIC_STORAGE_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.6-fixture-id!";
@@ -94,6 +103,7 @@ const DETERMINISTIC_ENTROPY_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.8-fixture-id!";
 const DETERMINISTIC_BALLOON_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.9-fixture-id!";
 const DETERMINISTIC_MEMORY_HOTPLUG_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.10-fixture-id";
 const DETERMINISTIC_NETWORK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.11-fixture-id";
+const DETERMINISTIC_VSOCK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.12-fixture-id";
 const COMPLETE_STATE_FINGERPRINTS: [(usize, u64); 2] = [
     (4_887, 10_136_861_786_457_474_800),
     (4_983, 7_169_128_621_506_763_529),
@@ -572,6 +582,7 @@ const PRODUCT_STORAGE_QUEUE_BASE: u64 = 0x8004_0000;
 const PRODUCT_ENTROPY_QUEUE_BASE: u64 = 0x8006_0000;
 const PRODUCT_BALLOON_QUEUE_BASE: u64 = 0x8008_0000;
 const PRODUCT_MEMORY_HOTPLUG_QUEUE_BASE: u64 = 0x8010_0000;
+const PRODUCT_VSOCK_QUEUE_BASE: u64 = 0x8018_0000;
 const PRODUCT_QUEUE_STRIDE: u64 = 0x1_0000;
 const PRODUCT_DRIVER_RING_OFFSET: u64 = 0x2000;
 const PRODUCT_DEVICE_RING_OFFSET: u64 = 0x4000;
@@ -777,6 +788,28 @@ fn relocate_network_product_fixture(
     }
 }
 
+fn relocate_vsock_product_fixture(bytes: &mut [u8], transport: SnapshotV2DeviceTransportKind) {
+    let common_entry =
+        NATIVE_V2_VSOCK_STATE_HEADER_BYTES + NATIVE_V2_VSOCK_STATE_SECTION_ENTRY_BYTES;
+    let common_offset = component_section_offset(bytes, common_entry);
+    relocate_common_queues(bytes, common_offset, PRODUCT_VSOCK_QUEUE_BASE);
+
+    let transport_entry =
+        NATIVE_V2_VSOCK_STATE_HEADER_BYTES + 2 * NATIVE_V2_VSOCK_STATE_SECTION_ENTRY_BYTES;
+    let transport_offset = component_section_offset(bytes, transport_entry);
+    match transport {
+        SnapshotV2DeviceTransportKind::Mmio => {
+            bytes[transport_offset + 12..transport_offset + 16]
+                .copy_from_slice(&44_u32.to_le_bytes());
+            write_wire_u64(bytes, transport_offset + 16, 104);
+            write_wire_u64(bytes, transport_offset + 24, 0xd004_0000);
+        }
+        SnapshotV2DeviceTransportKind::Pci => {
+            bytes_set_pci_endpoint(bytes, transport_offset, PCI_LAST_ENDPOINT_DEVICE - 2);
+        }
+    }
+}
+
 pub(crate) fn product_storage_fixture(
     transport: SnapshotV2DeviceTransportKind,
 ) -> SnapshotV2StorageDeviceGraph {
@@ -830,6 +863,18 @@ pub(crate) fn product_network_fixture(
     relocate_network_product_fixture(&mut bytes, transport, pci_device);
     SnapshotV2NetworkState::decode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, &bytes)
         .expect("relocated network fixture should decode")
+}
+
+pub(crate) fn product_vsock_fixture(
+    transport: SnapshotV2DeviceTransportKind,
+) -> SnapshotV2VsockState {
+    let mut bytes = fixture_bytes(match transport {
+        SnapshotV2DeviceTransportKind::Mmio => VSOCK_INACTIVE_MMIO_FIXTURE_HEX,
+        SnapshotV2DeviceTransportKind::Pci => VSOCK_ACTIVE_PCI_FIXTURE_HEX,
+    });
+    relocate_vsock_product_fixture(&mut bytes, transport);
+    SnapshotV2VsockState::decode(NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION, &bytes)
+        .expect("relocated vsock fixture should decode")
 }
 
 fn product_entropy_fixture(transport: SnapshotV2DeviceTransportKind) -> SnapshotV2EntropyState {
@@ -1112,6 +1157,86 @@ pub(crate) fn complete_network_state_fixture(
     .unwrap_or_else(|error| {
         panic!(
             "{transport:?} storage={has_storage} entropy={has_entropy} balloon={has_balloon} memory-hotplug={has_memory_hotplug} network={has_network} exact-2.11 fixture failed: {error:?}"
+        )
+    })
+}
+
+fn exact_minor_twelve_memory_binding(
+    state: Option<&SnapshotV2MemoryHotplugState>,
+) -> SnapshotV2MemoryBinding {
+    let mut ranges = aarch64::dram_layout(FIXTURE_MEMORY_MIB * MIB)
+        .expect("exact-2.12 base layout should validate")
+        .ranges()
+        .to_vec();
+    if let Some(state) = state {
+        ranges.extend(memory_hotplug_active_ranges(state));
+    }
+    let layout = GuestMemoryLayout::new(ranges).expect("exact-2.12 memory layout should validate");
+    let memory = GuestMemory::allocate(&layout).expect("exact-2.12 memory should allocate");
+    write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut Cursor::new(Vec::new()),
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact-2.12 memory binding should encode")
+}
+
+fn exact_minor_twelve_platform_fixture(
+    state: Option<SnapshotV2MemoryHotplugState>,
+) -> HvfSnapshotV2VsockPlatformState {
+    let capture = state.map(memory_hotplug_capture_fixture);
+    let memory = exact_minor_twelve_memory_binding(
+        capture
+            .as_ref()
+            .map(HvfSnapshotV2MemoryHotplugCaptureState::state),
+    );
+    let (_, machine, global, topology, vcpus, time) = deterministic_device_graph_platform_fixture(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        DETERMINISTIC_VSOCK_MEMORY_IMAGE_ID,
+    )
+    .into_parts();
+    HvfSnapshotV2VsockPlatformState::try_new(
+        memory, machine, global, topology, vcpus, time, capture,
+    )
+    .expect("exact-2.12 platform fixture should validate")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn complete_vsock_state_fixture(
+    transport: SnapshotV2DeviceTransportKind,
+    has_storage: bool,
+    has_entropy: bool,
+    has_balloon: bool,
+    has_memory_hotplug: bool,
+    has_network: bool,
+    has_vsock: bool,
+) -> HvfSnapshotV2VsockState {
+    let memory_hotplug = has_memory_hotplug.then(|| product_memory_hotplug_fixture(transport));
+    let graph = has_storage.then(|| product_storage_fixture_with_network(transport, has_network));
+    let block_count = graph
+        .as_ref()
+        .map_or(0, |graph| graph.block_records().len());
+    let network_device = PCI_FIRST_ENDPOINT_DEVICE
+        .checked_add(1)
+        .and_then(|device| {
+            device.checked_add(u8::try_from(block_count).expect("block count should fit u8"))
+        })
+        .expect("network product endpoint should fit");
+    let balloon = has_balloon.then(|| product_balloon_fixture(transport));
+    let network = has_network.then(|| product_network_fixture(transport, network_device));
+    let vsock = has_vsock.then(|| product_vsock_fixture(transport));
+    HvfSnapshotV2VsockState::try_new(
+        exact_minor_twelve_platform_fixture(memory_hotplug),
+        graph,
+        product_serial_fixture(),
+        has_entropy.then(|| memory_hotplug_product_entropy_fixture(transport)),
+        balloon,
+        network,
+        vsock,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "{transport:?} storage={has_storage} entropy={has_entropy} balloon={has_balloon} memory-hotplug={has_memory_hotplug} network={has_network} vsock={has_vsock} exact-2.12 fixture failed: {error:?}"
         )
     })
 }
@@ -2368,6 +2493,249 @@ fn exact_minor_eleven_network_encodes_all_thirty_two_mmio_and_pci_products() {
             assert!(!debug.contains("vmnet:"));
         }
     }
+}
+
+#[test]
+fn exact_minor_twelve_vsock_encodes_all_sixty_four_mmio_and_pci_products() {
+    for transport in [
+        SnapshotV2DeviceTransportKind::Mmio,
+        SnapshotV2DeviceTransportKind::Pci,
+    ] {
+        for mask in 0_u8..64 {
+            let has_storage = mask & 1 != 0;
+            let has_entropy = mask & 2 != 0;
+            let has_balloon = mask & 4 != 0;
+            let has_memory_hotplug = mask & 8 != 0;
+            let has_network = mask & 16 != 0;
+            let has_vsock = mask & 32 != 0;
+            let original = complete_vsock_state_fixture(
+                transport,
+                has_storage,
+                has_entropy,
+                has_balloon,
+                has_memory_hotplug,
+                has_network,
+                has_vsock,
+            );
+            let encoded = encode_hvf_snapshot_v2_vsock_state(&original)
+                .expect("complete exact-2.12 state should encode");
+            assert_eq!(
+                encode_hvf_snapshot_v2_vsock_state(&original)
+                    .expect("exact-2.12 encoding should be deterministic"),
+                encoded
+            );
+            let structural = decode_snapshot_v2_state_with_compatibility_version(
+                &encoded,
+                NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("exact-2.12 state should decode structurally");
+            let decoded = decode_hvf_snapshot_v2_vsock_state(&structural)
+                .expect("exact-2.12 HVF state should decode");
+            assert_eq!(decoded, original);
+            assert_eq!(
+                structural.metadata().component_count(),
+                8 + u32::from(has_storage)
+                    + u32::from(has_entropy)
+                    + u32::from(has_balloon)
+                    + u32::from(has_memory_hotplug)
+                    + u32::from(has_network)
+                    + u32::from(has_vsock)
+            );
+            assert_eq!(decoded.device_graph().is_some(), has_storage);
+            assert_eq!(decoded.entropy().is_some(), has_entropy);
+            assert_eq!(decoded.balloon().is_some(), has_balloon);
+            assert_eq!(decoded.memory_hotplug().is_some(), has_memory_hotplug);
+            assert_eq!(decoded.network().is_some(), has_network);
+            assert_eq!(decoded.vsock().is_some(), has_vsock);
+            let candidate =
+                NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(encoded.clone())
+                    .expect("exact-2.12 state should form one explicit candidate");
+            assert_eq!(candidate.bytes(), encoded);
+            assert_eq!(candidate.memory_binding(), original.platform().memory());
+            assert_eq!(candidate.device_graph(), original.device_graph());
+            assert_eq!(candidate.serial(), original.serial());
+            assert_eq!(candidate.entropy(), original.entropy());
+            assert_eq!(candidate.balloon(), original.balloon());
+            assert_eq!(candidate.memory_hotplug(), original.memory_hotplug());
+            assert_eq!(candidate.network(), original.network());
+            assert_eq!(candidate.vsock(), original.vsock());
+
+            if let Some(vsock) = original.vsock() {
+                assert_eq!(
+                    structural
+                        .component(NATIVE_V2_VSOCK_COMPONENT_KEY)
+                        .expect("exact-2.12 vsock component should exist")
+                        .payload(),
+                    vsock
+                        .encode(NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION)
+                        .expect("exact-2.12 vsock should encode")
+                );
+                assert_eq!(vsock.transport().kind(), transport);
+                assert_eq!(
+                    structural
+                        .components()
+                        .last()
+                        .expect("exact-2.12 component directory should not be empty")
+                        .key(),
+                    NATIVE_V2_VSOCK_COMPONENT_KEY
+                );
+            }
+
+            let debug = format!("{original:?}");
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains("serial-log"));
+            assert!(!debug.contains("vmnet:"));
+            assert!(!debug.contains("bangbang-vsock"));
+        }
+    }
+}
+
+#[test]
+fn exact_minor_twelve_vsock_rejects_transport_placement_queue_and_pci_order_conflicts() {
+    assert!(matches!(
+        HvfSnapshotV2VsockState::try_new(
+            exact_minor_twelve_platform_fixture(None),
+            None,
+            product_serial_fixture(),
+            None,
+            Some(product_balloon_fixture(SnapshotV2DeviceTransportKind::Mmio)),
+            None,
+            Some(product_vsock_fixture(SnapshotV2DeviceTransportKind::Pci)),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+
+    let balloon = product_balloon_fixture(SnapshotV2DeviceTransportKind::Pci);
+    let mut queue_collision = fixture_bytes(VSOCK_ACTIVE_PCI_FIXTURE_HEX);
+    relocate_vsock_product_fixture(&mut queue_collision, SnapshotV2DeviceTransportKind::Pci);
+    let common_entry =
+        NATIVE_V2_VSOCK_STATE_HEADER_BYTES + NATIVE_V2_VSOCK_STATE_SECTION_ENTRY_BYTES;
+    let common_offset = component_section_offset(&queue_collision, common_entry);
+    relocate_common_queues(
+        &mut queue_collision,
+        common_offset,
+        PRODUCT_BALLOON_QUEUE_BASE,
+    );
+    let queue_collision = SnapshotV2VsockState::decode(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        &queue_collision,
+    )
+    .expect("queue-overlapping vsock should remain locally valid");
+    assert!(matches!(
+        HvfSnapshotV2VsockState::try_new(
+            exact_minor_twelve_platform_fixture(None),
+            None,
+            product_serial_fixture(),
+            None,
+            Some(balloon.clone()),
+            None,
+            Some(queue_collision),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+
+    let balloon = product_balloon_fixture(SnapshotV2DeviceTransportKind::Mmio);
+    let SnapshotV2DeviceTransport::Mmio(balloon_mmio) = balloon.transport() else {
+        panic!("balloon collision fixture should use MMIO");
+    };
+    let mut placement_collision = fixture_bytes(VSOCK_INACTIVE_MMIO_FIXTURE_HEX);
+    relocate_vsock_product_fixture(
+        &mut placement_collision,
+        SnapshotV2DeviceTransportKind::Mmio,
+    );
+    let transport_entry =
+        NATIVE_V2_VSOCK_STATE_HEADER_BYTES + 2 * NATIVE_V2_VSOCK_STATE_SECTION_ENTRY_BYTES;
+    let transport_offset = component_section_offset(&placement_collision, transport_entry);
+    placement_collision[transport_offset + 12..transport_offset + 16]
+        .copy_from_slice(&balloon_mmio.interrupt_line().raw_value().to_le_bytes());
+    write_wire_u64(
+        &mut placement_collision,
+        transport_offset + 16,
+        balloon_mmio.region().id().raw_value(),
+    );
+    write_wire_u64(
+        &mut placement_collision,
+        transport_offset + 24,
+        balloon_mmio.region().range().start().raw_value(),
+    );
+    let placement_collision = SnapshotV2VsockState::decode(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        &placement_collision,
+    )
+    .expect("placement-overlapping vsock should remain locally valid");
+    assert!(matches!(
+        HvfSnapshotV2VsockState::try_new(
+            exact_minor_twelve_platform_fixture(None),
+            None,
+            product_serial_fixture(),
+            None,
+            Some(balloon),
+            None,
+            Some(placement_collision),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+
+    let platform = exact_minor_twelve_platform_fixture(None);
+    let memory_start = platform
+        .platform()
+        .memory()
+        .extents()
+        .first()
+        .expect("exact-2.12 platform should contain memory")
+        .range()
+        .start()
+        .raw_value();
+    let mut memory_collision = fixture_bytes(VSOCK_INACTIVE_MMIO_FIXTURE_HEX);
+    relocate_vsock_product_fixture(&mut memory_collision, SnapshotV2DeviceTransportKind::Mmio);
+    let transport_offset = component_section_offset(&memory_collision, transport_entry);
+    write_wire_u64(&mut memory_collision, transport_offset + 24, memory_start);
+    let memory_collision = SnapshotV2VsockState::decode(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        &memory_collision,
+    )
+    .expect("memory-overlapping vsock should remain locally valid");
+    assert!(matches!(
+        HvfSnapshotV2VsockState::try_new(
+            platform,
+            None,
+            product_serial_fixture(),
+            None,
+            None,
+            None,
+            Some(memory_collision),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+
+    let mut entropy_bytes = fixture_bytes(ENTROPY_ACTIVE_PCI_FIXTURE_HEX);
+    relocate_entropy_product_fixture(&mut entropy_bytes, SnapshotV2DeviceTransportKind::Pci);
+    let entropy_transport_entry =
+        NATIVE_V2_ENTROPY_STATE_HEADER_BYTES + 2 * NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES;
+    let entropy_transport_offset =
+        component_section_offset(&entropy_bytes, entropy_transport_entry);
+    bytes_set_pci_endpoint(
+        &mut entropy_bytes,
+        entropy_transport_offset,
+        PCI_LAST_ENDPOINT_DEVICE - 3,
+    );
+    let out_of_order_entropy = SnapshotV2EntropyState::decode(
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+        &entropy_bytes,
+    )
+    .expect("out-of-order entropy should remain locally valid");
+    assert!(matches!(
+        HvfSnapshotV2VsockState::try_new(
+            exact_minor_twelve_platform_fixture(None),
+            None,
+            product_serial_fixture(),
+            Some(out_of_order_entropy),
+            None,
+            None,
+            Some(product_vsock_fixture(SnapshotV2DeviceTransportKind::Pci)),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
 }
 
 #[test]
