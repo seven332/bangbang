@@ -20603,14 +20603,76 @@ where
     hvf_cleanup_uncertain || process_cleanup_uncertain
 }
 
-fn restored_process_snapshot_v2_network_mmio_is_equivalent<B>(
-    hvf: &RestoredHvfSnapshotV2NetworkMmioOwners,
+trait RestoredProcessSnapshotV2NetworkHvfOwners {
+    fn session(&self) -> &OwnedHvfArm64BootSession;
+    fn configs(&self) -> &[NetworkInterfaceConfig];
+    fn expected(&self) -> &[SnapshotV2NetworkInterfaceState];
+    fn mmds_state(&self) -> Option<&SnapshotV2MmdsState>;
+    fn mmds_config(&self) -> Option<&MmdsConfig>;
+    fn transport_kind(&self) -> SnapshotV2DeviceTransportKind;
+}
+
+impl RestoredProcessSnapshotV2NetworkHvfOwners for RestoredHvfSnapshotV2NetworkMmioOwners {
+    fn session(&self) -> &OwnedHvfArm64BootSession {
+        RestoredHvfSnapshotV2NetworkMmioOwners::session(self)
+    }
+
+    fn configs(&self) -> &[NetworkInterfaceConfig] {
+        RestoredHvfSnapshotV2NetworkMmioOwners::configs(self)
+    }
+
+    fn expected(&self) -> &[SnapshotV2NetworkInterfaceState] {
+        RestoredHvfSnapshotV2NetworkMmioOwners::expected(self)
+    }
+
+    fn mmds_state(&self) -> Option<&SnapshotV2MmdsState> {
+        RestoredHvfSnapshotV2NetworkMmioOwners::mmds_state(self)
+    }
+
+    fn mmds_config(&self) -> Option<&MmdsConfig> {
+        RestoredHvfSnapshotV2NetworkMmioOwners::mmds_config(self)
+    }
+
+    fn transport_kind(&self) -> SnapshotV2DeviceTransportKind {
+        SnapshotV2DeviceTransportKind::Mmio
+    }
+}
+
+impl RestoredProcessSnapshotV2NetworkHvfOwners for RestoredHvfSnapshotV2NetworkPciOwners {
+    fn session(&self) -> &OwnedHvfArm64BootSession {
+        RestoredHvfSnapshotV2NetworkPciOwners::session(self)
+    }
+
+    fn configs(&self) -> &[NetworkInterfaceConfig] {
+        RestoredHvfSnapshotV2NetworkPciOwners::configs(self)
+    }
+
+    fn expected(&self) -> &[SnapshotV2NetworkInterfaceState] {
+        RestoredHvfSnapshotV2NetworkPciOwners::expected(self)
+    }
+
+    fn mmds_state(&self) -> Option<&SnapshotV2MmdsState> {
+        RestoredHvfSnapshotV2NetworkPciOwners::mmds_state(self)
+    }
+
+    fn mmds_config(&self) -> Option<&MmdsConfig> {
+        RestoredHvfSnapshotV2NetworkPciOwners::mmds_config(self)
+    }
+
+    fn transport_kind(&self) -> SnapshotV2DeviceTransportKind {
+        SnapshotV2DeviceTransportKind::Pci
+    }
+}
+
+fn restored_process_snapshot_v2_network_is_equivalent<B, H>(
+    hvf: &H,
     completion: &PreparedProcessSnapshotV2NetworkRestoreCompletion<B>,
     resources: &[PreparedProcessSnapshotV2NetworkRestoreResource],
     now: Instant,
 ) -> Result<(), ()>
 where
     B: ProcessVmnetBackend,
+    H: RestoredProcessSnapshotV2NetworkHvfOwners,
 {
     if !completion.configs_match(hvf.configs())
         || !completion.resources_match(resources)
@@ -20701,10 +20763,9 @@ where
     {
         return Err(());
     }
-    let portable =
-        convert_process_capture_ready_network_state(captured, SnapshotV2DeviceTransportKind::Mmio)
-            .map_err(|_| ())?
-            .ok_or(())?;
+    let portable = convert_process_capture_ready_network_state(captured, hvf.transport_kind())
+        .map_err(|_| ())?
+        .ok_or(())?;
     if portable.interfaces() != hvf.expected() || portable.mmds() != hvf.mmds_state() {
         return Err(());
     }
@@ -20914,105 +20975,7 @@ fn restored_process_snapshot_v2_network_pci_is_equivalent<B>(
 where
     B: ProcessVmnetBackend,
 {
-    if !completion.configs_match(hvf.configs())
-        || !completion.resources_match(resources)
-        || completion.expected_mmds_state() != hvf.mmds_state()
-        || completion.expected_mmds_controller() != hvf.mmds_config()
-        || !completion
-            .network_metrics()
-            .shares_state_with(&hvf.session().shared_network_interface_metrics())
-    {
-        return Err(());
-    }
-
-    let Some(provider) = completion.provider() else {
-        return Err(());
-    };
-    if provider.readiness_wake.is_some() || provider.readiness_bridge.is_some() {
-        return Err(());
-    }
-    match (
-        completion.mmds_state(),
-        completion.mmds_metrics(),
-        hvf.mmds_config(),
-    ) {
-        (None, None, None) => {}
-        (Some(state), Some(metrics), Some(config)) => {
-            let state_is_fresh = state
-                .with(|state| {
-                    state.config() == Some(config)
-                        && state.data_store_present()
-                        && state.get_data().is_err()
-                })
-                .map_err(|_| ())?;
-            if !state_is_fresh || !metrics.snapshot().is_empty() {
-                return Err(());
-            }
-        }
-        _ => return Err(()),
-    }
-
-    let publication_guard = provider
-        .quiesce_capture_publication_for_owner(completion.authority())
-        .map_err(|_| ())?;
-    let limiter_guard = hvf
-        .session()
-        .quiesce_limiter_retry_wakeups()
-        .map_err(|_| ())?;
-    let prepared = provider
-        .prepare_capture_for_owner_with_optional_mmds(
-            completion.authority(),
-            hvf.configs(),
-            hvf.mmds_config(),
-            completion.mmds_state(),
-            completion.mmds_metrics(),
-            now,
-        )
-        .map_err(|_| ())?;
-    let metrics = hvf
-        .session()
-        .shared_network_interface_metrics()
-        .capture_state()
-        .map_err(|_| ())?;
-    let captured_hvf = hvf
-        .session()
-        .capture_ready_network_state_at(&prepared.hvf_configs, &limiter_guard, now)
-        .map_err(|_| ())?;
-    let captured =
-        compose_process_capture_ready_network_state(hvf.configs(), prepared, metrics, captured_hvf)
-            .map_err(|_| ())?;
-
-    if captured.interfaces().len() != resources.len()
-        || captured
-            .interfaces()
-            .iter()
-            .zip(resources)
-            .any(|(captured, resource)| {
-                captured.provider_generation() != resource.publication().generation
-                    || captured.metrics_generation() != resource._metrics_lease.generation()
-            })
-        || captured.source_work_normalized()
-        || !captured.aggregate_metrics().is_empty()
-        || captured
-            .interfaces()
-            .iter()
-            .any(|interface| !interface.metrics().is_empty())
-        || captured
-            .mmds()
-            .is_some_and(|mmds| !mmds.metrics().is_empty())
-    {
-        return Err(());
-    }
-    let portable =
-        convert_process_capture_ready_network_state(captured, SnapshotV2DeviceTransportKind::Pci)
-            .map_err(|_| ())?
-            .ok_or(())?;
-    if portable.interfaces() != hvf.expected() || portable.mmds() != hvf.mmds_state() {
-        return Err(());
-    }
-    drop(limiter_guard);
-    drop(publication_guard);
-    Ok(())
+    restored_process_snapshot_v2_network_is_equivalent(hvf, completion, resources, now)
 }
 
 fn prepared_process_snapshot_v2_network_batch_is_fresh<B>(
@@ -21280,7 +21243,7 @@ where
     };
 
     if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::CompleteRecapture)
-        || restored_process_snapshot_v2_network_mmio_is_equivalent(
+        || restored_process_snapshot_v2_network_is_equivalent(
             &staged_hvf,
             &completion,
             &resources,

@@ -129,19 +129,27 @@ impl PreparedSnapshotV2NetworkRestoreInterface {
             portable,
             mmds_stack,
         } = self;
-        if realized_profile != portable.profile()
-            || controller
-                .guest_mac()
-                .is_some_and(|mac| realized_profile.guest_mac() != Some(mac))
-            || controller
-                .mtu()
-                .is_some_and(|mtu| realized_profile.mtu() != Some(mtu))
-            || !realized_profile
-                .feature_capabilities()
-                .is_dependency_complete()
-        {
-            return Err(SnapshotV2NetworkMmioHandlerError::Profile);
+        validate_snapshot_v2_network_destination_profile(&controller, &portable, realized_profile)
+            .map_err(SnapshotV2NetworkMmioHandlerError::from_device)?;
+        if !matches!(portable.transport(), SnapshotV2DeviceTransport::Mmio(_)) {
+            return Err(SnapshotV2NetworkMmioHandlerError::WrongTransport);
         }
+        let RestoredSnapshotV2NetworkDevice {
+            queue_ranges,
+            retry_deadline,
+            config_space,
+            device,
+        } = restore_snapshot_v2_network_device(
+            &controller,
+            &portable,
+            destination_memory,
+            realized_profile,
+            interface_metrics,
+            aggregate_metrics,
+            now,
+        )
+        .map_err(SnapshotV2NetworkMmioHandlerError::from_device)?;
+        let activation_is_active = device.is_activated();
 
         let SnapshotV2NetworkInterfaceStateParts {
             iface_id,
@@ -161,111 +169,6 @@ impl PreparedSnapshotV2NetworkRestoreInterface {
         };
         let region = mmio.region();
         let interrupt_line = mmio.interrupt_line();
-
-        let rx_transport = virtio
-            .queues()
-            .first()
-            .copied()
-            .ok_or(SnapshotV2NetworkMmioHandlerError::Queue)?;
-        let tx_transport = virtio
-            .queues()
-            .get(1)
-            .copied()
-            .ok_or(SnapshotV2NetworkMmioHandlerError::Queue)?;
-        if virtio.queues().len() != VIRTIO_NET_QUEUE_SIZES.len() {
-            return Err(SnapshotV2NetworkMmioHandlerError::Queue);
-        }
-        let queue_ranges = [
-            queue_ranges(&rx_transport).map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)?,
-            queue_ranges(&tx_transport).map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)?,
-        ];
-        if queue_ranges
-            .iter()
-            .flatten()
-            .flatten()
-            .copied()
-            .any(|range| !range_is_wholly_contained(destination_memory, range))
-        {
-            return Err(SnapshotV2NetworkMmioHandlerError::QueueMemory);
-        }
-
-        let negotiated_features = virtio.driver_features();
-        let rx_queue = local
-            .active_rx_queue()
-            .map(|cursor| {
-                VirtioNetworkRxQueue::from_snapshot_state(
-                    restore_queue_state(rx_transport),
-                    cursor.next_available(),
-                    cursor.next_used(),
-                    negotiated_features,
-                )
-                .map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)
-            })
-            .transpose()?;
-        let tx_queue = local
-            .active_tx_queue()
-            .map(|cursor| {
-                VirtioNetworkTxQueue::from_snapshot_state(
-                    restore_queue_state(tx_transport),
-                    cursor.next_available(),
-                    cursor.next_used(),
-                    negotiated_features,
-                )
-                .map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)
-            })
-            .transpose()?;
-        if rx_queue.is_some() != virtio.is_activated()
-            || tx_queue.is_some() != virtio.is_activated()
-        {
-            return Err(SnapshotV2NetworkMmioHandlerError::Queue);
-        }
-        if let Some(queue) = rx_queue.as_ref() {
-            queue
-                .validate_snapshot_state(destination_memory)
-                .map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)?;
-        }
-        let has_tx_retry = local.tx_retry().has_retry();
-        if let Some(queue) = tx_queue.as_ref() {
-            queue
-                .validate_snapshot_state(destination_memory, has_tx_retry)
-                .map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)?;
-        }
-        if let (Some(rx), Some(tx)) = (rx_queue.as_ref(), tx_queue.as_ref()) {
-            validate_network_queue_pair_ranges(rx, tx)
-                .map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)?;
-        }
-
-        let rx_rate_limiter = VirtioNetworkRateLimiter::from_persisted_state_at(
-            controller.rx_rate_limiter(),
-            restore_limiter_state(rx_limiter),
-            now,
-        )
-        .map_err(|_| SnapshotV2NetworkMmioHandlerError::Limiter)?;
-        let tx_rate_limiter = VirtioNetworkRateLimiter::from_persisted_state_at(
-            controller.tx_rate_limiter(),
-            restore_limiter_state(tx_limiter),
-            now,
-        )
-        .map_err(|_| SnapshotV2NetworkMmioHandlerError::Limiter)?;
-        let retry_deadline = restored_retry_deadline_at(local.tx_retry(), now)?;
-        let device = VirtioNetworkDevice::from_snapshot_parts(
-            rx_queue,
-            tx_queue,
-            rx_rate_limiter,
-            tx_rate_limiter,
-            has_tx_retry,
-        )
-        .map_err(|_| SnapshotV2NetworkMmioHandlerError::Device)?;
-        let activation_is_active = device.is_activated();
-
-        let config_space = VirtioNetworkConfigSpace::with_feature_capabilities(
-            realized_profile.guest_mac(),
-            realized_profile.mtu(),
-            realized_profile.feature_capabilities(),
-        );
-        if config_space.available_features() != virtio.available_features() {
-            return Err(SnapshotV2NetworkMmioHandlerError::Profile);
-        }
         let retained = restore_mmio_transport_state_for_device_with_config_status_gate(
             VIRTIO_NET_DEVICE_ID,
             &virtio,
@@ -310,7 +213,6 @@ impl PreparedSnapshotV2NetworkRestoreInterface {
         handler
             .restore_network_interrupt_intents(&interrupt_intents)
             .map_err(|_| SnapshotV2NetworkMmioHandlerError::Allocation)?;
-        handler.attach_network_metrics_with_aggregate(interface_metrics, aggregate_metrics);
 
         let mut captured_selector = String::new();
         captured_selector
@@ -656,6 +558,19 @@ pub enum SnapshotV2NetworkMmioHandlerError {
     Normalize,
     StateMismatch,
     Allocation,
+}
+
+impl SnapshotV2NetworkMmioHandlerError {
+    const fn from_device(source: RestoreSnapshotV2NetworkDeviceError) -> Self {
+        match source {
+            RestoreSnapshotV2NetworkDeviceError::Profile => Self::Profile,
+            RestoreSnapshotV2NetworkDeviceError::Queue => Self::Queue,
+            RestoreSnapshotV2NetworkDeviceError::QueueMemory => Self::QueueMemory,
+            RestoreSnapshotV2NetworkDeviceError::Limiter => Self::Limiter,
+            RestoreSnapshotV2NetworkDeviceError::Retry => Self::Retry,
+            RestoreSnapshotV2NetworkDeviceError::Device => Self::Device,
+        }
+    }
 }
 
 impl fmt::Debug for SnapshotV2NetworkMmioHandlerError {
@@ -1330,16 +1245,11 @@ fn validate_destination_selector(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn restore_snapshot_v2_network_device(
+fn validate_snapshot_v2_network_destination_profile(
     controller: &NetworkInterfaceConfig,
     portable: &SnapshotV2NetworkInterfaceState,
-    destination_memory: &GuestMemory,
     realized_profile: NetworkDeviceProfile,
-    interface_metrics: SharedNetworkInterfaceMetrics,
-    aggregate_metrics: SharedNetworkInterfaceMetrics,
-    now: Instant,
-) -> Result<RestoredSnapshotV2NetworkDevice, RestoreSnapshotV2NetworkDeviceError> {
+) -> Result<(), RestoreSnapshotV2NetworkDeviceError> {
     if realized_profile != portable.profile()
         || controller
             .guest_mac()
@@ -1351,8 +1261,23 @@ fn restore_snapshot_v2_network_device(
             .feature_capabilities()
             .is_dependency_complete()
     {
-        return Err(RestoreSnapshotV2NetworkDeviceError::Profile);
+        Err(RestoreSnapshotV2NetworkDeviceError::Profile)
+    } else {
+        Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_snapshot_v2_network_device(
+    controller: &NetworkInterfaceConfig,
+    portable: &SnapshotV2NetworkInterfaceState,
+    destination_memory: &GuestMemory,
+    realized_profile: NetworkDeviceProfile,
+    interface_metrics: SharedNetworkInterfaceMetrics,
+    aggregate_metrics: SharedNetworkInterfaceMetrics,
+    now: Instant,
+) -> Result<RestoredSnapshotV2NetworkDevice, RestoreSnapshotV2NetworkDeviceError> {
+    validate_snapshot_v2_network_destination_profile(controller, portable, realized_profile)?;
 
     let virtio = portable.virtio();
     let local = portable.local();
@@ -1514,20 +1439,6 @@ fn restore_queue_state(
         queue.driver_ring(),
         queue.device_ring(),
     )
-}
-
-fn restored_retry_deadline_at(
-    retry: SnapshotV2NetworkRetryState,
-    now: Instant,
-) -> Result<Option<Instant>, SnapshotV2NetworkMmioHandlerError> {
-    match retry {
-        SnapshotV2NetworkRetryState::None => Ok(None),
-        SnapshotV2NetworkRetryState::Immediate => Ok(Some(now)),
-        SnapshotV2NetworkRetryState::After { remaining_nanos } => now
-            .checked_add(Duration::from_nanos(remaining_nanos))
-            .map(Some)
-            .ok_or(SnapshotV2NetworkMmioHandlerError::Retry),
-    }
 }
 
 fn token_bucket_config(bucket: SnapshotV2NetworkTokenBucketState) -> NetworkTokenBucketConfig {
