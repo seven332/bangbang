@@ -30126,7 +30126,6 @@ mod tests {
             network_configs,
             mmds_config,
             expected_transport: transport,
-            cancellation: _,
             ..
         } = request;
         let has_block = !storage_configs.drives().is_empty();
