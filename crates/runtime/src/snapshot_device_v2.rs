@@ -137,6 +137,7 @@ const DEVICE_KIND_BLOCK: u32 = 1;
 const DEVICE_KIND_PMEM: u32 = 2;
 const DEVICE_KIND_SERIAL: u32 = 3;
 const DEVICE_KIND_NETWORK: u32 = 4;
+const DEVICE_KIND_VSOCK: u32 = 5;
 const DEVICE_INSTANCE_ROOT: u32 = 0;
 const SECTION_KIND_CONFIG: u16 = 1;
 const SECTION_KIND_BLOCK: u16 = 2;
@@ -206,6 +207,13 @@ impl SnapshotV2DeviceKey {
         Self {
             kind: DEVICE_KIND_NETWORK,
             instance,
+        }
+    }
+
+    pub(crate) const fn vsock() -> Self {
+        Self {
+            kind: DEVICE_KIND_VSOCK,
+            instance: 0,
         }
     }
 

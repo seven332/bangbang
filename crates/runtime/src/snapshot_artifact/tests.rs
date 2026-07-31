@@ -21,8 +21,9 @@ use crate::snapshot_format_v2::{
     NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
     NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY,
     NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY, NATIVE_V2_NETWORK_COMPONENT_KEY,
-    NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
-    SnapshotV2ComponentKey, encode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_VSOCK_COMPONENT_KEY, SnapshotV2Component,
+    SnapshotV2ComponentDisposition, SnapshotV2ComponentKey,
+    encode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory_hotplug_v2_10::{
@@ -39,6 +40,10 @@ use crate::snapshot_network_v2_11::{
 #[cfg(target_os = "macos")]
 use crate::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
+};
+#[cfg(target_os = "macos")]
+use crate::snapshot_vsock_v2_12::{
+    NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION, SnapshotV2VsockState,
 };
 
 #[cfg(target_os = "macos")]
@@ -300,6 +305,70 @@ fn current_v2_artifact_boundary_rejects_missing_serial_state() {
             NativeV2SnapshotCandidateStateError::MissingSerialState
         ))
     ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_twelve_vsock_pair_remains_outside_artifact_and_family_activation() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("explicit exact-2.12 memory should encode");
+    let binding_payload = binding
+        .encode()
+        .expect("exact-2.12 memory binding should encode");
+    let vsock_payload = fixture_bytes(include_str!(
+        "../snapshot_vsock_v2_12/fixtures/inactive-mmio.hex"
+    ));
+    SnapshotV2VsockState::decode(NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION, &vsock_payload)
+        .expect("exact-2.12 vsock fixture should be semantically valid");
+    let components = [
+        SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &binding_payload,
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_VSOCK_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &vsock_payload,
+        ),
+    ];
+    let bytes = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("explicit exact-2.12 state/memory pair should be structurally valid");
+
+    assert!(matches!(
+        NativeSnapshotArtifactState::from_current_v2(bytes.clone()),
+        Err(NativeSnapshotArtifactStateError::CurrentV2Profile(_))
+    ));
+    assert!(matches!(
+        NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone()),
+        Err(NativeSnapshotArtifactStateError::Format(_))
+    ));
+    assert!(matches!(
+        classify_native_v2_profile(&bytes, &binding),
+        Err(NativeV2SnapshotCandidateStateError::Format(
+            SnapshotV2DecodeError::UnsupportedVersion { .. }
+        ))
+    ));
+    assert!(matches!(
+        crate::snapshot_format::decode_native_snapshot_state(&bytes),
+        Err(crate::snapshot_format::NativeSnapshotFormatError::NativeV2(
+            SnapshotV2DecodeError::UnsupportedVersion { .. }
+        ))
+    ));
+    assert_eq!(
+        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+    );
 }
 
 #[cfg(target_os = "macos")]

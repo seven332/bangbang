@@ -181,6 +181,13 @@ impl VsockBackendSelector {
     /// Validates one logical UDS selector without opening or claiming it.
     pub fn try_from_path(path: impl AsRef<Path>) -> Result<Self, VsockBackendSelectorError> {
         let path = path.as_ref();
+        Self::validate_path(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn validate_path(path: &Path) -> Result<(), VsockBackendSelectorError> {
         let Some(path_text) = path.to_str() else {
             return Err(VsockBackendSelectorError::NotUtf8);
         };
@@ -191,9 +198,18 @@ impl VsockBackendSelector {
             return Err(VsockBackendSelectorError::ControlCharacter);
         }
         unix_socket_address(path).map_err(|_| VsockBackendSelectorError::InvalidSocketAddress)?;
+        Ok(())
+    }
+
+    pub(crate) fn try_from_string(path: String) -> Result<Self, VsockBackendSelectorError> {
+        Self::validate_path(Path::new(&path))?;
         Ok(Self {
-            path: path.to_path_buf(),
+            path: PathBuf::from(path),
         })
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), VsockBackendSelectorError> {
+        Self::validate_path(&self.path)
     }
 
     /// Returns the logical selector. The value does not grant path access.
