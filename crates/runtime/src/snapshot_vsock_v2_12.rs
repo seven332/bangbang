@@ -6,15 +6,20 @@
 
 use std::fmt;
 
+use crate::interrupt::GuestInterruptLine;
 use crate::memory::GuestMemoryRange;
+use crate::mmio::MmioRegion;
 use crate::pci::{
     PCI_BAR64_SIZE, PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
-    PCI_LAST_ENDPOINT_DEVICE, PCI_SEGMENT_ZERO, PciBarAddressSpace, PciBarPrefetchable,
+    PCI_LAST_ENDPOINT_DEVICE, PCI_SEGMENT_ZERO, PciBarAddressSpace, PciBarPrefetchable, PciSbdf,
 };
 use crate::snapshot_device_v2::{
-    SnapshotV2DeviceKey, SnapshotV2DeviceTransport, SnapshotV2InterruptIntent,
-    SnapshotV2MmioDeviceState, SnapshotV2PciDeviceState, SnapshotV2PciMsixState,
-    SnapshotV2VirtioQueueState, SnapshotV2VirtioState,
+    SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceKey, SnapshotV2DeviceTransport,
+    SnapshotV2InterruptIntent, SnapshotV2MmioDeviceState, SnapshotV2PciDeviceState,
+    SnapshotV2PciMsixState, SnapshotV2VirtioQueueState, SnapshotV2VirtioState,
+    capture_mmio_common_for_device_with_queue_count_and_config_status_gate,
+    capture_mmio_transport_parts, capture_pci_common_for_device_with_queue_count,
+    capture_pci_transport_parts_with_queue_count,
 };
 use crate::snapshot_device_v2_5::queue_ranges;
 use crate::snapshot_format::SnapshotFormatVersion;
@@ -29,10 +34,12 @@ use crate::virtio_pci::{
     VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VIRTIO_PCI_MAX_MSIX_VECTORS,
     VIRTIO_PCI_NO_VECTOR, VirtioPciEndpointPhase,
 };
+use crate::vsock::VIRTIO_VSOCK_DEVICE_ID;
 use crate::vsock::{
     MIN_GUEST_CID, VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_QUEUE_COUNT,
-    VIRTIO_VSOCK_QUEUE_SIZE, VirtioVsockConfigSpace, VsockBackendSelector,
-    VsockHostLocalPortCursor,
+    VIRTIO_VSOCK_QUEUE_SIZE, VirtioVsockActiveQueuesCaptureState, VirtioVsockConfigSpace,
+    VirtioVsockDeviceCaptureState, VirtioVsockMmioCaptureState, VirtioVsockPciCaptureState,
+    VsockBackendSelector, VsockHostLocalPortCursor,
 };
 
 mod codec;
@@ -220,6 +227,58 @@ pub struct SnapshotV2VsockState {
 }
 
 impl SnapshotV2VsockState {
+    /// Converts one checked MMIO source capture without retaining source
+    /// ownership, reset validation, or normalized source-only work.
+    pub fn try_from_mmio_capture(
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+        captured: VirtioVsockMmioCaptureState,
+    ) -> Result<Self, SnapshotV2VsockStateCaptureError> {
+        let (device, transport) = captured.into_parts();
+        let virtio = capture_mmio_common_for_device_with_queue_count_and_config_status_gate(
+            &transport,
+            VIRTIO_VSOCK_DEVICE_ID,
+            device.available_features(),
+            VIRTIO_VSOCK_QUEUE_COUNT,
+            true,
+        )
+        .map_err(capture_common_error)?;
+        let transport = SnapshotV2DeviceTransport::Mmio(capture_mmio_transport_parts(
+            region,
+            interrupt_line,
+            &transport,
+        ));
+        capture_vsock_state(device, virtio, transport)
+    }
+
+    /// Converts one checked PCI source capture without retaining source
+    /// ownership, reset validation, or normalized source-only work.
+    pub fn try_from_pci_capture(
+        origin: StorageDeviceOrigin,
+        sbdf: PciSbdf,
+        bar_range: GuestMemoryRange,
+        captured: VirtioVsockPciCaptureState,
+    ) -> Result<Self, SnapshotV2VsockStateCaptureError> {
+        let (device, transport) = captured.into_parts();
+        let virtio = capture_pci_common_for_device_with_queue_count(
+            &transport,
+            VIRTIO_VSOCK_DEVICE_ID,
+            device.available_features(),
+            VIRTIO_VSOCK_QUEUE_COUNT,
+        )
+        .map_err(capture_common_error)?;
+        let transport = capture_pci_transport_parts_with_queue_count(
+            origin,
+            sbdf,
+            bar_range,
+            &transport,
+            VIRTIO_VSOCK_QUEUE_COUNT,
+        )
+        .map(SnapshotV2DeviceTransport::Pci)
+        .map_err(capture_common_error)?;
+        capture_vsock_state(device, virtio, transport)
+    }
+
     /// Validates and retains one complete detached state value.
     pub fn try_from_parts(
         parts: SnapshotV2VsockStateParts,
@@ -342,6 +401,53 @@ impl fmt::Display for SnapshotV2VsockStateBuildError {
 
 impl std::error::Error for SnapshotV2VsockStateBuildError {}
 
+/// Failure while converting one checked live vsock capture into exact-2.12
+/// portable state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2VsockStateCaptureError {
+    /// A bounded common-state collection could not be allocated.
+    Allocation,
+    /// Repeated live device and transport state disagree.
+    Device,
+    /// Common virtio or transport capture failed.
+    Common {
+        /// Redacted common capture category.
+        source: SnapshotV2DeviceGraphCaptureError,
+    },
+    /// Complete converted state failed its final semantic gate.
+    Build {
+        /// Redacted exact-2.12 relationship category.
+        source: SnapshotV2VsockStateBuildError,
+    },
+}
+
+impl fmt::Debug for SnapshotV2VsockStateCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2VsockStateCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Allocation => "native-v2 captured vsock state allocation failed",
+            Self::Device => "native-v2 captured vsock device state is inconsistent",
+            Self::Common { .. } => "native-v2 captured vsock transport state is invalid",
+            Self::Build { .. } => "native-v2 captured vsock state is invalid",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2VsockStateCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Common { source } => Some(source),
+            Self::Build { source } => Some(source),
+            Self::Allocation | Self::Device => None,
+        }
+    }
+}
+
 /// Exact-2.12 vsock component encoding failure.
 #[derive(Debug)]
 pub enum SnapshotV2VsockStateEncodeError {
@@ -450,6 +556,63 @@ impl std::error::Error for SnapshotV2VsockStateDecodeError {
             | Self::NonzeroReserved
             | Self::Allocation => None,
         }
+    }
+}
+
+fn capture_vsock_state(
+    device: VirtioVsockDeviceCaptureState,
+    virtio: SnapshotV2VirtioState,
+    transport: SnapshotV2DeviceTransport,
+) -> Result<SnapshotV2VsockState, SnapshotV2VsockStateCaptureError> {
+    let (
+        guest_cid,
+        available_features,
+        negotiated_features,
+        active_queues,
+        backend_selector,
+        host_local_port_cursor,
+    ) = device.into_parts();
+    if available_features != virtio.available_features()
+        || negotiated_features != virtio.driver_features()
+        || active_queues.is_some() != virtio.is_activated()
+    {
+        return Err(SnapshotV2VsockStateCaptureError::Device);
+    }
+    SnapshotV2VsockState::try_from_parts(SnapshotV2VsockStateParts {
+        guest_cid,
+        backend_selector,
+        host_local_port_cursor,
+        active_queues: active_queues.map(capture_active_queues),
+        virtio,
+        transport,
+    })
+    .map_err(|source| SnapshotV2VsockStateCaptureError::Build { source })
+}
+
+fn capture_active_queues(
+    queues: VirtioVsockActiveQueuesCaptureState,
+) -> SnapshotV2VsockActiveQueuesState {
+    let capture = |queue: crate::vsock::VirtioVsockQueueCaptureState| {
+        SnapshotV2VsockQueueState::new(
+            queue.next_available(),
+            queue.next_used(),
+            queue.event_idx_enabled(),
+        )
+    };
+    SnapshotV2VsockActiveQueuesState::new(
+        capture(queues.rx()),
+        capture(queues.tx()),
+        capture(queues.event()),
+    )
+}
+
+fn capture_common_error(
+    source: SnapshotV2DeviceGraphCaptureError,
+) -> SnapshotV2VsockStateCaptureError {
+    if source == SnapshotV2DeviceGraphCaptureError::Allocation {
+        SnapshotV2VsockStateCaptureError::Allocation
+    } else {
+        SnapshotV2VsockStateCaptureError::Common { source }
     }
 }
 

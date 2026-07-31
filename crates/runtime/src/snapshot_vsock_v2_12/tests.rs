@@ -1,5 +1,5 @@
 use crate::interrupt::GuestInterruptLine;
-use crate::memory::{GuestAddress, GuestMemoryRange};
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::{
     PCI_BAR64_START, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO, PCI_SEGMENT_ZERO,
@@ -10,20 +10,23 @@ use crate::snapshot_device_v2::{
     SnapshotV2PciBarProbeState, SnapshotV2PciDeviceState, SnapshotV2PciDeviceStateParts,
     SnapshotV2PciMsixState, SnapshotV2PciMsixStateParts, SnapshotV2PciMsixTableEntry,
     SnapshotV2PciWritableByte, SnapshotV2VirtioQueueState, SnapshotV2VirtioState,
-    SnapshotV2VirtioStateParts,
+    SnapshotV2VirtioStateParts, restore_mmio_transport_state_for_device_with_config_status_gate,
 };
 use crate::snapshot_restore::NATIVE_V2_VSOCK_RESTORE_PUBLIC_ID;
 use crate::storage_capture::StorageDeviceOrigin;
 use crate::virtio::{
     VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK,
-    VIRTIO_DEVICE_STATUS_FEATURES_OK,
+    VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioDeviceType,
 };
 use crate::virtio_mmio::{VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_VERSION_1_FEATURE};
 use crate::virtio_pci::{
     VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VirtioPciEndpointPhase,
+    VirtioPciIdentity, VirtioPciTransportState,
 };
 use crate::vsock::{
-    MIN_GUEST_CID, VIRTIO_VSOCK_QUEUE_COUNT, VIRTIO_VSOCK_QUEUE_SIZE, VirtioVsockConfigSpace,
+    MIN_GUEST_CID, VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_COUNT, VIRTIO_VSOCK_QUEUE_SIZE,
+    VirtioVsockActiveQueuesCaptureState, VirtioVsockConfigSpace, VirtioVsockDeviceCaptureState,
+    VirtioVsockMmioCaptureState, VirtioVsockPciCaptureState, VirtioVsockQueueCaptureState,
     VsockBackendSelector, VsockHostLocalPortCursor,
 };
 
@@ -229,6 +232,77 @@ fn deterministic_fixture_values_round_trip_and_report_stable_identity() {
             .len(),
         NATIVE_V2_VSOCK_STATE_WORST_CASE_BYTES
     );
+}
+
+#[test]
+fn checked_mmio_and_pci_captures_convert_to_exact_portable_state() {
+    let mut memory = capture_memory();
+    let inactive_mmio = inactive_mmio_state();
+    let active_pci = active_pci_state();
+    let active_mmio = replace_transport(active_pci.clone(), inactive_mmio.transport().clone());
+    let inactive_pci = replace_transport(inactive_mmio.clone(), active_pci.transport().clone());
+
+    for (profile, expected) in [("inactive-mmio", inactive_mmio), ("active-pci", active_pci)] {
+        let converted = convert_checked_capture(&mut memory, expected.clone());
+        assert_eq!(converted, expected, "{profile} capture should round trip");
+    }
+
+    for (profile, synthetic) in [("active-mmio", active_mmio), ("inactive-pci", inactive_pci)] {
+        let normalized = convert_checked_capture(&mut memory, synthetic.clone());
+        assert_eq!(normalized.guest_cid(), synthetic.guest_cid(), "{profile}");
+        assert_eq!(
+            normalized.backend_selector(),
+            synthetic.backend_selector(),
+            "{profile}"
+        );
+        assert_eq!(
+            normalized.host_local_port_cursor(),
+            synthetic.host_local_port_cursor(),
+            "{profile}"
+        );
+        assert_eq!(
+            normalized.active_queues(),
+            synthetic.active_queues(),
+            "{profile}"
+        );
+        assert_eq!(
+            normalized.transport().kind(),
+            synthetic.transport().kind(),
+            "{profile}"
+        );
+        let recaptured = convert_checked_capture(&mut memory, normalized.clone());
+        assert_eq!(
+            recaptured, normalized,
+            "{profile} normalized capture should be stable"
+        );
+    }
+}
+
+#[test]
+fn capture_failures_preserve_typed_categories_without_private_values() {
+    assert_eq!(
+        capture_common_error(SnapshotV2DeviceGraphCaptureError::Allocation),
+        SnapshotV2VsockStateCaptureError::Allocation
+    );
+    let error = capture_common_error(SnapshotV2DeviceGraphCaptureError::InvalidPciState);
+    assert_eq!(
+        error,
+        SnapshotV2VsockStateCaptureError::Common {
+            source: SnapshotV2DeviceGraphCaptureError::InvalidPciState,
+        }
+    );
+    assert!(std::error::Error::source(&error).is_some());
+
+    let state = active_pci_state();
+    let selector = state
+        .backend_selector()
+        .path()
+        .to_str()
+        .expect("selector should be UTF-8");
+    let rendered = format!("{error:?} {error}");
+    assert!(!rendered.contains(selector));
+    assert!(!rendered.contains(&state.guest_cid().to_string()));
+    assert!(!rendered.contains(&state.host_local_port_cursor().last_used().to_string()));
 }
 
 #[test]
@@ -949,6 +1023,147 @@ fn cloned_parts(state: &SnapshotV2VsockState) -> SnapshotV2VsockStateParts {
         active_queues: state.active_queues(),
         virtio: state.virtio().clone(),
         transport: state.transport().clone(),
+    }
+}
+
+fn capture_memory() -> GuestMemory {
+    let range = GuestMemoryRange::new(GuestAddress::new(0), 0x0040_0000)
+        .expect("capture memory range should validate");
+    let layout =
+        GuestMemoryLayout::new(vec![range]).expect("capture memory layout should validate");
+    GuestMemory::allocate(&layout).expect("capture memory should allocate")
+}
+
+fn replace_transport(
+    state: SnapshotV2VsockState,
+    transport: SnapshotV2DeviceTransport,
+) -> SnapshotV2VsockState {
+    let mut parts = state.into_parts();
+    parts.transport = transport;
+    SnapshotV2VsockState::try_from_parts(parts)
+        .expect("fixture device state should admit the other checked transport")
+}
+
+fn convert_checked_capture(
+    memory: &mut GuestMemory,
+    expected: SnapshotV2VsockState,
+) -> SnapshotV2VsockState {
+    let SnapshotV2VsockStateParts {
+        guest_cid,
+        backend_selector,
+        host_local_port_cursor,
+        active_queues,
+        virtio,
+        transport,
+    } = expected.clone().into_parts();
+    initialize_queue_indices(memory, &virtio, active_queues);
+    let device = live_device(
+        guest_cid,
+        backend_selector,
+        host_local_port_cursor,
+        active_queues,
+        &virtio,
+    );
+    match transport {
+        SnapshotV2DeviceTransport::Mmio(mmio) => {
+            let retained = restore_mmio_transport_state_for_device_with_config_status_gate(
+                VIRTIO_VSOCK_DEVICE_ID,
+                &virtio,
+                &mmio,
+                true,
+            )
+            .expect("portable MMIO state should restore");
+            let captured = VirtioVsockMmioCaptureState::try_from_parts(device, retained, memory)
+                .expect("restored MMIO state should form one checked capture");
+            SnapshotV2VsockState::try_from_mmio_capture(
+                mmio.region(),
+                mmio.interrupt_line(),
+                captured,
+            )
+            .expect("checked MMIO capture should convert")
+        }
+        SnapshotV2DeviceTransport::Pci(pci) => {
+            let identity = VirtioPciIdentity::new(
+                VirtioDeviceType::new(VIRTIO_VSOCK_DEVICE_ID)
+                    .expect("vsock should have a modern PCI identity"),
+                virtio.available_features(),
+            )
+            .with_config_generation(virtio.config_generation());
+            let retained =
+                VirtioPciTransportState::from_snapshot_v2_parts(identity, &virtio, &pci, false)
+                    .expect("portable PCI state should restore");
+            let captured = VirtioVsockPciCaptureState::try_from_parts(device, retained, memory)
+                .expect("restored PCI state should form one checked capture");
+            SnapshotV2VsockState::try_from_pci_capture(
+                pci.origin(),
+                pci.sbdf(),
+                pci.bar_range(),
+                captured,
+            )
+            .expect("checked PCI capture should convert")
+        }
+    }
+}
+
+fn live_device(
+    guest_cid: u64,
+    backend_selector: VsockBackendSelector,
+    host_local_port_cursor: VsockHostLocalPortCursor,
+    active_queues: Option<SnapshotV2VsockActiveQueuesState>,
+    virtio: &SnapshotV2VirtioState,
+) -> VirtioVsockDeviceCaptureState {
+    let queue = |state: SnapshotV2VsockQueueState| {
+        VirtioVsockQueueCaptureState::new(
+            state.next_available(),
+            state.next_used(),
+            state.event_idx_enabled(),
+        )
+    };
+    let active_queues = active_queues.map(|state| {
+        VirtioVsockActiveQueuesCaptureState::new(
+            queue(state.rx()),
+            queue(state.tx()),
+            queue(state.event()),
+        )
+    });
+    VirtioVsockDeviceCaptureState::try_from_parts(
+        guest_cid,
+        virtio.available_features(),
+        virtio.driver_features(),
+        active_queues,
+        backend_selector,
+        host_local_port_cursor,
+    )
+    .expect("portable device state should form one checked live capture")
+}
+
+fn initialize_queue_indices(
+    memory: &mut GuestMemory,
+    virtio: &SnapshotV2VirtioState,
+    active_queues: Option<SnapshotV2VsockActiveQueuesState>,
+) {
+    let Some(active_queues) = active_queues else {
+        return;
+    };
+    for (queue, cursor) in virtio.queues().iter().zip([
+        active_queues.rx(),
+        active_queues.tx(),
+        active_queues.event(),
+    ]) {
+        let available_index = queue
+            .driver_ring()
+            .checked_add(2)
+            .expect("available index address should not overflow");
+        memory
+            .write_slice(&cursor.next_available().to_le_bytes(), available_index)
+            .expect("available index should write");
+        let used_index = queue
+            .device_ring()
+            .checked_add(2)
+            .expect("used index address should not overflow");
+        memory
+            .write_slice(&cursor.next_used().to_le_bytes(), used_index)
+            .expect("used index should write");
     }
 }
 

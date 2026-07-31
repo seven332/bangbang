@@ -326,11 +326,25 @@ fn exact_minor_twelve_vsock_pair_remains_outside_artifact_and_family_activation(
     ));
     SnapshotV2VsockState::decode(NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION, &vsock_payload)
         .expect("exact-2.12 vsock fixture should be semantically valid");
+    let serial_device = SerialMmioDevice::discarding()
+        .capture_state()
+        .expect("exact-2.12 serial fixture should capture");
+    let serial_payload = SnapshotV2SerialState::try_from_capture_ready(
+        CaptureReadySerialState::new(SerialConfig::default(), serial_device),
+    )
+    .expect("exact-2.12 serial fixture should validate")
+    .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+    .expect("exact-2.12 serial fixture should encode");
     let components = [
         SnapshotV2Component::new(
             NATIVE_V2_MEMORY_COMPONENT_KEY,
             SnapshotV2ComponentDisposition::Semantic,
             &binding_payload,
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_SERIAL_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &serial_payload,
         ),
         SnapshotV2Component::new(
             NATIVE_V2_VSOCK_COMPONENT_KEY,
@@ -344,6 +358,141 @@ fn exact_minor_twelve_vsock_pair_remains_outside_artifact_and_family_activation(
         &components,
     )
     .expect("explicit exact-2.12 state/memory pair should be structurally valid");
+    let candidate = NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(bytes.clone())
+        .expect("explicit exact-2.12 candidate should validate");
+    assert_eq!(
+        candidate.version(),
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+    );
+    assert_eq!(candidate.bytes(), bytes);
+    assert_eq!(candidate.memory_binding(), &binding);
+    assert!(candidate.device_graph().is_none());
+    assert!(candidate.entropy().is_none());
+    assert!(candidate.balloon().is_none());
+    assert!(candidate.memory_hotplug().is_none());
+    assert!(candidate.network().is_none());
+    assert!(candidate.vsock().is_some());
+    let debug = format!("{candidate:?}");
+    assert!(debug.contains(REDACTED));
+    assert!(!debug.contains("bangbang-vsock"));
+
+    let absent_bytes = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &[
+            SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &binding_payload,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_SERIAL_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &serial_payload,
+            ),
+        ],
+    )
+    .expect("vsock-absent exact-2.12 state should encode");
+    let absent_candidate =
+        NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(absent_bytes)
+            .expect("vsock-absent exact-2.12 candidate should validate");
+    assert!(absent_candidate.vsock().is_none());
+
+    let invalid_payload = [0_u8; 64];
+    let malformed = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &[
+            SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &binding_payload,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_SERIAL_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &serial_payload,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_VSOCK_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &invalid_payload,
+            ),
+        ],
+    )
+    .expect("malformed nested vsock should remain structurally encodable");
+    assert!(matches!(
+        NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(malformed),
+        Err(NativeV2SnapshotCandidateStateError::VsockState(_))
+    ));
+
+    for component in [
+        SnapshotV2Component::new(
+            NATIVE_V2_VSOCK_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::NonSemantic,
+            &vsock_payload,
+        ),
+        SnapshotV2Component::new(
+            SnapshotV2ComponentKey::new(NATIVE_V2_VSOCK_COMPONENT_KEY.kind(), 1),
+            SnapshotV2ComponentDisposition::Semantic,
+            &vsock_payload,
+        ),
+    ] {
+        let invalid = encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+            &[],
+            &[
+                SnapshotV2Component::new(
+                    NATIVE_V2_MEMORY_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    &binding_payload,
+                ),
+                SnapshotV2Component::new(
+                    NATIVE_V2_SERIAL_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    &serial_payload,
+                ),
+                component,
+            ],
+        )
+        .expect("invalid exact-2.12 vsock singleton shape should remain structural");
+        assert!(matches!(
+            NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(invalid),
+            Err(NativeV2SnapshotCandidateStateError::InvalidVsockComponent)
+        ));
+    }
+
+    let duplicate_kind = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &[
+            SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &binding_payload,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_SERIAL_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &serial_payload,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_VSOCK_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &vsock_payload,
+            ),
+            SnapshotV2Component::new(
+                SnapshotV2ComponentKey::new(NATIVE_V2_VSOCK_COMPONENT_KEY.kind(), 1),
+                SnapshotV2ComponentDisposition::Semantic,
+                &vsock_payload,
+            ),
+        ],
+    )
+    .expect("two distinct kind-13 instances should remain structurally encodable");
+    assert!(matches!(
+        NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(duplicate_kind),
+        Err(NativeV2SnapshotCandidateStateError::InvalidVsockComponent)
+    ));
 
     assert!(matches!(
         NativeSnapshotArtifactState::from_current_v2(bytes.clone()),
@@ -353,12 +502,11 @@ fn exact_minor_twelve_vsock_pair_remains_outside_artifact_and_family_activation(
         NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone()),
         Err(NativeSnapshotArtifactStateError::Format(_))
     ));
-    assert!(matches!(
-        classify_native_v2_profile(&bytes, &binding),
-        Err(NativeV2SnapshotCandidateStateError::Format(
-            SnapshotV2DecodeError::UnsupportedVersion { .. }
-        ))
-    ));
+    assert_eq!(
+        classify_native_v2_profile(&bytes, &binding)
+            .expect("the explicit classifier should recognize exact 2.12"),
+        NativeV2SnapshotArtifactProfile::VsockStateV2_12
+    );
     assert!(matches!(
         crate::snapshot_format::decode_native_snapshot_state(&bytes),
         Err(crate::snapshot_format::NativeSnapshotFormatError::NativeV2(
@@ -369,6 +517,11 @@ fn exact_minor_twelve_vsock_pair_remains_outside_artifact_and_family_activation(
         NATIVE_V2_SNAPSHOT_VERSION,
         NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
     );
+
+    let (owned_bytes, owned_binding, _, _, _, _, _, _, owned_vsock) = candidate.into_parts();
+    assert_eq!(owned_bytes, bytes);
+    assert_eq!(owned_binding, binding);
+    assert!(owned_vsock.is_some());
 }
 
 #[cfg(target_os = "macos")]

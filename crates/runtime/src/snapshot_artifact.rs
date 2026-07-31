@@ -47,8 +47,9 @@ use crate::snapshot_format_v2::{
     NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
     NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
     NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY, NATIVE_V2_NETWORK_COMPONENT_KEY,
-    NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2ComponentDisposition,
-    SnapshotV2DecodeError, decode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, NATIVE_V2_VSOCK_COMPONENT_KEY,
+    SnapshotV2ComponentDisposition, SnapshotV2DecodeError,
+    decode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_format_v2::{NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES, decode_snapshot_v2_state};
@@ -85,6 +86,10 @@ use crate::snapshot_restore::{SnapshotRestoreManifest, SnapshotRestoreManifestEr
 use crate::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
     SnapshotV2SerialStateDecodeError,
+};
+use crate::snapshot_vsock_v2_12::{
+    NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION, SnapshotV2VsockState,
+    SnapshotV2VsockStateDecodeError,
 };
 
 const REDACTED: &str = "<redacted>";
@@ -128,6 +133,8 @@ pub enum NativeV2SnapshotArtifactProfile {
     MemoryHotplugStateV2_10,
     /// Exact 2.11 profile with optional unchanged devices and network/MMDS.
     NetworkStateV2_11,
+    /// Exact 2.12 profile with optional unchanged devices and vsock.
+    VsockStateV2_12,
 }
 
 /// Validation failure for one owned native snapshot artifact state.
@@ -1869,6 +1876,141 @@ impl fmt::Debug for NativeV2NetworkSnapshotCandidateState {
     }
 }
 
+/// One closed explicit exact native-v2 2.12 vsock candidate.
+///
+/// This owner-free value validates all unchanged earlier components and the
+/// optional kind-13 vsock singleton from one immutable byte vector. It
+/// deliberately has no conversion into current artifact publication
+/// authority.
+pub struct NativeV2VsockSnapshotCandidateState {
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+    balloon: Option<SnapshotV2BalloonState>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+    network: Option<SnapshotV2NetworkState>,
+    vsock: Option<SnapshotV2VsockState>,
+}
+
+/// Owned exact components retained by one explicit exact-2.12 candidate.
+pub type NativeV2VsockSnapshotCandidateParts = (
+    Vec<u8>,
+    SnapshotV2MemoryBinding,
+    Option<SnapshotV2StorageDeviceGraph>,
+    SnapshotV2SerialState,
+    Option<SnapshotV2EntropyState>,
+    Option<SnapshotV2BalloonState>,
+    Option<SnapshotV2MemoryHotplugState>,
+    Option<SnapshotV2NetworkState>,
+    Option<SnapshotV2VsockState>,
+);
+
+impl NativeV2VsockSnapshotCandidateState {
+    /// Validates and retains one explicit exact native-v2 2.12 state.
+    pub fn from_vsock_state_v2_12(
+        bytes: Vec<u8>,
+    ) -> Result<Self, NativeV2SnapshotCandidateStateError> {
+        let (binding, device_graph, serial, entropy, balloon, memory_hotplug, network, vsock) =
+            decode_vsock_state_v2_12(&bytes)?;
+        Ok(Self {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network,
+            vsock,
+        })
+    }
+
+    /// Returns the exact candidate compatibility version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+    }
+
+    /// Returns the unchanged immutable encoded state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the memory commitment derived from the same bytes.
+    pub const fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.binding
+    }
+
+    /// Returns optional unchanged exact-2.6 storage.
+    pub const fn device_graph(&self) -> Option<&SnapshotV2StorageDeviceGraph> {
+        self.device_graph.as_ref()
+    }
+
+    /// Returns required unchanged exact-2.7 serial state.
+    pub const fn serial(&self) -> &SnapshotV2SerialState {
+        &self.serial
+    }
+
+    /// Returns optional unchanged exact-2.8 entropy state.
+    pub const fn entropy(&self) -> Option<&SnapshotV2EntropyState> {
+        self.entropy.as_ref()
+    }
+
+    /// Returns optional unchanged exact-2.9 balloon state.
+    pub const fn balloon(&self) -> Option<&SnapshotV2BalloonState> {
+        self.balloon.as_ref()
+    }
+
+    /// Returns optional unchanged exact-2.10 virtio-mem state.
+    pub const fn memory_hotplug(&self) -> Option<&SnapshotV2MemoryHotplugState> {
+        self.memory_hotplug.as_ref()
+    }
+
+    /// Returns optional unchanged exact-2.11 network/MMDS state.
+    pub const fn network(&self) -> Option<&SnapshotV2NetworkState> {
+        self.network.as_ref()
+    }
+
+    /// Returns optional exact-2.12 vsock state.
+    pub const fn vsock(&self) -> Option<&SnapshotV2VsockState> {
+        self.vsock.as_ref()
+    }
+
+    /// Consumes the candidate into its inseparable exact components.
+    pub fn into_parts(self) -> NativeV2VsockSnapshotCandidateParts {
+        (
+            self.bytes,
+            self.binding,
+            self.device_graph,
+            self.serial,
+            self.entropy,
+            self.balloon,
+            self.memory_hotplug,
+            self.network,
+            self.vsock,
+        )
+    }
+}
+
+impl fmt::Debug for NativeV2VsockSnapshotCandidateState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2VsockSnapshotCandidateState")
+            .field("version", &self.version())
+            .field("has_storage", &self.device_graph.is_some())
+            .field("has_entropy", &self.entropy.is_some())
+            .field("has_balloon", &self.balloon.is_some())
+            .field("has_memory_hotplug", &self.memory_hotplug.is_some())
+            .field("has_network", &self.network.is_some())
+            .field("has_vsock", &self.vsock.is_some())
+            .field("state", &REDACTED)
+            .field("memory_binding", &REDACTED)
+            .field("serial", &REDACTED)
+            .finish()
+    }
+}
+
 fn decode_device_graph_v2_4(
     bytes: &[u8],
 ) -> Result<(SnapshotV2MemoryBinding, SnapshotV2DeviceGraph), NativeV2SnapshotCandidateStateError> {
@@ -2403,16 +2545,50 @@ type DecodedNetworkSnapshotV2_11 = (
     Option<SnapshotV2NetworkState>,
 );
 
+type DecodedVsockSnapshotV2_12 = (
+    SnapshotV2MemoryBinding,
+    Option<SnapshotV2StorageDeviceGraph>,
+    SnapshotV2SerialState,
+    Option<SnapshotV2EntropyState>,
+    Option<SnapshotV2BalloonState>,
+    Option<SnapshotV2MemoryHotplugState>,
+    Option<SnapshotV2NetworkState>,
+    Option<SnapshotV2VsockState>,
+);
+
 fn decode_network_state_v2_11(
     bytes: &[u8],
 ) -> Result<DecodedNetworkSnapshotV2_11, NativeV2SnapshotCandidateStateError> {
-    let state = decode_snapshot_v2_state_with_compatibility_version(
-        bytes,
-        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
-    )
-    .map_err(NativeV2SnapshotCandidateStateError::Format)?;
+    let (binding, device_graph, serial, entropy, balloon, memory_hotplug, network, vsock) =
+        decode_network_or_vsock_state(bytes, NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION)?;
+    if vsock.is_some() {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidVsockComponent);
+    }
+    Ok((
+        binding,
+        device_graph,
+        serial,
+        entropy,
+        balloon,
+        memory_hotplug,
+        network,
+    ))
+}
+
+fn decode_vsock_state_v2_12(
+    bytes: &[u8],
+) -> Result<DecodedVsockSnapshotV2_12, NativeV2SnapshotCandidateStateError> {
+    decode_network_or_vsock_state(bytes, NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION)
+}
+
+fn decode_network_or_vsock_state(
+    bytes: &[u8],
+    expected_version: SnapshotFormatVersion,
+) -> Result<DecodedVsockSnapshotV2_12, NativeV2SnapshotCandidateStateError> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(bytes, expected_version)
+        .map_err(NativeV2SnapshotCandidateStateError::Format)?;
     let version = state.metadata().version();
-    if version != NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION {
+    if version != expected_version {
         return Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version });
     }
     let binding = decode_snapshot_v2_memory_binding(&state)
@@ -2531,10 +2707,7 @@ fn decode_network_state_v2_11(
         .transpose()?;
     if let Some(memory_hotplug) = &memory_hotplug {
         memory_hotplug
-            .validate_memory_binding_for_compatibility_version(
-                &binding,
-                NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
-            )
+            .validate_memory_binding_for_compatibility_version(&binding, expected_version)
             .map_err(NativeV2SnapshotCandidateStateError::MemoryHotplugBinding)?;
     }
 
@@ -2560,6 +2733,31 @@ fn decode_network_state_v2_11(
         })
         .transpose()?;
 
+    let mut vsock_components = state
+        .components()
+        .filter(|component| component.key().kind() == NATIVE_V2_VSOCK_COMPONENT_KEY.kind());
+    let vsock = vsock_components.next();
+    if vsock_components.next().is_some()
+        || vsock.is_some_and(|component| {
+            component.key() != NATIVE_V2_VSOCK_COMPONENT_KEY
+                || component.disposition() != SnapshotV2ComponentDisposition::Semantic
+        })
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidVsockComponent);
+    }
+    let vsock = vsock
+        .map(|component| {
+            SnapshotV2VsockState::decode(
+                NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+                component.payload(),
+            )
+            .map_err(NativeV2SnapshotCandidateStateError::VsockState)
+        })
+        .transpose()?;
+    if expected_version != NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION && vsock.is_some() {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidVsockComponent);
+    }
+
     Ok((
         binding,
         device_graph,
@@ -2568,6 +2766,7 @@ fn decode_network_state_v2_11(
         balloon,
         memory_hotplug,
         network,
+        vsock,
     ))
 }
 
@@ -2577,7 +2776,7 @@ fn classify_native_v2_profile(
 ) -> Result<NativeV2SnapshotArtifactProfile, NativeV2SnapshotCandidateStateError> {
     let state = decode_snapshot_v2_state_with_compatibility_version(
         bytes,
-        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
     )
     .map_err(NativeV2SnapshotCandidateStateError::Format)?;
     let version = state.metadata().version();
@@ -2665,6 +2864,10 @@ fn classify_native_v2_profile(
             decode_network_state_v2_11(bytes)?;
             Ok(NativeV2SnapshotArtifactProfile::NetworkStateV2_11)
         }
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION => {
+            decode_vsock_state_v2_12(bytes)?;
+            Ok(NativeV2SnapshotArtifactProfile::VsockStateV2_12)
+        }
         _ => Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version }),
     }
 }
@@ -2734,6 +2937,10 @@ pub enum NativeV2SnapshotCandidateStateError {
     InvalidNetworkComponent,
     /// The optional network/MMDS payload is invalid.
     NetworkState(SnapshotV2NetworkStateDecodeError),
+    /// An exact-2.12 vsock component is not one semantic singleton.
+    InvalidVsockComponent,
+    /// The optional vsock payload is invalid.
+    VsockState(SnapshotV2VsockStateDecodeError),
 }
 
 impl fmt::Display for NativeV2SnapshotCandidateStateError {
@@ -2832,6 +3039,15 @@ impl fmt::Display for NativeV2SnapshotCandidateStateError {
                     "invalid native-v2 candidate network state: {source}"
                 )
             }
+            Self::InvalidVsockComponent => {
+                formatter.write_str("native-v2 candidate vsock component is invalid")
+            }
+            Self::VsockState(source) => {
+                write!(
+                    formatter,
+                    "invalid native-v2 candidate vsock state: {source}"
+                )
+            }
         }
     }
 }
@@ -2850,6 +3066,7 @@ impl std::error::Error for NativeV2SnapshotCandidateStateError {
             Self::MemoryHotplugState(source) => Some(source),
             Self::MemoryHotplugBinding(source) => Some(source),
             Self::NetworkState(source) => Some(source),
+            Self::VsockState(source) => Some(source),
             Self::UnexpectedVersion { .. }
             | Self::VersionMismatch { .. }
             | Self::MissingDeviceGraph
@@ -2859,7 +3076,8 @@ impl std::error::Error for NativeV2SnapshotCandidateStateError {
             | Self::InvalidEntropyComponent
             | Self::InvalidBalloonComponent
             | Self::InvalidMemoryHotplugComponent
-            | Self::InvalidNetworkComponent => None,
+            | Self::InvalidNetworkComponent
+            | Self::InvalidVsockComponent => None,
         }
     }
 }

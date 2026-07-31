@@ -10519,16 +10519,16 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_rejects_optional_vsock_before_live_reset_over_mmio() {
-        run_signed_vsock_snapshot_early_rejection(false);
+    fn signed_executable_resets_optional_vsock_before_unchanged_rejection_over_mmio() {
+        run_signed_vsock_snapshot_preflight_rejection(false);
     }
 
     #[test]
-    fn signed_executable_rejects_optional_vsock_before_live_reset_over_product_pci() {
-        run_signed_vsock_snapshot_early_rejection(true);
+    fn signed_executable_resets_optional_vsock_before_unchanged_rejection_over_product_pci() {
+        run_signed_vsock_snapshot_preflight_rejection(true);
     }
 
-    fn run_signed_vsock_snapshot_early_rejection(enable_pci: bool) {
+    fn run_signed_vsock_snapshot_preflight_rejection(enable_pci: bool) {
         let transport = if enable_pci { "product PCI" } else { "MMIO" };
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
@@ -10680,27 +10680,27 @@ mod macos_arm64 {
         assert_capture_ready_snapshot_rejected_without_artifacts(
             &socket_path,
             test_dir.path(),
-            &format!("paused {transport} vsock early profile rejection"),
+            &format!("paused {transport} vsock capture-preflight rejection"),
         );
         old_stream
             .set_nonblocking(true)
-            .expect("rejected snapshot should leave the old vsock stream probeable");
+            .expect("rejected snapshot should leave the reset old vsock stream probeable");
         match old_stream.read(&mut unexpected) {
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Ok(0) => {
-                panic!("{transport} early snapshot profile rejection closed the old vsock stream")
-            }
+            Ok(0) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => panic!(
+                "{transport} snapshot rejection returned before capture preflight reset the old vsock stream"
+            ),
             Ok(bytes) => panic!(
-                "{transport} old vsock stream produced {bytes} unexpected byte(s) after snapshot rejection"
+                "{transport} reset old vsock stream produced {bytes} unexpected byte(s) after snapshot rejection"
             ),
             Err(err) => panic!(
-                "{transport} old vsock stream probe failed after snapshot rejection: {:?}",
+                "{transport} reset old vsock stream probe failed after snapshot rejection: {:?}",
                 err.kind()
             ),
         }
         assert_no_content_response(
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
-            &format!("resume after vsock snapshot early rejection {transport}"),
+            &format!("resume after vsock snapshot capture-preflight rejection {transport}"),
         );
         drop(old_stream);
 
