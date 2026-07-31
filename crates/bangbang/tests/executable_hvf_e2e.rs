@@ -32,11 +32,15 @@ mod macos_arm64 {
     use bangbang_hvf::decode_hvf_snapshot_v2_network_state;
     use bangbang_runtime::balloon::VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
     use bangbang_runtime::block::{DriveCacheType, DriveIoEngine};
+    use bangbang_runtime::mmds::MmdsVersion;
     use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonState;
     use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
     use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
     use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
     use bangbang_runtime::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugState;
+    use bangbang_runtime::snapshot_network_v2_11::{
+        SnapshotV2NetworkBackendClass, SnapshotV2NetworkLimiterState, SnapshotV2NetworkState,
+    };
     use bangbang_runtime::storage_capture::StorageRetryState;
 
     use crate::macos_virtual_block::{
@@ -229,6 +233,32 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_MMDS_MARKER: &[u8] = b"BANGBANG_MMDS_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_MTU_MARKER: &[u8] = b"BANGBANG_MMDS_MTU_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_V2_MARKER: &[u8] = b"BANGBANG_MMDS_V2_GUEST_FETCH_OK";
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-snapshot=1 bangbang.mmds-mtu=1280";
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_SOURCE_CONTENT: &str =
+        r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_SNAPSHOT_SOURCE"}}"#;
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_DESTINATION_CONTENT: &str =
+        r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_SNAPSHOT_DESTINATION"}}"#;
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_READY_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_CAPTURE_READY";
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_CONTINUE_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_CONTINUE";
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_CONNECTION_LOST_MARKER: &[u8] =
+        b"BANGBANG_MMDS_SNAPSHOT_CONNECTION_LOST";
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_TOKEN_REJECTED_MARKER: &[u8] =
+        b"BANGBANG_MMDS_SNAPSHOT_TOKEN_REJECTED";
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_V1_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_V1_NO_TOKEN";
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_FRESH_MARKER: &[u8] =
+        b"BANGBANG_MMDS_SNAPSHOT_FRESH_FETCH_OK";
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_SUCCESS_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_OK";
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_FAILURE_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_FAIL";
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_SECTORS: u64 = 6;
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_CONTINUE_OFFSET: u64 =
+        bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_CONNECTION_OFFSET: u64 =
+        3 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_TOKEN_RESULT_OFFSET: u64 =
+        4 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_FRESH_OFFSET: u64 =
+        5 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const DIRECT_ROOTFS_MMDS_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
     const DIRECT_ROOTFS_MMDS_ETH0_MARKER: &[u8] = b"BANGBANG_MMDS_ETH0_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_ETH0_FAILURE_MARKER: &[u8] = b"BANGBANG_MMDS_ETH0_FETCH_FAIL";
     const DIRECT_ROOTFS_MMDS_ETH1_MARKER: &[u8] = b"BANGBANG_MMDS_ETH1_GUEST_FETCH_OK";
@@ -10281,6 +10311,15 @@ mod macos_arm64 {
     }
 
     #[test]
+    fn signed_executable_certifies_native_v2_network_mmds_snapshot_continuation() {
+        for enable_pci in [false, true] {
+            for mmds_v2 in [false, true] {
+                run_signed_network_mmds_snapshot_continuation(enable_pci, mmds_v2);
+            }
+        }
+    }
+
+    #[test]
     fn signed_executable_handles_guest_initiated_vsock_from_direct_rootfs() {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
@@ -11447,6 +11486,731 @@ mod macos_arm64 {
             !uds_path.exists(),
             "bangbang shutdown should remove its owned main vsock listener path"
         );
+    }
+
+    fn run_signed_network_mmds_snapshot_continuation(enable_pci: bool, mmds_v2: bool) {
+        let transport = if enable_pci { "pci" } else { "mmio" };
+        let version = if mmds_v2 { "v2" } else { "v1" };
+        let case = format!("{transport}-{version}");
+        let test_dir = TestDir::new();
+        let source_socket = test_dir.path().join("ns");
+        let paused_socket = test_dir.path().join("np");
+        let automatic_socket = test_dir.path().join("na");
+        let rejected_socket = test_dir.path().join("nr");
+        let state_path = test_dir.path().join(format!("{case}.state"));
+        let memory_path = test_dir.path().join(format!("{case}.memory"));
+        let data_path = test_dir.path().join(format!("{case}.data"));
+        let source_metrics = test_dir.path().join(format!("{case}-source.metrics"));
+        let paused_metrics = test_dir.path().join(format!("{case}-paused.metrics"));
+        let automatic_metrics = test_dir.path().join(format!("{case}-automatic.metrics"));
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let process_args: &[&str] = if enable_pci { &["--enable-pci"] } else { &[] };
+
+        create_zeroed_block_backing_with_sectors(&data_path, DIRECT_ROOTFS_MMDS_SNAPSHOT_SECTORS);
+        create_empty_file(&source_metrics);
+        let mut source = BangbangProcess::start_with_extra_args(
+            &source_socket,
+            &format!("{}-{case}-source", test_dir.instance_id()),
+            process_args,
+        );
+        configure_and_start_network_mmds_snapshot_source(NetworkMmdsSnapshotSource {
+            socket: &source_socket,
+            kernel: &kernel_path,
+            rootfs: &rootfs_path,
+            data: &data_path,
+            metrics: &source_metrics,
+            enable_pci,
+            mmds_v2,
+            context: &case,
+        });
+        if let Err(error) = wait_for_file_markers_at(
+            &data_path,
+            &[(
+                0,
+                DIRECT_ROOTFS_MMDS_SNAPSHOT_READY_MARKER,
+                DIRECT_ROOTFS_MMDS_SNAPSHOT_FAILURE_MARKER,
+            )],
+            DIRECT_ROOTFS_MMDS_SNAPSHOT_TIMEOUT,
+        ) {
+            let prefix = file_prefix_lossy(&data_path, 256);
+            let output = source.force_stop_and_collect();
+            panic!(
+                "{case} MMDS snapshot source did not reach capture readiness: {error}; data prefix: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/actions",
+                r#"{"action_type":"FlushMetrics"}"#,
+            ),
+            &format!("PUT {case} source FlushMetrics"),
+        );
+        assert_multi_interface_network_metrics(&source_metrics, &["eth0"]);
+        assert_no_content_response(
+            &http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            &format!("PATCH {case} source Paused"),
+        );
+        create_direct_network_mmds_snapshot(
+            &source_socket,
+            &state_path,
+            &memory_path,
+            &format!("{case} source"),
+        );
+        let source_network = assert_direct_network_mmds_snapshot(
+            &state_path,
+            enable_pci,
+            mmds_v2,
+            "vmnet:bridged:source-private",
+            &format!("{case} source"),
+        );
+        let state_before =
+            fs::read(&state_path).expect("direct network snapshot state should read");
+        let memory_before =
+            fs::read(&memory_path).expect("direct network snapshot memory should read");
+        assert_clean_shutdown(
+            source.terminate(),
+            &source_socket,
+            &format!("{case} network snapshot source"),
+        );
+
+        if !enable_pci && mmds_v2 {
+            run_direct_network_snapshot_override_rejections(
+                &rejected_socket,
+                &state_path,
+                &memory_path,
+                process_args,
+            );
+        }
+
+        run_direct_network_mmds_snapshot_destination(DirectNetworkMmdsSnapshotDestination {
+            test_root: test_dir.path(),
+            socket: &paused_socket,
+            metrics: &paused_metrics,
+            state: &state_path,
+            memory: &memory_path,
+            data: &data_path,
+            process_args,
+            enable_pci,
+            mmds_v2,
+            resume_vm: false,
+            recapture: true,
+            selector: "vmnet:host",
+            source_network: &source_network,
+            context: &format!("{case}-explicit"),
+        });
+        assert_eq!(
+            fs::read(&state_path).expect("explicit network snapshot state should read"),
+            state_before,
+            "{case} explicit destination must not mutate state"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("explicit network snapshot memory should read"),
+            memory_before,
+            "{case} explicit destination must not mutate memory"
+        );
+
+        run_direct_network_mmds_snapshot_destination(DirectNetworkMmdsSnapshotDestination {
+            test_root: test_dir.path(),
+            socket: &automatic_socket,
+            metrics: &automatic_metrics,
+            state: &state_path,
+            memory: &memory_path,
+            data: &data_path,
+            process_args,
+            enable_pci,
+            mmds_v2,
+            resume_vm: true,
+            recapture: false,
+            selector: "vmnet:shared",
+            source_network: &source_network,
+            context: &format!("{case}-automatic"),
+        });
+        assert_eq!(
+            fs::read(&state_path).expect("automatic network snapshot state should read"),
+            state_before,
+            "{case} automatic destination must not mutate state"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("automatic network snapshot memory should read"),
+            memory_before,
+            "{case} automatic destination must not mutate memory"
+        );
+        assert_no_snapshot_staging(test_dir.path());
+    }
+
+    struct NetworkMmdsSnapshotSource<'a> {
+        socket: &'a Path,
+        kernel: &'a Path,
+        rootfs: &'a Path,
+        data: &'a Path,
+        metrics: &'a Path,
+        enable_pci: bool,
+        mmds_v2: bool,
+        context: &'a str,
+    }
+
+    fn configure_and_start_network_mmds_snapshot_source(source: NetworkMmdsSnapshotSource<'_>) {
+        let NetworkMmdsSnapshotSource {
+            socket,
+            kernel,
+            rootfs,
+            data,
+            metrics,
+            enable_pci,
+            mmds_v2,
+            context,
+        } = source;
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            &format!("PUT {context} network snapshot machine config"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/network-interfaces/eth0",
+                r#"{"iface_id":"eth0","host_dev_name":"vmnet:bridged:source-private","guest_mac":"06:00:00:00:00:71","mtu":1280,"rx_rate_limiter":{"bandwidth":{"size":1048576,"one_time_burst":65536,"refill_time":1000},"ops":{"size":1000,"one_time_burst":100,"refill_time":1000}},"tx_rate_limiter":{"bandwidth":{"size":2097152,"one_time_burst":131072,"refill_time":2000},"ops":{"size":2000,"one_time_burst":200,"refill_time":2000}}}"#,
+            ),
+            &format!("PUT {context} network snapshot interface"),
+        );
+        let mmds_config = if mmds_v2 {
+            r#"{"network_interfaces":["eth0"],"version":"V2","ipv4_address":"169.254.169.254","imds_compat":true}"#
+        } else {
+            r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254","imds_compat":false}"#
+        };
+        assert_no_content_response(
+            &http_put_json(socket, "/mmds/config", mmds_config),
+            &format!("PUT {context} network snapshot MMDS config"),
+        );
+        assert_no_content_response(
+            &http_put_json(socket, "/mmds", DIRECT_ROOTFS_MMDS_SNAPSHOT_SOURCE_CONTENT),
+            &format!("PUT {context} network snapshot source MMDS"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/metrics",
+                &format!(r#"{{"metrics_path":{}}}"#, json_string(path_text(metrics))),
+            ),
+            &format!("PUT {context} network snapshot metrics"),
+        );
+        let mut boot_args = DIRECT_ROOTFS_MMDS_SNAPSHOT_BOOT_ARGS.to_string();
+        if mmds_v2 {
+            boot_args.push_str(" bangbang.mmds-snapshot-v2=1");
+        }
+        if enable_pci {
+            boot_args.push_str(" bangbang.expect-pci-data=1");
+        }
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/boot-source",
+                &format!(
+                    r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+                    json_string(path_text(kernel)),
+                    json_string(&boot_args)
+                ),
+            ),
+            &format!("PUT {context} network snapshot boot source"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/drives/rootfs",
+                &format!(
+                    r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+                    json_string(path_text(rootfs))
+                ),
+            ),
+            &format!("PUT {context} network snapshot rootfs"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/drives/data",
+                &format!(
+                    r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"}}"#,
+                    json_string(path_text(data))
+                ),
+            ),
+            &format!("PUT {context} network snapshot data"),
+        );
+        assert_no_content_response(
+            &http_put_json(socket, "/actions", r#"{"action_type":"InstanceStart"}"#),
+            &format!("PUT {context} network snapshot InstanceStart"),
+        );
+    }
+
+    fn create_direct_network_mmds_snapshot(
+        socket: &Path,
+        state: &Path,
+        memory: &Path,
+        context: &str,
+    ) {
+        let response = http_json_with_io_timeout(
+            socket,
+            "PUT",
+            "/snapshot/create",
+            &format!(
+                r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+                json_string(path_text(state)),
+                json_string(path_text(memory))
+            ),
+            DIRECT_ROOTFS_MMDS_SNAPSHOT_TIMEOUT,
+        );
+        assert_no_content_response(&response, &format!("PUT {context} /snapshot/create"));
+        assert!(state.is_file(), "{context} state should publish");
+        assert!(memory.is_file(), "{context} memory should publish");
+    }
+
+    fn assert_direct_network_mmds_snapshot(
+        state_path: &Path,
+        enable_pci: bool,
+        mmds_v2: bool,
+        selector: &str,
+        context: &str,
+    ) -> SnapshotV2NetworkState {
+        let bytes = fs::read(state_path).unwrap_or_else(|error| {
+            panic!(
+                "{context} network state {} should read: {error}",
+                state_path.display()
+            )
+        });
+        let structural =
+            decode_snapshot_v2_state(&bytes).expect("network state should decode structurally");
+        let state = decode_hvf_snapshot_v2_network_state(&structural)
+            .expect("network state should decode as exact native-v2 2.11");
+        let graph = state
+            .device_graph()
+            .expect("network certification source should retain root and data");
+        assert_eq!(graph.block_records().len(), 2);
+        let network = state
+            .network()
+            .expect("network certification artifact should contain kind 12");
+        assert_eq!(network.interfaces().len(), 1);
+        let interface = &network.interfaces()[0];
+        assert_eq!(interface.iface_id(), "eth0");
+        assert_eq!(interface.captured_selector(), selector);
+        assert_eq!(
+            interface
+                .requested_guest_mac()
+                .expect("network snapshot should retain requested MAC")
+                .octets(),
+            [0x06, 0, 0, 0, 0, 0x71]
+        );
+        assert_eq!(interface.requested_mtu(), Some(1280));
+        assert_eq!(
+            interface
+                .profile()
+                .guest_mac()
+                .expect("network snapshot should retain realized MAC")
+                .octets(),
+            [0x06, 0, 0, 0, 0, 0x71]
+        );
+        assert_eq!(interface.profile().mtu(), Some(1280));
+        assert_eq!(interface.backend(), SnapshotV2NetworkBackendClass::MmdsOnly);
+        assert!(interface.local().active_rx_queue().is_some());
+        assert!(interface.local().active_tx_queue().is_some());
+        assert_eq!(interface.virtio().queues().len(), 2);
+        assert!(interface.rx_limiter().is_configured());
+        assert!(interface.tx_limiter().is_configured());
+        assert_eq!(
+            interface
+                .rx_limiter()
+                .bandwidth()
+                .expect("RX bandwidth bucket should persist")
+                .size(),
+            1_048_576
+        );
+        assert_eq!(
+            interface
+                .tx_limiter()
+                .ops()
+                .expect("TX operations bucket should persist")
+                .size(),
+            2_000
+        );
+        assert_eq!(
+            interface.transport().kind(),
+            if enable_pci {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            }
+        );
+        let mmds = network
+            .mmds()
+            .expect("network certification artifact should contain MMDS config");
+        assert_eq!(
+            mmds.version(),
+            if mmds_v2 {
+                MmdsVersion::V2
+            } else {
+                MmdsVersion::V1
+            }
+        );
+        assert_eq!(mmds.effective_ipv4_address().to_string(), "169.254.169.254");
+        assert_eq!(mmds.imds_compat(), mmds_v2);
+        assert_eq!(mmds.interfaces().len(), 1);
+        assert_eq!(mmds.interfaces()[0].interface_index(), 0);
+        network.clone()
+    }
+
+    fn assert_normalized_network_mmds_recapture(
+        source: &SnapshotV2NetworkState,
+        recaptured: &SnapshotV2NetworkState,
+        context: &str,
+    ) {
+        assert_eq!(source.interfaces().len(), recaptured.interfaces().len());
+        let source_interface = &source.interfaces()[0];
+        let recaptured_interface = &recaptured.interfaces()[0];
+        assert_eq!(source_interface.iface_id(), recaptured_interface.iface_id());
+        assert_eq!(
+            source_interface.requested_guest_mac(),
+            recaptured_interface.requested_guest_mac(),
+            "{context} requested MAC should remain normalized"
+        );
+        assert_eq!(
+            source_interface.requested_mtu(),
+            recaptured_interface.requested_mtu(),
+            "{context} requested MTU should remain normalized"
+        );
+        assert_eq!(
+            source_interface.profile(),
+            recaptured_interface.profile(),
+            "{context} realized profile should remain normalized"
+        );
+        assert_eq!(
+            source_interface.backend(),
+            recaptured_interface.backend(),
+            "{context} backend class should remain normalized"
+        );
+        assert_eq!(
+            source_interface.local(),
+            recaptured_interface.local(),
+            "{context} local queue/retry state should remain normalized"
+        );
+        assert_eq!(
+            source_interface.virtio(),
+            recaptured_interface.virtio(),
+            "{context} common virtio state should remain normalized"
+        );
+        assert_eq!(
+            network_limiter_config(source_interface.rx_limiter()),
+            network_limiter_config(recaptured_interface.rx_limiter()),
+            "{context} RX limiter configuration should remain normalized"
+        );
+        assert_eq!(
+            network_limiter_config(source_interface.tx_limiter()),
+            network_limiter_config(recaptured_interface.tx_limiter()),
+            "{context} TX limiter configuration should remain normalized"
+        );
+        assert_eq!(
+            source_interface.transport(),
+            recaptured_interface.transport(),
+            "{context} transport placement should remain normalized"
+        );
+        assert_eq!(
+            source.mmds(),
+            recaptured.mmds(),
+            "{context} MMDS version/network stack identity should remain normalized"
+        );
+    }
+
+    type NetworkLimiterConfig = (
+        Option<(u64, Option<u64>, u64)>,
+        Option<(u64, Option<u64>, u64)>,
+    );
+
+    fn network_limiter_config(limiter: SnapshotV2NetworkLimiterState) -> NetworkLimiterConfig {
+        let bucket = |bucket: bangbang_runtime::snapshot_network_v2_11::SnapshotV2NetworkTokenBucketState| {
+            (
+                bucket.size(),
+                bucket.configured_burst(),
+                bucket.refill_time_millis(),
+            )
+        };
+        (limiter.bandwidth().map(bucket), limiter.ops().map(bucket))
+    }
+
+    struct DirectNetworkMmdsSnapshotDestination<'a> {
+        test_root: &'a Path,
+        socket: &'a Path,
+        metrics: &'a Path,
+        state: &'a Path,
+        memory: &'a Path,
+        data: &'a Path,
+        process_args: &'a [&'a str],
+        enable_pci: bool,
+        mmds_v2: bool,
+        resume_vm: bool,
+        recapture: bool,
+        selector: &'a str,
+        source_network: &'a SnapshotV2NetworkState,
+        context: &'a str,
+    }
+
+    fn run_direct_network_mmds_snapshot_destination(
+        destination: DirectNetworkMmdsSnapshotDestination<'_>,
+    ) {
+        let DirectNetworkMmdsSnapshotDestination {
+            test_root,
+            socket,
+            metrics,
+            state,
+            memory,
+            data,
+            process_args,
+            enable_pci,
+            mmds_v2,
+            resume_vm,
+            recapture,
+            selector,
+            source_network,
+            context,
+        } = destination;
+        reset_zeroed_block_backing(data, DIRECT_ROOTFS_MMDS_SNAPSHOT_SECTORS);
+        create_empty_file(metrics);
+        let mut process = BangbangProcess::start_with_extra_args(socket, context, process_args);
+        configure_snapshot_destination_metrics(socket, metrics, context);
+        assert!(
+            fs::read(metrics)
+                .expect("destination metrics should read")
+                .is_empty(),
+            "{context} destination metrics should start empty"
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                socket,
+                "PUT",
+                "/snapshot/load",
+                &direct_network_snapshot_load_body(state, memory, resume_vm, &[("eth0", selector)]),
+                DIRECT_ROOTFS_MMDS_SNAPSHOT_TIMEOUT,
+            ),
+            &format!("PUT {context} /snapshot/load"),
+        );
+        let info = http_get(socket, "/");
+        assert_response_contains(
+            &info,
+            if resume_vm {
+                r#""state":"Running""#
+            } else {
+                r#""state":"Paused""#
+            },
+            &format!("GET {context} requested state"),
+        );
+        let config = http_get(socket, "/vm/config");
+        for expected in [
+            r#""iface_id":"eth0""#,
+            &format!(r#""host_dev_name":"{selector}""#),
+            r#""guest_mac":"06:00:00:00:00:71""#,
+            r#""mtu":1280"#,
+            if mmds_v2 {
+                r#""version":"V2""#
+            } else {
+                r#""version":"V1""#
+            },
+        ] {
+            assert_response_contains(&config, expected, &format!("GET {context} VM config"));
+        }
+        let empty_mmds = http_get(socket, "/mmds");
+        assert_ok_response(&empty_mmds, &format!("GET {context} empty MMDS"));
+        assert!(
+            empty_mmds.ends_with("\r\n\r\nnull"),
+            "GET {context} empty restored MMDS should return exact JSON null; response:\n{empty_mmds}"
+        );
+        assert!(
+            !empty_mmds.contains("BANGBANG_MMDS_SNAPSHOT_SOURCE")
+                && !empty_mmds.contains("BANGBANG_MMDS_SNAPSHOT_DESTINATION"),
+            "GET {context} empty restored MMDS must not retain source or future destination data"
+        );
+
+        if recapture {
+            let recaptured_state = test_root.join(format!("{context}.recaptured.state"));
+            let recaptured_memory = test_root.join(format!("{context}.recaptured.memory"));
+            create_direct_network_mmds_snapshot(
+                socket,
+                &recaptured_state,
+                &recaptured_memory,
+                &format!("{context} recapture"),
+            );
+            let recaptured_network = assert_direct_network_mmds_snapshot(
+                &recaptured_state,
+                enable_pci,
+                mmds_v2,
+                selector,
+                &format!("{context} recapture"),
+            );
+            assert_normalized_network_mmds_recapture(source_network, &recaptured_network, context);
+        }
+
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/mmds",
+                DIRECT_ROOTFS_MMDS_SNAPSHOT_DESTINATION_CONTENT,
+            ),
+            &format!("PUT {context} destination MMDS"),
+        );
+        write_block_marker_at(
+            data,
+            DIRECT_ROOTFS_MMDS_SNAPSHOT_CONTINUE_OFFSET,
+            DIRECT_ROOTFS_MMDS_SNAPSHOT_CONTINUE_MARKER,
+        );
+        if !resume_vm {
+            assert_no_content_response(
+                &http_json(socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+                &format!("PATCH {context} Resumed"),
+            );
+        }
+        let token_marker = if mmds_v2 {
+            DIRECT_ROOTFS_MMDS_SNAPSHOT_TOKEN_REJECTED_MARKER
+        } else {
+            DIRECT_ROOTFS_MMDS_SNAPSHOT_V1_MARKER
+        };
+        if let Err(error) = wait_for_file_markers_at(
+            data,
+            &[
+                (
+                    0,
+                    DIRECT_ROOTFS_MMDS_SNAPSHOT_SUCCESS_MARKER,
+                    DIRECT_ROOTFS_MMDS_SNAPSHOT_FAILURE_MARKER,
+                ),
+                (
+                    DIRECT_ROOTFS_MMDS_SNAPSHOT_CONNECTION_OFFSET,
+                    DIRECT_ROOTFS_MMDS_SNAPSHOT_CONNECTION_LOST_MARKER,
+                    DIRECT_ROOTFS_MMDS_SNAPSHOT_FAILURE_MARKER,
+                ),
+                (
+                    DIRECT_ROOTFS_MMDS_SNAPSHOT_TOKEN_RESULT_OFFSET,
+                    token_marker,
+                    DIRECT_ROOTFS_MMDS_SNAPSHOT_FAILURE_MARKER,
+                ),
+                (
+                    DIRECT_ROOTFS_MMDS_SNAPSHOT_FRESH_OFFSET,
+                    DIRECT_ROOTFS_MMDS_SNAPSHOT_FRESH_MARKER,
+                    DIRECT_ROOTFS_MMDS_SNAPSHOT_FAILURE_MARKER,
+                ),
+            ],
+            DIRECT_ROOTFS_MMDS_SNAPSHOT_TIMEOUT,
+        ) {
+            let prefix =
+                file_prefix_lossy(data, 512 * DIRECT_ROOTFS_MMDS_SNAPSHOT_SECTORS as usize);
+            let output = process.force_stop_and_collect();
+            panic!(
+                "{context} restored MMDS guest failed: {error}; data: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        let output = process.wait_for_exit_with_timeout(
+            DIRECT_ROOTFS_MMDS_SNAPSHOT_TIMEOUT,
+            &format!("{context} restored MMDS guest poweroff"),
+        );
+        assert!(
+            output.stdout.contains("BANGBANG_MMDS_SNAPSHOT_OK"),
+            "{context} guest output should contain success; stdout:\n{}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("BANGBANG_MMDS_SNAPSHOT_FAIL_"),
+            "{context} guest output should not contain failure; stdout:\n{}",
+            output.stdout
+        );
+        assert_clean_shutdown(output, socket, context);
+        assert_multi_interface_network_metrics(metrics, &["eth0"]);
+    }
+
+    fn run_direct_network_snapshot_override_rejections(
+        socket: &Path,
+        state: &Path,
+        memory: &Path,
+        process_args: &[&str],
+    ) {
+        let process = BangbangProcess::start_with_extra_args(
+            socket,
+            "network-snapshot-override-rejections",
+            process_args,
+        );
+        let missing = http_json_with_io_timeout(
+            socket,
+            "PUT",
+            "/snapshot/load",
+            &snapshot_root_load_body(state, memory, false),
+            DIRECT_ROOTFS_MMDS_SNAPSHOT_TIMEOUT,
+        );
+        assert_bad_request_response(&missing, "missing network snapshot override");
+
+        let duplicate_selector = "vmnet:bridged:private-duplicate-selector";
+        let duplicate = http_json_with_io_timeout(
+            socket,
+            "PUT",
+            "/snapshot/load",
+            &direct_network_snapshot_load_body(
+                state,
+                memory,
+                false,
+                &[("eth0", duplicate_selector), ("eth0", "vmnet:shared")],
+            ),
+            DIRECT_ROOTFS_MMDS_SNAPSHOT_TIMEOUT,
+        );
+        assert_bad_request_response(&duplicate, "duplicate network snapshot override");
+        assert!(!duplicate.contains(duplicate_selector));
+
+        let unknown_selector = "vmnet:bridged:private-unknown-selector";
+        let unknown = http_json_with_io_timeout(
+            socket,
+            "PUT",
+            "/snapshot/load",
+            &direct_network_snapshot_load_body(
+                state,
+                memory,
+                false,
+                &[("unknown", unknown_selector)],
+            ),
+            DIRECT_ROOTFS_MMDS_SNAPSHOT_TIMEOUT,
+        );
+        assert_bad_request_response(&unknown, "unknown network snapshot override");
+        assert!(!unknown.contains(unknown_selector));
+        assert_response_contains(
+            &http_get(socket, "/"),
+            r#""state":"Not started""#,
+            "network override rejection should not publish a VM",
+        );
+        assert_clean_shutdown(
+            process.terminate(),
+            socket,
+            "network snapshot override rejection process",
+        );
+    }
+
+    fn direct_network_snapshot_load_body(
+        state: &Path,
+        memory: &Path,
+        resume_vm: bool,
+        overrides: &[(&str, &str)],
+    ) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "snapshot_path": path_text(state),
+            "mem_backend": {
+                "backend_path": path_text(memory),
+                "backend_type": "File",
+            },
+            "network_overrides": overrides
+                .iter()
+                .map(|(iface_id, host_dev_name)| serde_json::json!({
+                    "iface_id": iface_id,
+                    "host_dev_name": host_dev_name,
+                }))
+                .collect::<Vec<_>>(),
+            "resume_vm": resume_vm,
+        }))
+        .expect("direct network snapshot load body should serialize")
     }
 
     fn run_direct_rootfs_mmds_guest_fetch_test(case: DirectRootfsMmdsFetchCase<'_>) {

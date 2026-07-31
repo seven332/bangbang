@@ -6492,11 +6492,45 @@
     {
       "id": "api-property:SnapshotLoadParams.network_overrides",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.network_overrides.",
+      "summary": "Exact native-v2 2.11 network loads require one clone-local backend selector override for every saved interface. Missing, duplicate, and unknown interface IDs are rejected before publication; selector contents are redacted, never encoded in a destination snapshot, and never reused as host authority.",
       "source_refs": [
         "api-property:SnapshotLoadParams.network_overrides"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "snapshot network override parsing and redacted request values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "native-v2 2.11 network override planning, resource preparation, and publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "exact complete clone-local override-set validation and canonicalization"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_network_mmds_snapshot_continuation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_network_mmds_snapshot_continuation_and_containment"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "missing duplicate unknown redaction and exact-order override tests"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotLoadParams.resume_vm",
@@ -8945,11 +8979,50 @@
     {
       "id": "corpus:mmds-user-guide",
       "family": "network-and-mmds",
-      "summary": "Live host GET/PUT/PATCH, preboot interface/IP/version/format configuration, guest V1/V2 token sessions, JSON-pointer and IMDS responses, isolation, limits, and capture-ready producer state are implemented. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns artifact encoding, persisted MMDS version/network-stack configuration, restore compatibility, data reseeding, and fresh clone session behavior.",
+      "summary": "Live host GET/PUT/PATCH, preboot interface/IP/version/format configuration, guest V1/V2 token sessions, JSON-pointer and IMDS responses, isolation, limits, and capture-ready producer state are implemented. Exact native-v2 2.11 persists MMDS selection and protocol configuration while deliberately omitting data, token keys, tokens, TCP/ARP sessions, packets, and host clocks; signed MMIO/PCI direct and contained clones prove an empty destination store, explicit reseeding, invalid old V2 tokens, lost TCP sessions, and successful fresh V1/V2 sessions.",
       "source_refs": [
         "corpus:mmds-user-guide"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fresh destination MMDS datastore token authority stack and metrics construction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "bounded MMDS data and V1/V2 configuration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "fresh empty MMDS destination projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_v2_11.rs",
+          "anchor": "exact MMDS protocol configuration encoding with data and session exclusion"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed native-v2 2.11 empty reseeded old-session-loss and fresh-session proof"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained native-v2 2.11 V1 V2 clone and cleanup proof"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "MMDS V1 V2 session isolation flow-control and retransmission tests"
+        }
+      ]
     },
     {
       "id": "corpus:network-performance",
@@ -8963,7 +9036,7 @@
     {
       "id": "corpus:network-setup",
       "family": "network-and-mmds",
-      "summary": "Applicable guest device configuration, MAC/MTU identity, vmnet host/shared/bridged policy, bounded ingress/egress ownership, cleanup, and operator firewall guidance are implemented. External gate https://github.com/seven332/bangbang/issues/1378 owns positive production vmnet connectivity and credentialed failure/cleanup evidence; Wave 6 https://github.com/seven332/bangbang/issues/1490 owns restored backend identity, portability, and concurrent clone network policy.",
+      "summary": "Applicable guest device configuration, MAC/MTU identity, vmnet host/shared/bridged policy, bounded ingress/egress ownership, cleanup, and operator firewall guidance are implemented. Exact native-v2 2.11 restores portable network configuration through complete clone-local overrides and fresh backend/MMDS ownership, with signed direct and contained clone evidence. External gate https://github.com/seven332/bangbang/issues/1378 owns positive production vmnet connectivity and credentialed failure, cleanup, and concurrent-session evidence.",
       "source_refs": [
         "corpus:network-setup"
       ],
@@ -9301,11 +9374,55 @@
     {
       "id": "corpus:snapshot-network-clones",
       "family": "snapshots",
-      "summary": "Audit all applicable capability claims owned by the pinned snapshot-network-clones source corpus.",
+      "summary": "Exact native-v2 2.11 serializes portable network/MMDS device state and requires a complete clone-local network override set at every load. Signed direct and production/App Sandbox MMIO/PCI V1/V2 sources through explicit-Paused and automatic destinations prove fresh backend/MMDS ownership, immutable state and memory, empty-and-reseeded MMDS data, lost source TCP/token sessions, retry after validation or process failure, redaction, and cleanup. External peer packets, live connections, host backend authority, and broader artifact or host portability remain explicit non-claims.",
       "source_refs": [
         "corpus:snapshot-network-clones"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public native-v2 2.11 create load resource commit retry and cleanup"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_network_platform.rs",
+          "anchor": "fresh coherent MMIO and PCI network owner reconstruction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_artifact.rs",
+          "anchor": "exact native-v2 2.11 artifact admission and memory binding"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "clone-local override planning and owner-free restore values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_v2_11.rs",
+          "anchor": "bounded exact network and MMDS kind-12 codec"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct MMIO PCI V1 V2 explicit and automatic clone proof"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained immutable clone redaction failure death retry and cleanup proof"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_v2_11/tests.rs",
+          "anchor": "fixed codec capacity graph and hostile mutation tests"
+        }
+      ]
     },
     {
       "id": "corpus:snapshot-page-faults",
@@ -11007,17 +11124,61 @@
     {
       "id": "semantic.mmds:tcp-token-session-and-isolation",
       "family": "network-and-mmds",
-      "summary": "Firecracker-shaped MMDS V1/V2 HTTP behavior, stateless AES-256-GCM tokens bound to immutable instance identity, independent bounded per-interface TCP sessions, flow control, segmentation, retransmission, timeout, eviction, reset, metrics, capture-ready state, and signed lossy isolation are implemented. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns artifact encoding, restore reconstruction, compatibility, data reseeding, and fresh clone token/session behavior.",
+      "summary": "Firecracker-shaped MMDS V1/V2 HTTP behavior, stateless AES-256-GCM tokens bound to immutable instance identity, independent bounded per-interface TCP sessions, flow control, segmentation, retransmission, timeout, eviction, reset, metrics, capture-ready state, and signed lossy isolation are implemented. Exact native-v2 2.11 records protocol configuration but not MMDS data, keys, tokens, TCP/ARP sessions, packets, or deadlines; every clone reconstructs fresh bounded stacks and metrics. Signed V1/V2 MMIO/PCI direct and contained destinations prove explicit reseeding, source-connection loss, old-token rejection, fresh-token success, and cross-clone isolation.",
       "source_refs": [
         "corpus:mmds-design",
         "corpus:mmds-user-guide"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fresh clone MMDS store token stack scheduler and metric ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "per-interface MMDS packet and scheduler isolation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_tcp/mod.rs",
+          "anchor": "bounded independent MMDS TCP sessions flow control and timeout"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_token.rs",
+          "anchor": "instance-bound stateless AES-256-GCM V2 token authority"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_v2_11.rs",
+          "anchor": "MMDS protocol configuration encoding with TCP token data packet and clock exclusion"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed source TCP and token loss plus fresh destination session proof"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed MMIO and PCI V1 V2 segmentation retransmission and token isolation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained V1 V2 source-session loss and clone isolation proof"
+        }
+      ]
     },
     {
       "id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
       "family": "network-and-mmds",
-      "summary": "Virtio-net queues, portable headers/offloads, merged RX, typed vmnet results, generation-scoped callback readiness, bounded batches, limiters, metrics, MMDS ordering, PCI lifecycle, capture-ready state, contained policy, and cleanup are implemented. External gate https://github.com/seven332/bangbang/issues/1378 owns positive connectivity and credentialed service/crash evidence; Wave 6 https://github.com/seven332/bangbang/issues/1490 owns encoding, overrides, restore, portability, and clone identity; Wave 7 https://github.com/seven332/bangbang/issues/1491 owns final performance and observability closure.",
+      "summary": "Virtio-net queues, portable headers/offloads, merged RX, typed vmnet results, generation-scoped callback readiness, bounded batches, limiters, metrics, MMDS ordering, PCI lifecycle, capture-ready state, contained policy, and cleanup are implemented. Exact native-v2 2.11 encoding, complete clone-local overrides, fresh-owner restore, and signed direct and contained clone identity are implemented. External gate https://github.com/seven332/bangbang/issues/1378 owns positive connectivity and credentialed service/crash evidence; Wave 7 https://github.com/seven332/bangbang/issues/1491 owns final performance and observability closure.",
       "source_refs": [
         "corpus:network-performance",
         "corpus:network-setup",

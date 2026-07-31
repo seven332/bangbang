@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v100"
+direct_boot_variant="direct-boot-v102"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -3702,6 +3702,319 @@ fetch_mmds_v2_marker() {
   fi
 }
 
+certify_mmds_snapshot_restore() {
+  failure_marker=BANGBANG_MMDS_SNAPSHOT_FAIL
+  if ! prepare_mmds_network "$failure_marker" "$failure_marker"; then
+    return
+  fi
+
+  if [ ! -b /dev/vdb ]; then
+    emit_line BANGBANG_MMDS_SNAPSHOT_FAIL_NO_VDB
+    write_vdb_marker BANGBANG_MMDS_SNAPSHOT_FAIL_NO_VDB
+    return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    emit_line BANGBANG_MMDS_SNAPSHOT_FAIL_NO_PYTHON
+    write_vdb_marker BANGBANG_MMDS_SNAPSHOT_FAIL_NO_PYTHON
+    return
+  fi
+
+  expected_mac=06:00:00:00:00:71
+  actual_mac=$(cat "/sys/class/net/$mmds_iface/address" 2>/dev/null || true)
+  if [ "$actual_mac" != "$expected_mac" ]; then
+    emit_line BANGBANG_MMDS_SNAPSHOT_FAIL_MAC
+    write_vdb_marker BANGBANG_MMDS_SNAPSHOT_FAIL_MAC
+    return
+  fi
+
+  if cmdline_has bangbang.expect-pci-data=1; then
+    network_device_path=$(readlink -f "/sys/class/net/$mmds_iface/device" 2>/dev/null || true)
+    network_driver=$(readlink "$network_device_path/driver" 2>/dev/null || true)
+    network_pci_path=${network_device_path%/*}
+    network_vendor=$(cat "$network_pci_path/vendor" 2>/dev/null || true)
+    network_device=$(cat "$network_pci_path/device" 2>/dev/null || true)
+    if [ "${network_driver##*/}" != virtio_net ] \
+      || [ "$network_vendor" != 0x1af4 ] \
+      || [ "$network_device" != 0x1041 ]; then
+      emit_line BANGBANG_MMDS_SNAPSHOT_FAIL_PCI_IDENTITY
+      write_vdb_marker BANGBANG_MMDS_SNAPSHOT_FAIL_PCI_IDENTITY
+      return
+    fi
+    emit_line BANGBANG_MMDS_SNAPSHOT_PCI_IDENTITY_OK
+  fi
+
+  mmds_snapshot_version=V1
+  if cmdline_has bangbang.mmds-snapshot-v2=1; then
+    mmds_snapshot_version=V2
+  fi
+
+  mmds_snapshot_result=$(
+    python3 - "$mmds_snapshot_version" <<'PY' 2>/dev/null || true
+import os
+import socket
+import sys
+import time
+
+VERSION = sys.argv[1]
+DEVICE = "/dev/vdb"
+MMDS_ADDRESS = ("169.254.169.254", 80)
+SECTOR_SIZE = 512
+STATUS_OFFSET = 0
+HOST_CONTINUE_OFFSET = SECTOR_SIZE
+TOKEN_OFFSET = 2 * SECTOR_SIZE
+CONNECTION_RESULT_OFFSET = 3 * SECTOR_SIZE
+TOKEN_RESULT_OFFSET = 4 * SECTOR_SIZE
+FRESH_RESULT_OFFSET = 5 * SECTOR_SIZE
+SOURCE_VALUE = b"BANGBANG_MMDS_SNAPSHOT_SOURCE"
+DESTINATION_VALUE = b"BANGBANG_MMDS_SNAPSHOT_DESTINATION"
+READY_MARKER = b"BANGBANG_MMDS_SNAPSHOT_CAPTURE_READY"
+HOST_CONTINUE_MARKER = b"BANGBANG_MMDS_SNAPSHOT_CONTINUE"
+CONNECTION_LOST_MARKER = b"BANGBANG_MMDS_SNAPSHOT_CONNECTION_LOST"
+TOKEN_REJECTED_MARKER = b"BANGBANG_MMDS_SNAPSHOT_TOKEN_REJECTED"
+V1_MARKER = b"BANGBANG_MMDS_SNAPSHOT_V1_NO_TOKEN"
+FRESH_MARKER = b"BANGBANG_MMDS_SNAPSHOT_FRESH_FETCH_OK"
+SUCCESS_MARKER = b"BANGBANG_MMDS_SNAPSHOT_OK"
+FAILURE_MARKER = b"BANGBANG_MMDS_SNAPSHOT_FAIL"
+TIMEOUT_SECONDS = 90.0
+
+
+def marker_text(marker):
+    return marker.decode("ascii")
+
+
+def write_sector(offset, marker):
+    try:
+        with open(DEVICE, "r+b", buffering=0) as drive:
+            drive.seek(offset)
+            drive.write(marker.ljust(SECTOR_SIZE, b" "))
+            os.fsync(drive.fileno())
+    except OSError:
+        return False
+    return True
+
+
+def read_sector(offset):
+    try:
+        with open(DEVICE, "rb", buffering=0) as drive:
+            drive.seek(offset)
+            return drive.read(SECTOR_SIZE)
+    except OSError:
+        return b""
+
+
+def fail(reason):
+    marker = FAILURE_MARKER + b"_" + reason.encode("ascii")
+    write_sector(STATUS_OFFSET, marker)
+    print(marker_text(marker), flush=True)
+    sys.exit(1)
+
+
+def parse_response(response):
+    header_end = response.find(b"\r\n\r\n")
+    if header_end < 0:
+        fail("HTTP_HEADERS")
+    status_line = response[:header_end].split(b"\r\n", 1)[0]
+    fields = status_line.split()
+    if len(fields) < 2:
+        fail("HTTP_STATUS")
+    try:
+        status = int(fields[1])
+    except ValueError:
+        fail("HTTP_STATUS")
+    headers = {}
+    for line in response[len(status_line) + 2 : header_end].split(b"\r\n"):
+        name, separator, value = line.partition(b":")
+        if separator:
+            headers[name.strip().lower()] = value.strip()
+    body = response[header_end + 4 :]
+    content_length = headers.get(b"content-length")
+    if content_length is not None:
+        try:
+            expected = int(content_length)
+        except ValueError:
+            fail("HTTP_LENGTH")
+        if len(body) < expected:
+            fail("HTTP_BODY")
+        body = body[:expected]
+    return status, body
+
+
+def request(method, path, headers=None):
+    request_headers = {
+        "Host": "169.254.169.254",
+        "Accept": "*/*",
+        "Connection": "close",
+    }
+    if headers:
+        request_headers.update(headers)
+    encoded = [f"{method} {path} HTTP/1.1\r\n".encode("ascii")]
+    encoded.extend(
+        f"{name}: {value}\r\n".encode("ascii")
+        for name, value in request_headers.items()
+    )
+    encoded.append(b"Content-Length: 0\r\n\r\n")
+    with socket.create_connection(MMDS_ADDRESS, timeout=5.0) as connection:
+        connection.settimeout(5.0)
+        connection.sendall(b"".join(encoded))
+        response = bytearray()
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            response.extend(chunk)
+            header_end = response.find(b"\r\n\r\n")
+            if header_end >= 0:
+                for line in response[:header_end].split(b"\r\n")[1:]:
+                    name, separator, value = line.partition(b":")
+                    if separator and name.strip().lower() == b"content-length":
+                        try:
+                            expected = int(value.strip())
+                        except ValueError:
+                            fail("HTTP_LENGTH")
+                        if len(response) >= header_end + 4 + expected:
+                            return parse_response(bytes(response))
+        return parse_response(bytes(response))
+
+
+def request_token():
+    status, token = request(
+        "PUT",
+        "/latest/api/token",
+        {"X-metadata-token-ttl-seconds": "600"},
+    )
+    if status != 200 or len(token) != 48:
+        fail("TOKEN_CREATE")
+    try:
+        token.decode("ascii")
+    except UnicodeDecodeError:
+        fail("TOKEN_ENCODING")
+    return token
+
+
+def get_value(token=None):
+    headers = {}
+    if token is not None:
+        headers["X-metadata-token"] = token.decode("ascii")
+    return request("GET", "/meta-data/bangbang-marker", headers)
+
+
+old_token = None
+if VERSION == "V2":
+    old_token = request_token()
+    status, source_value = get_value(old_token)
+elif VERSION == "V1":
+    status, source_value = get_value()
+else:
+    fail("VERSION")
+if status != 200 or source_value != SOURCE_VALUE:
+    fail("SOURCE_FETCH")
+
+try:
+    stale_connection = socket.create_connection(MMDS_ADDRESS, timeout=5.0)
+    stale_connection.settimeout(5.0)
+    stale_connection.sendall(
+        b"GET /meta-data/bangbang-marker HTTP/1.1\r\n"
+        b"Host: 169.254.169.254\r\n"
+    )
+except OSError:
+    fail("SOURCE_CONNECTION")
+
+token_marker = old_token if old_token is not None else V1_MARKER
+if not write_sector(TOKEN_OFFSET, token_marker):
+    fail("TOKEN_MARKER")
+if not write_sector(STATUS_OFFSET, READY_MARKER):
+    fail("READY_MARKER")
+print(marker_text(READY_MARKER), flush=True)
+
+deadline = time.monotonic() + TIMEOUT_SECONDS
+while time.monotonic() < deadline:
+    if read_sector(HOST_CONTINUE_OFFSET).startswith(HOST_CONTINUE_MARKER):
+        break
+    time.sleep(0.05)
+else:
+    fail("HOST_CONTINUE")
+
+suffix = b"Accept: */*\r\n"
+if old_token is not None:
+    suffix += b"X-metadata-token: " + old_token + b"\r\n"
+suffix += b"\r\n"
+connection_lost = False
+try:
+    stale_connection.sendall(suffix)
+    stale_response = stale_connection.recv(65536)
+    if not stale_response:
+        connection_lost = True
+    else:
+        stale_status_line = stale_response.split(b"\r\n", 1)[0]
+        connection_lost = not (
+            b" 200 " in stale_status_line and DESTINATION_VALUE in stale_response
+        )
+except OSError:
+    connection_lost = True
+finally:
+    stale_connection.close()
+if not connection_lost:
+    fail("CONNECTION_SURVIVED")
+if not write_sector(CONNECTION_RESULT_OFFSET, CONNECTION_LOST_MARKER):
+    fail("CONNECTION_MARKER")
+
+if old_token is not None:
+    old_status, _ = get_value(old_token)
+    if old_status != 401:
+        fail("OLD_TOKEN_ACCEPTED")
+    if not write_sector(TOKEN_RESULT_OFFSET, TOKEN_REJECTED_MARKER):
+        fail("TOKEN_REJECTED_MARKER")
+    fresh_token = request_token()
+    if fresh_token == old_token:
+        fail("TOKEN_REUSED")
+    fresh_status, fresh_value = get_value(fresh_token)
+else:
+    if not write_sector(TOKEN_RESULT_OFFSET, V1_MARKER):
+        fail("V1_MARKER")
+    fresh_status, fresh_value = get_value()
+if fresh_status != 200 or fresh_value != DESTINATION_VALUE:
+    fail("FRESH_FETCH")
+if not write_sector(FRESH_RESULT_OFFSET, FRESH_MARKER):
+    fail("FRESH_MARKER")
+if not write_sector(STATUS_OFFSET, SUCCESS_MARKER):
+    fail("SUCCESS_MARKER")
+print(marker_text(CONNECTION_LOST_MARKER), flush=True)
+print(
+    marker_text(TOKEN_REJECTED_MARKER if old_token is not None else V1_MARKER),
+    flush=True,
+)
+print(marker_text(FRESH_MARKER), flush=True)
+print(marker_text(SUCCESS_MARKER), flush=True)
+os.sync()
+PY
+  )
+
+  case "$mmds_snapshot_result" in
+    *BANGBANG_MMDS_SNAPSHOT_OK*)
+      emit_line BANGBANG_MMDS_SNAPSHOT_OK
+      sync
+      python3 - <<'PY'
+import ctypes
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.reboot.argtypes = [ctypes.c_int]
+libc.reboot.restype = ctypes.c_int
+if libc.reboot(0x4321FEDC) != 0:
+    raise OSError(ctypes.get_errno(), "reboot(RB_POWER_OFF) failed")
+PY
+      emit_line BANGBANG_MMDS_SNAPSHOT_FAIL_POWEROFF
+      write_vdb_marker BANGBANG_MMDS_SNAPSHOT_FAIL_POWEROFF
+      ;;
+    *BANGBANG_MMDS_SNAPSHOT_FAIL_*)
+      emit_line "$mmds_snapshot_result"
+      ;;
+    *)
+      emit_line BANGBANG_MMDS_SNAPSHOT_FAIL_RESULT
+      write_vdb_marker BANGBANG_MMDS_SNAPSHOT_FAIL_RESULT
+      ;;
+  esac
+}
+
 fetch_mmds_process_a_marker() {
   if ! prepare_mmds_network BANGBANG_MMDS_PROCESS_A_FETCH_FAIL BANGBANG_MMDS_PROCESS_A_FETCH_FAIL; then
     return
@@ -4814,6 +5127,8 @@ elif cmdline_has bangbang.mmds-process-b-fetch=1; then
   fetch_mmds_process_b_marker
 elif cmdline_has bangbang.mmds-v2-fetch=1; then
   fetch_mmds_v2_marker
+elif cmdline_has bangbang.mmds-snapshot=1; then
+  certify_mmds_snapshot_restore
 elif cmdline_has bangbang.virtio-net-semantics=1; then
   prove_virtio_network_semantics
 elif cmdline_has bangbang.mmds-fetch=1; then

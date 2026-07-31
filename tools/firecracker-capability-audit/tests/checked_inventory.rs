@@ -545,15 +545,15 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 242);
-    assert_eq!(count(Disposition::AuditRequired), 156);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 246);
+    assert_eq!(count(Disposition::AuditRequired), 152);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
 
 #[test]
 fn network_mmds_closure_policy_is_stable() {
-    const TERMINAL: [&str; 31] = [
+    const TERMINAL: [&str; 33] = [
         "api-operation:GET /mmds",
         "api-operation:PATCH /mmds",
         "api-operation:PATCH /network-interfaces/{iface_id}",
@@ -583,36 +583,24 @@ fn network_mmds_closure_policy_is_stable() {
         "api-schema:NetworkInterface",
         "api-schema:PartialNetworkInterface",
         "corpus:mmds-design",
+        "corpus:mmds-user-guide",
         "corpus:patch-network-interface",
         "non-swagger-route:DELETE /network-interfaces/{iface_id}",
+        "semantic.mmds:tcp-token-session-and-isolation",
     ];
-    const RETAINED: [(&str, &[&str], &str); 4] = [
-        (
-            "corpus:mmds-user-guide",
-            &["https://github.com/seven332/bangbang/issues/1490"],
-            "`W6`",
-        ),
+    const RETAINED: [(&str, &[&str], &str); 2] = [
         (
             "corpus:network-setup",
-            &[
-                "https://github.com/seven332/bangbang/issues/1378",
-                "https://github.com/seven332/bangbang/issues/1490",
-            ],
-            "`EXTERNAL-GATE + W6`",
-        ),
-        (
-            "semantic.mmds:tcp-token-session-and-isolation",
-            &["https://github.com/seven332/bangbang/issues/1490"],
-            "`W6`",
+            &["https://github.com/seven332/bangbang/issues/1378"],
+            "`EXTERNAL-GATE`",
         ),
         (
             "semantic.network:virtio-net-vmnet-policy-and-connectivity",
             &[
                 "https://github.com/seven332/bangbang/issues/1378",
-                "https://github.com/seven332/bangbang/issues/1490",
                 "https://github.com/seven332/bangbang/issues/1491",
             ],
-            "`EXTERNAL-GATE + W6 + W7`",
+            "`EXTERNAL-GATE + W7`",
         ),
     ];
 
@@ -679,10 +667,10 @@ fn network_mmds_closure_policy_is_stable() {
                 "retained network/MMDS summary must name {owner_url}: {id}"
             );
         }
-        for outcome in ["restore", "clone"] {
+        for outcome in ["Exact native-v2 2.11", "restor", "clone"] {
             assert!(
                 capability.summary.contains(outcome),
-                "retained network/MMDS summary must name missing {outcome}: {id}"
+                "retained network/MMDS summary must retain delivered {outcome}: {id}"
             );
         }
         if id.contains("network") {
@@ -745,7 +733,6 @@ fn network_mmds_closure_policy_is_stable() {
 
     for required in [
         "https://github.com/seven332/bangbang/issues/1378",
-        "https://github.com/seven332/bangbang/issues/1490",
         "https://github.com/seven332/bangbang/issues/1491",
         "boots_signed_mmio_guest_with_complete_virtio_network_semantics",
         "boots_signed_pci_guest_with_complete_virtio_network_semantics",
@@ -755,6 +742,8 @@ fn network_mmds_closure_policy_is_stable() {
         "signed_executable_hotplugs_mmds_network_and_reuses_product_pci_slot",
         "normal_bundle_hotplugs_mmds_network_without_vmnet_authority",
         "networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation",
+        "signed_executable_certifies_native_v2_network_mmds_snapshot_continuation",
+        "normal_bundle_certifies_native_v2_network_mmds_snapshot_continuation_and_containment",
         "bangbang vmnet preflight: blocked",
     ] {
         assert!(
@@ -770,8 +759,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 242);
-    assert_eq!(count(Disposition::AuditRequired), 156);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 246);
+    assert_eq!(count(Disposition::AuditRequired), 152);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -982,8 +971,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 242);
-    assert_eq!(count(Disposition::AuditRequired), 156);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 246);
+    assert_eq!(count(Disposition::AuditRequired), 152);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -1053,6 +1042,12 @@ fn delivery_closure_policy_is_stable() {
     const RUNTIME_NETWORK_HOTPLUG: [&str; 2] = [
         "api-operation:PUT /network-interfaces/{iface_id}",
         "non-swagger-route:DELETE /network-interfaces/{iface_id}",
+    ];
+    const NETWORK_SNAPSHOT_TERMINAL: [&str; 4] = [
+        "api-property:SnapshotLoadParams.network_overrides",
+        "corpus:mmds-user-guide",
+        "corpus:snapshot-network-clones",
+        "semantic.mmds:tcp-token-session-and-isolation",
     ];
     const PCI_RUNTIME_HOTPLUG_AGGREGATES: [&str; 3] = [
         "corpus:device-hotplug",
@@ -1247,8 +1242,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 242);
-    assert_eq!(count(Disposition::AuditRequired), 156);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 246);
+    assert_eq!(count(Disposition::AuditRequired), 152);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -1334,6 +1329,25 @@ fn delivery_closure_policy_is_stable() {
                 .disposition,
             Disposition::ImplementedAndVerified,
             "runtime network hotplug record must remain implemented: {id}"
+        );
+    }
+
+    for id in NETWORK_SNAPSHOT_TERMINAL {
+        let capability = by_id
+            .get(id)
+            .expect("terminal network snapshot record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "network snapshot record must remain implemented: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "terminal network snapshot evidence must remain concrete: {id}"
+        );
+        assert!(
+            capability.summary.contains("native-v2 2.11"),
+            "terminal network snapshot summary must pin the exact format: {id}"
         );
     }
 

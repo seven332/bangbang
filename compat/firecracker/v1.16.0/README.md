@@ -50,10 +50,10 @@ claims mechanically visible.
   ledger, completed by #1634's pmem snapshot certification. It pins the exact
   40-record family with 40 terminal outcomes, field-specific implementation
   evidence, and signed direct/production live plus exact native-v2 2.6/current
-  2.10 create/load/cleanup proof.
+  2.11 create/load/cleanup proof.
 - [`balloon-contract.md`](balloon-contract.md) is the #1473 balloon ledger. It
   pins all 52 records as terminal after #1681, records publication-safe paired
-  PFN accounting, exact 2.9 kind-10 state retained unchanged by current 2.10,
+  PFN accounting, exact 2.9 kind-10 state retained unchanged by current 2.11,
   coherent MMIO/PCI fresh ownership, and signed direct/contained restored-guest
   continuation.
 - [`memory-hotplug-contract.md`](memory-hotplug-contract.md) is the #1474
@@ -71,7 +71,7 @@ claims mechanically visible.
   and snapshot ledger. It pins all six records as terminal, records default
   stdout, configured-output stdin exclusion, bounded terminal/FIFO/pipe RX,
   exact MMIO capture ownership, native-v2 2.7 encoding retained by current
-  2.10, fresh endpoint
+  2.11, fresh endpoint
   reconstruction, signed serial-only and storage-bearing continuation, clone
   loads, recapture, redaction, and cleanup.
 - [`time-identity-contract.md`](time-identity-contract.md) is the
@@ -90,10 +90,9 @@ claims mechanically visible.
   production containment, exact 2.7 serial, 2.8 entropy, 2.9 balloon, and 2.10
   virtio-mem restored-guest evidence.
 - [`network-mmds-contract.md`](network-mmds-contract.md) is the #1496 checked
-  aggregate network/MMDS ledger. It pins an exact 35-record set, promotes 31
-  complete live/capture-ready outcomes, and retains four explicit #1378,
-  #1490, or #1491 handoffs for external vmnet, restore/clone, and performance
-  work.
+  aggregate network/MMDS ledger. It pins an exact 35-record set. Exact 2.11
+  snapshot/clone certification raises it to 33 terminal outcomes; two broad
+  rows retain explicit #1378 external-vmnet and #1491 performance handoffs.
 - [`vsock-contract.md`](vsock-contract.md) is the #1518 checked aggregate vsock
   ledger. It pins the exact 14 directly named records, promotes eight complete
   API/live outcomes, and retains six explicit #1490 optional-device encoding,
@@ -669,11 +668,34 @@ retained nonzero plugged-memory bytes before partial UNPLUG, driver-reprobe
 UNPLUG_ALL/replug, later PLUG, and final UNPLUG; same-process peers, immutable
 fresh-process clones, exact metrics, malformed state/memory, cancellation,
 both death orders, redaction, and cleanup are covered. Kind 11 is capped at
-128 KiB inside the 16-MiB state-file cap. Diff, native-v2 Uffd,
-network/vsock/MMDS restore, tools, Firecracker artifact compatibility, source
-owner/dirty identity, synchronous RSS, and broad portability remain audited or
-explicitly unclaimed. The current aggregate selector is 84 terminal and one
-`audit-required`, and the current overlay is 242/156/3/17.
+128 KiB inside the 16-MiB state-file cap. At that checkpoint Diff, native-v2
+Uffd, network/vsock/MMDS restore, tools, Firecracker artifact compatibility,
+source owner/dirty identity, synchronous RSS, and broad portability remained
+audited or explicitly unclaimed. The aggregate remaining-device selector was
+84 terminal and one `audit-required`, and the overlay was 242/156/3/17.
+
+#1715 then activates exact `2.11.0` with optional singleton network/MMDS kind
+12 across all 32 storage/entropy/balloon/virtio-mem/network products. The
+bounded `BANGNW2\0` graph retains up to 16 ordered interfaces, requested and
+realized MAC/MTU, backend class, queue/common-virtio state, limiter/retry,
+MMIO/PCI placement, and MMDS protocol configuration while excluding host
+providers, handles, callbacks, packets, ARP/TCP sessions, data, token material,
+metrics, and clocks. Each load requires one exact redacted clone-local selector
+override per saved interface and reconstructs fresh network/MMDS owners.
+#1716 certifies signed direct and normal-production/App-Sandbox MMIO/PCI V1/V2
+sources through explicit-Paused recapture and automatic destinations. The
+guests prove empty then reseeded MMDS data, source-connection loss, old-token
+rejection, fresh-session success, immutable state/memory, fresh metrics,
+malformed state/memory and override rejection, cancellation, both death orders,
+retry, containment, and cleanup without vmnet authority. It promotes exactly
+`api-property:SnapshotLoadParams.network_overrides`,
+`corpus:snapshot-network-clones`, `corpus:mmds-user-guide`, and
+`semantic.mmds:tcp-token-session-and-isolation`. Positive external vmnet
+remains #1378; network performance remains #1491; vsock, Diff, native-v2 Uffd,
+Firecracker artifact compatibility, editing/tools, source packets/connections,
+and unconstrained portability remain explicit nonclaims. The current overlay
+is 246/152/3/17, and the checked network/MMDS ledger is 33 terminal with two
+audit-required rows.
 
 ## Commands
 

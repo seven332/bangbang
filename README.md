@@ -31,11 +31,12 @@ publishes per-vCPU stolen time from bounded owner-thread wall/execution samples,
 enables standard 64-bit SMCCC discovery when the HVF measurement primitive is
 available, and has signed Linux contention/idle/pause certification. PVTime
 serialization and clone restore are implemented in the public bangbang-native
-v2 profile. Public `Full` creation now writes current `2.10.0` state/memory
+v2 profile. Public `Full` creation now writes current `2.11.0` state/memory
 pairs from a strictly bounded paused production session. Every pair carries a
 complete serial component and may additionally carry the profile-3 ordered
 regular-file block/pmem graph, entropy state, balloon state, virtio-mem state,
-or any coherent combination over MMIO or the product PCI endpoint budget.
+portable network/MMDS state, or any coherent combination over MMIO or the
+product PCI endpoint budget.
 The serial value retains endpoint intent, limiter configuration, every
 guest-visible UART register, bounded RX bytes, status, and pending work while
 excluding source descriptors, terminal state, pipe buffers, TX bytes, and
@@ -49,7 +50,10 @@ while excluding random output, host-source identity, metrics, and absolute host
 time. Public load classifies the opened state once and reconstructs fresh
 destination serial endpoints plus any complete storage graph and a fresh
 entropy source, metrics set, scheduler, notifier, route, and endpoint through
-one exact authority transaction and read-only File/COW memory. Optional
+one exact authority transaction and read-only File/COW memory. Network-bearing
+loads require one clone-local backend selector override for every saved
+interface and reconstruct fresh packet-I/O, queue, metric, scheduler, route,
+endpoint, and MMDS owners. Optional
 balloon kind 10 retains exact configuration, queue cursors, latest statistics,
 one pending statistics descriptor, DONE-normalized hint history, and compact
 4-KiB PFN accounting while reconstructing fresh timers, metrics, reclaim,
@@ -59,6 +63,11 @@ cursors, coherent MMIO/PCI transport state, and a canonical plugged-block
 bitmap while reconstructing private base RAM plus one fresh descriptor-backed
 shared aperture, block-granular plugged views, dirty metadata, metrics,
 notifier/interrupt/dispatcher/route, endpoint, and cleanup ownership. Exact
+network/MMDS kind 12 retains requested interface configuration, captured inert
+selector identity, requested and realized MAC/MTU, backend class, queue,
+transport, limiter/retry, placement, and MMDS protocol configuration. It
+deliberately omits host handles, callbacks, packets, connections, MMDS data,
+token keys/tokens, metrics, and host clocks. Exact
 balloon-profile `2.9.0`, entropy-profile `2.8.0`, serial-required `2.7.0`,
 storage-only profile-3 `2.6.0`, block-only profile-2 `2.5.0`, single-root
 `2.4.0`, device-free `2.3.0`, and frozen native-v1 remain compatibility
@@ -69,9 +78,10 @@ and memory writes private, but writable external block and pmem prefixes
 deliberately share bytes and require operator serialization; each pmem
 alignment tail is private and starts zero in a fresh mapping. The balloon
 component is capped at 4 MiB and 262,144 accounting ranges inside the 16-MiB
-state cap; kind 11 is capped at 128 KiB. Guest PFNs are always 4 KiB; destination Darwin reclaim separately
-aligns and coalesces to host pages, normally 16 KiB. Network, vsock, and MMDS
-state remains an explicit Wave 6 limit.
+state cap; kind 11 is capped at 128 KiB, and kind 12 is capped at 512 KiB with
+an 83,552-byte calculated worst case for 16 interfaces. Guest PFNs are always
+4 KiB; destination Darwin reclaim separately aligns and coalesces to host
+pages, normally 16 KiB. Vsock snapshot state remains an explicit Wave 6 limit.
 Host discard never promises synchronous RSS or footprint
 reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
@@ -117,19 +127,20 @@ exact-prefix synchronous flush/unmap, and reusable aligned guest range.
 PCI-mode network PUT/DELETE uses the same owner-thread boundary with independent
 MMDS-only or vmnet packet I/O,
 generation-safe metrics, and exact cleanup. Automatic guest hotplug
-notification, snapshot persistence for network and vsock PCI devices (pmem,
-entropy, balloon, and virtio-mem are supported; serial remains a platform MMIO
-device with its exact 2.7 component retained unchanged by current 2.10),
+notification and snapshot persistence for vsock PCI devices remain limits.
+Network snapshot persistence is supported in exact 2.11; pmem, entropy,
+balloon, and virtio-mem are supported by their earlier profiles, and serial
+remains a platform MMIO device with its exact 2.7 component retained unchanged.
 external vmnet connectivity
 certification, and Firecracker's KVM ITS identity remain explicit limits.
 Current native-v2 create runs the complete paused live-storage preflight and
 then admits the exact profile-3 ordered regular-file block-and-pmem graph plus
-optional entropy, balloon, and virtio-mem over the process's selected MMIO or
-PCI transport, with no root or one first cross-storage root. Load validates and
-reconstructs the complete transport, placement, typed backing transaction,
-fresh balloon owner, and fresh mixed-memory virtio-mem aperture before
-controller or VM publication; a destination transport mismatch still fails
-before mutation.
+optional entropy, balloon, virtio-mem, and network/MMDS state over the
+process's selected MMIO or PCI transport, with no root or one first
+cross-storage root. Load validates and reconstructs the complete transport,
+placement, typed backing transaction, fresh balloon owner, fresh mixed-memory
+virtio-mem aperture, and fresh network/MMDS owners before controller or VM
+publication; a destination transport mismatch still fails before mutation.
 
 File-backed drives accept an existing regular file or, on macOS, one exact
 block-special descriptor over MMIO and PCI with omitted/default `Sync` or
@@ -386,14 +397,14 @@ These primitives back a deliberately narrow public native-v2 snapshot path on
 macOS Apple Silicon. `PUT /snapshot/create` supports only `Full` snapshots from
 a paused 1–32-vCPU VM with a configured boot source, complete live serial
 state, an optional ordered regular-file block/pmem storage graph, and optional
-entropy, balloon, and virtio-mem state. It rejects network, vsock, MMDS, boot
+entropy, balloon, virtio-mem, and network/MMDS state. It rejects vsock, boot
 timer, and vhost-user state. The storage graph may have no root or one first
 cross-storage root.
 Block records admit mixed read-only/read-write, Sync/Async, Unsafe/Writeback,
 partuuid, and limiter configurations; pmem records retain exact protection,
 limiter, queue, mapping, and file/private-tail geometry. Every storage record
 uses the process-selected MMIO or PCI transport, with PCI additionally bounded
-by the 31-endpoint product budget. It writes a current `2.10.0` pair whose state
+by the 31-endpoint product budget. It writes a current `2.11.0` pair whose state
 binds retained File/COW memory; the complete typed machine, GIC, topology,
 per-vCPU, and time/clone-identity graph; a required exact serial component; and
 any profile-3 block/pmem configuration, runtime, common virtio, queue, mapping,
@@ -411,6 +422,15 @@ bit per configured block. Its bitmap length is geometry-derived, padding bits
 must be zero, and the complete component is capped at 128 KiB. Kind 11 binds
 the unchanged kind-1 memory extents to exactly the plugged aperture union,
 independent of artifact fragmentation.
+If configured, network/MMDS kind 12 adds a canonical `BANGNW2\0` component
+containing up to 16 `BANGNI2\0` interface records and one optional
+`BANGMD2\0` configuration record. It retains interface order and ID, requested
+configuration, inert captured selector identity, requested and realized
+MAC/MTU, backend class, queue and common virtio state, limiter/retry state,
+exact MMIO/PCI placement, and MMDS selection/version/IP/IMDS compatibility.
+It excludes source packet-I/O owners, provider handles, callbacks, peer or
+cached packets, ARP/TCP sessions, MMDS data, token material, metrics, and
+absolute clocks or deadlines.
 Serial endpoint intent is serialized, but live process bindings are
 destination-local. Each restored process opens fresh default stdio or resolves
 one configured output under destination authority; no source descriptor,
@@ -422,8 +442,7 @@ quiesces the block, PMEM, network, entropy retry, balloon-statistics, and
 virtio-mem publishers. The same lease
 traverses capture-ready storage, balloon, memory-hotplug, entropy, serial, and
 network owners across their applicable MMIO/PCI transports before applying the
-narrow public rejection for network, vsock, MMDS, boot-timer, and vhost-user
-state.
+narrow public rejection for vsock, boot-timer, and vhost-user state.
 Entropy traversal validates exact queue, feature, limiter, pending-descriptor,
 and scheduler state, then exact 2.8 persists its portable device value without
 host entropy bytes, source identity, metrics, or a wall-clock value. Network
@@ -431,16 +450,17 @@ traversal joins configuration order to generation-bound packet
 I/O, metrics, MMDS identity, transport, queue, feature, limiter, and retry
 state. It retains one exact reconstructible TX retry while validating and
 normalizing source-only cached RX, active MMDS protocol state, callbacks, host
-handles, peer packets, and absolute deadlines out of the handoff. These
-detached, redacted values are input for Wave 6 #1490, not a network encoding or
-restore claim. Balloon traversal validates its active queues, pending
+handles, peer packets, and absolute deadlines out of the handoff. Exact 2.11
+encodes the portable portion as kind 12 while keeping the normalized source
+resources outside the artifact. Balloon traversal validates its active queues, pending
 statistics work, latest statistics, hint state, and compact accounting against
 mapped RAM. Exact 2.9 serializes that portable value while excluding deadlines,
 timers, metrics, reclaim advisers, handles, and ownership. Virtio-mem traversal
 validates configuration, queue, plugged topology, shared-reservation identity,
 active guest views, HVF mappings, dirty metadata, epoch, and exact accounting.
 Exact 2.10 serializes kind 11 without host addresses, descriptors, backing
-identities, metrics, or cleanup authority. The same lease
+identities, metrics, or cleanup authority; current 2.11 retains kind 11
+unchanged and may add kind 12. The same lease
 preflights both final namespaces, streams the paused aggregate capture into an
 owner-only staging inode, verifies and synchronizes it, publishes memory first
 and state last as the commit marker without replacing existing entries, and
@@ -468,7 +488,7 @@ profile before construction, creates the fresh HVF VM/GIC/vCPU topology,
 reconstructs PL031 from destination wall clock, restores PVTime, replaces and
 signals VMGenID, updates and signals VMClock, and only then commits the session
 as `Paused`. Legacy 2.3 parses the retained default FDT shell. Exact 2.4
-through current 2.10 instead verify the retained live FDT address, length, and
+through current 2.11 instead verify the retained live FDT address, length, and
 CRC, then require versioned source-product evidence. Exact 2.4 reconstructs
 its singleton root shell; exact 2.5 reconstructs the complete rooted or
 rootless block shell; exact 2.6 reconstructs the profile-3 block/pmem shell;
@@ -478,11 +498,15 @@ fresh OS source, metrics set, scheduler, notifier, route, endpoint, and
 destination-relative retry deadline; exact 2.9 additionally reconstructs
 optional balloon state with fresh memory bindings, statistics timer, metrics,
 reclaim adviser, notifier/interrupt/dispatcher, transport endpoint, and cleanup
-owner; and current 2.10 additionally validates kind 11 against unchanged
+owner; exact 2.10 additionally validates kind 11 against unchanged
 kind-1 extents, maps base RAM privately, creates one fresh unlinked shared
 aperture with block-granular plugged views, copies committed plugged bytes, and
 reconstructs fresh virtio-mem metrics, notifier, interrupt, dispatcher,
-endpoint, route, and cleanup ownership. A retained statistics descriptor waits one full destination-local
+endpoint, route, and cleanup ownership; and current 2.11 additionally validates
+kind 12 plus a complete, unique `network_overrides` set, then constructs fresh
+clone-local backend, packet-I/O, metric, scheduler, route, endpoint, and MMDS
+owners. The MMDS store starts empty and requires explicit reseeding; source
+TCP connections and V2 tokens never survive. A retained statistics descriptor waits one full destination-local
 interval after resume; no interval elapses while Paused. A captured active hint
 run is normalized to DONE, and the destination may start a fresh run. Linux may
 already have consumed or reclaimed the original FDT bytes.
@@ -502,17 +526,20 @@ read-only state and memory grants, and create outputs use retained
 `SnapshotOutputDirectory` anchors plus bounded UTF-8 child names. Load
 classifies a duplicate of the state descriptor, then atomically adopts the
 matching state/memory pair and any exact block, pmem, or configured serial
-grants; no tag is reopened as a pathname. Legacy native-v1 loads additionally
+grants; no tag is reopened as a pathname. Network selectors come only from the
+destination request, are redacted, and require no vmnet authority for an
+MMDS-only destination. Legacy native-v1 loads additionally
 adopt any persisted root grant required by that format.
 Create preserves the same anchor-relative no-clobber transaction and repeated
 output-directory authority. Direct mode keeps ordinary path behavior.
 
-The transaction stops bangbang-owned packet and stream access because the
-accepted profile excludes network and vsock devices and the transient vsock
-poller is joined before pause acknowledgement. It does not freeze or persist
-vmnet peers, vsock peers, or their host/kernel buffers. Native-v1 remains a
+The transaction stops bangbang-owned packet and stream access; the transient
+vsock poller is joined before pause acknowledgement, while an admitted network
+is encoded only after its packet-I/O and MMDS stack reach the portable capture
+boundary. It does not freeze or persist vmnet peers, vsock peers, packets,
+connections, token sessions, or their host/kernel buffers. Native-v1 remains a
 frozen one-vCPU compatibility format; native-v2 carries 1–32-vCPU state, while
-network, vsock, and MMDS remain outside the current public profile.
+vsock remains outside the current public profile.
 
 This is not Firecracker snapshot-file compatibility or a portable migration
 format. Machine `track_dirty_pages` now enables one shared guest-RAM epoch
@@ -522,8 +549,8 @@ keeps a separate write-protection overlay. A visibly committed Full snapshot
 re-protects guest-written pages before clearing and advancing the epoch while
 the source is still paused. Complete rollback keeps the old conservative epoch;
 incomplete rollback prevents resume and tears the VM down safely. `Diff`
-artifacts and merging, native-v2 `Uffd`, clock adjustment, restore overrides,
-vhost-user, network, vsock, and MMDS snapshot state,
+artifacts and merging, native-v2 `Uffd`, clock adjustment, per-drive and vsock
+restore overrides, vhost-user and vsock snapshot state,
 active SVE/SME/debug state, EL2 GIC CPU-interface state, and broad cross-host
 portability remain unsupported. Frozen native-v1 `Uffd` compatibility is
 supported only on macOS Apple Silicon with dirty tracking disabled. Its
@@ -647,12 +674,13 @@ exact 2.7 validates complete serial state plus optional profile-3 storage and
 live-FDT identity. Exact 2.8 preserves that product and optionally validates
 entropy queue/limiter/pending/retry state. Exact 2.9 preserves those products
 and optionally validates balloon queue/statistics/hint/accounting state.
-Current 2.10 preserves all prior products and optionally validates virtio-mem
+Exact 2.10 preserves all prior products and optionally validates virtio-mem
 configuration, config space, queue, bitmap, kind-1 extent binding, and selected
-transport. It installs fresh default process
+transport. Current 2.11 retains those products and optionally validates
+network/MMDS kind 12 plus a complete clone-local override set. It installs fresh default process
 stdio or a fresh configured output, restores buffered RX and pending UART work,
-constructs fresh entropy, balloon, and virtio-mem owners plus a destination-local
-shared aperture when present, and publishes a closed supervisor session
+constructs fresh entropy, balloon, virtio-mem, network, and MMDS owners plus a
+destination-local shared aperture when present, and publishes a closed supervisor session
 initially `Paused`. The same immutable pair can restore into multiple
 fresh destinations; requested resume still passes through the ordinary
 lifecycle gate. Base File/COW memory is private per destination; each
@@ -661,7 +689,9 @@ block-granular plugged views. External
 writable drive files are deliberately shared without snapshot COW isolation;
 load offers no per-drive selector or configuration override and validates exact
 identity, role, access, kind, size, and geometry before construction.
-`--snapshot-version` reports `v2.10.0`, and `--describe-snapshot` reports
+Network loads separately require exactly one destination backend selector for
+every saved interface and reject missing, duplicate, or unknown IDs before
+publication. `--snapshot-version` reports `v2.11.0`, and `--describe-snapshot` reports
 the actual validated native-v1 or native-v2 version. Recognizing a pinned
 Firecracker bitcode prefix reports incompatibility rather than claiming decode
 or translation. The exact wire,
@@ -710,7 +740,7 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
 - `--no-api` requires `--config-file <PATH>`, starts from that configuration
   without publishing an API socket, and exits cleanly on `SIGINT` or `SIGTERM`.
 - `--snapshot-version` prints the current bangbang-native writer version
-  (`v2.10.0`) and exits before startup.
+  (`v2.11.0`) and exits before startup.
 - `--describe-snapshot <PATH>` reads a bounded regular native state file,
   classifies and validates its complete native-v1 or native-v2 envelope and
   CRC, prints its exact embedded version, and exits before startup. In
@@ -1566,7 +1596,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 242 implemented-and-verified, 156 audit-required, three
+delivery overlay with 246 implemented-and-verified, 152 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
@@ -1595,8 +1625,8 @@ joins those five family ledgers into an exact 85-record,
 84-terminal/one-Wave-6 closure. The
 [network and MMDS closure ledger](compat/firecracker/v1.16.0/network-mmds-contract.md)
 then maps an exact 35-record set to the composed direct, contained, capture,
-and non-success external gates: 31 are terminal and four remain audit-owned by
-#1378, #1490, or #1491. The
+snapshot/clone, and non-success external gates: 33 are terminal and two remain
+audit-owned by #1378 or #1491. The
 [vsock closure ledger](compat/firecracker/v1.16.0/vsock-contract.md) maps its
 exact 14-record set to eight terminal API/live outcomes and six precise #1490
 artifact/restore/clone handoffs. The
@@ -1609,7 +1639,7 @@ bridge, ordered before/during/after removal, peer-failure propagation,
 complete consumer gates, native-v1 direct/contained restore, paused-host plus
 exact restored-guest demand, exact nested entitlement dictionaries, and
 cleanup are implemented and verified.
-The repository-wide disposition counts are 242/156/3/17.
+The repository-wide disposition counts are 246/152/3/17.
 
 ## Build And Test
 
@@ -1705,6 +1735,13 @@ then continue partial UNPLUG, driver-reprobe UNPLUG_ALL/replug, growth, and
 final removal. Checksum-corrupt state, truncated memory, graceful
 cancellation, worker-first death, and launcher-first death leave no API socket,
 session, worker, mapping, route, staging, or grant authority. The separate
+exact-2.11 network/MMDS case covers MMIO and PCI with V1 and V2 MMDS sources,
+explicit Paused recapture, and automatic destinations. It proves exact
+clone-local overrides, empty then reseeded destination data, source TCP-session
+loss, old V2-token rejection, fresh-session success, immutable state/memory,
+redacted missing/duplicate/unknown override failures, malformed artifacts,
+graceful cancellation, both process-death orders, retry, and cleanup without
+vmnet authority. The separate
 contained-pager probes do not make current native-v2 accept `Uffd`. Abrupt
 launcher-first and worker-first cases replace the
 granted API pathname before death and prove both surviving cleanup owners
