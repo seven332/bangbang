@@ -2945,6 +2945,272 @@ fn exact_minor_eleven_candidate(
 }
 
 #[cfg(target_os = "macos")]
+fn exact_minor_twelve_candidate(
+    network_payload: Option<&[u8]>,
+    vsock_payload: Option<&[u8]>,
+) -> (NativeV2VsockSnapshotCandidateState, GuestMemory) {
+    let range = GuestMemoryRange::new(GuestAddress::new(0), 0x0040_0000)
+        .expect("exact-2.12 memory range should validate");
+    let layout =
+        GuestMemoryLayout::new(vec![range]).expect("exact-2.12 memory layout should validate");
+    let mut memory = GuestMemory::allocate(&layout).expect("exact-2.12 memory should allocate");
+    if let Some(vsock_payload) = vsock_payload {
+        let vsock = SnapshotV2VsockState::decode(
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+            vsock_payload,
+        )
+        .expect("exact-2.12 vsock fixture should decode");
+        if let Some(active) = vsock.active_queues() {
+            for (queue, cursor) in
+                vsock
+                    .virtio()
+                    .queues()
+                    .iter()
+                    .zip([active.rx(), active.tx(), active.event()])
+            {
+                let available_index = queue
+                    .driver_ring()
+                    .checked_add(2)
+                    .expect("available index should not overflow");
+                memory
+                    .write_slice(&cursor.next_available().to_le_bytes(), available_index)
+                    .expect("available index should write");
+                let used_index = queue
+                    .device_ring()
+                    .checked_add(2)
+                    .expect("used index should not overflow");
+                memory
+                    .write_slice(&cursor.next_used().to_le_bytes(), used_index)
+                    .expect("used index should write");
+            }
+        }
+    }
+
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact-2.12 memory should encode internally");
+    let binding_payload = binding.encode().expect("memory binding should encode");
+    let serial_device = SerialMmioDevice::discarding()
+        .capture_state()
+        .expect("fixture serial device should capture");
+    let serial_payload = SnapshotV2SerialState::try_from_capture_ready(
+        CaptureReadySerialState::new(SerialConfig::default(), serial_device),
+    )
+    .expect("fixture serial state should validate")
+    .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+    .expect("fixture serial state should encode");
+
+    let mut components = vec![
+        SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &binding_payload,
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_SERIAL_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &serial_payload,
+        ),
+    ];
+    if let Some(network_payload) = network_payload {
+        components.push(SnapshotV2Component::new(
+            NATIVE_V2_NETWORK_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            network_payload,
+        ));
+    }
+    if let Some(vsock_payload) = vsock_payload {
+        components.push(SnapshotV2Component::new(
+            NATIVE_V2_VSOCK_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            vsock_payload,
+        ));
+    }
+    let bytes = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("exact-2.12 candidate should encode");
+    (
+        NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(bytes)
+            .expect("exact-2.12 candidate should close"),
+        memory,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn exact_minor_twelve_network_overrides(
+    candidate: &NativeV2VsockSnapshotCandidateState,
+) -> Vec<SnapshotNetworkOverride> {
+    candidate
+        .network()
+        .into_iter()
+        .flat_map(SnapshotV2NetworkState::interfaces)
+        .enumerate()
+        .map(|(index, interface)| {
+            SnapshotNetworkOverride::new(interface.iface_id(), format!("tap{index}"))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_twelve_preparation_closes_all_network_vsock_presence_products() {
+    let network_payload = fixture_bytes(include_str!(
+        "../snapshot_network_v2_11/fixtures/inactive-mmio.hex"
+    ));
+    let vsock_payload = fixture_bytes(include_str!(
+        "../snapshot_vsock_v2_12/fixtures/inactive-mmio.hex"
+    ));
+    for (network, vsock) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (candidate, memory) = exact_minor_twelve_candidate(
+            network.then_some(network_payload.as_slice()),
+            vsock.then_some(vsock_payload.as_slice()),
+        );
+        let bytes = candidate.bytes().to_vec();
+        let overrides = exact_minor_twelve_network_overrides(&candidate);
+        let expected_network_count = candidate
+            .network()
+            .map_or(0, |state| state.interfaces().len());
+        let prepared = candidate
+            .prepare(
+                &memory,
+                SnapshotV2DeviceTransportKind::Mmio,
+                &overrides,
+                None,
+            )
+            .expect("complete exact-2.12 product should prepare");
+
+        assert_eq!(prepared.bytes(), bytes);
+        assert_eq!(
+            prepared.network_topology().interfaces().len(),
+            expected_network_count
+        );
+        assert_eq!(prepared.vsock_topology().is_some(), vsock);
+        assert_eq!(
+            prepared.manifest().len(),
+            expected_network_count + usize::from(vsock)
+        );
+        if let Some(topology) = prepared.vsock_topology() {
+            assert!(!topology.request().is_overridden());
+            assert!(
+                !prepared
+                    .manifest()
+                    .is_overridden(topology.request().resource_key())
+            );
+        }
+        let debug = format!("{prepared:?}");
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("bangbang-vsock"));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_twelve_candidate_composes_vsock_override_and_manifest_membership() {
+    let vsock_payload = fixture_bytes(include_str!(
+        "../snapshot_vsock_v2_12/fixtures/inactive-mmio.hex"
+    ));
+    let (candidate, memory) = exact_minor_twelve_candidate(None, Some(&vsock_payload));
+    let destination = "/tmp/bangbang-candidate-private.sock";
+    let prepared = candidate
+        .prepare(
+            &memory,
+            SnapshotV2DeviceTransportKind::Mmio,
+            &[],
+            Some(&SnapshotVsockOverride::new(destination)),
+        )
+        .expect("overridden exact-2.12 candidate should prepare");
+    let topology = prepared
+        .vsock_topology()
+        .expect("saved vsock should produce topology");
+    assert!(topology.request().is_overridden());
+    assert_eq!(
+        topology.request().config().uds_path(),
+        Path::new(destination)
+    );
+    assert!(
+        prepared
+            .manifest()
+            .is_overridden(topology.request().resource_key())
+    );
+    assert!(!format!("{prepared:?}").contains(destination));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_twelve_candidate_rejects_before_later_topology_callbacks() {
+    let (candidate, memory) = exact_minor_twelve_candidate(None, None);
+    let callbacks = std::cell::Cell::new(0);
+    let secret = "/tmp/bangbang-no-device-private.sock";
+    let error = candidate
+        .prepare_with_cancel(
+            &memory,
+            SnapshotV2DeviceTransportKind::Mmio,
+            &[],
+            Some(&SnapshotVsockOverride::new(secret)),
+            |_| {
+                callbacks.set(callbacks.get() + 1);
+                false
+            },
+        )
+        .expect_err("vsock override without captured state should fail");
+    assert!(matches!(
+        error,
+        NativeV2VsockSnapshotPreparationError::Vsock(
+            SnapshotV2VsockRestorePreparationError::Selector(
+                crate::snapshot::SnapshotVsockSelectorError::OverrideWithoutDevice
+            )
+        )
+    ));
+    assert_eq!(callbacks.get(), 0);
+    assert!(!format!("{error:?} {error}").contains(secret));
+
+    let network_payload = fixture_bytes(include_str!(
+        "../snapshot_network_v2_11/fixtures/inactive-mmio.hex"
+    ));
+    let (candidate, memory) = exact_minor_twelve_candidate(Some(&network_payload), None);
+    assert!(matches!(
+        candidate.prepare(&memory, SnapshotV2DeviceTransportKind::Mmio, &[], None,),
+        Err(NativeV2VsockSnapshotPreparationError::Network(
+            SnapshotV2NetworkRestorePreparationError::MissingInterface
+        ))
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_twelve_candidate_checks_product_transport_and_active_memory() {
+    let mmio_payload = fixture_bytes(include_str!(
+        "../snapshot_vsock_v2_12/fixtures/inactive-mmio.hex"
+    ));
+    let (candidate, memory) = exact_minor_twelve_candidate(None, Some(&mmio_payload));
+    assert!(matches!(
+        candidate.prepare(&memory, SnapshotV2DeviceTransportKind::Pci, &[], None,),
+        Err(NativeV2VsockSnapshotPreparationError::Vsock(
+            SnapshotV2VsockRestorePreparationError::DestinationTransport
+        ))
+    ));
+
+    let pci_payload = fixture_bytes(include_str!(
+        "../snapshot_vsock_v2_12/fixtures/active-pci.hex"
+    ));
+    let (candidate, _) = exact_minor_twelve_candidate(None, Some(&pci_payload));
+    let (_, blank) = exact_minor_twelve_candidate(None, None);
+    assert!(matches!(
+        candidate.prepare(&blank, SnapshotV2DeviceTransportKind::Pci, &[], None,),
+        Err(NativeV2VsockSnapshotPreparationError::Vsock(
+            SnapshotV2VsockRestorePreparationError::Device(_)
+        ))
+    ));
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn native_v1_adapter_preserves_legacy_publication_bytes_and_outcome() {
     let directory = TestDirectory::new("native-v1-adapter");

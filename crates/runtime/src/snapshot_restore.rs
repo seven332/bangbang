@@ -144,19 +144,121 @@ fn validate_public_id(value: &str) -> Result<(), SnapshotRestorePublicIdError> {
     Ok(())
 }
 
-fn checked_native_v2_network_resource_count(
+fn checked_native_v2_restore_resource_count(
     storage_count: usize,
     serial_count: usize,
     network_count: usize,
+    vsock_count: usize,
 ) -> Result<usize, SnapshotRestoreManifestError> {
     let resource_count = storage_count
         .checked_add(serial_count)
         .and_then(|count| count.checked_add(network_count))
+        .and_then(|count| count.checked_add(vsock_count))
         .ok_or(SnapshotRestoreManifestError::TooManyResources)?;
     if resource_count > MAX_SNAPSHOT_RESTORE_RESOURCES {
         return Err(SnapshotRestoreManifestError::TooManyResources);
     }
     Ok(resource_count)
+}
+
+fn collect_native_v2_network_resources(
+    graph: Option<&SnapshotV2StorageDeviceGraph>,
+    serial: &SnapshotV2SerialState,
+    network: Option<&SnapshotV2NetworkState>,
+    additional_resource_count: usize,
+    additional_override_count: usize,
+) -> Result<
+    (
+        Vec<SnapshotRestoreResourceKey>,
+        Vec<SnapshotRestoreResourceKey>,
+    ),
+    SnapshotRestoreManifestError,
+> {
+    let storage_count = graph.map_or(0, SnapshotV2StorageDeviceGraph::record_count);
+    let serial_count = usize::from(serial.endpoint_intent().configured_selector().is_some());
+    let network_count = network.map_or(0, |state| state.interfaces().len());
+    let resource_count = checked_native_v2_restore_resource_count(
+        storage_count,
+        serial_count,
+        network_count,
+        additional_resource_count,
+    )?;
+    let override_count = network_count
+        .checked_add(additional_override_count)
+        .ok_or(SnapshotRestoreManifestError::TooManyOverrides)?;
+    if override_count > MAX_SNAPSHOT_RESTORE_RESOURCES {
+        return Err(SnapshotRestoreManifestError::TooManyOverrides);
+    }
+
+    let mut resources = Vec::new();
+    resources
+        .try_reserve_exact(resource_count)
+        .map_err(|source| SnapshotRestoreManifestError::AllocationFailed { source })?;
+    if let Some(graph) = graph {
+        for record in graph.block_records() {
+            let public_id = SnapshotRestorePublicId::try_from(record.config().drive_id())
+                .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+            resources.push(SnapshotRestoreResourceKey::new(
+                record.key(),
+                public_id,
+                SnapshotRestoreResourceClass::BlockBacking,
+            ));
+        }
+        for record in graph.pmem_records() {
+            let public_id = SnapshotRestorePublicId::try_from(record.config().pmem_id())
+                .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+            resources.push(SnapshotRestoreResourceKey::new(
+                record.key(),
+                public_id,
+                SnapshotRestoreResourceClass::PmemBacking,
+            ));
+        }
+    }
+    if serial_count == 1 {
+        let public_id = SnapshotRestorePublicId::try_from(NATIVE_V2_SERIAL_RESTORE_PUBLIC_ID)
+            .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+        resources.push(SnapshotRestoreResourceKey::new(
+            SnapshotV2DeviceKey::serial(),
+            public_id,
+            SnapshotRestoreResourceClass::SerialSink,
+        ));
+    }
+
+    let mut overrides = Vec::new();
+    overrides
+        .try_reserve_exact(override_count)
+        .map_err(|source| SnapshotRestoreManifestError::AllocationFailed { source })?;
+    if let Some(network) = network {
+        for (index, interface) in network.interfaces().iter().enumerate() {
+            let instance =
+                u32::try_from(index).map_err(|_| SnapshotRestoreManifestError::TooManyResources)?;
+            let public_id = SnapshotRestorePublicId::try_from(interface.iface_id())
+                .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+            let key = SnapshotRestoreResourceKey::new(
+                SnapshotV2DeviceKey::network(instance),
+                public_id,
+                SnapshotRestoreResourceClass::NetworkPacketIo,
+            );
+            overrides.push(key.clone());
+            resources.push(key);
+        }
+    }
+    Ok((resources, overrides))
+}
+
+pub(crate) fn validate_native_v2_vsock_resource_key(
+    key: &SnapshotRestoreResourceKey,
+) -> Result<(), SnapshotRestoreManifestError> {
+    if key.device_key() != SnapshotV2DeviceKey::vsock() {
+        return Err(SnapshotRestoreManifestError::InvalidVsockDeviceKey);
+    }
+    if key.resource_class() != SnapshotRestoreResourceClass::VsockEndpoint {
+        return Err(SnapshotRestoreManifestError::InvalidVsockResourceClass);
+    }
+    if key.public_id().as_str() != NATIVE_V2_VSOCK_RESTORE_PUBLIC_ID {
+        return Err(SnapshotRestoreManifestError::InvalidVsockPublicId);
+    }
+    Ok(())
 }
 
 /// Closed logical class of one snapshot restore resource.
@@ -407,64 +509,46 @@ impl SnapshotRestoreManifest {
         serial: &SnapshotV2SerialState,
         network: Option<&SnapshotV2NetworkState>,
     ) -> Result<Self, SnapshotRestoreManifestError> {
-        let storage_count = graph.map_or(0, SnapshotV2StorageDeviceGraph::record_count);
-        let serial_count = usize::from(serial.endpoint_intent().configured_selector().is_some());
-        let network_count = network.map_or(0, |state| state.interfaces().len());
-        let resource_count =
-            checked_native_v2_network_resource_count(storage_count, serial_count, network_count)?;
+        let (resources, overrides) =
+            collect_native_v2_network_resources(graph, serial, network, 0, 0)?;
+        Self::try_new(resources, overrides)
+    }
 
-        let mut resources = Vec::new();
-        resources
-            .try_reserve_exact(resource_count)
-            .map_err(|source| SnapshotRestoreManifestError::AllocationFailed { source })?;
-        if let Some(graph) = graph {
-            for record in graph.block_records() {
-                let public_id = SnapshotRestorePublicId::try_from(record.config().drive_id())
-                    .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
-                resources.push(SnapshotRestoreResourceKey::new(
-                    record.key(),
-                    public_id,
-                    SnapshotRestoreResourceClass::BlockBacking,
-                ));
-            }
-            for record in graph.pmem_records() {
-                let public_id = SnapshotRestorePublicId::try_from(record.config().pmem_id())
-                    .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
-                resources.push(SnapshotRestoreResourceKey::new(
-                    record.key(),
-                    public_id,
-                    SnapshotRestoreResourceClass::PmemBacking,
-                ));
-            }
-        }
-        if serial_count == 1 {
-            let public_id = SnapshotRestorePublicId::try_from(NATIVE_V2_SERIAL_RESTORE_PUBLIC_ID)
-                .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
-            resources.push(SnapshotRestoreResourceKey::new(
-                SnapshotV2DeviceKey::serial(),
-                public_id,
-                SnapshotRestoreResourceClass::SerialSink,
-            ));
-        }
-
-        let mut overrides = Vec::new();
-        overrides
-            .try_reserve_exact(network_count)
-            .map_err(|source| SnapshotRestoreManifestError::AllocationFailed { source })?;
-        if let Some(network) = network {
-            for (index, interface) in network.interfaces().iter().enumerate() {
-                let instance = u32::try_from(index)
-                    .map_err(|_| SnapshotRestoreManifestError::TooManyResources)?;
-                let public_id = SnapshotRestorePublicId::try_from(interface.iface_id())
-                    .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
-                let key = SnapshotRestoreResourceKey::new(
-                    SnapshotV2DeviceKey::network(instance),
-                    public_id,
-                    SnapshotRestoreResourceClass::NetworkPacketIo,
+    /// Derives the complete exact-2.12 storage, configured-serial, network, and
+    /// optional vsock resource set.
+    ///
+    /// The vsock request must use the validated singleton device key, endpoint
+    /// class, and private stable restore identity. It contributes an override
+    /// only when the caller explicitly selected a destination backend.
+    pub fn try_from_native_v2_vsock_state(
+        graph: Option<&SnapshotV2StorageDeviceGraph>,
+        serial: &SnapshotV2SerialState,
+        network: Option<&SnapshotV2NetworkState>,
+        vsock: Option<(&SnapshotRestoreResourceKey, bool)>,
+    ) -> Result<Self, SnapshotRestoreManifestError> {
+        let vsock_count = usize::from(vsock.is_some());
+        let vsock_override_count =
+            usize::from(vsock.is_some_and(|(_, is_overridden)| is_overridden));
+        let (mut resources, mut overrides) = collect_native_v2_network_resources(
+            graph,
+            serial,
+            network,
+            vsock_count,
+            vsock_override_count,
+        )?;
+        if let Some((key, is_overridden)) = vsock {
+            validate_native_v2_vsock_resource_key(key)?;
+            let retained = key
+                .try_clone()
+                .map_err(|source| SnapshotRestoreManifestError::AllocationFailed { source })?;
+            if is_overridden {
+                overrides.push(
+                    retained.try_clone().map_err(|source| {
+                        SnapshotRestoreManifestError::AllocationFailed { source }
+                    })?,
                 );
-                overrides.push(key.clone());
-                resources.push(key);
             }
+            resources.push(retained);
         }
         Self::try_new(resources, overrides)
     }
@@ -591,6 +675,12 @@ pub enum SnapshotRestoreManifestError {
     UnsupportedOverrideClass,
     /// The same exact override occurs more than once.
     DuplicateOverride,
+    /// The exact-2.12 vsock request uses the wrong device-graph key.
+    InvalidVsockDeviceKey,
+    /// The exact-2.12 vsock request uses the wrong resource class.
+    InvalidVsockResourceClass,
+    /// The exact-2.12 vsock request uses the wrong private restore identity.
+    InvalidVsockPublicId,
     /// A graph-derived public identifier could not be retained.
     PublicId {
         /// Public-ID validation or allocation failure.
@@ -616,6 +706,11 @@ impl fmt::Debug for SnapshotRestoreManifestError {
                 "SnapshotRestoreManifestError::UnsupportedOverrideClass"
             }
             Self::DuplicateOverride => "SnapshotRestoreManifestError::DuplicateOverride",
+            Self::InvalidVsockDeviceKey => "SnapshotRestoreManifestError::InvalidVsockDeviceKey",
+            Self::InvalidVsockResourceClass => {
+                "SnapshotRestoreManifestError::InvalidVsockResourceClass"
+            }
+            Self::InvalidVsockPublicId => "SnapshotRestoreManifestError::InvalidVsockPublicId",
             Self::PublicId { .. } => "SnapshotRestoreManifestError::PublicId",
             Self::AllocationFailed { .. } => "SnapshotRestoreManifestError::AllocationFailed",
         })
@@ -637,6 +732,15 @@ impl fmt::Display for SnapshotRestoreManifestError {
                 "snapshot restore resource class does not support an override"
             }
             Self::DuplicateOverride => "snapshot restore manifest contains a duplicate override",
+            Self::InvalidVsockDeviceKey => {
+                "snapshot restore vsock resource uses the wrong device identity"
+            }
+            Self::InvalidVsockResourceClass => {
+                "snapshot restore vsock resource uses the wrong class"
+            }
+            Self::InvalidVsockPublicId => {
+                "snapshot restore vsock resource uses the wrong private identity"
+            }
             Self::PublicId { .. } => "snapshot restore manifest has an invalid public identifier",
             Self::AllocationFailed { .. } => "failed to allocate snapshot restore manifest storage",
         })
@@ -655,7 +759,10 @@ impl std::error::Error for SnapshotRestoreManifestError {
             | Self::UnknownOverride
             | Self::OverrideClassMismatch
             | Self::UnsupportedOverrideClass
-            | Self::DuplicateOverride => None,
+            | Self::DuplicateOverride
+            | Self::InvalidVsockDeviceKey
+            | Self::InvalidVsockResourceClass
+            | Self::InvalidVsockPublicId => None,
         }
     }
 }
@@ -1429,21 +1536,152 @@ mod tests {
     #[test]
     fn exact_2_11_manifest_applies_one_aggregate_resource_ceiling() {
         assert_eq!(
-            checked_native_v2_network_resource_count(48, 0, 16)
+            checked_native_v2_restore_resource_count(48, 0, 16, 0)
                 .expect("storage plus network at the aggregate ceiling should fit"),
             MAX_SNAPSHOT_RESTORE_RESOURCES
         );
         assert_eq!(
-            checked_native_v2_network_resource_count(47, 1, 16)
+            checked_native_v2_restore_resource_count(47, 1, 16, 0)
                 .expect("storage, serial, and network at the aggregate ceiling should fit"),
             MAX_SNAPSHOT_RESTORE_RESOURCES
         );
         assert!(matches!(
-            checked_native_v2_network_resource_count(48, 1, 16),
+            checked_native_v2_restore_resource_count(48, 1, 16, 0),
             Err(SnapshotRestoreManifestError::TooManyResources)
         ));
         assert!(matches!(
-            checked_native_v2_network_resource_count(usize::MAX, 1, 1),
+            checked_native_v2_restore_resource_count(usize::MAX, 1, 1, 0),
+            Err(SnapshotRestoreManifestError::TooManyResources)
+        ));
+    }
+
+    #[test]
+    fn exact_2_12_manifest_adds_one_canonical_optional_vsock_request() {
+        let graph = storage_graph();
+        let serial = serial_state(true);
+        let network = network_state();
+        let vsock = key(
+            5,
+            0,
+            NATIVE_V2_VSOCK_RESTORE_PUBLIC_ID,
+            SnapshotRestoreResourceClass::VsockEndpoint,
+        );
+        let without_override = SnapshotRestoreManifest::try_from_native_v2_vsock_state(
+            Some(&graph),
+            &serial,
+            Some(&network),
+            Some((&vsock, false)),
+        )
+        .expect("captured-selector vsock manifest should validate");
+        assert_eq!(
+            without_override.len(),
+            graph.record_count() + 1 + network.interfaces().len() + 1
+        );
+        assert!(!without_override.is_overridden(&vsock));
+        assert_eq!(
+            without_override
+                .resources()
+                .iter()
+                .filter(|key| key.resource_class() == SnapshotRestoreResourceClass::VsockEndpoint)
+                .count(),
+            1
+        );
+
+        let overridden = SnapshotRestoreManifest::try_from_native_v2_vsock_state(
+            Some(&graph),
+            &serial,
+            Some(&network),
+            Some((&vsock, true)),
+        )
+        .expect("overridden vsock manifest should validate");
+        assert!(overridden.is_overridden(&vsock));
+        assert_eq!(
+            overridden.overrides().count(),
+            network.interfaces().len() + 1
+        );
+
+        let without_vsock = SnapshotRestoreManifest::try_from_native_v2_vsock_state(
+            Some(&graph),
+            &serial,
+            Some(&network),
+            None,
+        )
+        .expect("vsock-free exact-2.12 manifest should validate");
+        let exact_2_11 = SnapshotRestoreManifest::try_from_native_v2_network_state(
+            Some(&graph),
+            &serial,
+            Some(&network),
+        )
+        .expect("equivalent exact-2.11 manifest should validate");
+        assert_eq!(without_vsock.resources(), exact_2_11.resources());
+        assert_eq!(
+            without_vsock.overrides().collect::<Vec<_>>(),
+            exact_2_11.overrides().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn exact_2_12_manifest_rejects_wrong_vsock_identity_and_bounds_product() {
+        let serial = serial_state(false);
+        let wrong_device = key(
+            4,
+            0,
+            NATIVE_V2_VSOCK_RESTORE_PUBLIC_ID,
+            SnapshotRestoreResourceClass::VsockEndpoint,
+        );
+        assert!(matches!(
+            SnapshotRestoreManifest::try_from_native_v2_vsock_state(
+                None,
+                &serial,
+                None,
+                Some((&wrong_device, false)),
+            ),
+            Err(SnapshotRestoreManifestError::InvalidVsockDeviceKey)
+        ));
+
+        let wrong_class = key(
+            5,
+            0,
+            NATIVE_V2_VSOCK_RESTORE_PUBLIC_ID,
+            SnapshotRestoreResourceClass::NetworkPacketIo,
+        );
+        assert!(matches!(
+            SnapshotRestoreManifest::try_from_native_v2_vsock_state(
+                None,
+                &serial,
+                None,
+                Some((&wrong_class, false)),
+            ),
+            Err(SnapshotRestoreManifestError::InvalidVsockResourceClass)
+        ));
+
+        let wrong_public_id = key(
+            5,
+            0,
+            "private-vsock",
+            SnapshotRestoreResourceClass::VsockEndpoint,
+        );
+        assert!(matches!(
+            SnapshotRestoreManifest::try_from_native_v2_vsock_state(
+                None,
+                &serial,
+                None,
+                Some((&wrong_public_id, false)),
+            ),
+            Err(SnapshotRestoreManifestError::InvalidVsockPublicId)
+        ));
+
+        assert_eq!(
+            checked_native_v2_restore_resource_count(46, 1, 16, 1)
+                .expect("complete exact-2.12 product at the aggregate ceiling should fit"),
+            MAX_SNAPSHOT_RESTORE_RESOURCES
+        );
+        assert!(matches!(
+            checked_native_v2_restore_resource_count(47, 1, 16, 1),
+            Err(SnapshotRestoreManifestError::TooManyResources)
+        ));
+        assert!(matches!(
+            checked_native_v2_restore_resource_count(usize::MAX, 1, 1, 1),
             Err(SnapshotRestoreManifestError::TooManyResources)
         ));
     }
