@@ -126,10 +126,10 @@ connectivity.
 Aggregate network/MMDS reconciliation additionally requires
 `network_mmds_closure_policy_is_stable`. The checked
 [network and MMDS ledger](../compat/firecracker/v1.16.0/network-mmds-contract.md)
-pins exactly 35 identities, 31 terminal outcomes, four named downstream
+pins exactly 35 identities, 33 terminal outcomes, two named downstream
 handoffs, the direct MMIO/PCI transport cases above, signed process isolation
-and hotplug, signed capture-ready traversal, contained production ownership,
-and the credential-free vmnet preflight block. These layers compose the
+and hotplug, signed capture and exact-2.11 restore, contained production
+ownership, and the credential-free vmnet preflight block. These layers compose the
 aggregate claim; the repository still does not treat a blocked credential gate
 as positive #1378 connectivity evidence.
 
@@ -563,12 +563,13 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
 production catalog admits semantic memory kind 1 introduced in minor 1; the
-current `2.10.0` writer additionally admits machine/global/topology kinds 2–4
+current `2.11.0` writer additionally admits machine/global/topology kinds 2–4
 and per-vCPU kind 5 introduced in minor 2, singleton time kind 6 introduced in
 minor 3, optional singleton device-graph kind 7 introduced in minor 4, and
 mandatory singleton serial kind 8 introduced in minor 7, plus optional entropy
 kind 9 introduced in minor 8, optional balloon kind 10 introduced in minor 9,
-and optional virtio-mem kind 11 introduced in minor 10.
+optional virtio-mem kind 11 introduced in minor 10, and optional network/MMDS
+kind 12 introduced in minor 11.
 Exact `2.4.0` retains device-graph profile 1's singleton root, while `2.5.0`
 uses profile 2's bounded ordered block vector and `2.6.0` uses profile 3's
 bounded ordered block-and-pmem vector. Exact `2.7.0` requires kind 8 and
@@ -580,7 +581,12 @@ pending statistics, DONE-normalized hint history, exact PFN accounting, and
 MMIO/PCI placement. Exact `2.10.0` retains those rules and optionally appends
 kind 11 with configuration, config space, an inactive or active queue, a canonical
 plugged-block bitmap bound to exact kind-1 extents, common virtio state, and
-MMIO/PCI placement. Exact `2.3.0` remains the
+MMIO/PCI placement. Exact `2.11.0` retains those rules and optionally appends
+kind 12 with ordered interface configuration, inert selector identity,
+requested/realized MAC/MTU, backend class, queue/common-virtio state,
+limiter/retry, MMIO/PCI placement, and MMDS protocol configuration while
+excluding source owners, packets, connections, data, tokens, metrics, and
+clocks. Exact `2.3.0` remains the
 legacy device-free platform profile. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
 lengths, all three offsets, CRC and every truncation, feature
@@ -593,7 +599,7 @@ resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
 Native-v2 lazy-memory tests retain exact multi-extent binding and complete
-`2.1.0` compatibility fixtures while proving that new output uses `2.10.0`.
+`2.1.0` compatibility fixtures while proving that new output uses `2.11.0`.
 They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
 binding/header/topology/length mutation, exact admitted-version retention,
 typed state profiles,
@@ -671,7 +677,7 @@ The wrapper builds the `bangbang` binary unit-test harness, locates and signs
 that exact test executable, and runs only the ignored private-seam proof. Its
 minimal two-vCPU guest does not touch serial or optional devices beyond the
 required read-only root. The first test starts and pauses the real
-process-owned HVF supervisor, publishes one current 2.10
+process-owned HVF supervisor, publishes one current 2.11
 serial-plus-profile-3 MMIO-root pair without entropy, resumes and repauses the
 source, publishes a fresh recapture,
 and drops the source. It
@@ -1346,11 +1352,15 @@ activates exact native-v2 2.8 with optional entropy, and #1666 promotes the
 two entropy artifact/restore records after direct and normal-production
 continuation certification. #1680 activates exact native-v2 2.9 with optional
 balloon, and #1681 promotes the two balloon aggregate records after direct and
-normal-production continuation certification. #1697 activates current
+normal-production continuation certification. #1697 activates exact
 native-v2 2.10 with optional virtio-mem, and #1698 promotes only the
 memory-hotplug corpus and virtio-mem lifecycle aggregate after direct and
-normal-production continuation certification. The current overlay is
-242/156/3/17.
+normal-production continuation certification. #1715 activates current
+native-v2 2.11 with optional network/MMDS kind 12; #1716 promotes exactly the
+network override property, snapshot-network-clones corpus, MMDS user-guide
+corpus, and MMDS TCP/token/session aggregate after direct and
+normal-production/App Sandbox continuation certification. The current overlay
+is 246/152/3/17.
 
 Snapshot paging feasibility, its standalone protocol/client, internal
 lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
@@ -1686,7 +1696,7 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
-- exact external snapshot grants creating current native-v2 2.10
+- exact external snapshot grants creating current native-v2 2.11
   serial-plus-profile-3 rooted three-drive MMIO and PCI pairs without entropy
   into separate output directories, reusing both retained
   directories for a second successful pair, preserving all finals on
@@ -1891,9 +1901,9 @@ punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
 separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
-checks exact `v2.10.0` output for `--snapshot-version`, exact description of
+checks exact `v2.11.0` output for `--snapshot-version`, exact description of
 native-v1, legacy `2.3.0`, `2.4.0`, `2.5.0`, `2.6.0`, `2.7.0`, `2.8.0`, and
-`2.9.0`, and current native-v2 fixtures, plus explicit pinned
+`2.9.0`, `2.10.0`, and current native-v2 fixtures, plus explicit pinned
 Firecracker/unknown incompatibility. It also
 covers missing, non-regular,
 oversized, malformed, truncated, trailing/inconsistent-length, corrupt,
@@ -1948,7 +1958,7 @@ pausing, proving the source has already followed live MMIO or PCI root I/O.
 The source UART must remain canonical, while its Linux-consumed FDT bytes are
 captured and CRC-bound without being reparsed as trusted post-boot topology.
 Creation through `/snapshot/create` then verifies the real CLI reports
-`v2.10.0`. Fresh signed processes repeatedly load the same immutable pair: one
+`v2.11.0`. Fresh signed processes repeatedly load the same immutable pair: one
 remains paused until public `PATCH /vm`, and one uses `resume_vm: true`. The
 paused destination is also publicly recaptured and its decoded root graph must
 equal the source graph. After resume Linux reads the known root marker through
@@ -2185,6 +2195,48 @@ scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
   --nocapture
 scripts/run-integration-tests.sh --test production_bundle -- \
   normal_bundle_certifies_native_v2_memory_hotplug_snapshot_continuation_and_containment \
+  --nocapture
+```
+
+Exact native-v2 2.11 network/MMDS continuation is certified separately by
+`signed_executable_certifies_native_v2_network_mmds_snapshot_continuation` and
+`normal_bundle_certifies_native_v2_network_mmds_snapshot_continuation_and_containment`.
+Both loop over MMIO and PCI with MMDS V1 and V2 sources. The checked guest
+confirms its restored virtio device, fixed MAC, 1280-byte MTU, and transport,
+fetches source data, retains a half-open source TCP connection and (for V2) a
+source token, then signals capture readiness.
+
+The source publishes exact kind 12 and terminates while Paused. One destination
+uses a distinct complete clone-local selector set, remains Paused, recaptures
+normalized state, and explicitly resumes; a second destination uses another
+selector and automatic resume. Before reseeding, host GET returns exact JSON
+`null`. After reseeding, the guest proves the source connection is lost, the
+source V2 token returns `401`, and a fresh V1 session or newly minted V2 token
+retrieves only destination data. State and memory stay byte-identical, and each
+destination exposes fresh metrics and owners.
+
+The normal production/App Sandbox case repeats the four transport/version cells
+through exact snapshot and API grants with every pathname replaced after open.
+Its representative MMIO/V2 failures use independent contained processes for
+missing, duplicate, and unknown overrides, checksum-corrupted state, truncated
+memory, graceful SIGTERM cancellation, worker-first death, and launcher-first
+death. Selector/path contents stay redacted; no failed case publishes a VM or
+metrics, mutates the valid state/memory pair, retains a private namespace, or
+consumes vmnet authority. Later valid destinations prove retry and cleanup.
+Focused lower-layer tests pin the `BANGNW2\0`, `BANGNI2\0`, and `BANGMD2\0`
+codecs, 16-interface and 83,552-byte worst-case bounds, 512-KiB component and
+16-MiB state caps, all 32 products, exact override-set validation, placement,
+resource construction, cancellation, rollback, redaction, and exact 2.3–2.10
+readers.
+
+Run the focused signed proofs with:
+
+```sh
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  signed_executable_certifies_native_v2_network_mmds_snapshot_continuation \
+  --nocapture
+scripts/run-integration-tests.sh --test production_bundle -- \
+  normal_bundle_certifies_native_v2_network_mmds_snapshot_continuation_and_containment \
   --nocapture
 ```
 
@@ -2715,10 +2767,11 @@ outside positive signed vmnet evidence because the signed cases intentionally
 open no vmnet interface. Portable checksum/segmentation semantics, merged RX,
 ring behavior, limiter/backend metrics, bounded MMDS TCP sessions, and merged
 protocol/limiter scheduling have focused unsigned coverage plus signed MMIO and
-PCI MMDS-only packet-path evidence. Positive direct-header vmnet I/O, automatic
-PCI notification, external connectivity, and network/MMDS snapshot encoding
-and restore remain outside the signed boundary as described by their owning
-issues; deterministic capture-ready state is covered separately.
+PCI MMDS-only packet-path evidence. Exact native-v2 2.11 network/MMDS encoding,
+restore, and clone-session freshness have the separate signed direct and
+contained matrix above. Positive direct-header vmnet I/O, automatic PCI
+notification, and external connectivity remain outside the signed boundary as
+described by their owning issues.
 
 For block specifically, this evidence validates the supported public
 file-backed subset over MMIO by default or PCI with `--enable-pci`, including

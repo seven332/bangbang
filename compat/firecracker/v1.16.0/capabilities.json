@@ -2014,7 +2014,7 @@
     {
       "id": "api-path:/pmem/{id}",
       "family": "api-contract",
-      "summary": "Provide the complete currently applicable /pmem/{id} control-plane path: strict pre-boot configuration including deterministic root boot, PCI-only Running/Paused non-root PUT and bodyless DELETE transactions, and post-boot limiter PATCH. The path validates matching IDs, strict fields, and the one-block-or-pmem-root invariant before authority use; preserves the public projection until live commits succeed; preflights owner capacity before grant/open/map work; maps the retained file/private-tail range directly into HVF; synchronizes exactly the file prefix; redacts backing, descriptor, grant, and address details; and retains default-MMIO and runtime-root mutation as stable nonmutating rejections. Aggregate live storage and native-v2 profile-3 pmem create/load certification are complete in exact 2.6 and current 2.7.",
+      "summary": "Provide the complete currently applicable /pmem/{id} control-plane path: strict pre-boot configuration including deterministic root boot, PCI-only Running/Paused non-root PUT and bodyless DELETE transactions, and post-boot limiter PATCH. The path validates matching IDs, strict fields, and the one-block-or-pmem-root invariant before authority use; preserves the public projection until live commits succeed; preflights owner capacity before grant/open/map work; maps the retained file/private-tail range directly into HVF; synchronizes exactly the file prefix; redacts backing, descriptor, grant, and address details; and retains default-MMIO and runtime-root mutation as stable nonmutating rejections. Aggregate live storage and native-v2 profile-3 pmem create/load certification are complete from exact 2.6 through current 2.11.",
       "source_refs": [
         "api-path:/pmem/{id}"
       ],
@@ -6492,11 +6492,45 @@
     {
       "id": "api-property:SnapshotLoadParams.network_overrides",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.network_overrides.",
+      "summary": "Exact native-v2 2.11 network loads require one clone-local backend selector override for every saved interface. Missing, duplicate, and unknown interface IDs are rejected before publication; selector contents are redacted, never encoded in a destination snapshot, and never reused as host authority.",
       "source_refs": [
         "api-property:SnapshotLoadParams.network_overrides"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "snapshot network override parsing and redacted request values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "native-v2 2.11 network override planning, resource preparation, and publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "exact complete clone-local override-set validation and canonicalization"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_network_mmds_snapshot_continuation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_network_mmds_snapshot_continuation_and_containment"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "missing duplicate unknown redaction and exact-order override tests"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotLoadParams.resume_vm",
@@ -7967,7 +8001,7 @@
     {
       "id": "api-schema:Pmem",
       "family": "api-contract",
-      "summary": "Implement the strict Firecracker Pmem shape with matching ID, required nonempty backing, default false root/read-only flags, optional limiter, exact configuration projection, direct or typed contained ownership, one file/private-tail mapping, deterministic root selection, MMIO/PCI startup, PCI runtime PUT/PATCH/DELETE/reuse, exact-prefix flush, rollback, redaction, metrics, cleanup, and native-v2 profile-3 serialization and restore in exact 2.6 and current 2.7.",
+      "summary": "Implement the strict Firecracker Pmem shape with matching ID, required nonempty backing, default false root/read-only flags, optional limiter, exact configuration projection, direct or typed contained ownership, one file/private-tail mapping, deterministic root selection, MMIO/PCI startup, PCI runtime PUT/PATCH/DELETE/reuse, exact-prefix flush, rollback, redaction, metrics, cleanup, and native-v2 profile-3 serialization and restore from exact 2.6 through current 2.11.",
       "source_refs": [
         "api-schema:Pmem"
       ],
@@ -8566,7 +8600,7 @@
     {
       "id": "corpus:device-hotplug",
       "family": "runtime-device-management",
-      "summary": "Implement the complete pinned Developer Preview live-device contract for non-root virtio-block, virtio-pmem, and virtio-net under public all-virtio PCI. Running and Paused PUT/DELETE use one failure-atomic owner inventory, require manual guest rescan/removal, preserve type-scoped IDs and global network-MAC uniqueness, commit live configuration last, and release exact backing, packet-I/O, mapping, metrics, scheduler, dispatcher, BAR, MSI-X, and function ownership before shared capacity is reusable. Default MMIO rejects runtime mutation. Automatic guest notification remains outside the pinned live corpus, and native-v1 retains no PCI state. Exact native-v2 2.6 and current 2.7 persist startup- or runtime-origin regular-file block and pmem endpoints; network and every other optional device remain excluded.",
+      "summary": "Implement the complete pinned Developer Preview live-device contract for non-root virtio-block, virtio-pmem, and virtio-net under public all-virtio PCI. Running and Paused PUT/DELETE use one failure-atomic owner inventory, require manual guest rescan/removal, preserve type-scoped IDs and global network-MAC uniqueness, commit live configuration last, and release exact backing, packet-I/O, mapping, metrics, scheduler, dispatcher, BAR, MSI-X, and function ownership before shared capacity is reusable. Default MMIO rejects runtime mutation. Automatic guest notification remains outside the pinned live corpus, and native-v1 retains no PCI state. Exact native-v2 2.6 through current 2.11 retain startup- or runtime-origin regular-file block and pmem endpoints; current 2.11 additionally retains portable network/MMDS state while reconstructing fresh destination backend authority.",
       "source_refs": [
         "corpus:device-hotplug"
       ],
@@ -8820,7 +8854,7 @@
     {
       "id": "corpus:memory-hotplug",
       "family": "memory-devices",
-      "summary": "The applicable pinned Firecracker v1.16 virtio-mem corpus is implemented and verified: strict API sizing/status, block-granular STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe shared-aperture/HVF/dirty ownership, exact rollback, best-effort discard, metrics, MMIO/PCI capture and restoration, failures, and cleanup. Exact native-v2 2.10 optional kind 11 retains bounded configuration, features, config space, queue cursors, transport, and canonical plugged topology across all sixteen optional-product combinations. File/COW restore gives every destination private base RAM plus one fresh shared reservation with block-granular plugged views. Signed direct and normal-production/App Sandbox MMIO/PCI guests verify nonzero plugged-memory sentinels before mutation, then continue partial UNPLUG, reprobe UNPLUG_ALL/replug, PLUG, and final UNPLUG through explicit-Paused/recapture and automatic fresh-process clones. Same-process peers load one immutable pair independently; malformed/cancellation/death cases clean all unpublished authority. Diff, native-v2 Uffd, network/vsock/MMDS restore, Firecracker artifact bytes, source owner/dirty identity, synchronous RSS, and unconstrained cross-host portability are not claimed.",
+      "summary": "The applicable pinned Firecracker v1.16 virtio-mem corpus is implemented and verified: strict API sizing/status, block-granular STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe shared-aperture/HVF/dirty ownership, exact rollback, best-effort discard, metrics, MMIO/PCI capture and restoration, failures, and cleanup. Exact native-v2 2.10 optional kind 11 retains bounded configuration, features, config space, queue cursors, transport, and canonical plugged topology across all sixteen optional-product combinations; current 2.11 carries that state unchanged when network/MMDS is present. File/COW restore gives every destination private base RAM plus one fresh shared reservation with block-granular plugged views. Signed direct and normal-production/App Sandbox MMIO/PCI guests verify nonzero plugged-memory sentinels before mutation, then continue partial UNPLUG, reprobe UNPLUG_ALL/replug, PLUG, and final UNPLUG through explicit-Paused/recapture and automatic fresh-process clones. Same-process peers load one immutable pair independently; malformed/cancellation/death cases clean all unpublished authority. Diff, native-v2 Uffd, vsock restore, Firecracker artifact bytes, source owner/dirty identity, synchronous RSS, and unconstrained cross-host portability are not claimed.",
       "source_refs": [
         "corpus:memory-hotplug"
       ],
@@ -8945,11 +8979,50 @@
     {
       "id": "corpus:mmds-user-guide",
       "family": "network-and-mmds",
-      "summary": "Live host GET/PUT/PATCH, preboot interface/IP/version/format configuration, guest V1/V2 token sessions, JSON-pointer and IMDS responses, isolation, limits, and capture-ready producer state are implemented. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns artifact encoding, persisted MMDS version/network-stack configuration, restore compatibility, data reseeding, and fresh clone session behavior.",
+      "summary": "Live host GET/PUT/PATCH, preboot interface/IP/version/format configuration, guest V1/V2 token sessions, JSON-pointer and IMDS responses, isolation, limits, and capture-ready producer state are implemented. Exact native-v2 2.11 persists MMDS selection and protocol configuration while deliberately omitting data, token keys, tokens, TCP/ARP sessions, packets, and host clocks; signed MMIO/PCI direct and contained clones prove an empty destination store, explicit reseeding, invalid old V2 tokens, lost TCP sessions, and successful fresh V1/V2 sessions.",
       "source_refs": [
         "corpus:mmds-user-guide"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fresh destination MMDS datastore token authority stack and metrics construction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "bounded MMDS data and V1/V2 configuration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "fresh empty MMDS destination projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_v2_11.rs",
+          "anchor": "exact MMDS protocol configuration encoding with data and session exclusion"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed native-v2 2.11 empty reseeded old-session-loss and fresh-session proof"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained native-v2 2.11 V1 V2 clone and cleanup proof"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "MMDS V1 V2 session isolation flow-control and retransmission tests"
+        }
+      ]
     },
     {
       "id": "corpus:network-performance",
@@ -8963,7 +9036,7 @@
     {
       "id": "corpus:network-setup",
       "family": "network-and-mmds",
-      "summary": "Applicable guest device configuration, MAC/MTU identity, vmnet host/shared/bridged policy, bounded ingress/egress ownership, cleanup, and operator firewall guidance are implemented. External gate https://github.com/seven332/bangbang/issues/1378 owns positive production vmnet connectivity and credentialed failure/cleanup evidence; Wave 6 https://github.com/seven332/bangbang/issues/1490 owns restored backend identity, portability, and concurrent clone network policy.",
+      "summary": "Applicable guest device configuration, MAC/MTU identity, vmnet host/shared/bridged policy, bounded ingress/egress ownership, cleanup, and operator firewall guidance are implemented. Exact native-v2 2.11 restores portable network configuration through complete clone-local overrides and fresh backend/MMDS ownership, with signed direct and contained clone evidence. External gate https://github.com/seven332/bangbang/issues/1378 owns positive production vmnet connectivity and credentialed failure, cleanup, and concurrent-session evidence.",
       "source_refs": [
         "corpus:network-setup"
       ],
@@ -9058,7 +9131,7 @@
     {
       "id": "corpus:pmem",
       "family": "storage",
-      "summary": "The applicable pinned pmem corpus is implemented and verified: strict live API, direct file/private-tail mapping, deterministic root, read-only protection, limiting, exact-prefix persistence, capture-ready traversal, PCI hotplug/delete/range reuse, rollback, metrics, cleanup, direct ownership, contained descriptor authority, and native-v2 profile-3 serialization and restore in exact 2.6 and current 2.7. Signed direct and normal-production MMIO/PCI matrices certify rooted pmem-only and rootless mixed-storage guests, immutable state/memory reuse, shared writable prefixes, fresh zero private tails, read-only peers, limiter continuation, recapture, and cleanup. DAX choice, host paging/RSS/eviction, same-backing sharing, side-channel risk, operator serialization, and cross-host portability remain documented policy rather than Linux numeric or Firecracker-artifact promises.",
+      "summary": "The applicable pinned pmem corpus is implemented and verified: strict live API, direct file/private-tail mapping, deterministic root, read-only protection, limiting, exact-prefix persistence, capture-ready traversal, PCI hotplug/delete/range reuse, rollback, metrics, cleanup, direct ownership, contained descriptor authority, and native-v2 profile-3 serialization and restore from exact 2.6 through current 2.11. Signed direct and normal-production MMIO/PCI matrices certify rooted pmem-only and rootless mixed-storage guests, immutable state/memory reuse, shared writable prefixes, fresh zero private tails, read-only peers, limiter continuation, recapture, and cleanup. DAX choice, host paging/RSS/eviction, same-backing sharing, side-channel risk, operator serialization, and cross-host portability remain documented policy rather than Linux numeric or Firecracker-artifact promises.",
       "source_refs": [
         "corpus:pmem"
       ],
@@ -9301,11 +9374,55 @@
     {
       "id": "corpus:snapshot-network-clones",
       "family": "snapshots",
-      "summary": "Audit all applicable capability claims owned by the pinned snapshot-network-clones source corpus.",
+      "summary": "Exact native-v2 2.11 serializes portable network/MMDS device state and requires a complete clone-local network override set at every load. Signed direct and production/App Sandbox MMIO/PCI V1/V2 sources through explicit-Paused and automatic destinations prove fresh backend/MMDS ownership, immutable state and memory, empty-and-reseeded MMDS data, lost source TCP/token sessions, retry after validation or process failure, redaction, and cleanup. External peer packets, live connections, host backend authority, and broader artifact or host portability remain explicit non-claims.",
       "source_refs": [
         "corpus:snapshot-network-clones"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public native-v2 2.11 create load resource commit retry and cleanup"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_network_platform.rs",
+          "anchor": "fresh coherent MMIO and PCI network owner reconstruction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_artifact.rs",
+          "anchor": "exact native-v2 2.11 artifact admission and memory binding"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "clone-local override planning and owner-free restore values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_v2_11.rs",
+          "anchor": "bounded exact network and MMDS kind-12 codec"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct MMIO PCI V1 V2 explicit and automatic clone proof"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained immutable clone redaction failure death retry and cleanup proof"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_v2_11/tests.rs",
+          "anchor": "fixed codec capacity graph and hostile mutation tests"
+        }
+      ]
     },
     {
       "id": "corpus:snapshot-page-faults",
@@ -10875,7 +10992,7 @@
     {
       "id": "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
       "family": "memory-devices",
-      "summary": "Virtio-mem lifecycle, accounting, state, and restore semantics are implemented and verified. Live sizing/status, STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe guest/HVF mappings, dirty metadata, exact reverse rollback, best-effort discard, singleton metrics, opaque shared-aperture identity, MMIO/PCI ownership, failures, cleanup, and stable vhost coexistence are complete. Exact native-v2 2.10 kind 11 canonically binds configuration, features, config space, active/inactive queue state, plugged bitmap/ranges, transport, and unchanged kind-1 memory extents. Restore validates the complete state/memory pair before publication, creates fresh private base RAM and a destination-local shared aperture, copies only plugged bytes into block-granular views, installs a clean dirty epoch, and reconstructs fresh device/interrupt/dispatcher/route/cleanup owners. Signed Linux destinations first verify retained nonzero plugged-memory bytes, then continue partial UNPLUG, driver-reprobe UNPLUG_ALL, re-PLUG, growth, and final UNPLUG over MMIO and PCI through direct and contained explicit/automatic clones. Normalized recapture, immutable same-process and fresh-process pairs, malformed input, cancellation, death ordering, redaction, and cleanup are covered. Diff, native-v2 Uffd, network/vsock/MMDS restore, Firecracker artifact bytes, source owner/dirty identity, synchronous RSS, and unconstrained cross-host portability remain explicit non-claims.",
+      "summary": "Virtio-mem lifecycle, accounting, state, and restore semantics are implemented and verified. Live sizing/status, STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe guest/HVF mappings, dirty metadata, exact reverse rollback, best-effort discard, singleton metrics, opaque shared-aperture identity, MMIO/PCI ownership, failures, cleanup, and stable vhost coexistence are complete. Exact native-v2 2.10 kind 11 canonically binds configuration, features, config space, active/inactive queue state, plugged bitmap/ranges, transport, and unchanged kind-1 memory extents; current 2.11 composes it unchanged with optional network/MMDS state. Restore validates the complete state/memory pair before publication, creates fresh private base RAM and a destination-local shared aperture, copies only plugged bytes into block-granular views, installs a clean dirty epoch, and reconstructs fresh device/interrupt/dispatcher/route/cleanup owners. Signed Linux destinations first verify retained nonzero plugged-memory bytes, then continue partial UNPLUG, driver-reprobe UNPLUG_ALL, re-PLUG, growth, and final UNPLUG over MMIO and PCI through direct and contained explicit/automatic clones. Normalized recapture, immutable same-process and fresh-process pairs, malformed input, cancellation, death ordering, redaction, and cleanup are covered. Diff, native-v2 Uffd, vsock restore, Firecracker artifact bytes, source owner/dirty identity, synchronous RSS, and unconstrained cross-host portability remain explicit non-claims.",
       "source_refs": [
         "corpus:memory-hotplug"
       ],
@@ -11007,17 +11124,61 @@
     {
       "id": "semantic.mmds:tcp-token-session-and-isolation",
       "family": "network-and-mmds",
-      "summary": "Firecracker-shaped MMDS V1/V2 HTTP behavior, stateless AES-256-GCM tokens bound to immutable instance identity, independent bounded per-interface TCP sessions, flow control, segmentation, retransmission, timeout, eviction, reset, metrics, capture-ready state, and signed lossy isolation are implemented. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns artifact encoding, restore reconstruction, compatibility, data reseeding, and fresh clone token/session behavior.",
+      "summary": "Firecracker-shaped MMDS V1/V2 HTTP behavior, stateless AES-256-GCM tokens bound to immutable instance identity, independent bounded per-interface TCP sessions, flow control, segmentation, retransmission, timeout, eviction, reset, metrics, capture-ready state, and signed lossy isolation are implemented. Exact native-v2 2.11 records protocol configuration but not MMDS data, keys, tokens, TCP/ARP sessions, packets, or deadlines; every clone reconstructs fresh bounded stacks and metrics. Signed V1/V2 MMIO/PCI direct and contained destinations prove explicit reseeding, source-connection loss, old-token rejection, fresh-token success, and cross-clone isolation.",
       "source_refs": [
         "corpus:mmds-design",
         "corpus:mmds-user-guide"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fresh clone MMDS store token stack scheduler and metric ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "per-interface MMDS packet and scheduler isolation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_tcp/mod.rs",
+          "anchor": "bounded independent MMDS TCP sessions flow control and timeout"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_token.rs",
+          "anchor": "instance-bound stateless AES-256-GCM V2 token authority"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_v2_11.rs",
+          "anchor": "MMDS protocol configuration encoding with TCP token data packet and clock exclusion"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed source TCP and token loss plus fresh destination session proof"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed MMIO and PCI V1 V2 segmentation retransmission and token isolation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained V1 V2 source-session loss and clone isolation proof"
+        }
+      ]
     },
     {
       "id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
       "family": "network-and-mmds",
-      "summary": "Virtio-net queues, portable headers/offloads, merged RX, typed vmnet results, generation-scoped callback readiness, bounded batches, limiters, metrics, MMDS ordering, PCI lifecycle, capture-ready state, contained policy, and cleanup are implemented. External gate https://github.com/seven332/bangbang/issues/1378 owns positive connectivity and credentialed service/crash evidence; Wave 6 https://github.com/seven332/bangbang/issues/1490 owns encoding, overrides, restore, portability, and clone identity; Wave 7 https://github.com/seven332/bangbang/issues/1491 owns final performance and observability closure.",
+      "summary": "Virtio-net queues, portable headers/offloads, merged RX, typed vmnet results, generation-scoped callback readiness, bounded batches, limiters, metrics, MMDS ordering, PCI lifecycle, capture-ready state, contained policy, and cleanup are implemented. Exact native-v2 2.11 encoding, complete clone-local overrides, fresh-owner restore, and signed direct and contained clone identity are implemented. External gate https://github.com/seven332/bangbang/issues/1378 owns positive connectivity and credentialed service/crash evidence; Wave 7 https://github.com/seven332/bangbang/issues/1491 owns final performance and observability closure.",
       "source_refs": [
         "corpus:network-performance",
         "corpus:network-setup",
@@ -11218,7 +11379,7 @@
     {
       "id": "semantic.snapshot:multi-vcpu-drives-devices-and-mmds",
       "family": "snapshots",
-      "summary": "The current native-v2 2.7 Full/File profile serializes and restores a complete typed 1–32-vCPU platform with GIC, topology, timers, portable time/identity, applied CPU evidence, complete serial state, and an optional rooted or rootless ordered regular-file storage vector containing block and pmem devices with exact configuration, runtime, limiter/retry, queue, interrupt, mapping, and MMIO or PCI transport state plus complete destination backing authority. Signed direct and contained product matrices certify serial-only and storage-bearing UART/RX/TX continuation, fresh endpoints, active block-and-pmem persistence, recapture, immutable state/memory, deliberate shared writable external prefixes, volatile private pmem tails, finite failure classification, and cleanup. It deliberately excludes vhost-user, optional devices other than pmem and serial, MMDS, and boot timer. Generalized typed remaining-device restore-resource preparation and signed exact contained root-plus-vsock transaction evidence cover coherent authority, failure atomicity, one-time adoption, cleanup, replacement, redaction, and concurrency, but those other optional-device/MMDS codecs, artifact placement, public load invocation, resource binding, and restored-guest outcomes remain under audit.",
+      "summary": "The current native-v2 2.11 Full/File profile serializes and restores a complete typed 1–32-vCPU platform with GIC, topology, timers, portable time/identity, applied CPU evidence, required serial state, and independently optional rooted/rootless regular-file storage, entropy, balloon, virtio-mem, and network/MMDS state over coherent MMIO or PCI. Signed direct and contained product matrices certify all 32 optional-component products, exact clone-local network overrides, fresh destination owners, guest continuation, recapture, immutable state/memory, deliberate shared writable external prefixes, volatile private pmem tails, lossy network/MMDS sessions, finite failure classification, and cleanup. It deliberately excludes vhost-user, vsock, boot timer, source backend/session authority, Diff/native-v2 Uffd, and Firecracker artifact compatibility. The aggregate remains audit-required for vsock encoding and public restore, editing/tools, broader version evolution, and unconstrained artifact or host portability.",
       "source_refs": [
         "corpus:snapshot-support"
       ],
@@ -11227,7 +11388,7 @@
     {
       "id": "semantic.snapshot:network-vsock-overrides-portability-and-clones",
       "family": "snapshots",
-      "summary": "The public native-v2 minimal profile implements clone time/identity rules, compatible native version dispatch, and repeated isolated File/COW destinations. Network and vsock capture producers plus pre-access override/resource preparation exist, but Wave 6 https://github.com/seven332/bangbang/issues/1490 still owns their encoding/placement, public load invocation, restored connectivity and acknowledgement, override behavior, editing/version evolution, and broader artifact/host portability.",
+      "summary": "The public native-v2 profile implements clone time/identity rules, compatible native version dispatch, and repeated isolated File/COW destinations. Exact 2.11 implements portable network/MMDS encoding and MMIO/PCI placement, complete clone-local network overrides, fresh destination ownership, lossy source session semantics, public load invocation, and signed direct/contained restored-guest acknowledgement. Vsock capture and pre-access override/resource preparation exist, but Wave 6 https://github.com/seven332/bangbang/issues/1490 still owns vsock encoding and public restore, editing/version evolution, Firecracker artifact evolution, and broader artifact/host portability.",
       "source_refs": [
         "corpus:snapshot-network-clones",
         "corpus:snapshot-random-clones",
@@ -11305,7 +11466,7 @@
     {
       "id": "semantic.storage:pmem-root-mapping-flush-and-state",
       "family": "storage",
-      "summary": "Selected MMIO/PCI activation, deterministic pmem root, runtime PCI attach/update/delete, one authoritative file/private-tail mapping, exact-prefix persistence, limiting/retry, capacity preflight, exact cleanup, direct or contained descriptor authority, metrics, capture-ready state, and native-v2 profile-3 serialization and restore in exact 2.6 and current 2.7 are implemented and verified. Signed direct and normal-production matrices prove rooted pmem-only and rootless mixed-storage continuation, immutable state/memory reuse, shared writable prefixes, zero private tails on every fresh mapping, read-only protection, recapture, cancellation/fault cleanup, and exact grant ownership. This makes no Firecracker artifact, automatic migration, or broad host-portability claim.",
+      "summary": "Selected MMIO/PCI activation, deterministic pmem root, runtime PCI attach/update/delete, one authoritative file/private-tail mapping, exact-prefix persistence, limiting/retry, capacity preflight, exact cleanup, direct or contained descriptor authority, metrics, capture-ready state, and native-v2 profile-3 serialization and restore from exact 2.6 through current 2.11 are implemented and verified. Signed direct and normal-production matrices prove rooted pmem-only and rootless mixed-storage continuation, immutable state/memory reuse, shared writable prefixes, zero private tails on every fresh mapping, read-only protection, recapture, cancellation/fault cleanup, and exact grant ownership. This makes no Firecracker artifact, automatic migration, or broad host-portability claim.",
       "source_refs": [
         "corpus:pmem"
       ],
@@ -11380,7 +11541,7 @@
     {
       "id": "semantic.transport:pci-msi-and-coexistence",
       "family": "device-transport",
-      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all-virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and current native-v2 2.7 create/load persists and reconstructs every block and pmem endpoint in an optional rooted or rootless regular-file profile-3 vector, including configuration, runtime, limiter/retry, common virtio, queue, mapping, BAR/capability, MSI-X, registry, and GICv2m placement under the same product budget, while serial remains platform MMIO. Signed direct and contained storage/serial matrices prove active I/O, UART continuation, recapture, immutable-pair reuse, and cleanup. Snapshot persistence for other optional PCI devices remains outside this terminal transport aggregate.",
+      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all-virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and current native-v2 2.11 create/load persists and reconstructs optional block, pmem, entropy, balloon, virtio-mem, and network/MMDS endpoints with their exact common virtio, queue, BAR/capability, MSI-X, registry, and GICv2m placement under the same product budget, while serial remains platform MMIO. Signed direct and contained matrices prove active I/O, device continuation, recapture, immutable-pair reuse, fresh destination ownership, and cleanup. Vsock snapshot persistence remains outside this terminal transport aggregate.",
       "source_refs": [
         "corpus:device-api",
         "corpus:device-hotplug"

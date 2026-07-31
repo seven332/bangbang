@@ -284,11 +284,10 @@ block/PMEM/network/entropy-retry/balloon-statistics/virtio-mem-publisher
 quiescence, and every required runner operation domain through non-memory
 encoding, complete memory streaming, artifact verification and synchronization,
 exclusive memory-first/state-last commit, and the successful-publication hook.
-The current public writer is native-v2
-2.10 with mandatory complete serial state and independently optional entropy,
-balloon, virtio-mem, and an exact profile-3 graph of 1–64 ordered regular-file
-block/pmem records. The graph may be rooted or rootless across the storage
-classes.
+The current public writer is native-v2 2.11 with mandatory complete serial
+state and independently optional entropy, balloon, virtio-mem, network/MMDS,
+and an exact profile-3 graph of 1–64 ordered regular-file block/pmem records.
+The graph may be rooted or rootless across the storage classes.
 Block records may mix access, engine, cache, partuuid, and limiter
 configuration; pmem records bind access/root/limiter, exact file/mapped
 geometry, queue/retry/interrupt, mapping, and transport state. Serial binds
@@ -296,7 +295,10 @@ only destination endpoint intent, limiter configuration, complete UART
 registers, bounded RX/status, and pending work—not source handles or host
 buffers. Entropy binds queue/limiter/pending/retry/common-virtio/transport
 state—not random output, source identity, metrics, scheduler/notifier handles,
-routes/endpoints, or absolute host time. Exact native-v2 2.7 remains the
+routes/endpoints, or absolute host time. Network/MMDS binds portable interface,
+queue, limiter/retry, transport-placement, and MMDS protocol configuration,
+not provider or packet-I/O owners, handles, callbacks, packets, connections,
+data, token material, metrics, or host clocks. Exact native-v2 2.7 remains the
 serial-required reader, 2.6 remains the storage-only profile-3 reader, 2.5
 remains block-only profile 2, 2.4 remains the legacy single-root graph profile,
 native-v2 2.3 remains the device-free process profile, and the native-v1
@@ -320,8 +322,8 @@ Native-v2 represents PL031 through fixed MMIO metadata and an explicit
 destination-`SystemTime` fresh-device policy; no mutable alarm state is
 persisted. It also carries bounded PVTime and VMGenID/VMClock clone policies.
 Active unsupported SVE/SME or breakpoint/watchpoint state is rejected rather
-than silently omitted. Network, vsock, MMDS, boot-timer, and vhost-user state
-remain outside the accepted profile.
+than silently omitted. Vsock, boot-timer, and vhost-user state remain outside
+the accepted profile.
 
 The #1481 aggregate preflight traverses balloon, memory-hotplug, entropy,
 serial, and time/identity state in one fixed order before the existing
@@ -335,13 +337,17 @@ OS source, empty metrics, scheduler, notifier, route, and endpoint. Exact 2.9
 adopts balloon state but creates fresh destination
 memory bindings, timer and process clock, empty metrics, reclaim adviser,
 notifier/interrupt/dispatcher, transport endpoint, and cleanup owner.
-Current 2.10 adopts virtio-mem state but creates a fresh unlinked shared
+Exact 2.10 adopts virtio-mem state but creates a fresh unlinked shared
 aperture, clean dirty epoch, block-granular plugged views, and destination-local
 mapping, notifier, interrupt, dispatcher, route, metrics, endpoint, and cleanup
 owners. Kind 11 and the exact kind-1 aperture extents must close as one topology
-before publication. Network, vsock, MMDS, boot-timer, vhost-user, native-v2
-Diff/Uffd, Firecracker artifact bytes, and broad cross-host portability remain
-outside the current public profile.
+before publication. Current 2.11 adopts network/MMDS kind 12 only after an
+exact unique destination override set is validated, then creates fresh
+providers, packet-I/O owners, callbacks, metrics, schedulers, routes, endpoints,
+and MMDS stacks. The MMDS store starts empty, source connections are lost, and
+source V2 tokens fail against the destination key. Vsock, boot-timer,
+vhost-user, native-v2 Diff/Uffd, Firecracker artifact bytes, and broad
+cross-host portability remain outside the current public profile.
 
 The frozen native-v1 device profile is untrusted input even when its outer
 state file passed length and CRC checks; CRC detects accidental corruption and
@@ -391,7 +397,7 @@ For native-v2, state family classification, retained File/COW memory binding,
 the live-FDT identity, versioned UART profile, cache/platform state, topology,
 and every time/identity guest destination validate before HVF construction.
 Legacy 2.3 parses its retained bytes as the exact default process FDT. Exact
-2.4 through current 2.10 require a versioned source-product marker instead,
+2.4 through current 2.11 require a versioned source-product marker instead,
 because a booted guest may have consumed or reclaimed those bytes. Exact 2.4
 validates its singleton root; exact 2.5 validates the complete ordered block
 graph; exact 2.6 validates the complete ordered block/pmem configuration,
@@ -403,26 +409,31 @@ optionally requires exact entropy queue/limiter/pending/retry/common-virtio/
 transport state cross-bound to memory and the selected product transport.
 Exact 2.9 retains those rules and optionally requires exact balloon
 configuration/queue/statistics/hint/accounting/common-virtio/transport state,
-including mapped canonical PFN ranges. Current 2.10 retains those rules and
+including mapped canonical PFN ranges. Exact 2.10 retains those rules and
 optionally requires exact virtio-mem configuration/features/config-space/
 queue/common-virtio/transport state plus a canonical plugged-block bitmap whose
-coverage exactly matches the kind-1 aperture extents. The
+coverage exactly matches the kind-1 aperture extents. Current 2.11 retains
+those rules and optionally requires exact ordered network/MMDS kind 12 state
+plus one complete unique clone-local override set. The
 live bytes still must match the retained address, length, and CRC. The memory descriptor
 must remain read-only and close-on-exec; guest
 mappings are private, so destination writes do not mutate the pair. Recorded
 kernel/initrd paths remain inert metadata and are never reopened. Every graph
 selector is likewise inert until destination policy treats it as a direct path
 or resolves the complete keyed vector through exact destination authority.
-Current 2.10 resolves exact drive, pmem, and configured-serial grants as one
+Current 2.11 resolves exact drive, pmem, and configured-serial grants as one
 batch; default serial stdio and entropy source/metrics/scheduler/notifier/
 route/endpoint owners are destination-local and resource-free. Balloon memory,
 timer, metrics, reclaim, notifier/interrupt/dispatcher, endpoint, and cleanup
 owners are likewise destination-local and require no external grant. The
 virtio-mem aperture and all mapping/dirty/device owners are also
-destination-local and require no external grant. The batch
+destination-local and require no external grant. Network overrides are
+request-local, redacted, and validated as an exact interface-ID set before any
+fresh backend/network/MMDS owner is constructed; an MMDS-only destination
+requires no vmnet authority. The batch
 remains provisional through storage/platform construction and commits only
 with Paused session/controller publication. The restorer creates no
-network, vsock, MMDS, boot-timer, or vhost-user owner. Writable external block
+vsock, boot-timer, or vhost-user owner. Writable external block
 files and pmem prefixes
 remain shared rather than COW clones and require operator serialization. Each
 fresh pmem mapping owns a volatile zeroed private tail outside the backing
@@ -1085,14 +1096,15 @@ direct-vmnet guest connectivity.
 Configured RX/TX token buckets are implemented as device-local queue admission
 with retained work and session-owned retry wakeups. They are not packet
 filters, a host firewall, or a NAT policy, and current signed limiter evidence
-uses MMDS-only packet I/O rather than direct vmnet. The boundary still lacks
-packet filtering, production network isolation, a repository-owned approved
-credential and real contained vmnet evidence, network/MMDS snapshot encoding
-and restoration, and full Firecracker public packet-movement parity. The
+uses MMDS-only packet I/O rather than direct vmnet. Exact native-v2 2.11
+network/MMDS snapshot encoding and fresh-session restoration are separately
+signed. The boundary still lacks packet filtering, production network
+isolation, a repository-owned approved credential and real contained vmnet
+evidence, and full Firecracker public packet-movement parity. The
 checked
 [network and MMDS closure contract](../compat/firecracker/v1.16.0/network-mmds-contract.md)
-separately pins the implemented deterministic capture-ready state and the
-#1378/#1490/#1491 handoffs without broadening this security claim.
+separately pins the implemented deterministic capture/restore state and the
+#1378/#1491 handoffs without broadening this security claim.
 
 ## API Socket Handling
 
@@ -1312,8 +1324,9 @@ is resource-specific:
   quiescence through complete capture, publication, and the post-publication
   hook. API/MMDS/controller mutation and periodic callbacks cannot re-enter the
   synchronously borrowed process during that interval. External vmnet/vsock
-  peers and their host/kernel buffers are neither frozen nor persisted; the
-  admitted profile excludes those devices.
+  peers and their host/kernel buffers are neither frozen nor persisted; vsock
+  is excluded, while admitted network state is normalized to portable kind 12
+  without peer packets, connections, callbacks, handles, tokens, or data.
   Load freshness uses
   successful configuration history plus current non-logger/metrics state, so
   explicit defaults and residual MMDS presence fail closed without treating a
@@ -1322,11 +1335,11 @@ is resource-specific:
   untrusted, preserve redaction, and prevent one process from cleaning up or
   overwriting another process's resources. In contained mode, state
   preinspection is non-consuming and the eventual native-v2 state/memory claim
-  is atomic; current 2.10 then derives every ordered block/pmem request, any
-  configured serial sink, and optional entropy/balloon/virtio-mem state from decoded state,
+  is atomic; current 2.11 then derives every ordered block/pmem request, any
+  configured serial sink, and optional entropy/balloon/virtio-mem/network state from decoded state,
   resolves the entire typed keyed vector through one exact destination
-  authority transaction, and constructs fresh entropy/balloon/virtio-mem
-  owners. Default serial
+  authority transaction, validates the exact redacted network override set, and
+  constructs fresh entropy/balloon/virtio-mem/network/MMDS owners. Default serial
   stdio is constructed only from destination descriptors. Missing, extra,
   reordered, swapped, cross-class aliased, wrong-access, wrong-role/kind, wrong-size,
   changed-geometry, and consumed
@@ -1337,14 +1350,17 @@ is resource-specific:
   Create uses only exact retained output anchors and validated children. Direct
   mode retains ordinary path adapters. The current boundary is documented in
   [Snapshot Feasibility](snapshot-feasibility.md).
-  The signed normal-production/App Sandbox exact-2.10 matrix keeps kernel,
+  The signed normal-production/App Sandbox exact-2.11 matrix keeps kernel,
   root, command/data, metrics, state, and memory authority in typed grants. The
   launcher opens each source before pathname replacement and the worker never
   reopens the replaced name. Checksum-corrupted state and structurally
   truncated memory reject before destination publication; graceful
   cancellation, worker-first death, and launcher-first death remove the API
   socket and session namespace and release mapping, route, staging, and grant
-  authority. These cleanup proofs do not authenticate the artifact bytes:
+  authority. Its MMIO/PCI V1/V2 network cells additionally prove selector
+  redaction, no-vmnet all-MMDS containment, empty/reseeded destination data,
+  source connection/token loss, fresh sessions, retry, and immutable inputs.
+  These cleanup proofs do not authenticate the artifact bytes:
   CRCs and length checks are corruption/structure defenses, while operators
   remain responsible for snapshot confidentiality, integrity, provenance, and
   access control.
@@ -1375,8 +1391,9 @@ is resource-specific:
   exact `2.6.0` selects its bounded profile-3 block/pmem graph. Exact `2.7.0`
   adds mandatory serial kind 8 and makes kind 7 optional. Exact `2.8.0`
   retains those rules and adds optional entropy kind 9. Exact `2.9.0`
-  retains those rules and adds optional balloon kind 10. Current `2.10.0`
-  retains those rules and adds optional virtio-mem kind 11. The
+  retains those rules and adds optional balloon kind 10. Exact `2.10.0`
+  retains those rules and adds optional virtio-mem kind 11. Current `2.11.0`
+  retains those rules and adds optional network/MMDS kind 12. The
   platform decoder verifies that complete directory profile without
   payload-dependent allocation, caps every inner count and length before
   reservation, allocation-free scans the closed optional debug/SME registry,
@@ -1399,11 +1416,18 @@ is resource-specific:
   requested/usable sizes, queue, transport, and bitmap coverage against exact
   kind-1 memory extents before any owner is built. Aperture mappings, shared-file
   handles, dirty identity, metrics, notifiers, routes, endpoints, and cleanup
-  authority never enter the format. Every
+  authority never enter the format. Kind 12 admits at most 16 ordered
+  interfaces, has an 83,552-byte calculated worst case under its 512-KiB cap,
+  and cross-validates requested/realized MAC/MTU, backend class, queue/common-
+  virtio state, limiter/retry, MMIO/PCI placement, and MMDS protocol
+  configuration. Providers, packet-I/O owners, handles, callbacks, packets,
+  ARP/TCP state, MMDS data, token keys/tokens, metrics, generations, and clocks
+  never enter the format. Every
   device-graph or configured-serial selector remains
   inert during decode; only the destination authority layer may resolve the
-  complete vector after graph, serial, entropy, balloon, virtio-mem, and memory
-  validation.
+  complete vector after graph, serial, entropy, balloon, virtio-mem, network,
+  and memory validation. Network selector contents are also inert and redacted
+  until their complete exact interface-ID set is accepted.
   State/memory inputs stay immutable and File/COW memory is
   private to each destination, but writable external block files and pmem
   prefixes are not copied or authenticated by the snapshot. Repeated
@@ -1420,10 +1444,11 @@ is resource-specific:
   kernel, initrd, or memory path. Exact memory ranges, mapped live-FDT
   address/length/checksum, destination cache identity, guest VMClock/PVTime
   bytes, and identity destinations are checked before VM creation. Exact 2.3
-  parses the retained FDT shell; exact 2.4 through 2.10 instead require their
+  parses the retained FDT shell; exact 2.4 through 2.11 instead require their
   versioned source-product marker and reconstruct singleton-root, complete
   profile-2 block, complete profile-3 block/pmem, exact serial plus optional
-  storage, optional entropy, optional balloon, or current optional virtio-mem
+  storage, optional entropy, optional balloon, optional virtio-mem, or current
+  optional network/MMDS
   semantics from typed
   state because the guest may have reclaimed those bytes. The
   guard owns VM, memory, GIC,
@@ -1434,7 +1459,7 @@ is resource-specific:
   failure after the first guest-visible identity write is terminal, while
   earlier partial failure attempts reverse topology/backend cleanup and retains
   value-free primary and cleanup evidence. No control or runnable owner escapes
-  earlier. Network, vsock, MMDS, boot-timer, and vhost-user devices,
+  earlier. Vsock, boot-timer, and vhost-user devices,
   source-process host endpoints, and unsupported VM actions remain outside
   this boundary.
 - Native-v2 lazy memory validates the state binding before opening or adopting
@@ -2036,7 +2061,7 @@ private and volatile. Operators must treat DAX as a guest/filesystem choice and
 profile page faults, page-cache/RSS accounting, huge-page realization,
 eviction, same-backing physical-page sharing, side channels, and throughput on
 the deployed macOS/HVF system. Linux Firecracker measurements are not portable
-security or performance promises. Exact native-v2 2.6 through current 2.10
+security or performance promises. Exact native-v2 2.6 through current 2.11
 profile 3 bind exact file/mapped geometry and direct or contained backing
 authority, then restore the same external prefix through a complete-set
 transaction. Signed direct and
@@ -2116,13 +2141,15 @@ real MMDS exchange without vmnet authority. This evidence does not prove
 interrupt remapping, external vmnet connectivity, or Firecracker's KVM ITS
 behavior. Exact native-v2 2.5 reconstructs the exact GICv2m/MSI-X state for
 every admitted profile-2 PCI block endpoint under the same product capacity.
-Exact native-v2 2.6 through current 2.10 additionally reconstruct every admitted
+Exact native-v2 2.6 through current 2.11 additionally reconstruct every admitted
 profile-3 PCI block and pmem endpoint, including mapping and limiter/retry
 ownership; serial remains a platform MMIO device whose exact 2.7 state is
 composed with that PCI storage graph. Exact 2.8 may also reconstruct an exact
 PCI entropy endpoint, exact 2.9 may reconstruct a variable-queue PCI balloon
-endpoint, and current 2.10 may reconstruct a one-queue PCI virtio-mem endpoint
-with its fresh shared aperture and exact MSI-X/registry identity in canonical
+endpoint, and exact 2.10 may reconstruct a one-queue PCI virtio-mem endpoint
+with its fresh shared aperture and exact MSI-X/registry identity. Current 2.11
+may additionally reconstruct network/MMDS with fresh provider, packet-I/O,
+callback, metric, scheduler, route, endpoint, and MMDS ownership in canonical
 product order under the same capacity.
 Mismatched, aliased, reordered, or unmodeled MSI-bearing ownership is rejected
 rather than silently omitted. Exact 2.4 retains only its singleton PCI-root
@@ -2812,8 +2839,11 @@ coverage renews a v2 token, receives a segmented 49,152-byte response, drops one
 ACK, and observes retransmission before completion.
 
 The stack still does not implement a general ARP cache, gratuitous ARP, ARP
-timeouts/retries, or IPv4 fragment reassembly; capture/restore deliberately
-starts fresh network and MMDS sessions under the owning snapshot work.
+timeouts/retries, or IPv4 fragment reassembly. Exact native-v2 2.11
+capture/restore deliberately starts fresh network and MMDS sessions: peer
+packets, TCP connections, MMDS data, token keys/tokens, metrics, and source
+clocks are excluded, every destination uses an exact clone-local selector set,
+and signed V1/V2 guests prove reseeding plus new-session success.
 Consistent with Firecracker v1.16.0's
 [MMDS security considerations](https://github.com/firecracker-microvm/firecracker/blob/v1.16.0/docs/mmds/mmds-design.md#security-considerations),
 this detour is not an outbound firewall: guest traffic remains untrusted, and

@@ -3,15 +3,17 @@
 This is the checked closure ledger for #1496, the final aggregate child of
 #1493 under #1348. It covers exactly 35 directly owned Firecracker v1.16.0
 network and MMDS identities. Thirty-one rows are
-`implemented-and-verified`; four broad corpus or semantic rows remain
-`audit-required` for exact work owned by
+`implemented-and-verified` at the original #1496 checkpoint. Exact native-v2
+2.11 activation and #1716 certification promote two snapshot/session rows, so
+33 are now `implemented-and-verified`; two broad rows remain `audit-required`
+for exact work owned by
 [#1378](https://github.com/seven332/bangbang/issues/1378),
-[#1490](https://github.com/seven332/bangbang/issues/1490), or
 [#1491](https://github.com/seven332/bangbang/issues/1491).
 
 The generated source manifest remains 381 identities and the overlay remains
-418 identities, including 37 local semantic records. This reconciliation moves
-the global disposition counts from 191/207/3/17 to 220/178/3/17.
+418 identities, including 37 local semantic records. The #1496 reconciliation
+moved the global disposition counts from 191/207/3/17 to 220/178/3/17; the
+current post-#1716 counts are 246/152/3/17.
 
 ## Evidence keys
 
@@ -46,6 +48,12 @@ the global disposition counts from 191/207/3/17 to 220/178/3/17.
   plus the signed executable paused snapshot-preflight branches. They prove
   deterministic selected-owner capture, runtime generation reuse, retry state,
   fresh lossy MMDS identity, resume, and cleanup without defining encoding.
+- **SNAPSHOT-CODEC** — exact 2.11 kind-12 encoding and fresh reconstruction in
+  `crates/runtime/src/{snapshot_network_v2_11,snapshot_network_restore_v2_11}.rs`,
+  artifact admission in `crates/runtime/src/snapshot_artifact/`, process
+  override/resource composition in `crates/bangbang/src/vmm.rs`, and MMIO/PCI
+  owner reconstruction in
+  `crates/hvf/src/snapshot_v2_network_platform.rs`.
 - **SIGNED-PROCESS** — signed cases in
   `crates/bangbang/tests/executable_hvf_e2e.rs`, including
   `signed_executable_serves_mmds_with_configured_mtu_to_direct_rootfs_guest`,
@@ -60,13 +68,19 @@ the global disposition counts from 191/207/3/17 to 220/178/3/17.
   They prove exact lifecycle-v5 ownership, credential-free MMDS-only execution,
   runtime reuse, policy denial before session creation, and unchanged
   App-Sandbox/Hypervisor authority.
+- **SIGNED-SNAPSHOT** —
+  `crates/bangbang/tests/executable_hvf_e2e.rs::signed_executable_certifies_native_v2_network_mmds_snapshot_continuation`
+  and
+  `crates/launcher/tests/production_bundle_e2e.rs::normal_bundle_certifies_native_v2_network_mmds_snapshot_continuation_and_containment`.
+  They cover MMIO/PCI and V1/V2 MMDS, explicit-Paused recapture and automatic
+  destinations, exact overrides, empty/reseeded data, source TCP/token loss,
+  fresh sessions, immutable artifacts, redacted failures, cancellation and
+  death cleanup, retry, and all-MMDS containment without vmnet authority.
 - **EXTERNAL-GATE** — the missing-credential production preflight exits 3 and
   prints exactly `bangbang vmnet preflight: blocked`. #1378 owns the first real
   Apple-approved start, packet-connectivity, service-error, teardown, crash,
   retry, and concurrent-session results; a non-success local gate is never a
   passing skip.
-- **W6** — #1490 owns network/MMDS encoding, backend reconstruction, overrides,
-  restore, portability, version compatibility, and clone/session freshness.
 - **W7** — #1491 owns the excluded `corpus:network-performance` row and final
   repository-wide metrics/schema/timing/performance reconciliation.
 
@@ -103,12 +117,12 @@ the global disposition counts from 191/207/3/17 to 220/178/3/17.
 | `api-schema:NetworkInterface` | `implemented-and-verified` | `API-NET + NET-CORE` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CONTAINED` | `terminal` |
 | `api-schema:PartialNetworkInterface` | `implemented-and-verified` | `API-NET + NET-CORE` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS` | `terminal` |
 | `corpus:mmds-design` | `implemented-and-verified` | `API-MMDS + MMDS-CORE + NET-CORE` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS` | `terminal` |
-| `corpus:mmds-user-guide` | `audit-required` | `API-MMDS + MMDS-CORE` live subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS` | `W6` |
-| `corpus:network-setup` | `audit-required` | `API-NET + NET-CORE` applicable live subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CONTAINED + EXTERNAL-GATE` | `EXTERNAL-GATE + W6` |
+| `corpus:mmds-user-guide` | `implemented-and-verified` | `API-MMDS + MMDS-CORE + SNAPSHOT-CODEC` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-SNAPSHOT` | `terminal` |
+| `corpus:network-setup` | `audit-required` | `API-NET + NET-CORE` applicable live subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CONTAINED + EXTERNAL-GATE` | `EXTERNAL-GATE` |
 | `corpus:patch-network-interface` | `implemented-and-verified` | `API-NET + NET-CORE` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS` | `terminal` |
 | `non-swagger-route:DELETE /network-interfaces/{iface_id}` | `implemented-and-verified` | `API-NET + NET-CORE` | `FOCUSED` | `SIGNED-PROCESS + SIGNED-CONTAINED` | `terminal` |
-| `semantic.mmds:tcp-token-session-and-isolation` | `audit-required` | `MMDS-CORE` live and capture-ready subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CAPTURE` | `W6` |
-| `semantic.network:virtio-net-vmnet-policy-and-connectivity` | `audit-required` | `API-NET + NET-CORE + MMDS-CORE` live and capture-ready subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CAPTURE + SIGNED-CONTAINED + EXTERNAL-GATE` | `EXTERNAL-GATE + W6 + W7` |
+| `semantic.mmds:tcp-token-session-and-isolation` | `implemented-and-verified` | `MMDS-CORE + SNAPSHOT-CODEC` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CAPTURE + SIGNED-SNAPSHOT` | `terminal` |
+| `semantic.network:virtio-net-vmnet-policy-and-connectivity` | `audit-required` | `API-NET + NET-CORE + MMDS-CORE` live and capture-ready subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CAPTURE + SIGNED-CONTAINED + EXTERNAL-GATE` | `EXTERNAL-GATE + W7` |
 
 ## Observable live contract
 
@@ -141,13 +155,17 @@ the global disposition counts from 191/207/3/17 to 220/178/3/17.
 
 ## Capture and production boundaries
 
-Paused capture retains deterministic requested/realized/backend configuration,
-transport, queues, negotiated features, limiters, retry intent, provider and
-metrics generation, and MMDS selection/MAC/IP/port. It excludes raw host
-handles, callbacks, cached peer packets, active TCP/ARP/reset/response bytes,
-token keys, tokens, and wall-clock values. #1490 must encode and reconstruct a
-fresh lossy network/MMDS session and prove restored guest behavior before the
-two W6-backed composites can terminate.
+Exact native-v2 2.11 capture retains deterministic requested/realized/backend
+configuration, inert captured selector identity, transport placement, queues,
+negotiated features, limiters, retry intent, and MMDS
+selection/version/IP/IMDS compatibility. It excludes raw host handles,
+providers, packet-I/O owners, callbacks, cached or peer packets, active
+TCP/ARP/reset/response bytes, MMDS data, token keys, tokens, metrics, and
+wall-clock values. Every load requires an exact unique clone-local override
+set, constructs fresh backend/network/MMDS owners, starts with an empty MMDS
+store, and deliberately loses source connections and tokens. Signed direct and
+contained guests prove reseeding and fresh-session success before publication
+is treated as certified.
 
 Contained mode authenticates the exact lifecycle-v5 session and complete
 vmnet mode/count authority before backend work. All-MMDS execution consumes no
@@ -161,10 +179,11 @@ before session creation.
 - #1378 remains open. This contract does not claim an Apple-approved production
   vmnet start, external packet connectivity, service failure, crash reclamation,
   or credentialed concurrent connectivity.
-- #1490 owns snapshot bytes, optional-device schema/versioning, backend
-  reconstruction, overrides, restore, migration/portability, and clone identity
-  or session freshness. Peer-owned vmnet packets and active MMDS TCP sessions
-  are intentionally not persisted.
+- #1490 still owns the broader optional-device aggregate, vsock persistence,
+  artifact editing/version evolution, and unconstrained migration/host
+  portability. Exact 2.11 network/MMDS bytes, reconstruction, overrides, and
+  clone-session freshness are terminal here. Peer-owned vmnet packets and
+  active MMDS TCP sessions are intentionally not persisted.
 - #1491 owns the separate network-performance corpus, global metric schema and
   timing reconciliation, and performance validation. Correctness-critical
   network/MMDS producers already exist; this ledger does not claim throughput

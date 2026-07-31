@@ -39,10 +39,14 @@ use bangbang_pager::{
     ReferencePeerTermination,
 };
 use bangbang_runtime::balloon::VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
+use bangbang_runtime::mmds::MmdsVersion;
 use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonState;
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
 use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
 use bangbang_runtime::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugState;
+use bangbang_runtime::snapshot_network_v2_11::{
+    SnapshotV2NetworkBackendClass, SnapshotV2NetworkLimiterState, SnapshotV2NetworkState,
+};
 use bangbang_session::{
     BLOCK_CONTROL_BROKER_FD, Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY,
     SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId, VHOST_USER_BROKER_FD, WorkerPolicy,
@@ -244,6 +248,26 @@ const SNAPSHOT_MEMORY_HOTPLUG_SECTORS: u64 = 3;
 const SNAPSHOT_MEMORY_HOTPLUG_CONTINUE_OFFSET: u64 = 512;
 const SNAPSHOT_MEMORY_HOTPLUG_REPROBE_OFFSET: u64 = 2 * 512;
 const SNAPSHOT_MEMORY_HOTPLUG_TIMEOUT: Duration = Duration::from_secs(120);
+const SNAPSHOT_NETWORK_MMDS_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-snapshot=1 bangbang.mmds-mtu=1280";
+const SNAPSHOT_NETWORK_MMDS_SOURCE_CONTENT: &str =
+    r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_SNAPSHOT_SOURCE"}}"#;
+const SNAPSHOT_NETWORK_MMDS_DESTINATION_CONTENT: &str =
+    r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_SNAPSHOT_DESTINATION"}}"#;
+const SNAPSHOT_NETWORK_MMDS_READY_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_CAPTURE_READY";
+const SNAPSHOT_NETWORK_MMDS_CONTINUE_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_CONTINUE";
+const SNAPSHOT_NETWORK_MMDS_CONNECTION_LOST_MARKER: &[u8] =
+    b"BANGBANG_MMDS_SNAPSHOT_CONNECTION_LOST";
+const SNAPSHOT_NETWORK_MMDS_TOKEN_REJECTED_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_TOKEN_REJECTED";
+const SNAPSHOT_NETWORK_MMDS_V1_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_V1_NO_TOKEN";
+const SNAPSHOT_NETWORK_MMDS_FRESH_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_FRESH_FETCH_OK";
+const SNAPSHOT_NETWORK_MMDS_SUCCESS_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_OK";
+const SNAPSHOT_NETWORK_MMDS_FAILURE_MARKER: &[u8] = b"BANGBANG_MMDS_SNAPSHOT_FAIL";
+const SNAPSHOT_NETWORK_MMDS_SECTORS: u64 = 5;
+const SNAPSHOT_NETWORK_MMDS_CONTINUE_OFFSET: u64 = VIRTIO_BLOCK_SECTOR_BYTES;
+const SNAPSHOT_NETWORK_MMDS_CONNECTION_OFFSET: u64 = 2 * VIRTIO_BLOCK_SECTOR_BYTES;
+const SNAPSHOT_NETWORK_MMDS_TOKEN_RESULT_OFFSET: u64 = 3 * VIRTIO_BLOCK_SECTOR_BYTES;
+const SNAPSHOT_NETWORK_MMDS_FRESH_OFFSET: u64 = 4 * VIRTIO_BLOCK_SECTOR_BYTES;
+const SNAPSHOT_NETWORK_MMDS_TIMEOUT: Duration = Duration::from_secs(120);
 const SNAPSHOT_BLOCK_SECTOR_SIZE: usize = 512;
 const SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE: u8 = 0x11;
 const SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE: u8 = 0x12;
@@ -1687,6 +1711,1216 @@ fn run_production_configured_serial_snapshot_continuation(bundle: &Path, enable_
         .expect("opened configured serial drive should read"),
         drive_before
     );
+}
+
+#[test]
+fn normal_bundle_certifies_native_v2_network_mmds_snapshot_continuation_and_containment() {
+    let bundle = production_bundle();
+    let baseline_sessions = session_entries();
+    for enable_pci in [false, true] {
+        for mmds_v2 in [false, true] {
+            run_production_network_mmds_snapshot_continuation(
+                &bundle,
+                enable_pci,
+                mmds_v2,
+                &baseline_sessions,
+            );
+        }
+    }
+    assert_eq!(
+        session_entries(),
+        baseline_sessions,
+        "network/MMDS snapshot launcher and worker teardown must restore the session namespace"
+    );
+}
+
+fn run_production_network_mmds_snapshot_continuation(
+    bundle: &Path,
+    enable_pci: bool,
+    mmds_v2: bool,
+    baseline_sessions: &[PathBuf],
+) {
+    let transport = if enable_pci { "pci" } else { "mmio" };
+    let version = if mmds_v2 { "v2" } else { "v1" };
+    let case = format!("{transport}-{version}");
+    let source_fixture = SnapshotSourceGrantFixture::new(&format!("{case}-network-mmds-source"));
+    reset_zeroed_file(
+        &source_fixture.data_backing,
+        SNAPSHOT_NETWORK_MMDS_SECTORS * VIRTIO_BLOCK_SECTOR_BYTES,
+    );
+    let mut source = spawn_ready_snapshot_grant_api_launcher(
+        bundle,
+        &source_fixture.manifest,
+        source_fixture.sensitive_strings(),
+        &format!("network-mmds-snapshot-{case}-source"),
+        false,
+        enable_pci,
+    );
+    source_fixture.replace_source_file_pathnames();
+    configure_and_start_network_mmds_snapshot_source(&source.socket, enable_pci, mmds_v2, &case);
+    wait_for_network_mmds_snapshot_markers(
+        &source_fixture.opened_data_backing,
+        &[(0, SNAPSHOT_NETWORK_MMDS_READY_MARKER)],
+        &format!("production {case} network/MMDS source readiness"),
+    );
+    flush_production_metrics(
+        &source.socket,
+        &format!("{case} network/MMDS source traffic"),
+    );
+    assert_production_network_metrics(&source_fixture.opened_metrics, "eth0", &case);
+    assert_http_status(
+        &http_request(&source.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        &format!("pause production {case} network/MMDS source"),
+    );
+    assert_http_status(
+        &http_put(&source.socket, "/snapshot/create", &snapshot_create_body()),
+        204,
+        &format!("create production {case} network/MMDS snapshot"),
+    );
+    let artifacts = source_fixture.artifacts();
+    let source_network = assert_production_network_mmds_snapshot(
+        &artifacts.state,
+        enable_pci,
+        mmds_v2,
+        "vmnet:bridged:source-private",
+        &format!("{case} source"),
+    );
+    assert_no_snapshot_staging(&source_fixture.state_directory);
+    assert_no_snapshot_staging(&source_fixture.memory_directory);
+    let state_before =
+        fs::read(&artifacts.state).expect("production network/MMDS source state should read");
+    let memory_before =
+        fs::read(&artifacts.memory).expect("production network/MMDS source memory should read");
+    stop_running_launcher(
+        &mut source,
+        &format!("production {case} network/MMDS snapshot source"),
+    );
+    assert_session_entries_eventually_restored(
+        baseline_sessions,
+        &format!("production {case} network/MMDS snapshot source"),
+    );
+    source_fixture.assert_replacement_pathnames_unused(&format!(
+        "production {case} network/MMDS snapshot source"
+    ));
+
+    let mut current = artifacts;
+    if !enable_pci && mmds_v2 {
+        current =
+            run_production_network_snapshot_override_rejections(bundle, current, baseline_sessions);
+        for malformed in [
+            NetworkSnapshotMalformedInput::StateChecksum,
+            NetworkSnapshotMalformedInput::TruncatedMemory,
+        ] {
+            run_production_network_mmds_malformed_case(
+                bundle,
+                &current,
+                malformed,
+                baseline_sessions,
+            );
+        }
+        for shutdown in [
+            SnapshotContinuationShutdown::GracefulCancellation,
+            SnapshotContinuationShutdown::WorkerFirst,
+            SnapshotContinuationShutdown::LauncherFirst,
+        ] {
+            current = run_production_network_mmds_paused_shutdown_case(
+                bundle,
+                current,
+                shutdown,
+                baseline_sessions,
+            );
+        }
+    }
+
+    let explicit_case = format!("{transport}-{version}-net-exp");
+    current = run_production_network_mmds_snapshot_destination(ProductionNetworkMmdsDestination {
+        bundle,
+        artifacts: current,
+        source_network: &source_network,
+        enable_pci,
+        mmds_v2,
+        resume_vm: false,
+        recapture: true,
+        selector: "vmnet:host",
+        case: &explicit_case,
+        baseline_sessions,
+    });
+    let automatic_case = format!("{transport}-{version}-net-auto");
+    let final_artifacts =
+        run_production_network_mmds_snapshot_destination(ProductionNetworkMmdsDestination {
+            bundle,
+            artifacts: current,
+            source_network: &source_network,
+            enable_pci,
+            mmds_v2,
+            resume_vm: true,
+            recapture: false,
+            selector: "vmnet:shared",
+            case: &automatic_case,
+            baseline_sessions,
+        });
+    assert_eq!(
+        fs::read(&final_artifacts.state).expect("final network/MMDS state should read"),
+        state_before,
+        "{case} contained repeated loads must not mutate state"
+    );
+    assert_eq!(
+        fs::read(&final_artifacts.memory).expect("final network/MMDS memory should read"),
+        memory_before,
+        "{case} contained repeated loads must not mutate memory"
+    );
+}
+
+fn configure_and_start_network_mmds_snapshot_source(
+    socket: &Path,
+    enable_pci: bool,
+    mmds_v2: bool,
+    context: &str,
+) {
+    for (path, body, request) in [
+        (
+            "/machine-config",
+            serde_json::json!({
+                "vcpu_count": 1,
+                "mem_size_mib": 256,
+            }),
+            "machine config",
+        ),
+        (
+            "/network-interfaces/eth0",
+            serde_json::json!({
+                "iface_id": "eth0",
+                "host_dev_name": "vmnet:bridged:source-private",
+                "guest_mac": "06:00:00:00:00:71",
+                "mtu": 1280,
+                "rx_rate_limiter": {
+                    "bandwidth": {
+                        "size": 1_048_576,
+                        "one_time_burst": 65_536,
+                        "refill_time": 1_000,
+                    },
+                    "ops": {
+                        "size": 1_000,
+                        "one_time_burst": 100,
+                        "refill_time": 1_000,
+                    },
+                },
+                "tx_rate_limiter": {
+                    "bandwidth": {
+                        "size": 2_097_152,
+                        "one_time_burst": 131_072,
+                        "refill_time": 2_000,
+                    },
+                    "ops": {
+                        "size": 2_000,
+                        "one_time_burst": 200,
+                        "refill_time": 2_000,
+                    },
+                },
+            }),
+            "network interface",
+        ),
+        (
+            "/mmds/config",
+            serde_json::json!({
+                "network_interfaces": ["eth0"],
+                "version": if mmds_v2 { "V2" } else { "V1" },
+                "ipv4_address": "169.254.169.254",
+                "imds_compat": mmds_v2,
+            }),
+            "MMDS config",
+        ),
+        (
+            "/mmds",
+            serde_json::from_str(SNAPSHOT_NETWORK_MMDS_SOURCE_CONTENT)
+                .expect("network/MMDS source data should be valid JSON"),
+            "source MMDS data",
+        ),
+        (
+            "/metrics",
+            serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}),
+            "metrics",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                socket,
+                path,
+                &serde_json::to_string(&body)
+                    .expect("production network/MMDS snapshot request should serialize"),
+            ),
+            204,
+            &format!("PUT production {context} network/MMDS snapshot {request}"),
+        );
+    }
+
+    let mut boot_args = SNAPSHOT_NETWORK_MMDS_BOOT_ARGS.to_owned();
+    if mmds_v2 {
+        boot_args.push_str(" bangbang.mmds-snapshot-v2=1");
+    }
+    if enable_pci {
+        boot_args.push_str(" bangbang.expect-pci-data=1");
+    }
+    for (path, body, request) in [
+        (
+            "/boot-source",
+            serde_json::json!({
+                "kernel_image_path": SNAPSHOT_KERNEL_REF,
+                "boot_args": boot_args,
+            }),
+            "boot source",
+        ),
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": SNAPSHOT_ROOT_REF,
+                "is_root_device": true,
+                "is_read_only": false,
+            }),
+            "root drive",
+        ),
+        (
+            "/drives/data",
+            serde_json::json!({
+                "drive_id": "data",
+                "path_on_host": SNAPSHOT_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+                "io_engine": "Sync",
+            }),
+            "control drive",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                socket,
+                path,
+                &serde_json::to_string(&body)
+                    .expect("production network/MMDS boot request should serialize"),
+            ),
+            204,
+            &format!("PUT production {context} network/MMDS snapshot {request}"),
+        );
+    }
+    assert_http_status(
+        &http_put(socket, "/actions", r#"{"action_type":"InstanceStart"}"#),
+        204,
+        &format!("start production {context} network/MMDS snapshot source"),
+    );
+}
+
+fn assert_production_network_mmds_snapshot(
+    state_path: &Path,
+    enable_pci: bool,
+    mmds_v2: bool,
+    selector: &str,
+    context: &str,
+) -> SnapshotV2NetworkState {
+    let bytes = fs::read(state_path).unwrap_or_else(|error| {
+        panic!(
+            "production {context} network/MMDS state {} should read: {error}",
+            state_path.display()
+        )
+    });
+    let structural =
+        decode_snapshot_v2_state(&bytes).expect("production network/MMDS state should decode");
+    let state = decode_hvf_snapshot_v2_network_state(&structural)
+        .expect("production network/MMDS state should be exact native-v2 2.11");
+    let graph = state
+        .device_graph()
+        .expect("production network/MMDS artifact should retain root and data");
+    assert_eq!(
+        graph.block_records().len(),
+        2,
+        "production {context} should retain root and data drives"
+    );
+    let expected_transport = if enable_pci {
+        SnapshotV2DeviceTransportKind::Pci
+    } else {
+        SnapshotV2DeviceTransportKind::Mmio
+    };
+    assert_eq!(graph.transport_kind(), expected_transport);
+    let network = state
+        .network()
+        .expect("production certification artifact should contain kind 12");
+    assert_eq!(network.interfaces().len(), 1);
+    let interface = &network.interfaces()[0];
+    assert_eq!(interface.iface_id(), "eth0");
+    assert_eq!(interface.captured_selector(), selector);
+    assert_eq!(
+        interface
+            .requested_guest_mac()
+            .expect("production network snapshot should retain requested MAC")
+            .octets(),
+        [0x06, 0, 0, 0, 0, 0x71]
+    );
+    assert_eq!(interface.requested_mtu(), Some(1280));
+    assert_eq!(
+        interface
+            .profile()
+            .guest_mac()
+            .expect("production network snapshot should retain realized MAC")
+            .octets(),
+        [0x06, 0, 0, 0, 0, 0x71]
+    );
+    assert_eq!(interface.profile().mtu(), Some(1280));
+    assert_eq!(interface.backend(), SnapshotV2NetworkBackendClass::MmdsOnly);
+    assert!(interface.local().active_rx_queue().is_some());
+    assert!(interface.local().active_tx_queue().is_some());
+    assert_eq!(interface.virtio().queues().len(), 2);
+    assert!(interface.rx_limiter().is_configured());
+    assert!(interface.tx_limiter().is_configured());
+    assert_eq!(
+        interface
+            .rx_limiter()
+            .bandwidth()
+            .expect("production RX bandwidth bucket should persist")
+            .size(),
+        1_048_576
+    );
+    assert_eq!(
+        interface
+            .tx_limiter()
+            .ops()
+            .expect("production TX operations bucket should persist")
+            .size(),
+        2_000
+    );
+    assert_eq!(interface.transport().kind(), expected_transport);
+    let mmds = network
+        .mmds()
+        .expect("production network snapshot should contain MMDS config");
+    assert_eq!(
+        mmds.version(),
+        if mmds_v2 {
+            MmdsVersion::V2
+        } else {
+            MmdsVersion::V1
+        }
+    );
+    assert_eq!(mmds.effective_ipv4_address().to_string(), "169.254.169.254");
+    assert_eq!(mmds.imds_compat(), mmds_v2);
+    assert_eq!(mmds.interfaces().len(), 1);
+    assert_eq!(mmds.interfaces()[0].interface_index(), 0);
+    network.clone()
+}
+
+fn assert_normalized_production_network_mmds_recapture(
+    source: &SnapshotV2NetworkState,
+    recaptured: &SnapshotV2NetworkState,
+    context: &str,
+) {
+    assert_eq!(source.interfaces().len(), recaptured.interfaces().len());
+    let source_interface = &source.interfaces()[0];
+    let recaptured_interface = &recaptured.interfaces()[0];
+    assert_eq!(source_interface.iface_id(), recaptured_interface.iface_id());
+    assert_eq!(
+        source_interface.requested_guest_mac(),
+        recaptured_interface.requested_guest_mac(),
+        "production {context} requested MAC should remain normalized"
+    );
+    assert_eq!(
+        source_interface.requested_mtu(),
+        recaptured_interface.requested_mtu(),
+        "production {context} requested MTU should remain normalized"
+    );
+    assert_eq!(
+        source_interface.profile(),
+        recaptured_interface.profile(),
+        "production {context} realized profile should remain normalized"
+    );
+    assert_eq!(
+        source_interface.backend(),
+        recaptured_interface.backend(),
+        "production {context} backend class should remain normalized"
+    );
+    assert_eq!(
+        source_interface.local(),
+        recaptured_interface.local(),
+        "production {context} local queue state should remain normalized"
+    );
+    assert_eq!(
+        source_interface.virtio(),
+        recaptured_interface.virtio(),
+        "production {context} common virtio state should remain normalized"
+    );
+    assert_eq!(
+        production_network_limiter_config(source_interface.rx_limiter()),
+        production_network_limiter_config(recaptured_interface.rx_limiter()),
+        "production {context} RX limiter configuration should remain normalized"
+    );
+    assert_eq!(
+        production_network_limiter_config(source_interface.tx_limiter()),
+        production_network_limiter_config(recaptured_interface.tx_limiter()),
+        "production {context} TX limiter configuration should remain normalized"
+    );
+    assert_eq!(
+        source_interface.transport(),
+        recaptured_interface.transport(),
+        "production {context} transport placement should remain normalized"
+    );
+    assert_eq!(
+        source.mmds(),
+        recaptured.mmds(),
+        "production {context} MMDS identity should remain normalized"
+    );
+}
+
+type ProductionNetworkLimiterConfig = (
+    Option<(u64, Option<u64>, u64)>,
+    Option<(u64, Option<u64>, u64)>,
+);
+
+fn production_network_limiter_config(
+    limiter: SnapshotV2NetworkLimiterState,
+) -> ProductionNetworkLimiterConfig {
+    let bucket =
+        |bucket: bangbang_runtime::snapshot_network_v2_11::SnapshotV2NetworkTokenBucketState| {
+            (
+                bucket.size(),
+                bucket.configured_burst(),
+                bucket.refill_time_millis(),
+            )
+        };
+    (limiter.bandwidth().map(bucket), limiter.ops().map(bucket))
+}
+
+fn run_production_network_snapshot_override_rejections(
+    bundle: &Path,
+    artifacts: SnapshotArtifactSet,
+    baseline_sessions: &[PathBuf],
+) -> SnapshotArtifactSet {
+    const DUPLICATE_SELECTOR: &str = "vmnet:bridged:private-duplicate-selector";
+    const UNKNOWN_SELECTOR: &str = "vmnet:bridged:private-unknown-selector";
+    const CAPTURED_SELECTOR: &str = "vmnet:bridged:source-private";
+
+    let requests = [
+        ("missing", snapshot_load_body(false), Vec::<&str>::new()),
+        (
+            "duplicate",
+            network_snapshot_load_body(
+                false,
+                &[("eth0", DUPLICATE_SELECTOR), ("eth0", "vmnet:shared")],
+            ),
+            vec![DUPLICATE_SELECTOR],
+        ),
+        (
+            "unknown",
+            network_snapshot_load_body(false, &[("unknown", UNKNOWN_SELECTOR)]),
+            vec![UNKNOWN_SELECTOR],
+        ),
+    ];
+    let mut current = artifacts;
+    for (name, body, private_selectors) in requests {
+        let case = format!("net-ov-{name}");
+        let fixture = SnapshotContinuationInputGrantFixture::new(&case, current, false);
+        let mut sensitive = fixture.sensitive_strings();
+        sensitive.extend(
+            [DUPLICATE_SELECTOR, UNKNOWN_SELECTOR, CAPTURED_SELECTOR]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+            bundle,
+            &fixture.manifest,
+            &fixture.api_socket(),
+            sensitive.clone(),
+            &case,
+            false,
+        );
+        let opened = fixture.replace_source_pathnames();
+        let state_before =
+            fs::read(&opened.state).expect("override-rejection network state should read");
+        let memory_before =
+            fs::read(&opened.memory).expect("override-rejection network memory should read");
+        configure_network_mmds_snapshot_destination_metrics(&running.socket, &case);
+        assert!(
+            fs::read(&fixture.opened_metrics)
+                .expect("override-rejection network metrics should read")
+                .is_empty(),
+            "network {name} override rejection metrics should start empty"
+        );
+        let response = http_put(&running.socket, "/snapshot/load", &body);
+        assert_http_status(
+            &response,
+            400,
+            &format!("reject production network snapshot {name} override set"),
+        );
+        for private in sensitive
+            .iter()
+            .map(String::as_str)
+            .chain(private_selectors)
+        {
+            assert!(
+                !response.contains(private),
+                "production network {name} override fault must redact {private:?}"
+            );
+        }
+        assert!(
+            fs::read(&fixture.opened_metrics)
+                .expect("rejected network metrics should read")
+                .is_empty(),
+            "network {name} override rejection must not publish destination metrics"
+        );
+        thread::sleep(Duration::from_millis(100));
+        if running
+            .child
+            .try_wait()
+            .expect("network override rejection launcher status should read")
+            .is_some()
+            || !running.socket.exists()
+        {
+            let status = running.wait(&format!(
+                "terminal production network {name} override rejection"
+            ));
+            assert!(
+                !status.success(),
+                "terminal network {name} override rejection should fail closed"
+            );
+            assert!(
+                !running.socket.exists(),
+                "terminal network {name} override rejection should remove its API socket"
+            );
+        } else {
+            assert!(
+                http_get(&running.socket, "/").contains(r#""state":"Not started""#),
+                "production network {name} override rejection must not publish a VM"
+            );
+            stop_running_launcher(
+                &mut running,
+                &format!("production network {name} override rejection destination"),
+            );
+        }
+        assert_session_entries_eventually_restored(
+            baseline_sessions,
+            &format!("production network {name} override rejection destination"),
+        );
+        assert_eq!(
+            fs::read(&opened.state).expect("rejected network state should remain"),
+            state_before,
+            "network {name} override rejection must preserve immutable state"
+        );
+        assert_eq!(
+            fs::read(&opened.memory).expect("rejected network memory should remain"),
+            memory_before,
+            "network {name} override rejection must preserve immutable memory"
+        );
+        fixture.assert_replacement_pathnames_unused(&format!(
+            "production network {name} override rejection destination"
+        ));
+        current = opened;
+    }
+    current
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NetworkSnapshotMalformedInput {
+    StateChecksum,
+    TruncatedMemory,
+}
+
+fn run_production_network_mmds_malformed_case(
+    bundle: &Path,
+    artifacts: &SnapshotArtifactSet,
+    malformed_input: NetworkSnapshotMalformedInput,
+    baseline_sessions: &[PathBuf],
+) {
+    let case = match malformed_input {
+        NetworkSnapshotMalformedInput::StateChecksum => "network-mmds-malformed-state",
+        NetworkSnapshotMalformedInput::TruncatedMemory => "network-mmds-truncated-memory",
+    };
+    let original_state = fs::read(&artifacts.state).expect("valid network/MMDS state should read");
+    let original_memory =
+        fs::read(&artifacts.memory).expect("valid network/MMDS memory should read");
+    let malformed_root = TestDir::new(case);
+    let canonical_root = fs::canonicalize(malformed_root.path())
+        .expect("malformed network/MMDS fixture root should canonicalize");
+    let malformed = SnapshotArtifactSet {
+        state: canonical_root.join("malformed-state.snap"),
+        memory: canonical_root.join("malformed-memory.snap"),
+        root: canonical_root.join("malformed-root.img"),
+        data: canonical_root.join("malformed-data.img"),
+        audit: canonical_root.join("malformed-audit.img"),
+    };
+    fs::copy(&artifacts.state, &malformed.state)
+        .expect("malformed network/MMDS state fixture should copy");
+    fs::copy(&artifacts.memory, &malformed.memory)
+        .expect("malformed network/MMDS memory fixture should copy");
+    for (source, destination, context) in [
+        (
+            &artifacts.root,
+            &malformed.root,
+            "malformed network/MMDS root",
+        ),
+        (
+            &artifacts.data,
+            &malformed.data,
+            "malformed network/MMDS data",
+        ),
+        (
+            &artifacts.audit,
+            &malformed.audit,
+            "malformed network/MMDS audit",
+        ),
+    ] {
+        hard_link_or_copy_fixture(source, destination, context);
+    }
+    match malformed_input {
+        NetworkSnapshotMalformedInput::StateChecksum => {
+            let mut malformed_bytes =
+                fs::read(&malformed.state).expect("malformed network state should read");
+            let last = malformed_bytes
+                .len()
+                .checked_sub(1)
+                .expect("native-v2 network state must be nonempty");
+            malformed_bytes[last] ^= 0x80;
+            fs::write(&malformed.state, malformed_bytes)
+                .expect("malformed network checksum fixture should write");
+        }
+        NetworkSnapshotMalformedInput::TruncatedMemory => {
+            let len = fs::metadata(&malformed.memory)
+                .expect("malformed network memory metadata should read")
+                .len();
+            let truncated = len
+                .checked_sub(4096)
+                .expect("native-v2 network memory should exceed one page");
+            OpenOptions::new()
+                .write(true)
+                .open(&malformed.memory)
+                .expect("malformed network memory should reopen")
+                .set_len(truncated)
+                .expect("malformed network memory should truncate");
+        }
+    }
+
+    let fixture = SnapshotContinuationInputGrantFixture::new(case, malformed, false);
+    let sensitive = fixture.sensitive_strings();
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        sensitive.clone(),
+        case,
+        false,
+    );
+    fixture.replace_source_pathnames();
+    configure_network_mmds_snapshot_destination_metrics(&running.socket, case);
+    let response = http_put(
+        &running.socket,
+        "/snapshot/load",
+        &network_snapshot_load_body(false, &[("eth0", "vmnet:host")]),
+    );
+    assert_http_status(
+        &response,
+        400,
+        &format!("reject production {case} network/MMDS snapshot"),
+    );
+    for private in &sensitive {
+        assert!(
+            !response.contains(private),
+            "production {case} restore fault must redact private grant data"
+        );
+    }
+    assert!(
+        fs::read(&fixture.opened_metrics)
+            .expect("malformed network/MMDS metrics should read")
+            .is_empty(),
+        "production {case} restore must not publish metrics"
+    );
+    thread::sleep(Duration::from_millis(100));
+    if running
+        .child
+        .try_wait()
+        .expect("malformed network/MMDS launcher status should read")
+        .is_some()
+        || !running.socket.exists()
+    {
+        let status = running.wait(&format!("terminal production {case} destination"));
+        assert!(
+            !status.success(),
+            "terminal production {case} rejection should fail closed"
+        );
+        assert!(
+            !running.socket.exists(),
+            "terminal production {case} rejection should remove its API socket"
+        );
+    } else {
+        assert!(
+            http_get(&running.socket, "/").contains(r#""state":"Not started""#),
+            "production {case} restore must not publish a VM"
+        );
+        stop_running_launcher(&mut running, &format!("production {case} destination"));
+    }
+    assert_session_entries_eventually_restored(
+        baseline_sessions,
+        &format!("production {case} malformed destination"),
+    );
+    assert_eq!(
+        fs::read(&artifacts.state).expect("valid network state should survive malformed load"),
+        original_state
+    );
+    assert_eq!(
+        fs::read(&artifacts.memory).expect("valid network memory should survive malformed load"),
+        original_memory
+    );
+    fixture.assert_replacement_pathnames_unused(&format!(
+        "production {case} malformed network/MMDS destination"
+    ));
+}
+
+fn run_production_network_mmds_paused_shutdown_case(
+    bundle: &Path,
+    artifacts: SnapshotArtifactSet,
+    shutdown: SnapshotContinuationShutdown,
+    baseline_sessions: &[PathBuf],
+) -> SnapshotArtifactSet {
+    let name = match shutdown {
+        SnapshotContinuationShutdown::GracefulCancellation => "net-cancel",
+        SnapshotContinuationShutdown::WorkerFirst => "net-worker",
+        SnapshotContinuationShutdown::LauncherFirst => "net-launcher",
+    };
+    let fixture = SnapshotContinuationInputGrantFixture::new(name, artifacts, false);
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        fixture.sensitive_strings(),
+        &format!("network-mmds-snapshot-{name}"),
+        false,
+    );
+    let opened = fixture.replace_source_pathnames();
+    let state_before =
+        fs::read(&opened.state).expect("shutdown-case network/MMDS state should read");
+    let memory_before =
+        fs::read(&opened.memory).expect("shutdown-case network/MMDS memory should read");
+    reset_zeroed_file(
+        &opened.data,
+        SNAPSHOT_NETWORK_MMDS_SECTORS * VIRTIO_BLOCK_SECTOR_BYTES,
+    );
+    configure_network_mmds_snapshot_destination_metrics(&running.socket, name);
+    assert!(
+        fs::read(&fixture.opened_metrics)
+            .expect("shutdown-case network/MMDS metrics should read")
+            .is_empty(),
+        "fresh production {name} metrics should start empty"
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/snapshot/load",
+            &network_snapshot_load_body(false, &[("eth0", "vmnet:host")]),
+        ),
+        204,
+        &format!("load production network/MMDS snapshot before {name}"),
+    );
+    assert!(
+        http_get(&running.socket, "/").contains(r#""state":"Paused""#),
+        "production network/MMDS destination should remain Paused before {name}"
+    );
+    assert_production_network_mmds_config(&running.socket, "vmnet:host", true, name);
+    assert_eq!(session_entries().len(), baseline_sessions.len() + 1);
+
+    let status = match shutdown {
+        SnapshotContinuationShutdown::GracefulCancellation => {
+            let launcher =
+                i32::try_from(running.child.id()).expect("network/MMDS launcher PID should fit");
+            // SAFETY: The unreaped launcher owns this exact PID.
+            assert_eq!(unsafe { libc::kill(launcher, libc::SIGTERM) }, 0);
+            running.wait("Paused network/MMDS restoration cancellation")
+        }
+        SnapshotContinuationShutdown::WorkerFirst => {
+            let worker = only_worker_pid(&running.child);
+            // SAFETY: The worker is the sole live child of the unreaped launcher.
+            assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+            running.wait("Paused network/MMDS worker-first death")
+        }
+        SnapshotContinuationShutdown::LauncherFirst => {
+            let worker = only_worker_pid(&running.child);
+            let worker_exit = ProcessExitWatch::new(worker);
+            let launcher =
+                i32::try_from(running.child.id()).expect("network/MMDS launcher PID should fit");
+            // SAFETY: The unreaped launcher owns this PID and its worker
+            // independently observes authenticated lifecycle EOF.
+            assert_eq!(unsafe { libc::kill(launcher, libc::SIGKILL) }, 0);
+            let result = running.wait("Paused network/MMDS launcher-first death");
+            assert!(
+                worker_exit.wait(PROCESS_TIMEOUT),
+                "network/MMDS worker should observe launcher death"
+            );
+            result
+        }
+    };
+    match shutdown {
+        SnapshotContinuationShutdown::GracefulCancellation => {
+            assert!(
+                status.success(),
+                "network/MMDS cancellation should be graceful"
+            );
+        }
+        SnapshotContinuationShutdown::WorkerFirst => {
+            assert_eq!(status.code(), Some(128 + libc::SIGKILL));
+        }
+        SnapshotContinuationShutdown::LauncherFirst => {
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+        }
+    }
+    assert!(
+        !running.socket.exists(),
+        "production {name} destination should remove its API socket"
+    );
+    assert_session_entries_eventually_restored(baseline_sessions, name);
+    assert_eq!(
+        fs::read(&opened.state).expect("shutdown-case network state should remain"),
+        state_before,
+        "production {name} must preserve immutable state"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("shutdown-case network memory should remain"),
+        memory_before,
+        "production {name} must preserve immutable memory"
+    );
+    fixture.assert_replacement_pathnames_unused(&format!(
+        "production {name} network/MMDS shutdown destination"
+    ));
+    opened
+}
+
+struct ProductionNetworkMmdsDestination<'a> {
+    bundle: &'a Path,
+    artifacts: SnapshotArtifactSet,
+    source_network: &'a SnapshotV2NetworkState,
+    enable_pci: bool,
+    mmds_v2: bool,
+    resume_vm: bool,
+    recapture: bool,
+    selector: &'a str,
+    case: &'a str,
+    baseline_sessions: &'a [PathBuf],
+}
+
+fn run_production_network_mmds_snapshot_destination(
+    destination: ProductionNetworkMmdsDestination<'_>,
+) -> SnapshotArtifactSet {
+    let ProductionNetworkMmdsDestination {
+        bundle,
+        artifacts,
+        source_network,
+        enable_pci,
+        mmds_v2,
+        resume_vm,
+        recapture,
+        selector,
+        case,
+        baseline_sessions,
+    } = destination;
+    let fixture = SnapshotContinuationInputGrantFixture::new(case, artifacts, recapture);
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        fixture.sensitive_strings(),
+        &format!("network-mmds-snapshot-{case}"),
+        enable_pci,
+    );
+    let opened = fixture.replace_source_pathnames();
+    let state_before =
+        fs::read(&opened.state).expect("destination network/MMDS state should read before load");
+    let memory_before =
+        fs::read(&opened.memory).expect("destination network/MMDS memory should read before load");
+    reset_zeroed_file(
+        &opened.data,
+        SNAPSHOT_NETWORK_MMDS_SECTORS * VIRTIO_BLOCK_SECTOR_BYTES,
+    );
+    configure_network_mmds_snapshot_destination_metrics(&running.socket, case);
+    assert!(
+        fs::read(&fixture.opened_metrics)
+            .expect("destination network/MMDS metrics should read")
+            .is_empty(),
+        "production {case} destination metrics should start empty"
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/snapshot/load",
+            &network_snapshot_load_body(resume_vm, &[("eth0", selector)]),
+        ),
+        204,
+        &format!("load production {case} network/MMDS snapshot"),
+    );
+    assert!(
+        http_get(&running.socket, "/").contains(if resume_vm {
+            r#""state":"Running""#
+        } else {
+            r#""state":"Paused""#
+        }),
+        "production {case} destination should publish the requested resume state"
+    );
+    assert_production_network_mmds_config(&running.socket, selector, mmds_v2, case);
+    let empty_mmds = http_get(&running.socket, "/mmds");
+    assert_http_status(
+        &empty_mmds,
+        200,
+        &format!("GET production {case} empty restored MMDS"),
+    );
+    assert!(
+        empty_mmds.ends_with("\r\n\r\nnull"),
+        "production {case} empty restored MMDS should return exact JSON null; response:\n{empty_mmds}"
+    );
+    assert!(
+        !empty_mmds.contains("BANGBANG_MMDS_SNAPSHOT_SOURCE")
+            && !empty_mmds.contains("BANGBANG_MMDS_SNAPSHOT_DESTINATION"),
+        "production {case} restored MMDS must exclude source and future destination data"
+    );
+
+    if recapture {
+        assert_http_status(
+            &http_put(&running.socket, "/snapshot/create", &snapshot_create_body()),
+            204,
+            &format!("recapture production {case} network/MMDS snapshot"),
+        );
+        let recaptured = fixture.recaptured_artifacts();
+        let recaptured_network = assert_production_network_mmds_snapshot(
+            &recaptured.state,
+            enable_pci,
+            mmds_v2,
+            selector,
+            &format!("{case} recapture"),
+        );
+        assert_normalized_production_network_mmds_recapture(
+            source_network,
+            &recaptured_network,
+            case,
+        );
+        fixture.assert_no_recapture_staging();
+    }
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/mmds",
+            SNAPSHOT_NETWORK_MMDS_DESTINATION_CONTENT,
+        ),
+        204,
+        &format!("PUT production {case} destination MMDS"),
+    );
+    resize_and_write_file_marker_at(
+        &opened.data,
+        SNAPSHOT_NETWORK_MMDS_SECTORS * VIRTIO_BLOCK_SECTOR_BYTES,
+        SNAPSHOT_NETWORK_MMDS_CONTINUE_OFFSET,
+        SNAPSHOT_NETWORK_MMDS_CONTINUE_MARKER,
+    );
+    if !resume_vm {
+        assert_http_status(
+            &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            204,
+            &format!("resume production {case} network/MMDS destination"),
+        );
+    }
+    let token_marker = if mmds_v2 {
+        SNAPSHOT_NETWORK_MMDS_TOKEN_REJECTED_MARKER
+    } else {
+        SNAPSHOT_NETWORK_MMDS_V1_MARKER
+    };
+    wait_for_network_mmds_snapshot_markers(
+        &opened.data,
+        &[
+            (0, SNAPSHOT_NETWORK_MMDS_SUCCESS_MARKER),
+            (
+                SNAPSHOT_NETWORK_MMDS_CONNECTION_OFFSET,
+                SNAPSHOT_NETWORK_MMDS_CONNECTION_LOST_MARKER,
+            ),
+            (SNAPSHOT_NETWORK_MMDS_TOKEN_RESULT_OFFSET, token_marker),
+            (
+                SNAPSHOT_NETWORK_MMDS_FRESH_OFFSET,
+                SNAPSHOT_NETWORK_MMDS_FRESH_MARKER,
+            ),
+        ],
+        &format!("production {case} restored MMDS guest"),
+    );
+    let status = running.wait(&format!("production {case} restored MMDS guest poweroff"));
+    assert!(
+        status.success(),
+        "production {case} restored MMDS guest should reach SYSTEM_OFF: {status:?}"
+    );
+    assert!(
+        !running.socket.exists(),
+        "production {case} guest poweroff should remove its API socket"
+    );
+    assert_session_entries_eventually_restored(
+        baseline_sessions,
+        &format!("production {case} restored network/MMDS destination"),
+    );
+    assert_production_network_metrics(&fixture.opened_metrics, "eth0", case);
+    assert_eq!(
+        fs::read(&opened.state).expect("destination network state should remain"),
+        state_before,
+        "production {case} load must not mutate state"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("destination network memory should remain"),
+        memory_before,
+        "production {case} load must not mutate memory"
+    );
+    fixture.assert_replacement_pathnames_unused(&format!(
+        "production {case} restored network/MMDS destination"
+    ));
+    opened
+}
+
+fn configure_network_mmds_snapshot_destination_metrics(socket: &Path, context: &str) {
+    assert_http_status(
+        &http_put(
+            socket,
+            "/metrics",
+            &serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}).to_string(),
+        ),
+        204,
+        &format!("PUT production {context} network/MMDS destination metrics"),
+    );
+}
+
+fn assert_production_network_mmds_config(
+    socket: &Path,
+    selector: &str,
+    mmds_v2: bool,
+    context: &str,
+) {
+    let config = http_get(socket, "/vm/config");
+    assert_http_status(
+        &config,
+        200,
+        &format!("read production {context} restored VM config"),
+    );
+    for expected in [
+        r#""iface_id":"eth0""#,
+        &format!(r#""host_dev_name":"{selector}""#),
+        r#""guest_mac":"06:00:00:00:00:71""#,
+        r#""mtu":1280"#,
+        if mmds_v2 {
+            r#""version":"V2""#
+        } else {
+            r#""version":"V1""#
+        },
+    ] {
+        assert!(
+            config.contains(expected),
+            "production {context} restored config should contain {expected}; response:\n{config}"
+        );
+    }
+    assert_eq!(
+        config.matches(r#""drive_id":"#).count(),
+        2,
+        "production {context} restored config should retain root and control drives"
+    );
+}
+
+fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str) {
+    let output = fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!(
+            "production {context} network metrics {} should read: {error}",
+            path.display()
+        )
+    });
+    let latest_line = output
+        .lines()
+        .rev()
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| {
+            panic!("production {context} network metrics should contain JSON: {output}")
+        });
+    let latest: serde_json::Value = serde_json::from_str(latest_line).unwrap_or_else(|error| {
+        panic!(
+            "production {context} network metrics should be valid JSON: {error}; line:\n{latest_line}"
+        )
+    });
+    let key = format!("net_{iface_id}");
+    let metrics = latest.get(&key).unwrap_or_else(|| {
+        panic!("production {context} metrics should include {key}; line:\n{latest_line}")
+    });
+    for field in [
+        "rx_count",
+        "rx_packets_count",
+        "tx_count",
+        "tx_packets_count",
+    ] {
+        assert!(
+            metrics
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|value| value > 0),
+            "production {context} metrics should report nonzero {key}.{field}; line:\n{latest_line}"
+        );
+    }
+    assert_eq!(
+        metrics
+            .get("event_fails")
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "production {context} metrics should report no {key} event failures; line:\n{latest_line}"
+    );
+    assert!(
+        latest.get("mmds").is_some(),
+        "production {context} metrics should include MMDS activity; line:\n{latest_line}"
+    );
+}
+
+fn wait_for_network_mmds_snapshot_markers(path: &Path, markers: &[(u64, &[u8])], context: &str) {
+    let deadline = Instant::now()
+        .checked_add(SNAPSHOT_NETWORK_MMDS_TIMEOUT)
+        .expect("network/MMDS marker deadline should fit");
+    loop {
+        let all_present = markers
+            .iter()
+            .all(|(offset, marker)| file_bytes_at(path, *offset, marker.len()) == *marker);
+        if all_present {
+            return;
+        }
+        let failure = file_bytes_at(path, 0, SNAPSHOT_NETWORK_MMDS_FAILURE_MARKER.len());
+        assert_ne!(
+            failure,
+            SNAPSHOT_NETWORK_MMDS_FAILURE_MARKER,
+            "{context} reported guest failure; backing prefix: {:?}",
+            String::from_utf8_lossy(&file_bytes_at(
+                path,
+                0,
+                usize::try_from(SNAPSHOT_NETWORK_MMDS_SECTORS * VIRTIO_BLOCK_SECTOR_BYTES)
+                    .expect("network/MMDS diagnostic length should fit")
+            ))
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{context} timed out waiting for markers; backing prefix: {:?}",
+            String::from_utf8_lossy(&file_bytes_at(
+                path,
+                0,
+                usize::try_from(SNAPSHOT_NETWORK_MMDS_SECTORS * VIRTIO_BLOCK_SECTOR_BYTES)
+                    .expect("network/MMDS diagnostic length should fit")
+            ))
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn network_snapshot_load_body(resume_vm: bool, overrides: &[(&str, &str)]) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "snapshot_path": SNAPSHOT_STATE_INPUT_REF,
+        "mem_backend": {
+            "backend_path": SNAPSHOT_MEMORY_INPUT_REF,
+            "backend_type": "File",
+        },
+        "network_overrides": overrides
+            .iter()
+            .map(|(iface_id, host_dev_name)| serde_json::json!({
+                "iface_id": iface_id,
+                "host_dev_name": host_dev_name,
+            }))
+            .collect::<Vec<_>>(),
+        "resume_vm": resume_vm,
+    }))
+    .expect("production network snapshot load body should serialize")
 }
 
 #[test]

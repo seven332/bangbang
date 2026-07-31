@@ -528,7 +528,7 @@ execution proves:
   reuse for a second pair, same-GrantId concurrent-session isolation, bounded
   early description, and two fresh descriptor-bound state/memory/root restores
   with explicit and automatic resume through guest `SYSTEM_OFF`; and
-- exact native-v2 2.6 through current 2.10 profile-3 rooted pmem-only and
+- exact native-v2 2.6 through current 2.11 profile-3 rooted pmem-only and
   rootless mixed-storage create/load over MMIO and PCI, with exact read-only/read-write
   `PmemBacking` grants, source-path replacement resistance, complete-set
   cross-class alias rejection, immutable state/memory reuse, shared writable
@@ -551,7 +551,7 @@ execution proves:
   pathname-replacement resistance, explicit/automatic resume, recapture,
   immutable clone isolation, malformed/cancellation rejection, and both
   launcher/worker death-order staging/session/socket cleanup; and
-- current native-v2 2.10 virtio-mem create/load over MMIO and PCI with exact
+- exact native-v2 2.10 virtio-mem create/load over MMIO and PCI with exact
   state/memory/kernel/root/data/metrics/API grants, source-path replacement
   resistance, retained plugged-byte verification before mutation, partial
   UNPLUG, driver-reprobe UNPLUG_ALL/replug, later PLUG/final UNPLUG,
@@ -559,6 +559,12 @@ execution proves:
   and device ownership, checksum-corrupted state and truncated-memory rejection,
   graceful cancellation, and both launcher/worker death-order staging/session/
   socket cleanup; and
+- current native-v2 2.11 network/MMDS create/load over MMIO and PCI with exact
+  state/memory/kernel/root/data/metrics/API grants, complete clone-local
+  selectors, empty then explicitly reseeded MMDS data, deliberate source
+  TCP/token loss, fresh V1/V2 sessions and metrics, immutable inputs,
+  malformed/override rejection, graceful cancellation, both launcher/worker
+  death orders, and all-MMDS containment without vmnet authority; and
 - worker-first death after a durably recorded snapshot staging inode, with the
   launcher removing the exact inode or preserving a same-name replacement while
   clearing the private record and session namespace.
