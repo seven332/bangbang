@@ -36,10 +36,9 @@ use crate::snapshot_v2_multi_block_platform::{
 };
 use crate::snapshot_v2_platform::{PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID};
 use crate::snapshot_v2_storage_platform::{
-    HvfSnapshotV2StorageMmioFollowingInterrupts, HvfSnapshotV2StorageMmioPlatformPlan,
-    HvfSnapshotV2StorageMmioPlatformPrefix, HvfSnapshotV2StorageMmioProcessConfig,
-    HvfSnapshotV2StoragePciPlatformPlan, HvfSnapshotV2StoragePciPlatformPrefix,
-    PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
+    HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioPlatformPrefix,
+    HvfSnapshotV2StorageMmioProcessConfig, HvfSnapshotV2StoragePciPlatformPlan,
+    HvfSnapshotV2StoragePciPlatformPrefix, PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
     PrepareHvfSnapshotV2StoragePciPlatformPlanError, mmio_region_conflicts_with_platform,
     prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix,
     prepare_hvf_snapshot_v2_storage_pci_platform_plan_with_prefix,
@@ -706,6 +705,10 @@ fn prepare_balloon_mmio_platform_plan(
         .entropy()
         .map(|entropy| prepare_entropy_mmio_endpoint(platform, entropy, process.entropy_layout()))
         .transpose()?;
+    let entropy_interrupts = entropy_endpoint.map(|entropy| [entropy.interrupt_line()]);
+    let following_interrupts = entropy_interrupts
+        .as_ref()
+        .map_or(&[][..], |interrupts| &interrupts[..]);
 
     let storage_plan = product
         .storage()
@@ -718,14 +721,7 @@ fn prepare_balloon_mmio_platform_plan(
                     expected_balloon_region,
                     balloon_interrupt,
                 ),
-                entropy_endpoint.map_or(
-                    HvfSnapshotV2StorageMmioFollowingInterrupts::None,
-                    |entropy| {
-                        HvfSnapshotV2StorageMmioFollowingInterrupts::Entropy(
-                            entropy.interrupt_line(),
-                        )
-                    },
-                ),
+                following_interrupts,
             )
             .map_err(|source| {
                 PrepareHvfSnapshotV2BalloonPlatformPlanError::StorageMmio(Box::new(source))

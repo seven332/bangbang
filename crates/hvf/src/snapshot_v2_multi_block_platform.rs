@@ -944,7 +944,16 @@ pub(crate) fn valid_snapshot_v2_pci_record(
 }
 
 fn valid_pci_msix(state: &SnapshotV2PciMsixState, queue_count: usize) -> bool {
-    state.entries().len() == queue_count + 1
+    let route_count = match queue_count.checked_add(1) {
+        Some(route_count @ 1..=64) => route_count,
+        _ => return false,
+    };
+    let pending_mask = if route_count == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << route_count) - 1
+    };
+    state.entries().len() == route_count
         && state.entries().len() <= VIRTIO_PCI_MAX_MSIX_VECTORS
         && state.pending_words().len() == 1
         && state.queue_vectors().len() == queue_count
@@ -952,7 +961,7 @@ fn valid_pci_msix(state: &SnapshotV2PciMsixState, queue_count: usize) -> bool {
             .pending_words()
             .first()
             .copied()
-            .is_some_and(|pending| pending & !0b11 == 0)
+            .is_some_and(|pending| pending & !pending_mask == 0)
         && valid_pci_vector(state.config_vector(), state.entries().len())
         && state
             .queue_vectors()
