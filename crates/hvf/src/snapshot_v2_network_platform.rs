@@ -65,11 +65,12 @@ use crate::snapshot_v2_platform::{
     PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID, PROCESS_SERIAL_MMIO_BASE,
 };
 use crate::snapshot_v2_storage_platform::{
-    HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioPlatformPrefix,
-    HvfSnapshotV2StorageMmioProcessConfig, HvfSnapshotV2StoragePciPlatformPlan,
-    HvfSnapshotV2StoragePciPlatformPrefix, PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
+    HvfSnapshotV2StorageMmioInsertedEndpoint, HvfSnapshotV2StorageMmioPlatformPlan,
+    HvfSnapshotV2StorageMmioPlatformPrefix, HvfSnapshotV2StorageMmioProcessConfig,
+    HvfSnapshotV2StoragePciPlatformPlan, HvfSnapshotV2StoragePciPlatformPrefix,
+    PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
     PrepareHvfSnapshotV2StoragePciPlatformPlanError, mmio_region_conflicts_with_platform,
-    prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix,
+    prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion,
     prepare_hvf_snapshot_v2_storage_pci_platform_plan_with_prefix,
     queue_ranges_conflict_with_pci_platform, queue_ranges_conflict_with_platform,
     register_active_pci_routes,
@@ -1708,12 +1709,17 @@ fn validate_mmio_interrupt_sequence(
         validate(balloon.interrupt_line())?;
     }
     if let Some(storage) = storage {
-        for record in storage.block_records().iter().chain(storage.pmem_records()) {
+        for record in storage.block_records() {
             validate(record.interrupt_line())?;
         }
     }
     for endpoint in network {
         validate(endpoint.interrupt_line())?;
+    }
+    if let Some(storage) = storage {
+        for record in storage.pmem_records() {
+            validate(record.interrupt_line())?;
+        }
     }
     if let Some(entropy) = entropy {
         validate(entropy.interrupt_line())?;
@@ -1843,14 +1849,16 @@ fn prepare_network_mmio_platform_plan(
         HvfSnapshotV2NetworkPlatformPlanStage::Components,
     )?;
 
-    let following_count = network
-        .len()
-        .checked_add(usize::from(entropy.is_some()))
-        .and_then(|count| count.checked_add(usize::from(memory_hotplug.is_some())))
+    let mut inserted_endpoints = Vec::new();
+    reserve.reserve(&mut inserted_endpoints, network.len())?;
+    inserted_endpoints.extend(network.iter().map(|endpoint| {
+        HvfSnapshotV2StorageMmioInsertedEndpoint::new(endpoint.region(), endpoint.interrupt_line())
+    }));
+    let following_count = usize::from(entropy.is_some())
+        .checked_add(usize::from(memory_hotplug.is_some()))
         .ok_or(PrepareHvfSnapshotV2NetworkPlatformPlanError::ResourcePlan)?;
     let mut following_interrupts = Vec::new();
     reserve.reserve(&mut following_interrupts, following_count)?;
-    following_interrupts.extend(network.iter().map(|endpoint| endpoint.interrupt_line()));
     if let Some(entropy) = entropy {
         following_interrupts.push(entropy.interrupt_line());
     }
@@ -1863,11 +1871,12 @@ fn prepare_network_mmio_platform_plan(
     let storage = product
         .storage()
         .map(|storage| {
-            prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix(
+            prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion(
                 platform,
                 storage,
                 process.storage(),
                 prefix,
+                &inserted_endpoints,
                 &following_interrupts,
             )
             .map_err(|source| {
@@ -2140,19 +2149,16 @@ fn validate_mmio_inventory(
         regions.push(balloon.region());
     }
     if let Some(storage) = storage {
-        regions.extend(
-            storage
-                .block_records()
-                .iter()
-                .chain(storage.pmem_records())
-                .map(|record| record.region()),
-        );
+        regions.extend(storage.block_records().iter().map(|record| record.region()));
     }
     regions.extend(
         network
             .iter()
             .map(HvfSnapshotV2NetworkMmioEndpointPlan::region),
     );
+    if let Some(storage) = storage {
+        regions.extend(storage.pmem_records().iter().map(|record| record.region()));
+    }
     if let Some(entropy) = entropy {
         regions.push(entropy.region());
     }
@@ -2933,8 +2939,8 @@ mod fixture_identity_tests {
         MaterializedFixture, balloon_mmio_plan, balloon_pci_plan, entropy_mmio_plan,
         entropy_pci_plan, materialized_fixture, memory_hotplug_mmio_state,
         memory_hotplug_pci_state, mmio_platform as memory_fixture_mmio_platform,
-        pci_platform as memory_fixture_pci_platform, prepared_storage_bundle, storage_mmio_graph,
-        storage_pci_graph_with_gap,
+        pci_platform as memory_fixture_pci_platform, prepared_storage_bundle,
+        storage_mmio_graph_with_gap, storage_pci_graph_with_gap,
     };
     use crate::snapshot_v2_multi_block_platform::tests::{
         product_mmio_platform, product_pci_platform,
@@ -3666,24 +3672,30 @@ mod fixture_identity_tests {
 
     #[test]
     fn all_sixteen_mmio_product_tags_close_canonical_component_order() {
-        let storage_record_count =
-            product_storage_fixture(SnapshotV2DeviceTransportKind::Mmio).record_count();
+        let storage_graph = product_storage_fixture(SnapshotV2DeviceTransportKind::Mmio);
+        let storage_block_count = storage_graph.block_records().len();
+        let storage_pmem_count = storage_graph.pmem_records().len();
         for mask in 0_u8..16 {
             let has_storage = mask & 1 != 0;
             let has_entropy = mask & 2 != 0;
             let has_balloon = mask & 4 != 0;
             let has_memory_hotplug = mask & 8 != 0;
             let network_count = if mask == 15 { 16 } else { 1 };
-            let storage_count = usize::from(has_storage) * storage_record_count;
+            let block_count = usize::from(has_storage) * storage_block_count;
+            let pmem_count = usize::from(has_storage) * storage_pmem_count;
             let first_interrupt = 32_u32;
             let storage_interrupt = first_interrupt + u32::from(has_balloon);
             let network_interrupt = storage_interrupt
-                + u32::try_from(storage_count).expect("storage interrupt count should fit");
-            let entropy_interrupt = network_interrupt + u32::try_from(network_count).unwrap();
+                + u32::try_from(block_count).expect("block interrupt count should fit");
+            let pmem_interrupt =
+                network_interrupt + u32::try_from(network_count).expect("network count should fit");
+            let entropy_interrupt = pmem_interrupt
+                + u32::try_from(pmem_count).expect("pmem interrupt count should fit");
             let memory_hotplug_interrupt = entropy_interrupt + u32::from(has_entropy);
             let device_count = usize::from(has_balloon)
-                + storage_count
+                + block_count
                 + network_count
+                + pmem_count
                 + usize::from(has_entropy)
                 + usize::from(has_memory_hotplug);
 
@@ -3715,7 +3727,7 @@ mod fixture_identity_tests {
             let balloon = has_balloon.then(|| balloon_mmio_plan(&memory, first_interrupt));
             let entropy = has_entropy.then(|| entropy_mmio_plan(&memory, entropy_interrupt));
             let (storage, _backings) = if has_storage {
-                let graph = storage_mmio_graph(storage_interrupt);
+                let graph = storage_mmio_graph_with_gap(storage_interrupt, network_count);
                 let (bundle, backings) = prepared_storage_bundle(graph);
                 (Some(bundle), backings)
             } else {
@@ -3751,15 +3763,16 @@ mod fixture_identity_tests {
                 network_interrupt,
             );
             if let Some(storage) = plan.storage() {
-                for (index, record) in storage
-                    .block_records()
-                    .iter()
-                    .chain(storage.pmem_records())
-                    .enumerate()
-                {
+                for (index, record) in storage.block_records().iter().enumerate() {
                     assert_eq!(
                         record.interrupt_line().raw_value(),
                         storage_interrupt + u32::try_from(index).unwrap(),
+                    );
+                }
+                for (index, record) in storage.pmem_records().iter().enumerate() {
+                    assert_eq!(
+                        record.interrupt_line().raw_value(),
+                        pmem_interrupt + u32::try_from(index).unwrap(),
                     );
                 }
             }
@@ -4064,7 +4077,7 @@ mod fixture_identity_tests {
 
     #[test]
     fn every_network_identity_and_inventory_allocation_failure_is_explicit() {
-        for fail_at in 0..7 {
+        for fail_at in 0..8 {
             let (platform, product) = mmio_product(1, true, MmdsSelection::All);
             assert!(matches!(
                 prepare_network_mmio_platform_plan(

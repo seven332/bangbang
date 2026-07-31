@@ -666,6 +666,26 @@ impl HvfSnapshotV2StorageMmioPlatformPrefix {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct HvfSnapshotV2StorageMmioInsertedEndpoint {
+    region: MmioRegion,
+    interrupt: GuestInterruptLine,
+}
+
+impl HvfSnapshotV2StorageMmioInsertedEndpoint {
+    pub(crate) const fn new(region: MmioRegion, interrupt: GuestInterruptLine) -> Self {
+        Self { region, interrupt }
+    }
+
+    const fn region(self) -> MmioRegion {
+        self.region
+    }
+
+    const fn interrupt(self) -> GuestInterruptLine {
+        self.interrupt
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum HvfSnapshotV2StoragePciMsiProfile {
     Root,
     RootOrEntropy,
@@ -795,6 +815,7 @@ pub fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan(
         process,
         HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
         &[],
+        &[],
         &mut SystemStoragePlatformPlanReserve,
     )
 }
@@ -814,6 +835,7 @@ pub fn prepare_hvf_snapshot_v2_storage_entropy_mmio_platform_plan(
         bundle,
         process,
         HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
+        &[],
         std::slice::from_ref(&entropy_interrupt),
         &mut SystemStoragePlatformPlanReserve,
     )
@@ -827,11 +849,31 @@ pub(crate) fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix(
     following_interrupts: &[GuestInterruptLine],
 ) -> Result<HvfSnapshotV2StorageMmioPlatformPlan, PrepareHvfSnapshotV2StorageMmioPlatformPlanError>
 {
+    prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion(
+        platform,
+        bundle,
+        process,
+        prefix,
+        &[],
+        following_interrupts,
+    )
+}
+
+pub(crate) fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion(
+    platform: &HvfSnapshotV2PlatformState,
+    bundle: &PreparedSnapshotV2StorageBundle,
+    process: HvfSnapshotV2StorageMmioProcessConfig,
+    prefix: HvfSnapshotV2StorageMmioPlatformPrefix,
+    inserted_endpoints: &[HvfSnapshotV2StorageMmioInsertedEndpoint],
+    following_interrupts: &[GuestInterruptLine],
+) -> Result<HvfSnapshotV2StorageMmioPlatformPlan, PrepareHvfSnapshotV2StorageMmioPlatformPlanError>
+{
     prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
         platform,
         bundle,
         process,
         prefix,
+        inserted_endpoints,
         following_interrupts,
         &mut SystemStoragePlatformPlanReserve,
     )
@@ -842,6 +884,7 @@ fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
     bundle: &PreparedSnapshotV2StorageBundle,
     process: HvfSnapshotV2StorageMmioProcessConfig,
     prefix: HvfSnapshotV2StorageMmioPlatformPrefix,
+    inserted_endpoints: &[HvfSnapshotV2StorageMmioInsertedEndpoint],
     following_interrupts: &[GuestInterruptLine],
     reserve: &mut impl StoragePlatformPlanReserve,
 ) -> Result<HvfSnapshotV2StorageMmioPlatformPlan, PrepareHvfSnapshotV2StorageMmioPlatformPlanError>
@@ -888,10 +931,11 @@ fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
     reserve.reserve(&mut pmem_retries, pmem_records.len())?;
     reserve.reserve(&mut planned_block, block_records.len())?;
     reserve.reserve(&mut planned_pmem, pmem_records.len())?;
-    reserve.reserve(
-        &mut planned_regions,
-        record_count + usize::from(prefix.region.is_some()),
-    )?;
+    let planned_region_count = record_count
+        .checked_add(usize::from(prefix.region.is_some()))
+        .and_then(|count| count.checked_add(inserted_endpoints.len()))
+        .ok_or(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan)?;
+    reserve.reserve(&mut planned_regions, planned_region_count)?;
 
     if prefix.region.is_some() != prefix.interrupt.is_some() {
         return Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan);
@@ -984,6 +1028,24 @@ fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
             .allocate()
             .map_err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::Interrupt)?;
         validate_and_set_interrupt(record.transport(), interrupt, planned)?;
+    }
+
+    for endpoint in inserted_endpoints.iter().copied() {
+        let region = endpoint.region();
+        if mmio_region_conflicts_with_platform(platform, region, &gic)?
+            || planned_regions.iter().any(|planned| {
+                planned.id() == region.id() || planned.range().overlaps(region.range())
+            })
+        {
+            return Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan);
+        }
+        let interrupt = interrupt_allocator
+            .allocate()
+            .map_err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::Interrupt)?;
+        if interrupt != endpoint.interrupt() {
+            return Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan);
+        }
+        planned_regions.push(region);
     }
 
     for (index, (record, config)) in pmem_records.iter().zip(pmem_configs).enumerate() {
@@ -2052,6 +2114,14 @@ pub(crate) mod tests {
         graph: SnapshotV2StorageDeviceGraph,
         first_interrupt: u32,
     ) -> SnapshotV2StorageDeviceGraph {
+        canonicalize_pmem_placement_with_gap(graph, first_interrupt, 0)
+    }
+
+    fn canonicalize_pmem_placement_with_gap(
+        graph: SnapshotV2StorageDeviceGraph,
+        first_interrupt: u32,
+        inserted_interrupt_count: usize,
+    ) -> SnapshotV2StorageDeviceGraph {
         let root_key = graph.root_key();
         let block_records = graph.block_records().to_vec();
         for (index, record) in block_records.iter().enumerate() {
@@ -2078,8 +2148,13 @@ pub(crate) mod tests {
                     .expect("canonical pmem region should validate");
                 let interrupt = GuestInterruptLine::new(
                     first_interrupt
-                        + u32::try_from(block_count + index)
-                            .expect("storage interrupt index should fit"),
+                        + u32::try_from(
+                            block_count
+                                .checked_add(inserted_interrupt_count)
+                                .and_then(|count| count.checked_add(index))
+                                .expect("storage interrupt index should fit"),
+                        )
+                        .expect("storage interrupt index should fit"),
                 )
                 .expect("canonical pmem interrupt should validate");
                 let transport =
@@ -2218,6 +2293,72 @@ pub(crate) mod tests {
             bundle,
             _files: files,
         }
+    }
+
+    fn fixture_with_mmio_insertion(
+        inserted_endpoint_count: usize,
+    ) -> (
+        StorageFixture,
+        Vec<HvfSnapshotV2StorageMmioInsertedEndpoint>,
+    ) {
+        let base = base_graph(FixtureShape::MixedBlockRoot);
+        let platform = crate::snapshot_v2_multi_block_platform::tests::product_mmio_platform(
+            base.record_count()
+                .checked_add(inserted_endpoint_count)
+                .expect("inserted endpoint count should fit"),
+        );
+        let first_interrupt = platform
+            .global()
+            .compatibility()
+            .gic_metadata()
+            .spi_interrupt_range
+            .base;
+        let block_count = base.block_records().len();
+        let graph =
+            canonicalize_pmem_placement_with_gap(base, first_interrupt, inserted_endpoint_count);
+        let (bundle, files) = bundle_from_graph(graph);
+        let mut inserted = Vec::new();
+        inserted
+            .try_reserve_exact(inserted_endpoint_count)
+            .expect("inserted endpoint fixture should reserve");
+        for index in 0..inserted_endpoint_count {
+            let index_u64 = u64::try_from(index).expect("inserted endpoint index should fit");
+            let region = MmioRegion::new(
+                bangbang_runtime::mmio::MmioRegionId::new(
+                    300_u64
+                        .checked_add(index_u64)
+                        .expect("inserted region ID should fit"),
+                ),
+                GuestAddress::new(
+                    0xd200_0000_u64
+                        .checked_add(
+                            index_u64
+                                .checked_mul(VIRTIO_MMIO_DEVICE_WINDOW_SIZE)
+                                .expect("inserted region offset should fit"),
+                        )
+                        .expect("inserted region address should fit"),
+                ),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .expect("inserted endpoint region should validate");
+            let interrupt = GuestInterruptLine::new(
+                first_interrupt
+                    .checked_add(u32::try_from(block_count + index).expect("index should fit"))
+                    .expect("inserted endpoint interrupt should fit"),
+            )
+            .expect("inserted endpoint interrupt should validate");
+            inserted.push(HvfSnapshotV2StorageMmioInsertedEndpoint::new(
+                region, interrupt,
+            ));
+        }
+        (
+            StorageFixture {
+                platform,
+                bundle,
+                _files: files,
+            },
+            inserted,
+        )
     }
 
     fn pci_fixture(hex: &str) -> StorageFixture {
@@ -2439,6 +2580,216 @@ pub(crate) mod tests {
                 .abort()
                 .expect("planned storage bundle should abort cleanly");
         }
+    }
+
+    #[test]
+    fn mmio_insertion_places_one_and_sixteen_endpoints_between_block_and_pmem() {
+        for inserted_endpoint_count in [1, 16] {
+            let (fixture, inserted) = fixture_with_mmio_insertion(inserted_endpoint_count);
+            let first_interrupt = fixture
+                .platform
+                .global()
+                .compatibility()
+                .gic_metadata()
+                .spi_interrupt_range
+                .base;
+            let block_count = fixture
+                .bundle
+                .block_bundle()
+                .map_or(0, |bundle| bundle.records().len());
+            let pmem_count = fixture.bundle.pmem_records().len();
+            let plan =
+                prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion(
+                    &fixture.platform,
+                    &fixture.bundle,
+                    process_config(),
+                    HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
+                    &inserted,
+                    &[],
+                )
+                .expect("block/network/pmem insertion should plan");
+
+            for (index, record) in plan.block_records().iter().enumerate() {
+                assert_eq!(
+                    record.interrupt_line().raw_value(),
+                    first_interrupt + u32::try_from(index).expect("block index should fit"),
+                );
+            }
+            for (index, endpoint) in inserted.iter().copied().enumerate() {
+                assert_eq!(
+                    endpoint.interrupt().raw_value(),
+                    first_interrupt
+                        + u32::try_from(block_count + index)
+                            .expect("inserted endpoint index should fit"),
+                );
+            }
+            for (index, record) in plan.pmem_records().iter().enumerate() {
+                assert_eq!(
+                    record.interrupt_line().raw_value(),
+                    first_interrupt
+                        + u32::try_from(block_count + inserted_endpoint_count + index)
+                            .expect("pmem index should fit"),
+                );
+            }
+            assert_eq!(
+                plan.serial_interrupt().raw_value(),
+                first_interrupt
+                    + u32::try_from(block_count + inserted_endpoint_count + pmem_count)
+                        .expect("serial interrupt index should fit"),
+            );
+            fixture
+                .bundle
+                .abort()
+                .expect("inserted storage fixture should abort cleanly");
+        }
+    }
+
+    #[test]
+    fn mmio_insertion_rejects_interrupt_and_region_conflicts_before_pmem() {
+        let (fixture, inserted) = fixture_with_mmio_insertion(1);
+        let endpoint = inserted[0];
+        let wrong_interrupt = GuestInterruptLine::new(
+            endpoint
+                .interrupt()
+                .raw_value()
+                .checked_add(1)
+                .expect("wrong interrupt should fit"),
+        )
+        .expect("wrong interrupt should validate");
+        let wrong_interrupt = [HvfSnapshotV2StorageMmioInsertedEndpoint::new(
+            endpoint.region(),
+            wrong_interrupt,
+        )];
+        assert!(matches!(
+            prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion(
+                &fixture.platform,
+                &fixture.bundle,
+                process_config(),
+                HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
+                &wrong_interrupt,
+                &[],
+            ),
+            Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan),
+        ));
+
+        let block_region = process_config()
+            .block_layout()
+            .region_at(0)
+            .expect("block region should project");
+        let duplicate_block = [HvfSnapshotV2StorageMmioInsertedEndpoint::new(
+            block_region,
+            endpoint.interrupt(),
+        )];
+        assert!(matches!(
+            prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion(
+                &fixture.platform,
+                &fixture.bundle,
+                process_config(),
+                HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
+                &duplicate_block,
+                &[],
+            ),
+            Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan),
+        ));
+
+        let fixed_region = MmioRegion::new(
+            bangbang_runtime::mmio::MmioRegionId::new(999),
+            PROCESS_SERIAL_MMIO_BASE,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("fixed-overlap region should validate");
+        let fixed = [HvfSnapshotV2StorageMmioInsertedEndpoint::new(
+            fixed_region,
+            endpoint.interrupt(),
+        )];
+        assert!(matches!(
+            prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion(
+                &fixture.platform,
+                &fixture.bundle,
+                process_config(),
+                HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
+                &fixed,
+                &[],
+            ),
+            Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan),
+        ));
+
+        let pmem_region = process_config()
+            .pmem_layout()
+            .region_at(0)
+            .expect("pmem region should project");
+        let duplicate_pmem = [HvfSnapshotV2StorageMmioInsertedEndpoint::new(
+            pmem_region,
+            endpoint.interrupt(),
+        )];
+        assert!(matches!(
+            prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion(
+                &fixture.platform,
+                &fixture.bundle,
+                process_config(),
+                HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
+                &duplicate_pmem,
+                &[],
+            ),
+            Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan),
+        ));
+
+        let pmem_mapping = fixture.bundle.pmem_records()[0]
+            .prepared_device()
+            .guest_range();
+        let mapping_region = MmioRegion::new(
+            bangbang_runtime::mmio::MmioRegionId::new(998),
+            pmem_mapping.start(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("pmem-mapping overlap region should validate");
+        let mapping = [HvfSnapshotV2StorageMmioInsertedEndpoint::new(
+            mapping_region,
+            endpoint.interrupt(),
+        )];
+        assert!(matches!(
+            prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion(
+                &fixture.platform,
+                &fixture.bundle,
+                process_config(),
+                HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
+                &mapping,
+                &[],
+            ),
+            Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::PmemRangeConflict),
+        ));
+
+        fixture
+            .bundle
+            .abort()
+            .expect("hostile insertion fixture should abort cleanly");
+    }
+
+    #[test]
+    fn mmio_insertion_rejects_duplicate_inserted_endpoint_identity() {
+        let (fixture, inserted) = fixture_with_mmio_insertion(2);
+        let duplicate = [
+            inserted[0],
+            HvfSnapshotV2StorageMmioInsertedEndpoint::new(
+                inserted[0].region(),
+                inserted[1].interrupt(),
+            ),
+        ];
+        assert!(matches!(
+            prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion(
+                &fixture.platform,
+                &fixture.bundle,
+                process_config(),
+                HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
+                &duplicate,
+                &[],
+            ),
+            Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan),
+        ));
+        fixture
+            .bundle
+            .abort()
+            .expect("duplicate insertion fixture should abort cleanly");
     }
 
     #[test]
@@ -2822,14 +3173,16 @@ pub(crate) mod tests {
             process_config(),
         )
         .expect("legacy MMIO storage plan should validate");
-        let prefixed = prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix(
-            &fixture.platform,
-            &fixture.bundle,
-            process_config(),
-            HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
-            &[],
-        )
-        .expect("zero-prefix MMIO storage plan should validate");
+        let prefixed =
+            prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix_and_insertion(
+                &fixture.platform,
+                &fixture.bundle,
+                process_config(),
+                HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
+                &[],
+                &[],
+            )
+            .expect("zero-insertion MMIO storage plan should validate");
         assert_eq!(legacy.root_key(), prefixed.root_key());
         assert_eq!(legacy.command_line(), prefixed.command_line());
         assert_eq!(legacy.block_metrics_ids(), prefixed.block_metrics_ids());
@@ -2927,6 +3280,7 @@ pub(crate) mod tests {
                     &fixture.bundle,
                     process_config(),
                     HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
+                    &[],
                     &[],
                     &mut FailingReserve { calls: 0, fail_at },
                 ),
