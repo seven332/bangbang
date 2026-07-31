@@ -1476,8 +1476,9 @@ impl VmmController {
         snapshot::classify_v1_load_request(input).map_err(|_| VmmActionError::SnapshotUnsupported)
     }
 
-    /// Preflights the family-neutral destination and request constraints that
-    /// must be rejected before any snapshot state path or grant is touched.
+    /// Preflights the family-neutral destination and common request
+    /// constraints that must be rejected before any snapshot state path or
+    /// grant is touched.
     ///
     /// Memory-backend, dirty-tracking, deprecated-field, and other
     /// family-specific decisions remain deferred until after the state family
@@ -1492,9 +1493,10 @@ impl VmmController {
                 state: self.instance_info.state,
             });
         }
+        if input.clock_realtime() || input.vsock_override().is_some() {
+            return Err(VmmActionError::SnapshotUnsupported);
+        }
 
-        snapshot::classify_v1_load_request(input)
-            .map_err(|_| VmmActionError::SnapshotUnsupported)?;
         snapshot::classify_v1_load_eligibility(
             self.snapshot_load_history_fresh,
             self.snapshot_v1_load_profile()?,
@@ -1549,6 +1551,8 @@ impl VmmController {
             entropy_config,
             balloon_config,
             memory_hotplug,
+            network_configs,
+            mmds_state,
             resume_requested,
         ) = commit.into_parts();
         self.machine_config = machine_config;
@@ -1563,6 +1567,17 @@ impl VmmController {
         self.memory_hotplug_requested_size_mib = memory_hotplug
             .map(|projection| projection.requested_size_mib())
             .unwrap_or(0);
+        self.network_interface_configs = network_configs;
+        self.mmds_state = mmds_state.unwrap_or_else(|| {
+            let data_store_limit_bytes = self
+                .mmds_state
+                .with(mmds::MmdsState::data_store_limit_bytes)
+                .unwrap_or(mmds::MMDS_DATA_STORE_LIMIT_BYTES);
+            mmds::MmdsStateHandle::new(mmds::MmdsState::with_instance_id(
+                data_store_limit_bytes,
+                &self.instance_info.id,
+            ))
+        });
         self.snapshot_load_history_fresh = false;
         self.instance_info.state = InstanceState::Paused;
         resume_requested
@@ -2252,12 +2267,13 @@ mod tests {
         metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics},
         mmds::{
             MMDS_DATA_STORE_LIMIT_BYTES, MmdsConfigError, MmdsConfigInput, MmdsContentInput,
-            MmdsDataStoreError, MmdsState, MmdsVersion,
+            MmdsDataStoreError, MmdsState, MmdsStateHandle, MmdsVersion,
         },
         network::{
             GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfigError,
-            NetworkInterfaceConfigInput, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
-            NetworkRateLimiterConfig, NetworkRuntimeMutationError, NetworkTokenBucketConfig,
+            NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkInterfaceUpdateError,
+            NetworkInterfaceUpdateInput, NetworkRateLimiterConfig, NetworkRuntimeMutationError,
+            NetworkTokenBucketConfig,
         },
         pmem::{
             PmemConfig, PmemConfigError, PmemConfigInput, PmemRateLimiterConfig,
@@ -2267,6 +2283,8 @@ mod tests {
         snapshot::{
             SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend,
             SnapshotMemoryBackendType, SnapshotType, SnapshotV2ControllerCommit,
+            SnapshotV2ControllerCommitProductConfigs,
+            SnapshotV2NetworkControllerCommitProductConfigs,
         },
         storage_capture::CaptureReadyStorageConfigs,
         vsock::{MIN_GUEST_CID, VsockConfigError, VsockConfigInput},
@@ -3437,6 +3455,15 @@ mod tests {
             .with_resume_vm(true);
         assert_eq!(controller.preflight_load_snapshot_v2(&file), Ok(()));
         assert_eq!(controller.preflight_load_snapshot(&file), Ok(()));
+        let network = snapshot_load_input().with_network_overrides(vec![
+            super::snapshot::SnapshotNetworkOverride::new("eth0", "destination-selector"),
+        ]);
+        assert_eq!(controller.preflight_load_snapshot_v2(&network), Ok(()));
+        assert_eq!(
+            controller.preflight_load_snapshot(&network),
+            Err(VmmActionError::SnapshotUnsupported),
+            "native-v1 compatibility must retain its override rejection"
+        );
 
         let uffd = SnapshotLoadInput::new(
             "/private/state",
@@ -3776,6 +3803,163 @@ mod tests {
         assert_eq!(controller.serial_config(), &serial_only);
         assert_eq!(controller.entropy_config(), None);
         assert_eq!(controller.balloon_config(), None);
+    }
+
+    #[test]
+    fn private_native_v2_network_commit_atomically_publishes_overrides_and_fresh_mmds() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new("stale", "stale", "stale-private-selector"),
+            ))
+            .expect("stale network fixture should configure");
+        controller
+            .handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
+                "stale".to_owned(),
+            ])))
+            .expect("stale MMDS fixture should configure");
+        controller
+            .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(32, false)))
+            .expect("stale balloon fixture should configure");
+
+        let machine = MachineConfigInput::new(2, 256)
+            .with_track_dirty_pages(true)
+            .validate()
+            .expect("restored machine fixture should validate");
+        let boot = BootSourceConfigInput::new("/inert/source/kernel")
+            .validate()
+            .expect("restored boot fixture should validate");
+        let serial = SerialConfigInput::new()
+            .with_serial_out_path("restored-serial-selector")
+            .validate()
+            .expect("restored serial fixture should validate");
+        let entropy = EntropyConfigInput::new()
+            .validate()
+            .expect("restored entropy fixture should validate");
+        let network =
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "destination-private-selector")
+                .with_guest_mac("02:00:00:00:00:01")
+                .with_mtu(1400)
+                .validate()
+                .expect("restored network fixture should validate");
+        let network_configs = NetworkInterfaceConfigs::from_validated(vec![network.clone()]);
+        let fresh_mmds = MmdsStateHandle::new(MmdsState::with_instance_id(
+            MMDS_DATA_STORE_LIMIT_BYTES,
+            "demo-1",
+        ));
+        fresh_mmds
+            .with_mut(|state| {
+                state.put_config(
+                    MmdsConfigInput::new(vec!["eth0".to_owned()])
+                        .with_version(MmdsVersion::V2)
+                        .with_imds_compat(true),
+                    network_configs.as_slice(),
+                )
+            })
+            .expect("fresh MMDS state should lock")
+            .expect("fresh MMDS config should validate");
+        let expected_mmds = fresh_mmds.clone();
+        let commit = SnapshotV2ControllerCommit::with_network_product_configs(
+            machine,
+            boot,
+            SnapshotV2NetworkControllerCommitProductConfigs::new(
+                SnapshotV2ControllerCommitProductConfigs::new(
+                    None,
+                    serial.clone(),
+                    Some(entropy),
+                    None,
+                    None,
+                ),
+                network_configs,
+                Some(fresh_mmds),
+            ),
+            true,
+        );
+        let diagnostics = format!("{commit:?}");
+        assert!(diagnostics.contains("<redacted>"));
+        assert!(!diagnostics.contains("destination-private-selector"));
+        assert!(!diagnostics.contains("restored-serial-selector"));
+        assert!(!diagnostics.contains("/inert/source/kernel"));
+
+        assert!(controller.commit_snapshot_v2_load(commit));
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
+        assert_eq!(controller.machine_config(), machine);
+        assert_eq!(controller.network_interface_configs(), &[network]);
+        assert_eq!(controller.serial_config(), &serial);
+        assert_eq!(controller.entropy_config(), Some(entropy));
+        assert_eq!(controller.balloon_config(), None);
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.pmem_configs().is_empty());
+        let retained_mmds = controller.mmds_state_handle();
+        assert!(retained_mmds.shares_state_with(&expected_mmds));
+        assert_eq!(
+            controller
+                .mmds_config()
+                .expect("restored MMDS state should lock")
+                .expect("restored MMDS config should exist")
+                .network_interfaces(),
+            ["eth0"]
+        );
+        assert_eq!(retained_mmds.with(MmdsState::data_store_present), Ok(true));
+        assert_eq!(
+            retained_mmds.with(MmdsState::get_data),
+            Ok(Err(MmdsDataStoreError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn private_native_v2_network_free_commit_clears_stale_mmds_with_destination_identity() {
+        let mut controller =
+            VmmController::with_mmds_data_store_limit("demo-1", "0.1.0", "bangbang", 1_024);
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new("stale", "stale", "stale-selector"),
+            ))
+            .expect("stale network fixture should configure");
+        controller
+            .handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
+                "stale".to_owned(),
+            ])))
+            .expect("stale MMDS fixture should configure");
+        let stale_mmds = controller.mmds_state_handle();
+        let machine = MachineConfigInput::new(2, 256)
+            .validate()
+            .expect("restored machine fixture should validate");
+        let boot = BootSourceConfigInput::new("/inert/source/kernel")
+            .validate()
+            .expect("restored boot fixture should validate");
+        let commit = SnapshotV2ControllerCommit::with_network_product_configs(
+            machine,
+            boot,
+            SnapshotV2NetworkControllerCommitProductConfigs::new(
+                SnapshotV2ControllerCommitProductConfigs::new(
+                    None,
+                    super::serial::SerialConfig::default(),
+                    None,
+                    None,
+                    None,
+                ),
+                NetworkInterfaceConfigs::new(),
+                None,
+            ),
+            false,
+        );
+
+        assert!(!controller.commit_snapshot_v2_load(commit));
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
+        assert!(controller.network_interface_configs().is_empty());
+        assert_eq!(controller.mmds_config(), Ok(None));
+        let fresh_mmds = controller.mmds_state_handle();
+        assert!(!fresh_mmds.shares_state_with(&stale_mmds));
+        assert_eq!(fresh_mmds.with(MmdsState::data_store_present), Ok(false));
+        assert_eq!(
+            fresh_mmds.with(MmdsState::data_store_limit_bytes),
+            Ok(1_024)
+        );
+        assert_eq!(
+            fresh_mmds.with(|state| state.token_authority_is_bound_to_instance_id("demo-1")),
+            Ok(true)
+        );
     }
 
     #[test]

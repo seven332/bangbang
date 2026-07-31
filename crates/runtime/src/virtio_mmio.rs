@@ -2073,15 +2073,27 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
                         source,
                     },
                 ),
-            VirtioMmioRegister::InterruptAck => self
-                .interrupts
-                .write_register(register, value, self.device.status())
-                .map_err(
-                    |source| VirtioMmioRegisterHandlerError::InterruptRegisterWrite {
-                        register,
-                        source,
-                    },
-                ),
+            VirtioMmioRegister::InterruptAck => {
+                self.interrupts
+                    .write_register(register, value, self.device.status())
+                    .map_err(
+                        |source| VirtioMmioRegisterHandlerError::InterruptRegisterWrite {
+                            register,
+                            source,
+                        },
+                    )?;
+                if let Ok(acknowledged) = DeviceInterruptStatus::from_bits(value) {
+                    self.core.interrupt_intents.retain(|intent| match intent {
+                        VirtioInterruptIntent::Queue { .. } => {
+                            !acknowledged.contains(DeviceInterruptKind::Queue)
+                        }
+                        VirtioInterruptIntent::Configuration => {
+                            !acknowledged.contains(DeviceInterruptKind::Config)
+                        }
+                    });
+                }
+                Ok(())
+            }
             VirtioMmioRegister::MagicValue
             | VirtioMmioRegister::Version
             | VirtioMmioRegister::DeviceId
@@ -3282,6 +3294,7 @@ mod tests {
         MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioHandlerError,
         MmioOperation, MmioOperationKind, MmioRegionId,
     };
+    use crate::virtio::VirtioInterruptIntent;
 
     const BASE: u64 = 0x1000_0000;
     const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
@@ -4772,6 +4785,42 @@ mod tests {
             read_register_u32(&handler, VirtioMmioRegister::InterruptStatus.offset()),
             Ok(0)
         );
+    }
+
+    #[test]
+    fn register_handler_interrupt_ack_clears_matching_exact_intents() {
+        let mut handler =
+            VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build");
+        advance_handler_to_driver_ok(&mut handler).expect("handler should reach DRIVER_OK");
+
+        handler.mark_queue_interrupt_pending(0);
+        handler.mark_config_interrupt_pending();
+        assert_eq!(
+            handler.core.interrupt_intents,
+            vec![
+                VirtioInterruptIntent::Queue { queue_index: 0 },
+                VirtioInterruptIntent::Configuration,
+            ]
+        );
+
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::InterruptAck.offset(),
+            DeviceInterruptKind::Queue.status().bits(),
+        )
+        .expect("queue interrupt ack should write");
+        assert_eq!(
+            handler.core.interrupt_intents,
+            vec![VirtioInterruptIntent::Configuration]
+        );
+
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::InterruptAck.offset(),
+            DeviceInterruptKind::Config.status().bits(),
+        )
+        .expect("configuration interrupt ack should write");
+        assert!(handler.core.interrupt_intents.is_empty());
     }
 
     #[test]

@@ -1356,57 +1356,116 @@ pub(super) fn load_prepared_native_snapshot_memory_file_macos(
                     ),
                 )
             })?;
-            if state.v2_profile().map_err(|source| {
+            let profile = state.v2_profile().map_err(|source| {
                 load_error(
                     SnapshotArtifactLoadStage::StateDecode,
                     SnapshotArtifactLoadFailure::NativeState(source),
                 )
-            })? == NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
-            {
-                let candidate =
-                    NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
-                        bytes.clone(),
-                    )
-                    .map_err(|source| {
-                        load_error(
-                            SnapshotArtifactLoadStage::StateDecode,
-                            SnapshotArtifactLoadFailure::NativeState(
-                                NativeSnapshotArtifactStateError::CurrentV2Profile(source),
-                            ),
+            })?;
+            match profile {
+                NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10 => {
+                    let candidate =
+                        NativeV2MemoryHotplugSnapshotCandidateState::from_memory_hotplug_state_v2_10(
+                            bytes.clone(),
                         )
-                    })?;
-                match candidate.prepare().map_err(|source| {
-                    load_error(
-                        SnapshotArtifactLoadStage::StateDecode,
-                        SnapshotArtifactLoadFailure::MemoryHotplugPreparation(source),
-                    )
-                })? {
-                    NativeV2MemoryHotplugSnapshotPreparation::Compatible(_) => {
-                        load_snapshot_v2_memory_file(&decoded, memory_file).map_err(|source| {
-                            load_error(
-                                SnapshotArtifactLoadStage::MemoryLoad,
-                                SnapshotArtifactLoadFailure::MemoryV2(source),
-                            )
-                        })?
-                    }
-                    NativeV2MemoryHotplugSnapshotPreparation::Prepared(prepared) => prepared
-                        .materialize_memory_file(memory_file)
-                        .map(MaterializedNativeV2MemoryHotplugSnapshotCandidateState::into_parts)
-                        .map(|(_, _, _, _, _, _, memory)| memory)
                         .map_err(|source| {
                             load_error(
-                                SnapshotArtifactLoadStage::MemoryLoad,
-                                SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(source),
+                                SnapshotArtifactLoadStage::StateDecode,
+                                SnapshotArtifactLoadFailure::NativeState(
+                                    NativeSnapshotArtifactStateError::CurrentV2Profile(source),
+                                ),
                             )
-                        })?,
+                        })?;
+                    match candidate.prepare().map_err(|source| {
+                        load_error(
+                            SnapshotArtifactLoadStage::StateDecode,
+                            SnapshotArtifactLoadFailure::MemoryHotplugPreparation(source),
+                        )
+                    })? {
+                        NativeV2MemoryHotplugSnapshotPreparation::Compatible(_) => {
+                            load_snapshot_v2_memory_file(&decoded, memory_file).map_err(
+                                |source| {
+                                    load_error(
+                                        SnapshotArtifactLoadStage::MemoryLoad,
+                                        SnapshotArtifactLoadFailure::MemoryV2(source),
+                                    )
+                                },
+                            )?
+                        }
+                        NativeV2MemoryHotplugSnapshotPreparation::Prepared(prepared) => prepared
+                            .materialize_memory_file(memory_file)
+                            .map(
+                                MaterializedNativeV2MemoryHotplugSnapshotCandidateState::into_parts,
+                            )
+                            .map(|(_, _, _, _, _, _, memory)| memory)
+                            .map_err(|source| {
+                                load_error(
+                                    SnapshotArtifactLoadStage::MemoryLoad,
+                                    SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(
+                                        source,
+                                    ),
+                                )
+                            })?,
+                    }
                 }
-            } else {
-                load_snapshot_v2_memory_file(&decoded, memory_file).map_err(|source| {
+                NativeV2SnapshotArtifactProfile::NetworkStateV2_11 => {
+                    let candidate =
+                        NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(
+                            bytes.clone(),
+                        )
+                        .map_err(|source| {
+                            load_error(
+                                SnapshotArtifactLoadStage::StateDecode,
+                                SnapshotArtifactLoadFailure::NativeState(
+                                    NativeSnapshotArtifactStateError::CurrentV2Profile(source),
+                                ),
+                            )
+                        })?;
+                    let (_, binding, _, _, _, _, memory_hotplug, _) = candidate.into_parts();
+                    match memory_hotplug {
+                        Some(memory_hotplug) => {
+                            let topology =
+                                PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
+                                    memory_hotplug,
+                                    binding,
+                                    NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                                )
+                                .map_err(|source| {
+                                    load_error(
+                                        SnapshotArtifactLoadStage::StateDecode,
+                                        SnapshotArtifactLoadFailure::MemoryHotplugPreparation(
+                                            NativeV2MemoryHotplugSnapshotPreparationError::Topology(
+                                                source,
+                                            ),
+                                        ),
+                                    )
+                                })?;
+                            materialize_snapshot_v2_memory_hotplug_file(&topology, memory_file)
+                                .map_err(|source| {
+                                    load_error(
+                                        SnapshotArtifactLoadStage::MemoryLoad,
+                                        SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(
+                                            source,
+                                        ),
+                                    )
+                                })?
+                        }
+                        None => load_snapshot_v2_memory_file(&decoded, memory_file).map_err(
+                            |source| {
+                                load_error(
+                                    SnapshotArtifactLoadStage::MemoryLoad,
+                                    SnapshotArtifactLoadFailure::MemoryV2(source),
+                                )
+                            },
+                        )?,
+                    }
+                }
+                _ => load_snapshot_v2_memory_file(&decoded, memory_file).map_err(|source| {
                     load_error(
                         SnapshotArtifactLoadStage::MemoryLoad,
                         SnapshotArtifactLoadFailure::MemoryV2(source),
                     )
-                })?
+                })?,
             }
         }
     };

@@ -1688,7 +1688,6 @@ fn validate_product(
     product: &HvfSnapshotV2NetworkPreparedProduct,
 ) -> Result<SnapshotV2DeviceTransportKind, PrepareHvfSnapshotV2NetworkPlatformPlanError> {
     if !platform.machine().fdt().is_product_process_profile()
-        || !platform.machine().machine().track_dirty_pages()
         || platform.time().rtc_layout()
             != RtcMmioLayout::new(PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID)
     {
@@ -1698,13 +1697,10 @@ fn validate_product(
         return Err(PrepareHvfSnapshotV2NetworkPlatformPlanError::Binding);
     }
     let interfaces = product.network().interfaces();
-    if !(1..=NATIVE_V2_NETWORK_MAX_INTERFACES).contains(&interfaces.len()) {
+    if interfaces.len() > NATIVE_V2_NETWORK_MAX_INTERFACES {
         return Err(PrepareHvfSnapshotV2NetworkPlatformPlanError::Cardinality);
     }
-    let transport_kind = interfaces
-        .first()
-        .map(|interface| interface.portable().transport().kind())
-        .ok_or(PrepareHvfSnapshotV2NetworkPlatformPlanError::Interface)?;
+    let transport_kind = product.network().transport_kind();
     if product
         .storage()
         .is_some_and(|storage| storage.transport_kind() != transport_kind)
@@ -4336,7 +4332,10 @@ mod fixture_identity_tests {
             prepare_hvf_snapshot_v2_network_pci_platform_plan(&platform, duplicate_routes),
             Err(PrepareHvfSnapshotV2NetworkPlatformPlanError::RouteConflict),
         ));
+    }
 
+    #[test]
+    fn untracked_full_snapshot_profile_is_accepted() {
         let (untracked, _) = mmio_product(1, false, MmdsSelection::None);
         let (memory, machine, global, topology, vcpus, time) = untracked.into_parts();
         let machine = HvfSnapshotV2MachineState::try_new(
@@ -4350,14 +4349,14 @@ mod fixture_identity_tests {
             HvfSnapshotV2PlatformState::try_new(memory, machine, global, topology, vcpus, time)
                 .expect("untracked platform should validate");
         let (_, product) = mmio_product(1, false, MmdsSelection::None);
-        assert!(matches!(
+        assert!(
             prepare_hvf_snapshot_v2_network_mmio_platform_plan(
                 &untracked,
                 product,
                 mmio_process_config(),
-            ),
-            Err(PrepareHvfSnapshotV2NetworkPlatformPlanError::PlatformProfile),
-        ));
+            )
+            .is_ok()
+        );
     }
 
     #[test]

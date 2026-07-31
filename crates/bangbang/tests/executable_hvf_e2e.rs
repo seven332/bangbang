@@ -29,7 +29,7 @@ mod macos_arm64 {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use bangbang_hvf::decode_hvf_snapshot_v2_memory_hotplug_state;
+    use bangbang_hvf::decode_hvf_snapshot_v2_network_state;
     use bangbang_runtime::balloon::VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
     use bangbang_runtime::block::{DriveCacheType, DriveIoEngine};
     use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonState;
@@ -2036,10 +2036,7 @@ mod macos_arm64 {
             &socket_path,
             test_dir.path(),
             "paused serial stdio capture preflight",
-            false,
-            false,
-            false,
-            false,
+            ExpectedSnapshotOptionalProducts::NONE,
         );
         let captured_stdout = bangbang.stdout_snapshot();
         assert!(!captured_stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
@@ -3626,10 +3623,7 @@ mod macos_arm64 {
             &socket_path,
             test_dir.path(),
             &format!("paused {transport} balloon exact-2.9 publication"),
-            true,
-            false,
-            true,
-            false,
+            ExpectedSnapshotOptionalProducts::STORAGE_AND_BALLOON,
         );
         let state_path = test_dir.path().join("capture-ready.state");
         let memory_path = test_dir.path().join("capture-ready.memory");
@@ -3750,8 +3744,8 @@ mod macos_arm64 {
         });
         let structural =
             decode_snapshot_v2_state(&bytes).expect("balloon state should decode structurally");
-        let state = decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
-            .expect("balloon state should decode as exact native-v2 2.10");
+        let state = decode_hvf_snapshot_v2_network_state(&structural)
+            .expect("balloon state should decode as exact native-v2 2.11");
         assert_eq!(
             state.device_graph().is_some(),
             expect_storage,
@@ -4377,11 +4371,8 @@ mod macos_arm64 {
         assert_capture_ready_snapshot_succeeds(
             &socket_path,
             test_dir.path(),
-            &format!("paused {transport} memory-hotplug exact-2.10 publication"),
-            true,
-            false,
-            false,
-            true,
+            &format!("paused {transport} memory-hotplug exact-2.11 publication"),
+            ExpectedSnapshotOptionalProducts::STORAGE_AND_MEMORY_HOTPLUG,
         );
         let state_path = test_dir.path().join("capture-ready.state");
         let memory_path = test_dir.path().join("capture-ready.memory");
@@ -4476,8 +4467,8 @@ mod macos_arm64 {
         });
         let structural =
             decode_snapshot_v2_state(&bytes).expect("memory-hotplug state should decode");
-        let state = decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
-            .expect("memory-hotplug state should be exact native-v2 2.10");
+        let state = decode_hvf_snapshot_v2_network_state(&structural)
+            .expect("memory-hotplug state should be exact native-v2 2.11");
         let graph = state
             .device_graph()
             .expect("memory-hotplug certification artifact should retain root and data");
@@ -4525,7 +4516,10 @@ mod macos_arm64 {
         assert_eq!(plugged_ranges[0].start_block(), 0);
         assert_eq!(plugged_ranges[0].block_count(), 64);
         memory_hotplug
-            .validate_memory_binding(state.platform().memory())
+            .validate_memory_binding_for_compatibility_version(
+                state.platform().memory(),
+                state.platform().memory().version(),
+            )
             .expect("kind-11 bitmap should exactly close the kind-1 memory extents");
         memory_hotplug.clone()
     }
@@ -5910,10 +5904,7 @@ mod macos_arm64 {
             &socket_path,
             test_dir.path(),
             &format!("paused {transport} entropy capture-ready preflight"),
-            true,
-            true,
-            false,
-            false,
+            ExpectedSnapshotOptionalProducts::STORAGE_AND_ENTROPY,
         );
         assert_no_content_response(
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
@@ -6194,8 +6185,8 @@ mod macos_arm64 {
         });
         let structural =
             decode_snapshot_v2_state(&bytes).expect("entropy state should decode structurally");
-        let state = decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
-            .expect("entropy state should decode as exact native-v2 2.10");
+        let state = decode_hvf_snapshot_v2_network_state(&structural)
+            .expect("entropy state should decode as exact native-v2 2.11");
         assert_eq!(
             state.device_graph().is_some(),
             with_storage,
@@ -6799,10 +6790,7 @@ mod macos_arm64 {
             &socket_path,
             test_dir.path(),
             &format!("paused aggregate remaining-device capture-ready preflight {transport}"),
-            true,
-            true,
-            true,
-            true,
+            ExpectedSnapshotOptionalProducts::STORAGE_ENTROPY_BALLOON_AND_MEMORY_HOTPLUG,
         );
         assert_no_content_response(
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
@@ -8183,10 +8171,7 @@ mod macos_arm64 {
             &socket_path,
             test_dir.path(),
             "paused dynamic PCI Async storage preflight",
-            true,
-            false,
-            false,
-            false,
+            ExpectedSnapshotOptionalProducts::STORAGE,
         );
         write_block_marker_at(
             &control_backing_path,
@@ -9024,10 +9009,11 @@ mod macos_arm64 {
             r#""iface_id":"eth0""#,
             "GET /vm/config after network reuse",
         );
-        assert_capture_ready_snapshot_rejected_without_artifacts(
+        assert_capture_ready_snapshot_succeeds(
             &socket_path,
             test_dir.path(),
             "paused reused runtime MMDS network capture over product PCI",
+            ExpectedSnapshotOptionalProducts::STORAGE_AND_NETWORK,
         );
         write_block_marker_at(
             &control_backing_path,
@@ -9226,10 +9212,7 @@ mod macos_arm64 {
             &socket_path,
             test_dir.path(),
             "paused dynamic PCI pmem storage preflight",
-            true,
-            false,
-            false,
-            false,
+            ExpectedSnapshotOptionalProducts::STORAGE,
         );
         write_block_marker_at(
             &control_backing_path,
@@ -9453,10 +9436,7 @@ mod macos_arm64 {
             &socket_path,
             test_dir.path(),
             "paused direct pmem storage preflight",
-            true,
-            false,
-            false,
-            false,
+            ExpectedSnapshotOptionalProducts::STORAGE,
         );
         assert_no_content_response(
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
@@ -11728,10 +11708,11 @@ mod macos_arm64 {
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
             &pause_context,
         );
-        assert_capture_ready_snapshot_rejected_without_artifacts(
+        assert_capture_ready_snapshot_succeeds(
             &socket_path,
             test_dir.path(),
             &format!("paused MMDS network capture {}", case.request_context),
+            ExpectedSnapshotOptionalProducts::STORAGE_AND_NETWORK,
         );
         let resume_context = format!(
             "PATCH /vm Resumed after MMDS network capture {}",
@@ -13219,7 +13200,7 @@ mod macos_arm64 {
         let bytes = fs::read(path).expect("configured serial snapshot state should read");
         let structural = decode_snapshot_v2_state(&bytes)
             .expect("configured serial snapshot state should decode");
-        let decoded = decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
+        let decoded = decode_hvf_snapshot_v2_network_state(&structural)
             .expect("configured serial snapshot state should decode semantically");
         assert!(decoded.device_graph().is_none());
         assert_eq!(
@@ -13271,7 +13252,7 @@ mod macos_arm64 {
         let bytes = fs::read(path).expect("serial snapshot state should read");
         let structural =
             decode_snapshot_v2_state(&bytes).expect("serial snapshot state should decode");
-        let decoded = decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
+        let decoded = decode_hvf_snapshot_v2_network_state(&structural)
             .expect("serial snapshot state should decode semantically");
         assert!(
             decoded
@@ -13459,7 +13440,7 @@ mod macos_arm64 {
             "native-v2 description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.10.0");
+        assert_eq!(described.stdout.trim(), "v2.11.0");
 
         let collision = http_json_with_io_timeout(
             &source_socket,
@@ -13982,7 +13963,7 @@ mod macos_arm64 {
             "{transport} native-v2 root description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.10.0");
+        assert_eq!(described.stdout.trim(), "v2.11.0");
         let source_output = source.terminate();
         assert_clean_shutdown(
             source_output,
@@ -15096,7 +15077,7 @@ mod macos_arm64 {
         });
         let structural =
             decode_snapshot_v2_state(&bytes).expect("native-v2 state should decode structurally");
-        decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
+        decode_hvf_snapshot_v2_network_state(&structural)
             .expect("native-v2 state should decode semantically")
             .device_graph()
             .expect("storage-bearing native-v2 state should contain a device graph")
@@ -15353,14 +15334,56 @@ mod macos_arm64 {
         );
     }
 
+    #[derive(Clone, Copy)]
+    struct ExpectedSnapshotOptionalProducts {
+        storage: bool,
+        entropy: bool,
+        balloon: bool,
+        memory_hotplug: bool,
+        network: bool,
+    }
+
+    impl ExpectedSnapshotOptionalProducts {
+        const NONE: Self = Self {
+            storage: false,
+            entropy: false,
+            balloon: false,
+            memory_hotplug: false,
+            network: false,
+        };
+        const STORAGE: Self = Self {
+            storage: true,
+            ..Self::NONE
+        };
+        const STORAGE_AND_ENTROPY: Self = Self {
+            entropy: true,
+            ..Self::STORAGE
+        };
+        const STORAGE_AND_BALLOON: Self = Self {
+            balloon: true,
+            ..Self::STORAGE
+        };
+        const STORAGE_AND_MEMORY_HOTPLUG: Self = Self {
+            memory_hotplug: true,
+            ..Self::STORAGE
+        };
+        const STORAGE_AND_NETWORK: Self = Self {
+            network: true,
+            ..Self::STORAGE
+        };
+        const STORAGE_ENTROPY_BALLOON_AND_MEMORY_HOTPLUG: Self = Self {
+            entropy: true,
+            balloon: true,
+            memory_hotplug: true,
+            ..Self::STORAGE
+        };
+    }
+
     fn assert_capture_ready_snapshot_succeeds(
         socket_path: &Path,
         directory: &Path,
         context: &str,
-        expect_storage: bool,
-        expect_entropy: bool,
-        expect_balloon: bool,
-        expect_memory_hotplug: bool,
+        expected: ExpectedSnapshotOptionalProducts,
     ) {
         let state_path = directory.join("capture-ready.state");
         let memory_path = directory.join("capture-ready.memory");
@@ -15382,27 +15405,32 @@ mod macos_arm64 {
         let bytes = fs::read(&state_path).expect("capture-ready state should read");
         let structural =
             decode_snapshot_v2_state(&bytes).expect("capture-ready state should be exact current");
-        let state = decode_hvf_snapshot_v2_memory_hotplug_state(&structural)
-            .expect("capture-ready state should use the exact-2.10 virtio-mem profile");
+        let state = decode_hvf_snapshot_v2_network_state(&structural)
+            .expect("capture-ready state should use the exact-2.11 network profile");
         assert_eq!(
             state.device_graph().is_some(),
-            expect_storage,
+            expected.storage,
             "{context} storage profile presence should match"
         );
         assert_eq!(
             state.entropy().is_some(),
-            expect_entropy,
+            expected.entropy,
             "{context} entropy profile presence should match"
         );
         assert_eq!(
             state.balloon().is_some(),
-            expect_balloon,
+            expected.balloon,
             "{context} balloon profile presence should match"
         );
         assert_eq!(
             state.memory_hotplug().is_some(),
-            expect_memory_hotplug,
+            expected.memory_hotplug,
             "{context} virtio-mem profile presence should match"
+        );
+        assert_eq!(
+            state.network().is_some(),
+            expected.network,
+            "{context} network profile presence should match"
         );
         assert_no_snapshot_staging(directory);
     }

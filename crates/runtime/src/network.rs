@@ -765,6 +765,20 @@ impl NetworkInterfaceConfigs {
         Self::default()
     }
 
+    /// Retains a complete already-validated snapshot projection without
+    /// reparsing destination selectors or reallocating the vector.
+    #[doc(hidden)]
+    pub fn from_validated(configs: Vec<NetworkInterfaceConfig>) -> Self {
+        debug_assert!(configs.len() <= MAX_NETWORK_INTERFACE_COUNT);
+        debug_assert!(configs.iter().enumerate().all(|(index, config)| {
+            configs.iter().take(index).all(|previous| {
+                previous.iface_id() != config.iface_id()
+                    && (config.guest_mac().is_none() || previous.guest_mac() != config.guest_mac())
+            })
+        }));
+        Self { configs }
+    }
+
     pub fn as_slice(&self) -> &[NetworkInterfaceConfig] {
         &self.configs
     }
