@@ -302,6 +302,15 @@ pub(crate) struct RequestedVsockRestoreResource {
 }
 
 impl RequestedVsockRestoreResource {
+    /// Accepts selectors already resolved by the checked exact-2.12 runtime
+    /// topology without repeating caller override resolution.
+    pub(crate) const fn from_resolved(selectors: SnapshotVsockSelectors, overridden: bool) -> Self {
+        Self {
+            selectors,
+            overridden,
+        }
+    }
+
     /// Resolves captured and destination selectors before cancellation or authority access.
     pub(crate) fn resolve(
         captured: Option<&VsockBackendSelector>,

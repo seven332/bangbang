@@ -595,7 +595,7 @@ fn spawn_binder(
         .set_write_timeout(Some(BINDER_TIMEOUT))
         .map_err(|error| AnchoredSocketError::Io(error.kind()))?;
 
-    let executable = env::current_exe().map_err(|error| AnchoredSocketError::Io(error.kind()))?;
+    let executable = binder_executable()?;
     let executable = CString::new(executable.as_os_str().as_bytes())
         .map_err(|_| AnchoredSocketError::Invalid)?;
     let argument = CString::new(BINDER_ARGUMENT).map_err(|_| AnchoredSocketError::Invalid)?;
@@ -652,6 +652,18 @@ fn spawn_binder(
     validate_listener_descriptor(listener.as_raw_fd(), role)?;
     binder.wait_until(BINDER_TIMEOUT)?;
     Ok((listener, identity))
+}
+
+fn binder_executable() -> Result<std::path::PathBuf, AnchoredSocketError> {
+    let executable = env::current_exe().map_err(|error| AnchoredSocketError::Io(error.kind()))?;
+    #[cfg(test)]
+    if let Some(profile_directory) = executable.parent().and_then(Path::parent) {
+        let production = profile_directory.join("bangbang");
+        if production.is_file() {
+            return Ok(production);
+        }
+    }
+    Ok(executable)
 }
 
 fn spawn_connector(
