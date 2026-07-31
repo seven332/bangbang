@@ -145,6 +145,6 @@ and every lower-layer construction fault either roll back exactly or terminate
 without retained unpublished authority.
 
 This is not Firecracker snapshot-byte compatibility. Native-v2 Diff/merge and
-Uffd, network/vsock/MMDS restore, source owner or dirty-epoch identity,
+Uffd, vsock restore, source owner or dirty-epoch identity,
 synchronous host-RSS reduction, guest-independent convergence, and
 unconstrained cross-host portability remain explicit non-claims.

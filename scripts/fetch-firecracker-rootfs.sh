@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v102"
+direct_boot_variant="direct-boot-v103"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -3761,10 +3761,9 @@ MMDS_ADDRESS = ("169.254.169.254", 80)
 SECTOR_SIZE = 512
 STATUS_OFFSET = 0
 HOST_CONTINUE_OFFSET = SECTOR_SIZE
-TOKEN_OFFSET = 2 * SECTOR_SIZE
-CONNECTION_RESULT_OFFSET = 3 * SECTOR_SIZE
-TOKEN_RESULT_OFFSET = 4 * SECTOR_SIZE
-FRESH_RESULT_OFFSET = 5 * SECTOR_SIZE
+CONNECTION_RESULT_OFFSET = 2 * SECTOR_SIZE
+TOKEN_RESULT_OFFSET = 3 * SECTOR_SIZE
+FRESH_RESULT_OFFSET = 4 * SECTOR_SIZE
 SOURCE_VALUE = b"BANGBANG_MMDS_SNAPSHOT_SOURCE"
 DESTINATION_VALUE = b"BANGBANG_MMDS_SNAPSHOT_DESTINATION"
 READY_MARKER = b"BANGBANG_MMDS_SNAPSHOT_CAPTURE_READY"
@@ -3919,9 +3918,6 @@ try:
 except OSError:
     fail("SOURCE_CONNECTION")
 
-token_marker = old_token if old_token is not None else V1_MARKER
-if not write_sector(TOKEN_OFFSET, token_marker):
-    fail("TOKEN_MARKER")
 if not write_sector(STATUS_OFFSET, READY_MARKER):
     fail("READY_MARKER")
 print(marker_text(READY_MARKER), flush=True)
@@ -3942,13 +3938,7 @@ connection_lost = False
 try:
     stale_connection.sendall(suffix)
     stale_response = stale_connection.recv(65536)
-    if not stale_response:
-        connection_lost = True
-    else:
-        stale_status_line = stale_response.split(b"\r\n", 1)[0]
-        connection_lost = not (
-            b" 200 " in stale_status_line and DESTINATION_VALUE in stale_response
-        )
+    connection_lost = not stale_response
 except OSError:
     connection_lost = True
 finally:

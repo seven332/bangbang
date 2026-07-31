@@ -4117,7 +4117,8 @@ Their eventual support level should follow the endpoint matrix:
   exact `2.5.0` reader retains profile 2's block-only graph, and exact `2.6.0`
   retains profile 3's storage-only graph. Exact `2.7.0` retains required
   complete serial plus optional profile-3 storage, exact `2.8.0` may add
-  entropy, and exact `2.9.0` may add balloon. The current public `2.10.0` writer
+  entropy, exact `2.9.0` may add balloon, and exact `2.10.0` may add
+  virtio-mem. The current public `2.11.0` writer
   carries an exact typed 1–32-vCPU machine/global-GIC/topology/vCPU graph plus
   singleton portable PL031/PVTime/VMGenID/VMClock state, required complete
   serial kind 8, and optional unchanged profile-3 kind 7 with 1–64 ordered
@@ -4133,7 +4134,11 @@ Their eventual support level should follow the endpoint matrix:
   kind 11 carries virtio-mem configuration, features, config space, one queue,
   common virtio and MMIO/PCI placement, and a canonical block bitmap bound to
   matching kind-1 plugged extents. Kind 11 is capped at 128 KiB under the same
-  16-MiB state cap. The storage graph
+  16-MiB state cap. Optional kind 12 carries up to 16 ordered network
+  interfaces with portable configuration, queue, limiter/retry, common virtio,
+  MMIO/PCI placement, and MMDS protocol state. It is capped at 512 KiB and
+  excludes host backend authority, packet owners, packets, connections, MMDS
+  data, token material, metrics, and clocks. The storage graph
   may be rootless or select the first cross-storage record as root. The focused
   boundary captures a completed paused source into a fresh canonical
   64-KiB-aligned memory binding and reconstructs a complete never-run HVF
@@ -4146,7 +4151,10 @@ Their eventual support level should follow the endpoint matrix:
   endpoints, reconstructs a fresh entropy source/metrics/scheduler/notifier/
   route/endpoint set when kind 9 is present, reconstructs fresh balloon
   memory/timer/metrics/reclaim/notifier/interrupt/dispatcher/endpoint/cleanup
-  owners when kind 10 is present, and publishes only Paused. Signed three-vCPU proof covers repeat immutable
+  owners when kind 10 is present, reconstructs a fresh shared virtio-mem
+  aperture and device owners when kind 11 is present, reconstructs fresh
+  clone-local network/MMDS owners from an exact override set when kind 12 is
+  present, and publishes only Paused. Signed three-vCPU proof covers repeat immutable
   loads, distinct clone identities, ordered guest notifications/time
   observations, recapture-to-restore, timer PPI, secondary PSCI completion, and
   initially offline continuation. Signed serial-only and storage-bearing direct
@@ -4159,8 +4167,9 @@ Their eventual support level should follow the endpoint matrix:
   the live-FDT identity plus versioned product/UART/RTC/time/device graph before
   HVF, authorizes and retains the complete serial-plus-storage transaction
   without reopening a contained selector or falling back to paths, installs
-  fresh destination serial endpoints and optional entropy/balloon owners, and commits
-  a closed session initially Paused.
+  fresh destination serial endpoints and optional
+  entropy/balloon/virtio-mem/network/MMDS owners, and commits a closed session
+  initially Paused.
   Public create emits v2, while one-open load dispatch retains frozen
   native-v1 File/Uffd reading and selects native-v2 File/COW without decoder
   fallback. State/memory stay immutable and guest-memory writes are private,

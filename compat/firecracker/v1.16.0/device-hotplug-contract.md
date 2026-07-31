@@ -178,11 +178,11 @@ automatic guest PCI notification, PCI state in native-v1 snapshots, pmem dirty
 tracking, externally certified vmnet connectivity, or Firecracker's KVM
 eventfd, timerfd, and interrupt-controller implementation identities. Later
 storage work adds vhost-user block and portable Async, while exact native-v2
-2.6 through current 2.10 profile 3 persist startup- or runtime-origin
+2.6 through current 2.11 profile 3 persist startup- or runtime-origin
 regular-file block and pmem endpoints; exact 2.7 adds the required
 platform-MMIO serial component, exact 2.8 may add entropy, exact 2.9 may add
-balloon, and current 2.10 may add virtio-mem on the selected MMIO or PCI
-transport. Network, vsock, MMDS, boot-timer, and vhost-user snapshot profiles
-still reject before artifact mutation.
+balloon, exact 2.10 may add virtio-mem, and current 2.11 may add portable
+network/MMDS state on the selected MMIO or PCI transport. Vsock, boot-timer,
+and vhost-user snapshot profiles still reject before artifact mutation.
 Apple-approved production vmnet credentials and real external connectivity
 remain #1351/#1378 work.
