@@ -819,7 +819,7 @@ fn product_storage_fixture_with_network(
     .expect("relocated storage fixture should decode")
 }
 
-fn product_network_fixture(
+pub(crate) fn product_network_fixture(
     transport: SnapshotV2DeviceTransportKind,
     pci_device: u8,
 ) -> SnapshotV2NetworkState {
@@ -1080,7 +1080,7 @@ fn exact_minor_eleven_platform_fixture(
     .expect("exact-2.11 platform fixture should validate")
 }
 
-fn complete_network_state_fixture(
+pub(crate) fn complete_network_state_fixture(
     transport: SnapshotV2DeviceTransportKind,
     has_storage: bool,
     has_entropy: bool,

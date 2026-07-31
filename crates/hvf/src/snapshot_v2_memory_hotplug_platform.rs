@@ -54,10 +54,9 @@ use crate::snapshot_v2_platform::{
     PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID, PROCESS_SERIAL_MMIO_BASE,
 };
 use crate::snapshot_v2_storage_platform::{
-    HvfSnapshotV2StorageMmioFollowingInterrupts, HvfSnapshotV2StorageMmioPlatformPlan,
-    HvfSnapshotV2StorageMmioPlatformPrefix, HvfSnapshotV2StorageMmioProcessConfig,
-    HvfSnapshotV2StoragePciPlatformPlan, HvfSnapshotV2StoragePciPlatformPrefix,
-    PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
+    HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioPlatformPrefix,
+    HvfSnapshotV2StorageMmioProcessConfig, HvfSnapshotV2StoragePciPlatformPlan,
+    HvfSnapshotV2StoragePciPlatformPrefix, PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
     PrepareHvfSnapshotV2StoragePciPlatformPlanError, mmio_region_conflicts_with_platform,
     prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix,
     prepare_hvf_snapshot_v2_storage_pci_platform_plan_with_prefix,
@@ -924,13 +923,12 @@ fn prepare_memory_hotplug_mmio_platform_plan(
     let prefix = balloon.map_or(HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY, |endpoint| {
         HvfSnapshotV2StorageMmioPlatformPrefix::one(endpoint.region(), endpoint.interrupt_line())
     });
-    let following_interrupts = entropy.map_or(
-        HvfSnapshotV2StorageMmioFollowingInterrupts::MemoryHotplug(memory_hotplug.interrupt_line()),
-        |entropy| HvfSnapshotV2StorageMmioFollowingInterrupts::EntropyMemoryHotplug {
-            entropy: entropy.interrupt_line(),
-            memory_hotplug: memory_hotplug.interrupt_line(),
-        },
-    );
+    let memory_hotplug_interrupts = [memory_hotplug.interrupt_line()];
+    let entropy_memory_hotplug_interrupts =
+        entropy.map(|entropy| [entropy.interrupt_line(), memory_hotplug.interrupt_line()]);
+    let following_interrupts = entropy_memory_hotplug_interrupts
+        .as_ref()
+        .map_or(&memory_hotplug_interrupts[..], |interrupts| &interrupts[..]);
     let storage = product
         .storage()
         .map(|storage| {
@@ -1775,7 +1773,7 @@ fn register_product_active_pci_routes(
     Ok(())
 }
 
-fn register_active_snapshot_v2_pci_routes(
+pub(crate) fn register_active_snapshot_v2_pci_routes(
     state: &SnapshotV2PciDeviceState,
     msi: HvfGicMsiMetadata,
     queue_count: usize,
@@ -1886,7 +1884,7 @@ fn validate_pci_interrupt_sequence(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs::{self, File, OpenOptions};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2071,7 +2069,7 @@ mod tests {
         fail_unmap_on: Option<usize>,
     }
 
-    struct TestImage {
+    pub(crate) struct TestImage {
         path: PathBuf,
     }
 
@@ -2102,14 +2100,14 @@ mod tests {
         }
     }
 
-    struct MaterializedFixture {
-        platform: HvfSnapshotV2PlatformState,
-        topology: PreparedSnapshotV2MemoryHotplugTopology,
-        memory: GuestMemory,
-        _image: TestImage,
+    pub(crate) struct MaterializedFixture {
+        pub(crate) platform: HvfSnapshotV2PlatformState,
+        pub(crate) topology: PreparedSnapshotV2MemoryHotplugTopology,
+        pub(crate) memory: GuestMemory,
+        pub(crate) _image: TestImage,
     }
 
-    fn materialized_fixture(state: SnapshotV2MemoryHotplugState) -> MaterializedFixture {
+    pub(crate) fn materialized_fixture(state: SnapshotV2MemoryHotplugState) -> MaterializedFixture {
         let base_bytes = FIXTURE_MEMORY_MIB * MIB;
         let mut ranges = aarch64::dram_layout(base_bytes)
             .expect("base layout should validate")
@@ -2171,7 +2169,7 @@ mod tests {
         }
     }
 
-    struct TestBacking {
+    pub(crate) struct TestBacking {
         path: PathBuf,
     }
 
@@ -2300,7 +2298,7 @@ mod tests {
         }
     }
 
-    fn memory_hotplug_mmio_state(interrupt: u32) -> SnapshotV2MemoryHotplugState {
+    pub(crate) fn memory_hotplug_mmio_state(interrupt: u32) -> SnapshotV2MemoryHotplugState {
         let state = product_memory_hotplug_fixture(SnapshotV2DeviceTransportKind::Mmio);
         let mut bytes = state
             .encode(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION)
@@ -2314,7 +2312,7 @@ mod tests {
         .expect("relocated MMIO memory-hotplug state should decode")
     }
 
-    fn memory_hotplug_pci_state(
+    pub(crate) fn memory_hotplug_pci_state(
         slot: usize,
         msi: HvfGicMsiMetadata,
         route_offset: u32,
@@ -2332,7 +2330,7 @@ mod tests {
         .expect("relocated PCI memory-hotplug state should decode")
     }
 
-    fn storage_mmio_graph(first_interrupt: u32) -> SnapshotV2StorageDeviceGraph {
+    pub(crate) fn storage_mmio_graph(first_interrupt: u32) -> SnapshotV2StorageDeviceGraph {
         let graph = product_storage_fixture(SnapshotV2DeviceTransportKind::Mmio);
         let mut bytes = graph
             .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
@@ -2355,13 +2353,30 @@ mod tests {
         msi: HvfGicMsiMetadata,
         first_route_offset: u32,
     ) -> SnapshotV2StorageDeviceGraph {
+        storage_pci_graph_with_gap(first_slot, 0, msi, first_route_offset)
+    }
+
+    pub(crate) fn storage_pci_graph_with_gap(
+        first_slot: usize,
+        inserted_endpoint_count: usize,
+        msi: HvfGicMsiMetadata,
+        first_route_offset: u32,
+    ) -> SnapshotV2StorageDeviceGraph {
         let graph = product_storage_fixture(SnapshotV2DeviceTransportKind::Pci);
+        let block_count = graph.block_records().len();
         let mut bytes = graph
             .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
             .expect("PCI storage graph should encode");
         for (index, transport_offset) in storage_transport_offsets(&bytes).into_iter().enumerate() {
             let slot = first_slot
                 .checked_add(index)
+                .and_then(|slot| {
+                    if index < block_count {
+                        Some(slot)
+                    } else {
+                        slot.checked_add(inserted_endpoint_count)
+                    }
+                })
                 .expect("storage slot should fit");
             let route_offset = first_route_offset
                 .checked_add(
@@ -2372,6 +2387,19 @@ mod tests {
                     )
                     .expect("storage route index should fit u32"),
                 )
+                .and_then(|route_offset| {
+                    if index < block_count {
+                        Some(route_offset)
+                    } else {
+                        u32::try_from(
+                            inserted_endpoint_count
+                                .checked_mul(3)
+                                .expect("inserted route count should fit"),
+                        )
+                        .ok()
+                        .and_then(|inserted| route_offset.checked_add(inserted))
+                    }
+                })
                 .expect("storage route offset should fit");
             relocate_pci_transport(&mut bytes, transport_offset, slot, msi, route_offset);
         }
@@ -2382,7 +2410,10 @@ mod tests {
         .expect("relocated PCI storage graph should decode")
     }
 
-    fn balloon_mmio_plan(memory: &GuestMemory, interrupt: u32) -> SnapshotV2BalloonRestorePlan {
+    pub(crate) fn balloon_mmio_plan(
+        memory: &GuestMemory,
+        interrupt: u32,
+    ) -> SnapshotV2BalloonRestorePlan {
         let state = product_balloon_fixture(SnapshotV2DeviceTransportKind::Mmio);
         let mut bytes = state
             .encode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION)
@@ -2396,7 +2427,10 @@ mod tests {
             .expect("MMIO balloon restore plan should prepare")
     }
 
-    fn entropy_mmio_plan(memory: &GuestMemory, interrupt: u32) -> SnapshotV2EntropyRestorePlan {
+    pub(crate) fn entropy_mmio_plan(
+        memory: &GuestMemory,
+        interrupt: u32,
+    ) -> SnapshotV2EntropyRestorePlan {
         let state = memory_hotplug_product_entropy_fixture(SnapshotV2DeviceTransportKind::Mmio);
         let mut bytes = state
             .encode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION)
@@ -2410,7 +2444,7 @@ mod tests {
             .expect("MMIO entropy restore plan should prepare")
     }
 
-    fn balloon_pci_plan(
+    pub(crate) fn balloon_pci_plan(
         slot: usize,
         msi: HvfGicMsiMetadata,
         route_offset: u32,
@@ -2495,7 +2529,7 @@ mod tests {
         }
     }
 
-    fn entropy_pci_plan(
+    pub(crate) fn entropy_pci_plan(
         slot: usize,
         msi: HvfGicMsiMetadata,
         route_offset: u32,
@@ -2657,7 +2691,7 @@ mod tests {
         memory
     }
 
-    fn prepared_storage_bundle(
+    pub(crate) fn prepared_storage_bundle(
         graph: SnapshotV2StorageDeviceGraph,
     ) -> (PreparedSnapshotV2StorageBundle, Vec<TestBacking>) {
         let memory = storage_restore_memory(&graph);
@@ -2693,7 +2727,7 @@ mod tests {
         (bundle, files)
     }
 
-    fn mmio_platform(
+    pub(crate) fn mmio_platform(
         platform: HvfSnapshotV2PlatformState,
         state: &SnapshotV2MemoryHotplugState,
         device_count: usize,
@@ -2763,7 +2797,7 @@ mod tests {
         .clone()
     }
 
-    fn pci_platform(
+    pub(crate) fn pci_platform(
         platform: HvfSnapshotV2PlatformState,
         state: &SnapshotV2MemoryHotplugState,
         interrupt_count: u32,

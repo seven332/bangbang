@@ -666,30 +666,6 @@ impl HvfSnapshotV2StorageMmioPlatformPrefix {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum HvfSnapshotV2StorageMmioFollowingInterrupts {
-    None,
-    Entropy(GuestInterruptLine),
-    MemoryHotplug(GuestInterruptLine),
-    EntropyMemoryHotplug {
-        entropy: GuestInterruptLine,
-        memory_hotplug: GuestInterruptLine,
-    },
-}
-
-impl HvfSnapshotV2StorageMmioFollowingInterrupts {
-    fn lines(self) -> [Option<GuestInterruptLine>; 2] {
-        match self {
-            Self::None => [None, None],
-            Self::Entropy(interrupt) | Self::MemoryHotplug(interrupt) => [Some(interrupt), None],
-            Self::EntropyMemoryHotplug {
-                entropy,
-                memory_hotplug,
-            } => [Some(entropy), Some(memory_hotplug)],
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
 pub(crate) enum HvfSnapshotV2StoragePciMsiProfile {
     Root,
     RootOrEntropy,
@@ -705,6 +681,7 @@ enum HvfSnapshotV2StoragePciPlacement {
 #[derive(Clone, Copy)]
 pub(crate) struct HvfSnapshotV2StoragePciPlatformPrefix {
     preceding_endpoint_count: usize,
+    inserted_endpoint_count: usize,
     reserved_following_endpoint_count: usize,
     msi_profile: HvfSnapshotV2StoragePciMsiProfile,
     placement: HvfSnapshotV2StoragePciPlacement,
@@ -714,6 +691,7 @@ impl HvfSnapshotV2StoragePciPlatformPrefix {
     pub(crate) const fn root() -> Self {
         Self {
             preceding_endpoint_count: 0,
+            inserted_endpoint_count: 0,
             reserved_following_endpoint_count: 0,
             msi_profile: HvfSnapshotV2StoragePciMsiProfile::Root,
             placement: HvfSnapshotV2StoragePciPlacement::Retained,
@@ -723,6 +701,7 @@ impl HvfSnapshotV2StoragePciPlatformPrefix {
     pub(crate) const fn entropy() -> Self {
         Self {
             preceding_endpoint_count: 0,
+            inserted_endpoint_count: 0,
             reserved_following_endpoint_count: 1,
             msi_profile: HvfSnapshotV2StoragePciMsiProfile::RootOrEntropy,
             placement: HvfSnapshotV2StoragePciPlacement::Retained,
@@ -736,6 +715,24 @@ impl HvfSnapshotV2StoragePciPlatformPrefix {
     ) -> Self {
         Self {
             preceding_endpoint_count,
+            inserted_endpoint_count: 0,
+            reserved_following_endpoint_count,
+            msi_profile: HvfSnapshotV2StoragePciMsiProfile::Exact(msi_interrupt_count),
+            placement: HvfSnapshotV2StoragePciPlacement::Sequential {
+                start_slot: preceding_endpoint_count,
+            },
+        }
+    }
+
+    pub(crate) const fn exact_with_inserted_endpoints(
+        preceding_endpoint_count: usize,
+        inserted_endpoint_count: usize,
+        reserved_following_endpoint_count: usize,
+        msi_interrupt_count: u32,
+    ) -> Self {
+        Self {
+            preceding_endpoint_count,
+            inserted_endpoint_count,
             reserved_following_endpoint_count,
             msi_profile: HvfSnapshotV2StoragePciMsiProfile::Exact(msi_interrupt_count),
             placement: HvfSnapshotV2StoragePciPlacement::Sequential {
@@ -746,19 +743,38 @@ impl HvfSnapshotV2StoragePciPlatformPrefix {
 
     const fn storage_endpoint_capacity(self) -> Option<usize> {
         match PCI_ENDPOINT_SLOT_COUNT.checked_sub(self.preceding_endpoint_count) {
-            Some(remaining) => remaining.checked_sub(self.reserved_following_endpoint_count),
+            Some(remaining) => match remaining.checked_sub(self.inserted_endpoint_count) {
+                Some(remaining) => remaining.checked_sub(self.reserved_following_endpoint_count),
+                None => None,
+            },
             None => None,
         }
     }
 
-    fn expected_slot(
+    fn expected_block_slot(
         self,
-        storage_index: usize,
+        block_index: usize,
     ) -> Result<Option<usize>, PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
         match self.placement {
             HvfSnapshotV2StoragePciPlacement::Retained => Ok(None),
             HvfSnapshotV2StoragePciPlacement::Sequential { start_slot } => start_slot
-                .checked_add(storage_index)
+                .checked_add(block_index)
+                .map(Some)
+                .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan),
+        }
+    }
+
+    fn expected_pmem_slot(
+        self,
+        block_count: usize,
+        pmem_index: usize,
+    ) -> Result<Option<usize>, PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
+        match self.placement {
+            HvfSnapshotV2StoragePciPlacement::Retained => Ok(None),
+            HvfSnapshotV2StoragePciPlacement::Sequential { start_slot } => start_slot
+                .checked_add(block_count)
+                .and_then(|slot| slot.checked_add(self.inserted_endpoint_count))
+                .and_then(|slot| slot.checked_add(pmem_index))
                 .map(Some)
                 .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan),
         }
@@ -778,7 +794,7 @@ pub fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan(
         bundle,
         process,
         HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
-        HvfSnapshotV2StorageMmioFollowingInterrupts::None,
+        &[],
         &mut SystemStoragePlatformPlanReserve,
     )
 }
@@ -798,7 +814,7 @@ pub fn prepare_hvf_snapshot_v2_storage_entropy_mmio_platform_plan(
         bundle,
         process,
         HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
-        HvfSnapshotV2StorageMmioFollowingInterrupts::Entropy(entropy_interrupt),
+        std::slice::from_ref(&entropy_interrupt),
         &mut SystemStoragePlatformPlanReserve,
     )
 }
@@ -808,7 +824,7 @@ pub(crate) fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with_prefix(
     bundle: &PreparedSnapshotV2StorageBundle,
     process: HvfSnapshotV2StorageMmioProcessConfig,
     prefix: HvfSnapshotV2StorageMmioPlatformPrefix,
-    following_interrupts: HvfSnapshotV2StorageMmioFollowingInterrupts,
+    following_interrupts: &[GuestInterruptLine],
 ) -> Result<HvfSnapshotV2StorageMmioPlatformPlan, PrepareHvfSnapshotV2StorageMmioPlatformPlanError>
 {
     prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
@@ -826,7 +842,7 @@ fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
     bundle: &PreparedSnapshotV2StorageBundle,
     process: HvfSnapshotV2StorageMmioProcessConfig,
     prefix: HvfSnapshotV2StorageMmioPlatformPrefix,
-    following_interrupts: HvfSnapshotV2StorageMmioFollowingInterrupts,
+    following_interrupts: &[GuestInterruptLine],
     reserve: &mut impl StoragePlatformPlanReserve,
 ) -> Result<HvfSnapshotV2StorageMmioPlatformPlan, PrepareHvfSnapshotV2StorageMmioPlatformPlanError>
 {
@@ -1062,7 +1078,7 @@ fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
     }
     .map_err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::CommandLine)?;
 
-    for expected in following_interrupts.lines().into_iter().flatten() {
+    for expected in following_interrupts.iter().copied() {
         if interrupt_allocator
             .allocate()
             .map_err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::Interrupt)?
@@ -1322,7 +1338,7 @@ fn prepare_hvf_snapshot_v2_storage_pci_platform_plan_with(
         let planned = plan_pci_record(
             record.key(),
             record.transport(),
-            prefix.expected_slot(block_index)?,
+            prefix.expected_block_slot(block_index)?,
             block_route_count,
             VIRTIO_BLOCK_QUEUE_SIZES.len(),
             msi,
@@ -1387,12 +1403,7 @@ fn prepare_hvf_snapshot_v2_storage_pci_platform_plan_with(
         let planned = plan_pci_record(
             record.key(),
             record.transport(),
-            prefix.expected_slot(
-                block_records
-                    .len()
-                    .checked_add(pmem_index)
-                    .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?,
-            )?,
+            prefix.expected_pmem_slot(block_records.len(), pmem_index)?,
             pmem_route_count,
             VIRTIO_PMEM_QUEUE_SIZES.len(),
             msi,
@@ -2629,6 +2640,128 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pci_network_gap_preserves_blocks_and_shifts_only_pmem() {
+        for inserted in [0, 1, 16] {
+            let prefix = HvfSnapshotV2StoragePciPlatformPrefix::exact_with_inserted_endpoints(
+                1, inserted, 2, 96,
+            );
+            assert_eq!(
+                prefix.storage_endpoint_capacity(),
+                PCI_ENDPOINT_SLOT_COUNT
+                    .checked_sub(1)
+                    .and_then(|remaining| remaining.checked_sub(inserted))
+                    .and_then(|remaining| remaining.checked_sub(2)),
+            );
+            assert_eq!(
+                prefix
+                    .expected_block_slot(0)
+                    .expect("first block slot should project"),
+                Some(1),
+            );
+            assert_eq!(
+                prefix
+                    .expected_block_slot(3)
+                    .expect("later block slot should project"),
+                Some(4),
+            );
+            assert_eq!(
+                prefix
+                    .expected_pmem_slot(4, 0)
+                    .expect("first pmem slot should project"),
+                Some(5 + inserted),
+            );
+            assert_eq!(
+                prefix
+                    .expected_pmem_slot(4, 2)
+                    .expect("later pmem slot should project"),
+                Some(7 + inserted),
+            );
+        }
+    }
+
+    #[test]
+    fn pci_network_gap_matches_exact_network_storage_ceilings() {
+        for (preceding, network, following, expected) in
+            [(0, 1, 0, 30), (1, 1, 2, 27), (0, 16, 0, 15), (1, 16, 2, 12)]
+        {
+            assert_eq!(
+                HvfSnapshotV2StoragePciPlatformPrefix::exact_with_inserted_endpoints(
+                    preceding, network, following, 96,
+                )
+                .storage_endpoint_capacity(),
+                Some(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn zero_network_gap_is_slot_and_capacity_equivalent_to_exact_prefix() {
+        let legacy = HvfSnapshotV2StoragePciPlatformPrefix::exact(1, 2, 96);
+        let network =
+            HvfSnapshotV2StoragePciPlatformPrefix::exact_with_inserted_endpoints(1, 0, 2, 96);
+
+        assert_eq!(
+            legacy.storage_endpoint_capacity(),
+            network.storage_endpoint_capacity(),
+        );
+        for block_index in [0, 1, 29] {
+            assert_eq!(
+                legacy
+                    .expected_block_slot(block_index)
+                    .expect("legacy block slot should project"),
+                network
+                    .expected_block_slot(block_index)
+                    .expect("network block slot should project"),
+            );
+        }
+        for (block_count, pmem_index) in [(0, 0), (4, 0), (4, 7)] {
+            assert_eq!(
+                legacy
+                    .expected_pmem_slot(block_count, pmem_index)
+                    .expect("legacy pmem slot should project"),
+                network
+                    .expected_pmem_slot(block_count, pmem_index)
+                    .expect("network pmem slot should project"),
+            );
+        }
+    }
+
+    #[test]
+    fn pci_network_gap_rejects_capacity_and_slot_overflow() {
+        assert_eq!(
+            HvfSnapshotV2StoragePciPlatformPrefix::exact_with_inserted_endpoints(
+                1,
+                PCI_ENDPOINT_SLOT_COUNT,
+                0,
+                96,
+            )
+            .storage_endpoint_capacity(),
+            None,
+        );
+        let overflow = HvfSnapshotV2StoragePciPlatformPrefix::exact_with_inserted_endpoints(
+            usize::MAX,
+            1,
+            0,
+            96,
+        );
+        assert_eq!(overflow.storage_endpoint_capacity(), None);
+        assert!(matches!(
+            overflow.expected_block_slot(1),
+            Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan),
+        ));
+        assert!(matches!(
+            HvfSnapshotV2StoragePciPlatformPrefix::exact_with_inserted_endpoints(
+                1,
+                usize::MAX,
+                0,
+                96,
+            )
+            .expected_pmem_slot(1, 0),
+            Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan),
+        ));
+    }
+
+    #[test]
     fn legacy_pci_retains_slots_while_exact_prefix_requires_sequential_placement() {
         let fixture = balloon_prefixed_rootless_block_pci_fixture();
         let msi_interrupt_count = fixture
@@ -2694,7 +2827,7 @@ pub(crate) mod tests {
             &fixture.bundle,
             process_config(),
             HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
-            HvfSnapshotV2StorageMmioFollowingInterrupts::None,
+            &[],
         )
         .expect("zero-prefix MMIO storage plan should validate");
         assert_eq!(legacy.root_key(), prefixed.root_key());
@@ -2794,7 +2927,7 @@ pub(crate) mod tests {
                     &fixture.bundle,
                     process_config(),
                     HvfSnapshotV2StorageMmioPlatformPrefix::EMPTY,
-                    HvfSnapshotV2StorageMmioFollowingInterrupts::None,
+                    &[],
                     &mut FailingReserve { calls: 0, fail_at },
                 ),
                 Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::Allocation)

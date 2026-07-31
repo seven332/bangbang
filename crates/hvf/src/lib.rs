@@ -29,6 +29,7 @@ mod snapshot_v2_balloon_platform;
 mod snapshot_v2_entropy_platform;
 mod snapshot_v2_memory_hotplug_platform;
 mod snapshot_v2_multi_block_platform;
+mod snapshot_v2_network_platform;
 mod snapshot_v2_platform;
 mod snapshot_v2_storage_platform;
 mod startup;
@@ -190,6 +191,18 @@ pub use snapshot_v2_multi_block_platform::{
     HvfSnapshotV2MultiBlockProcessConfig, HvfSnapshotV2MultiBlockRetryPlan,
     HvfSnapshotV2MultiBlockTransportPlan, PrepareHvfSnapshotV2MultiBlockPlatformPlanError,
     prepare_hvf_snapshot_v2_multi_block_platform_plan,
+};
+pub use snapshot_v2_network_platform::{
+    HvfSnapshotV2NetworkAuxiliaryMmioEndpointPlan, HvfSnapshotV2NetworkAuxiliaryPciEndpointPlan,
+    HvfSnapshotV2NetworkMmioEndpointPlan, HvfSnapshotV2NetworkMmioPlatformPlan,
+    HvfSnapshotV2NetworkMmioProcessConfig, HvfSnapshotV2NetworkPciEndpointPlan,
+    HvfSnapshotV2NetworkPciPlatformPlan, HvfSnapshotV2NetworkPlatformPlanStage,
+    HvfSnapshotV2NetworkPreparedProduct, HvfSnapshotV2NetworkProductKind,
+    PrepareHvfSnapshotV2NetworkPlatformPlanError,
+    prepare_hvf_snapshot_v2_network_mmio_platform_plan,
+    prepare_hvf_snapshot_v2_network_mmio_platform_plan_with_cancel,
+    prepare_hvf_snapshot_v2_network_pci_platform_plan,
+    prepare_hvf_snapshot_v2_network_pci_platform_plan_with_cancel,
 };
 pub use snapshot_v2_platform::{
     HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2PlatformCleanupFailure,

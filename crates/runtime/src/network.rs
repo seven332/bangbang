@@ -6518,6 +6518,16 @@ impl NetworkMmioLayout {
         self
     }
 
+    /// Projects the exact MMIO region used for one configuration-order device.
+    ///
+    /// This is the value-only counterpart of live registration. It performs
+    /// the same stride and overflow validation without creating a handler or
+    /// mutating a dispatcher.
+    pub fn region_at(self, index: usize) -> Result<MmioRegion, NetworkMmioRegistrationError> {
+        self.validate()?;
+        self.placement(index).map(|placement| placement.region)
+    }
+
     fn validate(self) -> Result<(), NetworkMmioRegistrationError> {
         if self.address_stride < VIRTIO_MMIO_DEVICE_WINDOW_SIZE {
             return Err(NetworkMmioRegistrationError::AddressStrideTooSmall {
@@ -11098,6 +11108,90 @@ mod tests {
         assert_eq!(host_dev_name, "tap0");
         assert_eq!(config_space.guest_mac(), Some(test_guest_mac()));
         assert!(!device.is_activated());
+    }
+
+    #[test]
+    fn network_mmio_layout_projects_zero_and_sixteen_device_boundaries() {
+        let layout = NetworkMmioLayout::new(TEST_MMIO_BASE, MmioRegionId::new(100))
+            .with_address_stride(VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2)
+            .with_region_id_stride(3);
+
+        let first = layout.region_at(0).expect("first region should project");
+        let sixteenth = layout
+            .region_at(15)
+            .expect("sixteenth region should project");
+
+        assert_eq!(first.id(), MmioRegionId::new(100));
+        assert_eq!(first.range().start(), TEST_MMIO_BASE);
+        assert_eq!(sixteenth.id(), MmioRegionId::new(145));
+        assert_eq!(
+            sixteenth.range().start(),
+            TEST_MMIO_BASE
+                .checked_add(15 * VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2)
+                .expect("sixteenth address should fit"),
+        );
+    }
+
+    #[test]
+    fn network_mmio_layout_projection_reports_every_checked_overflow() {
+        assert!(matches!(
+            NetworkMmioLayout::new(TEST_MMIO_BASE, MmioRegionId::new(1))
+                .with_address_stride(VIRTIO_MMIO_DEVICE_WINDOW_SIZE - 1)
+                .region_at(0),
+            Err(NetworkMmioRegistrationError::AddressStrideTooSmall { .. }),
+        ));
+        assert!(matches!(
+            NetworkMmioLayout::new(TEST_MMIO_BASE, MmioRegionId::new(1))
+                .with_region_id_stride(0)
+                .region_at(0),
+            Err(NetworkMmioRegistrationError::DuplicateRegionIdStride { .. }),
+        ));
+        assert!(matches!(
+            NetworkMmioLayout::new(TEST_MMIO_BASE, MmioRegionId::new(1))
+                .with_address_stride(u64::MAX)
+                .region_at(2),
+            Err(NetworkMmioRegistrationError::AddressOffsetOverflow { .. }),
+        ));
+        assert!(matches!(
+            NetworkMmioLayout::new(GuestAddress::new(u64::MAX - 1), MmioRegionId::new(1))
+                .region_at(1),
+            Err(NetworkMmioRegistrationError::AddressOverflow { .. }),
+        ));
+        assert!(matches!(
+            NetworkMmioLayout::new(GuestAddress::new(u64::MAX), MmioRegionId::new(1)).region_at(0),
+            Err(NetworkMmioRegistrationError::InvalidRegion { .. }),
+        ));
+        assert!(matches!(
+            NetworkMmioLayout::new(TEST_MMIO_BASE, MmioRegionId::new(u64::MAX)).region_at(1),
+            Err(NetworkMmioRegistrationError::RegionIdOverflow { .. }),
+        ));
+    }
+
+    #[test]
+    fn network_mmio_layout_projection_matches_live_registration() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"))
+            .expect("first network config should be stored");
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1"))
+            .expect("second network config should be stored");
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("network devices should prepare");
+        let layout = NetworkMmioLayout::new(TEST_MMIO_BASE, MmioRegionId::new(10))
+            .with_address_stride(VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2)
+            .with_region_id_stride(5);
+        let projected = [
+            layout.region_at(0).expect("first region should project"),
+            layout.region_at(1).expect("second region should project"),
+        ];
+
+        let registered = prepared
+            .register_mmio(layout)
+            .expect("projected layout should register");
+
+        assert_eq!(registered.registrations()[0].region(), projected[0]);
+        assert_eq!(registered.registrations()[1].region(), projected[1]);
     }
 
     #[test]
