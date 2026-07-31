@@ -2331,13 +2331,31 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn storage_mmio_graph(first_interrupt: u32) -> SnapshotV2StorageDeviceGraph {
+        storage_mmio_graph_with_gap(first_interrupt, 0)
+    }
+
+    pub(crate) fn storage_mmio_graph_with_gap(
+        first_interrupt: u32,
+        inserted_interrupt_count: usize,
+    ) -> SnapshotV2StorageDeviceGraph {
         let graph = product_storage_fixture(SnapshotV2DeviceTransportKind::Mmio);
+        let block_count = graph.block_records().len();
         let mut bytes = graph
             .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
             .expect("MMIO storage graph should encode");
         for (index, transport_offset) in storage_transport_offsets(&bytes).into_iter().enumerate() {
+            let inserted = usize::from(index >= block_count)
+                .checked_mul(inserted_interrupt_count)
+                .expect("inserted interrupt count should fit");
             let interrupt = first_interrupt
-                .checked_add(u32::try_from(index).expect("storage index should fit"))
+                .checked_add(
+                    u32::try_from(
+                        index
+                            .checked_add(inserted)
+                            .expect("storage interrupt index should fit"),
+                    )
+                    .expect("storage interrupt index should fit"),
+                )
                 .expect("storage interrupt should fit");
             relocate_mmio_interrupt(&mut bytes, transport_offset, interrupt);
         }

@@ -32605,19 +32605,6 @@ fn allocate_interrupt_lines(
         })?);
     }
 
-    let mut pmem = Vec::new();
-    pmem.try_reserve_exact(request.pmem_device_count)
-        .map_err(|source| HvfArm64BootSessionError::InterruptLineStorage { source })?;
-
-    for _ in 0..request.pmem_device_count {
-        pmem.push(allocator.allocate().map_err(|source| {
-            HvfArm64BootSessionError::AllocateInterruptLine {
-                purpose: HvfArm64BootInterruptLinePurpose::PmemDevice,
-                source,
-            }
-        })?);
-    }
-
     let mut network = Vec::new();
     network
         .try_reserve_exact(request.network_device_count)
@@ -32627,6 +32614,19 @@ fn allocate_interrupt_lines(
         network.push(allocator.allocate().map_err(|source| {
             HvfArm64BootSessionError::AllocateInterruptLine {
                 purpose: HvfArm64BootInterruptLinePurpose::NetworkDevice,
+                source,
+            }
+        })?);
+    }
+
+    let mut pmem = Vec::new();
+    pmem.try_reserve_exact(request.pmem_device_count)
+        .map_err(|source| HvfArm64BootSessionError::InterruptLineStorage { source })?;
+
+    for _ in 0..request.pmem_device_count {
+        pmem.push(allocator.allocate().map_err(|source| {
+            HvfArm64BootSessionError::AllocateInterruptLine {
+                purpose: HvfArm64BootInterruptLinePurpose::PmemDevice,
                 source,
             }
         })?);
@@ -43926,8 +43926,8 @@ mod tests {
 
         assert_eq!(lines.balloon.map(|line| line.raw_value()), Some(32));
         assert_eq!(line_values(&lines.block), vec![33, 34]);
-        assert_eq!(line_values(&lines.pmem), vec![35, 36]);
-        assert_eq!(line_values(&lines.network), vec![37, 38]);
+        assert_eq!(line_values(&lines.network), vec![35, 36]);
+        assert_eq!(line_values(&lines.pmem), vec![37, 38]);
         assert_eq!(lines.vsock.map(|line| line.raw_value()), Some(39));
         assert_eq!(lines.entropy.map(|line| line.raw_value()), Some(40));
         assert_eq!(lines.memory_hotplug.map(|line| line.raw_value()), Some(41));
@@ -44000,14 +44000,15 @@ mod tests {
     #[test]
     fn interrupt_lines_report_pmem_exhaustion_with_purpose() {
         let err = allocate_interrupt_lines(
-            &gic_with_spi_range(32, 1),
+            &gic_with_spi_range(32, 2),
             HvfArm64BootInterruptRequest {
                 block_device_count: 1,
                 pmem_device_count: 1,
+                network_device_count: 1,
                 ..HvfArm64BootInterruptRequest::default()
             },
         )
-        .expect_err("pmem allocation should exhaust range");
+        .expect_err("pmem allocation should exhaust range after block and network");
 
         assert!(matches!(
             err,
