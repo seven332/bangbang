@@ -424,7 +424,36 @@ impl PreparedSnapshotV2MemoryHotplugTopology {
         state: SnapshotV2MemoryHotplugState,
         binding: SnapshotV2MemoryBinding,
     ) -> Result<Self, SnapshotV2MemoryHotplugPreparationError> {
-        prepare_memory_hotplug_topology(state, binding, TopologyReservePolicy::System)
+        prepare_memory_hotplug_topology(
+            state,
+            binding,
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            TopologyReservePolicy::System,
+        )
+    }
+
+    /// Applies the unchanged exact-2.10 topology to a later closed container.
+    #[doc(hidden)]
+    pub fn prepare_for_compatibility_version(
+        state: SnapshotV2MemoryHotplugState,
+        binding: SnapshotV2MemoryBinding,
+        compatibility_version: SnapshotFormatVersion,
+    ) -> Result<Self, SnapshotV2MemoryHotplugPreparationError> {
+        let base = NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION;
+        if compatibility_version.major() != base.major()
+            || (compatibility_version.minor(), compatibility_version.patch())
+                < (base.minor(), base.patch())
+        {
+            return Err(SnapshotV2MemoryHotplugPreparationError::Binding(
+                SnapshotV2MemoryHotplugBindingError::Version,
+            ));
+        }
+        prepare_memory_hotplug_topology(
+            state,
+            binding,
+            compatibility_version,
+            TopologyReservePolicy::System,
+        )
     }
 
     #[cfg(test)]
@@ -432,7 +461,12 @@ impl PreparedSnapshotV2MemoryHotplugTopology {
         state: SnapshotV2MemoryHotplugState,
         binding: SnapshotV2MemoryBinding,
     ) -> Result<Self, SnapshotV2MemoryHotplugPreparationError> {
-        prepare_memory_hotplug_topology(state, binding, TopologyReservePolicy::FailExtentClasses)
+        prepare_memory_hotplug_topology(
+            state,
+            binding,
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            TopologyReservePolicy::FailExtentClasses,
+        )
     }
 
     #[cfg(test)]
@@ -440,7 +474,12 @@ impl PreparedSnapshotV2MemoryHotplugTopology {
         state: SnapshotV2MemoryHotplugState,
         binding: SnapshotV2MemoryBinding,
     ) -> Result<Self, SnapshotV2MemoryHotplugPreparationError> {
-        prepare_memory_hotplug_topology(state, binding, TopologyReservePolicy::FailPluggedRanges)
+        prepare_memory_hotplug_topology(
+            state,
+            binding,
+            NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+            TopologyReservePolicy::FailPluggedRanges,
+        )
     }
 
     /// Returns the exact binding and attached extent classification.
@@ -1513,12 +1552,13 @@ impl TopologyReservePolicy {
 fn prepare_memory_hotplug_topology(
     state: SnapshotV2MemoryHotplugState,
     binding: SnapshotV2MemoryBinding,
+    compatibility_version: SnapshotFormatVersion,
     reserve_policy: TopologyReservePolicy,
 ) -> Result<PreparedSnapshotV2MemoryHotplugTopology, SnapshotV2MemoryHotplugPreparationError> {
     validate_memory_hotplug_state(&state)
         .map_err(|_| SnapshotV2MemoryHotplugPreparationError::InvalidState)?;
     state
-        .validate_memory_binding(&binding)
+        .validate_memory_binding_for_compatibility_version(&binding, compatibility_version)
         .map_err(SnapshotV2MemoryHotplugPreparationError::Binding)?;
 
     let config_space = state.config_space();

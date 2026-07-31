@@ -502,6 +502,24 @@ pub struct HvfSnapshotV2MemoryHotplugPciEndpointPlan {
 }
 
 impl HvfSnapshotV2MemoryHotplugPciEndpointPlan {
+    pub(crate) const fn for_network_product(
+        origin: StorageDeviceOrigin,
+        sbdf: PciSbdf,
+        bar_region_id: MmioRegionId,
+        bar_range: GuestMemoryRange,
+        route_count: usize,
+        msi_interrupt_count: u32,
+    ) -> Self {
+        Self {
+            origin,
+            sbdf,
+            bar_region_id,
+            bar_range,
+            route_count,
+            msi_interrupt_count,
+        }
+    }
+
     pub const fn origin(self) -> StorageDeviceOrigin {
         self.origin
     }

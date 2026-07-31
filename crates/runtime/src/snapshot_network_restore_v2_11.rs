@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestMemory, GuestMemoryRange};
+use crate::message_interrupt::GuestMessageInterruptRegistry;
 use crate::metrics::SharedNetworkInterfaceMetrics;
 use crate::mmds::{MmdsConfig, MmdsConfigInput};
-use crate::mmio::MmioRegion;
+use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::network::{
     NetworkDeviceProfile, NetworkInterfaceConfig, NetworkMmioDeviceRegistration,
     NetworkRateLimiterConfig, NetworkTokenBucketConfig, VIRTIO_NET_DEVICE_ID,
@@ -33,10 +34,31 @@ use crate::snapshot_restore::{
     SnapshotRestorePublicId, SnapshotRestorePublicIdError, SnapshotRestoreResourceClass,
     SnapshotRestoreResourceKey,
 };
-use crate::virtio::VirtioInterruptIntent;
+use crate::storage_capture::StorageDeviceOrigin;
+use crate::virtio::{VirtioDeviceType, VirtioInterruptIntent};
 use crate::virtio_mmio::VirtioMmioQueueState;
+use crate::virtio_pci::{
+    PreparedVirtioPciEndpoint, VirtioPciEndpointError, VirtioPciIdentity, VirtioPciTransportState,
+};
 
 const REDACTED: &str = "<redacted>";
+
+struct RestoredSnapshotV2NetworkDevice {
+    queue_ranges: [Option<[GuestMemoryRange; 3]>; 2],
+    retry_deadline: Option<Instant>,
+    config_space: VirtioNetworkConfigSpace,
+    device: VirtioNetworkDevice,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestoreSnapshotV2NetworkDeviceError {
+    Profile,
+    Queue,
+    QueueMemory,
+    Limiter,
+    Retry,
+    Device,
+}
 
 /// Stable cancellation checkpoints before an owner-free topology is published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +371,145 @@ impl PreparedSnapshotV2NetworkRestoreInterface {
             handler,
         })
     }
+
+    /// Consumes one checked interface into a complete retained PCI endpoint
+    /// against destination memory and fresh metrics.
+    ///
+    /// The caller supplies the dispatcher region fixed by the platform plan and
+    /// a fresh destination message registry. The result still owns no message
+    /// resources, BAR/function/dispatcher lease, packet-I/O provider, callback,
+    /// scheduler, session, or VM authority.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn into_pci_endpoint(
+        self,
+        destination_memory: &GuestMemory,
+        realized_profile: NetworkDeviceProfile,
+        interface_metrics: SharedNetworkInterfaceMetrics,
+        aggregate_metrics: SharedNetworkInterfaceMetrics,
+        region_id: MmioRegionId,
+        messages: GuestMessageInterruptRegistry,
+        now: Instant,
+    ) -> Result<PreparedSnapshotV2NetworkPciEndpoint, SnapshotV2NetworkPciEndpointError> {
+        let restored = restore_snapshot_v2_network_device(
+            &self.controller,
+            &self.portable,
+            destination_memory,
+            realized_profile,
+            interface_metrics,
+            aggregate_metrics,
+            now,
+        )
+        .map_err(SnapshotV2NetworkPciEndpointError::from_device)?;
+        let Self {
+            source_index,
+            resource_key,
+            controller,
+            portable,
+            mmds_stack,
+        } = self;
+        let SnapshotV2NetworkInterfaceStateParts {
+            iface_id,
+            captured_selector: _,
+            requested_guest_mac,
+            requested_mtu,
+            profile,
+            backend,
+            local,
+            virtio,
+            rx_limiter,
+            tx_limiter,
+            transport,
+        } = portable.into_parts();
+        let SnapshotV2DeviceTransport::Pci(pci) = &transport else {
+            return Err(SnapshotV2NetworkPciEndpointError::WrongTransport);
+        };
+        let origin = pci.origin();
+        let sbdf = pci.sbdf();
+        let bar_range = pci.bar_range();
+        let mut captured_selector = String::new();
+        captured_selector
+            .try_reserve_exact(controller.host_dev_name().len())
+            .map_err(|_| SnapshotV2NetworkPciEndpointError::Allocation)?;
+        captured_selector.push_str(controller.host_dev_name());
+        let expected_state =
+            SnapshotV2NetworkInterfaceState::try_from_parts(SnapshotV2NetworkInterfaceStateParts {
+                iface_id,
+                captured_selector,
+                requested_guest_mac,
+                requested_mtu,
+                profile,
+                backend,
+                local,
+                virtio,
+                rx_limiter,
+                tx_limiter,
+                transport,
+            })
+            .map_err(|_| SnapshotV2NetworkPciEndpointError::ExpectedState)?;
+        let device_type = VirtioDeviceType::new(VIRTIO_NET_DEVICE_ID)
+            .map_err(|_| SnapshotV2NetworkPciEndpointError::DeviceType)?;
+        let identity =
+            VirtioPciIdentity::new(device_type, expected_state.virtio().available_features())
+                .with_config_generation(expected_state.virtio().config_generation());
+        let SnapshotV2DeviceTransport::Pci(pci) = expected_state.transport() else {
+            return Err(SnapshotV2NetworkPciEndpointError::WrongTransport);
+        };
+        let retained = VirtioPciTransportState::from_snapshot_v2_parts(
+            identity,
+            expected_state.virtio(),
+            pci,
+            false,
+        )
+        .map_err(|_| SnapshotV2NetworkPciEndpointError::RetainedTransport)?;
+        let activation_is_active = restored.device.is_activated();
+        let endpoint = PreparedVirtioPciEndpoint::new(
+            identity,
+            &VIRTIO_NET_QUEUE_SIZES,
+            restored.config_space,
+            restored.device,
+            activation_is_active,
+            false,
+            &retained,
+            sbdf,
+            bar_range,
+            region_id,
+            messages,
+        )
+        .map_err(SnapshotV2NetworkPciEndpointError::Endpoint)?;
+        let (captured, validation) = endpoint
+            .endpoint()
+            .capture_network_state_at(&controller, realized_profile, destination_memory, None, now)
+            .map_err(|_| SnapshotV2NetworkPciEndpointError::Capture)?;
+        if validation.source_rx_retry().is_some() {
+            return Err(SnapshotV2NetworkPciEndpointError::Capture);
+        }
+        let normalized = SnapshotV2NetworkInterfaceState::try_from_pci_capture(
+            &controller,
+            backend,
+            origin,
+            sbdf,
+            bar_range,
+            &captured,
+        )
+        .map_err(|_| SnapshotV2NetworkPciEndpointError::Normalize)?;
+        if normalized != expected_state {
+            return Err(SnapshotV2NetworkPciEndpointError::StateMismatch);
+        }
+
+        Ok(PreparedSnapshotV2NetworkPciEndpoint {
+            source_index,
+            resource_key,
+            controller,
+            expected_state,
+            mmds_stack,
+            queue_ranges: restored.queue_ranges,
+            retry: normalized.local().tx_retry(),
+            retry_deadline: restored.retry_deadline,
+            origin,
+            endpoint,
+        })
+    }
 }
 
 impl fmt::Debug for PreparedSnapshotV2NetworkRestoreInterface {
@@ -526,6 +687,212 @@ impl fmt::Display for SnapshotV2NetworkMmioHandlerError {
 }
 
 impl std::error::Error for SnapshotV2NetworkMmioHandlerError {}
+
+/// One checked exact-2.11 network endpoint awaiting destination PCI
+/// publication.
+#[doc(hidden)]
+pub struct PreparedSnapshotV2NetworkPciEndpoint {
+    source_index: u16,
+    resource_key: SnapshotRestoreResourceKey,
+    controller: NetworkInterfaceConfig,
+    expected_state: SnapshotV2NetworkInterfaceState,
+    mmds_stack: Option<SnapshotV2MmdsInterfaceState>,
+    queue_ranges: [Option<[GuestMemoryRange; 3]>; 2],
+    retry: SnapshotV2NetworkRetryState,
+    retry_deadline: Option<Instant>,
+    origin: StorageDeviceOrigin,
+    endpoint: PreparedVirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice>,
+}
+
+/// Consumed checked network continuation and retained PCI endpoint.
+#[doc(hidden)]
+pub type PreparedSnapshotV2NetworkPciEndpointParts = (
+    u16,
+    SnapshotRestoreResourceKey,
+    NetworkInterfaceConfig,
+    SnapshotV2NetworkInterfaceState,
+    Option<SnapshotV2MmdsInterfaceState>,
+    [Option<[GuestMemoryRange; 3]>; 2],
+    SnapshotV2NetworkRetryState,
+    Option<Instant>,
+    StorageDeviceOrigin,
+    PreparedVirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice>,
+);
+
+impl PreparedSnapshotV2NetworkPciEndpoint {
+    pub const fn source_index(&self) -> u16 {
+        self.source_index
+    }
+
+    pub const fn resource_key(&self) -> &SnapshotRestoreResourceKey {
+        &self.resource_key
+    }
+
+    pub const fn controller(&self) -> &NetworkInterfaceConfig {
+        &self.controller
+    }
+
+    pub const fn expected_state(&self) -> &SnapshotV2NetworkInterfaceState {
+        &self.expected_state
+    }
+
+    pub const fn mmds_stack(&self) -> Option<SnapshotV2MmdsInterfaceState> {
+        self.mmds_stack
+    }
+
+    pub const fn queue_ranges(&self) -> &[Option<[GuestMemoryRange; 3]>; 2] {
+        &self.queue_ranges
+    }
+
+    pub const fn retry(&self) -> SnapshotV2NetworkRetryState {
+        self.retry
+    }
+
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_deadline
+    }
+
+    pub const fn origin(&self) -> StorageDeviceOrigin {
+        self.origin
+    }
+
+    pub const fn endpoint(
+        &self,
+    ) -> &PreparedVirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice> {
+        &self.endpoint
+    }
+
+    pub fn into_parts(self) -> PreparedSnapshotV2NetworkPciEndpointParts {
+        (
+            self.source_index,
+            self.resource_key,
+            self.controller,
+            self.expected_state,
+            self.mmds_stack,
+            self.queue_ranges,
+            self.retry,
+            self.retry_deadline,
+            self.origin,
+            self.endpoint,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2NetworkPciEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2NetworkPciEndpoint")
+            .field("source_index", &self.source_index)
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Redacted failure while materializing one checked network PCI endpoint.
+#[doc(hidden)]
+pub enum SnapshotV2NetworkPciEndpointError {
+    Profile,
+    WrongTransport,
+    Queue,
+    QueueMemory,
+    Limiter,
+    Retry,
+    Device,
+    DeviceType,
+    RetainedTransport,
+    Endpoint(VirtioPciEndpointError),
+    ExpectedState,
+    Capture,
+    Normalize,
+    StateMismatch,
+    Allocation,
+}
+
+impl SnapshotV2NetworkPciEndpointError {
+    const fn from_device(source: RestoreSnapshotV2NetworkDeviceError) -> Self {
+        match source {
+            RestoreSnapshotV2NetworkDeviceError::Profile => Self::Profile,
+            RestoreSnapshotV2NetworkDeviceError::Queue => Self::Queue,
+            RestoreSnapshotV2NetworkDeviceError::QueueMemory => Self::QueueMemory,
+            RestoreSnapshotV2NetworkDeviceError::Limiter => Self::Limiter,
+            RestoreSnapshotV2NetworkDeviceError::Retry => Self::Retry,
+            RestoreSnapshotV2NetworkDeviceError::Device => Self::Device,
+        }
+    }
+}
+
+impl fmt::Debug for SnapshotV2NetworkPciEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotV2NetworkPciEndpointError")
+            .field(
+                "kind",
+                &match self {
+                    Self::Profile => "Profile",
+                    Self::WrongTransport => "WrongTransport",
+                    Self::Queue => "Queue",
+                    Self::QueueMemory => "QueueMemory",
+                    Self::Limiter => "Limiter",
+                    Self::Retry => "Retry",
+                    Self::Device => "Device",
+                    Self::DeviceType => "DeviceType",
+                    Self::RetainedTransport => "RetainedTransport",
+                    Self::Endpoint(_) => "Endpoint",
+                    Self::ExpectedState => "ExpectedState",
+                    Self::Capture => "Capture",
+                    Self::Normalize => "Normalize",
+                    Self::StateMismatch => "StateMismatch",
+                    Self::Allocation => "Allocation",
+                },
+            )
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotV2NetworkPciEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Profile => "native-v2 network destination profile is invalid",
+            Self::WrongTransport => "native-v2 network restore interface is not PCI",
+            Self::Queue => "native-v2 network queue reconstruction failed",
+            Self::QueueMemory => "native-v2 network queue memory is invalid",
+            Self::Limiter => "native-v2 network limiter reconstruction failed",
+            Self::Retry => "native-v2 network retry reconstruction failed",
+            Self::Device => "native-v2 network device reconstruction failed",
+            Self::DeviceType => "native-v2 network PCI device type is invalid",
+            Self::RetainedTransport => "native-v2 network retained PCI state is invalid",
+            Self::Endpoint(_) => "native-v2 network PCI endpoint construction failed",
+            Self::ExpectedState => "native-v2 network normalized state is invalid",
+            Self::Capture => "native-v2 network immediate PCI capture failed",
+            Self::Normalize => "native-v2 network immediate PCI normalization failed",
+            Self::StateMismatch => "native-v2 network immediate PCI state does not match",
+            Self::Allocation => "native-v2 network PCI preparation allocation failed",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2NetworkPciEndpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Endpoint(source) => Some(source),
+            Self::Profile
+            | Self::WrongTransport
+            | Self::Queue
+            | Self::QueueMemory
+            | Self::Limiter
+            | Self::Retry
+            | Self::Device
+            | Self::DeviceType
+            | Self::RetainedTransport
+            | Self::ExpectedState
+            | Self::Capture
+            | Self::Normalize
+            | Self::StateMismatch
+            | Self::Allocation => None,
+        }
+    }
+}
 
 /// Immutable exact-2.11 network/controller/MMDS destination topology.
 ///
@@ -963,6 +1330,151 @@ fn validate_destination_selector(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn restore_snapshot_v2_network_device(
+    controller: &NetworkInterfaceConfig,
+    portable: &SnapshotV2NetworkInterfaceState,
+    destination_memory: &GuestMemory,
+    realized_profile: NetworkDeviceProfile,
+    interface_metrics: SharedNetworkInterfaceMetrics,
+    aggregate_metrics: SharedNetworkInterfaceMetrics,
+    now: Instant,
+) -> Result<RestoredSnapshotV2NetworkDevice, RestoreSnapshotV2NetworkDeviceError> {
+    if realized_profile != portable.profile()
+        || controller
+            .guest_mac()
+            .is_some_and(|mac| realized_profile.guest_mac() != Some(mac))
+        || controller
+            .mtu()
+            .is_some_and(|mtu| realized_profile.mtu() != Some(mtu))
+        || !realized_profile
+            .feature_capabilities()
+            .is_dependency_complete()
+    {
+        return Err(RestoreSnapshotV2NetworkDeviceError::Profile);
+    }
+
+    let virtio = portable.virtio();
+    let local = portable.local();
+    let rx_transport = virtio
+        .queues()
+        .first()
+        .copied()
+        .ok_or(RestoreSnapshotV2NetworkDeviceError::Queue)?;
+    let tx_transport = virtio
+        .queues()
+        .get(1)
+        .copied()
+        .ok_or(RestoreSnapshotV2NetworkDeviceError::Queue)?;
+    if virtio.queues().len() != VIRTIO_NET_QUEUE_SIZES.len() {
+        return Err(RestoreSnapshotV2NetworkDeviceError::Queue);
+    }
+    let queue_ranges = [
+        queue_ranges(&rx_transport).map_err(|_| RestoreSnapshotV2NetworkDeviceError::Queue)?,
+        queue_ranges(&tx_transport).map_err(|_| RestoreSnapshotV2NetworkDeviceError::Queue)?,
+    ];
+    if queue_ranges
+        .iter()
+        .flatten()
+        .flatten()
+        .copied()
+        .any(|range| !range_is_wholly_contained(destination_memory, range))
+    {
+        return Err(RestoreSnapshotV2NetworkDeviceError::QueueMemory);
+    }
+
+    let negotiated_features = virtio.driver_features();
+    let rx_queue = local
+        .active_rx_queue()
+        .map(|cursor| {
+            VirtioNetworkRxQueue::from_snapshot_state(
+                restore_queue_state(rx_transport),
+                cursor.next_available(),
+                cursor.next_used(),
+                negotiated_features,
+            )
+            .map_err(|_| RestoreSnapshotV2NetworkDeviceError::Queue)
+        })
+        .transpose()?;
+    let tx_queue = local
+        .active_tx_queue()
+        .map(|cursor| {
+            VirtioNetworkTxQueue::from_snapshot_state(
+                restore_queue_state(tx_transport),
+                cursor.next_available(),
+                cursor.next_used(),
+                negotiated_features,
+            )
+            .map_err(|_| RestoreSnapshotV2NetworkDeviceError::Queue)
+        })
+        .transpose()?;
+    if rx_queue.is_some() != virtio.is_activated() || tx_queue.is_some() != virtio.is_activated() {
+        return Err(RestoreSnapshotV2NetworkDeviceError::Queue);
+    }
+    if let Some(queue) = rx_queue.as_ref() {
+        queue
+            .validate_snapshot_state(destination_memory)
+            .map_err(|_| RestoreSnapshotV2NetworkDeviceError::Queue)?;
+    }
+    let has_tx_retry = local.tx_retry().has_retry();
+    if let Some(queue) = tx_queue.as_ref() {
+        queue
+            .validate_snapshot_state(destination_memory, has_tx_retry)
+            .map_err(|_| RestoreSnapshotV2NetworkDeviceError::Queue)?;
+    }
+    if let (Some(rx), Some(tx)) = (rx_queue.as_ref(), tx_queue.as_ref()) {
+        validate_network_queue_pair_ranges(rx, tx)
+            .map_err(|_| RestoreSnapshotV2NetworkDeviceError::Queue)?;
+    }
+
+    let rx_rate_limiter = VirtioNetworkRateLimiter::from_persisted_state_at(
+        controller.rx_rate_limiter(),
+        restore_limiter_state(portable.rx_limiter()),
+        now,
+    )
+    .map_err(|_| RestoreSnapshotV2NetworkDeviceError::Limiter)?;
+    let tx_rate_limiter = VirtioNetworkRateLimiter::from_persisted_state_at(
+        controller.tx_rate_limiter(),
+        restore_limiter_state(portable.tx_limiter()),
+        now,
+    )
+    .map_err(|_| RestoreSnapshotV2NetworkDeviceError::Limiter)?;
+    let retry_deadline = match local.tx_retry() {
+        SnapshotV2NetworkRetryState::None => None,
+        SnapshotV2NetworkRetryState::Immediate => Some(now),
+        SnapshotV2NetworkRetryState::After { remaining_nanos } => Some(
+            now.checked_add(Duration::from_nanos(remaining_nanos))
+                .ok_or(RestoreSnapshotV2NetworkDeviceError::Retry)?,
+        ),
+    };
+    let mut device = VirtioNetworkDevice::from_snapshot_parts(
+        rx_queue,
+        tx_queue,
+        rx_rate_limiter,
+        tx_rate_limiter,
+        has_tx_retry,
+    )
+    .map_err(|_| RestoreSnapshotV2NetworkDeviceError::Device)?;
+    let mut config_space = VirtioNetworkConfigSpace::with_feature_capabilities(
+        realized_profile.guest_mac(),
+        realized_profile.mtu(),
+        realized_profile.feature_capabilities(),
+    );
+    if config_space.available_features() != virtio.available_features() {
+        return Err(RestoreSnapshotV2NetworkDeviceError::Profile);
+    }
+    config_space
+        .attach_metrics_with_aggregate(interface_metrics.clone(), aggregate_metrics.clone());
+    device.attach_metrics_with_aggregate(interface_metrics, aggregate_metrics);
+
+    Ok(RestoredSnapshotV2NetworkDevice {
+        queue_ranges,
+        retry_deadline,
+        config_space,
+        device,
+    })
+}
+
 fn limiter_config(limiter: SnapshotV2NetworkLimiterState) -> Option<NetworkRateLimiterConfig> {
     let configured = NetworkRateLimiterConfig::new(
         limiter.bandwidth().map(token_bucket_config),
@@ -1028,9 +1540,14 @@ fn token_bucket_config(bucket: SnapshotV2NetworkTokenBucketState) -> NetworkToke
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::interrupt::GuestInterruptLine;
     use crate::memory::{GuestAddress, GuestMemoryLayout};
+    use crate::message_interrupt::{
+        GuestMessage, GuestMessageInterrupt, GuestMessageInterruptSignalError,
+    };
     use crate::mmio::{MmioRegion, MmioRegionId};
     use crate::network::{
         GuestMacAddress, NetworkDeviceProfile, VIRTIO_NET_QUEUE_SIZE, VirtioNetworkConfigSpace,
@@ -1063,6 +1580,49 @@ mod tests {
     const AVAILABLE_INDEX_OFFSET: u64 = 2;
     const AVAILABLE_RING_OFFSET: u64 = 4;
     const USED_INDEX_OFFSET: u64 = 2;
+
+    #[derive(Debug)]
+    struct TestMessageRoute(GuestMessage);
+
+    impl GuestMessageInterrupt for TestMessageRoute {
+        fn matches(&self, message: GuestMessage) -> bool {
+            self.0 == message
+        }
+
+        fn signal(&self, message: GuestMessage) -> Result<(), GuestMessageInterruptSignalError> {
+            if self.matches(message) {
+                Ok(())
+            } else {
+                Err(GuestMessageInterruptSignalError::new(
+                    "test route rejected an unknown message",
+                    false,
+                ))
+            }
+        }
+    }
+
+    fn network_message_registry(
+        interface: &SnapshotV2NetworkInterfaceState,
+    ) -> GuestMessageInterruptRegistry {
+        let SnapshotV2DeviceTransport::Pci(pci) = interface.transport() else {
+            panic!("test interface should use PCI");
+        };
+        let routes: Vec<Arc<dyn GuestMessageInterrupt>> = pci
+            .msix()
+            .entries()
+            .iter()
+            .map(|entry| {
+                let address = (u64::from(entry.message_address_high()) << 32)
+                    | u64::from(entry.message_address_low());
+                Arc::new(TestMessageRoute(GuestMessage::new(
+                    address,
+                    entry.message_data(),
+                ))) as Arc<dyn GuestMessageInterrupt>
+            })
+            .collect();
+        GuestMessageInterruptRegistry::new(routes)
+            .expect("network message registry should validate")
+    }
 
     fn fixture_bytes(fixture: &str) -> Vec<u8> {
         let compact = fixture.split_ascii_whitespace().collect::<String>();
@@ -1251,6 +1811,32 @@ mod tests {
             .expect("active retry interface should validate");
         SnapshotV2NetworkState::try_new(vec![interface], None)
             .expect("active retry network state should validate")
+    }
+
+    fn active_pci_state_with_immediate_retry() -> SnapshotV2NetworkState {
+        let fixture = fixture("active");
+        let source = &fixture.interfaces()[0];
+        let interface =
+            SnapshotV2NetworkInterfaceState::try_from_parts(SnapshotV2NetworkInterfaceStateParts {
+                iface_id: source.iface_id().to_owned(),
+                captured_selector: source.captured_selector().to_owned(),
+                requested_guest_mac: source.requested_guest_mac(),
+                requested_mtu: source.requested_mtu(),
+                profile: source.profile(),
+                backend: source.backend(),
+                local: SnapshotV2NetworkLocalState::new(
+                    source.local().active_rx_queue(),
+                    source.local().active_tx_queue(),
+                    SnapshotV2NetworkRetryState::Immediate,
+                ),
+                virtio: source.virtio().clone(),
+                rx_limiter: source.rx_limiter(),
+                tx_limiter: source.tx_limiter(),
+                transport: source.transport().clone(),
+            })
+            .expect("active PCI immediate-retry state should validate");
+        SnapshotV2NetworkState::try_new(vec![interface], fixture.mmds().cloned())
+            .expect("active PCI immediate-retry aggregate should validate")
     }
 
     fn restore_memory_with_pending_tx() -> GuestMemory {
@@ -1685,6 +2271,123 @@ mod tests {
             prepared.expected_state().captured_selector(),
             "vmnet:shared"
         );
+    }
+
+    #[test]
+    fn active_pci_endpoint_rebinds_selector_and_recaptures_exactly() {
+        let state = active_pci_state_with_immediate_retry();
+        let topology = PreparedSnapshotV2NetworkRestoreTopology::prepare(
+            state.clone(),
+            &exact_overrides(&state),
+        )
+        .expect("active PCI topology should prepare");
+        let (mut interfaces, _, _) = topology.into_parts();
+        let interface = interfaces.pop().expect("one interface should be prepared");
+        let profile = interface.portable().profile();
+        let messages = network_message_registry(interface.portable());
+        let now = Instant::now();
+        let prepared = interface
+            .into_pci_endpoint(
+                &restore_memory_with_pending_tx(),
+                profile,
+                SharedNetworkInterfaceMetrics::default(),
+                SharedNetworkInterfaceMetrics::default(),
+                MmioRegionId::new(44),
+                messages,
+                now,
+            )
+            .expect("active PCI endpoint should materialize");
+
+        let SnapshotV2DeviceTransport::Pci(expected_pci) = state.interfaces()[0].transport() else {
+            panic!("active fixture should use PCI");
+        };
+        assert_eq!(prepared.source_index(), 0);
+        assert_eq!(prepared.controller().host_dev_name(), "vmnet:shared");
+        assert_eq!(
+            prepared.expected_state().captured_selector(),
+            "vmnet:shared"
+        );
+        assert_eq!(prepared.origin(), expected_pci.origin());
+        assert_eq!(prepared.endpoint().sbdf(), expected_pci.sbdf());
+        assert_eq!(prepared.endpoint().bar_range(), expected_pci.bar_range());
+        assert_eq!(prepared.endpoint().region_id(), MmioRegionId::new(44));
+        assert_eq!(
+            prepared.expected_state().virtio(),
+            state.interfaces()[0].virtio()
+        );
+        assert!(prepared.queue_ranges().iter().all(Option::is_some));
+        let debug = format!("{prepared:?}");
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("vmnet:shared"));
+    }
+
+    #[test]
+    fn pci_endpoint_rejects_mmio_transport_and_unmapped_queue_memory_redacted() {
+        let state = fixture("inactive");
+        let topology = PreparedSnapshotV2NetworkRestoreTopology::prepare(
+            state.clone(),
+            &exact_overrides(&state),
+        )
+        .expect("inactive MMIO topology should prepare");
+        let (mut interfaces, _, _) = topology.into_parts();
+        let interface = interfaces.pop().expect("one interface should be prepared");
+        let profile = interface.portable().profile();
+        let dummy_messages = GuestMessageInterruptRegistry::new(vec![Arc::new(TestMessageRoute(
+            GuestMessage::new(0x0800_0040, 64),
+        ))
+            as Arc<dyn GuestMessageInterrupt>])
+        .expect("dummy registry should validate");
+        let error = interface
+            .into_pci_endpoint(
+                &restore_memory_with_pending_tx(),
+                profile,
+                SharedNetworkInterfaceMetrics::default(),
+                SharedNetworkInterfaceMetrics::default(),
+                MmioRegionId::new(44),
+                dummy_messages,
+                Instant::now(),
+            )
+            .expect_err("MMIO continuation must not materialize as PCI");
+        assert!(matches!(
+            error,
+            SnapshotV2NetworkPciEndpointError::WrongTransport
+        ));
+
+        let state = active_pci_state_with_immediate_retry();
+        let topology = PreparedSnapshotV2NetworkRestoreTopology::prepare(
+            state.clone(),
+            &exact_overrides(&state),
+        )
+        .expect("active PCI topology should prepare");
+        let (mut interfaces, _, _) = topology.into_parts();
+        let interface = interfaces.pop().expect("one interface should be prepared");
+        let profile = interface.portable().profile();
+        let messages = network_message_registry(interface.portable());
+        let tiny_layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), 0x4000)
+                .expect("tiny range should validate"),
+        ])
+        .expect("tiny layout should validate");
+        let tiny_memory = GuestMemory::allocate(&tiny_layout).expect("tiny memory should allocate");
+        let error = interface
+            .into_pci_endpoint(
+                &tiny_memory,
+                profile,
+                SharedNetworkInterfaceMetrics::default(),
+                SharedNetworkInterfaceMetrics::default(),
+                MmioRegionId::new(44),
+                messages,
+                Instant::now(),
+            )
+            .expect_err("unmapped PCI queue memory should fail");
+        assert!(matches!(
+            error,
+            SnapshotV2NetworkPciEndpointError::QueueMemory
+        ));
+        let diagnostic = format!("{error:?} {error}");
+        assert!(diagnostic.contains(REDACTED));
+        assert!(!diagnostic.contains("eth0"));
+        assert!(!diagnostic.contains("vmnet:"));
     }
 
     #[test]

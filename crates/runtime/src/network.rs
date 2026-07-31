@@ -1028,7 +1028,7 @@ impl VirtioNetworkConfigSpace {
         self.metrics = Some(VirtioNetworkTransportMetrics::for_interface(metrics));
     }
 
-    fn attach_metrics_with_aggregate(
+    pub(crate) fn attach_metrics_with_aggregate(
         &mut self,
         interface: SharedNetworkInterfaceMetrics,
         aggregate: SharedNetworkInterfaceMetrics,
@@ -3199,7 +3199,7 @@ impl VirtioNetworkDevice {
         self.metrics = Some(VirtioNetworkTransportMetrics::for_interface(metrics));
     }
 
-    fn attach_metrics_with_aggregate(
+    pub(crate) fn attach_metrics_with_aggregate(
         &mut self,
         interface: SharedNetworkInterfaceMetrics,
         aggregate: SharedNetworkInterfaceMetrics,

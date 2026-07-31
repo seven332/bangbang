@@ -52,6 +52,24 @@ pub struct HvfSnapshotV2EntropyPciEndpointPlan {
 }
 
 impl HvfSnapshotV2EntropyPciEndpointPlan {
+    pub(crate) const fn for_network_product(
+        preceding_endpoint_count: usize,
+        sbdf: PciSbdf,
+        bar_region_id: MmioRegionId,
+        bar_range: GuestMemoryRange,
+        route_count: usize,
+        msi_interrupt_count: u32,
+    ) -> Self {
+        Self {
+            preceding_endpoint_count,
+            sbdf,
+            bar_region_id,
+            bar_range,
+            route_count,
+            msi_interrupt_count,
+        }
+    }
+
     /// Returns how many storage endpoints must already be published.
     pub const fn preceding_endpoint_count(self) -> usize {
         self.preceding_endpoint_count

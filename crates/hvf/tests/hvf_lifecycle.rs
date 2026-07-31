@@ -20101,6 +20101,1253 @@ fn restores_signed_exact_2_11_mmio_network_owner_graph_at_exact_capacity() {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn restores_signed_exact_2_11_pci_network_owner_graph_at_exact_capacity() {
+    use std::io::Cursor;
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootNetworkCaptureConfig, HvfArm64BootNetworkDeviceOrigin,
+        HvfArm64BootNetworkTransportCaptureState, HvfArm64BootSerialDeviceConfig,
+        HvfArm64BootSessionConfig, HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BootState,
+        HvfSnapshotV2NativePath, HvfSnapshotV2NetworkPciMemoryInput,
+        HvfSnapshotV2NetworkPciRestoreDisposition, HvfSnapshotV2NetworkPciRestoreStage,
+        HvfSnapshotV2NetworkPreparedProduct, HvfSnapshotV2NetworkState,
+        HvfSnapshotV2RestoredSerialShell, OwnedHvfArm64BootSession,
+        encode_hvf_snapshot_v2_network_state, prepare_hvf_snapshot_v2_network_pci_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::metrics::SharedNetworkInterfaceMetricsRegistry;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::{
+        NetworkDeviceProfile, NetworkInterfaceConfigInput, NetworkMmioLayout,
+        NetworkRateLimiterConfig, NetworkTokenBucketConfig, PreparedNetworkDevice,
+    };
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot::SnapshotNetworkOverride;
+    use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version;
+    use bangbang_runtime::snapshot_memory_v2::load_snapshot_v2_memory_file;
+    use bangbang_runtime::snapshot_network_restore_v2_11::PreparedSnapshotV2NetworkRestoreTopology;
+    use bangbang_runtime::snapshot_network_v2_11::{
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, SnapshotV2NetworkBackendClass,
+        SnapshotV2NetworkInterfaceState, SnapshotV2NetworkState,
+    };
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::storage_capture::StorageDeviceOrigin;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("restore-network-pci-kernel", &image)
+        .expect("network restore kernel should create");
+    let limiter = NetworkRateLimiterConfig::new(
+        Some(NetworkTokenBucketConfig::new(4096, Some(8192), 100)),
+        Some(NetworkTokenBucketConfig::new(64, None, 100)),
+    );
+    let block_layout = BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
+    let pmem_layout = PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500));
+    let network_layout =
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000));
+
+    for interface_count in [1_usize, 16] {
+        let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                kernel.path(),
+            )))
+            .expect("network restore boot source should configure");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(
+                MachineConfigInput::new(1, 128).with_track_dirty_pages(true),
+            ))
+            .expect("network restore dirty tracking should configure");
+        let startup_interface_count = if interface_count == 16 {
+            interface_count - 1
+        } else {
+            interface_count
+        };
+        for index in 0..startup_interface_count {
+            let iface_id = format!("eth{index}");
+            let selector = format!("private-network-backend-{index}");
+            let guest_mac = format!("02:00:00:00:02:{index:02x}");
+            controller
+                .handle_action(VmmAction::PutNetworkInterface(
+                    NetworkInterfaceConfigInput::new(iface_id.clone(), iface_id, selector)
+                        .with_guest_mac(guest_mac)
+                        .with_mtu(1400)
+                        .with_rx_rate_limiter(limiter)
+                        .with_tx_rate_limiter(limiter),
+                ))
+                .expect("network restore interface should configure");
+        }
+        let session_config = HvfArm64BootSessionConfig::new(
+            block_layout,
+            pmem_layout,
+            network_layout,
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            bangbang_runtime::rtc::RtcMmioLayout::new(
+                GuestAddress::new(0x4000_1000),
+                MmioRegionId::new(10),
+            ),
+        )
+        .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+            MmioRegionId::new(20),
+            GuestAddress::new(0x4000_2000),
+            SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+        ))
+        .with_pci_enabled();
+        let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+            .expect("signed PCI network source should prepare");
+        if startup_interface_count != interface_count {
+            let index = startup_interface_count;
+            let iface_id = format!("eth{index}");
+            controller
+                .handle_action(VmmAction::PutNetworkInterface(
+                    NetworkInterfaceConfigInput::new(
+                        iface_id.clone(),
+                        iface_id,
+                        format!("private-network-backend-{index}"),
+                    )
+                    .with_guest_mac(format!("02:00:00:00:02:{index:02x}"))
+                    .with_mtu(1400)
+                    .with_rx_rate_limiter(limiter)
+                    .with_tx_rate_limiter(limiter),
+                ))
+                .expect("runtime network restore interface should configure");
+            let runtime_config = controller.network_interface_configs()[index].clone();
+            source
+                .insert_runtime_network_device(PreparedNetworkDevice::from_config(&runtime_config))
+                .expect("runtime PCI network source should publish");
+        }
+        let configs = controller.network_interface_configs().to_vec();
+        let profiles = configs
+            .iter()
+            .map(NetworkDeviceProfile::from_config)
+            .collect::<Vec<_>>();
+        let capture_configs = configs
+            .iter()
+            .zip(&profiles)
+            .map(|(config, profile)| {
+                HvfArm64BootNetworkCaptureConfig::new(config.clone(), *profile, None, None, false)
+            })
+            .collect::<Vec<_>>();
+        let capture_now = Instant::now();
+        let guard = source
+            .quiesce_limiter_retry_wakeups()
+            .expect("network source publishers should quiesce");
+        let captured = source
+            .capture_ready_network_state_at(&capture_configs, &guard, capture_now)
+            .expect("PCI network source should capture");
+        let serial = SnapshotV2SerialState::try_from_capture_ready(
+            source
+                .capture_ready_serial_state(controller.serial_config().clone(), &guard)
+                .expect("network product serial should capture"),
+        )
+        .expect("network product serial capture should convert");
+        drop(guard);
+        let mut interfaces = Vec::new();
+        interfaces
+            .try_reserve_exact(interface_count)
+            .expect("portable network inventory should reserve");
+        for captured in captured.interfaces() {
+            let HvfArm64BootNetworkTransportCaptureState::Pci {
+                origin,
+                sbdf,
+                bar_range,
+                state,
+            } = captured.transport()
+            else {
+                panic!("network source should use PCI");
+            };
+            let origin = match origin {
+                HvfArm64BootNetworkDeviceOrigin::Startup => StorageDeviceOrigin::Startup,
+                HvfArm64BootNetworkDeviceOrigin::Runtime => StorageDeviceOrigin::Runtime,
+            };
+            interfaces.push(
+                SnapshotV2NetworkInterfaceState::try_from_pci_capture(
+                    captured.config(),
+                    SnapshotV2NetworkBackendClass::Vmnet,
+                    origin,
+                    *sbdf,
+                    *bar_range,
+                    state,
+                )
+                .expect("portable PCI network interface should convert"),
+            );
+        }
+        let network = SnapshotV2NetworkState::try_new(interfaces, None)
+            .expect("portable network aggregate should validate");
+        if interface_count == 16 {
+            assert!(matches!(
+                network.interfaces()[15].transport(),
+                bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransport::Pci(pci)
+                    if pci.origin() == StorageDeviceOrigin::Runtime
+            ));
+        }
+        let overrides = network
+            .interfaces()
+            .iter()
+            .map(|interface| SnapshotNetworkOverride::new(interface.iface_id(), "vmnet:shared"))
+            .collect::<Vec<_>>();
+        source
+            .pause_for_snapshot_v2_capture()
+            .expect("network source should pause");
+        let boot = HvfSnapshotV2BootState::try_new(
+            HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+                .expect("network kernel path should validate"),
+            None,
+            None,
+        )
+        .expect("network boot metadata should validate");
+        let mut memory_writer = Cursor::new(Vec::new());
+        let network_platform = source
+            .capture_snapshot_v2_network_platform_with_cancel(
+                HvfArm64BootSnapshotV2CaptureInput::new(boot),
+                None,
+                &mut memory_writer,
+                |_| false,
+            )
+            .expect("exact-2.11 PCI network platform should capture");
+        let product = HvfSnapshotV2NetworkState::try_new(
+            network_platform.clone(),
+            None,
+            serial.clone(),
+            None,
+            None,
+            Some(network.clone()),
+        )
+        .expect("network-only exact-2.11 PCI product should compose");
+        let encoded = encode_hvf_snapshot_v2_network_state(&product)
+            .expect("network-only exact-2.11 PCI product should encode");
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            &encoded,
+            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+        )
+        .expect("network-only exact-2.11 PCI product should decode structurally");
+        let memory_image = TempFile::new(
+            "restore-network-pci-cancellation-memory",
+            memory_writer.get_ref(),
+        )
+        .expect("network-only exact-2.11 PCI memory image should persist");
+        let platform = network_platform.platform().clone();
+        source
+            .shutdown()
+            .expect("signed PCI network source should shut down");
+        let cancellation_stages = if interface_count == 1 {
+            vec![
+                HvfSnapshotV2NetworkPciRestoreStage::Product,
+                HvfSnapshotV2NetworkPciRestoreStage::Platform,
+                HvfSnapshotV2NetworkPciRestoreStage::EndpointPreparation { index: 0 },
+                HvfSnapshotV2NetworkPciRestoreStage::Publication { index: 0 },
+                HvfSnapshotV2NetworkPciRestoreStage::RetryScheduler,
+                HvfSnapshotV2NetworkPciRestoreStage::RetryDeadline,
+                HvfSnapshotV2NetworkPciRestoreStage::Recapture,
+                HvfSnapshotV2NetworkPciRestoreStage::Assembly,
+            ]
+        } else {
+            let mut stages = Vec::new();
+            stages
+                .try_reserve_exact(interface_count * 2 + 1)
+                .expect("PCI network prefix stages should reserve");
+            for index in 0..interface_count {
+                stages.push(HvfSnapshotV2NetworkPciRestoreStage::EndpointPreparation { index });
+                stages.push(HvfSnapshotV2NetworkPciRestoreStage::Publication { index });
+            }
+            stages.push(HvfSnapshotV2NetworkPciRestoreStage::RetryScheduler);
+            stages
+        };
+
+        let prepare_plan = || {
+            let topology =
+                PreparedSnapshotV2NetworkRestoreTopology::prepare(network.clone(), &overrides)
+                    .expect("destination network topology should prepare");
+            prepare_hvf_snapshot_v2_network_pci_platform_plan(
+                &platform,
+                HvfSnapshotV2NetworkPreparedProduct::serial_network(
+                    platform.memory().clone(),
+                    topology,
+                ),
+            )
+            .expect("network PCI platform plan should prepare")
+        };
+        let restored_shell = || {
+            HvfSnapshotV2RestoredSerialShell::new(
+                SerialMmioDevice::from_capture_state_with_shared_output(
+                    SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                    serial.device().clone(),
+                ),
+            )
+        };
+        let fresh_metrics = || {
+            SharedNetworkInterfaceMetricsRegistry::from_interface_ids(
+                configs.iter().map(|config| config.iface_id()),
+            )
+        };
+        let fresh_memory = || {
+            load_snapshot_v2_memory_file(
+                &structural,
+                std::fs::File::open(memory_image.path())
+                    .expect("network-only exact-2.11 PCI memory image should reopen"),
+            )
+            .expect("network-only exact-2.11 PCI memory should map privately")
+        };
+        let restore_now = Instant::now();
+        for cancel_stage in cancellation_stages {
+            let destination = fresh_memory();
+            let error = OwnedHvfArm64BootSession::restore_snapshot_v2_network_pci_with_cancel(
+                platform.clone(),
+                HvfSnapshotV2NetworkPciMemoryInput::Static(destination),
+                restored_shell(),
+                None,
+                prepare_plan(),
+                profiles.clone(),
+                fresh_metrics(),
+                restore_now,
+                |stage| stage == cancel_stage,
+            )
+            .expect_err("injected PCI network owner cancellation should reject");
+            assert_eq!(error.stage(), cancel_stage);
+            assert_eq!(
+                error.disposition(),
+                if matches!(
+                    cancel_stage,
+                    HvfSnapshotV2NetworkPciRestoreStage::Product
+                        | HvfSnapshotV2NetworkPciRestoreStage::Platform
+                ) {
+                    HvfSnapshotV2NetworkPciRestoreDisposition::Retryable
+                } else {
+                    HvfSnapshotV2NetworkPciRestoreDisposition::Terminal
+                }
+            );
+            assert!(!error.has_incomplete_cleanup());
+            let diagnostics = format!("{error:?} {error}");
+            assert!(diagnostics.contains("<redacted>"));
+            assert!(!diagnostics.contains("eth0"));
+            assert!(!diagnostics.contains("vmnet:shared"));
+        }
+
+        let premature_destination = fresh_memory();
+        let premature_owners = OwnedHvfArm64BootSession::restore_snapshot_v2_network_pci(
+            platform.clone(),
+            HvfSnapshotV2NetworkPciMemoryInput::Static(premature_destination),
+            restored_shell(),
+            None,
+            prepare_plan(),
+            profiles.clone(),
+            fresh_metrics(),
+            restore_now,
+        )
+        .expect("premature PCI extraction owner should restore");
+        let extraction_error = match premature_owners.into_session() {
+            Ok(mut session) => {
+                let _ = session.shutdown();
+                panic!("uncommitted PCI network owner must not release its session");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            extraction_error.stage(),
+            HvfSnapshotV2NetworkPciRestoreStage::Assembly
+        );
+        assert_eq!(
+            extraction_error.disposition(),
+            HvfSnapshotV2NetworkPciRestoreDisposition::Terminal
+        );
+        assert!(!extraction_error.has_incomplete_cleanup());
+
+        let destination = fresh_memory();
+        let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_network_pci(
+            platform.clone(),
+            HvfSnapshotV2NetworkPciMemoryInput::Static(destination),
+            restored_shell(),
+            None,
+            prepare_plan(),
+            profiles.clone(),
+            fresh_metrics(),
+            restore_now,
+        )
+        .unwrap_or_else(|error| {
+            panic!("exact-capacity PCI network owners should restore: {error:?}")
+        });
+        assert_eq!(owners.configs().len(), interface_count);
+        assert_eq!(owners.expected().len(), interface_count);
+        assert!(!owners.retry_publication_is_committed());
+        assert!(owners.session().pci_network_device_updater().is_some());
+        let recapture_configs = owners
+            .configs()
+            .iter()
+            .zip(&profiles)
+            .map(|(config, profile)| {
+                HvfArm64BootNetworkCaptureConfig::new(config.clone(), *profile, None, None, false)
+            })
+            .collect::<Vec<_>>();
+        let guard = owners
+            .session()
+            .quiesce_limiter_retry_wakeups()
+            .expect("restored PCI network publishers should quiesce");
+        let recaptured = owners
+            .session()
+            .capture_ready_network_state_at(&recapture_configs, &guard, restore_now)
+            .expect("restored PCI network graph should recapture");
+        for (captured, expected) in recaptured.interfaces().iter().zip(owners.expected()) {
+            let HvfArm64BootNetworkTransportCaptureState::Pci {
+                origin,
+                sbdf,
+                bar_range,
+                state,
+            } = captured.transport()
+            else {
+                panic!("restored network should remain PCI");
+            };
+            let origin = match origin {
+                HvfArm64BootNetworkDeviceOrigin::Startup => StorageDeviceOrigin::Startup,
+                HvfArm64BootNetworkDeviceOrigin::Runtime => StorageDeviceOrigin::Runtime,
+            };
+            let portable = SnapshotV2NetworkInterfaceState::try_from_pci_capture(
+                captured.config(),
+                expected.backend(),
+                origin,
+                *sbdf,
+                *bar_range,
+                state,
+            )
+            .expect("restored PCI network recapture should convert");
+            assert_eq!(&portable, expected);
+        }
+        drop(guard);
+
+        let owners = owners.commit_retry_publication();
+        assert!(owners.retry_publication_is_committed());
+        let mut restored = owners
+            .into_session()
+            .expect("committed PCI network owner should release its session");
+        restored
+            .shutdown()
+            .expect("restored PCI network destination should shut down");
+        restored
+            .shutdown()
+            .expect("restored PCI network destination shutdown should be idempotent");
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn restores_signed_all_sixteen_network_pci_product_shapes() {
+    use std::io::Cursor;
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig,
+        HvfArm64BootMemoryHotplugDeviceConfig, HvfArm64BootNetworkCaptureConfig,
+        HvfArm64BootNetworkDeviceOrigin, HvfArm64BootNetworkTransportCaptureState,
+        HvfArm64BootPciDataDeviceKind, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BootState, HvfSnapshotV2NativePath,
+        HvfSnapshotV2NetworkPciMemoryInput, HvfSnapshotV2NetworkPciRestoreDisposition,
+        HvfSnapshotV2NetworkPciRestoreStage, HvfSnapshotV2NetworkPreparedProduct,
+        HvfSnapshotV2NetworkState, HvfSnapshotV2RestoredSerialShell, OwnedHvfArm64BootSession,
+        prepare_hvf_snapshot_v2_network_pci_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::balloon::{BalloonConfigInput, BalloonMmioLayout};
+    use bangbang_runtime::block::{
+        BlockFileBacking, BlockMmioLayout, DriveConfigInput, DriveIoEngine,
+    };
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::entropy::{EntropyConfigInput, EntropyMmioLayout};
+    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+    use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, VirtioMemMmioLayout};
+    use bangbang_runtime::metrics::SharedNetworkInterfaceMetricsRegistry;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::{
+        NetworkDeviceProfile, NetworkInterfaceConfigInput, NetworkMmioLayout,
+    };
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot::SnapshotNetworkOverride;
+    use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonRestorePlan;
+    use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageRestorePlan;
+    use bangbang_runtime::snapshot_entropy_v2_8::SnapshotV2EntropyRestorePlan;
+    use bangbang_runtime::snapshot_memory_hotplug_v2_10::PreparedSnapshotV2MemoryHotplugTopology;
+    use bangbang_runtime::snapshot_memory_v2::{
+        SnapshotV2MemoryBinding, materialize_snapshot_v2_memory_hotplug_file,
+    };
+    use bangbang_runtime::snapshot_network_restore_v2_11::PreparedSnapshotV2NetworkRestoreTopology;
+    use bangbang_runtime::snapshot_network_v2_11::{
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, SnapshotV2NetworkBackendClass,
+        SnapshotV2NetworkInterfaceState, SnapshotV2NetworkState,
+    };
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::storage_capture::{CaptureReadyStorageConfigs, StorageDeviceOrigin};
+    use bangbang_runtime::virtio_pci::VirtioPciEndpointPhase;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    enum PreparedMemory {
+        Static {
+            binding: SnapshotV2MemoryBinding,
+            memory: GuestMemory,
+        },
+        Hotplug {
+            topology: Box<PreparedSnapshotV2MemoryHotplugTopology>,
+            memory: GuestMemory,
+        },
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn run_case(
+        image: &[u8],
+        has_balloon: bool,
+        has_storage: bool,
+        has_entropy: bool,
+        has_memory_hotplug: bool,
+        network_count: usize,
+        cancel_stage: Option<HvfSnapshotV2NetworkPciRestoreStage>,
+    ) {
+        let kernel = TempFile::new("restore-network-pci-matrix-kernel", image)
+            .expect("network PCI matrix kernel should create");
+        let root = has_storage.then(|| {
+            TempFile::new_len("restore-network-pci-matrix-root", 4096)
+                .expect("network PCI matrix root should create")
+        });
+        let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                kernel.path(),
+            )))
+            .expect("network PCI matrix boot source should configure");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(
+                MachineConfigInput::new(1, 128).with_track_dirty_pages(true),
+            ))
+            .expect("network PCI matrix dirty tracking should configure");
+        if let Some(root) = &root {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", root.path(), true)
+                        .with_is_read_only(true)
+                        .with_io_engine(DriveIoEngine::Sync),
+                ))
+                .expect("network PCI matrix root should configure");
+        }
+        if has_balloon {
+            controller
+                .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(8, false)))
+                .expect("network PCI matrix balloon should configure");
+        }
+        if has_entropy {
+            controller
+                .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+                .expect("network PCI matrix entropy should configure");
+        }
+        if has_memory_hotplug {
+            controller
+                .handle_action(VmmAction::PutMemoryHotplug(MemoryHotplugConfigInput::new(
+                    128, 2, 128,
+                )))
+                .expect("network PCI matrix memory-hotplug should configure");
+        }
+        for index in 0..network_count {
+            let iface_id = format!("eth{index}");
+            controller
+                .handle_action(VmmAction::PutNetworkInterface(
+                    NetworkInterfaceConfigInput::new(
+                        iface_id.clone(),
+                        iface_id,
+                        format!("private-network-backend-{index}"),
+                    )
+                    .with_guest_mac(format!("02:00:00:00:03:{index:02x}"))
+                    .with_mtu(1400),
+                ))
+                .expect("network PCI matrix interface should configure");
+        }
+
+        let configs = controller.network_interface_configs().to_vec();
+        let profiles = configs
+            .iter()
+            .map(NetworkDeviceProfile::from_config)
+            .collect::<Vec<_>>();
+        let memory_hotplug_config = controller.memory_hotplug_config();
+        let requested_size_mib = controller
+            .memory_hotplug_status()
+            .map(|status| status.requested_size_mib());
+        let block_layout =
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
+        let pmem_layout =
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500));
+        let mut session_config = HvfArm64BootSessionConfig::new(
+            block_layout,
+            pmem_layout,
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            bangbang_runtime::rtc::RtcMmioLayout::new(
+                GuestAddress::new(0x4000_1000),
+                MmioRegionId::new(10),
+            ),
+        )
+        .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+            MmioRegionId::new(20),
+            GuestAddress::new(0x4000_2000),
+            SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+        ))
+        .with_pci_enabled();
+        if has_balloon {
+            session_config =
+                session_config.with_balloon_device(HvfArm64BootBalloonDeviceConfig::new(
+                    BalloonMmioLayout::new(GuestAddress::new(0x4000_6000), MmioRegionId::new(3000)),
+                ));
+        }
+        if has_entropy {
+            session_config =
+                session_config.with_entropy_device(HvfArm64BootEntropyDeviceConfig::new(
+                    EntropyMmioLayout::new(GuestAddress::new(0x4000_7000), MmioRegionId::new(3001)),
+                ));
+        }
+        if has_memory_hotplug {
+            session_config = session_config.with_memory_hotplug_device(
+                HvfArm64BootMemoryHotplugDeviceConfig::new(VirtioMemMmioLayout::new(
+                    GuestAddress::new(0x4000_8000),
+                    MmioRegionId::new(4001),
+                )),
+            );
+        }
+
+        let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+            .expect("signed network PCI matrix source should prepare");
+        let storage_configs = has_storage.then(|| {
+            CaptureReadyStorageConfigs::new(controller.drive_configs().to_vec(), Vec::new())
+        });
+        let capture_now = Instant::now();
+        let guard = source
+            .quiesce_limiter_retry_wakeups()
+            .expect("network PCI matrix source should quiesce");
+        let graph = storage_configs.as_ref().map(|configs| {
+            source
+                .capture_snapshot_v2_storage_device_graph_at(configs, &guard, capture_now)
+                .expect("network PCI matrix storage graph should capture")
+        });
+        let balloon = controller.balloon_config().map(|config| {
+            source
+                .capture_ready_balloon_state(Some(config), &guard)
+                .expect("network PCI matrix balloon should capture")
+                .expect("configured network PCI matrix balloon should exist")
+                .try_to_snapshot_v2()
+                .expect("network PCI matrix balloon capture should convert")
+        });
+        let entropy = controller.entropy_config().map(|config| {
+            source
+                .capture_ready_entropy_state_at(Some(config), &guard, capture_now)
+                .expect("network PCI matrix entropy should capture")
+                .expect("configured network PCI matrix entropy should exist")
+                .try_to_snapshot_v2()
+                .expect("network PCI matrix entropy capture should convert")
+        });
+        let memory_hotplug = memory_hotplug_config.map(|config| {
+            source
+                .capture_ready_memory_hotplug_state(Some(config), &guard)
+                .expect("network PCI matrix memory-hotplug should capture")
+                .expect("configured network PCI matrix memory-hotplug should exist")
+                .try_to_snapshot_v2(
+                    requested_size_mib.expect("requested memory-hotplug size should exist"),
+                )
+                .expect("network PCI matrix memory-hotplug capture should convert")
+        });
+        let captured_network = source
+            .capture_ready_network_state_at(
+                &configs
+                    .iter()
+                    .zip(&profiles)
+                    .map(|(config, profile)| {
+                        HvfArm64BootNetworkCaptureConfig::new(
+                            config.clone(),
+                            *profile,
+                            None,
+                            None,
+                            false,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                &guard,
+                capture_now,
+            )
+            .expect("network PCI matrix interfaces should capture");
+        let serial = SnapshotV2SerialState::try_from_capture_ready(
+            source
+                .capture_ready_serial_state(controller.serial_config().clone(), &guard)
+                .expect("network PCI matrix serial should capture"),
+        )
+        .expect("network PCI matrix serial capture should convert");
+        drop(guard);
+
+        let interfaces = captured_network
+            .interfaces()
+            .iter()
+            .map(|captured| {
+                let HvfArm64BootNetworkTransportCaptureState::Pci {
+                    origin,
+                    sbdf,
+                    bar_range,
+                    state,
+                } = captured.transport()
+                else {
+                    panic!("network PCI matrix source should use PCI");
+                };
+                let origin = match origin {
+                    HvfArm64BootNetworkDeviceOrigin::Startup => StorageDeviceOrigin::Startup,
+                    HvfArm64BootNetworkDeviceOrigin::Runtime => StorageDeviceOrigin::Runtime,
+                };
+                SnapshotV2NetworkInterfaceState::try_from_pci_capture(
+                    captured.config(),
+                    SnapshotV2NetworkBackendClass::Vmnet,
+                    origin,
+                    *sbdf,
+                    *bar_range,
+                    state,
+                )
+                .expect("network PCI matrix portable interface should convert")
+            })
+            .collect::<Vec<_>>();
+        let network = SnapshotV2NetworkState::try_new(interfaces, None)
+            .expect("network PCI matrix portable state should validate");
+        let overrides = network
+            .interfaces()
+            .iter()
+            .map(|interface| SnapshotNetworkOverride::new(interface.iface_id(), "vmnet:shared"))
+            .collect::<Vec<_>>();
+
+        source
+            .pause_for_snapshot_v2_capture()
+            .expect("network PCI matrix source should pause");
+        let boot = HvfSnapshotV2BootState::try_new(
+            HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+                .expect("network PCI matrix kernel path should validate"),
+            None,
+            None,
+        )
+        .expect("network PCI matrix boot metadata should validate");
+        let mut memory_writer = Cursor::new(Vec::new());
+        let platform = source
+            .capture_snapshot_v2_network_platform_with_cancel(
+                HvfArm64BootSnapshotV2CaptureInput::new(boot),
+                memory_hotplug,
+                &mut memory_writer,
+                |_| false,
+            )
+            .expect("network PCI matrix exact-2.11 platform should capture");
+        HvfSnapshotV2NetworkState::try_new(
+            platform.clone(),
+            graph.clone(),
+            serial.clone(),
+            entropy.clone(),
+            balloon.clone(),
+            Some(network.clone()),
+        )
+        .expect("network PCI matrix exact-2.11 product should compose");
+        let static_memory =
+            (!has_memory_hotplug).then(|| copy_signed_session_guest_memory(&source));
+        let memory_image = has_memory_hotplug.then(|| {
+            TempFile::new("restore-network-pci-matrix-memory", memory_writer.get_ref())
+                .expect("network PCI matrix memory image should persist")
+        });
+        source
+            .shutdown()
+            .expect("signed network PCI matrix source should shut down");
+
+        let platform_state = platform.platform().clone();
+        let prepared_memory = if has_memory_hotplug {
+            let portable = platform
+                .memory_hotplug()
+                .expect("network PCI matrix platform should retain memory-hotplug")
+                .clone();
+            let topology =
+                PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
+                    portable,
+                    platform_state.memory().clone(),
+                    NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                )
+                .expect("network PCI matrix memory-hotplug topology should prepare");
+            let memory = materialize_snapshot_v2_memory_hotplug_file(
+                &topology,
+                std::fs::File::open(
+                    memory_image
+                        .as_ref()
+                        .expect("network PCI matrix memory image should exist")
+                        .path(),
+                )
+                .expect("network PCI matrix memory image should reopen"),
+            )
+            .expect("network PCI matrix memory should materialize");
+            PreparedMemory::Hotplug {
+                topology: Box::new(topology),
+                memory,
+            }
+        } else {
+            PreparedMemory::Static {
+                binding: platform_state.memory().clone(),
+                memory: static_memory.expect("network PCI matrix static memory should exist"),
+            }
+        };
+        let memory = match &prepared_memory {
+            PreparedMemory::Static { memory, .. } | PreparedMemory::Hotplug { memory, .. } => {
+                memory
+            }
+        };
+        let restore_now = Instant::now();
+        let balloon_plan = balloon.map(|state| {
+            SnapshotV2BalloonRestorePlan::prepare(state, memory)
+                .expect("network PCI matrix balloon restore plan should prepare")
+        });
+        let entropy_plan = entropy.map(|state| {
+            SnapshotV2EntropyRestorePlan::prepare(state, memory, restore_now)
+                .expect("network PCI matrix entropy restore plan should prepare")
+        });
+        let storage_bundle = graph.map(|graph| {
+            let backing = BlockFileBacking::open_snapshot(
+                std::path::Path::new(graph.block_records()[0].config().selector()),
+                graph.block_records()[0].config().is_read_only(),
+            )
+            .expect("network PCI matrix block backing should reopen")
+            .0;
+            SnapshotV2StorageRestorePlan::prepare(graph, memory, restore_now)
+                .expect("network PCI matrix storage restore plan should prepare")
+                .prepare_backings(vec![backing], Vec::new(), || false)
+                .expect("network PCI matrix storage backing bundle should prepare")
+        });
+        let network_topology =
+            PreparedSnapshotV2NetworkRestoreTopology::prepare(network, &overrides)
+                .expect("network PCI matrix destination topology should prepare");
+
+        let (product, memory_input) =
+            match (prepared_memory, balloon_plan, storage_bundle, entropy_plan) {
+                (
+                    PreparedMemory::Static { binding, memory },
+                    None,
+                    None,
+                    None,
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_network(
+                        binding,
+                        network_topology,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::Static(memory),
+                ),
+                (
+                    PreparedMemory::Static { binding, memory },
+                    None,
+                    Some(storage),
+                    None,
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_storage_network(
+                        binding,
+                        network_topology,
+                        storage,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::Static(memory),
+                ),
+                (
+                    PreparedMemory::Static { binding, memory },
+                    None,
+                    None,
+                    Some(entropy),
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_entropy_network(
+                        binding,
+                        network_topology,
+                        entropy,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::Static(memory),
+                ),
+                (
+                    PreparedMemory::Static { binding, memory },
+                    None,
+                    Some(storage),
+                    Some(entropy),
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_storage_entropy_network(
+                        binding,
+                        network_topology,
+                        storage,
+                        entropy,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::Static(memory),
+                ),
+                (
+                    PreparedMemory::Static { binding, memory },
+                    Some(balloon),
+                    None,
+                    None,
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_balloon_network(
+                        binding,
+                        network_topology,
+                        balloon,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::Static(memory),
+                ),
+                (
+                    PreparedMemory::Static { binding, memory },
+                    Some(balloon),
+                    Some(storage),
+                    None,
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_balloon_storage_network(
+                        binding,
+                        network_topology,
+                        balloon,
+                        storage,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::Static(memory),
+                ),
+                (
+                    PreparedMemory::Static { binding, memory },
+                    Some(balloon),
+                    None,
+                    Some(entropy),
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_balloon_entropy_network(
+                        binding,
+                        network_topology,
+                        balloon,
+                        entropy,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::Static(memory),
+                ),
+                (
+                    PreparedMemory::Static { binding, memory },
+                    Some(balloon),
+                    Some(storage),
+                    Some(entropy),
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_balloon_storage_entropy_network(
+                        binding,
+                        network_topology,
+                        balloon,
+                        storage,
+                        entropy,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::Static(memory),
+                ),
+                (
+                    PreparedMemory::Hotplug { topology, memory },
+                    None,
+                    None,
+                    None,
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_network_memory_hotplug(
+                        *topology,
+                        memory,
+                        network_topology,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::ProductOwned,
+                ),
+                (
+                    PreparedMemory::Hotplug { topology, memory },
+                    None,
+                    Some(storage),
+                    None,
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_storage_network_memory_hotplug(
+                        *topology,
+                        memory,
+                        network_topology,
+                        storage,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::ProductOwned,
+                ),
+                (
+                    PreparedMemory::Hotplug { topology, memory },
+                    None,
+                    None,
+                    Some(entropy),
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_entropy_network_memory_hotplug(
+                        *topology,
+                        memory,
+                        network_topology,
+                        entropy,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::ProductOwned,
+                ),
+                (
+                    PreparedMemory::Hotplug { topology, memory },
+                    None,
+                    Some(storage),
+                    Some(entropy),
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::
+                        serial_storage_entropy_network_memory_hotplug(
+                            *topology,
+                            memory,
+                            network_topology,
+                            storage,
+                            entropy,
+                        ),
+                    HvfSnapshotV2NetworkPciMemoryInput::ProductOwned,
+                ),
+                (
+                    PreparedMemory::Hotplug { topology, memory },
+                    Some(balloon),
+                    None,
+                    None,
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::serial_balloon_network_memory_hotplug(
+                        *topology,
+                        memory,
+                        network_topology,
+                        balloon,
+                    ),
+                    HvfSnapshotV2NetworkPciMemoryInput::ProductOwned,
+                ),
+                (
+                    PreparedMemory::Hotplug { topology, memory },
+                    Some(balloon),
+                    Some(storage),
+                    None,
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::
+                        serial_balloon_storage_network_memory_hotplug(
+                            *topology,
+                            memory,
+                            network_topology,
+                            balloon,
+                            storage,
+                        ),
+                    HvfSnapshotV2NetworkPciMemoryInput::ProductOwned,
+                ),
+                (
+                    PreparedMemory::Hotplug { topology, memory },
+                    Some(balloon),
+                    None,
+                    Some(entropy),
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::
+                        serial_balloon_entropy_network_memory_hotplug(
+                            *topology,
+                            memory,
+                            network_topology,
+                            balloon,
+                            entropy,
+                        ),
+                    HvfSnapshotV2NetworkPciMemoryInput::ProductOwned,
+                ),
+                (
+                    PreparedMemory::Hotplug { topology, memory },
+                    Some(balloon),
+                    Some(storage),
+                    Some(entropy),
+                ) => (
+                    HvfSnapshotV2NetworkPreparedProduct::
+                        serial_balloon_storage_entropy_network_memory_hotplug(
+                            *topology,
+                            memory,
+                            network_topology,
+                            balloon,
+                            storage,
+                            entropy,
+                        ),
+                    HvfSnapshotV2NetworkPciMemoryInput::ProductOwned,
+                ),
+            };
+        let plan = prepare_hvf_snapshot_v2_network_pci_platform_plan(&platform_state, product)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "network PCI matrix balloon={has_balloon} storage={has_storage} entropy={has_entropy} memory-hotplug={has_memory_hotplug} should plan: {error:?}"
+                )
+            });
+        assert_eq!(
+            plan.endpoint_count(),
+            network_count
+                + usize::from(has_balloon)
+                + usize::from(has_storage)
+                + usize::from(has_entropy)
+                + usize::from(has_memory_hotplug)
+        );
+        assert_eq!(plan.network().len(), network_count);
+
+        let restored_shell = HvfSnapshotV2RestoredSerialShell::new(
+            SerialMmioDevice::from_capture_state_with_shared_output(
+                SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                serial.device().clone(),
+            ),
+        );
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(
+            configs.iter().map(|config| config.iface_id()),
+        );
+        let owners = if let Some(cancel_stage) = cancel_stage {
+            let error = OwnedHvfArm64BootSession::restore_snapshot_v2_network_pci_with_cancel(
+                platform_state,
+                memory_input,
+                restored_shell,
+                None,
+                plan,
+                profiles,
+                metrics,
+                restore_now,
+                |stage| stage == cancel_stage,
+            )
+            .expect_err("network PCI matrix aggregate cancellation should reject");
+            assert_eq!(error.stage(), cancel_stage);
+            assert_eq!(
+                error.disposition(),
+                HvfSnapshotV2NetworkPciRestoreDisposition::Terminal
+            );
+            assert!(!error.has_incomplete_cleanup());
+            return;
+        } else {
+            OwnedHvfArm64BootSession::restore_snapshot_v2_network_pci(
+                platform_state,
+                memory_input,
+                restored_shell,
+                None,
+                plan,
+                profiles.clone(),
+                metrics,
+                restore_now,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "network PCI matrix balloon={has_balloon} storage={has_storage} entropy={has_entropy} memory-hotplug={has_memory_hotplug} should restore: {error:?}"
+                )
+            })
+        };
+        assert_eq!(owners.configs().len(), network_count);
+        assert_eq!(owners.expected().len(), network_count);
+        assert_eq!(owners.balloon_config().is_some(), has_balloon);
+        assert_eq!(owners.storage_configs().is_some(), has_storage);
+        assert_eq!(owners.entropy_config().is_some(), has_entropy);
+        assert_eq!(owners.memory_hotplug_state().is_some(), has_memory_hotplug);
+        assert_eq!(
+            owners.memory_hotplug_controller().is_some(),
+            has_memory_hotplug
+        );
+        assert!(!owners.retry_publication_is_committed());
+
+        let diagnostics = owners
+            .session()
+            .pci_data_device_diagnostics()
+            .expect("network PCI matrix manager should exist")
+            .expect("network PCI matrix diagnostics should inspect");
+        let mut expected_kinds = Vec::new();
+        if has_balloon {
+            expected_kinds.push(HvfArm64BootPciDataDeviceKind::Balloon);
+        }
+        if has_storage {
+            expected_kinds.push(HvfArm64BootPciDataDeviceKind::Block);
+        }
+        expected_kinds.extend(std::iter::repeat_n(
+            HvfArm64BootPciDataDeviceKind::Network,
+            network_count,
+        ));
+        if has_entropy {
+            expected_kinds.push(HvfArm64BootPciDataDeviceKind::Entropy);
+        }
+        if has_memory_hotplug {
+            expected_kinds.push(HvfArm64BootPciDataDeviceKind::MemoryHotplug);
+        }
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|entry| entry.kind)
+                .collect::<Vec<_>>(),
+            expected_kinds
+        );
+        assert!(diagnostics.iter().all(|entry| {
+            entry.transport.phase == VirtioPciEndpointPhase::Active
+                && !entry.transport.device_activated
+                && entry.queue_deliveries == 0
+        }));
+
+        let recapture_configs = owners
+            .configs()
+            .iter()
+            .zip(&profiles)
+            .map(|(config, profile)| {
+                HvfArm64BootNetworkCaptureConfig::new(config.clone(), *profile, None, None, false)
+            })
+            .collect::<Vec<_>>();
+        let guard = owners
+            .session()
+            .quiesce_limiter_retry_wakeups()
+            .expect("network PCI matrix destination should quiesce");
+        let recaptured = owners
+            .session()
+            .capture_ready_network_state_at(&recapture_configs, &guard, restore_now)
+            .expect("network PCI matrix destination should recapture");
+        for (captured, expected) in recaptured.interfaces().iter().zip(owners.expected()) {
+            let HvfArm64BootNetworkTransportCaptureState::Pci {
+                origin,
+                sbdf,
+                bar_range,
+                state,
+            } = captured.transport()
+            else {
+                panic!("network PCI matrix destination should remain PCI");
+            };
+            let origin = match origin {
+                HvfArm64BootNetworkDeviceOrigin::Startup => StorageDeviceOrigin::Startup,
+                HvfArm64BootNetworkDeviceOrigin::Runtime => StorageDeviceOrigin::Runtime,
+            };
+            let portable = SnapshotV2NetworkInterfaceState::try_from_pci_capture(
+                captured.config(),
+                expected.backend(),
+                origin,
+                *sbdf,
+                *bar_range,
+                state,
+            )
+            .expect("network PCI matrix destination recapture should convert");
+            assert_eq!(&portable, expected);
+        }
+        drop(guard);
+
+        let mut restored = owners
+            .commit_retry_publication()
+            .into_session()
+            .expect("network PCI matrix committed owner should release its session");
+        restored
+            .shutdown()
+            .expect("network PCI matrix destination should shut down");
+    }
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    for mask in 0_u8..16 {
+        let has_storage = mask & 1 != 0;
+        let has_entropy = mask & 2 != 0;
+        let has_balloon = mask & 4 != 0;
+        let has_memory_hotplug = mask & 8 != 0;
+        run_case(
+            &image,
+            has_balloon,
+            has_storage,
+            has_entropy,
+            has_memory_hotplug,
+            if mask == 15 { 16 } else { 1 },
+            None,
+        );
+    }
+    for cancel_stage in [
+        HvfSnapshotV2NetworkPciRestoreStage::Publication { index: 0 },
+        HvfSnapshotV2NetworkPciRestoreStage::Entropy,
+        HvfSnapshotV2NetworkPciRestoreStage::MemoryHotplug,
+    ] {
+        run_case(&image, true, true, true, true, 1, Some(cancel_stage));
+    }
+}
+
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[test]
 fn requires_macos_apple_silicon() {

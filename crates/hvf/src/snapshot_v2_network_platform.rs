@@ -1433,6 +1433,41 @@ impl HvfSnapshotV2NetworkPciPlatformPlan {
     pub const fn vmclock_interrupt(&self) -> GuestInterruptLine {
         self.vmclock_interrupt
     }
+
+    /// Proves that a separately retained process resource blueprint still
+    /// describes this exact saved-order PCI product. This performs no host
+    /// operation and retains no caller borrow.
+    #[doc(hidden)]
+    pub fn preflight_process_resource_identity<'a>(
+        &self,
+        resources: impl ExactSizeIterator<Item = HvfSnapshotV2NetworkProcessResourceIdentity<'a>>,
+        mmds_state: Option<&bangbang_runtime::snapshot_network_v2_11::SnapshotV2MmdsState>,
+        mmds_controller: Option<&bangbang_runtime::mmds::MmdsConfig>,
+    ) -> bool {
+        let topology = self.product.network();
+        if resources.len() != self.network.len()
+            || topology.interfaces().len() != self.network.len()
+            || topology.mmds_state() != mmds_state
+            || topology.mmds_controller() != mmds_controller
+        {
+            return false;
+        }
+        resources.zip(topology.interfaces()).zip(&self.network).all(
+            |((resource, interface), endpoint)| {
+                resource.source_index == interface.source_index()
+                    && resource.source_index == endpoint.source_index()
+                    && resource.resource_key == interface.resource_key()
+                    && resource.resource_key == endpoint.resource_key()
+                    && resource.resource_key.resource_class()
+                        == SnapshotRestoreResourceClass::NetworkPacketIo
+                    && resource.controller == interface.controller()
+                    && resource.profile == interface.portable().profile()
+                    && resource.backend == interface.portable().backend()
+                    && resource.mmds_stack == interface.mmds_stack()
+                    && resource.mmds_stack == endpoint.mmds_stack()
+            },
+        )
+    }
 }
 
 impl fmt::Debug for HvfSnapshotV2NetworkPciPlatformPlan {
@@ -1443,6 +1478,44 @@ impl fmt::Debug for HvfSnapshotV2NetworkPciPlatformPlan {
             .field("interface_count", &self.network.len())
             .field("state", &REDACTED)
             .finish()
+    }
+}
+
+pub(crate) struct HvfSnapshotV2NetworkPciPlatformOwnerParts {
+    pub(crate) product: HvfSnapshotV2NetworkPreparedProduct,
+    pub(crate) mapping: Option<HvfSnapshotV2MemoryHotplugMappingPlan>,
+    pub(crate) balloon: Option<HvfSnapshotV2BalloonPciEndpointPlan>,
+    pub(crate) storage: Option<HvfSnapshotV2StoragePciPlatformPlan>,
+    pub(crate) network: Vec<HvfSnapshotV2NetworkPciEndpointPlan>,
+    pub(crate) entropy: Option<HvfSnapshotV2NetworkAuxiliaryPciEndpointPlan>,
+    pub(crate) memory_hotplug: Option<HvfSnapshotV2NetworkAuxiliaryPciEndpointPlan>,
+    pub(crate) host: Arm64FdtPciHost,
+    pub(crate) msi: HvfGicMsiMetadata,
+    pub(crate) endpoint_count: usize,
+    pub(crate) route_demand: usize,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
+impl HvfSnapshotV2NetworkPciPlatformPlan {
+    pub(crate) fn into_owner_parts(self) -> HvfSnapshotV2NetworkPciPlatformOwnerParts {
+        HvfSnapshotV2NetworkPciPlatformOwnerParts {
+            product: self.product,
+            mapping: self.mapping,
+            balloon: self.balloon,
+            storage: self.storage,
+            network: self.network,
+            entropy: self.entropy,
+            memory_hotplug: self.memory_hotplug,
+            host: self.host,
+            msi: self.msi,
+            endpoint_count: self.endpoint_count,
+            route_demand: self.route_demand,
+            serial_interrupt: self.serial_interrupt,
+            vmgenid_interrupt: self.vmgenid_interrupt,
+            vmclock_interrupt: self.vmclock_interrupt,
+        }
     }
 }
 
@@ -4794,6 +4867,50 @@ mod tests {
                 plan.msi().interrupt_range.count,
             );
         }
+    }
+
+    #[test]
+    fn pci_process_resource_preflight_closes_saved_order_identity() {
+        let (platform, state) = network_fixture(SnapshotV2DeviceTransportKind::Pci);
+        let process_topology = network_topology(state.clone());
+        let product = HvfSnapshotV2NetworkPreparedProduct::serial_network(
+            platform.memory().clone(),
+            network_topology(state),
+        );
+        let plan = prepare_hvf_snapshot_v2_network_pci_platform_plan(&platform, product)
+            .expect("network-only PCI product should plan");
+
+        let identities = process_topology.interfaces().iter().map(|interface| {
+            HvfSnapshotV2NetworkProcessResourceIdentity::new(
+                interface.source_index(),
+                interface.resource_key(),
+                interface.controller(),
+                interface.portable().profile(),
+                interface.portable().backend(),
+                interface.mmds_stack(),
+            )
+        });
+        assert!(plan.preflight_process_resource_identity(
+            identities,
+            process_topology.mmds_state(),
+            process_topology.mmds_controller(),
+        ));
+
+        let wrong_order = process_topology.interfaces().iter().map(|interface| {
+            HvfSnapshotV2NetworkProcessResourceIdentity::new(
+                interface.source_index().saturating_add(1),
+                interface.resource_key(),
+                interface.controller(),
+                interface.portable().profile(),
+                interface.portable().backend(),
+                interface.mmds_stack(),
+            )
+        });
+        assert!(!plan.preflight_process_resource_identity(
+            wrong_order,
+            process_topology.mmds_state(),
+            process_topology.mmds_controller(),
+        ));
     }
 
     #[test]
