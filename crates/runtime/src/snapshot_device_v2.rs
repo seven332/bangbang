@@ -568,6 +568,13 @@ impl SnapshotV2VirtioState {
     pub fn interrupt_intents(&self) -> &[SnapshotV2InterruptIntent] {
         &self.interrupt_intents
     }
+
+    pub(crate) fn replace_interrupt_intents(
+        &mut self,
+        interrupt_intents: Vec<SnapshotV2InterruptIntent>,
+    ) {
+        self.interrupt_intents = interrupt_intents;
+    }
 }
 
 redacted_debug!(SnapshotV2VirtioState, "SnapshotV2VirtioState");

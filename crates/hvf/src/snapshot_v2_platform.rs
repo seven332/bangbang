@@ -477,6 +477,19 @@ pub(crate) struct HvfSnapshotV2MemoryHotplugMmioShellPlan<'a> {
     pub(crate) vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2NetworkMmioShellPlan<'a> {
+    pub(crate) balloon_interrupt: Option<GuestInterruptLine>,
+    pub(crate) command_line: Option<&'a str>,
+    pub(crate) block_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
+    pub(crate) network_interrupts: &'a [GuestInterruptLine],
+    pub(crate) pmem_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
+    pub(crate) entropy_interrupt: Option<GuestInterruptLine>,
+    pub(crate) memory_hotplug_interrupt: Option<GuestInterruptLine>,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 pub(crate) struct HvfSnapshotV2StoragePciShellPlan<'a> {
     pub(crate) command_line: &'a str,
     pub(crate) pci: &'a HvfSnapshotV2StoragePciHostPlan,
@@ -524,6 +537,10 @@ enum HvfSnapshotV2ProcessShellRestore<'a> {
     MemoryHotplugMmio {
         shell: HvfSnapshotV2ProcessSerialShell,
         plan: HvfSnapshotV2MemoryHotplugMmioShellPlan<'a>,
+    },
+    NetworkMmio {
+        shell: HvfSnapshotV2ProcessSerialShell,
+        plan: HvfSnapshotV2NetworkMmioShellPlan<'a>,
     },
     StoragePci {
         shell: HvfSnapshotV2ProcessSerialShell,
@@ -1663,6 +1680,36 @@ pub(crate) fn restore_hvf_snapshot_v2_serial_memory_hotplug_mmio_process_platfor
             plan,
         }),
         HvfSnapshotV2MemoryMappingRestore::MemoryHotplug(mapping),
+    )
+}
+
+pub(crate) fn restore_hvf_snapshot_v2_serial_network_mmio_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2RestoredSerialShell,
+    plan: HvfSnapshotV2NetworkMmioShellPlan<'_>,
+    mapping: Option<&HvfSnapshotV2MemoryHotplugMappingPlan>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    if mapping.is_some() != plan.memory_hotplug_interrupt.is_some() {
+        return Err(HvfSnapshotV2PlatformRestoreError::new(
+            HvfSnapshotV2PlatformRestoreStage::Preflight,
+            HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+            },
+            Vec::new(),
+        ));
+    }
+    restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::NetworkMmio {
+            shell: shell.into(),
+            plan,
+        }),
+        mapping.map_or(
+            HvfSnapshotV2MemoryMappingRestore::Ordinary,
+            HvfSnapshotV2MemoryMappingRestore::MemoryHotplug,
+        ),
     )
 }
 
@@ -2984,6 +3031,93 @@ fn prepare_process_shell(
                     .allocate()
                     .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
                     != plan.memory_hotplug_interrupt
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
+                }
+                let block_plan = match plan.command_line {
+                    Some(command_line) => HvfSnapshotV2ProcessBlockFdtPlan::StorageMmio {
+                        command_line,
+                        block_records: plan.block_records,
+                        pmem_records: plan.pmem_records,
+                    },
+                    None => HvfSnapshotV2ProcessBlockFdtPlan::None,
+                };
+                (
+                    shell,
+                    block_plan,
+                    true,
+                    false,
+                    Some((
+                        plan.serial_interrupt,
+                        plan.vmgenid_interrupt,
+                        plan.vmclock_interrupt,
+                    )),
+                )
+            }
+            HvfSnapshotV2ProcessShellRestore::NetworkMmio { shell, plan } => {
+                let storage_count = plan.block_records.len() + plan.pmem_records.len();
+                if gic.msi.is_some()
+                    || plan.network_interrupts.is_empty()
+                    || plan.command_line.is_some() != (storage_count != 0)
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                        mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                    });
+                }
+                if let Some(balloon_interrupt) = plan.balloon_interrupt
+                    && allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != balloon_interrupt
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
+                }
+                for record in plan.block_records {
+                    if allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != record.interrupt_line()
+                    {
+                        return Err(
+                            HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
+                        );
+                    }
+                }
+                for expected in plan.network_interrupts {
+                    if allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != *expected
+                    {
+                        return Err(
+                            HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
+                        );
+                    }
+                }
+                for record in plan.pmem_records {
+                    if allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != record.interrupt_line()
+                    {
+                        return Err(
+                            HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
+                        );
+                    }
+                }
+                if let Some(entropy_interrupt) = plan.entropy_interrupt
+                    && allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != entropy_interrupt
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
+                }
+                if let Some(memory_hotplug_interrupt) = plan.memory_hotplug_interrupt
+                    && allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != memory_hotplug_interrupt
                 {
                     return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
                 }

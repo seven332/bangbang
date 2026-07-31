@@ -1,21 +1,40 @@
 //! Host-operation-free exact-2.11 network destination preparation.
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
+use crate::interrupt::GuestInterruptLine;
+use crate::memory::{GuestMemory, GuestMemoryRange};
+use crate::metrics::SharedNetworkInterfaceMetrics;
 use crate::mmds::{MmdsConfig, MmdsConfigInput};
-use crate::network::{NetworkInterfaceConfig, NetworkRateLimiterConfig, NetworkTokenBucketConfig};
+use crate::mmio::MmioRegion;
+use crate::network::{
+    NetworkDeviceProfile, NetworkInterfaceConfig, NetworkMmioDeviceRegistration,
+    NetworkRateLimiterConfig, NetworkTokenBucketConfig, VIRTIO_NET_DEVICE_ID,
+    VIRTIO_NET_QUEUE_SIZES, VirtioNetworkConfigSpace, VirtioNetworkDevice,
+    VirtioNetworkMmioHandler, VirtioNetworkRateLimiter, VirtioNetworkRateLimiterCaptureState,
+    VirtioNetworkRxQueue, VirtioNetworkTokenBucketCaptureState, VirtioNetworkTxQueue,
+    validate_network_queue_pair_ranges,
+};
 use crate::snapshot::SnapshotNetworkOverride;
-use crate::snapshot_device_v2::SnapshotV2DeviceKey;
+use crate::snapshot_device_v2::{
+    SnapshotV2DeviceKey, SnapshotV2DeviceTransport, range_is_wholly_contained,
+    restore_mmio_transport_state_for_device_with_config_status_gate,
+};
+use crate::snapshot_device_v2_5::queue_ranges;
 use crate::snapshot_network_v2_11::{
     NATIVE_V2_NETWORK_MAX_CAPTURED_SELECTOR_BYTES, NATIVE_V2_NETWORK_MAX_INTERFACE_ID_BYTES,
     NATIVE_V2_NETWORK_MAX_INTERFACES, SnapshotV2MmdsInterfaceState, SnapshotV2MmdsState,
-    SnapshotV2NetworkInterfaceState, SnapshotV2NetworkLimiterState, SnapshotV2NetworkState,
+    SnapshotV2NetworkInterfaceState, SnapshotV2NetworkInterfaceStateParts,
+    SnapshotV2NetworkLimiterState, SnapshotV2NetworkRetryState, SnapshotV2NetworkState,
     SnapshotV2NetworkTokenBucketState,
 };
 use crate::snapshot_restore::{
     SnapshotRestorePublicId, SnapshotRestorePublicIdError, SnapshotRestoreResourceClass,
     SnapshotRestoreResourceKey,
 };
+use crate::virtio::VirtioInterruptIntent;
+use crate::virtio_mmio::VirtioMmioQueueState;
 
 const REDACTED: &str = "<redacted>";
 
@@ -69,6 +88,267 @@ impl PreparedSnapshotV2NetworkRestoreInterface {
     pub const fn mmds_stack(&self) -> Option<SnapshotV2MmdsInterfaceState> {
         self.mmds_stack
     }
+
+    /// Consumes one checked interface into a complete, still-unpublished MMIO
+    /// register handler against destination memory and fresh metrics.
+    #[doc(hidden)]
+    pub fn into_mmio_handler(
+        self,
+        destination_memory: &GuestMemory,
+        realized_profile: NetworkDeviceProfile,
+        interface_metrics: SharedNetworkInterfaceMetrics,
+        aggregate_metrics: SharedNetworkInterfaceMetrics,
+        now: Instant,
+    ) -> Result<PreparedSnapshotV2NetworkMmioHandler, SnapshotV2NetworkMmioHandlerError> {
+        let Self {
+            source_index,
+            resource_key,
+            controller,
+            portable,
+            mmds_stack,
+        } = self;
+        if realized_profile != portable.profile()
+            || controller
+                .guest_mac()
+                .is_some_and(|mac| realized_profile.guest_mac() != Some(mac))
+            || controller
+                .mtu()
+                .is_some_and(|mtu| realized_profile.mtu() != Some(mtu))
+            || !realized_profile
+                .feature_capabilities()
+                .is_dependency_complete()
+        {
+            return Err(SnapshotV2NetworkMmioHandlerError::Profile);
+        }
+
+        let SnapshotV2NetworkInterfaceStateParts {
+            iface_id,
+            captured_selector: _,
+            requested_guest_mac,
+            requested_mtu,
+            profile,
+            backend,
+            local,
+            virtio,
+            rx_limiter,
+            tx_limiter,
+            transport,
+        } = portable.into_parts();
+        let SnapshotV2DeviceTransport::Mmio(mmio) = &transport else {
+            return Err(SnapshotV2NetworkMmioHandlerError::WrongTransport);
+        };
+        let region = mmio.region();
+        let interrupt_line = mmio.interrupt_line();
+
+        let rx_transport = virtio
+            .queues()
+            .first()
+            .copied()
+            .ok_or(SnapshotV2NetworkMmioHandlerError::Queue)?;
+        let tx_transport = virtio
+            .queues()
+            .get(1)
+            .copied()
+            .ok_or(SnapshotV2NetworkMmioHandlerError::Queue)?;
+        if virtio.queues().len() != VIRTIO_NET_QUEUE_SIZES.len() {
+            return Err(SnapshotV2NetworkMmioHandlerError::Queue);
+        }
+        let queue_ranges = [
+            queue_ranges(&rx_transport).map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)?,
+            queue_ranges(&tx_transport).map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)?,
+        ];
+        if queue_ranges
+            .iter()
+            .flatten()
+            .flatten()
+            .copied()
+            .any(|range| !range_is_wholly_contained(destination_memory, range))
+        {
+            return Err(SnapshotV2NetworkMmioHandlerError::QueueMemory);
+        }
+
+        let negotiated_features = virtio.driver_features();
+        let rx_queue = local
+            .active_rx_queue()
+            .map(|cursor| {
+                VirtioNetworkRxQueue::from_snapshot_state(
+                    restore_queue_state(rx_transport),
+                    cursor.next_available(),
+                    cursor.next_used(),
+                    negotiated_features,
+                )
+                .map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)
+            })
+            .transpose()?;
+        let tx_queue = local
+            .active_tx_queue()
+            .map(|cursor| {
+                VirtioNetworkTxQueue::from_snapshot_state(
+                    restore_queue_state(tx_transport),
+                    cursor.next_available(),
+                    cursor.next_used(),
+                    negotiated_features,
+                )
+                .map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)
+            })
+            .transpose()?;
+        if rx_queue.is_some() != virtio.is_activated()
+            || tx_queue.is_some() != virtio.is_activated()
+        {
+            return Err(SnapshotV2NetworkMmioHandlerError::Queue);
+        }
+        if let Some(queue) = rx_queue.as_ref() {
+            queue
+                .validate_snapshot_state(destination_memory)
+                .map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)?;
+        }
+        let has_tx_retry = local.tx_retry().has_retry();
+        if let Some(queue) = tx_queue.as_ref() {
+            queue
+                .validate_snapshot_state(destination_memory, has_tx_retry)
+                .map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)?;
+        }
+        if let (Some(rx), Some(tx)) = (rx_queue.as_ref(), tx_queue.as_ref()) {
+            validate_network_queue_pair_ranges(rx, tx)
+                .map_err(|_| SnapshotV2NetworkMmioHandlerError::Queue)?;
+        }
+
+        let rx_rate_limiter = VirtioNetworkRateLimiter::from_persisted_state_at(
+            controller.rx_rate_limiter(),
+            restore_limiter_state(rx_limiter),
+            now,
+        )
+        .map_err(|_| SnapshotV2NetworkMmioHandlerError::Limiter)?;
+        let tx_rate_limiter = VirtioNetworkRateLimiter::from_persisted_state_at(
+            controller.tx_rate_limiter(),
+            restore_limiter_state(tx_limiter),
+            now,
+        )
+        .map_err(|_| SnapshotV2NetworkMmioHandlerError::Limiter)?;
+        let retry_deadline = restored_retry_deadline_at(local.tx_retry(), now)?;
+        let device = VirtioNetworkDevice::from_snapshot_parts(
+            rx_queue,
+            tx_queue,
+            rx_rate_limiter,
+            tx_rate_limiter,
+            has_tx_retry,
+        )
+        .map_err(|_| SnapshotV2NetworkMmioHandlerError::Device)?;
+        let activation_is_active = device.is_activated();
+
+        let config_space = VirtioNetworkConfigSpace::with_feature_capabilities(
+            realized_profile.guest_mac(),
+            realized_profile.mtu(),
+            realized_profile.feature_capabilities(),
+        );
+        if config_space.available_features() != virtio.available_features() {
+            return Err(SnapshotV2NetworkMmioHandlerError::Profile);
+        }
+        let retained = restore_mmio_transport_state_for_device_with_config_status_gate(
+            VIRTIO_NET_DEVICE_ID,
+            &virtio,
+            mmio,
+            true,
+        )
+        .map_err(|_| SnapshotV2NetworkMmioHandlerError::RetainedTransport)?;
+        let registers = *retained.device_registers();
+        let mut handler =
+            VirtioNetworkMmioHandler::with_vendor_id_and_config_generation_and_device_config_and_activation(
+                registers.device_id(),
+                registers.vendor_id(),
+                registers.device_features(),
+                registers.config_generation(),
+                &VIRTIO_NET_QUEUE_SIZES,
+                config_space,
+                device,
+            )
+            .map_err(|_| SnapshotV2NetworkMmioHandlerError::Handler)?;
+        handler
+            .restore_transport_state(&retained, activation_is_active)
+            .map_err(|_| SnapshotV2NetworkMmioHandlerError::Transport)?;
+        let mut interrupt_intents = Vec::new();
+        interrupt_intents
+            .try_reserve_exact(virtio.interrupt_intents().len())
+            .map_err(|_| SnapshotV2NetworkMmioHandlerError::Allocation)?;
+        interrupt_intents.extend(
+            virtio
+                .interrupt_intents()
+                .iter()
+                .map(|intent| match intent {
+                    crate::snapshot_device_v2::SnapshotV2InterruptIntent::Queue { queue_index } => {
+                        VirtioInterruptIntent::Queue {
+                            queue_index: *queue_index,
+                        }
+                    }
+                    crate::snapshot_device_v2::SnapshotV2InterruptIntent::Configuration => {
+                        VirtioInterruptIntent::Configuration
+                    }
+                }),
+        );
+        handler
+            .restore_network_interrupt_intents(&interrupt_intents)
+            .map_err(|_| SnapshotV2NetworkMmioHandlerError::Allocation)?;
+        handler.attach_network_metrics_with_aggregate(interface_metrics, aggregate_metrics);
+
+        let mut captured_selector = String::new();
+        captured_selector
+            .try_reserve_exact(controller.host_dev_name().len())
+            .map_err(|_| SnapshotV2NetworkMmioHandlerError::Allocation)?;
+        captured_selector.push_str(controller.host_dev_name());
+        let expected_state =
+            SnapshotV2NetworkInterfaceState::try_from_parts(SnapshotV2NetworkInterfaceStateParts {
+                iface_id,
+                captured_selector,
+                requested_guest_mac,
+                requested_mtu,
+                profile,
+                backend,
+                local,
+                virtio,
+                rx_limiter,
+                tx_limiter,
+                transport,
+            })
+            .map_err(|_| SnapshotV2NetworkMmioHandlerError::ExpectedState)?;
+        let (captured, validation) = handler
+            .capture_network_state_at(&controller, realized_profile, destination_memory, None, now)
+            .map_err(|_| SnapshotV2NetworkMmioHandlerError::Capture)?;
+        if validation.source_rx_retry().is_some() {
+            return Err(SnapshotV2NetworkMmioHandlerError::Capture);
+        }
+        let normalized = SnapshotV2NetworkInterfaceState::try_from_mmio_capture(
+            &controller,
+            backend,
+            region,
+            interrupt_line,
+            &captured,
+        )
+        .map_err(|_| SnapshotV2NetworkMmioHandlerError::Normalize)?;
+        if normalized != expected_state {
+            return Err(SnapshotV2NetworkMmioHandlerError::StateMismatch);
+        }
+        let registration = NetworkMmioDeviceRegistration::from_restored(
+            usize::from(source_index),
+            &controller,
+            region,
+        )
+        .map_err(|_| SnapshotV2NetworkMmioHandlerError::Allocation)?;
+
+        Ok(PreparedSnapshotV2NetworkMmioHandler {
+            source_index,
+            resource_key,
+            controller,
+            expected_state,
+            mmds_stack,
+            queue_ranges,
+            retry: normalized.local().tx_retry(),
+            retry_deadline,
+            region,
+            interrupt_line,
+            registration,
+            handler,
+        })
+    }
 }
 
 impl fmt::Debug for PreparedSnapshotV2NetworkRestoreInterface {
@@ -80,6 +360,172 @@ impl fmt::Debug for PreparedSnapshotV2NetworkRestoreInterface {
             .finish()
     }
 }
+
+/// One checked, complete, and still-unpublished MMIO network handler.
+///
+/// Packet I/O, readiness callbacks, dispatcher leases, interrupt routes,
+/// scheduler publication, MMDS data, and VM authority remain outside this
+/// value.
+#[doc(hidden)]
+pub struct PreparedSnapshotV2NetworkMmioHandler {
+    source_index: u16,
+    resource_key: SnapshotRestoreResourceKey,
+    controller: NetworkInterfaceConfig,
+    expected_state: SnapshotV2NetworkInterfaceState,
+    mmds_stack: Option<SnapshotV2MmdsInterfaceState>,
+    queue_ranges: [Option<[GuestMemoryRange; 3]>; 2],
+    retry: SnapshotV2NetworkRetryState,
+    retry_deadline: Option<Instant>,
+    region: MmioRegion,
+    interrupt_line: GuestInterruptLine,
+    registration: NetworkMmioDeviceRegistration,
+    handler: VirtioNetworkMmioHandler,
+}
+
+impl PreparedSnapshotV2NetworkMmioHandler {
+    pub const fn source_index(&self) -> u16 {
+        self.source_index
+    }
+
+    pub const fn resource_key(&self) -> &SnapshotRestoreResourceKey {
+        &self.resource_key
+    }
+
+    pub const fn controller(&self) -> &NetworkInterfaceConfig {
+        &self.controller
+    }
+
+    pub const fn expected_state(&self) -> &SnapshotV2NetworkInterfaceState {
+        &self.expected_state
+    }
+
+    pub const fn mmds_stack(&self) -> Option<SnapshotV2MmdsInterfaceState> {
+        self.mmds_stack
+    }
+
+    pub const fn queue_ranges(&self) -> &[Option<[GuestMemoryRange; 3]>; 2] {
+        &self.queue_ranges
+    }
+
+    pub const fn retry(&self) -> SnapshotV2NetworkRetryState {
+        self.retry
+    }
+
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_deadline
+    }
+
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    pub const fn interrupt_line(&self) -> GuestInterruptLine {
+        self.interrupt_line
+    }
+
+    pub const fn registration(&self) -> &NetworkMmioDeviceRegistration {
+        &self.registration
+    }
+
+    pub const fn handler(&self) -> &VirtioNetworkMmioHandler {
+        &self.handler
+    }
+
+    pub fn into_parts(self) -> PreparedSnapshotV2NetworkMmioHandlerParts {
+        (
+            self.source_index,
+            self.resource_key,
+            self.controller,
+            self.expected_state,
+            self.mmds_stack,
+            self.queue_ranges,
+            self.retry,
+            self.retry_deadline,
+            self.region,
+            self.interrupt_line,
+            self.registration,
+            self.handler,
+        )
+    }
+}
+
+/// Owned parts of one unpublished exact-2.11 MMIO network handler.
+#[doc(hidden)]
+pub type PreparedSnapshotV2NetworkMmioHandlerParts = (
+    u16,
+    SnapshotRestoreResourceKey,
+    NetworkInterfaceConfig,
+    SnapshotV2NetworkInterfaceState,
+    Option<SnapshotV2MmdsInterfaceState>,
+    [Option<[GuestMemoryRange; 3]>; 2],
+    SnapshotV2NetworkRetryState,
+    Option<Instant>,
+    MmioRegion,
+    GuestInterruptLine,
+    NetworkMmioDeviceRegistration,
+    VirtioNetworkMmioHandler,
+);
+
+impl fmt::Debug for PreparedSnapshotV2NetworkMmioHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2NetworkMmioHandler")
+            .field("source_index", &self.source_index)
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Redacted failure while materializing one checked network MMIO handler.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum SnapshotV2NetworkMmioHandlerError {
+    Profile,
+    WrongTransport,
+    Queue,
+    QueueMemory,
+    Limiter,
+    Retry,
+    Device,
+    RetainedTransport,
+    Handler,
+    Transport,
+    ExpectedState,
+    Capture,
+    Normalize,
+    StateMismatch,
+    Allocation,
+}
+
+impl fmt::Debug for SnapshotV2NetworkMmioHandlerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2NetworkMmioHandlerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Profile => "native-v2 network destination profile is invalid",
+            Self::WrongTransport => "native-v2 network restore interface is not MMIO",
+            Self::Queue => "native-v2 network queue reconstruction failed",
+            Self::QueueMemory => "native-v2 network queue memory is invalid",
+            Self::Limiter => "native-v2 network limiter reconstruction failed",
+            Self::Retry => "native-v2 network retry reconstruction failed",
+            Self::Device => "native-v2 network device reconstruction failed",
+            Self::RetainedTransport => "native-v2 network retained MMIO state is invalid",
+            Self::Handler => "native-v2 network MMIO handler construction failed",
+            Self::Transport => "native-v2 network MMIO handler state is invalid",
+            Self::ExpectedState => "native-v2 network normalized state is invalid",
+            Self::Capture => "native-v2 network immediate capture failed",
+            Self::Normalize => "native-v2 network immediate normalization failed",
+            Self::StateMismatch => "native-v2 network immediate state does not match",
+            Self::Allocation => "native-v2 network MMIO preparation allocation failed",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2NetworkMmioHandlerError {}
 
 /// Immutable exact-2.11 network/controller/MMDS destination topology.
 ///
@@ -525,6 +971,53 @@ fn limiter_config(limiter: SnapshotV2NetworkLimiterState) -> Option<NetworkRateL
     configured.is_configured().then_some(configured)
 }
 
+fn restore_limiter_state(
+    limiter: SnapshotV2NetworkLimiterState,
+) -> VirtioNetworkRateLimiterCaptureState {
+    VirtioNetworkRateLimiterCaptureState::new(
+        limiter.bandwidth().map(restore_token_bucket_state),
+        limiter.ops().map(restore_token_bucket_state),
+    )
+}
+
+fn restore_token_bucket_state(
+    bucket: SnapshotV2NetworkTokenBucketState,
+) -> VirtioNetworkTokenBucketCaptureState {
+    VirtioNetworkTokenBucketCaptureState::new(
+        token_bucket_config(bucket),
+        bucket.budget(),
+        bucket.remaining_burst(),
+        bucket.age_nanos(),
+    )
+}
+
+fn restore_queue_state(
+    queue: crate::snapshot_device_v2::SnapshotV2VirtioQueueState,
+) -> VirtioMmioQueueState {
+    VirtioMmioQueueState::from_parts(
+        queue.max_size(),
+        queue.size(),
+        queue.ready(),
+        queue.descriptor_table(),
+        queue.driver_ring(),
+        queue.device_ring(),
+    )
+}
+
+fn restored_retry_deadline_at(
+    retry: SnapshotV2NetworkRetryState,
+    now: Instant,
+) -> Result<Option<Instant>, SnapshotV2NetworkMmioHandlerError> {
+    match retry {
+        SnapshotV2NetworkRetryState::None => Ok(None),
+        SnapshotV2NetworkRetryState::Immediate => Ok(Some(now)),
+        SnapshotV2NetworkRetryState::After { remaining_nanos } => now
+            .checked_add(Duration::from_nanos(remaining_nanos))
+            .map(Some)
+            .ok_or(SnapshotV2NetworkMmioHandlerError::Retry),
+    }
+}
+
 fn token_bucket_config(bucket: SnapshotV2NetworkTokenBucketState) -> NetworkTokenBucketConfig {
     NetworkTokenBucketConfig::new(
         bucket.size(),
@@ -537,15 +1030,39 @@ fn token_bucket_config(bucket: SnapshotV2NetworkTokenBucketState) -> NetworkToke
 mod tests {
     use super::*;
     use crate::interrupt::GuestInterruptLine;
-    use crate::memory::GuestAddress;
+    use crate::memory::{GuestAddress, GuestMemoryLayout};
     use crate::mmio::{MmioRegion, MmioRegionId};
-    use crate::network::{GuestMacAddress, NetworkDeviceProfile};
-    use crate::snapshot_device_v2::{SnapshotV2DeviceTransport, SnapshotV2MmioDeviceState};
+    use crate::network::{
+        GuestMacAddress, NetworkDeviceProfile, VIRTIO_NET_QUEUE_SIZE, VirtioNetworkConfigSpace,
+    };
+    use crate::snapshot_device_v2::{
+        SnapshotV2DeviceTransport, SnapshotV2InterruptIntent, SnapshotV2MmioDeviceState,
+        SnapshotV2VirtioQueueState, SnapshotV2VirtioState, SnapshotV2VirtioStateParts,
+    };
     use crate::snapshot_format::SnapshotFormatVersion;
     use crate::snapshot_network_v2_11::{
         SnapshotV2NetworkBackendClass, SnapshotV2NetworkInterfaceStateParts,
+        SnapshotV2NetworkLocalState, SnapshotV2NetworkQueueState,
+    };
+    use crate::virtio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
     };
     use crate::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
+    use crate::virtio_queue::VIRTQUEUE_DESC_F_NEXT;
+
+    const TEST_MEMORY_SIZE: u64 = 0x20_0000;
+    const RX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x10_0000);
+    const RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x10_2000);
+    const RX_USED_RING: GuestAddress = GuestAddress::new(0x10_4000);
+    const TX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x11_0000);
+    const TX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x11_2000);
+    const TX_USED_RING: GuestAddress = GuestAddress::new(0x11_4000);
+    const TX_HEADER: GuestAddress = GuestAddress::new(0x18_0000);
+    const TX_PAYLOAD: GuestAddress = GuestAddress::new(0x18_0100);
+    const AVAILABLE_INDEX_OFFSET: u64 = 2;
+    const AVAILABLE_RING_OFFSET: u64 = 4;
+    const USED_INDEX_OFFSET: u64 = 2;
 
     fn fixture_bytes(fixture: &str) -> Vec<u8> {
         let compact = fixture.split_ascii_whitespace().collect::<String>();
@@ -654,6 +1171,149 @@ mod tests {
 
         SnapshotV2NetworkState::try_new(interfaces, None)
             .expect("expanded network state should validate")
+    }
+
+    fn active_mmio_state_with_tx_retry() -> SnapshotV2NetworkState {
+        let guest_mac = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0x70, 0]);
+        let profile = NetworkDeviceProfile::new(Some(guest_mac), Some(1500));
+        let available_features = VirtioNetworkConfigSpace::with_feature_capabilities(
+            profile.guest_mac(),
+            profile.mtu(),
+            profile.feature_capabilities(),
+        )
+        .available_features();
+        let queue = |descriptor_table, driver_ring, device_ring| {
+            SnapshotV2VirtioQueueState::from_parts(
+                VIRTIO_NET_QUEUE_SIZE,
+                VIRTIO_NET_QUEUE_SIZE,
+                true,
+                descriptor_table,
+                driver_ring,
+                device_ring,
+            )
+        };
+        let virtio = SnapshotV2VirtioState::from_parts(SnapshotV2VirtioStateParts {
+            available_features,
+            driver_features: available_features,
+            config_generation: 7,
+            status: VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                | VIRTIO_DEVICE_STATUS_DRIVER
+                | VIRTIO_DEVICE_STATUS_FEATURES_OK
+                | VIRTIO_DEVICE_STATUS_DRIVER_OK,
+            activated: true,
+            queues: vec![
+                queue(RX_DESCRIPTOR_TABLE, RX_AVAILABLE_RING, RX_USED_RING),
+                queue(TX_DESCRIPTOR_TABLE, TX_AVAILABLE_RING, TX_USED_RING),
+            ],
+            pending_notifications: vec![0, 1],
+            interrupt_intents: vec![
+                SnapshotV2InterruptIntent::Queue { queue_index: 0 },
+                SnapshotV2InterruptIntent::Configuration,
+            ],
+        });
+        let tx_limiter = SnapshotV2NetworkLimiterState::new(
+            None,
+            Some(SnapshotV2NetworkTokenBucketState::new(
+                1, None, 100, 0, 0, 0,
+            )),
+        );
+        let interface =
+            SnapshotV2NetworkInterfaceState::try_from_parts(SnapshotV2NetworkInterfaceStateParts {
+                iface_id: "eth0".to_owned(),
+                captured_selector: "captured:source".to_owned(),
+                requested_guest_mac: Some(guest_mac),
+                requested_mtu: Some(1500),
+                profile,
+                backend: SnapshotV2NetworkBackendClass::Vmnet,
+                local: SnapshotV2NetworkLocalState::new(
+                    Some(SnapshotV2NetworkQueueState::new(7, 7)),
+                    Some(SnapshotV2NetworkQueueState::new(9, 9)),
+                    SnapshotV2NetworkRetryState::After {
+                        remaining_nanos: 100_000_000,
+                    },
+                ),
+                virtio,
+                rx_limiter: SnapshotV2NetworkLimiterState::new(None, None),
+                tx_limiter,
+                transport: SnapshotV2DeviceTransport::Mmio(SnapshotV2MmioDeviceState::from_parts(
+                    1,
+                    0,
+                    1,
+                    MmioRegion::new(
+                        MmioRegionId::new(1),
+                        GuestAddress::new(0xd000_0000),
+                        VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+                    )
+                    .expect("network MMIO region should validate"),
+                    GuestInterruptLine::new(32).expect("network SPI should validate"),
+                )),
+            })
+            .expect("active retry interface should validate");
+        SnapshotV2NetworkState::try_new(vec![interface], None)
+            .expect("active retry network state should validate")
+    }
+
+    fn restore_memory_with_pending_tx() -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
+                .expect("restore memory range should validate"),
+        ])
+        .expect("restore memory layout should validate");
+        let mut memory = GuestMemory::allocate(&layout).expect("restore memory should allocate");
+
+        write_u16(&mut memory, RX_AVAILABLE_RING, AVAILABLE_INDEX_OFFSET, 7);
+        write_u16(&mut memory, RX_USED_RING, USED_INDEX_OFFSET, 7);
+        write_u16(&mut memory, TX_AVAILABLE_RING, AVAILABLE_INDEX_OFFSET, 10);
+        write_u16(
+            &mut memory,
+            TX_AVAILABLE_RING,
+            AVAILABLE_RING_OFFSET + u64::from(9 % VIRTIO_NET_QUEUE_SIZE) * 2,
+            0,
+        );
+        write_u16(&mut memory, TX_USED_RING, USED_INDEX_OFFSET, 9);
+
+        write_u64(&mut memory, TX_DESCRIPTOR_TABLE, 0, TX_HEADER.raw_value());
+        write_u32(&mut memory, TX_DESCRIPTOR_TABLE, 8, 12);
+        write_u16(&mut memory, TX_DESCRIPTOR_TABLE, 12, VIRTQUEUE_DESC_F_NEXT);
+        write_u16(&mut memory, TX_DESCRIPTOR_TABLE, 14, 1);
+        let payload_descriptor = TX_DESCRIPTOR_TABLE
+            .checked_add(16)
+            .expect("payload descriptor address should fit");
+        write_u64(&mut memory, payload_descriptor, 0, TX_PAYLOAD.raw_value());
+        write_u32(&mut memory, payload_descriptor, 8, 64);
+        write_u16(&mut memory, payload_descriptor, 12, 0);
+        write_u16(&mut memory, payload_descriptor, 14, 0);
+        memory
+    }
+
+    fn write_u16(memory: &mut GuestMemory, base: GuestAddress, offset: u64, value: u16) {
+        memory
+            .write_slice(
+                &value.to_le_bytes(),
+                base.checked_add(offset)
+                    .expect("test write address should fit"),
+            )
+            .expect("u16 should write to guest memory");
+    }
+
+    fn write_u32(memory: &mut GuestMemory, base: GuestAddress, offset: u64, value: u32) {
+        memory
+            .write_slice(
+                &value.to_le_bytes(),
+                base.checked_add(offset)
+                    .expect("test write address should fit"),
+            )
+            .expect("u32 should write to guest memory");
+    }
+
+    fn write_u64(memory: &mut GuestMemory, base: GuestAddress, offset: u64, value: u64) {
+        memory
+            .write_slice(
+                &value.to_le_bytes(),
+                base.checked_add(offset)
+                    .expect("test write address should fit"),
+            )
+            .expect("u64 should write to guest memory");
     }
 
     #[test]
@@ -927,6 +1587,199 @@ mod tests {
             ));
             assert!(!format!("{error:?} {error}").contains("vmnet:shared"));
         }
+    }
+
+    #[test]
+    fn inactive_mmio_handler_rebinds_only_selector_and_recaptures_exactly() {
+        let state = fixture("inactive");
+        let topology = PreparedSnapshotV2NetworkRestoreTopology::prepare(
+            state.clone(),
+            &exact_overrides(&state),
+        )
+        .expect("inactive topology should prepare");
+        let (mut interfaces, _, _) = topology.into_parts();
+        let interface = interfaces.pop().expect("one interface should be prepared");
+        let realized_profile = interface.portable().profile();
+        let memory = restore_memory_with_pending_tx();
+        let prepared = interface
+            .into_mmio_handler(
+                &memory,
+                realized_profile,
+                SharedNetworkInterfaceMetrics::default(),
+                SharedNetworkInterfaceMetrics::default(),
+                Instant::now(),
+            )
+            .expect("inactive MMIO handler should materialize");
+
+        assert_eq!(prepared.source_index(), 0);
+        assert_eq!(prepared.controller().host_dev_name(), "vmnet:shared");
+        assert_eq!(
+            prepared.expected_state().captured_selector(),
+            "vmnet:shared"
+        );
+        assert_eq!(
+            prepared.expected_state().requested_guest_mac(),
+            state.interfaces()[0].requested_guest_mac()
+        );
+        assert_eq!(prepared.queue_ranges(), &[None, None]);
+        assert_eq!(prepared.retry(), SnapshotV2NetworkRetryState::None);
+        assert_eq!(prepared.retry_deadline(), None);
+        assert!(!prepared.handler().is_device_activated());
+        assert_eq!(prepared.registration().index(), 0);
+        assert_eq!(prepared.registration().region_id(), prepared.region().id());
+        let debug = format!("{prepared:?}");
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("vmnet:shared"));
+    }
+
+    #[test]
+    fn active_mmio_handler_restores_queues_limiter_retry_and_common_state() {
+        let state = active_mmio_state_with_tx_retry();
+        let topology = PreparedSnapshotV2NetworkRestoreTopology::prepare(
+            state.clone(),
+            &exact_overrides(&state),
+        )
+        .expect("active topology should prepare");
+        let (mut interfaces, _, _) = topology.into_parts();
+        let interface = interfaces.pop().expect("one interface should be prepared");
+        let realized_profile = interface.portable().profile();
+        let memory = restore_memory_with_pending_tx();
+        let now = Instant::now();
+        let prepared = interface
+            .into_mmio_handler(
+                &memory,
+                realized_profile,
+                SharedNetworkInterfaceMetrics::default(),
+                SharedNetworkInterfaceMetrics::default(),
+                now,
+            )
+            .expect("active MMIO handler should materialize");
+
+        assert!(prepared.handler().is_device_activated());
+        assert!(
+            prepared
+                .handler()
+                .activation_handler()
+                .has_pending_rate_limited_tx_queue()
+        );
+        assert_eq!(
+            prepared.retry(),
+            SnapshotV2NetworkRetryState::After {
+                remaining_nanos: 100_000_000
+            }
+        );
+        assert_eq!(
+            prepared.retry_deadline(),
+            now.checked_add(Duration::from_millis(100))
+        );
+        assert!(prepared.queue_ranges().iter().all(Option::is_some));
+        assert_eq!(
+            prepared.expected_state().virtio(),
+            state.interfaces()[0].virtio()
+        );
+        assert_eq!(
+            prepared.expected_state().tx_limiter(),
+            state.interfaces()[0].tx_limiter()
+        );
+        assert_eq!(
+            prepared.expected_state().captured_selector(),
+            "vmnet:shared"
+        );
+    }
+
+    #[test]
+    fn sixteen_inactive_mmio_handlers_preserve_saved_order_and_exact_capacity() {
+        let state = inactive_state_with_interface_count(NATIVE_V2_NETWORK_MAX_INTERFACES);
+        let topology = PreparedSnapshotV2NetworkRestoreTopology::prepare(
+            state.clone(),
+            &exact_overrides(&state),
+        )
+        .expect("sixteen-interface topology should prepare");
+        let (interfaces, _, _) = topology.into_parts();
+        let memory = restore_memory_with_pending_tx();
+        let aggregate = SharedNetworkInterfaceMetrics::default();
+
+        let prepared = interfaces
+            .into_iter()
+            .enumerate()
+            .map(|(index, interface)| {
+                let profile = interface.portable().profile();
+                let prepared = interface
+                    .into_mmio_handler(
+                        &memory,
+                        profile,
+                        SharedNetworkInterfaceMetrics::default(),
+                        aggregate.clone(),
+                        Instant::now(),
+                    )
+                    .expect("saved-order interface should materialize");
+                assert_eq!(usize::from(prepared.source_index()), index);
+                assert_eq!(prepared.registration().index(), index);
+                prepared
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(prepared.len(), NATIVE_V2_NETWORK_MAX_INTERFACES);
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|entry| entry.region().id())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            NATIVE_V2_NETWORK_MAX_INTERFACES
+        );
+    }
+
+    #[test]
+    fn handler_materialization_rejects_profile_and_queue_memory_redacted() {
+        let state = active_mmio_state_with_tx_retry();
+        let topology = PreparedSnapshotV2NetworkRestoreTopology::prepare(
+            state.clone(),
+            &exact_overrides(&state),
+        )
+        .expect("active topology should prepare");
+        let (mut interfaces, _, _) = topology.into_parts();
+        let interface = interfaces.pop().expect("one interface should be prepared");
+        let error = interface
+            .into_mmio_handler(
+                &restore_memory_with_pending_tx(),
+                NetworkDeviceProfile::new(None, None),
+                SharedNetworkInterfaceMetrics::default(),
+                SharedNetworkInterfaceMetrics::default(),
+                Instant::now(),
+            )
+            .expect_err("mismatched profile should fail");
+        assert!(matches!(error, SnapshotV2NetworkMmioHandlerError::Profile));
+        assert!(!format!("{error:?} {error}").contains("eth0"));
+
+        let topology = PreparedSnapshotV2NetworkRestoreTopology::prepare(
+            state.clone(),
+            &exact_overrides(&state),
+        )
+        .expect("active topology should prepare again");
+        let (mut interfaces, _, _) = topology.into_parts();
+        let interface = interfaces.pop().expect("one interface should be prepared");
+        let profile = interface.portable().profile();
+        let tiny_layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), 0x4000)
+                .expect("tiny range should validate"),
+        ])
+        .expect("tiny layout should validate");
+        let tiny_memory = GuestMemory::allocate(&tiny_layout).expect("tiny memory should allocate");
+        let error = interface
+            .into_mmio_handler(
+                &tiny_memory,
+                profile,
+                SharedNetworkInterfaceMetrics::default(),
+                SharedNetworkInterfaceMetrics::default(),
+                Instant::now(),
+            )
+            .expect_err("unmapped queue memory should fail");
+        assert!(matches!(
+            error,
+            SnapshotV2NetworkMmioHandlerError::QueueMemory
+        ));
+        assert!(!format!("{error:?} {error}").contains("1048576"));
     }
 
     #[test]
