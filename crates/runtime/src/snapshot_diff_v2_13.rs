@@ -12,6 +12,7 @@ use crate::snapshot_memory_v2::{
     NATIVE_V2_MEMORY_ALIGNMENT, NATIVE_V2_MEMORY_EXTENT_BYTES, NATIVE_V2_MEMORY_GUEST_GRANULE,
     NATIVE_V2_MEMORY_HEADER_BYTES, SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError,
     SnapshotV2MemoryImageId, SnapshotV2MemoryStateError, decode_snapshot_v2_memory_binding,
+    decode_snapshot_v2_memory_binding_payload,
 };
 
 mod codec;
@@ -49,10 +50,10 @@ pub const NATIVE_V2_DIFF_MAX_EXTENTS: usize = 32_768;
 /// Maximum encoded state-component and layer-metadata size.
 pub const NATIVE_V2_DIFF_MAX_METADATA_BYTES: usize = 1024 * 1024;
 
-const MAX_RESULT_BINDING_BYTES: usize = NATIVE_V2_MEMORY_HEADER_BYTES
+const MAX_MEMORY_BINDING_BYTES: usize = NATIVE_V2_MEMORY_HEADER_BYTES
     + NATIVE_V2_MEMORY_EXTENT_BYTES * crate::snapshot_memory_v2::NATIVE_V2_MEMORY_MAX_EXTENTS;
 const MAX_ENCODED_METADATA_BYTES: usize = NATIVE_V2_DIFF_HEADER_BYTES
-    + MAX_RESULT_BINDING_BYTES
+    + MAX_MEMORY_BINDING_BYTES * 2
     + NATIVE_V2_DIFF_EXTENT_BYTES * NATIVE_V2_DIFF_MAX_EXTENTS;
 const MAX_DATA_OFFSET: usize = align_up_usize_const(
     MAX_ENCODED_METADATA_BYTES,
@@ -60,9 +61,9 @@ const MAX_DATA_OFFSET: usize = align_up_usize_const(
 );
 const REDACTED: &str = "<redacted>";
 
-const _: () = assert!(MAX_RESULT_BINDING_BYTES == 98_368);
-const _: () = assert!(MAX_ENCODED_METADATA_BYTES == 884_896);
-const _: () = assert!(MAX_DATA_OFFSET == 917_504);
+const _: () = assert!(MAX_MEMORY_BINDING_BYTES == 98_368);
+const _: () = assert!(MAX_ENCODED_METADATA_BYTES == 983_264);
+const _: () = assert!(MAX_DATA_OFFSET == NATIVE_V2_DIFF_MAX_METADATA_BYTES);
 const _: () = assert!(MAX_DATA_OFFSET <= NATIVE_V2_DIFF_MAX_METADATA_BYTES);
 const _: () = assert!(
     NATIVE_V2_DIFF_MAX_METADATA_BYTES
@@ -75,20 +76,28 @@ const fn align_up_usize_const(value: usize, alignment: usize) -> usize {
 }
 
 /// Required source of bytes omitted from one differential layer.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SnapshotV2DiffBase {
     /// Omitted bytes inherit the zero-initialized boot root.
     Zero,
-    /// Omitted bytes inherit one exact predecessor memory image.
-    Image(SnapshotV2MemoryImageId),
+    /// Omitted bytes inherit one exact complete predecessor memory image.
+    Image(SnapshotV2MemoryBinding),
 }
 
 impl SnapshotV2DiffBase {
     /// Returns the predecessor identity when this layer requires an image.
-    pub const fn image_id(self) -> Option<SnapshotV2MemoryImageId> {
+    pub const fn image_id(&self) -> Option<SnapshotV2MemoryImageId> {
         match self {
             Self::Zero => None,
-            Self::Image(image_id) => Some(image_id),
+            Self::Image(binding) => Some(binding.image_id()),
+        }
+    }
+
+    /// Returns the complete predecessor binding when this is an image base.
+    pub const fn binding(&self) -> Option<&SnapshotV2MemoryBinding> {
+        match self {
+            Self::Zero => None,
+            Self::Image(binding) => Some(binding),
         }
     }
 }
@@ -168,7 +177,7 @@ impl SnapshotV2DiffLayerBinding {
         reserve: &mut R,
     ) -> Result<Self, SnapshotV2DiffLayerBindingError> {
         validate_count(ranges.len())?;
-        let layout = calculate_layout(&result, ranges.len())?;
+        let layout = calculate_layout(&base, &result, ranges.len())?;
         let mut data_extents = Vec::new();
         reserve
             .reserve_extents(&mut data_extents, ranges.len())
@@ -204,8 +213,8 @@ impl SnapshotV2DiffLayerBinding {
     }
 
     /// Returns the required source of omitted bytes.
-    pub const fn base(&self) -> SnapshotV2DiffBase {
-        self.base
+    pub const fn base(&self) -> &SnapshotV2DiffBase {
+        &self.base
     }
 
     /// Returns the complete materialized result binding.
@@ -261,8 +270,10 @@ pub enum SnapshotV2DiffLayerBindingError {
     UnsupportedVersion,
     /// A fixed header field or reserved byte is noncanonical.
     InvalidHeader,
-    /// The base kind and predecessor identity do not form a valid pair.
+    /// The base kind, identity, and embedded-binding length do not form a valid pair.
     InvalidBase,
+    /// The fixed-header predecessor identity differs from its complete binding.
+    PredecessorBindingMismatch,
     /// The predecessor and materialized result identities are equal.
     BaseResultIdentityConflict,
     /// The data extent count exceeds the fixed profile bound.
@@ -274,6 +285,11 @@ pub enum SnapshotV2DiffLayerBindingError {
     },
     /// The embedded complete result binding is invalid.
     ResultBinding {
+        /// The complete-binding validation failure.
+        source: SnapshotV2MemoryBindingError,
+    },
+    /// The embedded complete predecessor binding is invalid.
+    PredecessorBinding {
         /// The complete-binding validation failure.
         source: SnapshotV2MemoryBindingError,
     },
@@ -306,6 +322,9 @@ impl fmt::Display for SnapshotV2DiffLayerBindingError {
             Self::UnsupportedVersion => "native-v2 Diff layer version is unsupported",
             Self::InvalidHeader => "native-v2 Diff layer header is noncanonical",
             Self::InvalidBase => "native-v2 Diff layer base is invalid",
+            Self::PredecessorBindingMismatch => {
+                "native-v2 Diff predecessor binding does not match its header"
+            }
             Self::BaseResultIdentityConflict => {
                 "native-v2 Diff layer base and result identities conflict"
             }
@@ -314,6 +333,7 @@ impl fmt::Display for SnapshotV2DiffLayerBindingError {
                 "native-v2 Diff layer metadata allocation failed"
             }
             Self::ResultBinding { .. } => "native-v2 Diff result binding is invalid",
+            Self::PredecessorBinding { .. } => "native-v2 Diff predecessor binding is invalid",
             Self::InvalidLength => "native-v2 Diff layer length is invalid",
             Self::LengthOverflow => "native-v2 Diff layer length arithmetic overflowed",
             Self::MetadataTooLarge => "native-v2 Diff layer metadata exceeds its limit",
@@ -333,6 +353,7 @@ impl std::error::Error for SnapshotV2DiffLayerBindingError {
         match self {
             Self::MetadataAllocationFailed { source } => Some(source),
             Self::ResultBinding { source } => Some(source),
+            Self::PredecessorBinding { source } => Some(source),
             _ => None,
         }
     }
@@ -426,6 +447,7 @@ struct CalculatedLayout {
 }
 
 fn calculate_layout(
+    base: &SnapshotV2DiffBase,
     result: &SnapshotV2MemoryBinding,
     extent_count: usize,
 ) -> Result<CalculatedLayout, SnapshotV2DiffLayerBindingError> {
@@ -433,17 +455,15 @@ fn calculate_layout(
         return Err(SnapshotV2DiffLayerBindingError::UnsupportedVersion);
     }
     validate_count(extent_count)?;
-    let result_length = NATIVE_V2_MEMORY_HEADER_BYTES
-        .checked_add(
-            result
-                .extents()
-                .len()
-                .checked_mul(NATIVE_V2_MEMORY_EXTENT_BYTES)
-                .ok_or(SnapshotV2DiffLayerBindingError::LengthOverflow)?,
-        )
-        .ok_or(SnapshotV2DiffLayerBindingError::LengthOverflow)?;
+    let result_length = encoded_memory_binding_length(result)?;
+    let predecessor_length = base
+        .binding()
+        .map(encoded_memory_binding_length)
+        .transpose()?
+        .unwrap_or(0);
     let metadata_length = NATIVE_V2_DIFF_HEADER_BYTES
         .checked_add(result_length)
+        .and_then(|length| length.checked_add(predecessor_length))
         .and_then(|length| {
             extent_count
                 .checked_mul(NATIVE_V2_DIFF_EXTENT_BYTES)
@@ -460,6 +480,20 @@ fn calculate_layout(
         metadata_length,
         data_offset,
     })
+}
+
+fn encoded_memory_binding_length(
+    binding: &SnapshotV2MemoryBinding,
+) -> Result<usize, SnapshotV2DiffLayerBindingError> {
+    NATIVE_V2_MEMORY_HEADER_BYTES
+        .checked_add(
+            binding
+                .extents()
+                .len()
+                .checked_mul(NATIVE_V2_MEMORY_EXTENT_BYTES)
+                .ok_or(SnapshotV2DiffLayerBindingError::LengthOverflow)?,
+        )
+        .ok_or(SnapshotV2DiffLayerBindingError::LengthOverflow)
 }
 
 fn build_binding(
@@ -479,7 +513,7 @@ fn build_binding(
         return Err(SnapshotV2DiffLayerBindingError::BaseResultIdentityConflict);
     }
     validate_count(data_extents.len())?;
-    let expected_layout = calculate_layout(&result, data_extents.len())?;
+    let expected_layout = calculate_layout(&base, &result, data_extents.len())?;
     if layout.metadata_length != expected_layout.metadata_length
         || layout.data_offset != expected_layout.data_offset
     {
@@ -581,6 +615,11 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, SnapshotV2DiffLayerBindin
 }
 
 trait ReservePolicy {
+    fn decode_memory_binding(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError>;
+
     fn reserve_extents(
         &mut self,
         value: &mut Vec<SnapshotV2DiffDataExtent>,
@@ -597,6 +636,13 @@ trait ReservePolicy {
 struct FallibleReserve;
 
 impl ReservePolicy for FallibleReserve {
+    fn decode_memory_binding(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError> {
+        decode_snapshot_v2_memory_binding_payload(bytes)
+    }
+
     fn reserve_extents(
         &mut self,
         value: &mut Vec<SnapshotV2DiffDataExtent>,

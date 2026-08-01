@@ -3,6 +3,9 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use crate::memory::{GuestMemoryLayout, aarch64};
 use crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
+use crate::snapshot_memory_v2::{
+    SnapshotV2MemoryBinding, snapshot_v2_memory_binding_from_ranges_for_test,
+};
 
 use super::*;
 
@@ -15,6 +18,25 @@ const PREDECESSOR_DYNAMIC_FIXTURE: &str = include_str!("../fixtures/predecessor-
 
 fn range(start: u64, size: u64) -> GuestMemoryRange {
     GuestMemoryRange::new(GuestAddress::new(start), size).expect("test range should validate")
+}
+
+fn predecessor_binding_with_id(
+    image_id: SnapshotV2MemoryImageId,
+    ranges: &[GuestMemoryRange],
+) -> SnapshotV2MemoryBinding {
+    snapshot_v2_memory_binding_from_ranges_for_test(NATIVE_V2_SNAPSHOT_VERSION, image_id, ranges)
+        .expect("test predecessor binding should validate")
+}
+
+fn image_base(ranges: &[GuestMemoryRange]) -> SnapshotV2DiffBase {
+    SnapshotV2DiffBase::Image(predecessor_binding_with_id(BASE_ID, ranges))
+}
+
+fn image_base_with_id(
+    image_id: SnapshotV2MemoryImageId,
+    ranges: &[GuestMemoryRange],
+) -> SnapshotV2DiffBase {
+    SnapshotV2DiffBase::Image(predecessor_binding_with_id(image_id, ranges))
 }
 
 fn allocate_memory(ranges: &[GuestMemoryRange]) -> GuestMemory {
@@ -268,7 +290,7 @@ fn current_dynamic_add_and_remove_topologies_write_canonically() {
     let removed_binding = write_with_identity(
         &memory,
         &mut removed_output,
-        SnapshotV2DiffBase::Image(BASE_ID),
+        image_base(&[original, added]),
         &removed_selection,
         |_| false,
     )
@@ -380,7 +402,10 @@ fn predecessor_writer_matches_fixture_and_packs_only_selected_bytes() {
     let binding = write_with_identity(
         &memory,
         &mut output,
-        SnapshotV2DiffBase::Image(BASE_ID),
+        image_base(&[
+            range(start, 32 * 1024),
+            range(start + 128 * 1024, 64 * 1024),
+        ]),
         &selection,
         |_| false,
     )
@@ -750,7 +775,7 @@ fn detached_verifier_rejects_mismatch_corruption_padding_and_length_changes() {
     let binding = write_with_identity(
         &memory,
         &mut output,
-        SnapshotV2DiffBase::Image(BASE_ID),
+        image_base(&[range(start, 32 * 1024)]),
         &selection,
         |_| false,
     )
@@ -758,7 +783,7 @@ fn detached_verifier_rejects_mismatch_corruption_padding_and_length_changes() {
     let bytes = output.into_inner();
 
     let mismatched = SnapshotV2DiffLayerBinding::try_from_ranges(
-        SnapshotV2DiffBase::Image(OTHER_BASE_ID),
+        image_base_with_id(OTHER_BASE_ID, &[range(start, 32 * 1024)]),
         binding.result().clone(),
         selection.ranges(),
     )

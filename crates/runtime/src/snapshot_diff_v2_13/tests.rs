@@ -2,6 +2,8 @@ use std::collections::TryReserveError;
 use std::fmt::Write as _;
 use std::mem::size_of;
 
+use crc64::crc64;
+
 use crate::memory::{GuestAddress, GuestMemoryRange, aarch64};
 use crate::snapshot_artifact::{
     NativeSnapshotArtifactState, NativeSnapshotArtifactStateError,
@@ -14,8 +16,8 @@ use crate::snapshot_format_v2::{
     encode_snapshot_v2_state_with_compatibility_version,
 };
 use crate::snapshot_memory_v2::{
-    SnapshotV2MemoryBinding, SnapshotV2MemoryImageId,
-    snapshot_v2_memory_binding_from_ranges_for_test,
+    SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError, SnapshotV2MemoryImageId,
+    decode_snapshot_v2_memory_binding_payload, snapshot_v2_memory_binding_from_ranges_for_test,
 };
 
 use super::*;
@@ -42,7 +44,9 @@ const DATA_OFFSET_OFFSET: usize = 48;
 const FILE_LENGTH_OFFSET: usize = 56;
 const CHECKSUM_OFFSET: usize = 64;
 const BASE_IMAGE_ID_OFFSET: usize = 72;
-const RESERVED_OFFSET: usize = 88;
+const PREDECESSOR_BINDING_LENGTH_OFFSET: usize = 88;
+const RESERVED_OFFSET: usize = 92;
+const MEMORY_BINDING_CHECKSUM_OFFSET: usize = 48;
 const EXTENT_GPA_OFFSET: usize = 0;
 const EXTENT_LENGTH_OFFSET: usize = 8;
 const EXTENT_FILE_OFFSET: usize = 16;
@@ -71,6 +75,43 @@ fn one_region_result() -> SnapshotV2MemoryBinding {
     result_binding(&[range(aarch64::DRAM_MEM_START, 64 * 1024)])
 }
 
+fn predecessor_binding_with_id(
+    image_id: SnapshotV2MemoryImageId,
+    ranges: &[GuestMemoryRange],
+) -> SnapshotV2MemoryBinding {
+    snapshot_v2_memory_binding_from_ranges_for_test(NATIVE_V2_SNAPSHOT_VERSION, image_id, ranges)
+        .expect("test predecessor binding should validate")
+}
+
+fn predecessor_binding(ranges: &[GuestMemoryRange]) -> SnapshotV2MemoryBinding {
+    predecessor_binding_with_id(BASE_ID, ranges)
+}
+
+fn image_base(ranges: &[GuestMemoryRange]) -> SnapshotV2DiffBase {
+    SnapshotV2DiffBase::Image(predecessor_binding(ranges))
+}
+
+fn image_base_with_id(
+    image_id: SnapshotV2MemoryImageId,
+    ranges: &[GuestMemoryRange],
+) -> SnapshotV2DiffBase {
+    SnapshotV2DiffBase::Image(predecessor_binding_with_id(image_id, ranges))
+}
+
+fn data_directory_offset(base: &SnapshotV2DiffBase, result: &SnapshotV2MemoryBinding) -> usize {
+    NATIVE_V2_DIFF_HEADER_BYTES
+        + result.encode().expect("result binding should encode").len()
+        + base
+            .binding()
+            .map(|binding| {
+                binding
+                    .encode()
+                    .expect("predecessor binding should encode")
+                    .len()
+            })
+            .unwrap_or(0)
+}
+
 fn encoded_layer(
     base: SnapshotV2DiffBase,
     result: SnapshotV2MemoryBinding,
@@ -89,7 +130,7 @@ fn root_zero_empty_and_selected_layers_round_trip_canonically() {
         SnapshotV2DiffLayerBinding::try_from_ranges(SnapshotV2DiffBase::Zero, result.clone(), &[])
             .expect("empty root layer should validate");
     assert_eq!(empty.version(), NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION);
-    assert_eq!(empty.base(), SnapshotV2DiffBase::Zero);
+    assert_eq!(empty.base(), &SnapshotV2DiffBase::Zero);
     assert_eq!(empty.result(), &result);
     assert!(empty.data_extents().is_empty());
     assert_eq!(empty.metadata_length(), 184);
@@ -137,6 +178,10 @@ fn root_zero_empty_and_selected_layers_round_trip_canonically() {
 
 #[test]
 fn predecessor_dynamic_fixture_round_trips_and_retains_packed_offsets() {
+    let predecessor_topology = [
+        range(aarch64::DRAM_MEM_START, 32 * 1024),
+        range(aarch64::DRAM_MEM_START + 128 * 1024, 64 * 1024),
+    ];
     let topology = [
         range(aarch64::DRAM_MEM_START, 16 * 1024),
         range(aarch64::DRAM_MEM_START + 128 * 1024, 32 * 1024),
@@ -147,11 +192,22 @@ fn predecessor_dynamic_fixture_round_trips_and_retains_packed_offsets() {
         range(aarch64::DRAM_MEM_START + 128 * 1024 + 8192, 8192),
     ];
     let layer = SnapshotV2DiffLayerBinding::try_from_ranges(
-        SnapshotV2DiffBase::Image(BASE_ID),
+        image_base(&predecessor_topology),
         result,
         &selected,
     )
     .expect("dynamic predecessor layer should validate");
+    assert_eq!(
+        layer
+            .base()
+            .binding()
+            .expect("image layer should retain predecessor")
+            .extents()
+            .iter()
+            .map(|extent| extent.range())
+            .collect::<Vec<_>>(),
+        predecessor_topology
+    );
     assert_eq!(layer.data_extents().len(), 2);
     assert_eq!(layer.data_extents()[0].file_offset(), layer.data_offset());
     assert_eq!(
@@ -204,7 +260,7 @@ fn checked_construction_rejects_identity_version_and_extent_failures() {
     let result = result_binding(&[range(start, 64 * 1024)]);
     assert!(matches!(
         SnapshotV2DiffLayerBinding::try_from_ranges(
-            SnapshotV2DiffBase::Image(RESULT_ID),
+            image_base_with_id(RESULT_ID, &[range(start, 64 * 1024)]),
             result.clone(),
             &[],
         ),
@@ -272,11 +328,20 @@ fn maximum_metadata_shape_is_exact_and_within_the_frozen_cap() {
     }
     assert_eq!(selected.len(), NATIVE_V2_DIFF_MAX_EXTENTS);
     let layer = SnapshotV2DiffLayerBinding::try_from_ranges(
-        SnapshotV2DiffBase::Zero,
+        image_base(&topology),
         result_binding(&topology),
         &selected,
     )
     .expect("maximum metadata layer should validate");
+    assert_eq!(
+        layer
+            .base()
+            .binding()
+            .expect("maximum image layer should retain predecessor")
+            .extents()
+            .len(),
+        crate::snapshot_memory_v2::NATIVE_V2_MEMORY_MAX_EXTENTS
+    );
     assert_eq!(
         usize::try_from(layer.metadata_length()).expect("metadata should fit"),
         MAX_ENCODED_METADATA_BYTES
@@ -343,6 +408,14 @@ fn fixed_header_and_integrity_mutations_fail_closed() {
     *invalid
         .get_mut(BASE_IMAGE_ID_OFFSET)
         .expect("base identity byte should exist") = 1;
+    repair_checksum(&mut invalid);
+    assert!(matches!(
+        SnapshotV2DiffLayerBinding::decode(&invalid),
+        Err(SnapshotV2DiffLayerBindingError::InvalidBase)
+    ));
+
+    let mut invalid = encoded.clone();
+    replace_u32(&mut invalid, PREDECESSOR_BINDING_LENGTH_OFFSET, 1);
     repair_checksum(&mut invalid);
     assert!(matches!(
         SnapshotV2DiffLayerBinding::decode(&invalid),
@@ -424,20 +497,178 @@ fn malformed_embedded_result_binding_fails_as_a_result_binding() {
 }
 
 #[test]
+fn malformed_embedded_predecessor_binding_and_pairing_fail_closed() {
+    let start = aarch64::DRAM_MEM_START;
+    let topology = [range(start, 64 * 1024)];
+    let result = result_binding(&topology);
+    let predecessor = predecessor_binding(&topology);
+    let predecessor_bytes = predecessor
+        .encode()
+        .expect("predecessor binding should encode");
+    let predecessor_start =
+        NATIVE_V2_DIFF_HEADER_BYTES + result.encode().expect("result binding should encode").len();
+    let predecessor_end = predecessor_start + predecessor_bytes.len();
+    let encoded = encoded_layer(SnapshotV2DiffBase::Image(predecessor), result.clone(), &[]);
+
+    let mut missing = encoded.clone();
+    replace_u32(&mut missing, PREDECESSOR_BINDING_LENGTH_OFFSET, 0);
+    repair_checksum(&mut missing);
+    assert!(matches!(
+        SnapshotV2DiffLayerBinding::decode(&missing),
+        Err(SnapshotV2DiffLayerBindingError::InvalidBase)
+    ));
+
+    let mut zero_with_binding = encoded.clone();
+    replace_u16(&mut zero_with_binding, BASE_KIND_OFFSET, 0);
+    zero_with_binding[BASE_IMAGE_ID_OFFSET..BASE_IMAGE_ID_OFFSET + 16].fill(0);
+    repair_checksum(&mut zero_with_binding);
+    assert!(matches!(
+        SnapshotV2DiffLayerBinding::decode(&zero_with_binding),
+        Err(SnapshotV2DiffLayerBindingError::InvalidBase)
+    ));
+
+    let mut bad_magic = encoded.clone();
+    *bad_magic
+        .get_mut(predecessor_start)
+        .expect("predecessor magic byte should exist") ^= 0x80;
+    repair_checksum(&mut bad_magic);
+    assert!(matches!(
+        SnapshotV2DiffLayerBinding::decode(&bad_magic),
+        Err(SnapshotV2DiffLayerBindingError::PredecessorBinding {
+            source: SnapshotV2MemoryBindingError::InvalidMagic
+        })
+    ));
+
+    let mut unsupported = encoded.clone();
+    replace_u16(
+        &mut unsupported,
+        predecessor_start + VERSION_MINOR_OFFSET,
+        14,
+    );
+    repair_memory_binding_checksum(
+        unsupported
+            .get_mut(predecessor_start..predecessor_end)
+            .expect("predecessor binding should exist"),
+    );
+    repair_checksum(&mut unsupported);
+    assert!(matches!(
+        SnapshotV2DiffLayerBinding::decode(&unsupported),
+        Err(SnapshotV2DiffLayerBindingError::PredecessorBinding {
+            source: SnapshotV2MemoryBindingError::UnsupportedVersion
+        })
+    ));
+
+    let mut corrupt = encoded.clone();
+    *corrupt
+        .get_mut(predecessor_start + MEMORY_BINDING_CHECKSUM_OFFSET)
+        .expect("predecessor checksum byte should exist") ^= 1;
+    repair_checksum(&mut corrupt);
+    assert!(matches!(
+        SnapshotV2DiffLayerBinding::decode(&corrupt),
+        Err(SnapshotV2DiffLayerBindingError::PredecessorBinding {
+            source: SnapshotV2MemoryBindingError::IntegrityMismatch
+        })
+    ));
+
+    let mut truncated = encoded.clone();
+    truncated.truncate(
+        truncated
+            .len()
+            .checked_sub(1)
+            .expect("predecessor metadata should be nonempty"),
+    );
+    replace_u32(
+        &mut truncated,
+        PREDECESSOR_BINDING_LENGTH_OFFSET,
+        u32::try_from(predecessor_bytes.len() - 1).expect("predecessor length should fit"),
+    );
+    replace_u64(
+        &mut truncated,
+        METADATA_LENGTH_OFFSET,
+        u64::try_from(predecessor_end - 1).expect("metadata length should fit"),
+    );
+    repair_checksum(&mut truncated);
+    assert!(matches!(
+        SnapshotV2DiffLayerBinding::decode(&truncated),
+        Err(SnapshotV2DiffLayerBindingError::PredecessorBinding {
+            source: SnapshotV2MemoryBindingError::InvalidLength
+        })
+    ));
+
+    let mut trailing = encoded.clone();
+    trailing.insert(predecessor_end, 0);
+    replace_u32(
+        &mut trailing,
+        PREDECESSOR_BINDING_LENGTH_OFFSET,
+        u32::try_from(predecessor_bytes.len() + 1).expect("predecessor length should fit"),
+    );
+    replace_u64(
+        &mut trailing,
+        METADATA_LENGTH_OFFSET,
+        u64::try_from(predecessor_end + 1).expect("metadata length should fit"),
+    );
+    repair_checksum(&mut trailing);
+    assert!(matches!(
+        SnapshotV2DiffLayerBinding::decode(&trailing),
+        Err(SnapshotV2DiffLayerBindingError::PredecessorBinding {
+            source: SnapshotV2MemoryBindingError::InvalidLength
+        })
+    ));
+
+    let mut noncanonical = encoded.clone();
+    replace_u64(
+        &mut noncanonical,
+        predecessor_start
+            + crate::snapshot_memory_v2::NATIVE_V2_MEMORY_HEADER_BYTES
+            + EXTENT_FILE_OFFSET,
+        crate::snapshot_memory_v2::NATIVE_V2_MEMORY_ALIGNMENT + 4096,
+    );
+    repair_memory_binding_checksum(
+        noncanonical
+            .get_mut(predecessor_start..predecessor_end)
+            .expect("predecessor binding should exist"),
+    );
+    repair_checksum(&mut noncanonical);
+    assert!(matches!(
+        SnapshotV2DiffLayerBinding::decode(&noncanonical),
+        Err(SnapshotV2DiffLayerBindingError::PredecessorBinding {
+            source: SnapshotV2MemoryBindingError::NonCanonicalFileOffset
+        })
+    ));
+
+    let conflicting = predecessor_binding_with_id(RESULT_ID, &topology)
+        .encode()
+        .expect("conflicting predecessor should encode");
+    assert_eq!(conflicting.len(), predecessor_bytes.len());
+    let mut conflict = encoded;
+    conflict
+        .get_mut(predecessor_start..predecessor_end)
+        .expect("predecessor binding should exist")
+        .copy_from_slice(&conflicting);
+    conflict[BASE_IMAGE_ID_OFFSET..BASE_IMAGE_ID_OFFSET + 16]
+        .copy_from_slice(&RESULT_ID.to_bytes());
+    repair_checksum(&mut conflict);
+    assert!(matches!(
+        SnapshotV2DiffLayerBinding::decode(&conflict),
+        Err(SnapshotV2DiffLayerBindingError::BaseResultIdentityConflict)
+    ));
+}
+
+#[test]
 fn predecessor_identity_and_extent_mutations_reject_canonically() {
     let start = aarch64::DRAM_MEM_START;
     let result = result_binding(&[range(start, 64 * 1024)]);
+    let base = image_base(&[range(start, 64 * 1024)]);
     let ranges = [range(start, 4096), range(start + 3 * 4096, 4096)];
-    let encoded = encoded_layer(SnapshotV2DiffBase::Image(BASE_ID), result.clone(), &ranges);
-    let directory =
-        NATIVE_V2_DIFF_HEADER_BYTES + result.encode().expect("result binding should encode").len();
+    let directory = data_directory_offset(&base, &result);
+    let encoded = encoded_layer(base, result.clone(), &ranges);
 
     let mut invalid = encoded.clone();
     invalid[BASE_IMAGE_ID_OFFSET..BASE_IMAGE_ID_OFFSET + 16].copy_from_slice(&RESULT_ID.to_bytes());
     repair_checksum(&mut invalid);
     assert!(matches!(
         SnapshotV2DiffLayerBinding::decode(&invalid),
-        Err(SnapshotV2DiffLayerBindingError::BaseResultIdentityConflict)
+        Err(SnapshotV2DiffLayerBindingError::PredecessorBindingMismatch)
     ));
 
     for (field_offset, value, expected) in [
@@ -480,16 +711,13 @@ fn predecessor_identity_and_extent_mutations_reject_canonically() {
     }
 
     let split_result = result_binding(&[range(start, 8192), range(start + 16 * 1024, 8192)]);
+    let split_base = image_base(&[range(start, 8192), range(start + 16 * 1024, 8192)]);
+    let split_directory = data_directory_offset(&split_base, &split_result);
     let mut crossing = encoded_layer(
-        SnapshotV2DiffBase::Image(BASE_ID),
+        split_base,
         split_result.clone(),
         &[range(start + 4096, 4096)],
     );
-    let split_directory = NATIVE_V2_DIFF_HEADER_BYTES
-        + split_result
-            .encode()
-            .expect("split result should encode")
-            .len();
     replace_u64(
         &mut crossing,
         split_directory + EXTENT_LENGTH_OFFSET,
@@ -511,7 +739,7 @@ fn predecessor_identity_and_extent_mutations_reject_canonically() {
 fn state_decoder_cross_checks_component_profile_and_result_binding() {
     let result = one_region_result();
     let layer = SnapshotV2DiffLayerBinding::try_from_ranges(
-        SnapshotV2DiffBase::Image(BASE_ID),
+        image_base(&[range(aarch64::DRAM_MEM_START, 64 * 1024)]),
         result.clone(),
         &[range(aarch64::DRAM_MEM_START, 4096)],
     )
@@ -675,13 +903,53 @@ fn construction_and_decode_inject_each_new_allocation_boundary() {
         ));
     }
 
-    let encoded = encoded_layer(SnapshotV2DiffBase::Zero, result, &selected);
-    for fail_at in 0..2 {
+    let encoded = encoded_layer(SnapshotV2DiffBase::Zero, result.clone(), &selected);
+    for fail_at in 0..3 {
         let mut reserve = FailingReserve::new(fail_at);
-        assert!(matches!(
-            super::codec::decode_with_reserve(&encoded, &mut reserve),
-            Err(SnapshotV2DiffLayerBindingError::MetadataAllocationFailed { .. })
-        ));
+        let error = super::codec::decode_with_reserve(&encoded, &mut reserve)
+            .expect_err("injected root decode allocation should fail");
+        if fail_at == 0 {
+            assert!(matches!(
+                error,
+                SnapshotV2DiffLayerBindingError::ResultBinding {
+                    source: SnapshotV2MemoryBindingError::MetadataAllocationFailed { .. }
+                }
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                SnapshotV2DiffLayerBindingError::MetadataAllocationFailed { .. }
+            ));
+        }
+    }
+
+    let image = encoded_layer(
+        image_base(&[range(aarch64::DRAM_MEM_START, 64 * 1024)]),
+        result,
+        &selected,
+    );
+    for fail_at in 0..4 {
+        let mut reserve = FailingReserve::new(fail_at);
+        let error = super::codec::decode_with_reserve(&image, &mut reserve)
+            .expect_err("injected image decode allocation should fail");
+        match fail_at {
+            0 => assert!(matches!(
+                error,
+                SnapshotV2DiffLayerBindingError::ResultBinding {
+                    source: SnapshotV2MemoryBindingError::MetadataAllocationFailed { .. }
+                }
+            )),
+            1 => assert!(matches!(
+                error,
+                SnapshotV2DiffLayerBindingError::PredecessorBinding {
+                    source: SnapshotV2MemoryBindingError::MetadataAllocationFailed { .. }
+                }
+            )),
+            _ => assert!(matches!(
+                error,
+                SnapshotV2DiffLayerBindingError::MetadataAllocationFailed { .. }
+            )),
+        }
     }
 }
 
@@ -689,7 +957,7 @@ fn construction_and_decode_inject_each_new_allocation_boundary() {
 fn diagnostics_redact_all_private_layer_values() {
     let result = one_region_result();
     let layer = SnapshotV2DiffLayerBinding::try_from_ranges(
-        SnapshotV2DiffBase::Image(BASE_ID),
+        image_base(&[range(aarch64::DRAM_MEM_START, 64 * 1024)]),
         result,
         &[range(aarch64::DRAM_MEM_START + 4096, 4096)],
     )
@@ -754,6 +1022,15 @@ impl FailingReserve {
 }
 
 impl ReservePolicy for FailingReserve {
+    fn decode_memory_binding(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError> {
+        self.check()
+            .map_err(|source| SnapshotV2MemoryBindingError::MetadataAllocationFailed { source })?;
+        decode_snapshot_v2_memory_binding_payload(bytes)
+    }
+
     fn reserve_extents(
         &mut self,
         value: &mut Vec<SnapshotV2DiffDataExtent>,
@@ -776,6 +1053,19 @@ impl ReservePolicy for FailingReserve {
 fn repair_checksum(bytes: &mut [u8]) {
     let checksum = super::codec::metadata_checksum(bytes).expect("test checksum should calculate");
     replace_u64(bytes, CHECKSUM_OFFSET, checksum);
+}
+
+fn repair_memory_binding_checksum(bytes: &mut [u8]) {
+    let before = bytes
+        .get(..MEMORY_BINDING_CHECKSUM_OFFSET)
+        .expect("memory checksum prefix should exist");
+    let after = bytes
+        .get(MEMORY_BINDING_CHECKSUM_OFFSET + size_of::<u64>()..)
+        .expect("memory checksum suffix should exist");
+    let checksum = crc64(0, before);
+    let checksum = crc64(checksum, &[0_u8; size_of::<u64>()]);
+    let checksum = crc64(checksum, after);
+    replace_u64(bytes, MEMORY_BINDING_CHECKSUM_OFFSET, checksum);
 }
 
 fn replace_u16(bytes: &mut [u8], offset: usize, value: u16) {
