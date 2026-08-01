@@ -563,13 +563,14 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
 production catalog admits semantic memory kind 1 introduced in minor 1; the
-current `2.11.0` writer additionally admits machine/global/topology kinds 2–4
+current `2.12.0` writer additionally admits machine/global/topology kinds 2–4
 and per-vCPU kind 5 introduced in minor 2, singleton time kind 6 introduced in
 minor 3, optional singleton device-graph kind 7 introduced in minor 4, and
 mandatory singleton serial kind 8 introduced in minor 7, plus optional entropy
 kind 9 introduced in minor 8, optional balloon kind 10 introduced in minor 9,
 optional virtio-mem kind 11 introduced in minor 10, and optional network/MMDS
-kind 12 introduced in minor 11.
+kind 12 introduced in minor 11, plus optional vsock kind 13 introduced in minor
+12.
 Exact `2.4.0` retains device-graph profile 1's singleton root, while `2.5.0`
 uses profile 2's bounded ordered block vector and `2.6.0` uses profile 3's
 bounded ordered block-and-pmem vector. Exact `2.7.0` requires kind 8 and
@@ -586,7 +587,11 @@ kind 12 with ordered interface configuration, inert selector identity,
 requested/realized MAC/MTU, backend class, queue/common-virtio state,
 limiter/retry, MMIO/PCI placement, and MMDS protocol configuration while
 excluding source owners, packets, connections, data, tokens, metrics, and
-clocks. Exact `2.3.0` remains the
+clocks. Exact `2.12.0` retains those rules and optionally appends kind 13 with
+the guest CID, inert backend selector, host-local port cursor, active
+queue/common-virtio continuation, and MMIO/PCI placement while excluding
+listeners, connections, callbacks, metrics, and other host authority. Exact
+`2.3.0` remains the
 legacy device-free platform profile. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
 lengths, all three offsets, CRC and every truncation, feature
@@ -599,7 +604,7 @@ resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
 Native-v2 lazy-memory tests retain exact multi-extent binding and complete
-`2.1.0` compatibility fixtures while proving that new output uses `2.11.0`.
+`2.1.0` compatibility fixtures while proving that new output uses `2.12.0`.
 They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
 binding/header/topology/length mutation, exact admitted-version retention,
 typed state profiles,
@@ -677,7 +682,7 @@ The wrapper builds the `bangbang` binary unit-test harness, locates and signs
 that exact test executable, and runs only the ignored private-seam proof. Its
 minimal two-vCPU guest does not touch serial or optional devices beyond the
 required read-only root. The first test starts and pauses the real
-process-owned HVF supervisor, publishes one current 2.11
+process-owned HVF supervisor, publishes one current 2.12
 serial-plus-profile-3 MMIO-root pair without entropy, resumes and repauses the
 source, publishes a fresh recapture,
 and drops the source. It
@@ -1698,7 +1703,7 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
-- exact external snapshot grants creating current native-v2 2.11
+- exact external snapshot grants creating current native-v2 2.12
   serial-plus-profile-3 rooted three-drive MMIO and PCI pairs without entropy
   into separate output directories, reusing both retained
   directories for a second successful pair, preserving all finals on
@@ -1903,9 +1908,10 @@ punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
 separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
-checks exact `v2.11.0` output for `--snapshot-version`, exact description of
+checks exact `v2.12.0` output for `--snapshot-version`, exact description of
 native-v1, legacy `2.3.0`, `2.4.0`, `2.5.0`, `2.6.0`, `2.7.0`, `2.8.0`, and
-`2.9.0`, `2.10.0`, and current native-v2 fixtures, plus explicit pinned
+`2.9.0`, `2.10.0`, `2.11.0`, and current `2.12.0` native-v2 fixtures, plus
+explicit pinned
 Firecracker/unknown incompatibility. It also
 covers missing, non-regular,
 oversized, malformed, truncated, trailing/inconsistent-length, corrupt,
@@ -1960,7 +1966,7 @@ pausing, proving the source has already followed live MMIO or PCI root I/O.
 The source UART must remain canonical, while its Linux-consumed FDT bytes are
 captured and CRC-bound without being reparsed as trusted post-boot topology.
 Creation through `/snapshot/create` then verifies the real CLI reports
-`v2.11.0`. Fresh signed processes repeatedly load the same immutable pair: one
+`v2.12.0`. Fresh signed processes repeatedly load the same immutable pair: one
 remains paused until public `PATCH /vm`, and one uses `resume_vm: true`. The
 paused destination is also publicly recaptured and its decoded root graph must
 equal the source graph. After resume Linux reads the known root marker through
@@ -2629,14 +2635,17 @@ guest payloads on both streams, waits for distinct host replies, and writes
 `BANGBANG_VSOCK_GUEST_MULTISTREAM_OK` only after both streams complete. When
 the boot args include `bangbang.vsock-snapshot-reset=1`, Python instead keeps
 one guest-initiated connection blocked while the harness proves pause alone
-does not close it. The harness invokes public snapshot creation while paused;
-the request still receives the supported-profile rejection and leaves no state,
-memory, or staging artifact, but only after the production vsock preflight has
-published `TRANSPORT_RESET`, captured state, and detached source-only work.
-After resume, the guest must observe non-timeout termination of the old socket,
-connect to a distinct host port, and complete a fresh marker/ack exchange before
-writing `BANGBANG_VSOCK_SNAPSHOT_RESET_OK`. Separate signed MMIO and product-PCI
-cases exercise this sequence.
+does not close it. The harness invokes public exact-2.12 snapshot creation while
+paused and requires durable state and memory artifacts after the production
+vsock capture has published `TRANSPORT_RESET`, captured state, and detached
+source-only work. A fresh signed process then loads the immutable pair, first
+through a Paused commit with the original selector and then through automatic
+resume with an overridden selector. The restored guest must acknowledge
+termination of the old socket, connect to a distinct host port, and complete a
+fresh marker/ack exchange before writing
+`BANGBANG_VSOCK_SNAPSHOT_RESET_OK`. The Paused destination is recaptured, and
+separate signed MMIO and product-PCI plus normal production/App Sandbox cases
+exercise the sequence and listener cleanup.
 When
 the boot args include `bangbang.vsock-host-connect=1`, Python instead binds and
 listens on the test AF_VSOCK port, writes

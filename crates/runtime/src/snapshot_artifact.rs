@@ -243,8 +243,8 @@ impl NativeSnapshotArtifactState {
 
     /// Validates exact current-version native-v2 bytes for publication.
     pub fn from_current_v2(bytes: Vec<u8>) -> Result<Self, NativeSnapshotArtifactStateError> {
-        NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(bytes)
-            .map(NativeV2NetworkSnapshotCandidateState::into_current_artifact_state)
+        NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(bytes)
+            .map(NativeV2VsockSnapshotCandidateState::into_current_artifact_state)
             .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)
     }
 
@@ -376,7 +376,7 @@ impl NativeSnapshotArtifactState {
         };
         if *version == NATIVE_V2_SNAPSHOT_VERSION && binding.version() == NATIVE_V2_SNAPSHOT_VERSION
         {
-            let (actual_binding, _, _, _, _, _, _) = decode_network_state_v2_11(bytes)
+            let (actual_binding, _, _, _, _, _, _, _) = decode_vsock_state_v2_12(bytes)
                 .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
             if &actual_binding == binding {
                 Ok(())
@@ -1850,8 +1850,8 @@ impl NativeV2NetworkSnapshotCandidateState {
         )
     }
 
-    /// Consumes this exact current candidate into artifact authority.
-    pub fn into_current_artifact_state(self) -> NativeSnapshotArtifactState {
+    /// Consumes this exact-2.11 compatibility candidate into artifact authority.
+    pub fn into_v2_11_artifact_state(self) -> NativeSnapshotArtifactState {
         let (bytes, binding, _, _, _, _, _, _) = self.into_parts();
         NativeSnapshotArtifactState {
             inner: NativeSnapshotArtifactStateInner::V2 {
@@ -2069,8 +2069,8 @@ impl std::error::Error for NativeV2VsockSnapshotPreparationError {
 ///
 /// This owner-free value validates all unchanged earlier components and the
 /// optional kind-13 vsock singleton from one immutable byte vector. It
-/// deliberately has no conversion into current artifact publication
-/// authority.
+/// becomes current artifact publication authority only through a consuming
+/// checked conversion.
 pub struct NativeV2VsockSnapshotCandidateState {
     bytes: Vec<u8>,
     binding: SnapshotV2MemoryBinding,
@@ -2280,6 +2280,18 @@ impl NativeV2VsockSnapshotCandidateState {
             self.network,
             self.vsock,
         )
+    }
+
+    /// Consumes this exact current candidate into artifact authority.
+    pub fn into_current_artifact_state(self) -> NativeSnapshotArtifactState {
+        let (bytes, binding, _, _, _, _, _, _, _) = self.into_parts();
+        NativeSnapshotArtifactState {
+            inner: NativeSnapshotArtifactStateInner::V2 {
+                bytes,
+                version: NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+                binding,
+            },
+        }
     }
 }
 
@@ -4442,17 +4454,26 @@ impl LoadedNativeSnapshotArtifacts {
         Ok((candidate, memory))
     }
 
-    /// Consumes one exact current 2.11 pair into the network load handoff.
+    /// Consumes one exact current 2.12 pair into the vsock load handoff.
     ///
     /// The state bytes are neither reopened nor re-encoded, and the already
     /// loaded guest memory remains bound to the candidate derived from them.
     pub fn into_current_v2_candidate(
         self,
-    ) -> Result<
-        (NativeV2NetworkSnapshotCandidateState, GuestMemory),
-        NativeSnapshotArtifactStateError,
-    > {
-        self.into_v2_11_candidate()
+    ) -> Result<(NativeV2VsockSnapshotCandidateState, GuestMemory), NativeSnapshotArtifactStateError>
+    {
+        let actual = self.family();
+        let (state, memory) = self.into_parts();
+        let (bytes, binding) = state.into_v2_parts().map_err(|_| {
+            NativeSnapshotArtifactStateError::UnexpectedFamily {
+                expected: NativeSnapshotArtifactFamily::V2,
+                actual,
+            }
+        })?;
+        let candidate = NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(bytes)
+            .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
+        debug_assert_eq!(candidate.memory_binding(), &binding);
+        Ok((candidate, memory))
     }
 
     /// Consumes one exact 2.11 pair into the network load handoff.

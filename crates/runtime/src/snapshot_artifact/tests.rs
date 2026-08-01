@@ -150,8 +150,8 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
     assert_eq!(
         state
             .v2_profile()
-            .expect("current state should classify as exact network profile"),
-        NativeV2SnapshotArtifactProfile::NetworkStateV2_11
+            .expect("current state should classify as exact vsock profile"),
+        NativeV2SnapshotArtifactProfile::VsockStateV2_12
     );
     assert!(state.v1_record().is_none());
     let debug = format!("{state:?}");
@@ -309,7 +309,7 @@ fn current_v2_artifact_boundary_rejects_missing_serial_state() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn exact_minor_twelve_vsock_pair_remains_outside_artifact_and_family_activation() {
+fn exact_minor_twelve_vsock_pair_has_current_artifact_and_family_authority() {
     let memory = test_v2_memory();
     let mut image = Cursor::new(Vec::new());
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
@@ -494,14 +494,16 @@ fn exact_minor_twelve_vsock_pair_remains_outside_artifact_and_family_activation(
         Err(NativeV2SnapshotCandidateStateError::InvalidVsockComponent)
     ));
 
-    assert!(matches!(
-        NativeSnapshotArtifactState::from_current_v2(bytes.clone()),
-        Err(NativeSnapshotArtifactStateError::CurrentV2Profile(_))
-    ));
-    assert!(matches!(
-        NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone()),
-        Err(NativeSnapshotArtifactStateError::Format(_))
-    ));
+    let artifact = NativeSnapshotArtifactState::from_current_v2(bytes.clone())
+        .expect("exact-2.12 should have current artifact authority");
+    assert_eq!(
+        artifact
+            .v2_profile()
+            .expect("current exact-2.12 artifact should classify"),
+        NativeV2SnapshotArtifactProfile::VsockStateV2_12
+    );
+    NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone())
+        .expect("the compatible family decoder should admit current exact-2.12");
     assert_eq!(
         classify_native_v2_profile(&bytes, &binding)
             .expect("the explicit classifier should recognize exact 2.12"),
@@ -509,13 +511,15 @@ fn exact_minor_twelve_vsock_pair_remains_outside_artifact_and_family_activation(
     );
     assert!(matches!(
         crate::snapshot_format::decode_native_snapshot_state(&bytes),
-        Err(crate::snapshot_format::NativeSnapshotFormatError::NativeV2(
-            SnapshotV2DecodeError::UnsupportedVersion { .. }
-        ))
+        Ok(crate::snapshot_format::NativeSnapshotState::V2(_))
     ));
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
-        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION.minor() + 1,
+        NATIVE_V2_SNAPSHOT_VERSION.minor()
     );
 
     let (owned_bytes, owned_binding, _, _, _, _, _, _, owned_vsock) = candidate.into_parts();
@@ -1138,18 +1142,28 @@ fn exact_minor_eleven_candidate_closes_every_optional_component_product() {
         assert!(!debug.contains("BANGNW2"));
         assert!(!debug.contains("vmnet:host"));
 
-        let artifact = candidate.into_current_artifact_state();
+        let artifact = candidate.into_v2_11_artifact_state();
         assert_eq!(
             artifact
                 .v2_profile()
                 .expect("exact-2.11 optional product should classify"),
             NativeV2SnapshotArtifactProfile::NetworkStateV2_11
         );
-        artifact
-            .validate_for_publication()
-            .expect("exact-2.11 should have current publication authority");
-        NativeSnapshotArtifactState::from_current_v2(bytes)
-            .expect("the public exact-2.11 constructor must admit product");
+        assert!(matches!(
+            artifact.validate_for_publication(),
+            Err(NativeSnapshotArtifactStateError::NonCurrentV2Publication {
+                state: NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                memory: NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            })
+        ));
+        assert!(matches!(
+            NativeSnapshotArtifactState::from_current_v2(bytes),
+            Err(NativeSnapshotArtifactStateError::CurrentV2Profile(
+                NativeV2SnapshotCandidateStateError::UnexpectedVersion {
+                    found: NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                }
+            ))
+        ));
     }
 }
 

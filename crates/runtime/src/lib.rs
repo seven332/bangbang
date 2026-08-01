@@ -1495,7 +1495,7 @@ impl VmmController {
                 state: self.instance_info.state,
             });
         }
-        if input.clock_realtime() || input.vsock_override().is_some() {
+        if input.clock_realtime() {
             return Err(VmmActionError::SnapshotUnsupported);
         }
 
@@ -1555,6 +1555,7 @@ impl VmmController {
             memory_hotplug,
             network_configs,
             mmds_state,
+            vsock_config,
             resume_requested,
         ) = commit.into_parts();
         self.machine_config = machine_config;
@@ -1570,6 +1571,7 @@ impl VmmController {
             .map(|projection| projection.requested_size_mib())
             .unwrap_or(0);
         self.network_interface_configs = network_configs;
+        self.vsock_config = vsock_config;
         self.mmds_state = mmds_state.unwrap_or_else(|| {
             let data_store_limit_bytes = self
                 .mmds_state
@@ -3465,6 +3467,15 @@ mod tests {
             controller.preflight_load_snapshot(&network),
             Err(VmmActionError::SnapshotUnsupported),
             "native-v1 compatibility must retain its override rejection"
+        );
+        let vsock = snapshot_load_input().with_vsock_override(
+            super::snapshot::SnapshotVsockOverride::new("destination-vsock"),
+        );
+        assert_eq!(controller.preflight_load_snapshot_v2(&vsock), Ok(()));
+        assert_eq!(
+            controller.preflight_load_snapshot(&vsock),
+            Err(VmmActionError::SnapshotUnsupported),
+            "native-v1 compatibility must retain its vsock override rejection"
         );
 
         let uffd = SnapshotLoadInput::new(

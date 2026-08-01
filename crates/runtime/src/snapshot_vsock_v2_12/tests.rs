@@ -366,7 +366,7 @@ fn public_debug_and_error_text_redact_private_values() {
 fn exact_version_is_required_for_component_codec() {
     let state = inactive_mmio_state();
     assert!(matches!(
-        state.encode(crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION),
+        state.encode(crate::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION),
         Err(SnapshotV2VsockStateEncodeError::UnsupportedVersion)
     ));
     let encoded = state
@@ -374,7 +374,7 @@ fn exact_version_is_required_for_component_codec() {
         .expect("state should encode");
     assert!(matches!(
         SnapshotV2VsockState::decode(
-            crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION,
+            crate::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
             &encoded,
         ),
         Err(SnapshotV2VsockStateDecodeError::UnsupportedVersion)

@@ -29,14 +29,17 @@ mod macos_arm64 {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use bangbang_hvf::decode_hvf_snapshot_v2_network_state;
+    use bangbang_hvf::decode_hvf_snapshot_v2_vsock_state;
     use bangbang_runtime::balloon::VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
     use bangbang_runtime::block::{DriveCacheType, DriveIoEngine};
     use bangbang_runtime::mmds::MmdsVersion;
     use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonState;
     use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
     use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
-    use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
+    use bangbang_runtime::snapshot_format_v2::{
+        NATIVE_V2_VSOCK_COMPONENT_KEY, SnapshotV2Component, decode_snapshot_v2_state,
+        encode_snapshot_v2_state_with_compatibility_version,
+    };
     use bangbang_runtime::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugState;
     use bangbang_runtime::snapshot_network_v2_11::{
         SnapshotV2NetworkBackendClass, SnapshotV2NetworkLimiterState, SnapshotV2NetworkState,
@@ -678,10 +681,11 @@ mod macos_arm64 {
             r#""state":"Paused""#,
             "GET / after idempotent duplicate PATCH /vm Paused",
         );
-        assert_capture_ready_snapshot_rejected_without_artifacts(
+        assert_capture_ready_snapshot_succeeds(
             &socket_path,
             test_dir.path(),
-            "paused MMIO Async storage preflight",
+            "paused MMIO Async storage and vsock exact-2.12 publication",
+            ExpectedSnapshotOptionalProducts::STORAGE_AND_VSOCK,
         );
 
         let resume_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
@@ -3774,8 +3778,8 @@ mod macos_arm64 {
         });
         let structural =
             decode_snapshot_v2_state(&bytes).expect("balloon state should decode structurally");
-        let state = decode_hvf_snapshot_v2_network_state(&structural)
-            .expect("balloon state should decode as exact native-v2 2.11");
+        let state = decode_hvf_snapshot_v2_vsock_state(&structural)
+            .expect("balloon state should decode as exact native-v2 2.12");
         assert_eq!(
             state.device_graph().is_some(),
             expect_storage,
@@ -4497,8 +4501,8 @@ mod macos_arm64 {
         });
         let structural =
             decode_snapshot_v2_state(&bytes).expect("memory-hotplug state should decode");
-        let state = decode_hvf_snapshot_v2_network_state(&structural)
-            .expect("memory-hotplug state should be exact native-v2 2.11");
+        let state = decode_hvf_snapshot_v2_vsock_state(&structural)
+            .expect("memory-hotplug state should be exact native-v2 2.12");
         let graph = state
             .device_graph()
             .expect("memory-hotplug certification artifact should retain root and data");
@@ -6215,8 +6219,8 @@ mod macos_arm64 {
         });
         let structural =
             decode_snapshot_v2_state(&bytes).expect("entropy state should decode structurally");
-        let state = decode_hvf_snapshot_v2_network_state(&structural)
-            .expect("entropy state should decode as exact native-v2 2.11");
+        let state = decode_hvf_snapshot_v2_vsock_state(&structural)
+            .expect("entropy state should decode as exact native-v2 2.12");
         assert_eq!(
             state.device_graph().is_some(),
             with_storage,
@@ -7231,10 +7235,15 @@ mod macos_arm64 {
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
             "pause before product PCI memory-hotplug capture-ready preflight",
         );
-        assert_capture_ready_snapshot_rejected_without_artifacts(
+        let memory_hotplug_snapshot_directory =
+            test_dir.path().join("all-virtio-memory-hotplug-snapshot");
+        fs::create_dir(&memory_hotplug_snapshot_directory)
+            .expect("product PCI memory-hotplug snapshot directory should create");
+        assert_capture_ready_snapshot_succeeds(
             &socket_path,
-            test_dir.path(),
-            "paused product PCI memory-hotplug capture-ready preflight",
+            &memory_hotplug_snapshot_directory,
+            "paused product PCI all-device memory-hotplug exact-2.12 publication",
+            ExpectedSnapshotOptionalProducts::ALL_WITH_VSOCK,
         );
         assert_no_content_response(
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
@@ -7300,10 +7309,14 @@ mod macos_arm64 {
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
             "pause before product PCI balloon capture-ready preflight",
         );
-        assert_capture_ready_snapshot_rejected_without_artifacts(
+        let balloon_snapshot_directory = test_dir.path().join("all-virtio-balloon-snapshot");
+        fs::create_dir(&balloon_snapshot_directory)
+            .expect("product PCI balloon snapshot directory should create");
+        assert_capture_ready_snapshot_succeeds(
             &socket_path,
-            test_dir.path(),
-            "paused product PCI balloon capture-ready preflight",
+            &balloon_snapshot_directory,
+            "paused product PCI all-device balloon exact-2.12 publication",
+            ExpectedSnapshotOptionalProducts::ALL_WITH_VSOCK,
         );
         assert_no_content_response(
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
@@ -10519,23 +10532,29 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_resets_optional_vsock_before_unchanged_rejection_over_mmio() {
-        run_signed_vsock_snapshot_preflight_rejection(false);
+    fn signed_executable_restores_native_v2_vsock_snapshot_over_mmio() {
+        run_signed_vsock_snapshot_activation(false);
     }
 
     #[test]
-    fn signed_executable_resets_optional_vsock_before_unchanged_rejection_over_product_pci() {
-        run_signed_vsock_snapshot_preflight_rejection(true);
+    fn signed_executable_restores_native_v2_vsock_snapshot_over_product_pci() {
+        run_signed_vsock_snapshot_activation(true);
     }
 
-    fn run_signed_vsock_snapshot_preflight_rejection(enable_pci: bool) {
+    fn run_signed_vsock_snapshot_activation(enable_pci: bool) {
         let transport = if enable_pci { "product PCI" } else { "MMIO" };
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let data_backing_path = test_dir.path().join("vsock-reset.img");
         let uds_path = test_dir.path().join("vs.sock");
+        let override_uds_path = test_dir.path().join("override-vs.sock");
+        let rejected_uds_path = test_dir.path().join("rejected-vs.sock");
+        let state_path = test_dir.path().join("vsock.state");
+        let memory_path = test_dir.path().join("vsock.memory");
+        let no_vsock_state_path = test_dir.path().join("without-vsock.state");
+        let recaptured_state_path = test_dir.path().join("recaptured-vsock.state");
+        let recaptured_memory_path = test_dir.path().join("recaptured-vsock.memory");
         let old_port_path = vsock_port_path(&uds_path, DIRECT_ROOTFS_VSOCK_SNAPSHOT_OLD_PORT);
-        let fresh_port_path = vsock_port_path(&uds_path, DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_PORT);
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
         let instance_id = test_dir.instance_id();
@@ -10544,12 +10563,6 @@ mod macos_arm64 {
         let old_listener = UnixListener::bind(&old_port_path).unwrap_or_else(|err| {
             panic!(
                 "{transport} old vsock listener should bind before startup: {:?}",
-                err.kind()
-            )
-        });
-        let fresh_listener = UnixListener::bind(&fresh_port_path).unwrap_or_else(|err| {
-            panic!(
-                "{transport} fresh vsock listener should bind before startup: {:?}",
                 err.kind()
             )
         });
@@ -10677,44 +10690,220 @@ mod macos_arm64 {
             .set_nonblocking(false)
             .expect("old vsock stream should return to blocking I/O");
 
-        assert_capture_ready_snapshot_rejected_without_artifacts(
-            &socket_path,
-            test_dir.path(),
-            &format!("paused {transport} vsock capture-preflight rejection"),
-        );
-        old_stream
-            .set_nonblocking(true)
-            .expect("rejected snapshot should leave the reset old vsock stream probeable");
-        match old_stream.read(&mut unexpected) {
-            Ok(0) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => panic!(
-                "{transport} snapshot rejection returned before capture preflight reset the old vsock stream"
-            ),
-            Ok(bytes) => panic!(
-                "{transport} reset old vsock stream produced {bytes} unexpected byte(s) after snapshot rejection"
-            ),
-            Err(err) => panic!(
-                "{transport} reset old vsock stream probe failed after snapshot rejection: {:?}",
-                err.kind()
-            ),
-        }
+        let create_body = serde_json::json!({
+            "snapshot_type": "Full",
+            "snapshot_path": state_path,
+            "mem_file_path": memory_path,
+        })
+        .to_string();
         assert_no_content_response(
-            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
-            &format!("resume after vsock snapshot capture-preflight rejection {transport}"),
+            &http_put_json(&socket_path, "/snapshot/create", &create_body),
+            &format!("create paused {transport} exact-2.12 vsock snapshot"),
         );
+        assert!(state_path.is_file());
+        assert!(memory_path.is_file());
+        assert_native_v2_vsock_snapshot(&state_path, enable_pci, transport);
+        let state_before = fs::read(&state_path).expect("vsock snapshot state should read");
+        let memory_before = fs::read(&memory_path).expect("vsock snapshot memory should read");
+
+        if let Err(err) = read_unix_stream_eof(&mut old_stream) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} snapshot capture did not reset the source-only old stream: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
         drop(old_stream);
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            &format!("bangbang {transport} vsock snapshot source"),
+        );
+        assert!(
+            !uds_path.exists(),
+            "{transport} source shutdown should remove its process-owned listener"
+        );
+
+        write_native_v2_snapshot_without_vsock(&state_path, &no_vsock_state_path, transport);
+        let rejected_socket_path = test_dir.path().join("rejected-api.socket");
+        let rejected_instance_id = format!("{instance_id}-rejected");
+        let rejected = if enable_pci {
+            BangbangProcess::start_with_extra_args(
+                &rejected_socket_path,
+                &rejected_instance_id,
+                &["--enable-pci"],
+            )
+        } else {
+            BangbangProcess::start(&rejected_socket_path, &rejected_instance_id)
+        };
+        let rejected_body = signed_vsock_snapshot_load_body(
+            &no_vsock_state_path,
+            &memory_path,
+            false,
+            Some(&rejected_uds_path),
+        );
+        let rejected_response =
+            http_put_json(&rejected_socket_path, "/snapshot/load", &rejected_body);
+        assert_bad_request_response(
+            &rejected_response,
+            &format!("{transport} override without snapshot vsock"),
+        );
+        assert!(
+            !rejected_response.contains(path_text(&rejected_uds_path))
+                && !rejected_response.contains(path_text(&no_vsock_state_path))
+                && !rejected_response.contains(path_text(&memory_path)),
+            "{transport} override-without-device diagnostics must redact selectors and artifacts"
+        );
+        assert!(
+            http_get(&rejected_socket_path, "/").contains(r#""state":"Not started""#),
+            "{transport} rejected destination must remain Not started"
+        );
+        assert!(
+            !rejected_uds_path.exists(),
+            "{transport} rejected override must not publish a socket"
+        );
+        assert_clean_shutdown(
+            rejected.terminate(),
+            &rejected_socket_path,
+            &format!("bangbang {transport} rejected vsock snapshot destination"),
+        );
+
+        run_signed_vsock_snapshot_destination(SignedVsockSnapshotDestination {
+            enable_pci,
+            transport,
+            instance_id: &format!("{instance_id}-paused"),
+            api_socket: &test_dir.path().join("paused-api.socket"),
+            state: &state_path,
+            memory: &memory_path,
+            data_backing: &data_backing_path,
+            saved_uds_path: &uds_path,
+            destination_uds_path: &uds_path,
+            requested_override: None,
+            resume_vm: false,
+            recapture: Some((&recaptured_state_path, &recaptured_memory_path)),
+        });
+        assert_native_v2_vsock_snapshot(&recaptured_state_path, enable_pci, transport);
+
+        run_signed_vsock_snapshot_destination(SignedVsockSnapshotDestination {
+            enable_pci,
+            transport,
+            instance_id: &format!("{instance_id}-automatic"),
+            api_socket: &test_dir.path().join("automatic-api.socket"),
+            state: &state_path,
+            memory: &memory_path,
+            data_backing: &data_backing_path,
+            saved_uds_path: &uds_path,
+            destination_uds_path: &override_uds_path,
+            requested_override: Some(&override_uds_path),
+            resume_vm: true,
+            recapture: None,
+        });
+
+        assert_eq!(
+            fs::read(&state_path).expect("immutable vsock snapshot state should read"),
+            state_before,
+            "{transport} repeated loads must not mutate the state artifact"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("immutable vsock snapshot memory should read"),
+            memory_before,
+            "{transport} repeated loads must not mutate the memory artifact"
+        );
+        assert_no_snapshot_staging(test_dir.path());
+    }
+
+    struct SignedVsockSnapshotDestination<'a> {
+        enable_pci: bool,
+        transport: &'a str,
+        instance_id: &'a str,
+        api_socket: &'a Path,
+        state: &'a Path,
+        memory: &'a Path,
+        data_backing: &'a Path,
+        saved_uds_path: &'a Path,
+        destination_uds_path: &'a Path,
+        requested_override: Option<&'a Path>,
+        resume_vm: bool,
+        recapture: Option<(&'a Path, &'a Path)>,
+    }
+
+    fn run_signed_vsock_snapshot_destination(case: SignedVsockSnapshotDestination<'_>) {
+        let SignedVsockSnapshotDestination {
+            enable_pci,
+            transport,
+            instance_id,
+            api_socket,
+            state,
+            memory,
+            data_backing,
+            saved_uds_path,
+            destination_uds_path,
+            requested_override,
+            resume_vm,
+            recapture,
+        } = case;
+        reset_zeroed_block_backing(data_backing, 1);
+        let fresh_port_path = vsock_port_path(
+            destination_uds_path,
+            DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_PORT,
+        );
+        let fresh_listener = UnixListener::bind(&fresh_port_path).unwrap_or_else(|err| {
+            panic!(
+                "{transport} destination fresh listener should bind before load: {:?}",
+                err.kind()
+            )
+        });
+        let mut destination = if enable_pci {
+            BangbangProcess::start_with_extra_args(api_socket, instance_id, &["--enable-pci"])
+        } else {
+            BangbangProcess::start(api_socket, instance_id)
+        };
+        let body = signed_vsock_snapshot_load_body(state, memory, resume_vm, requested_override);
+        let load_response = http_put_json(api_socket, "/snapshot/load", &body);
+        assert_no_content_response(
+            &load_response,
+            &format!("{transport} exact-2.12 vsock snapshot load"),
+        );
+        let expected_state = if resume_vm { "Running" } else { "Paused" };
+        assert!(
+            http_get(api_socket, "/").contains(&format!(r#""state":"{expected_state}""#)),
+            "{transport} destination should commit {expected_state}"
+        );
+        assert!(
+            destination_uds_path.exists(),
+            "{transport} destination should own its selected main listener"
+        );
+        if destination_uds_path != saved_uds_path {
+            assert!(
+                !saved_uds_path.exists(),
+                "{transport} override load must not republish the saved selector"
+            );
+        }
+        if !resume_vm {
+            assert_no_content_response(
+                &http_json(api_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+                &format!("resume paused {transport} exact-2.12 vsock destination"),
+            );
+        }
 
         let mut fresh_stream =
             wait_for_unix_listener_accept(&fresh_listener, GUEST_EXECUTION_TIMEOUT)
                 .unwrap_or_else(|err| {
-                    let prefix = file_prefix_lossy(&data_backing_path, 128);
-                    let output = bangbang.force_stop_and_collect();
+                    let prefix = file_prefix_lossy(data_backing, 128);
+                    let output = destination.force_stop_and_collect();
                     panic!(
-                        "{transport} guest did not establish a fresh vsock connection after the host closed the preserved old stream: {err}; control prefix: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                        "{transport} restored guest did not establish a fresh vsock connection: {err}; control prefix: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                         output.status, output.stdout, output.stderr
                     );
                 });
         drop(fresh_listener);
+        fs::remove_file(&fresh_port_path).unwrap_or_else(|err| {
+            panic!(
+                "{transport} host-owned fresh listener path should clean up: {:?}",
+                err.kind()
+            )
+        });
         fresh_stream
             .set_nonblocking(false)
             .expect("fresh vsock stream should use blocking I/O");
@@ -10726,61 +10915,155 @@ mod macos_arm64 {
             .expect("fresh vsock stream write timeout should set");
         let mut fresh_ready = vec![0; DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_READY.len()];
         fresh_stream.read_exact(&mut fresh_ready).unwrap_or_else(|err| {
-            let output = bangbang.force_stop_and_collect();
+            let output = destination.force_stop_and_collect();
             panic!(
-                "{transport} fresh vsock connection did not publish readiness: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "{transport} fresh restored vsock connection did not publish readiness: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         });
         assert_eq!(
             fresh_ready, DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_READY,
-            "{transport} fresh vsock readiness payload should match"
+            "{transport} restored fresh readiness payload should match"
         );
         fresh_stream
             .write_all(DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_ACK)
             .unwrap_or_else(|err| {
-                let output = bangbang.force_stop_and_collect();
+                let output = destination.force_stop_and_collect();
                 panic!(
-                    "{transport} host did not acknowledge the fresh vsock connection: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    "{transport} host did not acknowledge the restored fresh connection: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                     output.status, output.stdout, output.stderr
                 );
             });
         shutdown_unix_stream_write(&fresh_stream).unwrap_or_else(|err| {
-            let output = bangbang.force_stop_and_collect();
+            let output = destination.force_stop_and_collect();
             panic!(
-                "{transport} host did not half-close the fresh vsock connection: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "{transport} host did not half-close the restored fresh connection: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         });
         if let Err(err) = read_unix_stream_eof(&mut fresh_stream) {
-            let output = bangbang.force_stop_and_collect();
+            let output = destination.force_stop_and_collect();
             panic!(
-                "{transport} host did not observe EOF on the fresh vsock connection: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "{transport} host did not observe restored fresh connection EOF: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
 
         if let Err(err) = wait_for_file_prefix_marker(
-            &data_backing_path,
+            data_backing,
             DIRECT_ROOTFS_VSOCK_SNAPSHOT_SUCCESS,
             GUEST_EXECUTION_TIMEOUT,
         ) {
-            let prefix = file_prefix_lossy(&data_backing_path, 128);
-            let output = bangbang.force_stop_and_collect();
+            let prefix = file_prefix_lossy(data_backing, 128);
+            let output = destination.force_stop_and_collect();
             panic!(
-                "{transport} guest did not confirm reset and fresh reconnection: {err}; control prefix: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "{transport} restored guest did not confirm reset and fresh traffic: {err}; control prefix: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
 
+        if let Some((recaptured_state, recaptured_memory)) = recapture {
+            assert_no_content_response(
+                &http_json(api_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+                &format!("pause restored {transport} vsock destination before recapture"),
+            );
+            let recapture_body = serde_json::json!({
+                "snapshot_type": "Full",
+                "snapshot_path": recaptured_state,
+                "mem_file_path": recaptured_memory,
+            })
+            .to_string();
+            assert_no_content_response(
+                &http_put_json(api_socket, "/snapshot/create", &recapture_body),
+                &format!("recapture restored {transport} exact-2.12 vsock destination"),
+            );
+        }
+
         assert_clean_shutdown(
-            bangbang.terminate(),
-            &socket_path,
-            &format!("bangbang vsock snapshot reset {transport}"),
+            destination.terminate(),
+            api_socket,
+            &format!("bangbang restored {transport} vsock snapshot destination"),
         );
         assert!(
-            !uds_path.exists(),
-            "{transport} shutdown should remove the process-owned main vsock listener"
+            !destination_uds_path.exists(),
+            "{transport} destination shutdown should remove its selected main listener"
+        );
+    }
+
+    fn signed_vsock_snapshot_load_body(
+        state: &Path,
+        memory: &Path,
+        resume_vm: bool,
+        requested_override: Option<&Path>,
+    ) -> String {
+        let mut body = serde_json::json!({
+            "snapshot_path": state,
+            "mem_backend": {
+                "backend_path": memory,
+                "backend_type": "File",
+            },
+            "resume_vm": resume_vm,
+        });
+        if let Some(requested_override) = requested_override {
+            body["vsock_override"] = serde_json::json!({
+                "uds_path": requested_override,
+            });
+        }
+        body.to_string()
+    }
+
+    fn assert_native_v2_vsock_snapshot(path: &Path, enable_pci: bool, context: &str) {
+        let bytes = fs::read(path).expect("exact-2.12 vsock snapshot state should read");
+        let structural =
+            decode_snapshot_v2_state(&bytes).expect("exact-2.12 vsock state should decode");
+        let state = decode_hvf_snapshot_v2_vsock_state(&structural)
+            .expect("exact-2.12 vsock state should decode semantically");
+        let vsock = state
+            .vsock()
+            .expect("exact-2.12 activation artifact should contain kind 13");
+        assert_eq!(vsock.guest_cid(), 3, "{context} guest CID should persist");
+        assert_eq!(
+            vsock.transport().kind(),
+            if enable_pci {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            },
+            "{context} vsock transport should persist"
+        );
+    }
+
+    fn write_native_v2_snapshot_without_vsock(source: &Path, destination: &Path, context: &str) {
+        let bytes = fs::read(source).expect("source exact-2.12 state should read");
+        let structural =
+            decode_snapshot_v2_state(&bytes).expect("source exact-2.12 state should decode");
+        let required_features = structural.required_features().collect::<Vec<_>>();
+        let mut removed = 0;
+        let components = structural
+            .components()
+            .filter(|component| {
+                let retain = component.key() != NATIVE_V2_VSOCK_COMPONENT_KEY;
+                removed += usize::from(!retain);
+                retain
+            })
+            .collect::<Vec<SnapshotV2Component<'_>>>();
+        assert_eq!(removed, 1, "{context} fixture should remove one kind 13");
+        let encoded = encode_snapshot_v2_state_with_compatibility_version(
+            structural.metadata().version(),
+            &required_features,
+            &components,
+        )
+        .expect("exact-2.12 state without vsock should encode");
+        fs::write(destination, encoded).expect("exact-2.12 no-vsock fixture should write");
+        let rewritten =
+            fs::read(destination).expect("rewritten exact-2.12 no-vsock state should read");
+        let structural =
+            decode_snapshot_v2_state(&rewritten).expect("rewritten exact-2.12 state should decode");
+        let state = decode_hvf_snapshot_v2_vsock_state(&structural)
+            .expect("rewritten exact-2.12 no-vsock state should decode semantically");
+        assert!(
+            state.vsock().is_none(),
+            "{context} rewritten fixture should omit kind 13"
         );
     }
 
@@ -11784,8 +12067,8 @@ mod macos_arm64 {
         });
         let structural =
             decode_snapshot_v2_state(&bytes).expect("network state should decode structurally");
-        let state = decode_hvf_snapshot_v2_network_state(&structural)
-            .expect("network state should decode as exact native-v2 2.11");
+        let state = decode_hvf_snapshot_v2_vsock_state(&structural)
+            .expect("network state should decode as exact native-v2 2.12");
         let graph = state
             .device_graph()
             .expect("network certification source should retain root and data");
@@ -13964,7 +14247,7 @@ mod macos_arm64 {
         let bytes = fs::read(path).expect("configured serial snapshot state should read");
         let structural = decode_snapshot_v2_state(&bytes)
             .expect("configured serial snapshot state should decode");
-        let decoded = decode_hvf_snapshot_v2_network_state(&structural)
+        let decoded = decode_hvf_snapshot_v2_vsock_state(&structural)
             .expect("configured serial snapshot state should decode semantically");
         assert!(decoded.device_graph().is_none());
         assert_eq!(
@@ -14016,7 +14299,7 @@ mod macos_arm64 {
         let bytes = fs::read(path).expect("serial snapshot state should read");
         let structural =
             decode_snapshot_v2_state(&bytes).expect("serial snapshot state should decode");
-        let decoded = decode_hvf_snapshot_v2_network_state(&structural)
+        let decoded = decode_hvf_snapshot_v2_vsock_state(&structural)
             .expect("serial snapshot state should decode semantically");
         assert!(
             decoded
@@ -14204,7 +14487,7 @@ mod macos_arm64 {
             "native-v2 description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.11.0");
+        assert_eq!(described.stdout.trim(), "v2.12.0");
 
         let collision = http_json_with_io_timeout(
             &source_socket,
@@ -14727,7 +15010,7 @@ mod macos_arm64 {
             "{transport} native-v2 root description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.11.0");
+        assert_eq!(described.stdout.trim(), "v2.12.0");
         let source_output = source.terminate();
         assert_clean_shutdown(
             source_output,
@@ -15841,7 +16124,7 @@ mod macos_arm64 {
         });
         let structural =
             decode_snapshot_v2_state(&bytes).expect("native-v2 state should decode structurally");
-        decode_hvf_snapshot_v2_network_state(&structural)
+        decode_hvf_snapshot_v2_vsock_state(&structural)
             .expect("native-v2 state should decode semantically")
             .device_graph()
             .expect("storage-bearing native-v2 state should contain a device graph")
@@ -16085,19 +16368,6 @@ mod macos_arm64 {
         );
     }
 
-    fn assert_capture_ready_snapshot_rejected_without_artifacts(
-        socket_path: &Path,
-        directory: &Path,
-        context: &str,
-    ) {
-        assert_snapshot_rejected_without_artifacts(
-            socket_path,
-            directory,
-            context,
-            "Snapshot and restore are not supported.",
-        );
-    }
-
     #[derive(Clone, Copy)]
     struct ExpectedSnapshotOptionalProducts {
         storage: bool,
@@ -16105,6 +16375,7 @@ mod macos_arm64 {
         balloon: bool,
         memory_hotplug: bool,
         network: bool,
+        vsock: bool,
     }
 
     impl ExpectedSnapshotOptionalProducts {
@@ -16114,10 +16385,15 @@ mod macos_arm64 {
             balloon: false,
             memory_hotplug: false,
             network: false,
+            vsock: false,
         };
         const STORAGE: Self = Self {
             storage: true,
             ..Self::NONE
+        };
+        const STORAGE_AND_VSOCK: Self = Self {
+            vsock: true,
+            ..Self::STORAGE
         };
         const STORAGE_AND_ENTROPY: Self = Self {
             entropy: true,
@@ -16139,6 +16415,14 @@ mod macos_arm64 {
             entropy: true,
             balloon: true,
             memory_hotplug: true,
+            ..Self::STORAGE
+        };
+        const ALL_WITH_VSOCK: Self = Self {
+            entropy: true,
+            balloon: true,
+            memory_hotplug: true,
+            network: true,
+            vsock: true,
             ..Self::STORAGE
         };
     }
@@ -16169,8 +16453,8 @@ mod macos_arm64 {
         let bytes = fs::read(&state_path).expect("capture-ready state should read");
         let structural =
             decode_snapshot_v2_state(&bytes).expect("capture-ready state should be exact current");
-        let state = decode_hvf_snapshot_v2_network_state(&structural)
-            .expect("capture-ready state should use the exact-2.11 network profile");
+        let state = decode_hvf_snapshot_v2_vsock_state(&structural)
+            .expect("capture-ready state should use the exact-2.12 vsock profile");
         assert_eq!(
             state.device_graph().is_some(),
             expected.storage,
@@ -16196,35 +16480,11 @@ mod macos_arm64 {
             expected.network,
             "{context} network profile presence should match"
         );
-        assert_no_snapshot_staging(directory);
-    }
-
-    fn assert_snapshot_rejected_without_artifacts(
-        socket_path: &Path,
-        directory: &Path,
-        context: &str,
-        expected_error: &str,
-    ) {
-        let state_path = directory.join("capture-ready-rejected.state");
-        let memory_path = directory.join("capture-ready-rejected.memory");
-        let response = http_json_with_io_timeout(
-            socket_path,
-            "PUT",
-            "/snapshot/create",
-            &format!(
-                r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
-                json_string(path_text(&state_path)),
-                json_string(path_text(&memory_path))
-            ),
-            GUEST_EXECUTION_TIMEOUT,
+        assert_eq!(
+            state.vsock().is_some(),
+            expected.vsock,
+            "{context} vsock profile presence should match"
         );
-
-        assert_bad_request_response(&response, context);
-        assert_response_contains(&response, expected_error, context);
-        assert!(!response.contains(path_text(&state_path)));
-        assert!(!response.contains(path_text(&memory_path)));
-        assert!(!state_path.exists());
-        assert!(!memory_path.exists());
         assert_no_snapshot_staging(directory);
     }
 

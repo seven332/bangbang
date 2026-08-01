@@ -90,12 +90,12 @@ use bangbang_hvf::{
     decode_hvf_snapshot_v2_memory_hotplug_state, decode_hvf_snapshot_v2_multi_block_state,
     decode_hvf_snapshot_v2_network_state, decode_hvf_snapshot_v2_platform_state,
     decode_hvf_snapshot_v2_serial_state, decode_hvf_snapshot_v2_state,
-    decode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_balloon_state,
-    encode_hvf_snapshot_v2_entropy_state, encode_hvf_snapshot_v2_memory_hotplug_state,
-    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_network_state,
-    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
-    encode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_vsock_state,
-    prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    decode_hvf_snapshot_v2_storage_state, decode_hvf_snapshot_v2_vsock_state,
+    encode_hvf_snapshot_v2_balloon_state, encode_hvf_snapshot_v2_entropy_state,
+    encode_hvf_snapshot_v2_memory_hotplug_state, encode_hvf_snapshot_v2_multi_block_state,
+    encode_hvf_snapshot_v2_network_state, encode_hvf_snapshot_v2_serial_state,
+    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
+    encode_hvf_snapshot_v2_vsock_state, prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
     prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_pci_platform_plan,
@@ -180,7 +180,7 @@ use bangbang_runtime::snapshot::{
     SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackendType, SnapshotNetworkOverride,
     SnapshotV1ControllerCommit, SnapshotV2ControllerCommit,
     SnapshotV2ControllerCommitProductConfigs, SnapshotV2NetworkControllerCommitProductConfigs,
-    SnapshotVsockOverride,
+    SnapshotV2VsockControllerCommitProductConfigs, SnapshotVsockOverride,
 };
 #[cfg(target_os = "macos")]
 use bangbang_runtime::snapshot_artifact::SnapshotStagingTracker;
@@ -437,6 +437,7 @@ pub(crate) struct NativeV2SnapshotPublicationRequest {
     pub(crate) network_configs: Vec<NetworkInterfaceConfig>,
     pub(crate) mmds_config: Option<MmdsConfig>,
     pub(crate) mmds_state: MmdsStateHandle,
+    pub(crate) vsock_config: Option<VsockConfig>,
     pub(crate) expected_transport: SnapshotV2DeviceTransportKind,
     pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
 }
@@ -533,6 +534,18 @@ pub(crate) struct ProcessSnapshotV2NetworkLoadRequest<'a> {
     pub(crate) pci_enabled: bool,
     pub(crate) input: &'a SnapshotLoadInput,
     pub(crate) candidate: NativeV2NetworkSnapshotCandidateState,
+    pub(crate) memory: GuestMemory,
+    pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
+pub(crate) struct ProcessSnapshotV2VsockLoadRequest<'a> {
+    pub(crate) controller: &'a VmmController,
+    pub(crate) vmnet_authority: ProcessVmnetAuthority,
+    #[cfg(target_os = "macos")]
+    pub(crate) contained_restore_authority: Option<&'a ContainedSnapshotRestoreAuthority>,
+    pub(crate) pci_enabled: bool,
+    pub(crate) input: &'a SnapshotLoadInput,
+    pub(crate) candidate: NativeV2VsockSnapshotCandidateState,
     pub(crate) memory: GuestMemory,
     pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
 }
@@ -776,6 +789,15 @@ pub(crate) trait InstanceStartExecutor {
         ))
     }
 
+    fn load_prepared_snapshot_v2_vsock(
+        &mut self,
+        _request: ProcessSnapshotV2VsockLoadRequest<'_>,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        Err(NativeV2SnapshotLoadError::ProcessPreparation(
+            BackendError::InvalidState("native-v2 vsock snapshot loading is unavailable"),
+        ))
+    }
+
     fn commit_prepared_snapshot_v2_root_load(
         &mut self,
         _completion: ProcessSnapshotV2RootLoadCompletion,
@@ -909,7 +931,7 @@ enum NativeV2SnapshotCaptureProfile {
         mmds_config: Option<MmdsConfig>,
         mmds_state: MmdsStateHandle,
         vsock_config: Option<VsockConfig>,
-        expected_vsock_metrics: SharedVsockDeviceMetrics,
+        expected_vsock_metrics: Option<SharedVsockDeviceMetrics>,
         expected_transport: SnapshotV2DeviceTransportKind,
     },
 }
@@ -2358,7 +2380,7 @@ pub(crate) enum NativeV1SnapshotPublicationProducerError {
 pub(crate) enum NativeV2SnapshotPublicationError {
     Preflight(VmmActionError),
     CaptureReadyPreflight(SnapshotCaptureReadyPreflightError),
-    Profile(NativeV2NetworkCandidateProfileError),
+    Profile(NativeV2VsockCandidateProfileError),
     Resource(GrantClaimError),
     SessionUnavailable,
     ConfigurationUnavailable,
@@ -3326,6 +3348,65 @@ impl fmt::Display for NativeV2NetworkDestinationLoadError {
 #[cfg(target_os = "macos")]
 impl std::error::Error for NativeV2NetworkDestinationLoadError {}
 
+#[cfg(target_os = "macos")]
+pub(crate) struct NativeV2VsockDestinationLoadError {
+    transport: SnapshotV2DeviceTransportKind,
+    terminal: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeV2VsockDestinationLoadError {
+    const fn new(transport: SnapshotV2DeviceTransportKind, terminal: bool) -> Self {
+        Self {
+            transport,
+            terminal,
+        }
+    }
+
+    fn with_source(
+        transport: SnapshotV2DeviceTransportKind,
+        terminal: bool,
+        _source: &(dyn std::error::Error + 'static),
+    ) -> Self {
+        Self::new(transport, terminal)
+    }
+
+    const fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for NativeV2VsockDestinationLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2VsockDestinationLoadError")
+            .field("transport", &self.transport)
+            .field("terminal", &self.terminal)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for NativeV2VsockDestinationLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "native-v2 2.12 {:?} vsock destination transaction failed ({})",
+            self.transport,
+            if self.terminal {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for NativeV2VsockDestinationLoadError {}
+
 #[allow(
     dead_code,
     reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
@@ -3389,6 +3470,11 @@ pub(crate) enum NativeV2SnapshotLoadError {
     NetworkBundle(SnapshotV2SerialRestoreBundleError),
     #[cfg(target_os = "macos")]
     NetworkDestination(NativeV2NetworkDestinationLoadError),
+    VsockPreparation(NativeV2VsockSnapshotPreparationError),
+    #[cfg(target_os = "macos")]
+    VsockRestoreResources(ProcessSnapshotV2VsockRestoreResourceError),
+    #[cfg(target_os = "macos")]
+    VsockDestination(NativeV2VsockDestinationLoadError),
     AfterResourceAdoption {
         source: Box<NativeV2SnapshotLoadError>,
     },
@@ -3489,6 +3575,12 @@ impl NativeV2SnapshotLoadError {
             }
             #[cfg(target_os = "macos")]
             Self::NetworkDestination(source) => source.is_terminal(),
+            #[cfg(target_os = "macos")]
+            Self::VsockRestoreResources(source) => {
+                source.disposition() == ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+            }
+            #[cfg(target_os = "macos")]
+            Self::VsockDestination(source) => source.is_terminal(),
             Self::Restore(source) => source.is_committed() || !source.cleanup_failures().is_empty(),
             Self::RootRestore(source) => source.is_terminal(),
             Self::Preflight(_)
@@ -3502,6 +3594,7 @@ impl NativeV2SnapshotLoadError {
             | Self::CandidateMismatch
             | Self::MemoryHotplugPreparation(_)
             | Self::NetworkPreparation(_)
+            | Self::VsockPreparation(_)
             | Self::Decode(_)
             | Self::RootPlan(_)
             | Self::RootConfiguration(_)
@@ -3675,6 +3768,21 @@ impl fmt::Display for NativeV2SnapshotLoadError {
             }
             #[cfg(target_os = "macos")]
             Self::NetworkDestination(source) => source.fmt(formatter),
+            Self::VsockPreparation(source) => {
+                write!(
+                    formatter,
+                    "native-v2 2.12 vsock topology preparation failed: {source}"
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::VsockRestoreResources(source) => {
+                write!(
+                    formatter,
+                    "native-v2 2.12 process resource preparation failed: {source}"
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::VsockDestination(source) => source.fmt(formatter),
             Self::AfterResourceAdoption { source } => {
                 write!(
                     formatter,
@@ -3839,6 +3947,11 @@ impl std::error::Error for NativeV2SnapshotLoadError {
             Self::NetworkDestination(source) => Some(source),
             #[cfg(target_os = "macos")]
             Self::NetworkRestorePlan => None,
+            Self::VsockPreparation(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::VsockRestoreResources(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::VsockDestination(source) => Some(source),
             Self::AfterResourceAdoption { source } => Some(source.as_ref()),
             #[cfg(target_os = "macos")]
             Self::RootResourceCleanup { source, .. } => Some(source.as_ref()),
@@ -7403,11 +7516,21 @@ where
             .state
             .v2_profile()
             .map_err(NativeV2SnapshotLoadError::ArtifactState)?;
-        if !matches!(profile, NativeV2SnapshotArtifactProfile::NetworkStateV2_11)
-            && !input.network_overrides().is_empty()
+        if !matches!(
+            profile,
+            NativeV2SnapshotArtifactProfile::NetworkStateV2_11
+                | NativeV2SnapshotArtifactProfile::VsockStateV2_12
+        ) && !input.network_overrides().is_empty()
         {
             return Err(NativeV2SnapshotLoadError::NetworkPreparation(
                 NativeV2NetworkSnapshotPreparationError::OverridesWithoutNetwork,
+            ));
+        }
+        if !matches!(profile, NativeV2SnapshotArtifactProfile::VsockStateV2_12)
+            && input.vsock_override().is_some()
+        {
+            return Err(NativeV2SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported,
             ));
         }
         self.starter
@@ -7425,18 +7548,14 @@ where
             | NativeV2SnapshotArtifactProfile::EntropyStateV2_8
             | NativeV2SnapshotArtifactProfile::BalloonStateV2_9
             | NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
-            | NativeV2SnapshotArtifactProfile::NetworkStateV2_11 => {
+            | NativeV2SnapshotArtifactProfile::NetworkStateV2_11
+            | NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
                 self.starter
                     .preflight_snapshot_v2_root_process(self.pci_enabled)
                     .map_err(NativeV2SnapshotLoadError::Preflight)?;
                 if !self.snapshot_capture_cancellation.begin_operation() {
                     return Err(NativeV2SnapshotLoadError::Cancelled);
                 }
-            }
-            NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
-                return Err(NativeV2SnapshotLoadError::Preflight(
-                    VmmActionError::SnapshotUnsupported,
-                ));
             }
         }
 
@@ -7798,7 +7917,7 @@ where
             }
             NativeV2SnapshotArtifactProfile::NetworkStateV2_11 => {
                 let (candidate, memory) = artifacts
-                    .into_current_v2_candidate()
+                    .into_v2_11_candidate()
                     .map_err(NativeV2SnapshotLoadError::ArtifactState)
                     .map_err(|source| {
                         if resource_adopted {
@@ -7835,9 +7954,45 @@ where
                 self.started_session = Some(session);
                 Ok(self.controller.commit_snapshot_v2_load(controller_commit))
             }
-            NativeV2SnapshotArtifactProfile::VsockStateV2_12 => Err(
-                NativeV2SnapshotLoadError::Preflight(VmmActionError::SnapshotUnsupported),
-            ),
+            NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
+                let (candidate, memory) = artifacts
+                    .into_current_v2_candidate()
+                    .map_err(NativeV2SnapshotLoadError::ArtifactState)
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let restored = self
+                    .starter
+                    .load_prepared_snapshot_v2_vsock(ProcessSnapshotV2VsockLoadRequest {
+                        controller: &self.controller,
+                        vmnet_authority: self.vmnet_authority,
+                        #[cfg(target_os = "macos")]
+                        contained_restore_authority: self.contained_restore_authority.as_ref(),
+                        pci_enabled: self.pci_enabled,
+                        input,
+                        candidate,
+                        memory,
+                        cancellation: self.snapshot_capture_cancellation.clone(),
+                    })
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let (session, controller_commit) = restored.into_parts();
+                self.started_session = Some(session);
+                Ok(self.controller.commit_snapshot_v2_load(controller_commit))
+            }
         }
     }
 
@@ -9312,7 +9467,7 @@ where
     }
 
     /// Publishes one strictly admitted paused source as a current native-v2
-    /// 2.11 pair, including the network-free case.
+    /// 2.12 pair, including the vsock-free case.
     ///
     /// The public create action reaches this seam after request normalization.
     pub(crate) fn publish_native_v2_snapshot(
@@ -9322,13 +9477,7 @@ where
         self.controller
             .preflight_create_snapshot_v2_request(input)
             .map_err(NativeV2SnapshotPublicationError::Preflight)?;
-        if self.controller.vsock_config().is_some() {
-            let cancellation = self.snapshot_capture_cancellation.clone();
-            let _serial = self
-                .preflight_snapshot_capture_ready(cancellation)
-                .map_err(SnapshotCaptureReadyPreflightError::into_native_v2)?;
-        }
-        let NativeV2NetworkCandidateProductProfile {
+        let NativeV2VsockCandidateProductProfile {
             input: capture_input,
             serial_config,
             entropy_config,
@@ -9339,9 +9488,10 @@ where
             network_configs,
             mmds_config,
             mmds_state,
+            vsock_config,
             expected_transport,
         } = self
-            .native_v2_network_candidate_product_profile()
+            .native_v2_vsock_candidate_product_profile()
             .map_err(NativeV2SnapshotPublicationError::Profile)?;
         let cancellation = self.snapshot_capture_cancellation.clone();
         let _serial = self
@@ -9370,6 +9520,7 @@ where
             network_configs,
             mmds_config,
             mmds_state,
+            vsock_config,
             expected_transport,
             cancellation,
         };
@@ -9680,8 +9831,8 @@ const _: fn(
     -> Result<NativeV2NetworkSnapshotCandidateState, NativeV2NetworkCandidateProcessError> =
     ProcessVmm::<HvfInstanceStartExecutor>::capture_native_v2_network_candidate;
 
-// Keep the exact-2.12 vsock candidate seam type-checked while public create,
-// load, and artifact authority remain pinned to exact 2.11.
+// Keep the current exact-2.12 vsock candidate seam type-checked alongside the
+// public create, load, and artifact-authority transaction.
 const _: fn(
     &mut ProcessVmm<HvfInstanceStartExecutor>,
     BoxedNativeV2SnapshotMemoryOutput,
@@ -9876,9 +10027,7 @@ impl HvfInstanceStartExecutor {
                 NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
             }
             NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
-                return Err(NativeV2SnapshotLoadError::Preflight(
-                    VmmActionError::SnapshotUnsupported,
-                ));
+                NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
             }
         };
         let structural = decode_snapshot_v2_state_with_compatibility_version(bytes, version)
@@ -9921,9 +10070,8 @@ impl HvfInstanceStartExecutor {
                     .map_err(NativeV2SnapshotLoadError::Decode)?;
             }
             NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
-                return Err(NativeV2SnapshotLoadError::Preflight(
-                    VmmActionError::SnapshotUnsupported,
-                ));
+                decode_hvf_snapshot_v2_vsock_state(&structural)
+                    .map_err(NativeV2SnapshotLoadError::Decode)?;
             }
         }
         Ok(())
@@ -11207,13 +11355,18 @@ impl std::error::Error for HvfSnapshotV2SerialConstructionError {
 #[derive(Debug)]
 struct HvfSnapshotV2SerialDestinationCleanupError {
     session: Option<BackendError>,
+    vsock: bool,
     restoration: Option<SerialStdioRestorationError>,
 }
 
 #[cfg(target_os = "macos")]
 impl fmt::Display for HvfSnapshotV2SerialDestinationCleanupError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("native-v2 serial-bearing destination cleanup failed")
+        formatter.write_str("native-v2 serial-bearing destination cleanup failed")?;
+        if self.vsock {
+            formatter.write_str("; vsock publication cleanup is uncertain")?;
+        }
+        Ok(())
     }
 }
 
@@ -11246,12 +11399,20 @@ enum HvfSnapshotV2SerialControllerProfile {
         balloon_config: Option<BalloonConfig>,
         memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
     },
-    CurrentV2_11 {
+    RetainedV2_11 {
         entropy_config: Option<EntropyConfig>,
         balloon_config: Option<BalloonConfig>,
         memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
         network_configs: NetworkInterfaceConfigs,
         mmds_state: Option<MmdsStateHandle>,
+    },
+    CurrentV2_12 {
+        entropy_config: Option<EntropyConfig>,
+        balloon_config: Option<BalloonConfig>,
+        memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
+        network_configs: NetworkInterfaceConfigs,
+        mmds_state: Option<MmdsStateHandle>,
+        vsock_config: Option<VsockConfig>,
     },
 }
 
@@ -11267,7 +11428,8 @@ impl fmt::Debug for HvfSnapshotV2SerialControllerProfile {
                     Self::RetainedV2_8 { .. } => "2.8",
                     Self::CurrentV2_9 { .. } => "2.9",
                     Self::CurrentV2_10 { .. } => "2.10",
-                    Self::CurrentV2_11 { .. } => "2.11",
+                    Self::RetainedV2_11 { .. } => "2.11",
+                    Self::CurrentV2_12 { .. } => "2.12",
                 },
             )
             .field(
@@ -11282,7 +11444,10 @@ impl fmt::Debug for HvfSnapshotV2SerialControllerProfile {
                     } | Self::CurrentV2_10 {
                         entropy_config: Some(_),
                         ..
-                    } | Self::CurrentV2_11 {
+                    } | Self::RetainedV2_11 {
+                        entropy_config: Some(_),
+                        ..
+                    } | Self::CurrentV2_12 {
                         entropy_config: Some(_),
                         ..
                     }
@@ -11298,7 +11463,10 @@ impl fmt::Debug for HvfSnapshotV2SerialControllerProfile {
                     } | Self::CurrentV2_10 {
                         balloon_config: Some(_),
                         ..
-                    } | Self::CurrentV2_11 {
+                    } | Self::RetainedV2_11 {
+                        balloon_config: Some(_),
+                        ..
+                    } | Self::CurrentV2_12 {
                         balloon_config: Some(_),
                         ..
                     }
@@ -11311,7 +11479,10 @@ impl fmt::Debug for HvfSnapshotV2SerialControllerProfile {
                     Self::CurrentV2_10 {
                         memory_hotplug: Some(_),
                         ..
-                    } | Self::CurrentV2_11 {
+                    } | Self::RetainedV2_11 {
+                        memory_hotplug: Some(_),
+                        ..
+                    } | Self::CurrentV2_12 {
                         memory_hotplug: Some(_),
                         ..
                     }
@@ -11320,19 +11491,33 @@ impl fmt::Debug for HvfSnapshotV2SerialControllerProfile {
             .field(
                 "network_interface_count",
                 &match self {
-                    Self::CurrentV2_11 {
+                    Self::RetainedV2_11 {
+                        network_configs, ..
+                    }
+                    | Self::CurrentV2_12 {
                         network_configs, ..
                     } => network_configs.as_slice().len(),
                     _ => 0,
                 },
             )
+            .field(
+                "has_vsock",
+                &matches!(
+                    self,
+                    Self::CurrentV2_12 {
+                        vsock_config: Some(_),
+                        ..
+                    }
+                ),
+            )
             .finish()
     }
 }
 
-/// Complete exact-2.7 through exact-2.11 serial-bearing process owner. The stdio
+/// Complete exact-2.7 through exact-2.12 serial-bearing process owner. The stdio
 /// restoration receipt remains outside the worker and is finished only after
-/// worker, UART, input, active-output, and network-resource teardown.
+/// worker, UART, input, active-output, vsock publication, and network-resource
+/// teardown.
 #[cfg(target_os = "macos")]
 pub(crate) struct HvfSnapshotV2SerialDestination {
     session: Option<Box<HvfProcessSession>>,
@@ -11340,6 +11525,7 @@ pub(crate) struct HvfSnapshotV2SerialDestination {
     has_storage: bool,
     serial_config: Option<SerialConfig>,
     controller_profile: HvfSnapshotV2SerialControllerProfile,
+    active_vsock: Option<ActiveVsockRestoreGuard>,
     network_resources: Vec<PreparedProcessSnapshotV2NetworkRestoreResource>,
     serial_output: Option<SharedSerialOutput>,
     restoration: Option<SerialStdioRestoration>,
@@ -11437,7 +11623,7 @@ impl HvfSnapshotV2SerialDestination {
                     resume_requested,
                 )
             }
-            HvfSnapshotV2SerialControllerProfile::CurrentV2_11 {
+            HvfSnapshotV2SerialControllerProfile::RetainedV2_11 {
                 entropy_config,
                 balloon_config,
                 memory_hotplug,
@@ -11456,6 +11642,32 @@ impl HvfSnapshotV2SerialDestination {
                     ),
                     network_configs,
                     mmds_state,
+                ),
+                resume_requested,
+            ),
+            HvfSnapshotV2SerialControllerProfile::CurrentV2_12 {
+                entropy_config,
+                balloon_config,
+                memory_hotplug,
+                network_configs,
+                mmds_state,
+                vsock_config,
+            } => SnapshotV2ControllerCommit::with_vsock_product_configs(
+                machine,
+                boot,
+                SnapshotV2VsockControllerCommitProductConfigs::new(
+                    SnapshotV2NetworkControllerCommitProductConfigs::new(
+                        SnapshotV2ControllerCommitProductConfigs::new(
+                            storage_configs,
+                            serial_config,
+                            entropy_config,
+                            balloon_config,
+                            memory_hotplug,
+                        ),
+                        network_configs,
+                        mmds_state,
+                    ),
+                    vsock_config,
                 ),
                 resume_requested,
             ),
@@ -11515,6 +11727,10 @@ impl HvfSnapshotV2SerialDestination {
             )),
             None => None,
         };
+        let vsock = self
+            .active_vsock
+            .take()
+            .is_some_and(|guard| guard.cleanup().is_err());
         {
             let _session = self.session.take();
         }
@@ -11526,9 +11742,10 @@ impl HvfSnapshotV2SerialDestination {
             .restoration
             .take()
             .and_then(|restoration| restoration.finish().err());
-        if session.is_some() || restoration.is_some() {
+        if session.is_some() || vsock || restoration.is_some() {
             Err(HvfSnapshotV2SerialDestinationCleanupError {
                 session,
+                vsock,
                 restoration,
             })
         } else {
@@ -11966,6 +12183,7 @@ fn prepare_hvf_native_v2_serial_destination(
                 has_storage,
                 serial_config: Some(serial_config),
                 controller_profile: HvfSnapshotV2SerialControllerProfile::RetainedV2_7,
+                active_vsock: None,
                 network_resources: Vec::new(),
                 serial_output: Some(serial_output),
                 restoration,
@@ -12495,6 +12713,7 @@ fn prepare_hvf_native_v2_entropy_destination(
                         }
                     }
                 },
+                active_vsock: None,
                 network_resources: Vec::new(),
                 serial_output: Some(serial_output),
                 restoration,
@@ -12782,6 +13001,7 @@ fn prepare_hvf_native_v2_balloon_destination(
                     entropy_config,
                     balloon_config: Some(balloon_config),
                 },
+                active_vsock: None,
                 network_resources: Vec::new(),
                 serial_output: Some(serial_output),
                 restoration,
@@ -13116,6 +13336,7 @@ fn prepare_hvf_native_v2_memory_hotplug_destination(
                     balloon_config,
                     memory_hotplug: Some(memory_hotplug),
                 },
+                active_vsock: None,
                 network_resources: Vec::new(),
                 serial_output: Some(serial_output),
                 restoration,
@@ -13278,7 +13499,7 @@ struct PrepareHvfSnapshotV2NetworkDestinationInput<'a> {
     cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
-/// Reconstructs and atomically commits one current exact-2.11 destination,
+/// Reconstructs and atomically commits one retained exact-2.11 destination,
 /// retaining provider, MMDS, and per-interface metric owners for its complete
 /// process lifetime.
 #[cfg(target_os = "macos")]
@@ -13553,13 +13774,14 @@ fn prepare_hvf_native_v2_network_destination(
                 storage_configs,
                 has_storage,
                 serial_config: Some(serial_config),
-                controller_profile: HvfSnapshotV2SerialControllerProfile::CurrentV2_11 {
+                controller_profile: HvfSnapshotV2SerialControllerProfile::RetainedV2_11 {
                     entropy_config,
                     balloon_config,
                     memory_hotplug,
                     network_configs: NetworkInterfaceConfigs::from_validated(configs),
                     mmds_state,
                 },
+                active_vsock: None,
                 network_resources: resources,
                 serial_output: Some(serial_output),
                 restoration,
@@ -13582,6 +13804,186 @@ fn prepare_hvf_native_v2_network_destination(
         )
         .map_err(PrepareHvfSnapshotV2SerialDestinationError::Commit)?;
     Ok((destination, controller))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn cleanup_unpublished_native_v2_vsock_destination(
+    mut session: OwnedHvfArm64BootSession,
+    provider: ProcessNetworkPacketIoProvider,
+    mmds_state: Option<MmdsStateHandle>,
+    mmds_metrics: Option<SharedMmdsMetrics>,
+    mut resources: Vec<PreparedProcessSnapshotV2NetworkRestoreResource>,
+    active_vsock: Option<ActiveVsockRestoreGuard>,
+    serial_output: SharedSerialOutput,
+    serial_config: SerialConfig,
+    restoration: Option<SerialStdioRestoration>,
+) -> bool {
+    let mut cleanup_uncertain = session.shutdown().is_err();
+    cleanup_uncertain |= active_vsock.is_some_and(|guard| guard.cleanup().is_err());
+    drop((provider, mmds_state, mmds_metrics));
+    resources.clear();
+    let mut serial_output = Some(serial_output);
+    let mut serial_config = Some(serial_config);
+    let mut restoration = restoration;
+    cleanup_uncertain |= finish_process_snapshot_v2_serial_restoration(
+        &mut serial_output,
+        &mut serial_config,
+        &mut restoration,
+    );
+    cleanup_uncertain
+}
+
+#[cfg(target_os = "macos")]
+struct PrepareHvfSnapshotV2VsockDestinationInput {
+    parts: RestoredProcessSnapshotV2VsockDestinationParts,
+    machine: bangbang_runtime::machine::MachineConfig,
+    boot: bangbang_runtime::boot::BootSourceConfig,
+    resume_requested: bool,
+    expected_transport: SnapshotV2DeviceTransportKind,
+    cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
+/// Publishes one completely reconstructed exact-2.12 process graph as a
+/// Paused worker and closes its controller projection at the commit seal.
+#[cfg(target_os = "macos")]
+fn prepare_hvf_native_v2_vsock_destination(
+    input: PrepareHvfSnapshotV2VsockDestinationInput,
+) -> Result<
+    (HvfSnapshotV2SerialDestination, SnapshotV2ControllerCommit),
+    NativeV2VsockDestinationLoadError,
+> {
+    let PrepareHvfSnapshotV2VsockDestinationInput {
+        parts:
+            RestoredProcessSnapshotV2VsockDestinationParts {
+                mut session,
+                configs,
+                storage_configs,
+                entropy_config,
+                balloon_config,
+                memory_hotplug,
+                vsock_config,
+                provider,
+                mmds_state,
+                mmds_metrics,
+                authority,
+                resources,
+                active_vsock,
+                serial_output,
+                serial_config,
+                restoration,
+            },
+        machine,
+        boot,
+        resume_requested,
+        expected_transport,
+        cancellation,
+    } = input;
+
+    if let Err(_source) = session.prepare_restored_serial_continuation() {
+        let _cleanup_uncertain = cleanup_unpublished_native_v2_vsock_destination(
+            session,
+            provider,
+            mmds_state,
+            mmds_metrics,
+            resources,
+            active_vsock,
+            serial_output,
+            serial_config,
+            restoration,
+        );
+        return Err(NativeV2VsockDestinationLoadError::new(
+            expected_transport,
+            true,
+        ));
+    }
+    if let Err(_source) = session.resume_after_snapshot_v2_capture() {
+        let _cleanup_uncertain = cleanup_unpublished_native_v2_vsock_destination(
+            session,
+            provider,
+            mmds_state,
+            mmds_metrics,
+            resources,
+            active_vsock,
+            serial_output,
+            serial_config,
+            restoration,
+        );
+        return Err(NativeV2VsockDestinationLoadError::new(
+            expected_transport,
+            true,
+        ));
+    }
+
+    let process_session =
+        ProcessHvfBootSession::new_with_vmnet_authority(session, provider, mmds_metrics, authority);
+    let supervisor = match HvfBootRunLoopSupervisor::start_paused(
+        process_session,
+        default_hvf_boot_run_loop_step_limit(),
+    ) {
+        Ok(supervisor) => supervisor,
+        Err(error) => {
+            let (_source, failed_session) = error.into_parts();
+            let ProcessHvfBootSession {
+                packet_io,
+                session,
+                mmds_metrics,
+                vmnet_authority: _,
+            } = failed_session;
+            let _cleanup_uncertain = cleanup_unpublished_native_v2_vsock_destination(
+                session,
+                packet_io,
+                mmds_state,
+                mmds_metrics,
+                resources,
+                active_vsock,
+                serial_output,
+                serial_config,
+                restoration,
+            );
+            return Err(NativeV2VsockDestinationLoadError::new(
+                expected_transport,
+                true,
+            ));
+        }
+    };
+    let has_storage = storage_configs.is_some();
+    let destination = HvfSnapshotV2SerialDestination {
+        session: Some(Box::new(HvfProcessSession::Boot(supervisor))),
+        storage_configs,
+        has_storage,
+        serial_config: Some(serial_config),
+        controller_profile: HvfSnapshotV2SerialControllerProfile::CurrentV2_12 {
+            entropy_config,
+            balloon_config,
+            memory_hotplug,
+            network_configs: NetworkInterfaceConfigs::from_validated(configs),
+            mmds_state,
+            vsock_config,
+        },
+        active_vsock,
+        network_resources: resources,
+        serial_output: Some(serial_output),
+        restoration,
+        unavailable_diagnostics: (),
+    };
+    if !cancellation.try_seal_commit() {
+        let _ = destination.shutdown();
+        return Err(NativeV2VsockDestinationLoadError::new(
+            expected_transport,
+            true,
+        ));
+    }
+    match destination.prepare_controller(machine, boot, resume_requested) {
+        Ok(committed) => Ok(committed),
+        Err((destination, _source)) => {
+            let _ = (*destination).shutdown();
+            Err(NativeV2VsockDestinationLoadError::new(
+                expected_transport,
+                true,
+            ))
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -15465,6 +15867,180 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         let (destination, controller_commit) = result?;
         let serial_output = destination.serial_output_clone().ok_or_else(|| {
             NativeV2SnapshotLoadError::NetworkDestination(NativeV2NetworkDestinationLoadError::new(
+                expected_transport,
+                true,
+            ))
+        })?;
+        self.active_serial_output = Some(serial_output);
+        Ok(SnapshotV2LoadSuccess::new(
+            HvfProcessSession::SerialSnapshotV2(Box::new(destination)),
+            controller_commit,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_prepared_snapshot_v2_vsock(
+        &mut self,
+        request: ProcessSnapshotV2VsockLoadRequest<'_>,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        let ProcessSnapshotV2VsockLoadRequest {
+            controller,
+            vmnet_authority,
+            contained_restore_authority,
+            pci_enabled,
+            input,
+            candidate,
+            memory,
+            cancellation,
+        } = request;
+        self.preflight_snapshot_v2_root_process(pci_enabled)
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+        let expected_transport = if pci_enabled {
+            SnapshotV2DeviceTransportKind::Pci
+        } else {
+            SnapshotV2DeviceTransportKind::Mmio
+        };
+
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            candidate.bytes(),
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        )
+        .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
+        let decoded = decode_hvf_snapshot_v2_vsock_state(&structural)
+            .map_err(NativeV2SnapshotLoadError::Decode)?;
+        if decoded.platform().memory() != candidate.memory_binding()
+            || decoded.device_graph() != candidate.device_graph()
+            || decoded.serial() != candidate.serial()
+            || decoded.entropy() != candidate.entropy()
+            || decoded.balloon() != candidate.balloon()
+            || decoded.memory_hotplug() != candidate.memory_hotplug()
+            || decoded.network() != candidate.network()
+            || decoded.vsock() != candidate.vsock()
+        {
+            return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+        }
+        let (platform, graph, serial, entropy, balloon, memory_hotplug, network, vsock) =
+            decoded.into_parts();
+        if graph
+            .as_ref()
+            .is_some_and(|graph| graph.transport_kind() != expected_transport)
+            || entropy
+                .as_ref()
+                .is_some_and(|state| state.transport().kind() != expected_transport)
+            || balloon
+                .as_ref()
+                .is_some_and(|state| state.transport().kind() != expected_transport)
+            || memory_hotplug
+                .as_ref()
+                .is_some_and(|state| state.transport().kind() != expected_transport)
+            || network.as_ref().is_some_and(|state| {
+                state
+                    .interfaces()
+                    .iter()
+                    .any(|interface| interface.transport().kind() != expected_transport)
+            })
+            || vsock
+                .as_ref()
+                .is_some_and(|state| state.transport().kind() != expected_transport)
+        {
+            return Err(NativeV2SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ));
+        }
+        let boot = native_v2_boot_source_config(platform.machine().boot())
+            .map_err(NativeV2SnapshotLoadError::BootMetadata)?;
+        let machine = snapshot_destination_machine_config(
+            platform.machine().machine(),
+            input.track_dirty_pages(),
+        );
+        drop((
+            graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network,
+            vsock,
+        ));
+
+        // Selector resolution, override validation, destination-memory checks,
+        // and resource planning remain owner-free and precede all host access.
+        let candidate = candidate
+            .prepare_with_cancel(
+                &memory,
+                expected_transport,
+                input.network_overrides(),
+                input.vsock_override(),
+                |_| cancellation.is_cancelled(),
+            )
+            .map_err(NativeV2SnapshotLoadError::VsockPreparation)?;
+        let resource_plan =
+            prepare_process_snapshot_v2_vsock_resource_plan(candidate, vmnet_authority)
+                .map_err(NativeV2SnapshotLoadError::VsockRestoreResources)?;
+        let mmds_data_store_limit_bytes = controller
+            .mmds_state_handle()
+            .with(MmdsState::data_store_limit_bytes)
+            .map_err(|_| {
+                NativeV2SnapshotLoadError::ProcessPreparation(BackendError::InvalidState(
+                    "native-v2 destination MMDS state is unavailable",
+                ))
+            })?;
+        let now = Instant::now();
+        let parts = if pci_enabled {
+            restore_process_snapshot_v2_vsock_pci(
+                platform,
+                memory,
+                resource_plan,
+                contained_restore_authority,
+                &controller.instance_info().id,
+                mmds_data_store_limit_bytes,
+                now,
+                |_| cancellation.is_cancelled(),
+            )
+            .and_then(SystemRestoredProcessSnapshotV2VsockPciOwners::into_destination_parts)
+            .map_err(|source| {
+                NativeV2SnapshotLoadError::VsockDestination(
+                    NativeV2VsockDestinationLoadError::with_source(
+                        expected_transport,
+                        source.is_terminal(),
+                        &source,
+                    ),
+                )
+            })?
+        } else {
+            restore_process_snapshot_v2_vsock_mmio(
+                platform,
+                memory,
+                resource_plan,
+                contained_restore_authority,
+                &controller.instance_info().id,
+                mmds_data_store_limit_bytes,
+                now,
+                |_| cancellation.is_cancelled(),
+            )
+            .and_then(SystemRestoredProcessSnapshotV2VsockMmioOwners::into_destination_parts)
+            .map_err(|source| {
+                NativeV2SnapshotLoadError::VsockDestination(
+                    NativeV2VsockDestinationLoadError::with_source(
+                        expected_transport,
+                        source.is_terminal(),
+                        &source,
+                    ),
+                )
+            })?
+        };
+        let (destination, controller_commit) =
+            prepare_hvf_native_v2_vsock_destination(PrepareHvfSnapshotV2VsockDestinationInput {
+                parts,
+                machine,
+                boot,
+                resume_requested: input.resume_vm(),
+                expected_transport,
+                cancellation,
+            })
+            .map_err(NativeV2SnapshotLoadError::VsockDestination)?;
+        let serial_output = destination.serial_output_clone().ok_or_else(|| {
+            NativeV2SnapshotLoadError::VsockDestination(NativeV2VsockDestinationLoadError::new(
                 expected_transport,
                 true,
             ))
@@ -23434,6 +24010,13 @@ impl ProcessSnapshotV2VsockMmioRestoreError {
             },
         }
     }
+
+    const fn is_terminal(&self) -> bool {
+        !matches!(
+            self.disposition,
+            ProcessSnapshotV2VsockMmioRestoreDisposition::Retryable
+        )
+    }
 }
 
 impl fmt::Debug for ProcessSnapshotV2VsockMmioRestoreError {
@@ -23475,6 +24058,26 @@ where
     serial_output: Option<SharedSerialOutput>,
     serial_config: Option<SerialConfig>,
     serial_restoration: Option<SerialStdioRestoration>,
+}
+
+#[cfg(target_os = "macos")]
+struct RestoredProcessSnapshotV2VsockDestinationParts {
+    session: OwnedHvfArm64BootSession,
+    configs: Vec<NetworkInterfaceConfig>,
+    storage_configs: Option<CaptureReadyStorageConfigs>,
+    entropy_config: Option<EntropyConfig>,
+    balloon_config: Option<BalloonConfig>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
+    vsock_config: Option<VsockConfig>,
+    provider: ProcessNetworkPacketIoProvider,
+    mmds_state: Option<MmdsStateHandle>,
+    mmds_metrics: Option<SharedMmdsMetrics>,
+    authority: ProcessVmnetAuthority,
+    resources: Vec<PreparedProcessSnapshotV2NetworkRestoreResource>,
+    active_vsock: Option<ActiveVsockRestoreGuard>,
+    serial_output: SharedSerialOutput,
+    serial_config: SerialConfig,
+    restoration: Option<SerialStdioRestoration>,
 }
 
 fn abort_completed_process_snapshot_v2_vsock_resources<B>(
@@ -23827,6 +24430,13 @@ impl ProcessSnapshotV2VsockPciRestoreError {
                 ),
             },
         }
+    }
+
+    const fn is_terminal(&self) -> bool {
+        !matches!(
+            self.disposition,
+            ProcessSnapshotV2VsockPciRestoreDisposition::Retryable
+        )
     }
 }
 
@@ -25447,6 +26057,189 @@ where
 type SystemRestoredProcessSnapshotV2VsockMmioOwners =
     RestoredProcessSnapshotV2VsockMmioOwners<SystemVmnetInterfaceBackend>;
 
+#[cfg(target_os = "macos")]
+impl SystemRestoredProcessSnapshotV2VsockMmioOwners {
+    fn into_destination_parts(
+        mut self,
+    ) -> Result<
+        RestoredProcessSnapshotV2VsockDestinationParts,
+        ProcessSnapshotV2VsockMmioRestoreError,
+    > {
+        let graph_is_complete = match (&self.hvf, &self.completion) {
+            (Some(hvf), Some(completion)) => {
+                self.serial_output.is_some()
+                    && self.serial_config.is_some()
+                    && completion.network_completion.configs_match(hvf.configs())
+                    && completion
+                        .network_completion
+                        .resources_match(&self.network_resources)
+                    && completion.vsock_config.as_ref() == hvf.vsock_config()
+                    && self.active_vsock.is_some() == completion.vsock_config.is_some()
+            }
+            _ => false,
+        };
+        if !graph_is_complete {
+            let cleanup_uncertain = self.shutdown().is_err();
+            return Err(ProcessSnapshotV2VsockMmioRestoreError::terminal(
+                ProcessSnapshotV2VsockMmioRestoreStage::Assembly,
+                cleanup_uncertain,
+            ));
+        }
+
+        let (hvf, completion) = match (self.hvf.take(), self.completion.take()) {
+            (Some(hvf), Some(completion)) => (hvf, completion),
+            (hvf, completion) => {
+                self.hvf = hvf;
+                self.completion = completion;
+                let cleanup_uncertain = self.shutdown().is_err();
+                return Err(ProcessSnapshotV2VsockMmioRestoreError::terminal(
+                    ProcessSnapshotV2VsockMmioRestoreStage::Assembly,
+                    cleanup_uncertain,
+                ));
+            }
+        };
+        let (
+            mut session,
+            configs,
+            storage_configs,
+            entropy_config,
+            balloon_config,
+            memory_hotplug,
+            hvf_vsock_config,
+        ) = match hvf.into_destination_parts() {
+            Ok(parts) => parts,
+            Err(source) => {
+                self.completion = Some(completion);
+                let mut cleanup_uncertain = source.has_incomplete_cleanup();
+                cleanup_uncertain |= self.shutdown().is_err();
+                return Err(ProcessSnapshotV2VsockMmioRestoreError::terminal(
+                    ProcessSnapshotV2VsockMmioRestoreStage::Assembly,
+                    cleanup_uncertain,
+                ));
+            }
+        };
+        let (
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug_state,
+            network_topology,
+            vsock_state,
+            vsock_config,
+            binding_keys,
+            network_completion,
+        ) = match completion.commit() {
+            Ok(parts) => parts,
+            Err(source) => {
+                let mut cleanup_uncertain = source.cleanup_uncertain();
+                cleanup_uncertain |= session.shutdown().is_err();
+                cleanup_uncertain |= self.shutdown().is_err();
+                return Err(ProcessSnapshotV2VsockMmioRestoreError::terminal(
+                    ProcessSnapshotV2VsockMmioRestoreStage::Assembly,
+                    cleanup_uncertain,
+                ));
+            }
+        };
+        if hvf_vsock_config != vsock_config {
+            let mut cleanup_uncertain = session.shutdown().is_err();
+            cleanup_uncertain |= self
+                .active_vsock
+                .take()
+                .is_some_and(|guard| guard.cleanup().is_err());
+            cleanup_uncertain |= network_completion.abort().is_err();
+            self.network_resources.clear();
+            cleanup_uncertain |= self.shutdown().is_err();
+            return Err(ProcessSnapshotV2VsockMmioRestoreError::terminal(
+                ProcessSnapshotV2VsockMmioRestoreStage::Assembly,
+                cleanup_uncertain,
+            ));
+        }
+        let (
+            resource_interfaces,
+            mut provider,
+            mmds_state,
+            mmds_metrics,
+            expected_mmds_state,
+            expected_mmds_controller,
+            network_metrics,
+            authority,
+        ) = match network_completion.into_parts() {
+            Ok(parts) => parts,
+            Err(_) => {
+                let mut cleanup_uncertain = session.shutdown().is_err();
+                cleanup_uncertain |= self
+                    .active_vsock
+                    .take()
+                    .is_some_and(|guard| guard.cleanup().is_err());
+                self.network_resources.clear();
+                cleanup_uncertain |= self.shutdown().is_err();
+                return Err(ProcessSnapshotV2VsockMmioRestoreError::terminal(
+                    ProcessSnapshotV2VsockMmioRestoreStage::Assembly,
+                    cleanup_uncertain,
+                ));
+            }
+        };
+        drop((
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug_state,
+            network_topology,
+            vsock_state,
+            binding_keys,
+            resource_interfaces,
+            expected_mmds_state,
+            expected_mmds_controller,
+            network_metrics,
+        ));
+        let (serial_output, serial_config) =
+            match (self.serial_output.take(), self.serial_config.take()) {
+                (Some(serial_output), Some(serial_config)) => (serial_output, serial_config),
+                (serial_output, serial_config) => {
+                    self.serial_output = serial_output;
+                    self.serial_config = serial_config;
+                    let mut cleanup_uncertain = session.shutdown().is_err();
+                    cleanup_uncertain |= self
+                        .active_vsock
+                        .take()
+                        .is_some_and(|guard| guard.cleanup().is_err());
+                    cleanup_uncertain |= provider.shutdown_packet_io().is_err();
+                    drop((provider, mmds_state, mmds_metrics));
+                    self.network_resources.clear();
+                    cleanup_uncertain |= self.shutdown().is_err();
+                    return Err(ProcessSnapshotV2VsockMmioRestoreError::terminal(
+                        ProcessSnapshotV2VsockMmioRestoreStage::Assembly,
+                        cleanup_uncertain,
+                    ));
+                }
+            };
+        Ok(RestoredProcessSnapshotV2VsockDestinationParts {
+            session,
+            configs,
+            storage_configs,
+            entropy_config,
+            balloon_config,
+            memory_hotplug,
+            vsock_config,
+            provider,
+            mmds_state,
+            mmds_metrics,
+            authority,
+            resources: std::mem::take(&mut self.network_resources),
+            active_vsock: self.active_vsock.take(),
+            serial_output,
+            serial_config,
+            restoration: self.serial_restoration.take(),
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn restore_process_snapshot_v2_vsock_mmio<C>(
     platform: HvfSnapshotV2PlatformState,
@@ -26086,6 +26879,187 @@ where
 
 type SystemRestoredProcessSnapshotV2VsockPciOwners =
     RestoredProcessSnapshotV2VsockPciOwners<SystemVmnetInterfaceBackend>;
+
+#[cfg(target_os = "macos")]
+impl SystemRestoredProcessSnapshotV2VsockPciOwners {
+    fn into_destination_parts(
+        mut self,
+    ) -> Result<RestoredProcessSnapshotV2VsockDestinationParts, ProcessSnapshotV2VsockPciRestoreError>
+    {
+        let graph_is_complete = match (&self.hvf, &self.completion) {
+            (Some(hvf), Some(completion)) => {
+                self.serial_output.is_some()
+                    && self.serial_config.is_some()
+                    && completion.network_completion.configs_match(hvf.configs())
+                    && completion
+                        .network_completion
+                        .resources_match(&self.network_resources)
+                    && completion.vsock_config.as_ref() == hvf.vsock_config()
+                    && self.active_vsock.is_some() == completion.vsock_config.is_some()
+            }
+            _ => false,
+        };
+        if !graph_is_complete {
+            let cleanup_uncertain = self.shutdown().is_err();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+                cleanup_uncertain,
+            ));
+        }
+
+        let (hvf, completion) = match (self.hvf.take(), self.completion.take()) {
+            (Some(hvf), Some(completion)) => (hvf, completion),
+            (hvf, completion) => {
+                self.hvf = hvf;
+                self.completion = completion;
+                let cleanup_uncertain = self.shutdown().is_err();
+                return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                    ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+                    cleanup_uncertain,
+                ));
+            }
+        };
+        let (
+            mut session,
+            configs,
+            storage_configs,
+            entropy_config,
+            balloon_config,
+            memory_hotplug,
+            hvf_vsock_config,
+        ) = match hvf.into_destination_parts() {
+            Ok(parts) => parts,
+            Err(source) => {
+                self.completion = Some(completion);
+                let mut cleanup_uncertain = source.has_incomplete_cleanup();
+                cleanup_uncertain |= self.shutdown().is_err();
+                return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                    ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+                    cleanup_uncertain,
+                ));
+            }
+        };
+        let (
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug_state,
+            network_topology,
+            vsock_state,
+            vsock_config,
+            binding_keys,
+            network_completion,
+        ) = match completion.commit() {
+            Ok(parts) => parts,
+            Err(source) => {
+                let mut cleanup_uncertain = source.cleanup_uncertain();
+                cleanup_uncertain |= session.shutdown().is_err();
+                cleanup_uncertain |= self.shutdown().is_err();
+                return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                    ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+                    cleanup_uncertain,
+                ));
+            }
+        };
+        if hvf_vsock_config != vsock_config {
+            let mut cleanup_uncertain = session.shutdown().is_err();
+            cleanup_uncertain |= self
+                .active_vsock
+                .take()
+                .is_some_and(|guard| guard.cleanup().is_err());
+            cleanup_uncertain |= network_completion.abort().is_err();
+            self.network_resources.clear();
+            cleanup_uncertain |= self.shutdown().is_err();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+                cleanup_uncertain,
+            ));
+        }
+        let (
+            resource_interfaces,
+            mut provider,
+            mmds_state,
+            mmds_metrics,
+            expected_mmds_state,
+            expected_mmds_controller,
+            network_metrics,
+            authority,
+        ) = match network_completion.into_parts() {
+            Ok(parts) => parts,
+            Err(_) => {
+                let mut cleanup_uncertain = session.shutdown().is_err();
+                cleanup_uncertain |= self
+                    .active_vsock
+                    .take()
+                    .is_some_and(|guard| guard.cleanup().is_err());
+                self.network_resources.clear();
+                cleanup_uncertain |= self.shutdown().is_err();
+                return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                    ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+                    cleanup_uncertain,
+                ));
+            }
+        };
+        drop((
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug_state,
+            network_topology,
+            vsock_state,
+            binding_keys,
+            resource_interfaces,
+            expected_mmds_state,
+            expected_mmds_controller,
+            network_metrics,
+        ));
+        let (serial_output, serial_config) =
+            match (self.serial_output.take(), self.serial_config.take()) {
+                (Some(serial_output), Some(serial_config)) => (serial_output, serial_config),
+                (serial_output, serial_config) => {
+                    self.serial_output = serial_output;
+                    self.serial_config = serial_config;
+                    let mut cleanup_uncertain = session.shutdown().is_err();
+                    cleanup_uncertain |= self
+                        .active_vsock
+                        .take()
+                        .is_some_and(|guard| guard.cleanup().is_err());
+                    cleanup_uncertain |= provider.shutdown_packet_io().is_err();
+                    drop((provider, mmds_state, mmds_metrics));
+                    self.network_resources.clear();
+                    cleanup_uncertain |= self.shutdown().is_err();
+                    return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                        ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+                        cleanup_uncertain,
+                    ));
+                }
+            };
+        Ok(RestoredProcessSnapshotV2VsockDestinationParts {
+            session,
+            configs,
+            storage_configs,
+            entropy_config,
+            balloon_config,
+            memory_hotplug,
+            vsock_config,
+            provider,
+            mmds_state,
+            mmds_metrics,
+            authority,
+            resources: std::mem::take(&mut self.network_resources),
+            active_vsock: self.active_vsock.take(),
+            serial_output,
+            serial_config,
+            restoration: self.serial_restoration.take(),
+        })
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn restore_process_snapshot_v2_vsock_pci<C>(
@@ -31206,15 +32180,30 @@ where
                         NativeV2SnapshotCaptureStage::Vsock,
                     ));
                 }
-                let vsock = session
-                    .capture_native_v2_vsock(
-                        vsock_config,
-                        &expected_vsock_metrics,
-                        expected_transport,
-                        guard,
-                        cancellation,
-                    )
-                    .map_err(|source| NativeV2SnapshotCaptureError::Vsock { source })?;
+                let vsock = match vsock_config {
+                    Some(config) => {
+                        let expected_vsock_metrics =
+                            expected_vsock_metrics.as_ref().ok_or_else(|| {
+                                NativeV2SnapshotCaptureError::Vsock {
+                                    source: NativeV2SnapshotVsockCaptureError::Live {
+                                        source: HvfArm64BootVsockCaptureError::owner_unavailable(
+                                            HvfArm64BootVsockCaptureDisposition::Terminal,
+                                        ),
+                                    },
+                                }
+                            })?;
+                        session
+                            .capture_native_v2_vsock(
+                                Some(config),
+                                expected_vsock_metrics,
+                                expected_transport,
+                                guard,
+                                cancellation,
+                            )
+                            .map_err(|source| NativeV2SnapshotCaptureError::Vsock { source })?
+                    }
+                    None => None,
+                };
                 if cancellation.is_cancelled() {
                     return Err(native_v2_snapshot_cancelled(
                         NativeV2SnapshotCaptureStage::Vsock,
@@ -32078,17 +33067,22 @@ where
             expected_transport,
         )
         .map_err(native_v2_snapshot_transaction_error_before_staging)?;
-        let expected_vsock_metrics = self.vsock_device_metrics.clone().ok_or_else(|| {
-            native_v2_snapshot_transaction_error_before_staging(
-                NativeV2SnapshotCaptureError::Vsock {
-                    source: NativeV2SnapshotVsockCaptureError::Live {
-                        source: HvfArm64BootVsockCaptureError::owner_unavailable(
-                            HvfArm64BootVsockCaptureDisposition::Terminal,
-                        ),
-                    },
-                },
-            )
-        })?;
+        let expected_vsock_metrics = vsock_config
+            .as_ref()
+            .map(|_| {
+                self.vsock_device_metrics.clone().ok_or_else(|| {
+                    native_v2_snapshot_transaction_error_before_staging(
+                        NativeV2SnapshotCaptureError::Vsock {
+                            source: NativeV2SnapshotVsockCaptureError::Live {
+                                source: HvfArm64BootVsockCaptureError::owner_unavailable(
+                                    HvfArm64BootVsockCaptureDisposition::Terminal,
+                                ),
+                            },
+                        },
+                    )
+                })
+            })
+            .transpose()?;
         let active_capture = self
             .register_snapshot_capture_raw(cancellation.clone())
             .map_err(|source| {
@@ -32219,10 +33213,11 @@ where
             network_configs,
             mmds_config,
             mmds_state,
+            vsock_config,
             expected_transport,
             cancellation,
         } = request;
-        preflight_native_v2_network_capture(
+        preflight_native_v2_vsock_capture(
             &serial_config,
             balloon_config,
             entropy_config,
@@ -32232,9 +33227,26 @@ where
             &network_configs,
             mmds_config.as_ref(),
             &mmds_state,
+            vsock_config.as_ref(),
             expected_transport,
         )
         .map_err(native_v2_snapshot_transaction_error_before_staging)?;
+        let expected_vsock_metrics = vsock_config
+            .as_ref()
+            .map(|_| {
+                self.vsock_device_metrics.clone().ok_or_else(|| {
+                    native_v2_snapshot_transaction_error_before_staging(
+                        NativeV2SnapshotCaptureError::Vsock {
+                            source: NativeV2SnapshotVsockCaptureError::Live {
+                                source: HvfArm64BootVsockCaptureError::owner_unavailable(
+                                    HvfArm64BootVsockCaptureDisposition::Terminal,
+                                ),
+                            },
+                        },
+                    )
+                })
+            })
+            .transpose()?;
         let active_capture = self
             .register_snapshot_capture_raw(cancellation.clone())
             .map_err(|source| {
@@ -32289,7 +33301,7 @@ where
                     let state = capture_and_recover_native_v2_state(
                         session,
                         input,
-                        NativeV2SnapshotCaptureProfile::Network {
+                        NativeV2SnapshotCaptureProfile::Vsock {
                             serial,
                             memory_hotplug_config,
                             memory_hotplug_requested_size_mib,
@@ -32299,14 +33311,16 @@ where
                             network_configs,
                             mmds_config,
                             mmds_state,
+                            vsock_config,
+                            expected_vsock_metrics,
                             expected_transport,
                         },
                         &guard,
                         Box::new(writer),
                         &cancellation,
                         |encoded| {
-                            NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(encoded)
-                                .map(NativeV2NetworkSnapshotCandidateState::into_current_artifact_state)
+                            NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(encoded)
+                                .map(NativeV2VsockSnapshotCandidateState::into_current_artifact_state)
                                 .map_err(|source| {
                                     NativeV2SnapshotCaptureError::CandidateState { source }
                                 })
@@ -33596,7 +34610,8 @@ mod tests {
         SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend, SnapshotMemoryBackendType,
         SnapshotNetworkOverride, SnapshotType, SnapshotV1ControllerCommit,
         SnapshotV2ControllerCommit, SnapshotV2ControllerCommitProductConfigs,
-        SnapshotV2NetworkControllerCommitProductConfigs, SnapshotVsockOverride,
+        SnapshotV2NetworkControllerCommitProductConfigs,
+        SnapshotV2VsockControllerCommitProductConfigs, SnapshotVsockOverride,
         SnapshotVsockSelectorError,
     };
     use bangbang_runtime::snapshot_artifact::{
@@ -33765,11 +34780,12 @@ mod tests {
         ProcessSnapshotV2NetworkLoadRequest, ProcessSnapshotV2NetworkRestorePlanError,
         ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
         ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2SerialLoadRequest,
-        ProcessSnapshotV2StorageLoadRequest, ProcessSnapshotV2StorageLoadSuccess, ProcessVmm,
-        ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
-        SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
-        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
-        native_v2_platform_capture_is_terminal, prepare_process_snapshot_v2_network_restore_plan,
+        ProcessSnapshotV2StorageLoadRequest, ProcessSnapshotV2StorageLoadSuccess,
+        ProcessSnapshotV2VsockLoadRequest, ProcessVmm, ProcessVmnetAuthority,
+        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
+        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
+        prepare_process_snapshot_v2_network_restore_plan,
         prepare_process_snapshot_v2_vsock_candidate, require_native_v1_composite_record,
         snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
@@ -34925,12 +35941,14 @@ mod tests {
             storage_configs,
             network_configs,
             mmds_config,
+            vsock_config,
             expected_transport: transport,
             ..
         } = request;
         let has_block = !storage_configs.drives().is_empty();
         let has_pmem = !storage_configs.pmem().is_empty();
         let has_network = !network_configs.is_empty();
+        let has_vsock = vsock_config.is_some();
         session.native_snapshot_publication_count += 1;
         let memory_hotplug = memory_hotplug_config.map(|config| {
             fake_native_v2_memory_hotplug_state_for_request(
@@ -34976,7 +35994,7 @@ mod tests {
                 .expect("fake serial state should capture")
                 .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
                 .expect("fake serial state should encode");
-                let mut components = Vec::with_capacity(7);
+                let mut components = Vec::with_capacity(8);
                 components.push(SnapshotV2Component::new(
                     NATIVE_V2_MEMORY_COMPONENT_KEY,
                     SnapshotV2ComponentDisposition::Semantic,
@@ -35063,8 +36081,20 @@ mod tests {
                         network,
                     ));
                 }
+                let vsock = has_vsock.then(|| {
+                    fake_native_v2_vsock_state(transport)
+                        .encode(NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION)
+                        .expect("fake vsock state should encode")
+                });
+                if let Some(vsock) = &vsock {
+                    components.push(SnapshotV2Component::new(
+                        NATIVE_V2_VSOCK_COMPONENT_KEY,
+                        SnapshotV2ComponentDisposition::Semantic,
+                        vsock,
+                    ));
+                }
                 let encoded = encode_snapshot_v2_state_with_compatibility_version(
-                    NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                    NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
                     &[],
                     &components,
                 )
@@ -35075,8 +36105,8 @@ mod tests {
                         },
                     )
                 })?;
-                NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(encoded)
-                    .map(NativeV2NetworkSnapshotCandidateState::into_current_artifact_state)
+                NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(encoded)
+                    .map(NativeV2VsockSnapshotCandidateState::into_current_artifact_state)
                     .map_err(|source| {
                         NativeV2SnapshotPublicationProducerError::Capture(
                             NativeV2SnapshotCaptureError::CandidateState { source },
@@ -36611,6 +37641,196 @@ mod tests {
                     ),
                     network_configs,
                     mmds_state,
+                ),
+                input.resume_vm(),
+            );
+            let session = match self.result {
+                FakeSnapshotLoadResult::ResumeFailure => FakeSession::with_resume_result(
+                    77,
+                    BackendError::Hypervisor("private-resume-sentinel".to_owned()),
+                ),
+                FakeSnapshotLoadResult::Success | FakeSnapshotLoadResult::Terminal => {
+                    FakeSession::new(77)
+                }
+            };
+            Ok(SnapshotV2LoadSuccess::new(session, commit))
+        }
+
+        fn load_prepared_snapshot_v2_vsock(
+            &mut self,
+            request: ProcessSnapshotV2VsockLoadRequest<'_>,
+        ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+            let ProcessSnapshotV2VsockLoadRequest {
+                controller,
+                vmnet_authority,
+                #[cfg(target_os = "macos")]
+                    contained_restore_authority: _,
+                pci_enabled,
+                input,
+                candidate,
+                memory,
+                cancellation,
+            } = request;
+            let expected_transport = if pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            };
+            if candidate
+                .device_graph()
+                .is_some_and(|graph| graph.transport_kind() != expected_transport)
+                || candidate
+                    .entropy()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+                || candidate
+                    .balloon()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+                || candidate
+                    .memory_hotplug()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+            {
+                return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+            }
+            let candidate = candidate
+                .prepare(
+                    &memory,
+                    expected_transport,
+                    input.network_overrides(),
+                    input.vsock_override(),
+                )
+                .map_err(NativeV2SnapshotLoadError::VsockPreparation)?;
+            let drive_configs = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::block_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = DriveConfigInput::new(
+                        config.drive_id(),
+                        config.drive_id(),
+                        config.selector(),
+                        config.is_root(),
+                    )
+                    .with_is_read_only(config.is_read_only())
+                    .with_cache_type(config.cache_type())
+                    .with_io_engine(config.io_engine());
+                    if let Some(partuuid) = config.partuuid() {
+                        input = input.with_partuuid(partuuid);
+                    }
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    input.validate()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let pmem_configs = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::pmem_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = PmemConfigInput::new(config.pmem_id(), config.selector())
+                        .with_root_device(config.is_root())
+                        .with_read_only(config.is_read_only());
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    PmemConfig::try_from(input)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let storage_configs = candidate
+                .device_graph()
+                .map(|_| CaptureReadyStorageConfigs::new(drive_configs, pmem_configs));
+            let mut serial_input = SerialConfigInput::new();
+            if let Some(selector) = candidate.serial().endpoint_intent().configured_selector() {
+                serial_input = serial_input.with_serial_out_path(selector);
+            }
+            if let Some(rate_limiter) = candidate.serial().rate_limiter() {
+                serial_input = serial_input.with_rate_limiter(rate_limiter);
+            }
+            let serial_config = serial_input
+                .validate()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let entropy_config = candidate.entropy().map(SnapshotV2EntropyState::config);
+            let balloon_config = candidate.balloon().map(SnapshotV2BalloonState::config);
+            let memory_hotplug = candidate
+                .memory_hotplug()
+                .cloned()
+                .map(|state| {
+                    PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
+                        state,
+                        candidate.memory_binding().clone(),
+                        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+                    )
+                })
+                .transpose()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?
+                .map(|topology| topology.controller());
+            let network_configs = NetworkInterfaceConfigs::from_validated(
+                candidate
+                    .network_topology()
+                    .interfaces()
+                    .iter()
+                    .map(|interface| interface.controller().clone())
+                    .collect(),
+            );
+            let mmds_state = candidate
+                .network_topology()
+                .mmds_controller()
+                .map(|config| {
+                    let mut config_input =
+                        MmdsConfigInput::new(config.network_interfaces().to_vec())
+                            .with_version(config.version())
+                            .with_imds_compat(config.imds_compat());
+                    if let Some(address) = config.ipv4_address() {
+                        config_input = config_input.with_ipv4_address(address);
+                    }
+                    let state = MmdsStateHandle::default();
+                    state
+                        .with_mut(|state| {
+                            state.put_config(config_input, network_configs.as_slice())
+                        })
+                        .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?
+                        .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+                    Ok::<_, NativeV2SnapshotLoadError>(state)
+                })
+                .transpose()?;
+            let vsock_config = candidate
+                .vsock_topology()
+                .map(|topology| topology.request().config().clone());
+            if !cancellation.try_seal_commit() {
+                return Err(NativeV2SnapshotLoadError::Cancelled);
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.last_vmnet_authority = Some(vmnet_authority);
+            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            if self.result == FakeSnapshotLoadResult::Terminal {
+                return Err(NativeV2SnapshotLoadError::ProcessTerminal);
+            }
+
+            let boot_source = BootSourceConfigInput::new("/private/restored-vmlinux")
+                .validate()
+                .expect("fake restored boot source should validate");
+            let machine =
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages());
+            let commit = SnapshotV2ControllerCommit::with_vsock_product_configs(
+                machine,
+                boot_source,
+                SnapshotV2VsockControllerCommitProductConfigs::new(
+                    SnapshotV2NetworkControllerCommitProductConfigs::new(
+                        SnapshotV2ControllerCommitProductConfigs::new(
+                            storage_configs,
+                            serial_config,
+                            entropy_config,
+                            balloon_config,
+                            memory_hotplug,
+                        ),
+                        network_configs,
+                        mmds_state,
+                    ),
+                    vsock_config,
                 ),
                 input.resume_vm(),
             );
@@ -41862,6 +43082,7 @@ mod tests {
             mmds_state: MmdsStateHandle::new(bangbang_runtime::mmds::MmdsState::new(
                 bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
             )),
+            vsock_config: None,
             expected_transport,
             cancellation,
         }
@@ -42027,6 +43248,7 @@ mod tests {
                 mmds_state: MmdsStateHandle::new(bangbang_runtime::mmds::MmdsState::new(
                     bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
                 )),
+                vsock_config: None,
                 expected_transport: transport,
                 cancellation: NativeV2SnapshotCaptureCancellation::default(),
             },
@@ -42069,6 +43291,7 @@ mod tests {
                 mmds_state: MmdsStateHandle::new(bangbang_runtime::mmds::MmdsState::new(
                     bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
                 )),
+                vsock_config: None,
                 expected_transport: transport,
                 cancellation: NativeV2SnapshotCaptureCancellation::default(),
             },
@@ -44595,7 +45818,7 @@ mod tests {
     }
 
     #[test]
-    fn native_v2_process_preflight_validates_exact_minor_eleven_profile() {
+    fn native_v2_process_preflight_validates_exact_minor_profiles() {
         let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
             .expect("exact minor-eleven fixture range should validate");
         let layout = GuestMemoryLayout::new(vec![range])
@@ -44642,7 +45865,7 @@ mod tests {
         .expect("network-free exact minor-eleven state should encode internally");
         let state = NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(encoded)
             .expect("network-free exact minor-eleven candidate should validate")
-            .into_current_artifact_state();
+            .into_v2_11_artifact_state();
         assert_eq!(
             state
                 .v2_profile()
@@ -44663,9 +45886,7 @@ mod tests {
                 &prepared,
                 NativeV2SnapshotArtifactProfile::VsockStateV2_12,
             ),
-            Err(NativeV2SnapshotLoadError::Preflight(
-                VmmActionError::SnapshotUnsupported
-            ))
+            Err(NativeV2SnapshotLoadError::Decode(_))
         ));
     }
 
@@ -52844,7 +54065,7 @@ mod tests {
         let (candidate, _) = load_native_snapshot_artifacts(&paths)
             .expect("published network snapshot should load")
             .into_current_v2_candidate()
-            .expect("published network snapshot should retain exact 2.11");
+            .expect("published network snapshot should retain exact 2.12");
         assert!(candidate.network().is_some());
         directory.assert_no_staging();
     }
@@ -52880,7 +54101,7 @@ mod tests {
         let (candidate, _) = load_native_snapshot_artifacts(&paths)
             .expect("published memory-hotplug snapshot should load")
             .into_current_v2_candidate()
-            .expect("published memory-hotplug snapshot should retain exact 2.11");
+            .expect("published memory-hotplug snapshot should retain exact 2.12");
         let memory_hotplug = candidate
             .memory_hotplug()
             .expect("published memory-hotplug snapshot should contain kind 11");
@@ -52889,9 +54110,9 @@ mod tests {
         PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
             memory_hotplug.clone(),
             candidate.memory_binding().clone(),
-            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         )
-        .expect("published memory-hotplug binding should close at exact 2.11");
+        .expect("published memory-hotplug binding should close at exact 2.12");
         directory.assert_no_staging();
     }
 
@@ -53042,13 +54263,11 @@ mod tests {
         assert!(!parent.exists());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn public_exact_minor_eleven_configured_vsock_captures_before_unchanged_rejection() {
-        let state_path = missing_temp_child_path("public-vsock.state");
-        let memory_path = state_path.with_file_name("public-vsock.memory");
-        let parent = state_path
-            .parent()
-            .expect("missing public-vsock path should have a parent");
+    fn public_exact_minor_twelve_configured_vsock_publishes_current_pair() {
+        let directory = TempSnapshotDirectory::new("public-vsock");
+        let paths = directory.paths();
         let mut vmm = configured_vmm(FakeStarter::success(161));
         vmm.handle_action(VmmAction::PutVsock(VsockConfigInput::new(
             42,
@@ -53060,15 +54279,15 @@ mod tests {
         vmm.handle_action(VmmAction::Pause)
             .expect("public vsock fake session should pause");
 
-        let error = vmm
-            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+        assert_eq!(
+            vmm.handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
                 SnapshotType::Full,
-                &state_path,
-                &memory_path,
-            )))
-            .expect_err("public exact-2.11 should reject configured vsock after capture");
+                paths.state(),
+                paths.memory(),
+            ))),
+            Ok(VmmData::Empty)
+        );
 
-        assert_eq!(error, VmmActionError::SnapshotUnsupported);
         assert_eq!(
             vmm.starter.snapshot_preflight_trace,
             [
@@ -53089,12 +54308,19 @@ mod tests {
         let session = vmm
             .started_session
             .as_ref()
-            .expect("rejected public vsock snapshot should retain its paused session");
-        assert_eq!(session.native_snapshot_publication_count, 0);
-        assert_eq!(session.native_snapshot_producer_count, 0);
-        assert!(!state_path.exists());
-        assert!(!memory_path.exists());
-        assert!(!parent.exists());
+            .expect("published public vsock snapshot should retain its paused session");
+        assert_eq!(session.native_snapshot_publication_count, 1);
+        assert_eq!(session.native_snapshot_producer_count, 1);
+        let (candidate, _) = load_native_snapshot_artifacts(&paths)
+            .expect("public exact-2.12 vsock pair should load")
+            .into_current_v2_candidate()
+            .expect("public exact-2.12 vsock pair should retain the current candidate");
+        assert_eq!(
+            candidate.version(),
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+        );
+        assert!(candidate.vsock().is_some());
+        directory.assert_no_staging();
     }
 
     #[test]
@@ -53778,7 +55004,7 @@ mod tests {
                             }
                             source
                                 .handle_action(VmmAction::InstanceStart)
-                                .expect("public exact-2.11 source should start");
+                                .expect("public exact-2.12 source should start");
                             if has_memory_hotplug {
                                 source
                                     .handle_action(VmmAction::PatchMemoryHotplug(
@@ -53788,7 +55014,7 @@ mod tests {
                             }
                             source
                                 .handle_action(VmmAction::Pause)
-                                .expect("public exact-2.11 source should pause");
+                                .expect("public exact-2.12 source should pause");
                             source
                             .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
                                 SnapshotType::Full,
@@ -53802,13 +55028,13 @@ mod tests {
                             });
 
                             let loaded = load_native_snapshot_artifacts(&paths)
-                                .expect("public exact-2.11 pair should load");
+                                .expect("public exact-2.12 pair should load");
                             let (candidate, _) = loaded
                                 .into_current_v2_candidate()
                                 .expect("public pair should retain the exact current candidate");
                             assert_eq!(
                                 candidate.version(),
-                                NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+                                NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
                             );
                             assert_eq!(candidate.entropy().is_some(), has_entropy);
                             if let Some(entropy) = candidate.entropy() {
@@ -53829,9 +55055,9 @@ mod tests {
                                 PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
                                     memory_hotplug.clone(),
                                     candidate.memory_binding().clone(),
-                                    NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                                    NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
                                 )
-                                .expect("public exact-2.11 virtio-mem memory binding should close");
+                                .expect("public exact-2.12 virtio-mem memory binding should close");
                             }
                             match candidate.device_graph() {
                                 Some(graph) => {
@@ -55445,7 +56671,7 @@ mod tests {
     #[test]
     #[ignore = "requires the signed native_v2_process integration group"]
     fn signed_native_v2_process_publishes_recaptures_and_resumes_private_pair() {
-        use bangbang_hvf::{HvfArm64StableVcpuDisposition, decode_hvf_snapshot_v2_network_state};
+        use bangbang_hvf::{HvfArm64StableVcpuDisposition, decode_hvf_snapshot_v2_vsock_state};
         use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
 
         const ARM64_IMAGE_HEADER_SIZE: usize = 64;
@@ -55515,7 +56741,7 @@ mod tests {
                 .expect("native-v2 load should retain structural bytes"),
         )
         .expect("real process native-v2 state should decode structurally");
-        let first_state = decode_hvf_snapshot_v2_network_state(&first_structural)
+        let first_state = decode_hvf_snapshot_v2_vsock_state(&first_structural)
             .expect("real process native-v2 current state should cross-validate");
         let first_platform = first_state.platform();
         assert_eq!(first_platform.topology().members().len(), 2);
@@ -55659,13 +56885,13 @@ mod tests {
             Ok(VmmData::Empty)
         );
         let recaptured = load_native_snapshot_artifacts(&recaptured_paths)
-            .expect("restored destination should publish current exact-2.11 state");
+            .expect("restored destination should publish current exact-2.12 state");
         assert_eq!(
             recaptured
                 .state()
                 .v2_profile()
                 .expect("recaptured destination should retain a closed profile"),
-            NativeV2SnapshotArtifactProfile::NetworkStateV2_11
+            NativeV2SnapshotArtifactProfile::VsockStateV2_12
         );
         recaptured_directory.assert_no_staging();
         drop(paused_destination);
@@ -57028,7 +58254,7 @@ mod tests {
             .expect("empty-drive source should pause");
         drive
             .publish_native_v2_snapshot(&drive_input)
-            .expect("serial-only source should publish current exact-2.11 state");
+            .expect("serial-only source should publish current exact-2.12 state");
         assert_eq!(
             drive
                 .started_session
@@ -57044,7 +58270,7 @@ mod tests {
         let (candidate, _) = load_native_snapshot_artifacts(&drive_paths)
             .expect("serial-only pair should load")
             .into_current_v2_candidate()
-            .expect("serial-only pair should close as current exact 2.11");
+            .expect("serial-only pair should close as current exact 2.12");
         assert!(candidate.device_graph().is_none());
         drive_directory.assert_no_staging();
 
@@ -57104,7 +58330,7 @@ mod tests {
                 optional_paths.state(),
                 optional_paths.memory(),
             ))
-            .expect("balloon source should publish current exact-2.11 state");
+            .expect("balloon source should publish current exact-2.12 state");
         assert_eq!(
             optional.starter.snapshot_storage_preflight_calls, 1,
             "balloon publication should preflight the storage owner set"
@@ -57112,7 +58338,7 @@ mod tests {
         let (candidate, _) = load_native_snapshot_artifacts(&optional_paths)
             .expect("balloon publication should load")
             .into_current_v2_candidate()
-            .expect("balloon publication should close as current exact 2.11");
+            .expect("balloon publication should close as current exact 2.12");
         assert!(candidate.balloon().is_some());
         optional_directory.assert_no_staging();
 
@@ -57140,7 +58366,7 @@ mod tests {
             .expect("custom serial source should pause");
         serial
             .publish_native_v2_snapshot(&serial_input)
-            .expect("configured serial state should publish in current exact 2.11");
+            .expect("configured serial state should publish in current exact 2.12");
         assert_eq!(
             serial
                 .started_session
@@ -57156,7 +58382,7 @@ mod tests {
         let (candidate, _) = load_native_snapshot_artifacts(&serial_paths)
             .expect("configured serial snapshot should load")
             .into_current_v2_candidate()
-            .expect("configured serial snapshot should close as current exact 2.11");
+            .expect("configured serial snapshot should close as current exact 2.12");
         assert_eq!(
             candidate.serial().rate_limiter(),
             Some(SerialRateLimiterConfig::new(1, None, 1_000))
@@ -62915,27 +64141,32 @@ mod tests {
                 assert!(!format!("{candidate:?}").contains("captured-vsock"));
                 assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 1);
                 assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 1);
+                let mut expected_events = vec![
+                    "aux-acquire",
+                    "v2-serial",
+                    "v2-pause",
+                    "v2-balloon",
+                    "v2-entropy",
+                    "v2-memory-hotplug",
+                    "v2-network",
+                ];
+                if has_vsock {
+                    expected_events.push("v2-vsock");
+                }
+                expected_events.extend([
+                    "v2-vsock-platform",
+                    "v2-vsock-compose",
+                    "v2-vsock-encode",
+                    "v2-recover",
+                    "v2-candidate-sealed",
+                    "aux-drop",
+                ]);
                 assert_eq!(
                     events
                         .lock()
                         .expect("vsock candidate events should lock")
                         .as_slice(),
-                    [
-                        "aux-acquire",
-                        "v2-serial",
-                        "v2-pause",
-                        "v2-balloon",
-                        "v2-entropy",
-                        "v2-memory-hotplug",
-                        "v2-network",
-                        "v2-vsock",
-                        "v2-vsock-platform",
-                        "v2-vsock-compose",
-                        "v2-vsock-encode",
-                        "v2-recover",
-                        "v2-candidate-sealed",
-                        "aux-drop",
-                    ]
+                    expected_events.as_slice()
                 );
                 assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
                 drop(supervisor);
@@ -64840,9 +66071,9 @@ mod tests {
                 "v2-entropy",
                 "v2-memory-hotplug",
                 "v2-network",
-                "v2-network-platform",
-                "v2-network-compose",
-                "v2-network-encode",
+                "v2-vsock-platform",
+                "v2-vsock-compose",
+                "v2-vsock-encode",
                 "v2-recover",
                 "v2-published",
                 "aux-drop",
@@ -64916,12 +66147,12 @@ mod tests {
                 ),
                 &paths,
             )
-            .expect("mutated UART state should publish as complete exact-2.11 state");
+            .expect("mutated UART state should publish as complete exact-2.12 state");
         assert_eq!(outcome.family(), NativeSnapshotArtifactFamily::V2);
         let (candidate, _) = load_native_snapshot_artifacts(&paths)
             .expect("mutated UART pair should load")
             .into_current_v2_candidate()
-            .expect("mutated UART pair should close as exact 2.11");
+            .expect("mutated UART pair should close as exact 2.12");
         assert_eq!(candidate.serial().device().receive_bytes(), b"x");
         assert_eq!(
             events
@@ -64938,9 +66169,9 @@ mod tests {
                 "v2-entropy",
                 "v2-memory-hotplug",
                 "v2-network",
-                "v2-network-platform",
-                "v2-network-compose",
-                "v2-network-encode",
+                "v2-vsock-platform",
+                "v2-vsock-compose",
+                "v2-vsock-encode",
                 "v2-recover",
                 "v2-published",
                 "aux-drop",

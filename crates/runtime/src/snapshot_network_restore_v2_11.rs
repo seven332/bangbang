@@ -822,7 +822,7 @@ pub struct PreparedSnapshotV2NetworkRestoreTopology {
 }
 
 impl PreparedSnapshotV2NetworkRestoreTopology {
-    /// Constructs the internal network-free form for one current exact-2.11
+    /// Constructs the internal network-free form for one retained exact-2.11
     /// destination. Portable kind-12 state itself remains non-empty.
     #[doc(hidden)]
     pub fn empty(transport_kind: SnapshotV2DeviceTransportKind) -> Self {
