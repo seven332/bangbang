@@ -11462,7 +11462,9 @@ fn notify_vsock_capture_event_queue(
     pci: bool,
 ) {
     use bangbang_runtime::virtio_mmio::VirtioMmioRegister;
-    use bangbang_runtime::virtio_pci::VIRTIO_PCI_NOTIFICATION_OFFSET;
+    use bangbang_runtime::virtio_pci::{
+        VIRTIO_PCI_NOTIFICATION_MULTIPLIER, VIRTIO_PCI_NOTIFICATION_OFFSET,
+    };
     use bangbang_runtime::vsock::VIRTIO_VSOCK_EVENT_QUEUE_INDEX;
 
     let dispatcher = session.mmio_dispatcher();
@@ -11471,7 +11473,14 @@ fn notify_vsock_capture_event_queue(
         .expect("signed vsock MMIO dispatcher should not be poisoned");
     let (offset, bytes) = if pci {
         (
-            VIRTIO_PCI_NOTIFICATION_OFFSET,
+            VIRTIO_PCI_NOTIFICATION_OFFSET
+                .checked_add(
+                    u64::try_from(VIRTIO_VSOCK_EVENT_QUEUE_INDEX)
+                        .unwrap()
+                        .checked_mul(u64::from(VIRTIO_PCI_NOTIFICATION_MULTIPLIER))
+                        .unwrap(),
+                )
+                .unwrap(),
             u16::try_from(VIRTIO_VSOCK_EVENT_QUEUE_INDEX)
                 .unwrap()
                 .to_le_bytes()
@@ -11759,6 +11768,361 @@ fn capture_ready_vsock_resets_signed_mmio_and_pci_owners() {
         .expect("signed PCI vsock session should shut down");
     drop(pci_session);
     assert!(!socket_path.exists());
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn restores_signed_active_exact_2_12_pci_vsock_owner_graph() {
+    use std::io::Cursor;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    use bangbang_hvf::{
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfArm64BootVsockTransportState,
+        HvfSnapshotV2BootState, HvfSnapshotV2NativePath, HvfSnapshotV2NetworkPciMemoryInput,
+        HvfSnapshotV2RestoredSerialShell, HvfSnapshotV2VsockPreparedEndpoint,
+        HvfSnapshotV2VsockPreparedMemory, HvfSnapshotV2VsockPreparedProduct,
+        HvfSnapshotV2VsockPreparedProductParts, HvfSnapshotV2VsockProductKind,
+        HvfSnapshotV2VsockState, OwnedHvfArm64BootSession, encode_hvf_snapshot_v2_vsock_state,
+        prepare_hvf_snapshot_v2_vsock_pci_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::metrics::{
+        SharedNetworkInterfaceMetricsRegistry, SharedVsockDeviceMetrics,
+    };
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot::SnapshotVsockOverride;
+    use bangbang_runtime::snapshot_device_v2::{
+        SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
+    };
+    use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version;
+    use bangbang_runtime::snapshot_memory_v2::load_snapshot_v2_memory_file;
+    use bangbang_runtime::snapshot_network_restore_v2_11::PreparedSnapshotV2NetworkRestoreTopology;
+    use bangbang_runtime::snapshot_restore::NATIVE_V2_VSOCK_RESTORE_PUBLIC_ID;
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::snapshot_vsock_restore_v2_12::PreparedSnapshotV2VsockRestoreTopology;
+    use bangbang_runtime::snapshot_vsock_v2_12::NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
+    use bangbang_runtime::vsock::{
+        SuppliedVsockListener, VirtioVsockReconstructionResource, VsockBackendSelector,
+        VsockConfigInput, VsockGuestConnector, VsockMmioLayout,
+    };
+
+    // Direct listener creation is unavailable in the App Sandbox lifecycle
+    // replay. Supplied-listener containment is covered by the signed process
+    // transaction test in the same integration wrapper.
+    if is_app_sandbox_hvf_lifecycle_replay() {
+        return;
+    }
+
+    #[derive(Debug)]
+    struct RejectingGuestConnector;
+
+    impl VsockGuestConnector for RejectingGuestConnector {
+        fn connect(&mut self, _host_port: u32) -> std::io::Result<UnixStream> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("restore-vsock-pci-kernel", &image)
+        .expect("vsock restore kernel should create");
+    let socket_id = NEXT_HVF_TEST_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let source_socket = std::env::temp_dir().join(format!(
+        "bb-vsock-source-{}-{socket_id}.sock",
+        std::process::id()
+    ));
+    let destination_socket = std::env::temp_dir().join(format!(
+        "bb-vsock-destination-{}-{socket_id}.sock",
+        std::process::id()
+    ));
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("vsock restore boot source should configure");
+    controller
+        .handle_action(VmmAction::PutMachineConfig(
+            MachineConfigInput::new(1, 128).with_track_dirty_pages(true),
+        ))
+        .expect("vsock restore machine should configure");
+    controller
+        .handle_action(VmmAction::PutVsock(VsockConfigInput::new(
+            42,
+            path_text(&source_socket),
+        )))
+        .expect("vsock restore source should configure");
+    let source_config = controller
+        .vsock_config()
+        .cloned()
+        .expect("vsock restore source config should exist");
+    let session_config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
+    )
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+    ))
+    .with_pci_enabled();
+    let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+        .expect("signed active PCI vsock source should prepare");
+    let source_metrics = source.shared_vsock_device_metrics();
+    let idle_guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("PCI vsock source publishers should quiesce");
+    let idle = source
+        .capture_ready_vsock_state(Some(source_config.clone()), &source_metrics, &idle_guard)
+        .expect("inactive PCI vsock source should capture")
+        .expect("configured PCI vsock source should exist");
+    let HvfArm64BootVsockTransportState::Pci { bar_range, .. } = idle.transport() else {
+        panic!("vsock source should use PCI");
+    };
+    let transport_base = bar_range.start();
+    drop(idle_guard);
+    activate_vsock_capture_queues(&mut source, transport_base, true);
+    {
+        let dispatcher = source.mmio_dispatcher();
+        let mut dispatcher = dispatcher
+            .lock()
+            .expect("signed PCI vsock dispatcher should not be poisoned");
+        write_vsock_capture_mmio(
+            &mut dispatcher,
+            transport_base.checked_add(0x10).unwrap(),
+            &3_u16.to_le_bytes(),
+        );
+        for (queue_index, vector) in [(0_u16, 0_u16), (1, 1), (2, 2)] {
+            write_vsock_capture_mmio(
+                &mut dispatcher,
+                transport_base.checked_add(0x16).unwrap(),
+                &queue_index.to_le_bytes(),
+            );
+            write_vsock_capture_mmio(
+                &mut dispatcher,
+                transport_base.checked_add(0x1a).unwrap(),
+                &vector.to_le_bytes(),
+            );
+        }
+    }
+
+    let active_guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("active PCI vsock source publishers should quiesce");
+    let captured_vsock = source
+        .capture_ready_vsock_state(Some(source_config.clone()), &source_metrics, &active_guard)
+        .expect("active PCI vsock source should capture")
+        .expect("configured active PCI vsock source should exist")
+        .try_into_snapshot_v2()
+        .expect("active PCI vsock source should convert");
+    assert!(captured_vsock.active_queues().is_some());
+    assert!(matches!(
+        captured_vsock.transport(),
+        SnapshotV2DeviceTransport::Pci(_)
+    ));
+    let serial = SnapshotV2SerialState::try_from_capture_ready(
+        source
+            .capture_ready_serial_state(controller.serial_config().clone(), &active_guard)
+            .expect("vsock product serial should capture"),
+    )
+    .expect("vsock product serial should convert");
+    drop(active_guard);
+
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("active PCI vsock source should pause");
+    let boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+            .expect("vsock restore kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("vsock restore boot metadata should validate");
+    let mut memory_writer = Cursor::new(Vec::new());
+    let platform = source
+        .capture_snapshot_v2_vsock_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            None,
+            &mut memory_writer,
+            |_| false,
+        )
+        .expect("active PCI vsock platform should capture");
+    let encoded = encode_hvf_snapshot_v2_vsock_state(
+        &HvfSnapshotV2VsockState::try_new(
+            platform.clone(),
+            None,
+            serial.clone(),
+            None,
+            None,
+            None,
+            Some(captured_vsock.clone()),
+        )
+        .expect("active PCI vsock product should compose"),
+    )
+    .expect("active PCI vsock product should encode");
+    let structural = decode_snapshot_v2_state_with_compatibility_version(
+        &encoded,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("active PCI vsock product should decode structurally");
+    let memory_image = TempFile::new("restore-vsock-pci-memory", memory_writer.get_ref())
+        .expect("active PCI vsock memory should persist");
+    let platform_state = platform.platform().clone();
+    source
+        .shutdown()
+        .expect("active PCI vsock source should shut down");
+    drop(source);
+    assert!(!source_socket.exists());
+
+    let destination_memory = load_snapshot_v2_memory_file(
+        &structural,
+        std::fs::File::open(memory_image.path()).expect("active PCI vsock memory should reopen"),
+    )
+    .expect("active PCI vsock memory should map privately");
+    let topology = PreparedSnapshotV2VsockRestoreTopology::prepare(
+        captured_vsock,
+        Some(&SnapshotVsockOverride::new(&destination_socket)),
+        SnapshotV2DeviceTransportKind::Pci,
+        &destination_memory,
+    )
+    .expect("active PCI vsock destination should prepare");
+    let (request, state) = topology.into_parts();
+    let (resource_key, selectors, destination_config, overridden) = request.into_parts();
+    assert_eq!(
+        resource_key.public_id().as_str(),
+        NATIVE_V2_VSOCK_RESTORE_PUBLIC_ID
+    );
+    assert!(overridden);
+    let expected = state
+        .clone()
+        .into_destination_normalized_state(&destination_config)
+        .expect("active PCI vsock expected state should normalize");
+    let product =
+        HvfSnapshotV2VsockPreparedProduct::try_from_parts(HvfSnapshotV2VsockPreparedProductParts {
+            kind: HvfSnapshotV2VsockProductKind::from_presence(
+                false, false, false, false, false, true,
+            ),
+            memory: HvfSnapshotV2VsockPreparedMemory::Static(platform_state.memory().clone()),
+            storage: None,
+            entropy: None,
+            balloon: None,
+            network: PreparedSnapshotV2NetworkRestoreTopology::empty(
+                SnapshotV2DeviceTransportKind::Pci,
+            ),
+            vsock: Some(HvfSnapshotV2VsockPreparedEndpoint::new(
+                state,
+                destination_config.clone(),
+            )),
+            serial_resource_present: false,
+            binding_keys: vec![resource_key],
+        })
+        .expect("active PCI vsock prepared product should validate");
+    let plan = prepare_hvf_snapshot_v2_vsock_pci_platform_plan(&platform_state, product)
+        .unwrap_or_else(|error| {
+            panic!(
+                "active PCI vsock platform plan should prepare: {error:?}; source={:?}",
+                std::error::Error::source(&error)
+            )
+        });
+    let listener = UnixListener::bind(&destination_socket)
+        .expect("active PCI vsock destination listener should bind");
+    let mut resource = VirtioVsockReconstructionResource::with_destination_selector(
+        selectors.captured().clone(),
+        VsockBackendSelector::try_from_path(&destination_socket)
+            .expect("active PCI vsock destination selector should validate"),
+        SuppliedVsockListener::new(listener).with_guest_connector(RejectingGuestConnector),
+    );
+    let destination_metrics = SharedVsockDeviceMetrics::default();
+    let shell = HvfSnapshotV2RestoredSerialShell::new(
+        SerialMmioDevice::from_capture_state_with_shared_output(
+            SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+            serial.device().clone(),
+        ),
+    );
+    let mut owners = OwnedHvfArm64BootSession::restore_snapshot_v2_vsock_pci_with_cancel(
+        platform_state,
+        HvfSnapshotV2NetworkPciMemoryInput::Static(destination_memory),
+        shell,
+        None,
+        plan,
+        Vec::new(),
+        SharedNetworkInterfaceMetricsRegistry::default(),
+        Some(&mut resource),
+        destination_metrics.clone(),
+        std::time::Instant::now(),
+        |_| false,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "active exact-2.12 PCI vsock owner graph should restore at {:?}: {error:?}",
+            error.stage()
+        )
+    });
+
+    assert!(resource.is_consumed());
+    assert!(!owners.retry_publication_is_committed());
+    assert!(owners.configs().is_empty());
+    assert_eq!(owners.expected_vsock(), Some(&expected));
+    assert_eq!(owners.vsock_config(), Some(&destination_config));
+    assert!(owners.resource_keys().len() == 1);
+    assert!(
+        owners
+            .vsock_metrics()
+            .is_some_and(|metrics| metrics.shares_state_with(&destination_metrics))
+    );
+    assert!(!source_metrics.shares_state_with(&destination_metrics));
+    let destination_metric_snapshot = destination_metrics.snapshot();
+    assert!(
+        destination_metric_snapshot.is_empty(),
+        "fresh destination metrics should be empty: {destination_metric_snapshot:?}"
+    );
+    let guard = owners
+        .session()
+        .quiesce_limiter_retry_wakeups()
+        .expect("restored PCI vsock publishers should quiesce");
+    let recaptured = owners
+        .session_mut()
+        .capture_ready_vsock_state(
+            Some(destination_config.clone()),
+            &destination_metrics,
+            &guard,
+        )
+        .expect("restored active PCI vsock should recapture")
+        .expect("restored active PCI vsock should remain present")
+        .try_into_snapshot_v2()
+        .expect("restored active PCI vsock should convert");
+    drop(guard);
+    assert_eq!(recaptured, expected);
+    let diagnostics = format!("{owners:?}");
+    assert!(diagnostics.contains("<redacted>"));
+    assert!(!diagnostics.contains(destination_socket.to_string_lossy().as_ref()));
+
+    let owners = owners.commit_retry_publication();
+    assert!(owners.retry_publication_is_committed());
+    owners
+        .shutdown()
+        .expect("restored active PCI vsock owner graph should shut down");
+    assert!(destination_socket.exists());
+    std::fs::remove_file(&destination_socket)
+        .expect("restored active PCI vsock socket should unlink after shutdown");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

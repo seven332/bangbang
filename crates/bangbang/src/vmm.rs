@@ -71,7 +71,8 @@ use bangbang_hvf::{
     HvfSnapshotV2StoragePciRestoreError, HvfSnapshotV2StorageState,
     HvfSnapshotV2VsockMmioPlatformPlan, HvfSnapshotV2VsockMmioProcessConfig,
     HvfSnapshotV2VsockMmioRestoreError, HvfSnapshotV2VsockMmioRestoreStage,
-    HvfSnapshotV2VsockPciPlatformPlan, HvfSnapshotV2VsockPlatformState,
+    HvfSnapshotV2VsockPciPlatformPlan, HvfSnapshotV2VsockPciRestoreError,
+    HvfSnapshotV2VsockPciRestoreStage, HvfSnapshotV2VsockPlatformState,
     HvfSnapshotV2VsockPreparedEndpoint, HvfSnapshotV2VsockPreparedMemory,
     HvfSnapshotV2VsockPreparedProduct, HvfSnapshotV2VsockPreparedProductParts,
     HvfSnapshotV2VsockProcessResourceIdentity, HvfSnapshotV2VsockProductKind,
@@ -84,16 +85,17 @@ use bangbang_hvf::{
     PrepareHvfSnapshotV2StoragePciPlatformPlanError, PreparedHvfArm64BootPciNetworkRemoval,
     PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2NetworkMmioOwners,
     RestoredHvfSnapshotV2NetworkPciOwners, RestoredHvfSnapshotV2Platform,
-    RestoredHvfSnapshotV2VsockMmioOwners, decode_hvf_snapshot_v2_balloon_state,
-    decode_hvf_snapshot_v2_entropy_state, decode_hvf_snapshot_v2_memory_hotplug_state,
-    decode_hvf_snapshot_v2_multi_block_state, decode_hvf_snapshot_v2_network_state,
-    decode_hvf_snapshot_v2_platform_state, decode_hvf_snapshot_v2_serial_state,
-    decode_hvf_snapshot_v2_state, decode_hvf_snapshot_v2_storage_state,
-    encode_hvf_snapshot_v2_balloon_state, encode_hvf_snapshot_v2_entropy_state,
-    encode_hvf_snapshot_v2_memory_hotplug_state, encode_hvf_snapshot_v2_multi_block_state,
-    encode_hvf_snapshot_v2_network_state, encode_hvf_snapshot_v2_serial_state,
-    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
-    encode_hvf_snapshot_v2_vsock_state, prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    RestoredHvfSnapshotV2VsockMmioOwners, RestoredHvfSnapshotV2VsockPciOwners,
+    decode_hvf_snapshot_v2_balloon_state, decode_hvf_snapshot_v2_entropy_state,
+    decode_hvf_snapshot_v2_memory_hotplug_state, decode_hvf_snapshot_v2_multi_block_state,
+    decode_hvf_snapshot_v2_network_state, decode_hvf_snapshot_v2_platform_state,
+    decode_hvf_snapshot_v2_serial_state, decode_hvf_snapshot_v2_state,
+    decode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_balloon_state,
+    encode_hvf_snapshot_v2_entropy_state, encode_hvf_snapshot_v2_memory_hotplug_state,
+    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_network_state,
+    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
+    encode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_vsock_state,
+    prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
     prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_pci_platform_plan,
@@ -105,7 +107,8 @@ use bangbang_hvf::{
     prepare_hvf_snapshot_v2_storage_entropy_pci_platform_plan,
     prepare_hvf_snapshot_v2_storage_mmio_platform_plan,
     prepare_hvf_snapshot_v2_storage_pci_platform_plan,
-    prepare_hvf_snapshot_v2_vsock_mmio_platform_plan, restore_hvf_snapshot_v2_process_platform,
+    prepare_hvf_snapshot_v2_vsock_mmio_platform_plan,
+    prepare_hvf_snapshot_v2_vsock_pci_platform_plan, restore_hvf_snapshot_v2_process_platform,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -22756,6 +22759,43 @@ where
         )
     }
 
+    fn matches_pci_platform_plan(&self, plan: &HvfSnapshotV2VsockPciPlatformPlan) -> bool {
+        let mut vsock_keys = self
+            .binding_keys
+            .iter()
+            .filter(|key| key.resource_class() == SnapshotRestoreResourceClass::VsockEndpoint);
+        let vsock = match (
+            vsock_keys.next(),
+            vsock_keys.next(),
+            self.vsock_config.as_ref(),
+        ) {
+            (None, None, None) => None,
+            (Some(key), None, Some(config)) => {
+                Some(HvfSnapshotV2VsockProcessResourceIdentity::new(key, config))
+            }
+            _ => return false,
+        };
+        plan.preflight_process_resource_identity(
+            self.network_completion
+                .resource_interfaces
+                .iter()
+                .map(|interface| {
+                    HvfSnapshotV2NetworkProcessResourceIdentity::new(
+                        interface.source_index,
+                        &interface.resource_key,
+                        &interface.controller,
+                        interface.profile,
+                        interface.backend,
+                        interface.mmds_stack,
+                    )
+                }),
+            self.network_completion.expected_mmds_state(),
+            self.network_completion.expected_mmds_controller(),
+            vsock,
+            &self.binding_keys,
+        )
+    }
+
     pub(crate) fn remaining_count(&self) -> usize {
         self.bindings.remaining_count()
     }
@@ -23659,6 +23699,356 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessSnapshotV2VsockPciRestoreStage {
+    ResourcePreparation,
+    ProductPreparation,
+    ResourceTake { index: usize },
+    Serial,
+    HvfConstruction,
+    Hvf(HvfSnapshotV2VsockPciRestoreStage),
+    BatchFinish,
+    CompleteRecapture,
+    Assembly,
+    GateCommit,
+    Cleanup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessSnapshotV2VsockPciRestoreDisposition {
+    Retryable,
+    Terminal,
+    TerminalCleanup,
+}
+
+/// Bounded process-level failure for one exact-2.12 PCI owner transaction.
+struct ProcessSnapshotV2VsockPciRestoreError {
+    stage: ProcessSnapshotV2VsockPciRestoreStage,
+    disposition: ProcessSnapshotV2VsockPciRestoreDisposition,
+}
+
+impl ProcessSnapshotV2VsockPciRestoreError {
+    const fn retryable(stage: ProcessSnapshotV2VsockPciRestoreStage) -> Self {
+        Self {
+            stage,
+            disposition: ProcessSnapshotV2VsockPciRestoreDisposition::Retryable,
+        }
+    }
+
+    const fn terminal(
+        stage: ProcessSnapshotV2VsockPciRestoreStage,
+        cleanup_uncertain: bool,
+    ) -> Self {
+        Self {
+            stage,
+            disposition: if cleanup_uncertain {
+                ProcessSnapshotV2VsockPciRestoreDisposition::TerminalCleanup
+            } else {
+                ProcessSnapshotV2VsockPciRestoreDisposition::Terminal
+            },
+        }
+    }
+
+    fn from_resource(
+        stage: ProcessSnapshotV2VsockPciRestoreStage,
+        source: &ProcessSnapshotV2VsockRestoreResourceError,
+    ) -> Self {
+        if source.cleanup_uncertain() {
+            return Self::terminal(stage, true);
+        }
+        match source.disposition() {
+            ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable => Self::retryable(stage),
+            ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal => {
+                Self::terminal(stage, false)
+            }
+        }
+    }
+
+    fn from_hvf(source: &HvfSnapshotV2VsockPciRestoreError, cleanup_uncertain: bool) -> Self {
+        let stage = ProcessSnapshotV2VsockPciRestoreStage::Hvf(source.stage());
+        if source.has_incomplete_cleanup() || cleanup_uncertain {
+            return Self::terminal(stage, true);
+        }
+        match source.disposition() {
+            HvfSnapshotV2NetworkPciRestoreDisposition::Retryable => Self::retryable(stage),
+            HvfSnapshotV2NetworkPciRestoreDisposition::Terminal
+            | HvfSnapshotV2NetworkPciRestoreDisposition::TerminalCleanup => {
+                Self::terminal(stage, false)
+            }
+        }
+    }
+
+    fn from_adoption(
+        source: &ProcessSnapshotV2VsockAdoptionError<HvfSnapshotV2VsockPciRestoreError>,
+        cleanup_uncertain: bool,
+    ) -> Self {
+        match source {
+            ProcessSnapshotV2VsockAdoptionError::Resources(source) => {
+                let mapped = Self::from_resource(
+                    ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction,
+                    source,
+                );
+                if cleanup_uncertain {
+                    Self::terminal(mapped.stage, true)
+                } else {
+                    mapped
+                }
+            }
+            ProcessSnapshotV2VsockAdoptionError::Adoption(
+                VsockRestoreAdoptionError::Reconstruction {
+                    source,
+                    disposition,
+                },
+            ) => {
+                let mapped = Self::from_hvf(source, cleanup_uncertain);
+                if matches!(disposition, VsockRestoreDisposition::Terminal)
+                    && matches!(
+                        mapped.disposition,
+                        ProcessSnapshotV2VsockPciRestoreDisposition::Retryable
+                    )
+                {
+                    Self::terminal(mapped.stage, cleanup_uncertain)
+                } else {
+                    mapped
+                }
+            }
+            ProcessSnapshotV2VsockAdoptionError::Adoption(VsockRestoreAdoptionError::Contract(
+                source,
+            )) => match (source.disposition(), cleanup_uncertain) {
+                (_, true) => {
+                    Self::terminal(ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction, true)
+                }
+                (VsockRestoreDisposition::Retryable, false) => {
+                    Self::retryable(ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction)
+                }
+                (VsockRestoreDisposition::Terminal, false) => Self::terminal(
+                    ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction,
+                    false,
+                ),
+            },
+        }
+    }
+}
+
+impl fmt::Debug for ProcessSnapshotV2VsockPciRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessSnapshotV2VsockPciRestoreError")
+            .field("stage", &self.stage)
+            .field("disposition", &self.disposition)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for ProcessSnapshotV2VsockPciRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.12 process PCI vsock reconstruction failed at {:?} ({:?})",
+            self.stage, self.disposition
+        )
+    }
+}
+
+impl std::error::Error for ProcessSnapshotV2VsockPciRestoreError {}
+
+/// Complete unpublished process/HVF exact-2.12 PCI owner graph.
+///
+/// Explicit shutdown preserves the irreversible lifetime order: HVF/session,
+/// active socket publication, network provider and metrics leases, file and
+/// contained authority, then process-stdio restoration.
+struct RestoredProcessSnapshotV2VsockPciOwners<B>
+where
+    B: ProcessVmnetBackend,
+{
+    hvf: Option<RestoredHvfSnapshotV2VsockPciOwners>,
+    active_vsock: Option<ActiveVsockRestoreGuard>,
+    completion: Option<PreparedProcessSnapshotV2VsockRestoreCompletion<B>>,
+    network_resources: Vec<PreparedProcessSnapshotV2NetworkRestoreResource>,
+    serial_output: Option<SharedSerialOutput>,
+    serial_config: Option<SerialConfig>,
+    serial_restoration: Option<SerialStdioRestoration>,
+}
+
+impl<B> RestoredProcessSnapshotV2VsockPciOwners<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn shutdown(&mut self) -> Result<(), ProcessSnapshotV2VsockPciRestoreError> {
+        let mut cleanup_uncertain = self.hvf.take().is_some_and(|hvf| hvf.shutdown().is_err());
+        cleanup_uncertain |= self
+            .active_vsock
+            .take()
+            .is_some_and(|guard| guard.cleanup().is_err());
+        if let Some(completion) = self.completion.take() {
+            cleanup_uncertain |= abort_completed_process_snapshot_v2_vsock_resources(
+                completion,
+                &mut self.network_resources,
+            );
+        } else {
+            self.network_resources.clear();
+        }
+        cleanup_uncertain |= finish_process_snapshot_v2_serial_restoration(
+            &mut self.serial_output,
+            &mut self.serial_config,
+            &mut self.serial_restoration,
+        );
+        if cleanup_uncertain {
+            Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::Cleanup,
+                true,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<B> Drop for RestoredProcessSnapshotV2VsockPciOwners<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+impl<B> fmt::Debug for RestoredProcessSnapshotV2VsockPciOwners<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoredProcessSnapshotV2VsockPciOwners")
+            .field("interface_count", &self.network_resources.len())
+            .field("has_vsock", &self.active_vsock.is_some())
+            .field(
+                "retry_publication_committed",
+                &self.hvf.as_ref().is_some_and(
+                    RestoredHvfSnapshotV2VsockPciOwners::retry_publication_is_committed,
+                ),
+            )
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+struct StagedProcessSnapshotV2VsockPciOwners<B>
+where
+    B: ProcessVmnetBackend,
+{
+    batch: Option<PreparedProcessSnapshotV2VsockRestoreBatch<B>>,
+    hvf: Option<RestoredHvfSnapshotV2VsockPciOwners>,
+    active_vsock: Option<ActiveVsockRestoreGuard>,
+    completion: Option<PreparedProcessSnapshotV2VsockRestoreCompletion<B>>,
+    network_resources: Vec<PreparedProcessSnapshotV2NetworkRestoreResource>,
+    serial_endpoint: Option<PreparedSnapshotV2SerialEndpoint>,
+    serial_output: Option<SharedSerialOutput>,
+    serial_config: Option<SerialConfig>,
+    serial_restoration: Option<SerialStdioRestoration>,
+}
+
+impl<B> StagedProcessSnapshotV2VsockPciOwners<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn new(batch: PreparedProcessSnapshotV2VsockRestoreBatch<B>) -> Self {
+        Self {
+            batch: Some(batch),
+            hvf: None,
+            active_vsock: None,
+            completion: None,
+            network_resources: Vec::new(),
+            serial_endpoint: None,
+            serial_output: None,
+            serial_config: None,
+            serial_restoration: None,
+        }
+    }
+
+    fn shutdown_evidence(&mut self) -> ProcessSnapshotV2VsockAbortEvidence {
+        let mut evidence = ProcessSnapshotV2VsockAbortEvidence::clean();
+        if self.hvf.take().is_some_and(|hvf| hvf.shutdown().is_err()) {
+            evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::terminal(true));
+        }
+        if self
+            .active_vsock
+            .take()
+            .is_some_and(|guard| guard.cleanup().is_err())
+        {
+            evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::terminal(true));
+        }
+        if let Some(completion) = self.completion.take() {
+            if abort_completed_process_snapshot_v2_vsock_resources(
+                completion,
+                &mut self.network_resources,
+            ) {
+                evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::terminal(true));
+            }
+        } else if let Some(batch) = self.batch.take() {
+            if let Err(source) = batch.abort() {
+                evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::terminal(
+                    source.cleanup_uncertain(),
+                ));
+            }
+            self.network_resources.clear();
+        } else {
+            self.network_resources.clear();
+        }
+        if self
+            .serial_endpoint
+            .take()
+            .is_some_and(|endpoint| endpoint.abort().is_err())
+        {
+            evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::terminal(true));
+        }
+        if finish_process_snapshot_v2_serial_restoration(
+            &mut self.serial_output,
+            &mut self.serial_config,
+            &mut self.serial_restoration,
+        ) {
+            evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::terminal(true));
+        }
+        evidence
+    }
+
+    fn shutdown(&mut self) -> bool {
+        self.shutdown_evidence().cleanup_uncertain
+    }
+
+    fn into_owners(
+        mut self,
+    ) -> Result<RestoredProcessSnapshotV2VsockPciOwners<B>, ProcessSnapshotV2VsockPciRestoreError>
+    {
+        let (Some(hvf), Some(completion)) = (self.hvf.take(), self.completion.take()) else {
+            let cleanup_uncertain = self.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+                cleanup_uncertain,
+            ));
+        };
+        Ok(RestoredProcessSnapshotV2VsockPciOwners {
+            hvf: Some(hvf),
+            active_vsock: self.active_vsock.take(),
+            completion: Some(completion),
+            network_resources: std::mem::take(&mut self.network_resources),
+            serial_output: self.serial_output.take(),
+            serial_config: self.serial_config.take(),
+            serial_restoration: self.serial_restoration.take(),
+        })
+    }
+}
+
+impl<B> Drop for StagedProcessSnapshotV2VsockPciOwners<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
 trait ProcessSnapshotV2NetworkResourcePlanInput {
     fn into_resource_plan(self) -> PreparedProcessSnapshotV2NetworkResourcePlan;
 }
@@ -24166,6 +24556,93 @@ impl RestoredProcessSnapshotV2NetworkHvfOwners for RestoredHvfSnapshotV2VsockMmi
     }
 }
 
+impl RestoredProcessSnapshotV2NetworkHvfOwners for RestoredHvfSnapshotV2VsockPciOwners {
+    fn session(&self) -> &OwnedHvfArm64BootSession {
+        RestoredHvfSnapshotV2VsockPciOwners::session(self)
+    }
+
+    fn configs(&self) -> &[NetworkInterfaceConfig] {
+        RestoredHvfSnapshotV2VsockPciOwners::configs(self)
+    }
+
+    fn expected(&self) -> &[SnapshotV2NetworkInterfaceState] {
+        RestoredHvfSnapshotV2VsockPciOwners::expected_network(self)
+    }
+
+    fn mmds_state(&self) -> Option<&SnapshotV2MmdsState> {
+        RestoredHvfSnapshotV2VsockPciOwners::mmds_state(self)
+    }
+
+    fn mmds_config(&self) -> Option<&MmdsConfig> {
+        RestoredHvfSnapshotV2VsockPciOwners::mmds_config(self)
+    }
+
+    fn transport_kind(&self) -> SnapshotV2DeviceTransportKind {
+        SnapshotV2DeviceTransportKind::Pci
+    }
+}
+
+trait RestoredProcessSnapshotV2VsockHvfOwners: RestoredProcessSnapshotV2NetworkHvfOwners {
+    fn resource_keys(&self) -> &[SnapshotRestoreResourceKey];
+    fn serial_resource_present(&self) -> bool;
+    fn kind(&self) -> HvfSnapshotV2VsockProductKind;
+    fn vsock_config(&self) -> Option<&VsockConfig>;
+    fn expected_vsock(&self) -> Option<&SnapshotV2VsockState>;
+    fn vsock_metrics(&self) -> Option<&SharedVsockDeviceMetrics>;
+}
+
+impl RestoredProcessSnapshotV2VsockHvfOwners for RestoredHvfSnapshotV2VsockMmioOwners {
+    fn resource_keys(&self) -> &[SnapshotRestoreResourceKey] {
+        RestoredHvfSnapshotV2VsockMmioOwners::resource_keys(self)
+    }
+
+    fn serial_resource_present(&self) -> bool {
+        RestoredHvfSnapshotV2VsockMmioOwners::serial_resource_present(self)
+    }
+
+    fn kind(&self) -> HvfSnapshotV2VsockProductKind {
+        RestoredHvfSnapshotV2VsockMmioOwners::kind(self)
+    }
+
+    fn vsock_config(&self) -> Option<&VsockConfig> {
+        RestoredHvfSnapshotV2VsockMmioOwners::vsock_config(self)
+    }
+
+    fn expected_vsock(&self) -> Option<&SnapshotV2VsockState> {
+        RestoredHvfSnapshotV2VsockMmioOwners::expected_vsock(self)
+    }
+
+    fn vsock_metrics(&self) -> Option<&SharedVsockDeviceMetrics> {
+        RestoredHvfSnapshotV2VsockMmioOwners::vsock_metrics(self)
+    }
+}
+
+impl RestoredProcessSnapshotV2VsockHvfOwners for RestoredHvfSnapshotV2VsockPciOwners {
+    fn resource_keys(&self) -> &[SnapshotRestoreResourceKey] {
+        RestoredHvfSnapshotV2VsockPciOwners::resource_keys(self)
+    }
+
+    fn serial_resource_present(&self) -> bool {
+        RestoredHvfSnapshotV2VsockPciOwners::serial_resource_present(self)
+    }
+
+    fn kind(&self) -> HvfSnapshotV2VsockProductKind {
+        RestoredHvfSnapshotV2VsockPciOwners::kind(self)
+    }
+
+    fn vsock_config(&self) -> Option<&VsockConfig> {
+        RestoredHvfSnapshotV2VsockPciOwners::vsock_config(self)
+    }
+
+    fn expected_vsock(&self) -> Option<&SnapshotV2VsockState> {
+        RestoredHvfSnapshotV2VsockPciOwners::expected_vsock(self)
+    }
+
+    fn vsock_metrics(&self) -> Option<&SharedVsockDeviceMetrics> {
+        RestoredHvfSnapshotV2VsockPciOwners::vsock_metrics(self)
+    }
+}
+
 fn restored_process_snapshot_v2_network_is_equivalent<B, H>(
     hvf: &H,
     completion: &PreparedProcessSnapshotV2NetworkRestoreCompletion<B>,
@@ -24278,14 +24755,15 @@ where
     Ok(())
 }
 
-fn restored_process_snapshot_v2_vsock_mmio_is_equivalent<B>(
-    hvf: &RestoredHvfSnapshotV2VsockMmioOwners,
+fn restored_process_snapshot_v2_vsock_is_equivalent<B, H>(
+    hvf: &H,
     completion: &PreparedProcessSnapshotV2VsockRestoreCompletion<B>,
     resources: &[PreparedProcessSnapshotV2NetworkRestoreResource],
     now: Instant,
 ) -> Result<(), ()>
 where
     B: ProcessVmnetBackend,
+    H: RestoredProcessSnapshotV2VsockHvfOwners,
 {
     restored_process_snapshot_v2_network_is_equivalent(
         hvf,
@@ -24333,6 +24811,30 @@ where
         Some(_) | None => return Err(()),
     }
     Ok(())
+}
+
+fn restored_process_snapshot_v2_vsock_mmio_is_equivalent<B>(
+    hvf: &RestoredHvfSnapshotV2VsockMmioOwners,
+    completion: &PreparedProcessSnapshotV2VsockRestoreCompletion<B>,
+    resources: &[PreparedProcessSnapshotV2NetworkRestoreResource],
+    now: Instant,
+) -> Result<(), ()>
+where
+    B: ProcessVmnetBackend,
+{
+    restored_process_snapshot_v2_vsock_is_equivalent(hvf, completion, resources, now)
+}
+
+fn restored_process_snapshot_v2_vsock_pci_is_equivalent<B>(
+    hvf: &RestoredHvfSnapshotV2VsockPciOwners,
+    completion: &PreparedProcessSnapshotV2VsockRestoreCompletion<B>,
+    resources: &[PreparedProcessSnapshotV2NetworkRestoreResource],
+    now: Instant,
+) -> Result<(), ()>
+where
+    B: ProcessVmnetBackend,
+{
+    restored_process_snapshot_v2_vsock_is_equivalent(hvf, completion, resources, now)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -24989,6 +25491,646 @@ type SystemRestoreProcessSnapshotV2VsockMmioFn = fn(
 
 const _: SystemRestoreProcessSnapshotV2VsockMmioFn =
     restore_process_snapshot_v2_vsock_mmio::<fn(ProcessSnapshotV2VsockMmioRestoreStage) -> bool>;
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn restore_process_snapshot_v2_vsock_pci_with_factory<B, F, C>(
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    resource_plan: PreparedProcessSnapshotV2VsockResourcePlan,
+    contained_authority: Option<&ContainedSnapshotRestoreAuthority>,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    factory: &mut F,
+    now: Instant,
+    cancelled: C,
+) -> Result<RestoredProcessSnapshotV2VsockPciOwners<B>, ProcessSnapshotV2VsockPciRestoreError>
+where
+    B: ProcessVmnetBackend,
+    F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    C: Fn(ProcessSnapshotV2VsockPciRestoreStage) -> bool,
+{
+    if cancelled(ProcessSnapshotV2VsockPciRestoreStage::ResourcePreparation) {
+        return Err(ProcessSnapshotV2VsockPciRestoreError::retryable(
+            ProcessSnapshotV2VsockPciRestoreStage::ResourcePreparation,
+        ));
+    }
+    let batch = {
+        let resource_cancelled =
+            |_| cancelled(ProcessSnapshotV2VsockPciRestoreStage::ResourcePreparation);
+        prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            resource_plan,
+            contained_authority,
+            destination_instance_id,
+            mmds_data_store_limit_bytes,
+            factory,
+            resource_cancelled,
+        )
+        .map_err(|source| {
+            ProcessSnapshotV2VsockPciRestoreError::from_resource(
+                ProcessSnapshotV2VsockPciRestoreStage::ResourcePreparation,
+                &source,
+            )
+        })?
+    };
+    let mut staged = StagedProcessSnapshotV2VsockPciOwners::new(batch);
+
+    if cancelled(ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation) {
+        let evidence = staged.shutdown_evidence();
+        return Err(if evidence.terminal {
+            ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                evidence.cleanup_uncertain,
+            )
+        } else {
+            ProcessSnapshotV2VsockPciRestoreError::retryable(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+            )
+        });
+    }
+
+    let (
+        binding,
+        graph,
+        serial_state,
+        entropy_state,
+        balloon_state,
+        memory_hotplug_state,
+        network_topology,
+        vsock_state,
+        vsock_config,
+        binding_keys,
+    ) = {
+        let Some(batch) = staged.batch.as_ref() else {
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                false,
+            ));
+        };
+        (
+            batch.binding.clone(),
+            batch.device_graph.clone(),
+            batch.serial.clone(),
+            batch.entropy.clone(),
+            batch.balloon.clone(),
+            batch.memory_hotplug.clone(),
+            batch.network_topology.clone(),
+            batch.vsock_state.clone(),
+            batch.vsock_config.clone(),
+            batch.binding_keys.clone(),
+        )
+    };
+    let product_transport_is_pci = graph
+        .as_ref()
+        .is_none_or(|graph| graph.transport_kind() == SnapshotV2DeviceTransportKind::Pci)
+        && entropy_state
+            .as_ref()
+            .is_none_or(|state| state.transport().kind() == SnapshotV2DeviceTransportKind::Pci)
+        && balloon_state
+            .as_ref()
+            .is_none_or(|state| state.transport().kind() == SnapshotV2DeviceTransportKind::Pci)
+        && memory_hotplug_state
+            .as_ref()
+            .is_none_or(|state| state.transport().kind() == SnapshotV2DeviceTransportKind::Pci)
+        && network_topology.transport_kind() == SnapshotV2DeviceTransportKind::Pci
+        && vsock_state
+            .as_ref()
+            .is_none_or(|state| state.transport_kind() == SnapshotV2DeviceTransportKind::Pci);
+    if platform.memory() != &binding || !product_transport_is_pci {
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+            ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+            cleanup_uncertain,
+        ));
+    }
+
+    let storage_plan = match graph.clone() {
+        Some(graph) => match SnapshotV2StorageRestorePlan::prepare(graph, &memory, now) {
+            Ok(plan) => Some(plan),
+            Err(_) => {
+                let cleanup_uncertain = staged.shutdown();
+                return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                    ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                    cleanup_uncertain,
+                ));
+            }
+        },
+        None => None,
+    };
+    let entropy = match entropy_state
+        .clone()
+        .map(|state| SnapshotV2EntropyRestorePlan::prepare(state, &memory, now))
+        .transpose()
+    {
+        Ok(entropy) => entropy,
+        Err(_) => {
+            let cleanup_uncertain = staged.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                cleanup_uncertain,
+            ));
+        }
+    };
+    let balloon = match balloon_state
+        .clone()
+        .map(|state| SnapshotV2BalloonRestorePlan::prepare(state, &memory))
+        .transpose()
+    {
+        Ok(balloon) => balloon,
+        Err(_) => {
+            let cleanup_uncertain = staged.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                cleanup_uncertain,
+            ));
+        }
+    };
+    let memory_hotplug = match memory_hotplug_state
+        .clone()
+        .map(|state| {
+            PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
+                state,
+                binding.clone(),
+                NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+            )
+        })
+        .transpose()
+    {
+        Ok(memory_hotplug) => memory_hotplug,
+        Err(_) => {
+            let cleanup_uncertain = staged.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                cleanup_uncertain,
+            ));
+        }
+    };
+
+    let block_count = binding_keys
+        .iter()
+        .filter(|key| key.resource_class() == SnapshotRestoreResourceClass::BlockBacking)
+        .count();
+    let pmem_count = binding_keys
+        .iter()
+        .filter(|key| key.resource_class() == SnapshotRestoreResourceClass::PmemBacking)
+        .count();
+    let network_count = binding_keys
+        .iter()
+        .filter(|key| key.resource_class() == SnapshotRestoreResourceClass::NetworkPacketIo)
+        .count();
+    let mut block_backings = Vec::new();
+    let mut pmem_backings = Vec::new();
+    if block_backings.try_reserve_exact(block_count).is_err()
+        || pmem_backings.try_reserve_exact(pmem_count).is_err()
+        || staged
+            .network_resources
+            .try_reserve_exact(network_count)
+            .is_err()
+    {
+        let evidence = staged.shutdown_evidence();
+        return Err(if evidence.terminal {
+            ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                evidence.cleanup_uncertain,
+            )
+        } else {
+            ProcessSnapshotV2VsockPciRestoreError::retryable(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+            )
+        });
+    }
+    let mut serial_output = None;
+    for (index, key) in binding_keys.iter().enumerate() {
+        if key.resource_class() == SnapshotRestoreResourceClass::VsockEndpoint {
+            continue;
+        }
+        let stage = ProcessSnapshotV2VsockPciRestoreStage::ResourceTake { index };
+        if cancelled(stage) {
+            drop((block_backings, pmem_backings, serial_output));
+            let already_consumed = staged
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.taken_count != 0);
+            let evidence = staged.shutdown_evidence();
+            return Err(if already_consumed || evidence.terminal {
+                ProcessSnapshotV2VsockPciRestoreError::terminal(stage, evidence.cleanup_uncertain)
+            } else {
+                ProcessSnapshotV2VsockPciRestoreError::retryable(stage)
+            });
+        }
+        let Some(batch) = staged.batch.as_mut() else {
+            drop((block_backings, pmem_backings, serial_output));
+            let cleanup_uncertain = staged.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                stage,
+                cleanup_uncertain,
+            ));
+        };
+        let result = match key.resource_class() {
+            SnapshotRestoreResourceClass::BlockBacking => batch
+                .take_block(key)
+                .map(|backing| block_backings.push(backing)),
+            SnapshotRestoreResourceClass::PmemBacking => batch
+                .take_pmem(key)
+                .map(|backing| pmem_backings.push(backing)),
+            SnapshotRestoreResourceClass::SerialSink => batch
+                .take_serial(key)
+                .map(|output| serial_output = Some(output)),
+            SnapshotRestoreResourceClass::NetworkPacketIo => batch
+                .take_network(key)
+                .map(|resource| staged.network_resources.push(resource)),
+            SnapshotRestoreResourceClass::VsockEndpoint => Ok(()),
+        };
+        if result.is_err() {
+            drop((block_backings, pmem_backings, serial_output));
+            let cleanup_uncertain = staged.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                stage,
+                cleanup_uncertain,
+            ));
+        }
+    }
+
+    let storage = match storage_plan {
+        Some(plan) => match plan.prepare_backings(block_backings, pmem_backings, || false) {
+            Ok(storage) => Some(storage),
+            Err(_) => {
+                let cleanup_uncertain = staged.shutdown();
+                return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                    ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                    cleanup_uncertain,
+                ));
+            }
+        },
+        None if block_backings.is_empty() && pmem_backings.is_empty() => None,
+        None => {
+            drop((block_backings, pmem_backings));
+            let cleanup_uncertain = staged.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                cleanup_uncertain,
+            ));
+        }
+    };
+    let serial_endpoint =
+        match prepare_native_v2_serial_restore_endpoint(serial_state.clone(), serial_output) {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                drop(storage);
+                let cleanup_uncertain = staged.shutdown();
+                return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                    ProcessSnapshotV2VsockPciRestoreStage::Serial,
+                    cleanup_uncertain,
+                ));
+            }
+        };
+    staged.serial_endpoint = Some(serial_endpoint);
+
+    let serial_resource_present = !serial_state.endpoint_intent().is_default_process_stdio();
+    let kind = HvfSnapshotV2VsockProductKind::from_presence(
+        storage.is_some(),
+        entropy.is_some(),
+        balloon.is_some(),
+        memory_hotplug.is_some(),
+        !network_topology.interfaces().is_empty(),
+        vsock_state.is_some(),
+    );
+    let (prepared_memory, static_memory) = match memory_hotplug {
+        Some(topology) => (
+            HvfSnapshotV2VsockPreparedMemory::MemoryHotplug {
+                topology: Box::new(topology),
+                memory,
+            },
+            None,
+        ),
+        None => (
+            HvfSnapshotV2VsockPreparedMemory::Static(binding),
+            Some(memory),
+        ),
+    };
+    let vsock = match (vsock_state, vsock_config) {
+        (Some(state), Some(config)) => Some(HvfSnapshotV2VsockPreparedEndpoint::new(state, config)),
+        (None, None) => None,
+        _ => {
+            drop((prepared_memory, storage, entropy, balloon, network_topology));
+            let cleanup_uncertain = staged.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                cleanup_uncertain,
+            ));
+        }
+    };
+    let product = match HvfSnapshotV2VsockPreparedProduct::try_from_parts(
+        HvfSnapshotV2VsockPreparedProductParts {
+            kind,
+            memory: prepared_memory,
+            storage,
+            entropy,
+            balloon,
+            network: network_topology,
+            vsock,
+            serial_resource_present,
+            binding_keys,
+        },
+    ) {
+        Ok(product) => product,
+        Err(_) => {
+            let cleanup_uncertain = staged.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                cleanup_uncertain,
+            ));
+        }
+    };
+    let platform_plan = match prepare_hvf_snapshot_v2_vsock_pci_platform_plan(&platform, product) {
+        Ok(plan) => plan,
+        Err(_) => {
+            let cleanup_uncertain = staged.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                cleanup_uncertain,
+            ));
+        }
+    };
+    if !staged
+        .batch
+        .as_ref()
+        .is_some_and(|batch| batch.matches_pci_platform_plan(&platform_plan))
+        || platform_plan.network().len() != staged.network_resources.len()
+    {
+        drop(platform_plan);
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+            ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+            cleanup_uncertain,
+        ));
+    }
+
+    if cancelled(ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction) {
+        drop(platform_plan);
+        let already_consumed = staged
+            .batch
+            .as_ref()
+            .is_some_and(|batch| batch.taken_count != 0);
+        let evidence = staged.shutdown_evidence();
+        return Err(if already_consumed || evidence.terminal {
+            ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction,
+                evidence.cleanup_uncertain,
+            )
+        } else {
+            ProcessSnapshotV2VsockPciRestoreError::retryable(
+                ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction,
+            )
+        });
+    }
+    let Some(endpoint) = staged.serial_endpoint.take() else {
+        drop(platform_plan);
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+            ProcessSnapshotV2VsockPciRestoreStage::Serial,
+            cleanup_uncertain,
+        ));
+    };
+    let (serial, serial_input, serial_restoration, serial_config) = match endpoint.into_parts() {
+        Ok(parts) => parts,
+        Err(_) => {
+            drop(platform_plan);
+            let cleanup_uncertain = staged.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::Serial,
+                cleanup_uncertain,
+            ));
+        }
+    };
+    staged.serial_output = Some(serial.output().clone());
+    staged.serial_config = Some(serial_config);
+    staged.serial_restoration = serial_restoration;
+    let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial);
+    let profiles = staged
+        .network_resources
+        .iter()
+        .map(PreparedProcessSnapshotV2NetworkRestoreResource::device_profile)
+        .collect::<Vec<_>>();
+    let Some(network_metrics) = staged
+        .batch
+        .as_ref()
+        .map(|batch| batch.network_completion.network_metrics().clone())
+    else {
+        drop((platform_plan, process_shell, profiles));
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+            ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction,
+            cleanup_uncertain,
+        ));
+    };
+    let vsock_key = platform_plan
+        .vsock()
+        .map(|endpoint| endpoint.resource_key().clone());
+    let memory_input = static_memory
+        .map(HvfSnapshotV2NetworkPciMemoryInput::Static)
+        .unwrap_or(HvfSnapshotV2NetworkPciMemoryInput::ProductOwned);
+    let vsock_metrics = SharedVsockDeviceMetrics::default();
+
+    let restored = match vsock_key {
+        Some(key) => {
+            let Some(batch) = staged.batch.as_mut() else {
+                let cleanup_uncertain = staged.shutdown();
+                return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                    ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction,
+                    cleanup_uncertain,
+                ));
+            };
+            match batch.adopt_vsock(&key, |resource| {
+                OwnedHvfArm64BootSession::restore_snapshot_v2_vsock_pci_with_cancel(
+                    platform,
+                    memory_input,
+                    process_shell,
+                    serial_input,
+                    platform_plan,
+                    profiles,
+                    network_metrics,
+                    Some(resource),
+                    vsock_metrics,
+                    now,
+                    |stage| cancelled(ProcessSnapshotV2VsockPciRestoreStage::Hvf(stage)),
+                )
+            }) {
+                Ok((hvf, guard)) => {
+                    staged.active_vsock = Some(guard);
+                    hvf
+                }
+                Err(source) => {
+                    let cleanup_uncertain = staged.shutdown();
+                    return Err(ProcessSnapshotV2VsockPciRestoreError::from_adoption(
+                        &source,
+                        cleanup_uncertain,
+                    ));
+                }
+            }
+        }
+        None => {
+            match OwnedHvfArm64BootSession::restore_snapshot_v2_vsock_pci_with_cancel(
+                platform,
+                memory_input,
+                process_shell,
+                serial_input,
+                platform_plan,
+                profiles,
+                network_metrics,
+                None,
+                vsock_metrics,
+                now,
+                |stage| cancelled(ProcessSnapshotV2VsockPciRestoreStage::Hvf(stage)),
+            ) {
+                Ok(hvf) => hvf,
+                Err(source) => {
+                    let cleanup_uncertain = staged.shutdown();
+                    return Err(ProcessSnapshotV2VsockPciRestoreError::from_hvf(
+                        &source,
+                        cleanup_uncertain,
+                    ));
+                }
+            }
+        }
+    };
+    staged.hvf = Some(restored);
+
+    if cancelled(ProcessSnapshotV2VsockPciRestoreStage::BatchFinish) {
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+            ProcessSnapshotV2VsockPciRestoreStage::BatchFinish,
+            cleanup_uncertain,
+        ));
+    }
+    let Some(batch) = staged.batch.take() else {
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+            ProcessSnapshotV2VsockPciRestoreStage::BatchFinish,
+            cleanup_uncertain,
+        ));
+    };
+    let completion = match batch.finish() {
+        Ok(completion) => completion,
+        Err(_) => {
+            let cleanup_uncertain = staged.shutdown();
+            return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+                ProcessSnapshotV2VsockPciRestoreStage::BatchFinish,
+                cleanup_uncertain,
+            ));
+        }
+    };
+    staged.completion = Some(completion);
+
+    let equivalent = match (&staged.hvf, &staged.completion) {
+        (Some(hvf), Some(completion)) => restored_process_snapshot_v2_vsock_pci_is_equivalent(
+            hvf,
+            completion,
+            &staged.network_resources,
+            now,
+        )
+        .is_ok(),
+        _ => false,
+    };
+    if cancelled(ProcessSnapshotV2VsockPciRestoreStage::CompleteRecapture) || !equivalent {
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+            ProcessSnapshotV2VsockPciRestoreStage::CompleteRecapture,
+            cleanup_uncertain,
+        ));
+    }
+
+    if cancelled(ProcessSnapshotV2VsockPciRestoreStage::Assembly) {
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+            ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+            cleanup_uncertain,
+        ));
+    }
+    let owner_graph_is_complete = match (&staged.hvf, &staged.completion) {
+        (Some(hvf), Some(completion)) => {
+            hvf.configs().len() == staged.network_resources.len()
+                && completion
+                    .network_completion
+                    .resources_match(&staged.network_resources)
+                && staged.serial_output.is_some()
+                && staged.serial_config.is_some()
+                && hvf.expected_vsock().is_some() == staged.active_vsock.is_some()
+        }
+        _ => false,
+    };
+    if !owner_graph_is_complete {
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+            ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+            cleanup_uncertain,
+        ));
+    }
+
+    if cancelled(ProcessSnapshotV2VsockPciRestoreStage::GateCommit) {
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+            ProcessSnapshotV2VsockPciRestoreStage::GateCommit,
+            cleanup_uncertain,
+        ));
+    }
+    let Some(hvf) = staged.hvf.take() else {
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+            ProcessSnapshotV2VsockPciRestoreStage::GateCommit,
+            cleanup_uncertain,
+        ));
+    };
+    staged.hvf = Some(hvf.commit_retry_publication());
+    staged.into_owners()
+}
+
+type SystemRestoredProcessSnapshotV2VsockPciOwners =
+    RestoredProcessSnapshotV2VsockPciOwners<SystemVmnetInterfaceBackend>;
+
+#[allow(clippy::too_many_arguments)]
+fn restore_process_snapshot_v2_vsock_pci<C>(
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    resource_plan: PreparedProcessSnapshotV2VsockResourcePlan,
+    contained_authority: Option<&ContainedSnapshotRestoreAuthority>,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    now: Instant,
+    cancelled: C,
+) -> Result<SystemRestoredProcessSnapshotV2VsockPciOwners, ProcessSnapshotV2VsockPciRestoreError>
+where
+    C: Fn(ProcessSnapshotV2VsockPciRestoreStage) -> bool,
+{
+    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+    restore_process_snapshot_v2_vsock_pci_with_factory(
+        platform,
+        memory,
+        resource_plan,
+        contained_authority,
+        destination_instance_id,
+        mmds_data_store_limit_bytes,
+        &mut factory,
+        now,
+        cancelled,
+    )
+}
+
+type SystemRestoreProcessSnapshotV2VsockPciFn = fn(
+    HvfSnapshotV2PlatformState,
+    GuestMemory,
+    PreparedProcessSnapshotV2VsockResourcePlan,
+    Option<&ContainedSnapshotRestoreAuthority>,
+    &str,
+    usize,
+    Instant,
+    fn(ProcessSnapshotV2VsockPciRestoreStage) -> bool,
+) -> Result<
+    SystemRestoredProcessSnapshotV2VsockPciOwners,
+    ProcessSnapshotV2VsockPciRestoreError,
+>;
+
+const _: SystemRestoreProcessSnapshotV2VsockPciFn =
+    restore_process_snapshot_v2_vsock_pci::<fn(ProcessSnapshotV2VsockPciRestoreStage) -> bool>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessSnapshotV2NetworkPciRestoreStage {
@@ -53722,9 +54864,9 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    #[ignore = "requires the signed native_v2_process integration group"]
-    fn signed_exact_minor_twelve_process_mmio_vsock_owner_transaction_is_atomic() {
+    fn verify_signed_exact_minor_twelve_process_vsock_owner_transaction_is_atomic(
+        pci_enabled: bool,
+    ) {
         use bangbang_runtime::snapshot_memory_v2::load_snapshot_v2_memory_path;
         use bangbang_runtime::vsock::VsockBackendSelector;
 
@@ -53767,13 +54909,16 @@ mod tests {
             .cloned()
             .expect("vsock source config should exist");
 
-        let mut source = super::OwnedHvfArm64BootSession::new(
-            &controller,
-            default_hvf_boot_session_config(SharedSerialOutput::from(
-                SharedSerialOutputBuffer::default(),
-            )),
-        )
-        .expect("signed exact-2.12 source should prepare");
+        let session_config = default_hvf_boot_session_config(SharedSerialOutput::from(
+            SharedSerialOutputBuffer::default(),
+        ));
+        let session_config = if pci_enabled {
+            session_config.with_pci_enabled()
+        } else {
+            session_config
+        };
+        let mut source = super::OwnedHvfArm64BootSession::new(&controller, session_config)
+            .expect("signed exact-2.12 source should prepare");
         assert!(source_socket.path().exists());
         let source_metrics = source.shared_vsock_device_metrics();
         let guard = source
@@ -53854,10 +54999,15 @@ mod tests {
             let candidate =
                 NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(encoded.clone())
                     .expect("exact-2.12 candidate should decode");
+            let transport_kind = if pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            };
             let prepared = prepare_process_snapshot_v2_vsock_candidate(
                 candidate,
                 &memory,
-                SnapshotV2DeviceTransportKind::Mmio,
+                transport_kind,
                 &[],
                 Some(&SnapshotVsockOverride::new(destination_socket.path())),
             )
@@ -53869,6 +55019,168 @@ mod tests {
             .expect("exact-2.12 process resource plan should prepare");
             (memory, resource_plan)
         };
+
+        if pci_enabled {
+            for (cancel_stage, expected_disposition) in [
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::ResourcePreparation,
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Retryable,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Retryable,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction,
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Retryable,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::Hvf(
+                        super::HvfSnapshotV2VsockPciRestoreStage::Product,
+                    ),
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Retryable,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::Hvf(
+                        super::HvfSnapshotV2VsockPciRestoreStage::Platform,
+                    ),
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Retryable,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::Hvf(
+                        super::HvfSnapshotV2VsockPciRestoreStage::VsockPreparation,
+                    ),
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Terminal,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::Hvf(
+                        super::HvfSnapshotV2VsockPciRestoreStage::VsockPublication,
+                    ),
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Terminal,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::Hvf(
+                        super::HvfSnapshotV2VsockPciRestoreStage::RetryScheduler,
+                    ),
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Terminal,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::Hvf(
+                        super::HvfSnapshotV2VsockPciRestoreStage::RetryDeadline,
+                    ),
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Terminal,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::Hvf(
+                        super::HvfSnapshotV2VsockPciRestoreStage::Recapture,
+                    ),
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Terminal,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::Hvf(
+                        super::HvfSnapshotV2VsockPciRestoreStage::Assembly,
+                    ),
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Terminal,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::BatchFinish,
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Terminal,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::CompleteRecapture,
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Terminal,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Terminal,
+                ),
+                (
+                    super::ProcessSnapshotV2VsockPciRestoreStage::GateCommit,
+                    super::ProcessSnapshotV2VsockPciRestoreDisposition::Terminal,
+                ),
+            ] {
+                let (memory, resource_plan) = make_restore_inputs();
+                let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+                let events = factory.events();
+                let error = super::restore_process_snapshot_v2_vsock_pci_with_factory(
+                    platform.clone(),
+                    memory,
+                    resource_plan,
+                    None,
+                    "exact-2-12-pci-cancelled-destination",
+                    bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                    &mut factory,
+                    Instant::now(),
+                    |stage| stage == cancel_stage,
+                )
+                .expect_err("injected exact-2.12 PCI owner cancellation should reject");
+                assert_eq!(error.stage, cancel_stage);
+                assert_eq!(error.disposition, expected_disposition);
+                let diagnostics = format!("{error:?} {error}");
+                assert!(diagnostics.contains("<redacted>"));
+                assert!(
+                    !diagnostics.contains(destination_socket.path().to_string_lossy().as_ref())
+                );
+                assert!(!diagnostics.contains("exact-2-12-pci-cancelled-destination"));
+                assert!(!destination_socket.path().exists());
+                assert!(recorded_events(&events).is_empty());
+            }
+
+            let (memory, resource_plan) = make_restore_inputs();
+            let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+            let events = factory.events();
+            let mut owners = super::restore_process_snapshot_v2_vsock_pci_with_factory(
+                platform,
+                memory,
+                resource_plan,
+                None,
+                "exact-2-12-pci-committed-destination",
+                bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                &mut factory,
+                Instant::now(),
+                |_| false,
+            )
+            .expect("complete exact-2.12 PCI process/HVF owner graph should commit");
+            assert!(destination_socket.path().exists());
+            assert!(owners.active_vsock.is_some());
+            assert!(owners.completion.is_some());
+            assert!(owners.network_resources.is_empty());
+            let hvf = owners
+                .hvf
+                .as_ref()
+                .expect("committed exact-2.12 PCI graph should retain HVF");
+            assert!(hvf.retry_publication_is_committed());
+            assert_eq!(hvf.expected_vsock(), Some(&expected_destination_vsock));
+            let restored_config = hvf
+                .vsock_config()
+                .expect("committed exact-2.12 PCI graph should retain vsock config");
+            assert_eq!(restored_config.guest_cid(), source_config.guest_cid());
+            assert_eq!(restored_config.uds_path(), destination_socket.path());
+            let destination_metrics = hvf
+                .vsock_metrics()
+                .expect("committed exact-2.12 PCI graph should retain fresh metrics");
+            assert!(
+                destination_metrics.shares_state_with(&hvf.session().shared_vsock_device_metrics())
+            );
+            assert!(!source_metrics.shares_state_with(destination_metrics));
+            assert!(destination_metrics.snapshot().is_empty());
+            assert!(source_metrics.snapshot().is_empty());
+            assert_eq!(controller.vsock_config(), Some(&source_config));
+            let diagnostics = format!("{owners:?}");
+            assert!(diagnostics.contains("<redacted>"));
+            assert!(!diagnostics.contains(destination_socket.path().to_string_lossy().as_ref()));
+            assert!(!diagnostics.contains("exact-2-12-pci-committed-destination"));
+            assert!(recorded_events(&events).is_empty());
+
+            owners
+                .shutdown()
+                .expect("committed exact-2.12 PCI process/HVF owner graph should shut down");
+            owners
+                .shutdown()
+                .expect("repeated exact-2.12 PCI process/HVF shutdown should be idempotent");
+            assert!(!destination_socket.path().exists());
+            return;
+        }
 
         for (cancel_stage, expected_disposition) in [
             (
@@ -54026,6 +55338,20 @@ mod tests {
             .shutdown()
             .expect("repeated exact-2.12 process/HVF shutdown should be idempotent");
         assert!(!destination_socket.path().exists());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires the signed native_v2_process integration group"]
+    fn signed_exact_minor_twelve_process_mmio_vsock_owner_transaction_is_atomic() {
+        verify_signed_exact_minor_twelve_process_vsock_owner_transaction_is_atomic(false);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires the signed native_v2_process integration group"]
+    fn signed_exact_minor_twelve_process_pci_vsock_owner_transaction_is_atomic() {
+        verify_signed_exact_minor_twelve_process_vsock_owner_transaction_is_atomic(true);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
