@@ -69,10 +69,11 @@ use bangbang_hvf::{
     HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioProcessConfig,
     HvfSnapshotV2StorageMmioRestoreError, HvfSnapshotV2StoragePciPlatformPlan,
     HvfSnapshotV2StoragePciRestoreError, HvfSnapshotV2StorageState,
-    HvfSnapshotV2VsockPlatformState, HvfSnapshotV2VsockState, HvfVcpuRunControl,
-    HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
-    PrepareHvfSnapshotV1LoadError, PrepareHvfSnapshotV2BalloonPlatformPlanError,
-    PrepareHvfSnapshotV2EntropyPciPlatformPlanError,
+    HvfSnapshotV2VsockMmioPlatformPlan, HvfSnapshotV2VsockPciPlatformPlan,
+    HvfSnapshotV2VsockPlatformState, HvfSnapshotV2VsockProcessResourceIdentity,
+    HvfSnapshotV2VsockState, HvfVcpuRunControl, HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome,
+    OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError,
+    PrepareHvfSnapshotV2BalloonPlatformPlanError, PrepareHvfSnapshotV2EntropyPciPlatformPlanError,
     PrepareHvfSnapshotV2MemoryHotplugPlatformPlanError,
     PrepareHvfSnapshotV2MultiBlockPlatformPlanError, PrepareHvfSnapshotV2NetworkPlatformPlanError,
     PrepareHvfSnapshotV2RootPlanError, PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
@@ -20577,6 +20578,66 @@ impl PreparedProcessSnapshotV2VsockResourcePlan {
             && self.vsock_config.is_some() == self.files.vsock_key().is_some()
     }
 
+    fn vsock_identity(&self) -> Option<Option<HvfSnapshotV2VsockProcessResourceIdentity<'_>>> {
+        match (self.files.vsock_key(), self.vsock_config.as_ref()) {
+            (None, None) => Some(None),
+            (Some(key), Some(config)) => Some(Some(
+                HvfSnapshotV2VsockProcessResourceIdentity::new(key, config),
+            )),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn matches_mmio_platform_plan(
+        &self,
+        plan: &HvfSnapshotV2VsockMmioPlatformPlan,
+    ) -> bool {
+        let Some(vsock) = self.vsock_identity() else {
+            return false;
+        };
+        plan.preflight_process_resource_identity(
+            self.network.interfaces.iter().map(|interface| {
+                HvfSnapshotV2NetworkProcessResourceIdentity::new(
+                    interface.source_index,
+                    &interface.resource_key,
+                    &interface.controller,
+                    interface.profile,
+                    interface.backend,
+                    interface.mmds_stack,
+                )
+            }),
+            self.network.mmds_state.as_ref(),
+            self.network.mmds_controller.as_ref(),
+            vsock,
+            &self.binding_keys,
+        )
+    }
+
+    pub(crate) fn matches_pci_platform_plan(
+        &self,
+        plan: &HvfSnapshotV2VsockPciPlatformPlan,
+    ) -> bool {
+        let Some(vsock) = self.vsock_identity() else {
+            return false;
+        };
+        plan.preflight_process_resource_identity(
+            self.network.interfaces.iter().map(|interface| {
+                HvfSnapshotV2NetworkProcessResourceIdentity::new(
+                    interface.source_index,
+                    &interface.resource_key,
+                    &interface.controller,
+                    interface.profile,
+                    interface.backend,
+                    interface.mmds_stack,
+                )
+            }),
+            self.network.mmds_state.as_ref(),
+            self.network.mmds_controller.as_ref(),
+            vsock,
+            &self.binding_keys,
+        )
+    }
+
     #[cfg(all(test, target_os = "macos"))]
     fn drop_last_binding_key_for_test(&mut self) {
         self.binding_keys.pop();
@@ -20600,6 +20661,15 @@ impl PreparedProcessSnapshotV2VsockResourcePlan {
         }
     }
 }
+
+type ProcessSnapshotV2VsockMmioPlatformPreflight =
+    fn(&PreparedProcessSnapshotV2VsockResourcePlan, &HvfSnapshotV2VsockMmioPlatformPlan) -> bool;
+type ProcessSnapshotV2VsockPciPlatformPreflight =
+    fn(&PreparedProcessSnapshotV2VsockResourcePlan, &HvfSnapshotV2VsockPciPlatformPlan) -> bool;
+const _: ProcessSnapshotV2VsockMmioPlatformPreflight =
+    PreparedProcessSnapshotV2VsockResourcePlan::matches_mmio_platform_plan;
+const _: ProcessSnapshotV2VsockPciPlatformPreflight =
+    PreparedProcessSnapshotV2VsockResourcePlan::matches_pci_platform_plan;
 
 fn prepare_process_snapshot_v2_vsock_resource_plan(
     candidate: PreparedNativeV2VsockSnapshotCandidateState,

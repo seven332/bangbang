@@ -34516,6 +34516,23 @@ pub(crate) fn pci_memory_hotplug_restore_gic_msi_configuration(
     pci_all_virtio_gic_msi_configuration_for_fixed_demand(fixed_demand)
 }
 
+pub(crate) fn pci_vsock_restore_gic_msi_configuration(
+    balloon_queue_count: Option<usize>,
+    entropy_configured: bool,
+    memory_hotplug_configured: bool,
+) -> Result<HvfGicMsiConfiguration, HvfArm64BootPciDataError> {
+    let fixed_demand = pci_all_virtio_resource_demand(
+        0,
+        0,
+        0,
+        balloon_queue_count,
+        true,
+        entropy_configured,
+        memory_hotplug_configured,
+    )?;
+    pci_all_virtio_gic_msi_configuration_for_fixed_demand(fixed_demand)
+}
+
 pub(crate) fn pci_root_restore_bar_region_id() -> Result<MmioRegionId, HvfArm64BootPciDataError> {
     pci_data_region_id(0)
 }
