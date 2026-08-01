@@ -1273,252 +1273,82 @@ execution on unsupported runners.
 The checked
 [Firecracker v1.16.0 capability inventory](../compat/firecracker/v1.16.0/README.md)
 is validated by a dedicated non-published workspace tool. Run its focused tests
-and delivery-time validation when changing the manifest, overlay, validator, or
-any Firecracker-facing capability:
+and delivery-time validation when changing the manifest, overlay, validator,
+evidence ledgers, or any Firecracker-facing capability:
 
 ```sh
 cargo test -p bangbang-firecracker-capability-audit --all-targets --locked
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 ```
 
-The workspace test suite includes an integration test of both checked-in files.
-Ordinary tests do not discover or require a sibling Firecracker checkout.
+The workspace suite also validates both checked JSON files. Ordinary validation
+uses only the pinned checked-in inventory and does not discover or require a
+sibling Firecracker checkout.
 
-Process-facing changes must also keep the checked
-[`process-contract.md`](../compat/firecracker/v1.16.0/process-contract.md)
-aligned with production code, executable tests, and the exact overlay records.
-The current main-process audit has 21 `implemented-and-verified`, two
-`proven-platform-impossible`, and six nonterminal process-family records. #1383
-separately promotes seven offline-seccompiler records; #1384 certifies the two
-runtime seccomp leaves, five jailer leaves, and `corpus:seccomp` as exact macOS
-platform exclusions. #1389/#1390 promote two lifecycle records, and #1391
-promotes the vCPU/memory/SMT leaves while certifying exact `2M` and its pinned
-hugepages corpus. The complete 417-record delivery inventory is therefore 38
-implemented-and-verified, 366 audit-required, three missing-platform-feasible,
-and ten proven-platform-impossible. Delivery
-validation permits the explicit handoffs, while final validation continues to
-reject them. Parser recognition or native snapshot output is not sufficient
-evidence for a Firecracker runtime or artifact claim.
+### Evidence Responsibilities
 
-After the remaining #1388 slices and the #1408 closure audit, the generated
-manifest contains 381 identities and the 418-record overlay contains 70
-`implemented-and-verified`, 328 `audit-required`, three
-`missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. The
-checked `machine_lifecycle_closure_policy_is_stable` integration test pins the
-original 28-record split, all 22 Wave 7 handoffs, the 18 directly promoted API
-identities, count arithmetic, and removal of stale future-#1388 summaries. The
-[closure ledger](../compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
-records the corresponding evidence and later-wave boundaries. Generic source,
-reference, and disposition invariants remain owned by the validator itself.
+A Firecracker-facing change must update every affected record in
+[`capabilities.json`](../compat/firecracker/v1.16.0/capabilities.json) and its
+owner contract. The
+[compatibility scope](firecracker-compatibility.md) owns observable API, CLI,
+field, and runtime behavior. The
+[validation matrix](firecracker-validation-matrix.md) is only the compact
+current-state index. Contract ownership is listed in the
+[inventory guide](../compat/firecracker/v1.16.0/README.md#contract-index).
 
-After the checked storage, balloon, memory-hotplug, entropy, and serial delivery
-closures, that checkpoint of the 418-record overlay contains 191
-`implemented-and-verified`, 207 `audit-required`, three
-`missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. The
-[entropy closure ledger](../compat/firecracker/v1.16.0/entropy-contract.md)
-now pins all seven selected entropy records terminal: five API/live leaves plus
-the exact 2.8 optional-device serialization and restored-device aggregate.
-When changing entropy code or evidence, run the focused runtime tests, both
-signed MMIO/PCI lifecycle cases, the direct and production continuation cases,
-the capability validator, and the ordinary workspace gates. The
-[serial closure ledger](../compat/firecracker/v1.16.0/serial-contract.md) pins
-all six selected records terminal after exact 2.7
-encoding/endpoint-reconstruction certification. Serial changes additionally
-require the signed default-stdio executable cases and production-bundle
-boundary case.
-The
-[balloon closure ledger](../compat/firecracker/v1.16.0/balloon-contract.md)
-pins all 52 selected records terminal after exact 2.9 kind-10 direct and
-normal-production MMIO/PCI continuation certification. Balloon snapshot
-changes require the focused exact codec/product/memory/failure suites plus both
-signed continuation cases and the complete integration wrapper.
-The checked
-[aggregate remaining-device ledger](../compat/firecracker/v1.16.0/remaining-device-contract.md)
-fixes the union at 85 unique records with an 82-terminal/three-Wave-6 split.
-Its audit test rejects family drift, overlap, stale #1440/#1481 handoffs, wrong
-#1490 URLs, any selected #1491 row, and missing focused or signed evidence.
+Terminal evidence must match the exact claim:
 
-At the checked network/MMDS closure checkpoint, the overlay contained 220
-`implemented-and-verified`, 178 `audit-required`, three
-`missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. Its
-35-record selector promotes 29 formerly audited rows and retains exactly four
-for #1378, #1490, or #1491 outcomes. The subsequent checked vsock closure
-promotes eight API/live rows from its exact 14-record selector and retains six
-precise #1490 artifact/restore/clone outcomes, so that checkpoint contained
-228/170/3/17 outcomes. The subsequent checked
-[snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
-moves one exact corpus record to #1527-owned
-`missing-platform-feasible`, making that checkpoint 228/169/4/17 without
-premature promotion. #1555 subsequently adds direct signed host/guest demand,
-removal-generation, exact entitlement, and full-matrix evidence and promotes
-only that record. #1578 then promotes four public native-v2 process/snapshot
-records. #1634 promotes the final two pmem storage composites after native-v2
-2.6 profile-3 certification. #1652 promotes the serial semantic aggregate
-after exact 2.7 direct and normal-production continuation certification. #1665
-activates exact native-v2 2.8 with optional entropy, and #1666 promotes the
-two entropy artifact/restore records after direct and normal-production
-continuation certification. #1680 activates exact native-v2 2.9 with optional
-balloon, and #1681 promotes the two balloon aggregate records after direct and
-normal-production continuation certification. #1697 activates exact
-native-v2 2.10 with optional virtio-mem, and #1698 promotes only the
-memory-hotplug corpus and virtio-mem lifecycle aggregate after direct and
-normal-production continuation certification. #1715 activates current
-native-v2 2.11 with optional network/MMDS kind 12; #1716 promotes exactly the
-network override property, snapshot-network-clones corpus, MMDS user-guide
-corpus, and MMDS TCP/token/session aggregate after direct and
-normal-production/App Sandbox continuation certification. The current overlay
-then contains 246/152/3/17. #1735 activates current native-v2 2.12 with optional
-vsock kind 13. #1736 promotes exactly
-`api-property:SnapshotLoadParams.vsock_override`,
-`api-property:VsockOverride.uds_path`, `api-schema:VsockOverride`,
-`corpus:vsock`,
-`semantic.snapshot:network-vsock-overrides-portability-and-clones`, and
-`semantic.vsock:snapshot-override-reset-and-rx-gating` after strict signed
-direct and normal-production/App Sandbox restored-guest certification. The
-current overlay is 252/146/3/17.
+- parser and schema tests prove recognition, not backend behavior;
+- a stable unsupported response is not implementation;
+- aggregate capabilities require aggregate validation rather than a collection
+  of unrelated leaf tests;
+- signed HVF or App Sandbox evidence must run through the repository wrapper;
+- a corpus reference records audit ownership and does not by itself prove every
+  statement in that corpus; and
+- platform-impossible claims require the upstream contract, authoritative
+  platform evidence, rejected alternatives, stable product behavior, focused
+  tests, compatibility/security documentation, and a trusted Challenge result.
 
-Snapshot paging feasibility, its standalone protocol/client, internal
-lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
-peer-failure propagation, checked consumer boundary, and native-v1 restore
-assembly remain guarded as one exact terminal aggregate. The inventory test pins
-the upstream contract, public macOS environment, signed prototype output,
-unchanged entitlement floor, stable pre-access profile rejection anchors,
-direct/contained successful restore evidence, exact implementation and
-validation paths, protocol/coordinator/host/guest/restore source and
-documentation anchors, and terminal status. The pager package covers canonical framing,
-every
-split/coalesced boundary, adversarial input, negotiation, exact out-of-order
-matching, concurrent mixed page/removal completion, first-terminal fan-out,
-cancellation, shutdown, timeout/EOF, redaction, and two inherited-stream
-child-process sessions. The HVF adapter additionally proves requested
-cancellation, coordinator-first peer-loss signaling, and pre-fault rejection
-when a peer reduces the coordinator's preconstructed in-flight bound.
+The validator is authoritative for current global disposition totals. Contract
+documents may retain selected-family counts only when a focused test uses them
+as a closure invariant; do not copy global totals or delivery chronology into
+prose.
 
-Contained pager brokerage is tested as a separate startup-authority boundary.
-Session and launcher tests cover the closed connected-stream record, malformed
-peer/source identity, CLOEXEC/status/type/identity/credential revalidation,
-one-time claim and cleanup, no-follow anchored connection, missing and
-non-socket targets, and source replacement. The bounded reference peer covers
-page data, zero, removal, cancellation, terminal, operation limits, and orderly
-shutdown without claiming Linux UFFD compatibility. The signed contained
-complete probe uses `PagerClient` and verifies remove followed by zero refault.
-The `pager-consumer` probe additionally constructs the real lazy owner and
-Mach bridge inside the signed App Sandbox worker, then covers ordinary slice
-access, volatile raw access, aligned atomic publication, virtqueue metadata,
-full snapshot streaming, mutation/export rejection, acknowledged removal, and
-zero refault against the connected reference peer.
+### Snapshot Paging Evidence
 
-The runtime lazy-memory tests use barriers, channels/condition wakeups, and
-bounded yield polling rather than sleeps. They cover absent private-anonymous
-construction, invalid layouts and bounds, exact data/zero publication, every
-public page state, mixed-access duplicate coalescing, waiter/in-flight
-exhaustion and reuse, stale response/replay rejection, retired operations
-retaining capacity, removal before/during/after population, acknowledgement
-ordering, publication/removal serialization, cancellation, peer failure,
-teardown, abandoned RAII work, poison recovery, generation exhaustion,
-redaction, and repeated cleanup:
+Changes to the frozen native-v1 Uffd reader, pager protocol, lazy-memory
+coordinator, Mach/HVF bridges, contained grant, or consumer table must run the
+focused inventory test and the affected implementation suites:
 
 ```sh
 cargo test -p bangbang-pager --all-targets --all-features --locked
 cargo test -p bangbang-runtime lazy_memory --all-features --locked
-cargo test -p bangbang-firecracker-capability-audit --test checked_inventory snapshot_paging_feasibility_policy_is_stable --locked
-cargo test -p bangbang-runtime native_v1_load_policy_rejects_each_unsupported_dimension --locked
-cargo test -p bangbang returns_fault_for_snapshot_endpoint --locked
-```
-
-Protected-consumer tests additionally pin the one-shot claim, closed profile
-priority, eager-vs-lazy tag, every topology/dirty/discard/export rejection,
-vhost-user shared-memory preflight, public session-borrow closure, and
-composite retention across partial map and failed unmap. Combined pmem and
-virtio-mem dispatch borrows also prove that lazy mode takes guest bytes from
-the protected consumer while retaining the mapping-owned executors. The signed
-guest tests consume the composite, so repeat teardown proves the protected view
-is dropped before Mach restoration:
-
-```sh
+cargo test -p bangbang-firecracker-capability-audit --test checked_inventory snapshot_paging_terminal_policy_is_stable --locked
+cargo test -p bangbang native_v1_uffd --all-features --locked
 cargo test -p bangbang-hvf --lib --all-features --locked lazy_composite
-scripts/run-integration-tests.sh --test production_bundle -- signed_pager_consumer_chain_runs_inside_app_sandbox
-```
-
-HVF host-fault unit tests use the real public Mach server for ordinary accesses
-and deterministic coordinator entry for failure paths. They cover host-page
-preflight, exact data/zero publication, read-to-write permission upgrade,
-source/content/coordinator terminalization, owner-busy alias rollback,
-admitted-action shutdown, blocked-response supersession, exact revoke/hide/zero
-ordering, peer-failure fan-out, redaction, and cleanup. The signed lifecycle cases
-then exercise real read-first, write-first, aligned atomic, and raw-pointer
-faults. A native prior handler repairs an unowned protected page after the
-bridge forwards it; that handler then replaces the bridge so shutdown proves
-it does not clobber a later owner. The lifecycle repeats, and an isolated child
-observes the exact fixed exit status for owned source failure. Run both the
-ordinary signed binary and the production App Sandbox replay:
-
-```sh
 cargo test -p bangbang-hvf --lib --all-features --locked lazy_host_fault
-scripts/run-integration-tests.sh --test hvf_lifecycle -- lazy_host_fault_integration::
-scripts/run-integration-tests.sh --test app_sandbox -- lazy_host_fault_integration::
+cargo test -p bangbang-hvf --lib --all-features --locked lazy_guest
 ```
 
-HVF guest-fault unit tests cover the signed-observed data/instruction syndrome
-classifier, including the Apple-Silicon data-abort form without instruction
-syndrome metadata, complete cross-page resolution before permission, serialized
-read/write/execute permission unions, duplicate-vCPU coalescing, one stale
-admission followed by no-progress failure, transactional setup cleanup,
-source/protection terminalization, redaction, dirty/raw exclusion, and canceled
-dispatch. The signed lifecycle test runs real execute-, read-, and write-first
-faults twice, verifies source-failure cleanup and no duplicate work after
-cancellation, blocks one source request until a second vCPU joins it, and
-proves an unowned instruction fault does not reach the lazy source. It also
-removes a page before population, supersedes one blocked old-generation data
-response during population, and removes a committed real stage-two page after
-population. Those cases observe newer-generation host and guest zero refault,
-no stranded waiter, and restored exception ownership. The
-guest-boot target starts directly on a lazy instruction page:
+On supported Apple Silicon, select the signed cases affected by the change and
+then run the complete wrapper without `--allow-unsupported` before promoting
+the terminal paging record:
 
 ```sh
-cargo test -p bangbang-hvf --lib --all-features --locked lazy_guest
+scripts/run-integration-tests.sh --test hvf_lifecycle -- lazy_host_fault_integration::
 scripts/run-integration-tests.sh --test hvf_lifecycle -- hvf_lazy_guest_
 scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_integration::boots_guest_entry_from_a_lazy_instruction_page
-```
-
-Frozen native-v1 restore tests keep `File` behavior as the eager regression
-path and cover `Uffd` profile ordering, state-derived pager-session identity,
-exact header-relative region offsets, invalid topology/limits/peer negotiation,
-transactional failure cleanup, public family routing, and path/value
-redaction. Current native-v2 explicitly rejects `Uffd`. Signed host/guest fault
-tests still exercise exact execute/read/write demand, removal generations,
-coalescing, failure, and cleanup, while signed production pager probes exercise
-the launcher-connected stream, App Sandbox boundary, death orders, and exact
-entitlement floor without claiming that current native-v2 accepts the backend.
-The signed frozen-v1 public-dispatch fixture uses File; no production format
-selector or v1 writer is exposed:
-
-```sh
-cargo test -p bangbang native_v1_uffd --all-features --locked
-cargo test -p bangbang-hvf --lib --all-features --locked snapshot_restore
-scripts/run-integration-tests.sh --test native_v2_process
-scripts/run-integration-tests.sh --test hvf_lifecycle -- lazy_host_fault_integration::
 scripts/run-integration-tests.sh --test production_bundle -- signed_pager_grant_
-scripts/run-integration-tests.sh --test production_bundle -- production_bundle_has_exact_nested_signing_contract --exact
+scripts/run-integration-tests.sh --test production_bundle -- signed_pager_consumer_chain_runs_inside_app_sandbox
+scripts/run-integration-tests.sh
 ```
 
-#1555's final #1527 certification runs the complete signed wrapper without
-`--allow-unsupported` after the focused direct, contained, removal, and
-entitlement cases. Promotion is valid only when that complete matrix and the
-checked inventory validator pass on the same submitted head.
+These cases cover direct and contained authority, execute/read/write-first
+demand, removal generations, refault-to-zero, peer failure, cancellation,
+entitlements, App Sandbox consumers, and ordered cleanup. Current native-v2
+Uffd rejection and native-v1 File behavior remain regression gates.
 
-Run its two focused gates with:
-
-```sh
-cargo test -p bangbang aggregate_remaining_device_snapshot_preflight_failures_preserve_order_and_reuse --all-features --locked
-cargo test -p bangbang-hvf --lib remaining_device_owner_budget_covers_mmio_and_pci_and_reuses_resources --all-features --locked
-```
-
-Run the offline compiler's focused surface with:
-
-```sh
-cargo test -p bangbang-seccompiler --all-targets --all-features --locked
-```
+### Compare, Regenerate, and Final Validation
 
 Maintainers can compare the machine-owned manifest with a clean explicit
 checkout at the exact pinned commit:
@@ -1537,18 +1367,20 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- regenerate \
   --output codex-work/tmp/firecracker-v1.16-source-manifest.candidate.json
 ```
 
-Review exact identity changes before updating the machine-owned file. Never use
-regeneration to alter `capabilities.json`; missing and stale overlays must be
-resolved deliberately. The parent certification gate is:
+Review exact identity changes before updating `source-manifest.json`. Never
+use regeneration to alter `capabilities.json`; missing and stale overlays
+must be resolved deliberately.
+
+The final parent gate is:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --final
 ```
 
-Final mode is expected to fail while any `audit-required` or
-`missing-platform-feasible` record remains. Signed HVF integration remains
-regression evidence for an inventory-only change and does not promote a record
-without record-specific evidence.
+Final mode fails while any `audit-required` or
+`missing-platform-feasible` record remains. An inventory-only change does not
+promote a capability without record-specific implementation and validation
+evidence.
 
 ## Running Tests
 
@@ -2753,8 +2585,10 @@ interrupts, public time-state restoration outside the focused native-v2
 profile, cross-host clock portability, or broader RTC-adjacent behavior beyond
 the checked PL031/VMGenID/VMClock/PVTime contract is supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
-Network optional-device encoding, restore, migration/clone, and cross-host
-policy remain the exact Wave 6 #1490 handoff. Entropy is terminal only for the
+Exact native-v2 2.11 network/MMDS encoding, restore, and fresh clone-local
+sessions have their own signed certification; live-peer migration, external
+vmnet connectivity, and broad cross-host policy remain outside that proof.
+Entropy is terminal only for the
 exact native-v2 2.8 contract and evidence above; it does not claim Firecracker
 artifacts or broad portability. The network producer intentionally requests a
 fresh lossy destination rather than serializing peer packets, callbacks, active

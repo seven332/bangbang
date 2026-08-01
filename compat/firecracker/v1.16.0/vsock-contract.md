@@ -2,13 +2,9 @@
 
 This is the checked closure ledger for the 14 directly vsock-named identities
 in the pinned Firecracker v1.16.0 inventory. All 14 are
-`implemented-and-verified`. Native-v2 2.12 closes the six snapshot rows that
-previously retained Wave 6, moving the global inventory from 246/152/3/17 to
-252/146/3/17 without changing any other disposition.
-
+`implemented-and-verified`; native-v2 2.12 supplies the six snapshot rows.
 The immutable upstream baseline is Firecracker commit
-`d83d72b710361a10294480131377b1b00b163af8`. The generated source manifest
-remains 381 identities and the human overlay remains 418 identities.
+`d83d72b710361a10294480131377b1b00b163af8`.
 
 ## Evidence keys
 

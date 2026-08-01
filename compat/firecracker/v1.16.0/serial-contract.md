@@ -1,15 +1,9 @@
 # Firecracker v1.16.0 serial closure contract
 
-This ledger is the final checked closure record for the six directly owned
-Firecracker v1.16.0 serial identities. #1479 originally closed the five
-API/model identities and handed the semantic snapshot aggregate to Wave 6.
-[#1652](https://github.com/seven332/bangbang/issues/1652) now closes that
-handoff through the public bangbang-native `2.7.0` Full/File lifecycle.
-
-All six identities are `implemented-and-verified`. The generated source
-manifest remains 381 identities, the overlay retains 37 local semantic
-identities and 418 total records, and this reconciliation moves the current
-global disposition counts from 235/163/3/17 to 236/162/3/17.
+This ledger owns the six Firecracker v1.16.0 serial identities. All six are
+`implemented-and-verified`, including the bangbang-native `2.7.0`
+Full/File snapshot aggregate certified by
+[#1652](https://github.com/seven332/bangbang/issues/1652).
 
 ## Evidence keys
 

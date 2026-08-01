@@ -1,15 +1,8 @@
 # Firecracker v1.16.0 entropy closure contract
 
-This ledger began as the checked live-device closure for #1475, the third
-delivery slice of #1440 under #1348. #1666 completes its exact native-v2 2.8
-snapshot continuation and containment gate. It covers exactly seven directly
-owned Firecracker v1.16.0 entropy identities, and all seven are now
-`implemented-and-verified`.
-
-The generated source manifest remains 381 identities, the overlay retains 37
-local semantic identities and 418 total records. The original live closure
-moved the global counts from 181/217/3/17 to 186/212/3/17; #1666 promotes the
-two retained aggregates from 236/162/3/17 to 238/160/3/17.
+This checked #1475/#1666 ledger owns exactly seven Firecracker v1.16.0 entropy
+identities. All seven are `implemented-and-verified`, including exact
+native-v2 2.8 snapshot continuation and containment.
 
 ## Evidence keys
 

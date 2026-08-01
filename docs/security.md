@@ -2945,117 +2945,23 @@ The current scaffold does not implement:
 - broader snapshot profiles or Firecracker artifact compatibility beyond the
   exact contained native-v2 Full/File state-memory-root boundary, legacy
   device-free native-v2 2.3 reader, and frozen native-v1 reader
-- full containment for network, guest-visible MMDS, or vsock beyond the exact
-  granted Unix-socket subset; the
-  current network interface configuration path validates and stores
-  configuration strings, and internal
-  virtio-net notification dispatch can parse guest TX descriptor metadata and
-  pass validated TX frame payloads to injected packet I/O selected per configured
-  interface, and can copy injected RX packet bytes into validated guest RX
-  buffers through the same boundary. On macOS, the process crate has internal
-  vmnet descriptor, lifecycle, start owner, concrete system start/stop backend,
-  packet descriptor, single-packet system read/write backend boundaries, a
-  cleanup-owning packet backend for retaining stop-on-drop ownership while
-  delegating packet I/O, and an internal virtio-net adapter that can move
-  packets between vmnet and the runtime packet traits, detour speculatively
-  targeted MMDS traffic before external egress, and share one bounded
-  interface-local ARP/IPv4/TCP stack between TX classification and RX delivery.
-  The stack owns 30 connections, 100 resets, fixed 2,500-byte receive buffers,
-  one response per endpoint, segmentation/flow control/ACK/FIN/RST state,
-  retransmission and eviction deadlines, and one commit-retained output frame.
-  Protocol deadlines merge into the existing generation-safe owner scheduler.
-  An MMDS-only adapter reuses the same stack without opening vmnet when every
-  configured interface is listed in MMDS config, plus a bounded per-interface registry that owns independent adapters,
-  explicit vmnet stop/drop, and exact generation take/restore, and an internal `host_dev_name` mapping for
-  `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. The current
-  model stores at most 16 configured network interfaces. Startup revalidates
-  that limit before selecting packet I/O, opens vmnet resources only for
-  non-MMDS-only startup when configured interfaces use the supported names,
-  keeps no-network startup on an empty hotplug-capable registry, and enforces
-  bounded lifecycle-v5 session-and-vmnet-authority owner for contained startup,
-  restore, runtime insertion, and capture. Public PCI PUT/DELETE coordinates
-  that registry with exact PCI, metrics, retry, and live-config ownership;
-  MMDS-only runtime entries consume no vmnet capacity but still require the
-  exact session owner, while actual live vmnet entries are charged to the bound.
-  The
-  default networkless code-sign profile rejects every positive authority
-  before worker spawn but supports the signed all-MMDS hotplug path. Explicit vmnet packaging can bind a caller-approved
-  profile to a positive authority only after exact inspection and current-host
-  authorization, while real production connectivity policy and full public
-  vmnet packet-movement proof beyond the documented operator-owned boundary
-  remain missing. The current
-  vsock API path validates and stores `guest_cid` plus `uds_path` before boot.
-  The runtime crate has an internal virtio-vsock prepared resource, MMIO
-  registration helper, config-space, packet header model, TX descriptor packet
-  parser, TX available-ring drain helper with used-ring descriptor completion,
-  MMIO handler skeleton with active queue metadata retention and RX/TX
-  notification dispatch, startup FDT attachment, startup-level RX/TX
-  notification dispatch, and HVF queue interrupt signaling that expose only the
-  configured guest CID through bounded config reads. The runtime can also parse
-  host `CONNECT <PORT>` requests, allocate Firecracker-shaped host local ports,
-  retain host-initiated accepted streams in an internal table, expose one-shot
-  guest-facing `VSOCK_OP_REQUEST` packet headers for retained host connections,
-  dispatch those request headers into validated writable guest RX descriptors,
-  accept one pending host connection per dispatch pass into an owned
-  nonblocking stream, retain bounded accepted streams across partial handshakes
-  and retained connection records, drop invalid accepted-stream handshakes
-  without exposing host paths, retry RX delivery when pending host requests
-  exist, and acknowledge guest `VSOCK_OP_RESPONSE` packets for delivered host
-  requests by writing `OK <local_port>\n` to the retained host stream. Short or
-  failed acknowledgement writes drop the retained connection and release its
-  host local port. Unsupported or orphan host-destined guest TX packets can
-  queue bounded guest-visible `VSOCK_OP_RST` headers. Supported guest
-  `VSOCK_OP_REQUEST` packets attempt nonblocking connects to Firecracker-shaped
-  `uds_path_<PORT>` sockets, retain successful streams in a bounded
-  guest-initiated connection table, and deliver guest-visible
-  `VSOCK_OP_RESPONSE` headers; connect or retention failures deliver
-  guest-visible `VSOCK_OP_RST` headers and retain no stream. Established
-  host-initiated or guest-initiated connections can forward bounded guest
-  `VSOCK_OP_RW` payload bytes to retained host streams, keep a bounded
-  four-packet per-connection guest-to-host retry queue for partial or
-  would-block nonblocking writes, and retry pending bytes on later notification
-  dispatch before accepting more guest `RW` data for the same connection. Queue
-  overflow or terminal write failures drop the retained stream before queuing a
-  guest-visible reset. Established host-initiated and guest-initiated
-  connections can retain a bounded
-  four-packet per-connection backlog of host `VSOCK_OP_RW` payloads and deliver
-  one queued payload at a time into validated guest RX buffers,
-  guest `VSOCK_OP_RST` packets drop matching retained host-initiated or
-  guest-initiated streams without queuing guest-visible RX output, partial guest
-  `VSOCK_OP_SHUTDOWN` packets record receive/send closure state, suppress
-  later data movement in the closed direction, and apply TX shutdown control
-  before same-window RX host-payload delivery, while full guest
-  `VSOCK_OP_SHUTDOWN` packets drop matching retained streams before queuing a
-  guest-visible reset. Valid guest `VSOCK_OP_CREDIT_UPDATE` packets for
-  established retained streams are consumed without queuing a reset, and valid
-  guest `VSOCK_OP_CREDIT_REQUEST` packets queue zero-payload guest-visible
-  `VSOCK_OP_CREDIT_UPDATE` headers on the existing RX path. Dynamic 64-KiB
-  credit windows use wrapping counters and bounded reservations; clean host EOF
-  queues shutdown after pending payloads, while terminal read/write failures
-  queue a reset. Request and shutdown cleanup are bounded to two seconds. Both
-  initiation directions share one 1023-connection active budget, incomplete
-  accepted host handshakes are bounded separately to 256, and host-local ports
-  use a detached round-robin last-used cursor.
-  Startup preparation
-  creates a nonblocking host Unix listener at `uds_path` and cleans it up only
-  while the path still matches the created socket inode. `EVENT_IDX` is active
-  on RX/TX, indirect descriptors are a supported bangbang extension, and the
-  event queue supports validated `TRANSPORT_RESET` publication plus guest
-  acknowledgement of the runtime-only restored-origin RX gate. This
-  **implemented supported live MMIO-or-PCI startup/Unix-socket subset** still is not full
-  containment: there is no global host-path broker, PATCH/DELETE/runtime
-  hotplug, broader CID routing, or broader event type. The private redacted
-  MMIO/PCI capture and listener/connector-parameterized empty-state reconstruction layer
-  grants no path authority and persists no live peer work. Production quiesced
-  capture now validates one exact source owner, publishes reset, and detaches
-  connection work while retaining listener/connector authority for fresh
-  traffic. Internal destination preparation now validates the captured and
-  optional override selectors before resource access, uses owner-only
-  stale-safe direct publication or exact transactional contained authority,
-  and transfers cleanup ownership through one single-use runtime adoption.
-  The checked ledger certifies all eight API/live records. Public native-v2
-  encoding/placement and invocation, restored-guest acknowledgement/reconnect/
-  override proof, clone/versioning, and portability remain #1490 work.
+- full external-network containment beyond the documented lifecycle-v5
+  vmnet authority and MMDS-only fast path. Networkless production rejects
+  positive vmnet authority before worker spawn, while an explicit vmnet profile
+  still depends on operator-owned signing credentials, current-host
+  authorization, connectivity policy, and firewall policy. The current
+  ownership boundary is summarized in
+  [Firecracker Compatibility Scope](firecracker-compatibility.md#aggregate-network-and-mmds-closure).
+- vsock behavior beyond the implemented live MMIO-or-PCI Unix-socket subset and
+  exact native-v2 2.12 snapshot/override/clone contract. Exact 2.12 captures
+  portable CID, selector, cursor, queue/reset, and placement state, closes
+  source streams, and reconstructs fresh direct or contained destination
+  owners. Live-peer migration, automatic socket or grant migration,
+  PATCH/DELETE/runtime hotplug, broader CID and event behavior, Firecracker
+  artifact bytes, Diff/Uffd, vhost/KVM parity, broad performance parity, and
+  unconstrained cross-host portability remain non-goals. The exact snapshot
+  boundary is in
+  [Snapshot Feasibility](snapshot-feasibility.md#native-v2-212-vsock-activation-and-certification).
 - log rotation, syslog, journald, tracing, remote telemetry, or process-global
   panic/fatal observability durability
 - a public serial streaming API, generalized serial artifact encoding/restore,

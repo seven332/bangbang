@@ -1,17 +1,9 @@
 # Firecracker v1.16.0 memory-hotplug closure contract
 
-This ledger is the checked closure record for #1474, the second delivery slice
-of #1440 under #1348. It covers exactly 19 directly owned Firecracker v1.16.0
-memory-hotplug identities. All 19 API, corpus, and semantic identities are
-`implemented-and-verified`. #1538 delivered exact native-v2 `2.10.0`
-serialization and fresh-owner restoration; #1698 closes the aggregate with
-signed direct and normal-production/App-Sandbox MMIO/PCI restored-guest
-continuation.
-
-The generated source manifest remains 381 identities, the overlay retains 37
-local semantic identities and 418 total records. The terminal promotion of
-exactly the two retained virtio-mem aggregates moves the current global
-disposition counts from 240/158/3/17 to 242/156/3/17.
+This checked #1474 ledger owns exactly 19 Firecracker v1.16.0 memory-hotplug
+identities. All 19 are `implemented-and-verified`, including exact native-v2
+`2.10.0` serialization, fresh-owner restoration, and signed direct and
+normal-production/App-Sandbox MMIO/PCI continuation.
 
 ## Evidence keys
 

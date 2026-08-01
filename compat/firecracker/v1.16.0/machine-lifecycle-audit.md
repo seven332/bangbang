@@ -5,12 +5,10 @@ under #1348. It records the disposition of every capability that belonged to
 the original Wave 2 family set and the directly related API aggregates reviewed
 after all eight implementation children merged.
 
-The generated `source-manifest.json` contains 381 Firecracker source identities.
-The human-owned delivery overlay contains those identities plus 37 local
-`semantic.*` identities, for 418 records total. The original Wave 2 baseline at
-commit `ed60a1abe850db7dbddc836d6316e3663381e8b9` contained 417 overlay records;
-issue #1392 later added `semantic.boot:arm64-cache-fdt`. That local cache
-record is implemented and verified, but is not one of the original 28 below.
+The immutable upstream baseline is Firecracker commit
+`d83d72b710361a10294480131377b1b00b163af8`. The original Wave 2 selector
+contains the 28 records below; later local semantic records remain outside this
+ledger.
 
 ## Original 28-record ledger
 
@@ -112,22 +110,13 @@ Those exact identities establish the following non-overlapping handoffs:
 - #1351 retains only its independent external root/vmnet evidence gates. This
   audit does not change those records or their public behavior.
 
-## Count reconciliation and validation
-
-The 21 promotions above move the current overlay from 49/349/3/17 to:
-
-| Disposition | Records |
-| --- | ---: |
-| `implemented-and-verified` | 70 |
-| `audit-required` | 328 |
-| `missing-platform-feasible` | 3 |
-| `proven-platform-impossible` | 17 |
-| **Total** | **418** |
+## Validation
 
 `tools/firecracker-capability-audit/tests/checked_inventory.rs` pins the
-original ledger, Wave 7 set, promoted identity set, counts, and absence of a
-future-#1388 reconciliation placeholder. Generic source coverage, evidence
-reference, and disposition rules remain owned by the existing validator.
+original selector, Wave 7 set, promoted identity set, and absence of a stale
+future-#1388 handoff. Generic source coverage, global disposition totals,
+evidence references, and disposition rules remain owned by the validator and
+`capabilities.json`.
 
 Delivery validation must pass, and the generated manifest must still compare
 byte-for-byte with a clean Firecracker checkout at

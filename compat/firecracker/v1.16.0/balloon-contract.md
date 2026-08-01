@@ -1,15 +1,8 @@
 # Firecracker v1.16.0 balloon closure contract
 
-This ledger is the checked terminal closure record for #1473 and #1681 under
-#1490 and #1348. It covers exactly 52 directly owned Firecracker v1.16.0
-balloon identities. All 52 API operation, path, property, schema, corpus, and
-semantic identities are `implemented-and-verified`.
-
-The generated source manifest remains 381 identities, the overlay retains 37
-local semantic identities and 418 total records. #1473 first moved the 50
-bounded live/API identities from 114/284/3/17 to 164/234/3/17. #1681 closes the
-two retained aggregates and moves the current global disposition counts from
-238/160/3/17 to 240/158/3/17.
+This checked #1473/#1681 ledger owns exactly 52 Firecracker v1.16.0 balloon
+identities. All 52 API operation, path, property, schema, corpus, and semantic
+identities are `implemented-and-verified`.
 
 ## Evidence keys
 

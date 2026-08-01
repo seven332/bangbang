@@ -1,21 +1,11 @@
 # Firecracker v1.16.0 network and MMDS closure contract
 
-This is the checked closure ledger for #1496, the final aggregate child of
-#1493 under #1348. It covers exactly 35 directly owned Firecracker v1.16.0
-network and MMDS identities. Thirty-one rows are
-`implemented-and-verified` at the original #1496 checkpoint. Exact native-v2
-2.11 activation and #1716 certification promote two snapshot/session rows, so
-33 are now `implemented-and-verified`; two broad rows remain `audit-required`
-for exact work owned by
+This checked #1496 closure ledger owns exactly 35 Firecracker v1.16.0 network
+and MMDS identities. Thirty-three are `implemented-and-verified`, including
+the exact native-v2 2.11 snapshot/session rows. Two broad rows remain
+`audit-required` for work owned by
 [#1378](https://github.com/seven332/bangbang/issues/1378),
 [#1491](https://github.com/seven332/bangbang/issues/1491).
-
-The generated source manifest remains 381 identities and the overlay remains
-418 identities, including 37 local semantic records. The #1496 reconciliation
-moved the global disposition counts from 191/207/3/17 to 220/178/3/17; the
-post-#1716 checkpoint was 246/152/3/17. #1736's independent vsock promotions
-leave this 35-row ledger unchanged and move the current global counts to
-252/146/3/17.
 
 ## Evidence keys
 
@@ -181,11 +171,11 @@ before session creation.
 - #1378 remains open. This contract does not claim an Apple-approved production
   vmnet start, external packet connectivity, service failure, crash reclamation,
   or credentialed concurrent connectivity.
-- #1490 still owns the broader optional-device aggregate, vsock persistence,
-  artifact editing/version evolution, and unconstrained migration/host
-  portability. Exact 2.11 network/MMDS bytes, reconstruction, overrides, and
-  clone-session freshness are terminal here. Peer-owned vmnet packets and
-  active MMDS TCP sessions are intentionally not persisted.
+- #1490 retains Diff/native-v2-Uffd work, artifact editing/version evolution,
+  and unconstrained migration/host portability. Exact 2.11 network/MMDS bytes,
+  reconstruction, overrides, and clone-session freshness are terminal here;
+  current 2.12 composes them unchanged with optional vsock. Peer-owned vmnet
+  packets and active MMDS TCP sessions are intentionally not persisted.
 - #1491 owns the separate network-performance corpus, global metric schema and
   timing reconciliation, and performance validation. Correctness-critical
   network/MMDS producers already exist; this ledger does not claim throughput
