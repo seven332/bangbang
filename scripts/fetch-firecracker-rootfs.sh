@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v103"
+direct_boot_variant="direct-boot-v109"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -4294,6 +4294,205 @@ PY
   fi
 }
 
+certify_vsock_snapshot_restore() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    emit_line BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_NO_PYTHON
+    return
+  fi
+
+  if ! python3 - <<'PY'; then
+import socket
+import sys
+import time
+
+HOST_CID = getattr(socket, "VMADDR_CID_HOST", 2)
+SOURCE_GUEST_PORTS = (5011,)
+FRESH_GUEST_PORTS = (5021, 5022, 5023, 5024)
+GUEST_LISTEN_PORTS = tuple(range(6011, 6027))
+SOURCE_HOST_STREAMS = 1
+FRESH_HOST_STREAMS = 16
+SOCKET_TIMEOUT = 30.0
+RECONNECT_TIMEOUT = 10.0
+
+
+def emit(marker):
+    for offset in range(0, len(marker), 16):
+        sys.stdout.write(marker[offset : offset + 16])
+        sys.stdout.flush()
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def fail(reason):
+    emit(f"BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_{reason}")
+    sys.exit(1)
+
+
+def payload(direction, index, size):
+    prefix = f"BANGBANG_VSOCK_SNAPSHOT_{direction}_{index}:".encode("ascii")
+    if len(prefix) > size:
+        fail("PAYLOAD_PREFIX")
+    fill = bytes((ord("A") + index % 26,))
+    return prefix + fill * (size - len(prefix))
+
+
+def connect_host(port):
+    try:
+        stream = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    except OSError:
+        fail(f"SOCKET_{port}")
+    stream.settimeout(SOCKET_TIMEOUT)
+    try:
+        stream.connect((HOST_CID, port))
+    except OSError:
+        stream.close()
+        fail(f"CONNECT_{port}")
+    return stream
+
+
+def connect_host_after_reset(port):
+    deadline = time.monotonic() + RECONNECT_TIMEOUT
+    while True:
+        try:
+            stream = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        except OSError:
+            fail(f"SOCKET_{port}")
+        stream.settimeout(1.0)
+        try:
+            stream.connect((HOST_CID, port))
+            stream.settimeout(SOCKET_TIMEOUT)
+            return stream
+        except OSError:
+            stream.close()
+            if time.monotonic() >= deadline:
+                fail(f"RECONNECT_{port}")
+            time.sleep(0.05)
+
+
+def recv_exact(stream, size):
+    data = bytearray()
+    while len(data) < size:
+        try:
+            chunk = stream.recv(size - len(data))
+        except socket.timeout:
+            fail("RECV_TIMEOUT")
+        except OSError:
+            fail("RECV_ERROR")
+        if not chunk:
+            fail("RECV_EOF")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def recv_to_eof(stream):
+    data = bytearray()
+    while True:
+        try:
+            chunk = stream.recv(65536)
+        except socket.timeout:
+            fail("EOF_TIMEOUT")
+        except OSError:
+            fail("EOF_RECV")
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+
+
+def expect_reset(stream, label):
+    stream.settimeout(RECONNECT_TIMEOUT)
+    try:
+        data = stream.recv(1)
+    except socket.timeout:
+        fail(f"{label}_RESET_TIMEOUT")
+    except OSError:
+        return
+    if data:
+        fail(f"{label}_RESET_DATA")
+
+
+if not hasattr(socket, "AF_VSOCK"):
+    fail("NO_AF_VSOCK")
+
+guest_listeners = []
+for index, port in enumerate(GUEST_LISTEN_PORTS):
+    try:
+        listener = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((getattr(socket, "VMADDR_CID_ANY", -1), port))
+        listener.listen(8)
+        listener.settimeout(SOCKET_TIMEOUT)
+        guest_listeners.append(listener)
+    except OSError:
+        fail(f"GUEST_LISTENER_{index}")
+
+source_guest_streams = []
+for index, port in enumerate(SOURCE_GUEST_PORTS):
+    stream = connect_host(port)
+    stream.sendall(payload("SOURCE_G2H", index, 1024))
+    expected = payload("SOURCE_G2H_ACK", index, 128)
+    if recv_exact(stream, len(expected)) != expected:
+        fail(f"SOURCE_G2H_ACK_{index}")
+    source_guest_streams.append(stream)
+
+source_host_streams = []
+for index in range(SOURCE_HOST_STREAMS):
+    try:
+        stream, _ = guest_listeners[index].accept()
+    except OSError:
+        fail(f"SOURCE_H2G_ACCEPT_{index}")
+    stream.settimeout(SOCKET_TIMEOUT)
+    expected = payload("SOURCE_H2G", index, 1024)
+    if recv_exact(stream, len(expected)) != expected:
+        fail(f"SOURCE_H2G_PAYLOAD_{index}")
+    stream.sendall(payload("SOURCE_H2G_ACK", index, 128))
+    source_host_streams.append(stream)
+
+emit("BANGBANG_VSOCK_SNAPSHOT_SOURCE_READY")
+
+for index, stream in enumerate(source_guest_streams):
+    expect_reset(stream, f"SOURCE_G2H_{index}")
+    stream.close()
+for index, stream in enumerate(source_host_streams):
+    expect_reset(stream, f"SOURCE_H2G_{index}")
+    stream.close()
+
+emit("BANGBANG_VSOCK_SNAPSHOT_RESET_OBSERVED")
+
+for index, port in enumerate(FRESH_GUEST_PORTS):
+    stream = connect_host_after_reset(port)
+    stream.sendall(payload("FRESH_G2H", index, 4096))
+    expected = payload("FRESH_G2H_REPLY", index, 4096)
+    if recv_to_eof(stream) != expected:
+        fail(f"FRESH_G2H_REPLY_{index}")
+    stream.close()
+
+emit("BANGBANG_VSOCK_SNAPSHOT_FRESH_G2H_OK")
+
+for index in range(FRESH_HOST_STREAMS):
+    try:
+        stream, _ = guest_listeners[index].accept()
+    except OSError:
+        fail(f"FRESH_H2G_ACCEPT_{index}")
+    stream.settimeout(SOCKET_TIMEOUT)
+    try:
+        stream.sendall(payload("FRESH_H2G_REPLY", index, 4096))
+        stream.shutdown(socket.SHUT_WR)
+    except OSError:
+        fail(f"FRESH_H2G_REPLY_{index}")
+    expected = payload("FRESH_H2G", index, 4096)
+    if recv_to_eof(stream) != expected:
+        fail(f"FRESH_H2G_PAYLOAD_{index}")
+    stream.close()
+
+for listener in guest_listeners:
+    listener.close()
+emit("BANGBANG_VSOCK_SNAPSHOT_PRESERVED_LISTENER_OK")
+emit("BANGBANG_VSOCK_SNAPSHOT_RESET_OK")
+PY
+    emit_line BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_UNEXPECTED
+  fi
+}
+
 fetch_vsock_snapshot_reset_marker() {
   if ! command -v python3 >/dev/null 2>&1; then
     emit_line BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_NO_PYTHON
@@ -5125,6 +5324,8 @@ elif cmdline_has bangbang.mmds-fetch=1; then
   fetch_mmds_marker
 elif cmdline_has bangbang.native-v2-root-snapshot=1; then
   check_native_v2_root_snapshot_marker
+elif cmdline_has bangbang.vsock-snapshot-certify=1; then
+  certify_vsock_snapshot_restore
 elif cmdline_has bangbang.vsock-snapshot-reset=1; then
   fetch_vsock_snapshot_reset_marker
 elif cmdline_has bangbang.vsock-guest-connect=1; then

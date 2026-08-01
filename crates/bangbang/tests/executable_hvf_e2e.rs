@@ -45,6 +45,7 @@ mod macos_arm64 {
         SnapshotV2NetworkBackendClass, SnapshotV2NetworkLimiterState, SnapshotV2NetworkState,
     };
     use bangbang_runtime::storage_capture::StorageRetryState;
+    use bangbang_runtime::vsock::VSOCK_HOST_LOCAL_PORT_BASE;
 
     use crate::macos_virtual_block::{
         MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize,
@@ -304,12 +305,26 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_VSOCK_GUEST_STREAM_SEED: u8 = 0x3d;
     const DIRECT_ROOTFS_VSOCK_HOST_STREAM_SEED: u8 = 0xa7;
     const DIRECT_ROOTFS_VSOCK_PORT: u32 = 5005;
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_SOURCE_GUEST_PORTS: [u32; 1] = [5011];
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_GUEST_PORTS: [u32; 4] = [5021, 5022, 5023, 5024];
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_GUEST_LISTEN_PORT: u32 = 6011;
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_SOURCE_HOST_STREAMS: usize = 1;
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_HOST_STREAMS: usize = 16;
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_SOURCE_READY: &[u8] =
+        b"BANGBANG_VSOCK_SNAPSHOT_SOURCE_READY";
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_RESET_OBSERVED: &[u8] =
+        b"BANGBANG_VSOCK_SNAPSHOT_RESET_OBSERVED";
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_G2H_OK: &[u8] =
+        b"BANGBANG_VSOCK_SNAPSHOT_FRESH_G2H_OK";
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_PRESERVED_LISTENER_OK: &[u8] =
+        b"BANGBANG_VSOCK_SNAPSHOT_PRESERVED_LISTENER_OK";
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_SUCCESS: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_RESET_OK";
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_FAILURE: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_";
     const DIRECT_ROOTFS_VSOCK_SNAPSHOT_OLD_PORT: u32 = 5011;
     const DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_PORT: u32 = 5012;
     const DIRECT_ROOTFS_VSOCK_SNAPSHOT_OLD_READY: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_OLD_READY";
     const DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_READY: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_FRESH_READY";
     const DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_ACK: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_FRESH_ACK";
-    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_SUCCESS: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_RESET_OK";
     const DIRECT_ROOTFS_VSOCK_MULTISTREAM_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_MULTISTREAM_OK";
     const DIRECT_ROOTFS_VSOCK_MULTISTREAM_EXCHANGES: &[(u32, &[u8], &[u8])] = &[
         (
@@ -407,6 +422,7 @@ mod macos_arm64 {
         r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_GUEST_VALUE"}}"#;
     const DIRECT_ROOTFS_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-connect=1";
     const DIRECT_ROOTFS_VSOCK_SNAPSHOT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait init=/bangbang-direct-rootfs-init bangbang.vsock-snapshot-reset=1";
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_CERTIFY_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait init=/bangbang-direct-rootfs-init bangbang.vsock-snapshot-certify=1";
     const DIRECT_ROOTFS_VSOCK_MULTISTREAM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-multistream=1";
     const DIRECT_ROOTFS_HOST_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-connect=1";
     const DIRECT_ROOTFS_HOST_VSOCK_MULTISTREAM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-multistream=1";
@@ -11012,7 +11028,7 @@ mod macos_arm64 {
         body.to_string()
     }
 
-    fn assert_native_v2_vsock_snapshot(path: &Path, enable_pci: bool, context: &str) {
+    fn assert_native_v2_vsock_snapshot(path: &Path, enable_pci: bool, context: &str) -> u32 {
         let bytes = fs::read(path).expect("exact-2.12 vsock snapshot state should read");
         let structural =
             decode_snapshot_v2_state(&bytes).expect("exact-2.12 vsock state should decode");
@@ -11031,6 +11047,7 @@ mod macos_arm64 {
             },
             "{context} vsock transport should persist"
         );
+        vsock.host_local_port_cursor().last_used()
     }
 
     fn write_native_v2_snapshot_without_vsock(source: &Path, destination: &Path, context: &str) {
@@ -11065,6 +11082,905 @@ mod macos_arm64 {
             state.vsock().is_none(),
             "{context} rewritten fixture should omit kind 13"
         );
+    }
+
+    #[test]
+    fn signed_executable_certifies_native_v2_vsock_snapshot_over_mmio() {
+        run_signed_vsock_snapshot_certification(false);
+    }
+
+    #[test]
+    fn signed_executable_certifies_native_v2_vsock_snapshot_over_product_pci() {
+        run_signed_vsock_snapshot_certification(true);
+    }
+
+    fn run_signed_vsock_snapshot_certification(enable_pci: bool) {
+        let transport = if enable_pci { "product PCI" } else { "MMIO" };
+        let test_dir = TestDir::new();
+        let source_api = test_dir.path().join("s.api");
+        let source_uds = test_dir.path().join("a.sock");
+        let override_uds = test_dir.path().join("b.sock");
+        let source_metrics = test_dir.path().join("certify-source.metrics");
+        let paused_metrics = test_dir.path().join("certify-paused.metrics");
+        let automatic_metrics = test_dir.path().join("certify-automatic.metrics");
+        let state_path = test_dir.path().join("certify-vsock.state");
+        let memory_path = test_dir.path().join("certify-vsock.memory");
+        let recaptured_state = test_dir.path().join("certify-vsock-recaptured.state");
+        let recaptured_memory = test_dir.path().join("certify-vsock-recaptured.memory");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        let source_guest_listeners =
+            bind_snapshot_vsock_source_guest_listeners(&source_uds, transport);
+        let mut source =
+            start_snapshot_vsock_process(&source_api, &instance_id, enable_pci, &source_metrics);
+        configure_signed_vsock_snapshot_certification_source(
+            &source_api,
+            &kernel_path,
+            &rootfs_path,
+            &source_uds,
+            transport,
+        );
+
+        let mut source_guest_streams = accept_snapshot_vsock_guest_streams(
+            source_guest_listeners,
+            SnapshotVsockExchange {
+                request_kind: "SOURCE_G2H",
+                response_kind: "SOURCE_G2H_ACK",
+                request_size: 1024,
+                response_size: 128,
+            },
+            transport,
+            &source,
+        );
+        let (mut source_host_streams, source_host_ports) = connect_snapshot_vsock_guest_listener(
+            &source_uds,
+            DIRECT_ROOTFS_VSOCK_SNAPSHOT_SOURCE_HOST_STREAMS,
+            SnapshotVsockExchange {
+                request_kind: "SOURCE_H2G",
+                response_kind: "SOURCE_H2G_ACK",
+                request_size: 1024,
+                response_size: 128,
+            },
+            transport,
+            &source,
+        );
+        assert_eq!(
+            source_host_ports,
+            vec![VSOCK_HOST_LOCAL_PORT_BASE],
+            "{transport} source host-local ports must start at the pinned Firecracker base"
+        );
+        source
+            .wait_for_stdout_marker(
+                snapshot_vsock_marker(DIRECT_ROOTFS_VSOCK_SNAPSHOT_SOURCE_READY),
+                GUEST_EXECUTION_TIMEOUT,
+            )
+            .unwrap_or_else(|error| {
+                let output = source.force_stop_and_collect();
+                panic!(
+                    "{transport} certification source did not retain all connections: {error}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                )
+            });
+        flush_direct_snapshot_vsock_metrics(&source_api, &source_metrics, 2, transport);
+
+        assert_no_content_response(
+            &http_json(&source_api, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            &format!("pause {transport} vsock certification source"),
+        );
+        let create_body = serde_json::json!({
+            "snapshot_type": "Full",
+            "snapshot_path": state_path,
+            "mem_file_path": memory_path,
+        })
+        .to_string();
+        assert_no_content_response(
+            &http_put_json(&source_api, "/snapshot/create", &create_body),
+            &format!("create {transport} vsock certification snapshot"),
+        );
+        let saved_cursor = assert_native_v2_vsock_snapshot(&state_path, enable_pci, transport);
+        assert_eq!(
+            saved_cursor, VSOCK_HOST_LOCAL_PORT_BASE,
+            "{transport} snapshot must retain the exact source host-local cursor"
+        );
+        let state_before =
+            fs::read(&state_path).expect("certification vsock state should remain readable");
+        let memory_before =
+            fs::read(&memory_path).expect("certification vsock memory should remain readable");
+
+        assert_snapshot_vsock_source_connections_lost(
+            &mut source_guest_streams,
+            &mut source_host_streams,
+            transport,
+        );
+        let source_output = source.terminate();
+        assert_snapshot_vsock_output_redacted(
+            &source_output,
+            &[&source_uds, &state_path, &memory_path, &source_metrics],
+            &format!("{transport} certification source"),
+        );
+        assert_clean_shutdown(
+            source_output,
+            &source_api,
+            &format!("bangbang {transport} vsock certification source"),
+        );
+        assert!(
+            !source_uds.exists(),
+            "{transport} source shutdown must remove its main vsock listener"
+        );
+
+        let mut paused =
+            prepare_signed_vsock_certification_destination(CertifiedSignedVsockDestinationInput {
+                enable_pci,
+                transport,
+                instance_id: format!("{instance_id}-certify-paused"),
+                api_socket: test_dir.path().join("p.api"),
+                state: state_path.clone(),
+                memory: memory_path.clone(),
+                saved_uds: source_uds.clone(),
+                destination_uds: source_uds.clone(),
+                requested_override: None,
+                metrics: paused_metrics,
+                resume_vm: false,
+                saved_cursor,
+            });
+        assert!(
+            !paused
+                .process
+                .stdout_snapshot()
+                .contains(snapshot_vsock_marker(
+                    DIRECT_ROOTFS_VSOCK_SNAPSHOT_RESET_OBSERVED
+                )),
+            "{transport} Paused destination must not process reset or queued RX before resume"
+        );
+
+        let mut automatic =
+            prepare_signed_vsock_certification_destination(CertifiedSignedVsockDestinationInput {
+                enable_pci,
+                transport,
+                instance_id: format!("{instance_id}-certify-automatic"),
+                api_socket: test_dir.path().join("a.api"),
+                state: state_path.clone(),
+                memory: memory_path.clone(),
+                saved_uds: source_uds.clone(),
+                destination_uds: override_uds,
+                requested_override: Some(test_dir.path().join("b.sock")),
+                metrics: automatic_metrics,
+                resume_vm: true,
+                saved_cursor,
+            });
+        assert!(
+            paused.destination_uds.exists() && automatic.destination_uds.exists(),
+            "{transport} original and override clone sockets must coexist"
+        );
+
+        automatic.complete_guest_protocol();
+        assert!(
+            !paused
+                .process
+                .stdout_snapshot()
+                .contains(snapshot_vsock_marker(
+                    DIRECT_ROOTFS_VSOCK_SNAPSHOT_RESET_OBSERVED
+                )),
+            "{transport} automatic clone activity must not advance the Paused clone"
+        );
+
+        paused.resume();
+        paused.complete_guest_protocol();
+        paused.recapture(&recaptured_state, &recaptured_memory);
+        assert_eq!(
+            assert_native_v2_vsock_snapshot(
+                &recaptured_state,
+                enable_pci,
+                &format!("{transport} certification recapture"),
+            ),
+            saved_cursor
+                + u32::try_from(DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_HOST_STREAMS)
+                    .expect("fresh host stream count should fit u32"),
+            "{transport} recapture must retain destination-local cursor progression"
+        );
+
+        assert_eq!(
+            fs::read(&state_path).expect("immutable certification state should read"),
+            state_before,
+            "{transport} coexisting clones must not mutate the source state"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("immutable certification memory should read"),
+            memory_before,
+            "{transport} coexisting clones must not mutate the source memory"
+        );
+
+        automatic.shutdown();
+        paused.shutdown();
+        assert_no_snapshot_staging(test_dir.path());
+    }
+
+    struct CertifiedSignedVsockDestinationInput {
+        enable_pci: bool,
+        transport: &'static str,
+        instance_id: String,
+        api_socket: PathBuf,
+        state: PathBuf,
+        memory: PathBuf,
+        saved_uds: PathBuf,
+        destination_uds: PathBuf,
+        requested_override: Option<PathBuf>,
+        metrics: PathBuf,
+        resume_vm: bool,
+        saved_cursor: u32,
+    }
+
+    struct PreparedCertifiedSignedVsockDestination {
+        process: BangbangProcess,
+        api_socket: PathBuf,
+        state: PathBuf,
+        memory: PathBuf,
+        saved_uds: PathBuf,
+        destination_uds: PathBuf,
+        metrics: PathBuf,
+        transport: &'static str,
+        resume_vm: bool,
+        saved_cursor: u32,
+        guest_listeners: Vec<(PathBuf, UnixListener)>,
+        host_streams: Vec<UnixStream>,
+    }
+
+    fn prepare_signed_vsock_certification_destination(
+        input: CertifiedSignedVsockDestinationInput,
+    ) -> PreparedCertifiedSignedVsockDestination {
+        let CertifiedSignedVsockDestinationInput {
+            enable_pci,
+            transport,
+            instance_id,
+            api_socket,
+            state,
+            memory,
+            saved_uds,
+            destination_uds,
+            requested_override,
+            metrics,
+            resume_vm,
+            saved_cursor,
+        } = input;
+        let guest_listeners =
+            bind_snapshot_vsock_guest_listeners(&destination_uds, transport, &instance_id);
+        let process = start_snapshot_vsock_process(&api_socket, &instance_id, enable_pci, &metrics);
+        let body = signed_vsock_snapshot_load_body(
+            &state,
+            &memory,
+            resume_vm,
+            requested_override.as_deref(),
+        );
+        assert_no_content_response(
+            &http_put_json(&api_socket, "/snapshot/load", &body),
+            &format!("load {transport} certified destination {instance_id}"),
+        );
+        let expected_state = if resume_vm { "Running" } else { "Paused" };
+        assert!(
+            http_get(&api_socket, "/").contains(&format!(r#""state":"{expected_state}""#)),
+            "{transport} certified destination {instance_id} must publish {expected_state}"
+        );
+        assert!(
+            destination_uds.exists(),
+            "{transport} certified destination {instance_id} must publish its selected listener"
+        );
+        let config = http_get(&api_socket, "/vm/config");
+        assert_ok_response(
+            &config,
+            &format!("GET {transport} certified destination config {instance_id}"),
+        );
+        assert!(
+            config.contains(path_text(&destination_uds)),
+            "{transport} certified destination {instance_id} must retain its selected listener in controller state"
+        );
+        if destination_uds != saved_uds {
+            assert!(
+                !config.contains(path_text(&saved_uds)),
+                "{transport} override clone controller state must not retain the saved selector"
+            );
+        }
+
+        let host_streams = queue_snapshot_vsock_host_connections(
+            &destination_uds,
+            DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_HOST_STREAMS,
+            transport,
+            &instance_id,
+        );
+        if !resume_vm {
+            assert_snapshot_vsock_host_connections_blocked_while_paused(
+                &host_streams,
+                transport,
+                &instance_id,
+            );
+        }
+
+        PreparedCertifiedSignedVsockDestination {
+            process,
+            api_socket,
+            state,
+            memory,
+            saved_uds,
+            destination_uds,
+            metrics,
+            transport,
+            resume_vm,
+            saved_cursor,
+            guest_listeners,
+            host_streams,
+        }
+    }
+
+    impl PreparedCertifiedSignedVsockDestination {
+        fn resume(&mut self) {
+            assert!(
+                !self.resume_vm,
+                "automatic destination must not resume twice"
+            );
+            assert_no_content_response(
+                &http_json(&self.api_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+                &format!("resume {} certified Paused clone", self.transport),
+            );
+            self.resume_vm = true;
+        }
+
+        fn complete_guest_protocol(&mut self) {
+            assert!(self.resume_vm, "certified destination must be Running");
+            let listeners = std::mem::take(&mut self.guest_listeners);
+            accept_snapshot_vsock_guest_streams(
+                listeners,
+                SnapshotVsockExchange {
+                    request_kind: "FRESH_G2H",
+                    response_kind: "FRESH_G2H_REPLY",
+                    request_size: 4096,
+                    response_size: 4096,
+                },
+                self.transport,
+                &self.process,
+            );
+
+            for (index, stream) in self.host_streams.iter_mut().enumerate() {
+                let local_port = read_vsock_connect_ok(stream).unwrap_or_else(|error| {
+                    let output = self.process.force_stop_and_collect();
+                    panic!(
+                        "{} clone did not acknowledge preserved-listener stream {index}: {error}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                        self.transport, output.status, output.stdout, output.stderr
+                    )
+                });
+                assert_eq!(
+                    local_port,
+                    self.saved_cursor
+                        + 1
+                        + u32::try_from(index).expect("host stream index should fit u32"),
+                    "{} clone host-local cursor must continue independently at stream {index}",
+                    self.transport
+                );
+                let mut reply = vec![0_u8; 4096];
+                stream.read_exact(&mut reply).unwrap_or_else(|error| {
+                    panic!(
+                        "{} clone could not read host stream {index} reply: {:?}",
+                        self.transport,
+                        error.kind()
+                    )
+                });
+                assert_eq!(
+                    reply,
+                    snapshot_vsock_payload("FRESH_H2G_REPLY", index, 4096),
+                    "{} clone host stream {index} reply must remain isolated",
+                    self.transport
+                );
+                let payload = snapshot_vsock_payload("FRESH_H2G", index, 4096);
+                stream.write_all(&payload).unwrap_or_else(|error| {
+                    panic!(
+                        "{} clone could not write host stream {index}: {:?}",
+                        self.transport,
+                        error.kind()
+                    )
+                });
+                shutdown_unix_stream_write(stream).unwrap_or_else(|error| {
+                    panic!(
+                        "{} clone could not half-close host stream {index}: {error}",
+                        self.transport
+                    )
+                });
+                read_unix_stream_eof(stream).unwrap_or_else(|error| {
+                    panic!(
+                        "{} clone did not observe host stream {index} EOF: {error}",
+                        self.transport
+                    )
+                });
+            }
+
+            for marker in [
+                DIRECT_ROOTFS_VSOCK_SNAPSHOT_RESET_OBSERVED,
+                DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_G2H_OK,
+                DIRECT_ROOTFS_VSOCK_SNAPSHOT_PRESERVED_LISTENER_OK,
+                DIRECT_ROOTFS_VSOCK_SNAPSHOT_SUCCESS,
+            ] {
+                self.process
+                    .wait_for_stdout_marker(snapshot_vsock_marker(marker), GUEST_EXECUTION_TIMEOUT)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} clone did not publish {:?}: {error}; stdout:\n{}",
+                            self.transport,
+                            snapshot_vsock_marker(marker),
+                            self.process.stdout_snapshot()
+                        )
+                    });
+            }
+            assert!(
+                !self
+                    .process
+                    .stdout_snapshot()
+                    .contains(snapshot_vsock_marker(DIRECT_ROOTFS_VSOCK_SNAPSHOT_FAILURE)),
+                "{} clone guest protocol must not publish a failure marker",
+                self.transport
+            );
+            flush_direct_snapshot_vsock_metrics(
+                &self.api_socket,
+                &self.metrics,
+                u64::try_from(
+                    DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_GUEST_PORTS.len()
+                        + DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_HOST_STREAMS,
+                )
+                .expect("destination connection count should fit u64"),
+                self.transport,
+            );
+        }
+
+        fn recapture(&self, state: &Path, memory: &Path) {
+            assert_no_content_response(
+                &http_json(&self.api_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+                &format!("pause {} certified clone before recapture", self.transport),
+            );
+            let body = serde_json::json!({
+                "snapshot_type": "Full",
+                "snapshot_path": state,
+                "mem_file_path": memory,
+            })
+            .to_string();
+            assert_no_content_response(
+                &http_put_json(&self.api_socket, "/snapshot/create", &body),
+                &format!("recapture {} certified clone", self.transport),
+            );
+        }
+
+        fn shutdown(mut self) {
+            let output = self.process.terminate();
+            assert_snapshot_vsock_output_redacted(
+                &output,
+                &[
+                    &self.state,
+                    &self.memory,
+                    &self.saved_uds,
+                    &self.destination_uds,
+                    &self.metrics,
+                ],
+                &format!("{} certified destination", self.transport),
+            );
+            assert_clean_shutdown(
+                output,
+                &self.api_socket,
+                &format!("bangbang {} certified vsock destination", self.transport),
+            );
+            assert!(
+                !self.destination_uds.exists(),
+                "{} certified destination must remove its selected listener",
+                self.transport
+            );
+            assert!(
+                self.host_streams
+                    .iter_mut()
+                    .all(|stream| read_unix_stream_eof(stream).is_ok()),
+                "{} shutdown must close every host-initiated stream",
+                self.transport
+            );
+        }
+    }
+
+    fn start_snapshot_vsock_process(
+        api_socket: &Path,
+        instance_id: &str,
+        enable_pci: bool,
+        metrics: &Path,
+    ) -> BangbangProcess {
+        create_empty_file(metrics);
+        let process = if enable_pci {
+            BangbangProcess::start_with_extra_args(api_socket, instance_id, &["--enable-pci"])
+        } else {
+            BangbangProcess::start(api_socket, instance_id)
+        };
+        assert_no_content_response(
+            &http_put_json(
+                api_socket,
+                "/metrics",
+                &serde_json::json!({"metrics_path": metrics}).to_string(),
+            ),
+            "configure certified vsock snapshot metrics",
+        );
+        process
+    }
+
+    fn configure_signed_vsock_snapshot_certification_source(
+        api_socket: &Path,
+        kernel: &Path,
+        rootfs: &Path,
+        uds_path: &Path,
+        context: &str,
+    ) {
+        for (path, body, request) in [
+            (
+                "/machine-config",
+                serde_json::json!({"vcpu_count": 1, "mem_size_mib": 256}),
+                "machine config",
+            ),
+            (
+                "/boot-source",
+                serde_json::json!({
+                    "kernel_image_path": kernel,
+                    "boot_args": DIRECT_ROOTFS_VSOCK_SNAPSHOT_CERTIFY_BOOT_ARGS,
+                }),
+                "boot source",
+            ),
+            (
+                "/drives/rootfs",
+                serde_json::json!({
+                    "drive_id": "rootfs",
+                    "path_on_host": rootfs,
+                    "is_root_device": true,
+                    "is_read_only": true,
+                }),
+                "rootfs",
+            ),
+            (
+                "/vsock",
+                serde_json::json!({"guest_cid": 3, "uds_path": uds_path}),
+                "vsock",
+            ),
+        ] {
+            assert_no_content_response(
+                &http_put_json(api_socket, path, &body.to_string()),
+                &format!("PUT {context} certified snapshot-vsock {request}"),
+            );
+        }
+        assert_no_content_response(
+            &http_put_json(api_socket, "/actions", r#"{"action_type":"InstanceStart"}"#),
+            &format!("start {context} certified snapshot-vsock source"),
+        );
+    }
+
+    fn bind_snapshot_vsock_guest_listeners(
+        uds_path: &Path,
+        context: &str,
+        case: &str,
+    ) -> Vec<(PathBuf, UnixListener)> {
+        DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_GUEST_PORTS
+            .iter()
+            .map(|port| {
+                let path = vsock_port_path(uds_path, *port);
+                let listener = UnixListener::bind(&path).unwrap_or_else(|error| {
+                    panic!(
+                        "{context} {case} guest-port listener {port} should bind: {:?}",
+                        error.kind()
+                    )
+                });
+                (path, listener)
+            })
+            .collect()
+    }
+
+    fn bind_snapshot_vsock_source_guest_listeners(
+        uds_path: &Path,
+        context: &str,
+    ) -> Vec<(PathBuf, UnixListener)> {
+        DIRECT_ROOTFS_VSOCK_SNAPSHOT_SOURCE_GUEST_PORTS
+            .iter()
+            .map(|port| {
+                let path = vsock_port_path(uds_path, *port);
+                let listener = UnixListener::bind(&path).unwrap_or_else(|error| {
+                    panic!(
+                        "{context} source guest-port listener {port} should bind: {:?}",
+                        error.kind()
+                    )
+                });
+                (path, listener)
+            })
+            .collect()
+    }
+
+    struct SnapshotVsockExchange {
+        request_kind: &'static str,
+        response_kind: &'static str,
+        request_size: usize,
+        response_size: usize,
+    }
+
+    fn accept_snapshot_vsock_guest_streams(
+        listeners: Vec<(PathBuf, UnixListener)>,
+        exchange: SnapshotVsockExchange,
+        context: &str,
+        process: &BangbangProcess,
+    ) -> Vec<UnixStream> {
+        let SnapshotVsockExchange {
+            request_kind,
+            response_kind,
+            request_size,
+            response_size,
+        } = exchange;
+        listeners
+            .into_iter()
+            .enumerate()
+            .map(|(index, (path, listener))| {
+                let mut stream =
+                    wait_for_unix_listener_accept(&listener, GUEST_EXECUTION_TIMEOUT)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{context} guest stream {request_kind}[{index}] should arrive: {error}; stdout:\n{}",
+                                process.stdout_snapshot()
+                            )
+                        });
+                drop(listener);
+                fs::remove_file(&path).unwrap_or_else(|error| {
+                    panic!(
+                        "{context} guest listener path should clean after accept: {:?}",
+                        error.kind()
+                    )
+                });
+                stream
+                    .set_nonblocking(false)
+                    .expect("snapshot-vsock guest stream should use blocking I/O");
+                stream
+                    .set_read_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+                    .expect("snapshot-vsock guest stream read timeout should set");
+                stream
+                    .set_write_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+                    .expect("snapshot-vsock guest stream write timeout should set");
+                let expected = snapshot_vsock_payload(request_kind, index, request_size);
+                let mut received = vec![0_u8; expected.len()];
+                stream.read_exact(&mut received).unwrap_or_else(|error| {
+                    panic!(
+                        "{context} guest stream {request_kind}[{index}] should deliver its payload: {:?}; stdout:\n{}",
+                        error.kind(),
+                        process.stdout_snapshot()
+                    )
+                });
+                assert_eq!(
+                    received, expected,
+                    "{context} guest stream {request_kind}[{index}] payload must remain isolated; stdout:\n{}",
+                    process.stdout_snapshot()
+                );
+                stream
+                    .write_all(&snapshot_vsock_payload(
+                        response_kind,
+                        index,
+                        response_size,
+                    ))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{context} guest stream {request_kind}[{index}] response should write: {:?}; stdout:\n{}",
+                            error.kind(),
+                            process.stdout_snapshot()
+                        )
+                    });
+                if request_kind == "FRESH_G2H" {
+                    shutdown_unix_stream_write(&stream).unwrap_or_else(|error| {
+                        panic!(
+                            "{context} guest stream {request_kind}[{index}] response should half-close: {error}"
+                        )
+                    });
+                }
+                stream
+            })
+            .collect()
+    }
+
+    fn connect_snapshot_vsock_guest_listener(
+        uds_path: &Path,
+        count: usize,
+        exchange: SnapshotVsockExchange,
+        context: &str,
+        process: &BangbangProcess,
+    ) -> (Vec<UnixStream>, Vec<u32>) {
+        let SnapshotVsockExchange {
+            request_kind,
+            response_kind,
+            request_size,
+            response_size,
+        } = exchange;
+        let mut streams = Vec::with_capacity(count);
+        let mut local_ports = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut stream = UnixStream::connect(uds_path).unwrap_or_else(|error| {
+                panic!(
+                    "{context} host stream {index} should connect to the main listener: {:?}",
+                    error.kind()
+                )
+            });
+            stream
+                .set_read_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+                .expect("source host stream read timeout should set");
+            stream
+                .set_write_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+                .expect("source host stream write timeout should set");
+            writeln!(
+                stream,
+                "CONNECT {}",
+                DIRECT_ROOTFS_VSOCK_SNAPSHOT_GUEST_LISTEN_PORT
+                    + u32::try_from(index).expect("source host stream index should fit u32")
+            )
+            .expect("source host stream CONNECT should write");
+            local_ports.push(read_vsock_connect_ok(&mut stream).unwrap_or_else(|error| {
+                panic!(
+                    "{context} CONNECT {index} failed: {error}; stdout:\n{}",
+                    process.stdout_snapshot()
+                )
+            }));
+            stream
+                .write_all(&snapshot_vsock_payload(request_kind, index, request_size))
+                .expect("source host stream payload should write");
+            let expected = snapshot_vsock_payload(response_kind, index, response_size);
+            let mut received = vec![0_u8; expected.len()];
+            stream
+                .read_exact(&mut received)
+                .expect("source host stream acknowledgement should read");
+            assert_eq!(
+                received, expected,
+                "{context} source host stream {index} acknowledgement should match"
+            );
+            streams.push(stream);
+        }
+        (streams, local_ports)
+    }
+
+    fn queue_snapshot_vsock_host_connections(
+        uds_path: &Path,
+        count: usize,
+        context: &str,
+        case: &str,
+    ) -> Vec<UnixStream> {
+        (0..count)
+            .map(|index| {
+                let mut stream = UnixStream::connect(uds_path).unwrap_or_else(|error| {
+                    panic!(
+                        "{context} {case} queued host stream {index} should connect: {:?}",
+                        error.kind()
+                    )
+                });
+                stream
+                    .set_read_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+                    .expect("queued host stream read timeout should set");
+                stream
+                    .set_write_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+                    .expect("queued host stream write timeout should set");
+                writeln!(
+                    stream,
+                    "CONNECT {}",
+                    DIRECT_ROOTFS_VSOCK_SNAPSHOT_GUEST_LISTEN_PORT
+                        + u32::try_from(index).expect("queued host stream index should fit u32")
+                )
+                .expect("queued host stream CONNECT should write");
+                stream
+            })
+            .collect()
+    }
+
+    fn assert_snapshot_vsock_host_connections_blocked_while_paused(
+        streams: &[UnixStream],
+        context: &str,
+        case: &str,
+    ) {
+        for (index, stream) in streams.iter().enumerate() {
+            stream
+                .set_nonblocking(true)
+                .expect("Paused host stream should become nonblocking");
+            let mut probe = [0_u8; 1];
+            let mut view = stream;
+            match view.read(&mut probe) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(0) => panic!("{context} {case} queued stream {index} closed while Paused"),
+                Ok(read) => panic!(
+                    "{context} {case} queued stream {index} advanced by {read} byte(s) while Paused"
+                ),
+                Err(error) => panic!(
+                    "{context} {case} queued stream {index} probe failed: {:?}",
+                    error.kind()
+                ),
+            }
+            stream
+                .set_nonblocking(false)
+                .expect("Paused host stream should return to blocking I/O");
+        }
+    }
+
+    fn assert_snapshot_vsock_source_connections_lost(
+        guest_streams: &mut [UnixStream],
+        host_streams: &mut [UnixStream],
+        context: &str,
+    ) {
+        for (kind, streams) in [
+            ("guest-to-host", guest_streams),
+            ("host-to-guest", host_streams),
+        ] {
+            for (index, stream) in streams.iter_mut().enumerate() {
+                read_unix_stream_eof(stream).unwrap_or_else(|error| {
+                    panic!(
+                        "{context} source {kind} stream {index} must be lost at capture: {error}"
+                    )
+                });
+            }
+        }
+    }
+
+    fn snapshot_vsock_payload(kind: &str, index: usize, size: usize) -> Vec<u8> {
+        let prefix = format!("BANGBANG_VSOCK_SNAPSHOT_{kind}_{index}:").into_bytes();
+        assert!(
+            prefix.len() <= size,
+            "snapshot-vsock payload prefix must fit"
+        );
+        let fill = b'A' + u8::try_from(index % 26).expect("payload fill should fit u8");
+        let mut payload = prefix;
+        payload.resize(size, fill);
+        payload
+    }
+
+    fn snapshot_vsock_marker(marker: &[u8]) -> &str {
+        std::str::from_utf8(marker).expect("snapshot-vsock marker must be UTF-8")
+    }
+
+    fn flush_direct_snapshot_vsock_metrics(
+        api_socket: &Path,
+        metrics_path: &Path,
+        expected_connections: u64,
+        context: &str,
+    ) {
+        assert_no_content_response(
+            &http_put_json(api_socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+            &format!("FlushMetrics {context} snapshot-vsock"),
+        );
+        let output = fs::read_to_string(metrics_path)
+            .expect("snapshot-vsock metrics output should be readable");
+        let generation: serde_json::Value = serde_json::from_str(
+            output
+                .lines()
+                .last()
+                .expect("snapshot-vsock metrics should contain one generation"),
+        )
+        .expect("snapshot-vsock metrics generation should be JSON");
+        let vsock = generation
+            .get("vsock")
+            .expect("snapshot-vsock metrics should contain a vsock object");
+        assert!(
+            vsock
+                .get("conns_added")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count >= expected_connections),
+            "{context} snapshot-vsock metrics must record at least {expected_connections} fresh connections: {generation}"
+        );
+        for field in ["rx_bytes_count", "tx_bytes_count"] {
+            assert!(
+                vsock
+                    .get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|count| count > 0),
+                "{context} snapshot-vsock metrics must record {field}: {generation}"
+            );
+        }
+    }
+
+    fn assert_snapshot_vsock_output_redacted(
+        output: &CompletedProcess,
+        sensitive: &[&Path],
+        context: &str,
+    ) {
+        let diagnostics = format!("{} {}", output.stdout, output.stderr);
+        for value in sensitive {
+            assert!(
+                !diagnostics.contains(path_text(value)),
+                "{context} diagnostics must redact {}",
+                value.display()
+            );
+        }
     }
 
     #[test]
