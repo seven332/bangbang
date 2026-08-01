@@ -18,13 +18,13 @@ use crate::memory::{
     GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError, GuestMemoryBacking,
     GuestMemoryRange, aarch64,
 };
+use crate::snapshot_diff_v2_13::NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_format::SnapshotFormatVersion;
 use crate::snapshot_format_v2::{
     NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2Component,
     SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
     encode_snapshot_v2_state,
 };
-use crate::snapshot_vsock_v2_12::NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
 
 mod materialize;
 
@@ -78,9 +78,12 @@ const REDACTED: &str = "<redacted>";
 pub struct SnapshotV2MemoryImageId([u8; IMAGE_ID_BYTES]);
 
 impl SnapshotV2MemoryImageId {
-    #[cfg(test)]
-    const fn from_bytes(bytes: [u8; IMAGE_ID_BYTES]) -> Self {
+    pub(crate) const fn from_bytes(bytes: [u8; IMAGE_ID_BYTES]) -> Self {
         Self(bytes)
+    }
+
+    pub(crate) const fn to_bytes(self) -> [u8; IMAGE_ID_BYTES] {
+        self.0
     }
 }
 
@@ -349,6 +352,12 @@ pub fn decode_snapshot_v2_memory_binding(
     }
     let payload = selected.ok_or(SnapshotV2MemoryStateError::MissingMemoryComponent)?;
     decode_binding(payload).map_err(Into::into)
+}
+
+pub(crate) fn decode_snapshot_v2_memory_binding_payload(
+    payload: &[u8],
+) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError> {
+    decode_binding(payload)
 }
 
 /// Stages at which cooperative native-v2 memory writing may stop or fail.
@@ -1172,6 +1181,35 @@ fn binding_from_memory_with_version(
     build_binding_with_version(version, image_id, extents, file_length)
 }
 
+#[cfg(test)]
+pub(crate) fn snapshot_v2_memory_binding_from_ranges_for_test(
+    version: SnapshotFormatVersion,
+    image_id: SnapshotV2MemoryImageId,
+    ranges: &[GuestMemoryRange],
+) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError> {
+    validate_extent_count(ranges.len())?;
+    let mut extents = Vec::new();
+    extents
+        .try_reserve_exact(ranges.len())
+        .map_err(|source| SnapshotV2MemoryBindingError::MetadataAllocationFailed { source })?;
+    let mut file_offset = NATIVE_V2_MEMORY_ALIGNMENT;
+    for range in ranges.iter().copied() {
+        extents.push(SnapshotV2MemoryExtent { range, file_offset });
+        file_offset = file_offset
+            .checked_add(range.size())
+            .ok_or(SnapshotV2MemoryBindingError::LengthOverflow)?;
+        file_offset = align_up(file_offset, NATIVE_V2_MEMORY_ALIGNMENT)?;
+    }
+    let last = extents
+        .last()
+        .ok_or(SnapshotV2MemoryBindingError::CountOutOfBounds)?;
+    let file_length = last
+        .file_offset()
+        .checked_add(last.range().size())
+        .ok_or(SnapshotV2MemoryBindingError::LengthOverflow)?;
+    build_binding_with_version(version, image_id, extents, file_length)
+}
+
 fn build_binding_with_version(
     version: SnapshotFormatVersion,
     image_id: SnapshotV2MemoryImageId,
@@ -1323,8 +1361,8 @@ fn decode_binding(bytes: &[u8]) -> Result<SnapshotV2MemoryBinding, SnapshotV2Mem
 fn validate_memory_version(
     version: SnapshotFormatVersion,
 ) -> Result<(), SnapshotV2MemoryBindingError> {
-    if version.major() == NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.major()
-        && (1..=NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.minor()).contains(&version.minor())
+    if version.major() == NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION.major()
+        && (1..=NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION.minor()).contains(&version.minor())
     {
         Ok(())
     } else {

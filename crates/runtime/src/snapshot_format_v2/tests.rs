@@ -2,6 +2,7 @@ use crate::snapshot_balloon_v2_9::NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+use crate::snapshot_diff_v2_13::NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_format::{
     NativeSnapshotFormatError, NativeSnapshotState, decode_native_snapshot_state,
@@ -209,7 +210,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn public_writer_is_vsock_twelve_and_retains_network_eleven_compatibility() {
+fn public_writer_is_vsock_twelve_and_explicit_diff_thirteen_is_dormant() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -640,19 +641,67 @@ fn public_writer_is_vsock_twelve_and_retains_network_eleven_compatibility() {
         Err(SnapshotV2DecodeError::UnknownSemanticComponent)
     );
 
-    let future = SnapshotFormatVersion::new(2, 13, 0);
+    let diff = SnapshotV2Component::new(
+        NATIVE_V2_DIFF_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        b"diff",
+    );
+    assert!(matches!(
+        encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+            &[],
+            &[diff],
+        ),
+        Err(SnapshotV2EncodeError::UnknownSemanticComponent)
+    ));
+    let diff_state = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &[vsock, diff],
+    )
+    .expect("explicit exact 2.13 should admit the dormant Diff component");
+    let decoded_diff = decode_snapshot_v2_state_with_compatibility_version(
+        &diff_state,
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("explicit exact 2.13 should decode the dormant Diff component");
+    assert_eq!(
+        decoded_diff.metadata().version(),
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        decoded_diff.component(NATIVE_V2_DIFF_COMPONENT_KEY),
+        Some(diff)
+    );
+    assert!(matches!(
+        decode_snapshot_v2_state(&diff_state),
+        Err(SnapshotV2DecodeError::UnsupportedVersion {
+            found: NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_SNAPSHOT_VERSION,
+        })
+    ));
+    let downgraded_diff = with_u16_field_and_checksum(&diff_state, VERSION_MINOR_OFFSET, 12);
+    assert_eq!(
+        decode_snapshot_v2_state_with_compatibility_version(
+            &downgraded_diff,
+            NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+        ),
+        Err(SnapshotV2DecodeError::UnknownSemanticComponent)
+    );
+
+    let future = SnapshotFormatVersion::new(2, 14, 0);
     assert!(matches!(
         encode_snapshot_v2_state_with_compatibility_version(future, &[], &[]),
         Err(SnapshotV2EncodeError::UnsupportedVersion {
             requested,
-            maximum: NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+            maximum: NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
         }) if requested == future
     ));
     assert_eq!(
         decode_snapshot_v2_state_with_compatibility_version(&EMPTY_V2_FIXTURE, future),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
             found: future,
-            supported: NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
         })
     );
 }
