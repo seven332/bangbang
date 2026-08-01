@@ -13,7 +13,9 @@ for exact work owned by
 The generated source manifest remains 381 identities and the overlay remains
 418 identities, including 37 local semantic records. The #1496 reconciliation
 moved the global disposition counts from 191/207/3/17 to 220/178/3/17; the
-current post-#1716 counts are 246/152/3/17.
+post-#1716 checkpoint was 246/152/3/17. #1736's independent vsock promotions
+leave this 35-row ledger unchanged and move the current global counts to
+252/146/3/17.
 
 ## Evidence keys
 

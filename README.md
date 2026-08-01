@@ -31,12 +31,12 @@ publishes per-vCPU stolen time from bounded owner-thread wall/execution samples,
 enables standard 64-bit SMCCC discovery when the HVF measurement primitive is
 available, and has signed Linux contention/idle/pause certification. PVTime
 serialization and clone restore are implemented in the public bangbang-native
-v2 profile. Public `Full` creation now writes current `2.11.0` state/memory
+v2 profile. Public `Full` creation now writes current `2.12.0` state/memory
 pairs from a strictly bounded paused production session. Every pair carries a
 complete serial component and may additionally carry the profile-3 ordered
 regular-file block/pmem graph, entropy state, balloon state, virtio-mem state,
-portable network/MMDS state, or any coherent combination over MMIO or the
-product PCI endpoint budget.
+portable network/MMDS state, vsock state, or any coherent combination over
+MMIO or the product PCI endpoint budget.
 The serial value retains endpoint intent, limiter configuration, every
 guest-visible UART register, bounded RX bytes, status, and pending work while
 excluding source descriptors, terminal state, pipe buffers, TX bytes, and
@@ -67,7 +67,14 @@ network/MMDS kind 12 retains requested interface configuration, captured inert
 selector identity, requested and realized MAC/MTU, backend class, queue,
 transport, limiter/retry, placement, and MMDS protocol configuration. It
 deliberately omits host handles, callbacks, packets, connections, MMDS data,
-token keys/tokens, metrics, and host clocks. Exact
+token keys/tokens, metrics, and host clocks. Exact vsock kind 13 retains CID,
+inert selector, host-local port cursor, common virtio queues/features/
+interrupts, reset origin, and coherent MMIO/PCI placement. It excludes live
+connections, accepts, packets, wakeups, deadlines, metrics, descriptors,
+grants, sessions, and host handles. Restored work starts empty, the guest
+observes `TRANSPORT_RESET`, RX waits for event-queue acknowledgement while TX
+remains live, and existing guest listeners accept fresh traffic through the
+original or one clone-local overridden selector. Exact
 balloon-profile `2.9.0`, entropy-profile `2.8.0`, serial-required `2.7.0`,
 storage-only profile-3 `2.6.0`, block-only profile-2 `2.5.0`, single-root
 `2.4.0`, device-free `2.3.0`, and frozen native-v1 remain compatibility
@@ -81,7 +88,10 @@ component is capped at 4 MiB and 262,144 accounting ranges inside the 16-MiB
 state cap; kind 11 is capped at 128 KiB, and kind 12 is capped at 512 KiB with
 an 83,552-byte calculated worst case for 16 interfaces. Guest PFNs are always
 4 KiB; destination Darwin reclaim separately aligns and coalesces to host
-pages, normally 16 KiB. Vsock snapshot state remains an explicit Wave 6 limit.
+pages, normally 16 KiB. Kind 13 has a 640-byte calculated worst case and a
+defensive 64-KiB component cap. Firecracker snapshot bytes, live peer
+migration, Diff/Uffd, and unconstrained cross-host portability remain explicit
+exclusions.
 Host discard never promises synchronous RSS or footprint
 reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
@@ -127,16 +137,18 @@ exact-prefix synchronous flush/unmap, and reusable aligned guest range.
 PCI-mode network PUT/DELETE uses the same owner-thread boundary with independent
 MMDS-only or vmnet packet I/O,
 generation-safe metrics, and exact cleanup. Automatic guest hotplug
-notification and snapshot persistence for vsock PCI devices remain limits.
-Network snapshot persistence is supported in exact 2.11; pmem, entropy,
-balloon, and virtio-mem are supported by their earlier profiles, and serial
-remains a platform MMIO device with its exact 2.7 component retained unchanged.
+notification and runtime vsock PCI hotplug remain limits. Network snapshot
+persistence is supported in exact 2.11 and vsock persistence in exact 2.12;
+pmem, entropy, balloon, and virtio-mem are supported by their earlier profiles,
+and serial remains a platform MMIO device with its exact 2.7 component retained
+unchanged.
 external vmnet connectivity
 certification, and Firecracker's KVM ITS identity remain explicit limits.
 Current native-v2 create runs the complete paused live-storage preflight and
 then admits the exact profile-3 ordered regular-file block-and-pmem graph plus
 optional entropy, balloon, virtio-mem, and network/MMDS state over the
-process's selected MMIO or PCI transport, with no root or one first
+process's selected MMIO or PCI transport, plus optional vsock state, with no
+root or one first
 cross-storage root. Load validates and reconstructs the complete transport,
 placement, typed backing transaction, fresh balloon owner, fresh mixed-memory
 virtio-mem aperture, and fresh network/MMDS owners before controller or VM
@@ -397,14 +409,14 @@ These primitives back a deliberately narrow public native-v2 snapshot path on
 macOS Apple Silicon. `PUT /snapshot/create` supports only `Full` snapshots from
 a paused 1–32-vCPU VM with a configured boot source, complete live serial
 state, an optional ordered regular-file block/pmem storage graph, and optional
-entropy, balloon, virtio-mem, and network/MMDS state. It rejects vsock, boot
-timer, and vhost-user state. The storage graph may have no root or one first
+entropy, balloon, virtio-mem, network/MMDS, and vsock state. It rejects boot
+timer and vhost-user state. The storage graph may have no root or one first
 cross-storage root.
 Block records admit mixed read-only/read-write, Sync/Async, Unsafe/Writeback,
 partuuid, and limiter configurations; pmem records retain exact protection,
 limiter, queue, mapping, and file/private-tail geometry. Every storage record
 uses the process-selected MMIO or PCI transport, with PCI additionally bounded
-by the 31-endpoint product budget. It writes a current `2.11.0` pair whose state
+by the 31-endpoint product budget. It writes a current `2.12.0` pair whose state
 binds retained File/COW memory; the complete typed machine, GIC, topology,
 per-vCPU, and time/clone-identity graph; a required exact serial component; and
 any profile-3 block/pmem configuration, runtime, common virtio, queue, mapping,
@@ -431,6 +443,11 @@ exact MMIO/PCI placement, and MMDS selection/version/IP/IMDS compatibility.
 It excludes source packet-I/O owners, provider handles, callbacks, peer or
 cached packets, ARP/TCP sessions, MMDS data, token material, metrics, and
 absolute clocks or deadlines.
+If configured, vsock kind 13 adds a canonical bounded component with CID,
+logical selector, host-local cursor, common virtio state, three queues,
+interrupt/reset state, and exact MMIO/PCI placement. It excludes every live
+connection, accept, packet, wakeup, deadline, metric, descriptor, grant,
+session, and host handle.
 Serial endpoint intent is serialized, but live process bindings are
 destination-local. Each restored process opens fresh default stdio or resolves
 one configured output under destination authority; no source descriptor,
@@ -440,9 +457,9 @@ artifact.
 Create reserves one FIFO boot-worker transaction, then failure-atomically
 quiesces the block, PMEM, network, entropy retry, balloon-statistics, and
 virtio-mem publishers. The same lease
-traverses capture-ready storage, balloon, memory-hotplug, entropy, serial, and
-network owners across their applicable MMIO/PCI transports before applying the
-narrow public rejection for vsock, boot-timer, and vhost-user state.
+traverses capture-ready storage, balloon, memory-hotplug, entropy, serial,
+network, and vsock owners across their applicable MMIO/PCI transports before
+applying the narrow public rejection for boot-timer and vhost-user state.
 Entropy traversal validates exact queue, feature, limiter, pending-descriptor,
 and scheduler state, then exact 2.8 persists its portable device value without
 host entropy bytes, source identity, metrics, or a wall-clock value. Network
@@ -459,8 +476,10 @@ timers, metrics, reclaim advisers, handles, and ownership. Virtio-mem traversal
 validates configuration, queue, plugged topology, shared-reservation identity,
 active guest views, HVF mappings, dirty metadata, epoch, and exact accounting.
 Exact 2.10 serializes kind 11 without host addresses, descriptors, backing
-identities, metrics, or cleanup authority; current 2.11 retains kind 11
-unchanged and may add kind 12. The same lease
+identities, metrics, or cleanup authority; current 2.12 retains kinds 11 and 12
+unchanged and may add kind 13. Vsock traversal validates the exact live owner,
+publishes reset, retains portable queue/cursor/selector state, and normalizes
+all connections and pending work out of the artifact. The same lease
 preflights both final namespaces, streams the paused aggregate capture into an
 owner-only staging inode, verifies and synchronizes it, publishes memory first
 and state last as the commit marker without replacing existing entries, and
@@ -488,7 +507,7 @@ profile before construction, creates the fresh HVF VM/GIC/vCPU topology,
 reconstructs PL031 from destination wall clock, restores PVTime, replaces and
 signals VMGenID, updates and signals VMClock, and only then commits the session
 as `Paused`. Legacy 2.3 parses the retained default FDT shell. Exact 2.4
-through current 2.11 instead verify the retained live FDT address, length, and
+through current 2.12 instead verify the retained live FDT address, length, and
 CRC, then require versioned source-product evidence. Exact 2.4 reconstructs
 its singleton root shell; exact 2.5 reconstructs the complete rooted or
 rootless block shell; exact 2.6 reconstructs the profile-3 block/pmem shell;
@@ -502,10 +521,15 @@ owner; exact 2.10 additionally validates kind 11 against unchanged
 kind-1 extents, maps base RAM privately, creates one fresh unlinked shared
 aperture with block-granular plugged views, copies committed plugged bytes, and
 reconstructs fresh virtio-mem metrics, notifier, interrupt, dispatcher,
-endpoint, route, and cleanup ownership; and current 2.11 additionally validates
-kind 12 plus a complete, unique `network_overrides` set, then constructs fresh
+endpoint, route, and cleanup ownership; exact 2.11 additionally validates kind
+12 plus a complete, unique `network_overrides` set, then constructs fresh
 clone-local backend, packet-I/O, metric, scheduler, route, endpoint, and MMDS
-owners. The MMDS store starts empty and requires explicit reseeding; source
+owners; and current 2.12 additionally validates kind 13, resolves the captured
+or overridden selector before authority access, and constructs a fresh
+clone-local vsock listener/device with the saved cursor and empty live work.
+The restored guest observes reset before RX is released, TX remains live, and
+preserved guest listeners accept fresh traffic in both directions. The MMDS
+store starts empty and requires explicit reseeding; source
 TCP connections and V2 tokens never survive. A retained statistics descriptor waits one full destination-local
 interval after resume; no interval elapses while Paused. A captured active hint
 run is normalized to DONE, and the destination may start a fresh run. Linux may
@@ -526,20 +550,22 @@ read-only state and memory grants, and create outputs use retained
 `SnapshotOutputDirectory` anchors plus bounded UTF-8 child names. Load
 classifies a duplicate of the state descriptor, then atomically adopts the
 matching state/memory pair and any exact block, pmem, or configured serial
-grants; no tag is reopened as a pathname. Network selectors come only from the
+grants, then resolves any exact vsock selector authority; no tag is reopened as
+a pathname. Network selectors come only from the
 destination request, are redacted, and require no vmnet authority for an
 MMDS-only destination. Legacy native-v1 loads additionally
 adopt any persisted root grant required by that format.
 Create preserves the same anchor-relative no-clobber transaction and repeated
 output-directory authority. Direct mode keeps ordinary path behavior.
 
-The transaction stops bangbang-owned packet and stream access; the transient
-vsock poller is joined before pause acknowledgement, while an admitted network
-is encoded only after its packet-I/O and MMDS stack reach the portable capture
-boundary. It does not freeze or persist vmnet peers, vsock peers, packets,
-connections, token sessions, or their host/kernel buffers. Native-v1 remains a
-frozen one-vCPU compatibility format; native-v2 carries 1–32-vCPU state, while
-vsock remains outside the current public profile.
+The transaction stops bangbang-owned packet and stream access. An admitted
+network is encoded only after its packet-I/O and MMDS stack reach the portable
+capture boundary. Vsock capture joins the transient poller, closes source
+connections, queues reset, and encodes only portable CID/selector/cursor/
+virtio/placement state as kind 13. It does not freeze or persist vmnet/vsock
+peers, packets, connections, token sessions, or their host/kernel buffers.
+Native-v1 remains a frozen one-vCPU compatibility format; native-v2 carries
+1–32-vCPU state and reconstructs fresh network and vsock ownership.
 
 This is not Firecracker snapshot-file compatibility or a portable migration
 format. Machine `track_dirty_pages` now enables one shared guest-RAM epoch
@@ -676,12 +702,14 @@ entropy queue/limiter/pending/retry state. Exact 2.9 preserves those products
 and optionally validates balloon queue/statistics/hint/accounting state.
 Exact 2.10 preserves all prior products and optionally validates virtio-mem
 configuration, config space, queue, bitmap, kind-1 extent binding, and selected
-transport. Current 2.11 retains those products and optionally validates
-network/MMDS kind 12 plus a complete clone-local override set. It installs fresh default process
-stdio or a fresh configured output, restores buffered RX and pending UART work,
-constructs fresh entropy, balloon, virtio-mem, network, and MMDS owners plus a
-destination-local shared aperture when present, and publishes a closed supervisor session
-initially `Paused`. The same immutable pair can restore into multiple
+transport. Current 2.12 retains those products, optionally validates
+network/MMDS kind 12 plus a complete clone-local override set, and optionally
+validates vsock kind 13 plus at most one clone-local `vsock_override`. It
+installs fresh default process stdio or a fresh configured output, restores
+buffered RX and pending UART work, constructs fresh entropy, balloon,
+virtio-mem, network, MMDS, and vsock owners plus a destination-local shared
+aperture when present, and publishes a closed supervisor session initially
+`Paused`. The same immutable pair can restore into multiple
 fresh destinations; requested resume still passes through the ordinary
 lifecycle gate. Base File/COW memory is private per destination; each
 virtio-mem destination also gets a distinct unlinked shared reservation and
@@ -691,7 +719,9 @@ load offers no per-drive selector or configuration override and validates exact
 identity, role, access, kind, size, and geometry before construction.
 Network loads separately require exactly one destination backend selector for
 every saved interface and reject missing, duplicate, or unknown IDs before
-publication. `--snapshot-version` reports `v2.11.0`, and `--describe-snapshot` reports
+publication. Vsock loads use the captured selector unless one validated
+override replaces it; a no-device override fails before publication.
+`--snapshot-version` reports `v2.12.0`, and `--describe-snapshot` reports
 the actual validated native-v1 or native-v2 version. Recognizing a pinned
 Firecracker bitcode prefix reports incompatibility rather than claiming decode
 or translation. The exact wire,
@@ -740,7 +770,7 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
 - `--no-api` requires `--config-file <PATH>`, starts from that configuration
   without publishing an API socket, and exits cleanly on `SIGINT` or `SIGTERM`.
 - `--snapshot-version` prints the current bangbang-native writer version
-  (`v2.11.0`) and exits before startup.
+  (`v2.12.0`) and exits before startup.
 - `--describe-snapshot <PATH>` reads a bounded regular native state file,
   classifies and validates its complete native-v1 or native-v2 envelope and
   CRC, prints its exact embedded version, and exits before startup. In
@@ -1418,28 +1448,31 @@ three queue cursors, `EVENT_IDX`, the host-local cursor, and the logical backend
 selector. Capture validates transport and guest rings fail closed, reports
 source-only connection/reset normalization separately, and can rebuild fresh
 empty device state from an externally supplied listener/connector while rearming
-the snapshot-origin RX gate. The paused native-v1 producer now reconciles the
+the snapshot-origin RX gate. The paused native-v2 producer reconciles the
 controller config, runtime registration, exact MMIO-or-PCI owner, CID, selector,
 placement, activation, metrics owner, and mapped memory under the existing
 quiescence lease. It publishes a reset, validates one immutable capture, and
 detaches pending accepts, live connections, pending packets, and their
 wakeups/deadlines from that same observation while retaining listener and
 connector authority for fresh traffic. Typed redacted failures preserve
-recoverable versus terminal process policy. Public create invokes this producer
-before its unchanged optional-device rejection, so it creates no vsock artifact
-and makes no load promise. Internal destination restore now resolves the
+recoverable versus terminal process policy. Public exact-2.12 create invokes
+this producer and encodes the portable result as optional kind 13. Destination
+restore resolves the
 captured selector and optional override before resource access. Direct mode
 prepares an owner-only listener with stale-safe atomic replacement and exact
 identity cleanup; contained mode reserves the exact directory grant and
 session-bound broker endpoint, rolls both back before activation, and never
 falls back to an ambient path. A single-use process transaction transfers the
 resource only when runtime reconstruction consumes it and retains cleanup
-ownership for the active device. Public native-v2 artifacts still do not encode
-or place vsock, and public load continues to reject overrides. The checked
-[vsock closure ledger](compat/firecracker/v1.16.0/vsock-contract.md) certifies
-the eight complete API/live records; the exact six encoding, public invocation,
-restored-guest, clone/version, and portability outcomes remain #1490 work. This
-does not claim general performance, Firecracker artifact, or snapshot parity.
+ownership for the active device. Public load validates kind 13 placement,
+rejects an override when no vsock was captured, reconstructs empty live work,
+and preserves reset/RX-gate, TX, guest-listener, and host-port cursor semantics.
+Signed direct and normal App Sandbox MMIO/PCI matrices prove original and
+override Paused/automatic clones, bidirectional multistream/half-close, queued
+RX, immutable pairs, metrics, hostile failures, death cleanup, and retry. The
+checked [vsock closure ledger](compat/firecracker/v1.16.0/vsock-contract.md)
+certifies all 14 records. This does not claim general performance, Firecracker
+artifact bytes, live peer migration, or unconstrained portability.
 
 Configure metrics output before boot:
 
@@ -1596,7 +1629,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 246 implemented-and-verified, 152 audit-required, three
+delivery overlay with 252 implemented-and-verified, 146 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
@@ -1628,8 +1661,8 @@ then maps an exact 35-record set to the composed direct, contained, capture,
 snapshot/clone, and non-success external gates: 33 are terminal and two remain
 audit-owned by #1378 or #1491. The
 [vsock closure ledger](compat/firecracker/v1.16.0/vsock-contract.md) maps its
-exact 14-record set to eight terminal API/live outcomes and six precise #1490
-artifact/restore/clone handoffs. The
+exact 14-record set to terminal API, live-device, native-v2 2.12
+artifact/restore, authority, and clone outcomes. The
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 now promotes its one exact corpus record after #1555's signed final
 certification. Its standalone protocol and concurrent client, contained
@@ -1639,7 +1672,7 @@ bridge, ordered before/during/after removal, peer-failure propagation,
 complete consumer gates, native-v1 direct/contained restore, paused-host plus
 exact restored-guest demand, exact nested entitlement dictionaries, and
 cleanup are implemented and verified.
-The repository-wide disposition counts are 246/152/3/17.
+The repository-wide disposition counts are 252/146/3/17.
 
 ## Build And Test
 
@@ -1742,6 +1775,11 @@ loss, old V2-token rejection, fresh-session success, immutable state/memory,
 redacted missing/duplicate/unknown override failures, malformed artifacts,
 graceful cancellation, both process-death orders, retry, and cleanup without
 vmnet authority. The separate
+exact-2.12 vsock case covers direct and normal App Sandbox MMIO/PCI sources,
+original/override Paused and automatic destinations, reset acknowledgement,
+preserved listeners, bidirectional multistream/half-close, queued host work,
+clone-local cursors/metrics/sockets, immutable pairs, malformed/no-device/grant
+failures, cancellation, both death orders, retry, and cleanup. The separate
 contained-pager probes do not make current native-v2 accept `Uffd`. Abrupt
 launcher-first and worker-first cases replace the
 granted API pathname before death and prove both surviving cleanup owners

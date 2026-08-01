@@ -82,8 +82,9 @@ terminal. The directly reviewed identities that do not change disposition are:
 | --- | --- | --- |
 | Exported configuration | `api-operation:GET /vm/config`; `api-path:/vm/config`; `api-schema:FullVmConfiguration` | `audit-required`; Wave 8 owns final cross-capability certification after every exported device field has a terminal result. |
 | Snapshot API aggregates | `api-operation:PUT /snapshot/create`; `api-operation:PUT /snapshot/load`; `api-path:/snapshot/create`; `api-path:/snapshot/load`; `api-schema:SnapshotCreateParams`; `api-schema:SnapshotLoadParams` | `audit-required`; Wave 6 owns Diff artifacts, merge/restore, overrides, additional backends, optional-device schemas, and portability beyond the current native-v2 Full/File profile. |
-| Snapshot semantics | `semantic.snapshot:full-create-load-and-public-lifecycle` | `implemented-and-verified`; #1578 certifies the initial device-free native-v2 2.3 Full/File multi-vCPU public lifecycle, #1589 adds exact 2.4 with one read-only File/Sync root, #1616/#1617 add exact 2.5 rooted/rootless ordered regular-file block vectors, #1634 adds exact 2.6 profile-3 block/pmem storage, #1651/#1652 add exact 2.7 complete serial state, #1665/#1666 add exact 2.8 optional entropy, #1680/#1681 add exact 2.9 optional balloon, #1697/#1698 activate and certify exact 2.10 optional virtio-mem across all sixteen storage/entropy/balloon/virtio-mem products, and #1715/#1716 activate and certify current 2.11 optional network/MMDS across all 32 products while retaining all earlier readers. |
-| Remaining snapshot semantics | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `semantic.snapshot:multi-vcpu-drives-devices-and-mmds`; `semantic.snapshot:network-vsock-overrides-portability-and-clones` | `audit-required`; Wave 6 owns Diff/native-v2-Uffd, vsock restore/overrides, editing/tools, Firecracker artifact evolution, and broader portability. Exact 2.11 network/MMDS restore and clone-local overrides are delivered. |
+| Snapshot semantics | `semantic.snapshot:full-create-load-and-public-lifecycle` | `implemented-and-verified`; #1578 certifies the initial device-free native-v2 2.3 Full/File multi-vCPU public lifecycle, #1589 adds exact 2.4 with one read-only File/Sync root, #1616/#1617 add exact 2.5 rooted/rootless ordered regular-file block vectors, #1634 adds exact 2.6 profile-3 block/pmem storage, #1651/#1652 add exact 2.7 complete serial state, #1665/#1666 add exact 2.8 optional entropy, #1680/#1681 add exact 2.9 optional balloon, #1697/#1698 activate and certify exact 2.10 optional virtio-mem across all sixteen storage/entropy/balloon/virtio-mem products, #1715/#1716 activate and certify exact 2.11 optional network/MMDS across all 32 products, and #1735/#1736 activate and certify current 2.12 optional vsock across all 64 products while retaining all earlier readers. |
+| Snapshot network/vsock clone semantics | `semantic.snapshot:network-vsock-overrides-portability-and-clones` | `implemented-and-verified`; exact 2.11 supplies complete clone-local network overrides and fresh network/MMDS sessions, while exact 2.12 supplies captured-or-overridden vsock authority, reset/RX/TX, preserved listeners, multistream/half-close, clone-local cursors, immutable independent clones, containment, redaction, and cleanup. Portability is bounded to compatible Bangbang-native File/COW destinations and excludes Firecracker bytes, live-peer migration, automatic socket/grant migration, and unconstrained cross-host execution. |
+| Remaining snapshot semantics | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `semantic.snapshot:multi-vcpu-drives-devices-and-mmds` | `audit-required`; Wave 6 owns Diff/native-v2-Uffd, per-drive override and broader device composition, editing/tools, Firecracker artifact evolution, and broader portability. Exact 2.11 network/MMDS and exact 2.12 vsock restore/clone behavior are delivered. |
 | Snapshot tracking leaves | `api-property:SnapshotLoadParams.enable_diff_snapshots`; `api-property:SnapshotLoadParams.track_dirty_pages` | Already `implemented-and-verified`; they select complete destination dirty tracking but do not imply Diff artifact support. |
 | Broad specifications | `corpus:specification`; `semantic.specification:api-availability-stability-and-failure-information`; `semantic.specification:performance-resource-and-telemetry-outcomes` | `audit-required`; applicable repository-wide outcomes remain Wave 7 work after their producers stabilize. |
 | Cross-capability certification | `semantic.cross-capability:state-errors-metrics-security-and-snapshots` | `audit-required`; Wave 8 owns the final interaction audit after the individual lifecycle, error, telemetry, security, device, network, and snapshot producers stabilize. |
@@ -91,13 +92,13 @@ terminal. The directly reviewed identities that do not change disposition are:
 
 Those exact identities establish the following non-overlapping handoffs:
 
-- Wave 6 has terminal current native-v2 2.11 Full/File create/load for complete
+- Wave 6 has terminal current native-v2 2.12 Full/File create/load for complete
   serial state plus independently optional entropy, balloon, virtio-mem,
-  network/MMDS, and rooted/rootless regular-file block/pmem profile-3 vectors
-  over MMIO/PCI, and retains exact 2.10/2.9/2.8/2.7/2.6/2.5/2.4/2.3 plus
-  frozen native-v1 readers. It still owns Diff artifacts, vsock restore,
-  dirty-image serialization and merging, native-v2 Uffd, per-drive/vsock
-  restore overrides, tools, broader portability, and schema evolution. The
+  network/MMDS, vsock, and rooted/rootless regular-file block/pmem profile-3
+  vectors over MMIO/PCI, and retains exact 2.11/2.10/2.9/2.8/2.7/2.6/2.5/2.4/
+  2.3 plus frozen native-v1 readers. It still owns Diff artifacts, dirty-image
+  serialization and merging, native-v2 Uffd, per-drive restore overrides,
+  tools, broader portability, and schema evolution. The
   terminal load tracking properties and complete dirty epochs are
   prerequisites, not proof of those remaining artifacts.
 - Wave 7 owns `cpu-template-helper`, host-side kernel/rootfs construction,

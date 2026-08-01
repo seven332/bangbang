@@ -42,11 +42,15 @@ use bangbang_runtime::balloon::VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
 use bangbang_runtime::mmds::MmdsVersion;
 use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonState;
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
-use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
+use bangbang_runtime::snapshot_format_v2::{
+    NATIVE_V2_VSOCK_COMPONENT_KEY, SnapshotV2Component, decode_snapshot_v2_state,
+    encode_snapshot_v2_state_with_compatibility_version,
+};
 use bangbang_runtime::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugState;
 use bangbang_runtime::snapshot_network_v2_11::{
     SnapshotV2NetworkBackendClass, SnapshotV2NetworkLimiterState, SnapshotV2NetworkState,
 };
+use bangbang_runtime::vsock::VSOCK_HOST_LOCAL_PORT_BASE;
 use bangbang_session::{
     BLOCK_CONTROL_BROKER_FD, Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY,
     SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId, VHOST_USER_BROKER_FD, WorkerPolicy,
@@ -283,6 +287,17 @@ const SNAPSHOT_VSOCK_OLD_READY: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_OLD_READY";
 const SNAPSHOT_VSOCK_FRESH_READY: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_FRESH_READY";
 const SNAPSHOT_VSOCK_FRESH_ACK: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_FRESH_ACK";
 const SNAPSHOT_VSOCK_SUCCESS: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_RESET_OK";
+const SNAPSHOT_VSOCK_CERTIFY_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait init=/bangbang-direct-rootfs-init bangbang.vsock-snapshot-certify=1";
+const SNAPSHOT_VSOCK_CERTIFY_SOURCE_GUEST_PORTS: [u32; 1] = [5011];
+const SNAPSHOT_VSOCK_CERTIFY_FRESH_GUEST_PORTS: [u32; 4] = [5021, 5022, 5023, 5024];
+const SNAPSHOT_VSOCK_CERTIFY_GUEST_LISTEN_PORT: u32 = 6011;
+const SNAPSHOT_VSOCK_CERTIFY_HOST_STREAMS: usize = 16;
+const SNAPSHOT_VSOCK_CERTIFY_SOURCE_READY: &str = "BANGBANG_VSOCK_SNAPSHOT_SOURCE_READY";
+const SNAPSHOT_VSOCK_CERTIFY_RESET_OBSERVED: &str = "BANGBANG_VSOCK_SNAPSHOT_RESET_OBSERVED";
+const SNAPSHOT_VSOCK_CERTIFY_FRESH_G2H_OK: &str = "BANGBANG_VSOCK_SNAPSHOT_FRESH_G2H_OK";
+const SNAPSHOT_VSOCK_CERTIFY_PRESERVED_LISTENER_OK: &str =
+    "BANGBANG_VSOCK_SNAPSHOT_PRESERVED_LISTENER_OK";
+const SNAPSHOT_VSOCK_CERTIFY_FAILURE: &str = "BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_";
 const SNAPSHOT_BLOCK_SECTOR_SIZE: usize = 512;
 const SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE: u8 = 0x11;
 const SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE: u8 = 0x12;
@@ -1907,7 +1922,7 @@ fn configure_and_start_production_vsock_snapshot_source(socket: &Path, context: 
                 "drive_id": "rootfs",
                 "path_on_host": SNAPSHOT_ROOT_REF,
                 "is_root_device": true,
-                "is_read_only": false,
+                "is_read_only": true,
                 "cache_type": "Unsafe",
                 "io_engine": "Async",
             }),
@@ -2133,7 +2148,7 @@ fn production_vsock_snapshot_load_body(resume_vm: bool, selector: Option<&str>) 
     body.to_string()
 }
 
-fn assert_production_vsock_snapshot(path: &Path, enable_pci: bool, context: &str) {
+fn assert_production_vsock_snapshot(path: &Path, enable_pci: bool, context: &str) -> u32 {
     let bytes = fs::read(path).expect("production exact-2.12 vsock state should read");
     let structural =
         decode_snapshot_v2_state(&bytes).expect("production exact-2.12 vsock state should decode");
@@ -2156,6 +2171,1314 @@ fn assert_production_vsock_snapshot(path: &Path, enable_pci: bool, context: &str
         },
         "production {context} vsock transport should persist"
     );
+    vsock.host_local_port_cursor().last_used()
+}
+
+#[test]
+fn normal_bundle_certifies_native_v2_vsock_restored_guest_lifecycle_and_containment() {
+    let bundle = production_bundle();
+    let baseline_sessions = session_entries();
+    for enable_pci in [false, true] {
+        run_certified_production_vsock_snapshot_restore(&bundle, enable_pci, &baseline_sessions);
+    }
+    assert_eq!(
+        session_entries(),
+        baseline_sessions,
+        "certified vsock snapshot launcher and worker teardown must restore the session namespace"
+    );
+}
+
+fn run_certified_production_vsock_snapshot_restore(
+    bundle: &Path,
+    enable_pci: bool,
+    baseline_sessions: &[PathBuf],
+) {
+    let transport = if enable_pci { "pci" } else { "mmio" };
+    let source_fixture =
+        SnapshotVsockSourceGrantFixture::new(&format!("{transport}-vsock-certified-source"));
+    let source_sensitive = source_fixture.sensitive_strings();
+    let source_guest_listeners = bind_certified_production_vsock_guest_listeners(
+        &source_fixture,
+        &SNAPSHOT_VSOCK_CERTIFY_SOURCE_GUEST_PORTS,
+        &format!("production {transport} source"),
+    );
+    let mut source = spawn_ready_serial_snapshot_grant_api_launcher(
+        bundle,
+        &source_fixture.snapshot.manifest,
+        &format!("vsock-certified-{transport}-source"),
+        enable_pci,
+    );
+    source_fixture.snapshot.replace_source_file_pathnames();
+    configure_and_start_certified_production_vsock_source(&source.socket, transport);
+    assert_socket_mode(
+        &source_fixture.socket(),
+        0o600,
+        &format!("production {transport} certified source vsock"),
+    );
+    let worker = only_worker_pid(&source.child);
+    assert!(
+        child_pids(worker).is_empty(),
+        "production {transport} certified source must not retain a helper"
+    );
+
+    let mut source_guest_streams = accept_certified_production_vsock_guest_streams(
+        source_guest_listeners,
+        CertifiedProductionVsockGuestExchange {
+            request_kind: "SOURCE_G2H",
+            response_kind: "SOURCE_G2H_ACK",
+            request_size: 1024,
+            response_size: 128,
+            finish_exchange: false,
+        },
+        &format!("production {transport} source"),
+        &source,
+    );
+    let (mut source_host_streams, source_host_ports) =
+        connect_certified_production_vsock_source_host_streams(
+            &source_fixture.socket(),
+            &format!("production {transport} source"),
+            &source,
+        );
+    assert_eq!(
+        source_host_ports,
+        vec![VSOCK_HOST_LOCAL_PORT_BASE],
+        "production {transport} source host-local port must start at the pinned Firecracker base"
+    );
+    source
+        .wait_for_stdout_marker(SNAPSHOT_VSOCK_CERTIFY_SOURCE_READY, PROCESS_TIMEOUT)
+        .unwrap_or_else(|error| {
+            panic!("production {transport} certified source should become ready: {error}")
+        });
+    flush_certified_production_vsock_metrics(
+        &source.socket,
+        &source_fixture.snapshot.opened_metrics,
+        2,
+        &format!("production {transport} source"),
+    );
+
+    assert_http_status(
+        &http_request(&source.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        &format!("pause production {transport} certified vsock source"),
+    );
+    assert_http_status(
+        &http_put(&source.socket, "/snapshot/create", &snapshot_create_body()),
+        204,
+        &format!("create production {transport} certified vsock snapshot"),
+    );
+    let mut artifacts = source_fixture.snapshot.artifacts();
+    let saved_cursor = assert_production_vsock_snapshot(
+        &artifacts.state,
+        enable_pci,
+        &format!("{transport} certified source"),
+    );
+    assert_eq!(
+        saved_cursor, VSOCK_HOST_LOCAL_PORT_BASE,
+        "production {transport} snapshot must retain the exact source host-local cursor"
+    );
+    let state_before =
+        fs::read(&artifacts.state).expect("production certified vsock state should read");
+    let memory_before =
+        fs::read(&artifacts.memory).expect("production certified vsock memory should read");
+    for (kind, streams) in [
+        ("guest-to-host", &mut source_guest_streams),
+        ("host-to-guest", &mut source_host_streams),
+    ] {
+        for (index, stream) in streams.iter_mut().enumerate() {
+            wait_for_stream_eof_nonblocking(stream, PROCESS_TIMEOUT).unwrap_or_else(|error| {
+                panic!(
+                    "production {transport} source {kind} stream {index} must be lost at capture: {error}"
+                )
+            });
+        }
+    }
+    assert_no_snapshot_staging(&source_fixture.snapshot.state_directory);
+    assert_no_snapshot_staging(&source_fixture.snapshot.memory_directory);
+    let (source_stdout, source_stderr) = stop_certified_production_vsock_launcher(
+        &mut source,
+        &source_sensitive,
+        &format!("production {transport} certified vsock source"),
+    );
+    assert!(
+        source_stdout.contains(SNAPSHOT_VSOCK_CERTIFY_SOURCE_READY),
+        "production {transport} source output must retain its readiness evidence"
+    );
+    assert!(
+        !source_stdout.contains(SNAPSHOT_VSOCK_CERTIFY_RESET_OBSERVED)
+            && !source_stdout.contains(SNAPSHOT_VSOCK_CERTIFY_FAILURE),
+        "production {transport} terminated source must not claim restored work\nstdout:\n{source_stdout}\nstderr:\n{source_stderr}"
+    );
+    assert!(
+        !source_fixture.socket().exists(),
+        "production {transport} source shutdown must clean its granted listener"
+    );
+    assert_session_entries_eventually_restored(
+        baseline_sessions,
+        &format!("production {transport} certified vsock source"),
+    );
+    source_fixture
+        .snapshot
+        .assert_replacement_pathnames_unused(&format!(
+            "production {transport} certified vsock source"
+        ));
+
+    if !enable_pci {
+        run_certified_production_vsock_hostile_loads(bundle, &artifacts, baseline_sessions);
+        artifacts = run_certified_production_vsock_missing_grant_rejection(
+            bundle,
+            artifacts,
+            baseline_sessions,
+        );
+        for order in [
+            CertifiedProductionVsockShutdownOrder::Graceful,
+            CertifiedProductionVsockShutdownOrder::WorkerFirst,
+            CertifiedProductionVsockShutdownOrder::LauncherFirst,
+        ] {
+            artifacts = run_certified_production_vsock_paused_shutdown(
+                bundle,
+                artifacts,
+                order,
+                baseline_sessions,
+            );
+        }
+    }
+
+    let explicit_case = format!("{transport}-vsock-certified-explicit");
+    let current = run_certified_production_vsock_destination(CertifiedProductionVsockDestination {
+        bundle,
+        artifacts,
+        enable_pci,
+        resume_vm: false,
+        use_override: false,
+        recapture: true,
+        saved_cursor,
+        case: &explicit_case,
+        baseline_sessions,
+    });
+    assert_eq!(
+        fs::read(&current.state).expect("production certified repeated state should read"),
+        state_before,
+        "production {transport} explicit load must not mutate the immutable state"
+    );
+    assert_eq!(
+        fs::read(&current.memory).expect("production certified repeated memory should read"),
+        memory_before,
+        "production {transport} explicit load must not mutate the immutable memory"
+    );
+
+    let automatic_case = format!("{transport}-vsock-certified-automatic");
+    let final_artifacts =
+        run_certified_production_vsock_destination(CertifiedProductionVsockDestination {
+            bundle,
+            artifacts: current,
+            enable_pci,
+            resume_vm: true,
+            use_override: true,
+            recapture: false,
+            saved_cursor,
+            case: &automatic_case,
+            baseline_sessions,
+        });
+    assert_eq!(
+        fs::read(&final_artifacts.state)
+            .expect("final production certified vsock state should read"),
+        state_before,
+        "production {transport} repeated clones must keep state immutable"
+    );
+    assert_eq!(
+        fs::read(&final_artifacts.memory)
+            .expect("final production certified vsock memory should read"),
+        memory_before,
+        "production {transport} repeated clones must keep memory immutable"
+    );
+}
+
+struct CertifiedProductionVsockHostileArtifacts {
+    _root: TestDir,
+    artifacts: SnapshotArtifactSet,
+}
+
+impl CertifiedProductionVsockHostileArtifacts {
+    fn new(case: &str, sources: &SnapshotArtifactSet, copy_state: bool, copy_memory: bool) -> Self {
+        let root = TestDir::new(&format!("certified-vsock-hostile-{case}"));
+        let canonical_root = fs::canonicalize(root.path())
+            .expect("certified hostile vsock root should canonicalize");
+        let artifacts = SnapshotArtifactSet {
+            state: canonical_root.join("snapshot.state"),
+            memory: canonical_root.join("snapshot.memory"),
+            root: canonical_root.join("root.img"),
+            data: canonical_root.join("data.img"),
+            audit: canonical_root.join("audit.img"),
+        };
+        for (source, destination, copy) in [
+            (&sources.state, &artifacts.state, copy_state),
+            (&sources.memory, &artifacts.memory, copy_memory),
+            (&sources.root, &artifacts.root, false),
+            (&sources.data, &artifacts.data, false),
+            (&sources.audit, &artifacts.audit, false),
+        ] {
+            if copy {
+                fs::copy(source, destination)
+                    .unwrap_or_else(|error| panic!("{case} hostile artifact should copy: {error}"));
+            } else {
+                hard_link_or_copy_fixture(source, destination, case);
+            }
+        }
+        Self {
+            _root: root,
+            artifacts,
+        }
+    }
+}
+
+fn run_certified_production_vsock_hostile_loads(
+    bundle: &Path,
+    sources: &SnapshotArtifactSet,
+    baseline_sessions: &[PathBuf],
+) {
+    let checksum = CertifiedProductionVsockHostileArtifacts::new("checksum", sources, true, false);
+    let mut checksum_bytes =
+        fs::read(&checksum.artifacts.state).expect("hostile checksum state should read");
+    let checksum_index = checksum_bytes.len() / 2;
+    checksum_bytes[checksum_index] ^= 0x80;
+    fs::write(&checksum.artifacts.state, checksum_bytes)
+        .expect("hostile checksum state should update");
+    run_certified_production_vsock_rejected_load(
+        bundle,
+        &checksum.artifacts,
+        "checksum",
+        baseline_sessions,
+    );
+
+    let truncated =
+        CertifiedProductionVsockHostileArtifacts::new("truncated-memory", sources, false, true);
+    let memory_len = fs::metadata(&truncated.artifacts.memory)
+        .expect("hostile memory metadata should read")
+        .len();
+    assert!(
+        memory_len > 4096,
+        "hostile memory fixture should be large enough to truncate"
+    );
+    OpenOptions::new()
+        .write(true)
+        .open(&truncated.artifacts.memory)
+        .expect("hostile memory should reopen")
+        .set_len(memory_len - 4096)
+        .expect("hostile memory should truncate");
+    run_certified_production_vsock_rejected_load(
+        bundle,
+        &truncated.artifacts,
+        "truncated-memory",
+        baseline_sessions,
+    );
+
+    let no_vsock = CertifiedProductionVsockHostileArtifacts::new("no-vsock", sources, true, false);
+    write_certified_production_snapshot_without_vsock(&sources.state, &no_vsock.artifacts.state);
+    run_certified_production_vsock_rejected_load(
+        bundle,
+        &no_vsock.artifacts,
+        "no-vsock",
+        baseline_sessions,
+    );
+}
+
+fn write_certified_production_snapshot_without_vsock(source: &Path, destination: &Path) {
+    let bytes = fs::read(source).expect("production certified source state should read");
+    let structural =
+        decode_snapshot_v2_state(&bytes).expect("production certified source state should decode");
+    let required_features = structural.required_features().collect::<Vec<_>>();
+    let mut removed = 0;
+    let components = structural
+        .components()
+        .filter(|component| {
+            let retain = component.key() != NATIVE_V2_VSOCK_COMPONENT_KEY;
+            removed += usize::from(!retain);
+            retain
+        })
+        .collect::<Vec<SnapshotV2Component<'_>>>();
+    assert_eq!(
+        removed, 1,
+        "production certified fixture should remove one kind 13 component"
+    );
+    let encoded = encode_snapshot_v2_state_with_compatibility_version(
+        structural.metadata().version(),
+        &required_features,
+        &components,
+    )
+    .expect("production certified no-vsock state should encode");
+    fs::write(destination, encoded).expect("production certified no-vsock state should write");
+}
+
+fn run_certified_production_vsock_rejected_load(
+    bundle: &Path,
+    sources: &SnapshotArtifactSet,
+    case: &str,
+    baseline_sessions: &[PathBuf],
+) {
+    let fixture = SnapshotVsockContinuationInputGrantFixture::new(
+        &format!("certified-hostile-{case}"),
+        sources.clone(),
+        false,
+        true,
+    );
+    let sensitive = fixture.sensitive_strings();
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.snapshot.manifest,
+        &fixture.snapshot.api_socket(),
+        sensitive.clone(),
+        &format!("vsock-certified-hostile-{case}"),
+        false,
+    );
+    let opened = fixture.snapshot.replace_source_pathnames();
+    let state_before =
+        fs::read(&opened.state).expect("hostile production state should remain readable");
+    let memory_before =
+        fs::read(&opened.memory).expect("hostile production memory should remain readable");
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/metrics",
+            &serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}).to_string(),
+        ),
+        204,
+        &format!("configure hostile production {case} metrics"),
+    );
+    let response = http_put(
+        &running.socket,
+        "/snapshot/load",
+        &production_vsock_snapshot_load_body(false, Some(fixture.selector_ref)),
+    );
+    assert_http_status(
+        &response,
+        400,
+        &format!("reject hostile production {case} vsock snapshot"),
+    );
+    for private in &sensitive {
+        assert!(
+            !response.contains(private),
+            "hostile production {case} response must redact private authority"
+        );
+    }
+    thread::sleep(Duration::from_millis(100));
+    if running
+        .child
+        .try_wait()
+        .expect("hostile production launcher status should read")
+        .is_some()
+        || !running.socket.exists()
+    {
+        let status = running.wait(&format!("terminal hostile production {case} rejection"));
+        assert!(
+            !status.success(),
+            "terminal hostile production {case} rejection must fail closed"
+        );
+    } else {
+        assert!(
+            http_get(&running.socket, "/").contains(r#""state":"Not started""#),
+            "hostile production {case} destination must remain Not started"
+        );
+        stop_running_launcher(
+            &mut running,
+            &format!("hostile production {case} vsock rejection"),
+        );
+    }
+    assert!(
+        !running.socket.exists() && !fixture.socket().exists(),
+        "hostile production {case} rejection must not retain API or vsock listeners"
+    );
+    assert_session_entries_eventually_restored(
+        baseline_sessions,
+        &format!("hostile production {case} vsock rejection"),
+    );
+    assert_eq!(
+        fs::read(&opened.state).expect("hostile production state should remain"),
+        state_before,
+        "hostile production {case} rejection must not mutate state"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("hostile production memory should remain"),
+        memory_before,
+        "hostile production {case} rejection must not mutate memory"
+    );
+    fixture
+        .snapshot
+        .assert_replacement_pathnames_unused(&format!("hostile production {case} vsock rejection"));
+}
+
+fn run_certified_production_vsock_missing_grant_rejection(
+    bundle: &Path,
+    artifacts: SnapshotArtifactSet,
+    baseline_sessions: &[PathBuf],
+) -> SnapshotArtifactSet {
+    let fixture = SnapshotVsockContinuationInputGrantFixture::new(
+        "certified-missing-vsock-grant",
+        artifacts,
+        false,
+        true,
+    );
+    remove_snapshot_vsock_grant(&fixture.snapshot.manifest, fixture.selector_id);
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.snapshot.manifest,
+        &fixture.snapshot.api_socket(),
+        fixture.sensitive_strings(),
+        "vsock-certified-missing-grant",
+        false,
+    );
+    let opened = fixture.snapshot.replace_source_pathnames();
+    let state_before = fs::read(&opened.state).expect("missing-grant production state should read");
+    let memory_before =
+        fs::read(&opened.memory).expect("missing-grant production memory should read");
+    let response = http_put(
+        &running.socket,
+        "/snapshot/load",
+        &production_vsock_snapshot_load_body(false, Some(fixture.selector_ref)),
+    );
+    assert_http_status(
+        &response,
+        400,
+        "reject production vsock override without its exact grant",
+    );
+    assert!(
+        response.contains("vsock destination transaction failed (retryable)")
+            && !response.contains(fixture.selector_ref)
+            && !response.contains(path_text(&fixture.vsock_directory)),
+        "missing-grant production retryable fault must remain stable and redacted: {response}"
+    );
+    assert!(
+        !fixture.socket().exists(),
+        "missing-grant production rejection must not publish a vsock listener"
+    );
+    thread::sleep(Duration::from_millis(250));
+    if running
+        .child
+        .try_wait()
+        .expect("missing-grant production launcher status should read")
+        .is_some()
+    {
+        let status = running.wait("terminal production certified missing-vsock-grant rejection");
+        assert!(
+            !status.success(),
+            "terminal missing-grant production rejection must fail closed"
+        );
+    } else {
+        let launcher =
+            i32::try_from(running.child.id()).expect("missing-grant launcher PID should fit");
+        // SAFETY: `launcher` is the live unreaped process owned by `running`.
+        assert_eq!(unsafe { libc::kill(launcher, libc::SIGTERM) }, 0);
+        let _ = running
+            .wait("production certified missing-vsock-grant rejection after retryable response");
+    }
+    assert_session_entries_eventually_restored(
+        baseline_sessions,
+        "production certified missing-vsock-grant rejection",
+    );
+    assert_eq!(
+        fs::read(&opened.state).expect("missing-grant state should remain"),
+        state_before
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("missing-grant memory should remain"),
+        memory_before
+    );
+    fixture
+        .snapshot
+        .assert_replacement_pathnames_unused("production certified missing-vsock-grant rejection");
+    opened
+}
+
+fn remove_snapshot_vsock_grant(manifest: &Path, id: &str) {
+    let mut value: serde_json::Value = serde_json::from_slice(
+        &fs::read(manifest).expect("production certified manifest should read"),
+    )
+    .expect("production certified manifest should parse");
+    let grants = value
+        .get_mut("grants")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("production certified manifest should contain grants");
+    let before = grants.len();
+    grants.retain(|grant| grant.get("id").and_then(serde_json::Value::as_str) != Some(id));
+    assert_eq!(
+        grants.len() + 1,
+        before,
+        "production certified manifest should remove exactly one vsock grant"
+    );
+    fs::write(
+        manifest,
+        serde_json::to_vec(&value).expect("production certified manifest should serialize"),
+    )
+    .expect("production certified manifest should update");
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CertifiedProductionVsockShutdownOrder {
+    Graceful,
+    WorkerFirst,
+    LauncherFirst,
+}
+
+fn run_certified_production_vsock_paused_shutdown(
+    bundle: &Path,
+    artifacts: SnapshotArtifactSet,
+    order: CertifiedProductionVsockShutdownOrder,
+    baseline_sessions: &[PathBuf],
+) -> SnapshotArtifactSet {
+    let (name, use_override) = match order {
+        CertifiedProductionVsockShutdownOrder::Graceful => ("graceful", false),
+        CertifiedProductionVsockShutdownOrder::WorkerFirst => ("worker-first", true),
+        CertifiedProductionVsockShutdownOrder::LauncherFirst => ("launcher-first", false),
+    };
+    let fixture = SnapshotVsockContinuationInputGrantFixture::new(
+        &format!("certified-paused-{name}"),
+        artifacts,
+        false,
+        use_override,
+    );
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.snapshot.manifest,
+        &fixture.snapshot.api_socket(),
+        fixture.sensitive_strings(),
+        &format!("vsock-certified-paused-{name}"),
+        false,
+    );
+    let opened = fixture.snapshot.replace_source_pathnames();
+    let state_before =
+        fs::read(&opened.state).expect("paused shutdown production state should read");
+    let memory_before =
+        fs::read(&opened.memory).expect("paused shutdown production memory should read");
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/metrics",
+            &serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}).to_string(),
+        ),
+        204,
+        &format!("configure production {name} shutdown metrics"),
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/snapshot/load",
+            &production_vsock_snapshot_load_body(
+                false,
+                use_override.then_some(fixture.selector_ref),
+            ),
+        ),
+        204,
+        &format!("load production {name} shutdown vsock pair"),
+    );
+    assert!(
+        http_get(&running.socket, "/").contains(r#""state":"Paused""#),
+        "production {name} shutdown destination must publish Paused"
+    );
+    assert!(
+        fixture.socket().exists(),
+        "production {name} shutdown destination must publish its selected listener"
+    );
+
+    match order {
+        CertifiedProductionVsockShutdownOrder::Graceful => {
+            stop_running_launcher(
+                &mut running,
+                "production certified Paused graceful cancellation",
+            );
+        }
+        CertifiedProductionVsockShutdownOrder::WorkerFirst => {
+            let worker = only_worker_pid(&running.child);
+            // SAFETY: The worker is the live child of this unreaped launcher.
+            assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+            assert_eq!(
+                running
+                    .wait("production certified Paused worker-first death")
+                    .code(),
+                Some(128 + libc::SIGKILL)
+            );
+        }
+        CertifiedProductionVsockShutdownOrder::LauncherFirst => {
+            let worker = only_worker_pid(&running.child);
+            let worker_exit = ProcessExitWatch::new(worker);
+            let launcher =
+                i32::try_from(running.child.id()).expect("production launcher PID should fit");
+            // SAFETY: The unreaped launcher owns this PID and the worker
+            // observes authenticated lifecycle EOF independently.
+            assert_eq!(unsafe { libc::kill(launcher, libc::SIGKILL) }, 0);
+            assert_eq!(
+                running
+                    .wait("production certified Paused launcher-first death")
+                    .signal(),
+                Some(libc::SIGKILL)
+            );
+            assert!(
+                worker_exit.wait(PROCESS_TIMEOUT),
+                "production certified worker must observe launcher-first death"
+            );
+        }
+    }
+
+    assert_session_entries_eventually_restored(
+        baseline_sessions,
+        &format!("production certified Paused {name} shutdown"),
+    );
+    assert!(
+        !running.socket.exists() && !fixture.socket().exists(),
+        "production certified Paused {name} shutdown must clean API and vsock listeners"
+    );
+    assert_eq!(
+        fs::read(&opened.state).expect("paused shutdown state should remain"),
+        state_before,
+        "production certified Paused {name} shutdown must preserve state"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("paused shutdown memory should remain"),
+        memory_before,
+        "production certified Paused {name} shutdown must preserve memory"
+    );
+    fixture
+        .snapshot
+        .assert_replacement_pathnames_unused(&format!(
+            "production certified Paused {name} shutdown"
+        ));
+    opened
+}
+
+fn configure_and_start_certified_production_vsock_source(socket: &Path, context: &str) {
+    for (path, body, request) in [
+        (
+            "/machine-config",
+            serde_json::json!({"vcpu_count": 1, "mem_size_mib": 256}),
+            "machine config",
+        ),
+        (
+            "/metrics",
+            serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}),
+            "metrics",
+        ),
+        (
+            "/boot-source",
+            serde_json::json!({
+                "kernel_image_path": SNAPSHOT_KERNEL_REF,
+                "boot_args": SNAPSHOT_VSOCK_CERTIFY_BOOT_ARGS,
+            }),
+            "boot source",
+        ),
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": SNAPSHOT_ROOT_REF,
+                "is_root_device": true,
+                "is_read_only": false,
+                "cache_type": "Unsafe",
+                "io_engine": "Async",
+            }),
+            "rootfs",
+        ),
+        (
+            "/vsock",
+            serde_json::json!({
+                "guest_cid": 3,
+                "uds_path": SNAPSHOT_VSOCK_SOURCE_REF,
+            }),
+            "vsock",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                socket,
+                path,
+                &serde_json::to_string(&body)
+                    .expect("certified production snapshot-vsock request should serialize"),
+            ),
+            204,
+            &format!("PUT production {context} certified snapshot-vsock {request}"),
+        );
+    }
+    assert_http_status(
+        &http_put(socket, "/actions", r#"{"action_type":"InstanceStart"}"#),
+        204,
+        &format!("start production {context} certified snapshot-vsock source"),
+    );
+}
+
+struct CertifiedProductionVsockDestination<'a> {
+    bundle: &'a Path,
+    artifacts: SnapshotArtifactSet,
+    enable_pci: bool,
+    resume_vm: bool,
+    use_override: bool,
+    recapture: bool,
+    saved_cursor: u32,
+    case: &'a str,
+    baseline_sessions: &'a [PathBuf],
+}
+
+fn run_certified_production_vsock_destination(
+    destination: CertifiedProductionVsockDestination<'_>,
+) -> SnapshotArtifactSet {
+    let CertifiedProductionVsockDestination {
+        bundle,
+        artifacts,
+        enable_pci,
+        resume_vm,
+        use_override,
+        recapture,
+        saved_cursor,
+        case,
+        baseline_sessions,
+    } = destination;
+    let fixture =
+        SnapshotVsockContinuationInputGrantFixture::new(case, artifacts, recapture, use_override);
+    let sensitive = fixture.sensitive_strings();
+    let guest_listeners = bind_certified_production_vsock_guest_listeners(
+        &fixture,
+        &SNAPSHOT_VSOCK_CERTIFY_FRESH_GUEST_PORTS,
+        &format!("production {case} destination"),
+    );
+    let mut running = spawn_ready_serial_snapshot_grant_api_launcher_with_granted_socket(
+        bundle,
+        &fixture.snapshot.manifest,
+        &fixture.snapshot.api_socket(),
+        &format!("vsock-certified-{case}"),
+        enable_pci,
+    );
+    let worker = only_worker_pid(&running.child);
+    let opened = fixture.snapshot.replace_source_pathnames();
+    let state_before =
+        fs::read(&opened.state).expect("production certified destination state should read");
+    let memory_before =
+        fs::read(&opened.memory).expect("production certified destination memory should read");
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/metrics",
+            &serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}).to_string(),
+        ),
+        204,
+        &format!("configure production {case} certified destination metrics"),
+    );
+    let load_body = production_vsock_snapshot_load_body(
+        resume_vm,
+        use_override.then_some(fixture.selector_ref),
+    );
+    assert_http_status(
+        &http_put(&running.socket, "/snapshot/load", &load_body),
+        204,
+        &format!("load production {case} certified vsock snapshot"),
+    );
+    assert!(
+        http_get(&running.socket, "/").contains(if resume_vm {
+            r#""state":"Running""#
+        } else {
+            r#""state":"Paused""#
+        }),
+        "production {case} certified destination must publish the requested resume state"
+    );
+    let config = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &config,
+        200,
+        &format!("read production {case} certified restored config"),
+    );
+    assert!(
+        config.contains(fixture.selector_ref),
+        "production {case} controller commit must retain the selected vsock reference"
+    );
+    assert_socket_mode(
+        &fixture.socket(),
+        0o600,
+        &format!("production {case} selected vsock"),
+    );
+    assert!(
+        child_pids(worker).is_empty(),
+        "production {case} certified destination must not retain a helper"
+    );
+
+    let mut host_streams = queue_certified_production_vsock_host_streams(
+        &fixture.socket(),
+        &format!("production {case}"),
+    );
+    if !resume_vm {
+        assert_certified_production_vsock_streams_blocked_while_paused(
+            &mut host_streams,
+            &format!("production {case}"),
+        );
+        assert!(
+            !running
+                .stdout_snapshot()
+                .contains(SNAPSHOT_VSOCK_CERTIFY_RESET_OBSERVED),
+            "production {case} Paused destination must not process reset or queued RX"
+        );
+        assert_http_status(
+            &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            204,
+            &format!("resume production {case} certified vsock destination"),
+        );
+    }
+
+    let fresh_guest_streams = accept_certified_production_vsock_guest_streams(
+        guest_listeners,
+        CertifiedProductionVsockGuestExchange {
+            request_kind: "FRESH_G2H",
+            response_kind: "FRESH_G2H_REPLY",
+            request_size: 4096,
+            response_size: 4096,
+            finish_exchange: true,
+        },
+        &format!("production {case}"),
+        &running,
+    );
+    drop(fresh_guest_streams);
+    for (index, stream) in host_streams.iter_mut().enumerate() {
+        let local_port =
+            read_certified_production_vsock_connect_ok(stream, PROCESS_TIMEOUT).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "production {case} preserved-listener stream {index} should connect: {error}; stdout:\n{}",
+                        running.stdout_snapshot()
+                    )
+                },
+            );
+        assert_eq!(
+            local_port,
+            saved_cursor
+                + 1
+                + u32::try_from(index).expect("production host stream index should fit u32"),
+            "production {case} clone host-local cursor must continue independently at stream {index}"
+        );
+        let mut guest_reply = vec![0_u8; 4096];
+        read_exact_nonblocking(stream, &mut guest_reply, PROCESS_TIMEOUT).unwrap_or_else(|error| {
+            panic!(
+                "production {case} host stream {index} guest reply should arrive: {error}; stdout:\n{}",
+                running.stdout_snapshot()
+            )
+        });
+        assert_eq!(
+            guest_reply,
+            certified_snapshot_vsock_payload("FRESH_H2G_REPLY", index, 4096),
+            "production {case} host stream {index} guest reply must remain isolated"
+        );
+        write_all_nonblocking(
+            stream,
+            &certified_snapshot_vsock_payload("FRESH_H2G", index, 4096),
+            PROCESS_TIMEOUT,
+        )
+        .unwrap_or_else(|error| {
+            panic!("production {case} host stream {index} payload should write: {error}")
+        });
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap_or_else(|error| {
+                panic!("production {case} host stream {index} should half-close: {error}")
+            });
+        wait_for_stream_eof_nonblocking(stream, PROCESS_TIMEOUT).unwrap_or_else(|error| {
+            panic!("production {case} host stream {index} EOF should arrive: {error}")
+        });
+    }
+
+    for marker in [
+        SNAPSHOT_VSOCK_CERTIFY_RESET_OBSERVED,
+        SNAPSHOT_VSOCK_CERTIFY_FRESH_G2H_OK,
+        SNAPSHOT_VSOCK_CERTIFY_PRESERVED_LISTENER_OK,
+        std::str::from_utf8(SNAPSHOT_VSOCK_SUCCESS)
+            .expect("production snapshot-vsock success marker should be UTF-8"),
+    ] {
+        running
+            .wait_for_stdout_marker(marker, PROCESS_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!("production {case} restored guest must publish {marker:?}: {error}")
+            });
+    }
+    assert!(
+        !running
+            .stdout_snapshot()
+            .contains(SNAPSHOT_VSOCK_CERTIFY_FAILURE),
+        "production {case} restored guest must not publish a failure marker"
+    );
+    flush_certified_production_vsock_metrics(
+        &running.socket,
+        &fixture.snapshot.opened_metrics,
+        u64::try_from(
+            SNAPSHOT_VSOCK_CERTIFY_FRESH_GUEST_PORTS.len() + SNAPSHOT_VSOCK_CERTIFY_HOST_STREAMS,
+        )
+        .expect("production destination connection count should fit u64"),
+        &format!("production {case} destination"),
+    );
+
+    if recapture {
+        assert_http_status(
+            &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            204,
+            &format!("pause production {case} certified destination before recapture"),
+        );
+        assert_http_status(
+            &http_put(&running.socket, "/snapshot/create", &snapshot_create_body()),
+            204,
+            &format!("recapture production {case} certified vsock snapshot"),
+        );
+        let recaptured = fixture.snapshot.recaptured_artifacts();
+        assert_eq!(
+            assert_production_vsock_snapshot(
+                &recaptured.state,
+                enable_pci,
+                &format!("{case} certified recapture"),
+            ),
+            saved_cursor
+                + u32::try_from(SNAPSHOT_VSOCK_CERTIFY_HOST_STREAMS)
+                    .expect("production host stream count should fit u32"),
+            "production {case} recapture must retain destination-local cursor progression"
+        );
+        fixture.snapshot.assert_no_recapture_staging();
+    }
+
+    let (stdout, stderr) = stop_certified_production_vsock_launcher(
+        &mut running,
+        &sensitive,
+        &format!("production {case} certified vsock destination"),
+    );
+    assert!(
+        stdout.contains(SNAPSHOT_VSOCK_CERTIFY_RESET_OBSERVED)
+            && stdout.contains(SNAPSHOT_VSOCK_CERTIFY_FRESH_G2H_OK)
+            && stdout.contains(SNAPSHOT_VSOCK_CERTIFY_PRESERVED_LISTENER_OK)
+            && stdout.contains(
+                std::str::from_utf8(SNAPSHOT_VSOCK_SUCCESS)
+                    .expect("production snapshot-vsock success marker should be UTF-8")
+            )
+            && !stdout.contains(SNAPSHOT_VSOCK_CERTIFY_FAILURE),
+        "production {case} output must retain complete process-local success evidence\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !fixture.socket().exists(),
+        "production {case} shutdown must clean its selected listener"
+    );
+    assert_session_entries_eventually_restored(
+        baseline_sessions,
+        &format!("production {case} certified vsock destination"),
+    );
+    assert_eq!(
+        fs::read(&opened.state).expect("production certified destination state should remain"),
+        state_before,
+        "production {case} load must not mutate state"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("production certified destination memory should remain"),
+        memory_before,
+        "production {case} load must not mutate memory"
+    );
+    fixture
+        .snapshot
+        .assert_replacement_pathnames_unused(&format!(
+            "production {case} certified vsock destination"
+        ));
+    opened
+}
+
+trait CertifiedProductionVsockSocketFixture {
+    fn certified_socket(&self) -> PathBuf;
+}
+
+impl CertifiedProductionVsockSocketFixture for SnapshotVsockSourceGrantFixture {
+    fn certified_socket(&self) -> PathBuf {
+        self.socket()
+    }
+}
+
+impl CertifiedProductionVsockSocketFixture for SnapshotVsockContinuationInputGrantFixture {
+    fn certified_socket(&self) -> PathBuf {
+        self.socket()
+    }
+}
+
+fn bind_certified_production_vsock_guest_listeners(
+    fixture: &impl CertifiedProductionVsockSocketFixture,
+    ports: &[u32],
+    context: &str,
+) -> Vec<(PathBuf, UnixListener)> {
+    let socket = fixture.certified_socket();
+    ports
+        .iter()
+        .map(|port| {
+            let path = snapshot_vsock_port_path(&socket, *port);
+            let listener = UnixListener::bind(&path).unwrap_or_else(|error| {
+                panic!("{context} guest-port listener {port} should bind: {error}")
+            });
+            listener
+                .set_nonblocking(true)
+                .expect("production certified guest-port listener should be nonblocking");
+            (path, listener)
+        })
+        .collect()
+}
+
+struct CertifiedProductionVsockGuestExchange {
+    request_kind: &'static str,
+    response_kind: &'static str,
+    request_size: usize,
+    response_size: usize,
+    finish_exchange: bool,
+}
+
+fn accept_certified_production_vsock_guest_streams(
+    listeners: Vec<(PathBuf, UnixListener)>,
+    exchange: CertifiedProductionVsockGuestExchange,
+    context: &str,
+    running: &RunningSerialApiLauncher,
+) -> Vec<UnixStream> {
+    let CertifiedProductionVsockGuestExchange {
+        request_kind,
+        response_kind,
+        request_size,
+        response_size,
+        finish_exchange,
+    } = exchange;
+    listeners
+        .into_iter()
+        .enumerate()
+        .map(|(index, (path, listener))| {
+            let mut stream =
+                wait_for_unix_listener_accept(&listener, PROCESS_TIMEOUT).unwrap_or_else(|error| {
+                    panic!(
+                        "{context} guest stream {request_kind}[{index}] should arrive: {error}; stdout:\n{}",
+                        running.stdout_snapshot()
+                    )
+                });
+            drop(listener);
+            fs::remove_file(&path)
+                .expect("production certified guest listener path should clean after accept");
+            stream
+                .set_nonblocking(true)
+                .expect("production certified guest stream should be nonblocking");
+            let expected = certified_snapshot_vsock_payload(request_kind, index, request_size);
+            let mut received = vec![0_u8; expected.len()];
+            read_exact_nonblocking(&mut stream, &mut received, PROCESS_TIMEOUT).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "{context} guest stream {request_kind}[{index}] payload should arrive: {error}; stdout:\n{}",
+                        running.stdout_snapshot()
+                    )
+                },
+            );
+            assert_eq!(
+                received, expected,
+                "{context} guest stream {request_kind}[{index}] payload must remain isolated"
+            );
+            write_all_nonblocking(
+                &mut stream,
+                &certified_snapshot_vsock_payload(response_kind, index, response_size),
+                PROCESS_TIMEOUT,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{context} guest stream {request_kind}[{index}] response should write: {error}")
+            });
+            if finish_exchange {
+                stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{context} guest stream {request_kind}[{index}] response should half-close: {error}"
+                        )
+                    });
+                wait_for_stream_eof_nonblocking(&mut stream, PROCESS_TIMEOUT).unwrap_or_else(
+                    |error| {
+                        panic!(
+                            "{context} guest stream {request_kind}[{index}] EOF should arrive: {error}"
+                        )
+                    },
+                );
+            }
+            stream
+        })
+        .collect()
+}
+
+fn connect_certified_production_vsock_source_host_streams(
+    socket: &Path,
+    context: &str,
+    running: &RunningSerialApiLauncher,
+) -> (Vec<UnixStream>, Vec<u32>) {
+    let mut streams = Vec::with_capacity(1);
+    let mut local_ports = Vec::with_capacity(1);
+    for index in 0..1 {
+        let mut stream = UnixStream::connect(socket)
+            .unwrap_or_else(|error| panic!("{context} source host stream should connect: {error}"));
+        stream
+            .set_nonblocking(true)
+            .expect("production source host stream should be nonblocking");
+        write_all_nonblocking(
+            &mut stream,
+            format!(
+                "CONNECT {}\n",
+                SNAPSHOT_VSOCK_CERTIFY_GUEST_LISTEN_PORT
+                    + u32::try_from(index).expect("source host stream index should fit u32")
+            )
+            .as_bytes(),
+            PROCESS_TIMEOUT,
+        )
+        .expect("production source host CONNECT should write");
+        local_ports.push(
+            read_certified_production_vsock_connect_ok(&mut stream, PROCESS_TIMEOUT)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{context} source CONNECT {index} should succeed: {error}; stdout:\n{}",
+                        running.stdout_snapshot()
+                    )
+                }),
+        );
+        write_all_nonblocking(
+            &mut stream,
+            &certified_snapshot_vsock_payload("SOURCE_H2G", index, 1024),
+            PROCESS_TIMEOUT,
+        )
+        .expect("production source host payload should write");
+        let expected = certified_snapshot_vsock_payload("SOURCE_H2G_ACK", index, 128);
+        let mut received = vec![0_u8; expected.len()];
+        read_exact_nonblocking(&mut stream, &mut received, PROCESS_TIMEOUT)
+            .expect("production source host acknowledgement should arrive");
+        assert_eq!(
+            received, expected,
+            "{context} source host acknowledgement should remain isolated"
+        );
+        streams.push(stream);
+    }
+    (streams, local_ports)
+}
+
+fn queue_certified_production_vsock_host_streams(socket: &Path, context: &str) -> Vec<UnixStream> {
+    (0..SNAPSHOT_VSOCK_CERTIFY_HOST_STREAMS)
+        .map(|index| {
+            let mut stream = UnixStream::connect(socket).unwrap_or_else(|error| {
+                panic!("{context} queued host stream {index} should connect: {error}")
+            });
+            stream
+                .set_nonblocking(true)
+                .expect("production queued host stream should be nonblocking");
+            write_all_nonblocking(
+                &mut stream,
+                format!(
+                    "CONNECT {}\n",
+                    SNAPSHOT_VSOCK_CERTIFY_GUEST_LISTEN_PORT
+                        + u32::try_from(index).expect("queued host stream index should fit u32")
+                )
+                .as_bytes(),
+                PROCESS_TIMEOUT,
+            )
+            .expect("production queued host CONNECT should write");
+            stream
+        })
+        .collect()
+}
+
+fn assert_certified_production_vsock_streams_blocked_while_paused(
+    streams: &mut [UnixStream],
+    context: &str,
+) {
+    for (index, stream) in streams.iter_mut().enumerate() {
+        let mut probe = [0_u8; 1];
+        match stream.read(&mut probe) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(0) => panic!("{context} queued stream {index} closed while Paused"),
+            Ok(read) => {
+                panic!("{context} queued stream {index} advanced by {read} byte(s) while Paused")
+            }
+            Err(error) => {
+                panic!("{context} queued stream {index} probe failed while Paused: {error}")
+            }
+        }
+    }
+}
+
+fn read_certified_production_vsock_connect_ok(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<u32, String> {
+    let response = read_line_nonblocking(stream, 32, timeout)
+        .map_err(|error| format!("CONNECT response read failed: {error}"))?;
+    let response =
+        std::str::from_utf8(&response).map_err(|_| "CONNECT response was not UTF-8".to_owned())?;
+    let Some(local_port) = response
+        .strip_prefix("OK ")
+        .and_then(|value| value.strip_suffix('\n'))
+    else {
+        return Err("unexpected CONNECT response".to_owned());
+    };
+    local_port
+        .parse::<u32>()
+        .map_err(|_| "CONNECT response had an invalid local port".to_owned())
+}
+
+fn certified_snapshot_vsock_payload(kind: &str, index: usize, size: usize) -> Vec<u8> {
+    let prefix = format!("BANGBANG_VSOCK_SNAPSHOT_{kind}_{index}:").into_bytes();
+    assert!(
+        prefix.len() <= size,
+        "certified production snapshot-vsock payload prefix must fit"
+    );
+    let fill = b'A' + u8::try_from(index % 26).expect("production payload fill should fit u8");
+    let mut payload = prefix;
+    payload.resize(size, fill);
+    payload
+}
+
+fn flush_certified_production_vsock_metrics(
+    socket: &Path,
+    metrics: &Path,
+    expected_connections: u64,
+    context: &str,
+) {
+    assert_http_status(
+        &http_put(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+        204,
+        &format!("flush {context} certified snapshot-vsock metrics"),
+    );
+    let output =
+        fs::read_to_string(metrics).expect("production certified vsock metrics should read");
+    let generation: serde_json::Value = serde_json::from_str(
+        output
+            .lines()
+            .last()
+            .expect("production certified vsock metrics should contain a generation"),
+    )
+    .expect("production certified vsock metrics generation should be JSON");
+    let vsock = generation
+        .get("vsock")
+        .expect("production certified metrics should contain a vsock object");
+    assert!(
+        vsock
+            .get("conns_added")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count >= expected_connections),
+        "{context} metrics must record at least {expected_connections} fresh connections: {generation}"
+    );
+    for field in ["rx_bytes_count", "tx_bytes_count"] {
+        assert!(
+            vsock
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count > 0),
+            "{context} metrics must record {field}: {generation}"
+        );
+    }
+}
+
+fn stop_certified_production_vsock_launcher(
+    running: &mut RunningSerialApiLauncher,
+    sensitive: &[String],
+    context: &str,
+) -> (String, String) {
+    let pid = i32::try_from(running.child.id()).expect("production launcher PID should fit");
+    // SAFETY: `pid` is the live unreaped launcher owned by `running`.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let (status, stdout, stderr) = running.wait(context);
+    assert!(
+        status.success(),
+        "{context} should stop cleanly: {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_serial_snapshot_output_redacted(&stdout, &stderr, sensitive, context);
+    assert!(
+        !running.socket.exists(),
+        "{context} should remove the granted API socket"
+    );
+    (stdout, stderr)
 }
 
 #[test]

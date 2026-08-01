@@ -528,7 +528,7 @@ execution proves:
   reuse for a second pair, same-GrantId concurrent-session isolation, bounded
   early description, and two fresh descriptor-bound state/memory/root restores
   with explicit and automatic resume through guest `SYSTEM_OFF`; and
-- exact native-v2 2.6 through current 2.11 profile-3 rooted pmem-only and
+- exact native-v2 2.6 through current 2.12 profile-3 rooted pmem-only and
   rootless mixed-storage create/load over MMIO and PCI, with exact read-only/read-write
   `PmemBacking` grants, source-path replacement resistance, complete-set
   cross-class alias rejection, immutable state/memory reuse, shared writable
@@ -565,6 +565,15 @@ execution proves:
   TCP/token loss, fresh V1/V2 sessions and metrics, immutable inputs,
   malformed/override rejection, graceful cancellation, both launcher/worker
   death orders, and all-MMDS containment without vmnet authority; and
+- current native-v2 2.12 vsock create/load over MMIO and PCI with exact
+  state/memory/kernel/root/metrics/API/vsock grants, source-path replacement
+  resistance, captured and overridden selectors, old-stream reset/loss,
+  reset-event RX gating with live TX, preserved guest listeners, deterministic
+  bidirectional multistream/half-close, clone-local cursor and fresh metrics/
+  socket/session ownership, immutable artifacts, malformed state/memory,
+  no-device and missing-authority faults, Paused cancellation, both launcher/
+  worker death orders, later retry, redaction, no entitlement/helper expansion,
+  and complete staging/session/socket cleanup; and
 - worker-first death after a durably recorded snapshot staging inode, with the
   launcher removing the exact inode or preserving a same-name replacement while
   clearing the private record and session namespace.

@@ -2014,7 +2014,7 @@
     {
       "id": "api-path:/pmem/{id}",
       "family": "api-contract",
-      "summary": "Provide the complete currently applicable /pmem/{id} control-plane path: strict pre-boot configuration including deterministic root boot, PCI-only Running/Paused non-root PUT and bodyless DELETE transactions, and post-boot limiter PATCH. The path validates matching IDs, strict fields, and the one-block-or-pmem-root invariant before authority use; preserves the public projection until live commits succeed; preflights owner capacity before grant/open/map work; maps the retained file/private-tail range directly into HVF; synchronizes exactly the file prefix; redacts backing, descriptor, grant, and address details; and retains default-MMIO and runtime-root mutation as stable nonmutating rejections. Aggregate live storage and native-v2 profile-3 pmem create/load certification are complete from exact 2.6 through current 2.11.",
+      "summary": "Provide the complete currently applicable /pmem/{id} control-plane path: strict pre-boot configuration including deterministic root boot, PCI-only Running/Paused non-root PUT and bodyless DELETE transactions, and post-boot limiter PATCH. The path validates matching IDs, strict fields, and the one-block-or-pmem-root invariant before authority use; preserves the public projection until live commits succeed; preflights owner capacity before grant/open/map work; maps the retained file/private-tail range directly into HVF; synchronizes exactly the file prefix; redacts backing, descriptor, grant, and address details; and retains default-MMIO and runtime-root mutation as stable nonmutating rejections. Aggregate live storage and native-v2 profile-3 pmem create/load certification are complete from exact 2.6 through current 2.12.",
       "source_refs": [
         "api-path:/pmem/{id}"
       ],
@@ -6601,11 +6601,45 @@
     {
       "id": "api-property:SnapshotLoadParams.vsock_override",
       "family": "api-contract",
-      "summary": "Bangbang parses and redacts vsock_override and resolves it before resource access. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns optional-device encoding and placement, public load invocation, restored acknowledgement and reconnect through the override, clone/version policy, and artifact/host portability.",
+      "summary": "Implement the optional one-device native-v2 2.12 vsock_override contract: parse and redact the selector, reject invalid or no-device overrides before authority access, replace only the restored vsock selector, and load original or overridden MMIO/PCI destinations through direct or contained authority. Signed immutable File clones certify Paused and automatic resume, fresh restored traffic, clone-local cursor and socket ownership, and bounded Bangbang-native portability; Firecracker bytes, live peers, and unconstrained cross-host portability are excluded.",
       "source_refs": [
         "api-property:SnapshotLoadParams.vsock_override"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "SnapshotVsockOverrideRequestBody and parse_snapshot_load"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "prepare_process_snapshot_v2_vsock_candidate and public native-v2 load"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "SnapshotVsockOverride and resolve_snapshot_vsock_selectors"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict vsock_override parsing and Debug redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_vsock_snapshot_over_mmio and product_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_vsock_restored_guest_lifecycle_and_containment"
+        }
+      ]
     },
     {
       "id": "api-property:TokenBucket.one_time_burst",
@@ -6978,11 +7012,45 @@
     {
       "id": "api-property:VsockOverride.uds_path",
       "family": "api-contract",
-      "summary": "Bangbang validates the override selector before direct or contained authority access and prepares exact destination resources without ambient fallback. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns optional-device encoding and placement, public artifact-load invocation, restored acknowledgement and reconnect through that override, clone/version policy, and artifact/host portability.",
+      "summary": "Implement uds_path as a validated, redacted logical selector for one restored native-v2 2.12 vsock device. It is resolved before access, maps to one exact direct or App Sandbox grant-backed listener without ambient fallback, remains clone-local, and is proved by signed MMIO/PCI original and override destinations, failure rollback, replacement preservation, cleanup, and immutable repeated loads.",
       "source_refs": [
         "api-property:VsockOverride.uds_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "native-v2 vsock direct and contained destination resource transactions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "SnapshotVsockOverride selector validation and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock/direct_restore.rs",
+          "anchor": "inode-safe direct restored listener ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "no-device invalid authority cancellation retry terminal and cleanup matrices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "coexisting original and override certified native-v2 vsock clones"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "contained selector grant rejection death cleanup and valid retry certification"
+        }
+      ]
     },
     {
       "id": "api-schema:ArmRegisterModifier",
@@ -8001,7 +8069,7 @@
     {
       "id": "api-schema:Pmem",
       "family": "api-contract",
-      "summary": "Implement the strict Firecracker Pmem shape with matching ID, required nonempty backing, default false root/read-only flags, optional limiter, exact configuration projection, direct or typed contained ownership, one file/private-tail mapping, deterministic root selection, MMIO/PCI startup, PCI runtime PUT/PATCH/DELETE/reuse, exact-prefix flush, rollback, redaction, metrics, cleanup, and native-v2 profile-3 serialization and restore from exact 2.6 through current 2.11.",
+      "summary": "Implement the strict Firecracker Pmem shape with matching ID, required nonempty backing, default false root/read-only flags, optional limiter, exact configuration projection, direct or typed contained ownership, one file/private-tail mapping, deterministic root selection, MMIO/PCI startup, PCI runtime PUT/PATCH/DELETE/reuse, exact-prefix flush, rollback, redaction, metrics, cleanup, and native-v2 profile-3 serialization and restore from exact 2.6 through current 2.12.",
       "source_refs": [
         "api-schema:Pmem"
       ],
@@ -8296,11 +8364,45 @@
     {
       "id": "api-schema:VsockOverride",
       "family": "api-contract",
-      "summary": "Bangbang parses, validates, redacts, and resolves the one-field VsockOverride producer before resource access. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns optional-device encoding and placement, public load invocation, restored acknowledgement, reconnect and override proof, clone/version policy, and artifact/host portability.",
+      "summary": "Implement the strict one-field VsockOverride schema for Bangbang-native native-v2 2.12 Full/File load. Unknown or missing fields fail, Debug and public faults redact the selector, an override without a captured vsock fails before publication, and valid direct or contained MMIO/PCI loads reconstruct exactly one clone-local listener and restored device.",
       "source_refs": [
         "api-schema:VsockOverride"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "SnapshotVsockOverrideRequestBody strict schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "SnapshotVsockOverride request projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public exact-2.12 vsock load dispatch"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "missing unknown valid and redacted VsockOverride request tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed exact-2.12 no-device rejection and original/override restoration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal contained exact-2.12 override lifecycle certification"
+        }
+      ]
     },
     {
       "id": "corpus:actions-api",
@@ -8600,7 +8702,7 @@
     {
       "id": "corpus:device-hotplug",
       "family": "runtime-device-management",
-      "summary": "Implement the complete pinned Developer Preview live-device contract for non-root virtio-block, virtio-pmem, and virtio-net under public all-virtio PCI. Running and Paused PUT/DELETE use one failure-atomic owner inventory, require manual guest rescan/removal, preserve type-scoped IDs and global network-MAC uniqueness, commit live configuration last, and release exact backing, packet-I/O, mapping, metrics, scheduler, dispatcher, BAR, MSI-X, and function ownership before shared capacity is reusable. Default MMIO rejects runtime mutation. Automatic guest notification remains outside the pinned live corpus, and native-v1 retains no PCI state. Exact native-v2 2.6 through current 2.11 retain startup- or runtime-origin regular-file block and pmem endpoints; current 2.11 additionally retains portable network/MMDS state while reconstructing fresh destination backend authority.",
+      "summary": "Implement the complete pinned Developer Preview live-device contract for non-root virtio-block, virtio-pmem, and virtio-net under public all-virtio PCI. Running and Paused PUT/DELETE use one failure-atomic owner inventory, require manual guest rescan/removal, preserve type-scoped IDs and global network-MAC uniqueness, commit live configuration last, and release exact backing, packet-I/O, mapping, metrics, scheduler, dispatcher, BAR, MSI-X, and function ownership before shared capacity is reusable. Default MMIO rejects runtime mutation. Automatic guest notification remains outside the pinned live corpus, and native-v1 retains no PCI state. Exact native-v2 2.6 through current 2.12 retain startup- or runtime-origin regular-file block and pmem endpoints; exact 2.11 additionally retains portable network/MMDS state while reconstructing fresh destination backend authority, and current 2.12 may compose portable vsock state with fresh socket authority.",
       "source_refs": [
         "corpus:device-hotplug"
       ],
@@ -8854,7 +8956,7 @@
     {
       "id": "corpus:memory-hotplug",
       "family": "memory-devices",
-      "summary": "The applicable pinned Firecracker v1.16 virtio-mem corpus is implemented and verified: strict API sizing/status, block-granular STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe shared-aperture/HVF/dirty ownership, exact rollback, best-effort discard, metrics, MMIO/PCI capture and restoration, failures, and cleanup. Exact native-v2 2.10 optional kind 11 retains bounded configuration, features, config space, queue cursors, transport, and canonical plugged topology across all sixteen optional-product combinations; current 2.11 carries that state unchanged when network/MMDS is present. File/COW restore gives every destination private base RAM plus one fresh shared reservation with block-granular plugged views. Signed direct and normal-production/App Sandbox MMIO/PCI guests verify nonzero plugged-memory sentinels before mutation, then continue partial UNPLUG, reprobe UNPLUG_ALL/replug, PLUG, and final UNPLUG through explicit-Paused/recapture and automatic fresh-process clones. Same-process peers load one immutable pair independently; malformed/cancellation/death cases clean all unpublished authority. Diff, native-v2 Uffd, vsock restore, Firecracker artifact bytes, source owner/dirty identity, synchronous RSS, and unconstrained cross-host portability are not claimed.",
+      "summary": "The applicable pinned Firecracker v1.16 virtio-mem corpus is implemented and verified: strict API sizing/status, block-granular STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe shared-aperture/HVF/dirty ownership, exact rollback, best-effort discard, metrics, MMIO/PCI capture and restoration, failures, and cleanup. Exact native-v2 2.10 optional kind 11 retains bounded configuration, features, config space, queue cursors, transport, and canonical plugged topology across all sixteen pre-network optional-product combinations; current 2.12 carries that state unchanged when network/MMDS and vsock are present. File/COW restore gives every destination private base RAM plus one fresh shared reservation with block-granular plugged views. Signed direct and normal-production/App Sandbox MMIO/PCI guests verify nonzero plugged-memory sentinels before mutation, then continue partial UNPLUG, reprobe UNPLUG_ALL/replug, PLUG, and final UNPLUG through explicit-Paused/recapture and automatic fresh-process clones. Same-process peers load one immutable pair independently; malformed/cancellation/death cases clean all unpublished authority. Diff, native-v2 Uffd, Firecracker artifact bytes, source owner/dirty identity, synchronous RSS, and unconstrained cross-host portability are not claimed.",
       "source_refs": [
         "corpus:memory-hotplug"
       ],
@@ -9131,7 +9233,7 @@
     {
       "id": "corpus:pmem",
       "family": "storage",
-      "summary": "The applicable pinned pmem corpus is implemented and verified: strict live API, direct file/private-tail mapping, deterministic root, read-only protection, limiting, exact-prefix persistence, capture-ready traversal, PCI hotplug/delete/range reuse, rollback, metrics, cleanup, direct ownership, contained descriptor authority, and native-v2 profile-3 serialization and restore from exact 2.6 through current 2.11. Signed direct and normal-production MMIO/PCI matrices certify rooted pmem-only and rootless mixed-storage guests, immutable state/memory reuse, shared writable prefixes, fresh zero private tails, read-only peers, limiter continuation, recapture, and cleanup. DAX choice, host paging/RSS/eviction, same-backing sharing, side-channel risk, operator serialization, and cross-host portability remain documented policy rather than Linux numeric or Firecracker-artifact promises.",
+      "summary": "The applicable pinned pmem corpus is implemented and verified: strict live API, direct file/private-tail mapping, deterministic root, read-only protection, limiting, exact-prefix persistence, capture-ready traversal, PCI hotplug/delete/range reuse, rollback, metrics, cleanup, direct ownership, contained descriptor authority, and native-v2 profile-3 serialization and restore from exact 2.6 through current 2.12. Signed direct and normal-production MMIO/PCI matrices certify rooted pmem-only and rootless mixed-storage guests, immutable state/memory reuse, shared writable prefixes, fresh zero private tails, read-only peers, limiter continuation, recapture, and cleanup. DAX choice, host paging/RSS/eviction, same-backing sharing, side-channel risk, operator serialization, and cross-host portability remain documented policy rather than Linux numeric or Firecracker-artifact promises.",
       "source_refs": [
         "corpus:pmem"
       ],
@@ -9540,11 +9642,50 @@
     {
       "id": "corpus:vsock",
       "family": "vsock",
-      "summary": "The applicable API, live queues, routing, credit, reset, metrics, authority, cleanup, capture-ready state, and destination-resource producer are implemented. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns aggregate optional-device encoding and placement, public restore invocation, restored acknowledgement, reconnect and override proof, clone/version policy, and artifact/host portability.",
+      "summary": "The applicable pinned Firecracker v1.16 vsock corpus is implemented and verified across strict API configuration, MMIO/PCI queues, routing, credit, reset, metrics, direct/App Sandbox authority, cleanup, and Bangbang-native native-v2 2.12 Full/File snapshot create/load. Snapshot state retains CID, selector, host-port cursor, virtio queues and placement while normalizing live work empty; restored Linux observes TRANSPORT_RESET, preserved listeners, fresh bidirectional multistream/half-close traffic, RX acknowledgement gating and live TX. Original and override Paused/automatic clones have isolated sockets, metrics, sessions and cursors; hostile artifacts, missing authority, cancellation and both death orders fail closed. Firecracker artifact bytes, live peer migration, Diff/Uffd, and unconstrained cross-host portability remain excluded.",
       "source_refs": [
         "corpus:vsock"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live and native-v2 2.12 vsock capture restore process integration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_vsock_platform.rs",
+          "anchor": "exact MMIO and PCI vsock destination platform plans"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_vsock_v2_12.rs",
+          "anchor": "exact native-v2 2.12 kind-13 state"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "bounded live routing credit reset metrics and restored RX gate"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct live and certified native-v2 vsock MMIO/PCI scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained live and certified native-v2 vsock MMIO/PCI scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "focused packet queue connection cursor reset gating failure metrics and cleanup tests"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:api-sock",
@@ -10992,7 +11133,7 @@
     {
       "id": "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
       "family": "memory-devices",
-      "summary": "Virtio-mem lifecycle, accounting, state, and restore semantics are implemented and verified. Live sizing/status, STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe guest/HVF mappings, dirty metadata, exact reverse rollback, best-effort discard, singleton metrics, opaque shared-aperture identity, MMIO/PCI ownership, failures, cleanup, and stable vhost coexistence are complete. Exact native-v2 2.10 kind 11 canonically binds configuration, features, config space, active/inactive queue state, plugged bitmap/ranges, transport, and unchanged kind-1 memory extents; current 2.11 composes it unchanged with optional network/MMDS state. Restore validates the complete state/memory pair before publication, creates fresh private base RAM and a destination-local shared aperture, copies only plugged bytes into block-granular views, installs a clean dirty epoch, and reconstructs fresh device/interrupt/dispatcher/route/cleanup owners. Signed Linux destinations first verify retained nonzero plugged-memory bytes, then continue partial UNPLUG, driver-reprobe UNPLUG_ALL, re-PLUG, growth, and final UNPLUG over MMIO and PCI through direct and contained explicit/automatic clones. Normalized recapture, immutable same-process and fresh-process pairs, malformed input, cancellation, death ordering, redaction, and cleanup are covered. Diff, native-v2 Uffd, vsock restore, Firecracker artifact bytes, source owner/dirty identity, synchronous RSS, and unconstrained cross-host portability remain explicit non-claims.",
+      "summary": "Virtio-mem lifecycle, accounting, state, and restore semantics are implemented and verified. Live sizing/status, STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe guest/HVF mappings, dirty metadata, exact reverse rollback, best-effort discard, singleton metrics, opaque shared-aperture identity, MMIO/PCI ownership, failures, cleanup, and stable vhost coexistence are complete. Exact native-v2 2.10 kind 11 canonically binds configuration, features, config space, active/inactive queue state, plugged bitmap/ranges, transport, and unchanged kind-1 memory extents; current 2.12 composes it unchanged with optional network/MMDS and vsock state. Restore validates the complete state/memory pair before publication, creates fresh private base RAM and a destination-local shared aperture, copies only plugged bytes into block-granular views, installs a clean dirty epoch, and reconstructs fresh device/interrupt/dispatcher/route/cleanup owners. Signed Linux destinations first verify retained nonzero plugged-memory bytes, then continue partial UNPLUG, driver-reprobe UNPLUG_ALL, re-PLUG, growth, and final UNPLUG over MMIO and PCI through direct and contained explicit/automatic clones. Normalized recapture, immutable same-process and fresh-process pairs, malformed input, cancellation, death ordering, redaction, and cleanup are covered. Diff, native-v2 Uffd, Firecracker artifact bytes, source owner/dirty identity, synchronous RSS, and unconstrained cross-host portability remain explicit non-claims.",
       "source_refs": [
         "corpus:memory-hotplug"
       ],
@@ -11388,13 +11529,47 @@
     {
       "id": "semantic.snapshot:network-vsock-overrides-portability-and-clones",
       "family": "snapshots",
-      "summary": "The public native-v2 profile implements clone time/identity rules, compatible native version dispatch, and repeated isolated File/COW destinations. Exact 2.11 implements portable network/MMDS encoding and MMIO/PCI placement, complete clone-local network overrides, fresh destination ownership, lossy source session semantics, public load invocation, and signed direct/contained restored-guest acknowledgement. Vsock capture and pre-access override/resource preparation exist, but Wave 6 https://github.com/seven332/bangbang/issues/1490 still owns vsock encoding and public restore, editing/version evolution, Firecracker artifact evolution, and broader artifact/host portability.",
+      "summary": "The public Bangbang-native profile implements compatible-minor dispatch and immutable repeated File/COW destinations with fresh time, process, metrics, network and vsock ownership. Exact 2.11 network/MMDS and exact 2.12 vsock encode coherent MMIO/PCI placement, clone-local original or override selectors, lossy source sessions, public Paused/automatic load, restored-guest acknowledgement and independent cursor progression. This is bounded portability across validated Bangbang-native artifacts and explicitly supplied destination authorities; Firecracker bytes, live peer migration, snapshot editing/rebase, Diff/Uffd, and unconstrained cross-host execution are not claimed.",
       "source_refs": [
         "corpus:snapshot-network-clones",
         "corpus:snapshot-random-clones",
         "corpus:snapshot-versioning"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "native-v2 2.11 network and 2.12 vsock public clone dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_network_platform.rs",
+          "anchor": "coherent optional network and vsock MMIO/PCI placement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "File/COW load policy and clone-local network/vsock overrides"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed immutable coexisting network and vsock clone certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal bundle network/MMDS and vsock continuation and containment certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "version File/COW and override policy tests"
+        }
+      ]
     },
     {
       "id": "semantic.specification:api-availability-stability-and-failure-information",
@@ -11466,7 +11641,7 @@
     {
       "id": "semantic.storage:pmem-root-mapping-flush-and-state",
       "family": "storage",
-      "summary": "Selected MMIO/PCI activation, deterministic pmem root, runtime PCI attach/update/delete, one authoritative file/private-tail mapping, exact-prefix persistence, limiting/retry, capacity preflight, exact cleanup, direct or contained descriptor authority, metrics, capture-ready state, and native-v2 profile-3 serialization and restore from exact 2.6 through current 2.11 are implemented and verified. Signed direct and normal-production matrices prove rooted pmem-only and rootless mixed-storage continuation, immutable state/memory reuse, shared writable prefixes, zero private tails on every fresh mapping, read-only protection, recapture, cancellation/fault cleanup, and exact grant ownership. This makes no Firecracker artifact, automatic migration, or broad host-portability claim.",
+      "summary": "Selected MMIO/PCI activation, deterministic pmem root, runtime PCI attach/update/delete, one authoritative file/private-tail mapping, exact-prefix persistence, limiting/retry, capacity preflight, exact cleanup, direct or contained descriptor authority, metrics, capture-ready state, and native-v2 profile-3 serialization and restore from exact 2.6 through current 2.12 are implemented and verified. Signed direct and normal-production matrices prove rooted pmem-only and rootless mixed-storage continuation, immutable state/memory reuse, shared writable prefixes, zero private tails on every fresh mapping, read-only protection, recapture, cancellation/fault cleanup, and exact grant ownership. This makes no Firecracker artifact, automatic migration, or broad host-portability claim.",
       "source_refs": [
         "corpus:pmem"
       ],
@@ -11682,12 +11857,46 @@
     {
       "id": "semantic.vsock:snapshot-override-reset-and-rx-gating",
       "family": "vsock",
-      "summary": "Source-side TRANSPORT_RESET, capture-ready MMIO/PCI state, port cursor preservation, runtime-only RX acknowledgement gating, empty-work reconstruction, and direct/contained override resource preparation are implemented. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns artifact encoding and placement, public restore invocation, restored guest acknowledgement, reconnect and override proof, clone/version policy, and artifact/host portability.",
+      "summary": "Implement Bangbang-native native-v2 2.12 vsock snapshot create/load with source TRANSPORT_RESET, exact MMIO/PCI state and cursor, normalized empty live work, original or overridden direct/contained authority, guest reset acknowledgement before RX, live TX, preserved guest listeners, fresh bidirectional traffic, and independently progressing clones. Signed direct and App Sandbox matrices cover Paused and automatic resume, queued post-restore host work, no-device and malformed rejection, authority failure, cancellation, death, redaction, immutable pairs, recapture and cleanup.",
       "source_refs": [
         "corpus:snapshot-support",
         "corpus:vsock"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "transactional direct and contained public vsock snapshot restore"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_vsock_restore_v2_12.rs",
+          "anchor": "empty-work reconstruction reset RX gate and cursor state"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_vsock_v2_12.rs",
+          "anchor": "exact kind-13 capture and decode contract"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_vsock_snapshot_over_mmio and product_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_vsock_restored_guest_lifecycle_and_containment"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "virtio_vsock_restored_gate_preserves_host_request_until_event_ack"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/compare/curr",

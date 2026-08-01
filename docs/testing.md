@@ -1367,7 +1367,15 @@ native-v2 2.11 with optional network/MMDS kind 12; #1716 promotes exactly the
 network override property, snapshot-network-clones corpus, MMDS user-guide
 corpus, and MMDS TCP/token/session aggregate after direct and
 normal-production/App Sandbox continuation certification. The current overlay
-is 246/152/3/17.
+then contains 246/152/3/17. #1735 activates current native-v2 2.12 with optional
+vsock kind 13. #1736 promotes exactly
+`api-property:SnapshotLoadParams.vsock_override`,
+`api-property:VsockOverride.uds_path`, `api-schema:VsockOverride`,
+`corpus:vsock`,
+`semantic.snapshot:network-vsock-overrides-portability-and-clones`, and
+`semantic.vsock:snapshot-override-reset-and-rx-gating` after strict signed
+direct and normal-production/App Sandbox restored-guest certification. The
+current overlay is 252/146/3/17.
 
 Snapshot paging feasibility, its standalone protocol/client, internal
 lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
@@ -1755,6 +1763,15 @@ may skip execution. On supported Apple Silicon it proves:
   published-socket replacement preservation, concurrent same-ID session
   isolation, fixed redacted output, unchanged networkless entitlements, and no
   ready-state helper, while the normal bundle rejects the probe option;
+- `normal_bundle_certifies_native_v2_vsock_restored_guest_lifecycle_and_containment`,
+  which uses the normal launcher/nested App Sandbox worker over MMIO and PCI to
+  restore original and overridden selectors, prove old-stream reset/loss,
+  event-acknowledged RX release with live TX, preserved guest listeners,
+  deterministic bidirectional multistream/half-close, clone-local cursor/
+  metric/socket ownership, recapture, immutable inputs, replacement safety,
+  malformed/no-device/missing-authority faults, Paused cancellation, both
+  independent death orders, later retry, redaction, unchanged entitlements,
+  and exact staging/session/socket/helper cleanup;
 - source kernel/root/metrics and load state/memory pathnames replaced after the
   launcher opens them, with no tag reopen, no staging residue, redacted
   wrong-role output, and no extra private session namespace;
@@ -2248,6 +2265,49 @@ scripts/run-integration-tests.sh --test production_bundle -- \
   --nocapture
 ```
 
+Current native-v2 2.12 vsock continuation is certified by the separate exact
+tests
+`signed_executable_certifies_native_v2_vsock_snapshot_over_mmio`,
+`signed_executable_certifies_native_v2_vsock_snapshot_over_product_pci`, and
+`normal_bundle_certifies_native_v2_vsock_restored_guest_lifecycle_and_containment`.
+The direct pair creates one real source with a guest-to-host stream and a
+host-to-guest stream retained across capture readiness. Full creation closes
+both source streams, queues `TRANSPORT_RESET`, records the exact host-local
+cursor, and emits kind 13 with no live work.
+
+Two independent direct destinations load the same immutable pair: one through
+the original selector remains Paused while 16 host requests are queued, and a
+second through `vsock_override` automatically resumes and completes first.
+The Paused destination shows no guest marker or reply progress until explicit
+resume. Each guest observes reset on the old streams, acknowledges it, then
+completes four fresh guest-to-host and 16 fresh host-to-guest deterministic
+4-KiB streams through preserved guest listeners. Every stream proves complete
+payload/reply integrity, half-close/EOF behavior, and the exact clone-local
+cursor increment. Recapture records `saved + 16`; source artifacts, destination
+metrics, socket ownership, and clone cursors remain independent.
+
+The production/App Sandbox test repeats original and overridden MMIO/PCI
+destinations through the normal outer launcher, nested worker, and exact grant
+manifests. Process-local serial output is the guest evidence channel. Its
+representative MMIO hostile matrix covers checksum-corrupted state, truncated
+memory, a no-device override, a missing exact vsock-selector grant, Paused
+graceful cancellation, worker-first `SIGKILL`, launcher-first `SIGKILL`, and a
+later valid retry. It also proves pathname replacement resistance, exact
+session/socket/helper cleanup, immutable inputs, and redaction of selector,
+descriptor, grant/session, connection, and payload authority.
+
+Run the focused signed proofs with:
+
+```sh
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  signed_executable_certifies_native_v2_vsock_snapshot_over_mmio --exact
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  signed_executable_certifies_native_v2_vsock_snapshot_over_product_pci --exact
+scripts/run-integration-tests.sh --test production_bundle -- \
+  normal_bundle_certifies_native_v2_vsock_restored_guest_lifecycle_and_containment \
+  --exact
+```
+
 Runtime `PATCH /balloon` target-size updates are covered by unit, API socket,
 and process-session tests that verify stored config updates, active config-space
 generation changes, and config interrupt signaling. Guest-reported statistics
@@ -2646,6 +2706,14 @@ fresh marker/ack exchange before writing
 `BANGBANG_VSOCK_SNAPSHOT_RESET_OK`. The Paused destination is recaptured, and
 separate signed MMIO and product-PCI plus normal production/App Sandbox cases
 exercise the sequence and listener cleanup.
+With `bangbang.vsock-snapshot-certify=1`, the rootfs instead runs the independent
+2.12 completion protocol. It retains one stream in each direction, publishes a
+source-ready marker, observes both restored resets, and then runs four fresh
+guest-to-host plus 16 prebound-listener host-to-guest deterministic 4-KiB
+streams. Exact per-stream markers expose reply integrity, half-close/EOF,
+listener completion, cursor order, and final success without writing a shared
+control drive. Serial markers are emitted in bounded chunks so the guest
+protocol cannot block on UART backpressure.
 When
 the boot args include `bangbang.vsock-host-connect=1`, Python instead binds and
 listens on the test AF_VSOCK port, writes
@@ -2719,19 +2787,23 @@ guest memory; it keeps reset-attempt and source-normalization evidence separate
 while detaching connection work only after validation and retaining the source
 listener/connector for fresh traffic. Signed HVF coverage exercises
 inactive, published, empty-queue, cancellation, ack, and both transport owners.
-The process tests above prove the real Linux reset/reconnect boundary and the
-unchanged public rejection with zero artifacts. Focused destination tests prove
+The activation process tests prove the real Linux reset/reconnect boundary and
+exact native-v2 2.12 kind-13 artifact creation. Focused destination tests prove
 pure captured/override selector resolution before resource access, owner-only
 stale-safe direct publication and exact cleanup, transactional contained
 directory/broker reservation with no ambient fallback, cancellation rollback,
 single-use runtime consumption, retryable preactivation failure, and terminal
-postactivation failure. Public native-v2 artifacts still omit vsock
-encoding/placement and public load rejects overrides. The checked vsock ledger
-certifies the eight API/live records; the exact six aggregate invocation,
-restored acknowledgement/reconnect/override, clone/version, and portability
-outcomes remain #1490 work.
-The signed transfer is a compatibility/progress gate, not a general performance,
-Firecracker artifact, or snapshot-parity claim.
+postactivation failure. The strict #1736 direct MMIO/PCI tests add simultaneous
+immutable original/override clones, Paused work gating, preserved listeners,
+four guest-to-host plus 16 host-to-guest deterministic 4-KiB streams,
+half-close/EOF, exact clone-local cursor continuation, recapture, fresh metrics,
+and cleanup. The strict normal-production/App Sandbox MMIO/PCI test adds exact
+grant authority, replacement, malformed/no-device/missing-authority failures,
+cancellation, both death orders, retry, redaction, containment, and
+session/socket/helper cleanup. The checked vsock ledger certifies all 14
+API/live/snapshot records. This is a bounded Bangbang-native compatibility/
+progress gate, not general performance, Firecracker artifact, live-peer
+migration, or unconstrained portability evidence.
 
 The production-bundle socket-directory cases exercise the same guest protocol
 through contained host authority. Host initiation enters through the supplied

@@ -50,10 +50,10 @@ claims mechanically visible.
   ledger, completed by #1634's pmem snapshot certification. It pins the exact
   40-record family with 40 terminal outcomes, field-specific implementation
   evidence, and signed direct/production live plus exact native-v2 2.6/current
-  2.11 create/load/cleanup proof.
+  2.12 create/load/cleanup proof.
 - [`balloon-contract.md`](balloon-contract.md) is the #1473 balloon ledger. It
   pins all 52 records as terminal after #1681, records publication-safe paired
-  PFN accounting, exact 2.9 kind-10 state retained unchanged by current 2.11,
+  PFN accounting, exact 2.9 kind-10 state retained unchanged by current 2.12,
   coherent MMIO/PCI fresh ownership, and signed direct/contained restored-guest
   continuation.
 - [`memory-hotplug-contract.md`](memory-hotplug-contract.md) is the #1474
@@ -71,7 +71,7 @@ claims mechanically visible.
   and snapshot ledger. It pins all six records as terminal, records default
   stdout, configured-output stdin exclusion, bounded terminal/FIFO/pipe RX,
   exact MMIO capture ownership, native-v2 2.7 encoding retained by current
-  2.11, fresh endpoint
+  2.12, fresh endpoint
   reconstruction, signed serial-only and storage-bearing continuation, clone
   loads, recapture, redaction, and cleanup.
 - [`time-identity-contract.md`](time-identity-contract.md) is the
@@ -93,10 +93,11 @@ claims mechanically visible.
   aggregate network/MMDS ledger. It pins an exact 35-record set. Exact 2.11
   snapshot/clone certification raises it to 33 terminal outcomes; two broad
   rows retain explicit #1378 external-vmnet and #1491 performance handoffs.
-- [`vsock-contract.md`](vsock-contract.md) is the #1518 checked aggregate vsock
-  ledger. It pins the exact 14 directly named records, promotes eight complete
-  API/live outcomes, and retains six explicit #1490 optional-device encoding,
-  public restore, clone/version, and portability handoffs.
+- [`vsock-contract.md`](vsock-contract.md) is the #1518/#1735/#1736 checked
+  aggregate vsock ledger. It pins all 14 directly named records as terminal,
+  combining the live API with exact native-v2 2.12 kind-13 encoding, public
+  restore/override, reset/RX/TX, listener, multistream/half-close, cursor,
+  immutable clone, failure, containment, redaction, and cleanup evidence.
 - [`snapshot-paging-contract.md`](snapshot-paging-contract.md) is the
   #1546-#1555 checked public-macOS UFFD-equivalent feasibility, delivery, and
   certification
@@ -576,7 +577,10 @@ quiesced source ownership, and direct/contained destination resources. #1518
 reconciles those producers with the API and signed live evidence in the checked
 [`vsock-contract.md`](vsock-contract.md). Its exact 14-record selector promotes
 eight API/live rows and retains six precise Wave 6 #1490 outcomes, so the
-overlay at that checkpoint was 228/170/3/17.
+overlay at that checkpoint was 228/170/3/17. #1735 later activates exact
+native-v2 2.12 kind 13 and #1736 certifies those six rows through strict signed
+direct and normal-production/App Sandbox MMIO/PCI restore, making all 14
+terminal.
 
 #1546 records the positively challenged public-macOS UFFD-equivalent
 feasibility decision in the checked
@@ -694,8 +698,25 @@ retry, containment, and cleanup without vmnet authority. It promotes exactly
 remains #1378; network performance remains #1491; vsock, Diff, native-v2 Uffd,
 Firecracker artifact compatibility, editing/tools, source packets/connections,
 and unconstrained portability remain explicit nonclaims. The current overlay
-is 246/152/3/17, and the checked network/MMDS ledger is 33 terminal with two
-audit-required rows.
+at that checkpoint was 246/152/3/17, and the checked network/MMDS ledger is 33
+terminal with two audit-required rows.
+
+#1735 then activates exact `2.12.0` with optional singleton vsock kind 13 across
+all 64 products. The bounded `BANGVS2\0` value retains CID, logical selector,
+host-local cursor, queue/common-virtio, reset/interrupt, and MMIO/PCI placement
+while excluding live connections, accepts, packets, wakeups, deadlines,
+metrics, descriptors, grants, sessions, and host handles. #1736 certifies
+strict signed direct MMIO/PCI simultaneous original/override clones, old-stream
+reset/loss, Paused RX gating with live TX, preserved listeners, four
+guest-to-host plus 16 host-to-guest deterministic 4-KiB streams, half-close,
+exact cursor continuation, recapture, fresh metrics, immutable artifacts, and
+cleanup. Its normal-production/App Sandbox MMIO/PCI matrix adds exact grants,
+replacement safety, malformed state/memory, no-device and missing-authority
+faults, cancellation, both death orders, later retry, redaction, containment,
+and session/socket/helper cleanup. Exactly the three `VsockOverride` API
+identities, `corpus:vsock`, the snapshot network/vsock clone semantic, and the
+vsock reset/RX-gating semantic become terminal. The current overlay is
+252/146/3/17.
 
 ## Commands
 
