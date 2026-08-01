@@ -22643,6 +22643,7 @@ where
         network_completion,
         resource_count,
         taken_count: 0,
+        handoff_failed: false,
     })
 }
 
@@ -22666,6 +22667,7 @@ where
     network_completion: PreparedProcessSnapshotV2NetworkRestoreCompletion<B>,
     resource_count: usize,
     taken_count: usize,
+    handoff_failed: bool,
 }
 
 impl<B> PreparedProcessSnapshotV2VsockRestoreBatch<B>
@@ -22706,8 +22708,10 @@ where
     }
 
     fn wrong_typed_resource(
+        &mut self,
         resource: PreparedProcessSnapshotV2VsockRestoreResource,
     ) -> ProcessSnapshotV2VsockRestoreResourceError {
+        self.handoff_failed = true;
         let evidence = resource.abort();
         ProcessSnapshotV2VsockRestoreResourceError::terminal(
             ProcessSnapshotV2VsockRestoreResourceStage::Take,
@@ -22722,7 +22726,7 @@ where
     ) -> Result<BlockFileBacking, ProcessSnapshotV2VsockRestoreResourceError> {
         match self.take_bound(key)? {
             PreparedProcessSnapshotV2VsockRestoreResource::Block(backing) => Ok(backing),
-            resource => Err(Self::wrong_typed_resource(resource)),
+            resource => Err(self.wrong_typed_resource(resource)),
         }
     }
 
@@ -22732,7 +22736,7 @@ where
     ) -> Result<PmemFileBacking, ProcessSnapshotV2VsockRestoreResourceError> {
         match self.take_bound(key)? {
             PreparedProcessSnapshotV2VsockRestoreResource::Pmem(backing) => Ok(backing),
-            resource => Err(Self::wrong_typed_resource(resource)),
+            resource => Err(self.wrong_typed_resource(resource)),
         }
     }
 
@@ -22742,7 +22746,7 @@ where
     ) -> Result<SerialOutputFile, ProcessSnapshotV2VsockRestoreResourceError> {
         match self.take_bound(key)? {
             PreparedProcessSnapshotV2VsockRestoreResource::Serial(output) => Ok(output),
-            resource => Err(Self::wrong_typed_resource(resource)),
+            resource => Err(self.wrong_typed_resource(resource)),
         }
     }
 
@@ -22755,7 +22759,7 @@ where
     > {
         match self.take_bound(key)? {
             PreparedProcessSnapshotV2VsockRestoreResource::Network(resource) => Ok(resource),
-            resource => Err(Self::wrong_typed_resource(resource)),
+            resource => Err(self.wrong_typed_resource(resource)),
         }
     }
 
@@ -22771,12 +22775,16 @@ where
             .map_err(ProcessSnapshotV2VsockAdoptionError::Resources)?;
         let PreparedProcessSnapshotV2VsockRestoreResource::Vsock(resource) = resource else {
             return Err(ProcessSnapshotV2VsockAdoptionError::Resources(
-                Self::wrong_typed_resource(resource),
+                self.wrong_typed_resource(resource),
             ));
         };
-        resource
-            .adopt(reconstruct)
-            .map_err(ProcessSnapshotV2VsockAdoptionError::Adoption)
+        match resource.adopt(reconstruct) {
+            Ok(adopted) => Ok(adopted),
+            Err(source) => {
+                self.handoff_failed = true;
+                Err(ProcessSnapshotV2VsockAdoptionError::Adoption(source))
+            }
+        }
     }
 
     pub(crate) fn abort(self) -> Result<(), ProcessSnapshotV2VsockRestoreResourceError> {
@@ -22797,6 +22805,7 @@ where
             network_completion,
             resource_count: _,
             taken_count,
+            handoff_failed,
         } = self;
         let evidence = abort_process_snapshot_v2_vsock_values(bindings.into_values()).merge(
             abort_process_snapshot_v2_vsock_completions(
@@ -22804,7 +22813,8 @@ where
                 Some(file_completion),
             ),
         );
-        match process_snapshot_v2_vsock_cleanup_error(evidence, taken_count != 0) {
+        match process_snapshot_v2_vsock_cleanup_error(evidence, taken_count != 0 || handoff_failed)
+        {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -22833,6 +22843,7 @@ where
             network_completion,
             resource_count,
             taken_count,
+            handoff_failed,
         } = self;
         match bindings.finish() {
             Ok(()) => (),
@@ -22853,7 +22864,7 @@ where
                 return Err(error);
             }
         };
-        if taken_count != resource_count {
+        if handoff_failed || taken_count != resource_count {
             let evidence = abort_process_snapshot_v2_vsock_completions(
                 Some(network_completion),
                 Some(file_completion),
@@ -22892,6 +22903,7 @@ where
             .field("resource_count", &self.resource_count)
             .field("remaining_count", &self.remaining_count())
             .field("taken_count", &self.taken_count)
+            .field("handoff_failed", &self.handoff_failed)
             .field("has_vsock", &self.vsock_state.is_some())
             .field("state", &"<redacted>")
             .finish()
@@ -41354,6 +41366,71 @@ mod tests {
             .expect("the empty file/network completions should abort cleanly");
         drop(guard);
         assert!(!destination.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_failed_vsock_adoption_cannot_finish_the_batch() {
+        for consume_before_failure in [false, true] {
+            let socket =
+                TempFilePath::absent(&format!("v2-adopt-failure-{consume_before_failure}.sock"));
+            let destination = socket.path().to_path_buf();
+            let (plan, _) = prepared_native_v2_vsock_resource_plan(&destination, false);
+            let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+            let mut batch =
+                super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+                    plan,
+                    None,
+                    "private-failed-adoption-instance",
+                    bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                    &mut factory,
+                    |_| false,
+                )
+                .expect("canonical direct vsock resources should prepare");
+            let key = batch.resource_keys()[0].clone();
+            let private_source = "private aggregate adoption failure";
+
+            let adoption = batch
+                .adopt_vsock(&key, |resource| {
+                    if consume_before_failure {
+                        resource
+                            .consume_for_test()
+                            .expect("the test endpoint should consume once");
+                    }
+                    Err::<(), _>(private_source)
+                })
+                .expect_err("the injected reconstruction failure should be retained");
+            assert_eq!(
+                adoption.disposition(),
+                if consume_before_failure {
+                    super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+                } else {
+                    super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+                }
+            );
+            assert_eq!(batch.remaining_count(), 0);
+            assert!(!destination.exists());
+            let diagnostics = format!("{adoption:?} {adoption}");
+            assert!(!diagnostics.contains(private_source));
+            assert!(!diagnostics.contains(destination.to_string_lossy().as_ref()));
+
+            let error = batch
+                .finish()
+                .expect_err("a failed typed handoff must prevent aggregate completion");
+            assert_eq!(
+                error.stage,
+                super::ProcessSnapshotV2VsockRestoreResourceStage::Finish
+            );
+            assert!(matches!(
+                error.kind,
+                super::ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch
+            ));
+            assert_eq!(
+                error.disposition(),
+                super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+            );
+            assert!(!error.cleanup_uncertain());
+        }
     }
 
     #[cfg(target_os = "macos")]
