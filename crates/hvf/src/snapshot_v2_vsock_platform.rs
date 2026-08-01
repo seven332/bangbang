@@ -343,7 +343,11 @@ fn validate_prepared_vsock(
         PreparedSnapshotV2VsockRestoreState::Pci(state) => state.capture().device(),
     };
     if device.guest_cid() != u64::from(endpoint.config.guest_cid())
-        || device.backend_selector().path() != endpoint.config.uds_path()
+        || endpoint
+            .state
+            .clone()
+            .into_destination_normalized_state(&endpoint.config)
+            .is_err()
     {
         return Err(PrepareHvfSnapshotV2VsockPlatformPlanError::Vsock);
     }
@@ -858,6 +862,24 @@ impl HvfSnapshotV2VsockMmioPlatformPlan {
             && matches_vsock_identity_mmio(self.vsock.as_ref(), vsock)
             && self.binding_keys == binding_keys
     }
+
+    pub(crate) fn into_owner_parts(self) -> HvfSnapshotV2VsockMmioPlatformOwnerParts {
+        HvfSnapshotV2VsockMmioPlatformOwnerParts {
+            kind: self.kind,
+            base: self.base,
+            vsock: self.vsock,
+            serial_resource_present: self.serial_resource_present,
+            binding_keys: self.binding_keys,
+        }
+    }
+}
+
+pub(crate) struct HvfSnapshotV2VsockMmioPlatformOwnerParts {
+    pub(crate) kind: HvfSnapshotV2VsockProductKind,
+    pub(crate) base: HvfSnapshotV2NetworkMmioPlatformPlan,
+    pub(crate) vsock: Option<HvfSnapshotV2VsockMmioEndpointPlan>,
+    pub(crate) serial_resource_present: bool,
+    pub(crate) binding_keys: Vec<SnapshotRestoreResourceKey>,
 }
 
 impl fmt::Debug for HvfSnapshotV2VsockMmioPlatformPlan {

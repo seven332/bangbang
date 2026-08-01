@@ -167,6 +167,19 @@ fn explicit_override_changes_only_destination_intent() {
         std::path::Path::new(destination)
     );
     assert!(topology.request().is_overridden());
+    let destination_state = topology
+        .state()
+        .clone()
+        .into_destination_normalized_state(topology.request().config())
+        .expect("override should normalize to the selected destination");
+    assert_eq!(
+        destination_state.backend_selector().path(),
+        std::path::Path::new(destination)
+    );
+    assert_eq!(
+        destination_state.guest_cid(),
+        u64::from(topology.request().config().guest_cid())
+    );
     let debug = format!("{topology:?} {:?}", topology.request());
     assert!(!debug.contains(destination));
     assert!(!debug.contains(captured.to_string_lossy().as_ref()));

@@ -11295,6 +11295,16 @@ pub struct VsockMmioDeviceRegistration {
 }
 
 impl VsockMmioDeviceRegistration {
+    /// Reconstructs registration metadata from an already-validated restore
+    /// plan.
+    pub fn from_restored(guest_cid: u32, uds_path: PathBuf, region: MmioRegion) -> Self {
+        Self {
+            guest_cid,
+            uds_path,
+            region,
+        }
+    }
+
     pub const fn guest_cid(&self) -> u32 {
         self.guest_cid
     }
@@ -11585,7 +11595,7 @@ mod tests {
         VsockHostLocalPort, VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError,
         VsockHostLocalPortCursor, VsockHostLocalPortCursorError, VsockHostLocalPortError,
         VsockHostSocketAcceptError, VsockHostSocketOwner, VsockHostSocketOwnerError,
-        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
+        VsockMmioDevice, VsockMmioDeviceRegistration, VsockMmioLayout, VsockMmioRegistrationError,
         is_transient_host_socket_accept_error, is_transient_host_socket_read_error,
         parse_vsock_host_connect_request, prepare_direct_vsock_restore, virtio_vsock_mmio_handler,
     };
@@ -16170,6 +16180,27 @@ mod tests {
             .expect("registered vsock handler should be present");
         assert!(!handler.is_device_activated());
         assert!(!handler.activation_handler().is_activated());
+    }
+
+    #[test]
+    fn restored_vsock_mmio_registration_retains_exact_independent_metadata() {
+        let region = vsock_mmio_layout()
+            .region()
+            .expect("fixture MMIO region should validate");
+        let registration = VsockMmioDeviceRegistration::from_restored(
+            42,
+            PathBuf::from("restored-vsock.sock"),
+            region,
+        );
+        let mut clone = registration.clone();
+
+        assert_eq!(registration.guest_cid(), 42);
+        assert_eq!(registration.uds_path(), Path::new("restored-vsock.sock"));
+        assert_eq!(registration.region(), region);
+        assert_eq!(clone, registration);
+        clone.uds_path.push("independent");
+        assert_eq!(registration.uds_path(), Path::new("restored-vsock.sock"));
+        assert_ne!(clone, registration);
     }
 
     #[test]

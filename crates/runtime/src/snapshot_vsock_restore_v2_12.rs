@@ -234,6 +234,27 @@ impl PreparedSnapshotV2VsockRestoreState {
             }
         }
     }
+
+    /// Consumes checked source state and projects the exact state expected
+    /// from a live destination using the already-validated destination
+    /// configuration.
+    pub fn into_destination_normalized_state(
+        self,
+        config: &VsockConfig,
+    ) -> Result<SnapshotV2VsockState, SnapshotV2VsockRestorePreparationError> {
+        let normalized = self
+            .into_normalized_state()
+            .map_err(SnapshotV2VsockRestorePreparationError::Normalize)?;
+        if normalized.guest_cid() != u64::from(config.guest_cid()) {
+            return Err(SnapshotV2VsockRestorePreparationError::Config);
+        }
+        let mut parts = normalized.into_parts();
+        parts.backend_selector =
+            crate::vsock::VsockBackendSelector::try_from_path(config.uds_path())
+                .map_err(|_| SnapshotV2VsockRestorePreparationError::Config)?;
+        SnapshotV2VsockState::try_from_parts(parts)
+            .map_err(|_| SnapshotV2VsockRestorePreparationError::StateMismatch)
+    }
 }
 
 impl fmt::Debug for PreparedSnapshotV2VsockRestoreState {
