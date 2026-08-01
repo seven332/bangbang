@@ -1922,7 +1922,7 @@ fn configure_and_start_production_vsock_snapshot_source(socket: &Path, context: 
                 "drive_id": "rootfs",
                 "path_on_host": SNAPSHOT_ROOT_REF,
                 "is_root_device": true,
-                "is_read_only": true,
+                "is_read_only": false,
                 "cache_type": "Unsafe",
                 "io_engine": "Async",
             }),
@@ -2194,8 +2194,9 @@ fn run_certified_production_vsock_snapshot_restore(
     baseline_sessions: &[PathBuf],
 ) {
     let transport = if enable_pci { "pci" } else { "mmio" };
-    let source_fixture =
-        SnapshotVsockSourceGrantFixture::new(&format!("{transport}-vsock-certified-source"));
+    let source_fixture = SnapshotVsockSourceGrantFixture::new_with_read_only_root(&format!(
+        "{transport}-vsock-certified-source"
+    ));
     let source_sensitive = source_fixture.sensitive_strings();
     let source_guest_listeners = bind_certified_production_vsock_guest_listeners(
         &source_fixture,
@@ -2515,7 +2516,7 @@ fn run_certified_production_vsock_rejected_load(
     case: &str,
     baseline_sessions: &[PathBuf],
 ) {
-    let fixture = SnapshotVsockContinuationInputGrantFixture::new(
+    let fixture = SnapshotVsockContinuationInputGrantFixture::new_with_read_only_root(
         &format!("certified-hostile-{case}"),
         sources.clone(),
         false,
@@ -2611,7 +2612,7 @@ fn run_certified_production_vsock_missing_grant_rejection(
     artifacts: SnapshotArtifactSet,
     baseline_sessions: &[PathBuf],
 ) -> SnapshotArtifactSet {
-    let fixture = SnapshotVsockContinuationInputGrantFixture::new(
+    let fixture = SnapshotVsockContinuationInputGrantFixture::new_with_read_only_root(
         "certified-missing-vsock-grant",
         artifacts,
         false,
@@ -2729,7 +2730,7 @@ fn run_certified_production_vsock_paused_shutdown(
         CertifiedProductionVsockShutdownOrder::WorkerFirst => ("worker-first", true),
         CertifiedProductionVsockShutdownOrder::LauncherFirst => ("launcher-first", false),
     };
-    let fixture = SnapshotVsockContinuationInputGrantFixture::new(
+    let fixture = SnapshotVsockContinuationInputGrantFixture::new_with_read_only_root(
         &format!("certified-paused-{name}"),
         artifacts,
         false,
@@ -2869,7 +2870,7 @@ fn configure_and_start_certified_production_vsock_source(socket: &Path, context:
                 "drive_id": "rootfs",
                 "path_on_host": SNAPSHOT_ROOT_REF,
                 "is_root_device": true,
-                "is_read_only": false,
+                "is_read_only": true,
                 "cache_type": "Unsafe",
                 "io_engine": "Async",
             }),
@@ -2928,8 +2929,12 @@ fn run_certified_production_vsock_destination(
         case,
         baseline_sessions,
     } = destination;
-    let fixture =
-        SnapshotVsockContinuationInputGrantFixture::new(case, artifacts, recapture, use_override);
+    let fixture = SnapshotVsockContinuationInputGrantFixture::new_with_read_only_root(
+        case,
+        artifacts,
+        recapture,
+        use_override,
+    );
     let sensitive = fixture.sensitive_strings();
     let guest_listeners = bind_certified_production_vsock_guest_listeners(
         &fixture,
@@ -13582,6 +13587,12 @@ impl SnapshotVsockSourceGrantFixture {
         }
     }
 
+    fn new_with_read_only_root(case: &str) -> Self {
+        let fixture = Self::new(case);
+        make_snapshot_root_grant_read_only(&fixture.snapshot.manifest);
+        fixture
+    }
+
     fn socket(&self) -> PathBuf {
         self.vsock_directory.join(SNAPSHOT_VSOCK_SOURCE_CHILD)
     }
@@ -13623,6 +13634,43 @@ fn append_snapshot_vsock_grant(manifest_path: &Path, id: &str, directory: &Path)
         serde_json::to_vec(&manifest).expect("snapshot-vsock manifest should serialize"),
     )
     .expect("snapshot-vsock manifest should update");
+}
+
+fn make_snapshot_root_grant_read_only(manifest_path: &Path) {
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(manifest_path).expect("snapshot root manifest should read"),
+    )
+    .expect("snapshot root manifest should parse");
+    let grants = manifest
+        .get_mut("grants")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("snapshot root manifest should contain grants");
+    let mut root_grants = grants.iter_mut().filter(|grant| {
+        grant.get("id").and_then(serde_json::Value::as_str) == Some(SNAPSHOT_ROOT_ID)
+    });
+    let root = root_grants
+        .next()
+        .expect("snapshot root manifest should contain its root grant");
+    assert!(
+        root_grants.next().is_none(),
+        "snapshot root manifest should contain exactly one root grant"
+    );
+    assert_eq!(
+        root.get("role").and_then(serde_json::Value::as_str),
+        Some("drive-backing"),
+        "snapshot root grant role should remain exact"
+    );
+    assert_eq!(
+        root.get("access").and_then(serde_json::Value::as_str),
+        Some("read-write"),
+        "snapshot root grant should start read-write"
+    );
+    root["access"] = serde_json::Value::String("read-only".to_owned());
+    fs::write(
+        manifest_path,
+        serde_json::to_vec(&manifest).expect("snapshot root manifest should serialize"),
+    )
+    .expect("snapshot root manifest should update");
 }
 
 fn snapshot_vsock_port_path(socket: &Path, port: u32) -> PathBuf {
@@ -14288,6 +14336,17 @@ impl SnapshotVsockContinuationInputGrantFixture {
             selector_ref,
             selector_child,
         }
+    }
+
+    fn new_with_read_only_root(
+        case: &str,
+        sources: SnapshotArtifactSet,
+        with_recapture: bool,
+        use_override: bool,
+    ) -> Self {
+        let fixture = Self::new(case, sources, with_recapture, use_override);
+        make_snapshot_root_grant_read_only(&fixture.snapshot.manifest);
+        fixture
     }
 
     fn socket(&self) -> PathBuf {
