@@ -2301,6 +2301,7 @@ mod tests {
     use bangbang_runtime::metrics::{
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
     };
+    use bangbang_runtime::mmds::MmdsStateHandle;
     use bangbang_runtime::network::{NetworkInterfaceConfigs, NetworkRuntimeMutationError};
     use bangbang_runtime::serial::{
         CaptureReadySerialState, SerialConfig, SerialConfigInput, SerialMmioDevice,
@@ -2308,13 +2309,14 @@ mod tests {
     use bangbang_runtime::snapshot::{
         SnapshotLoadInput, SnapshotV1ControllerCommit, SnapshotV2ControllerCommit,
         SnapshotV2ControllerCommitProductConfigs, SnapshotV2NetworkControllerCommitProductConfigs,
+        SnapshotV2VsockControllerCommitProductConfigs,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_artifact::load_native_snapshot_artifacts;
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactState,
         NativeSnapshotPublicationOutcome, NativeV2MemoryHotplugSnapshotPreparation,
-        NativeV2NetworkSnapshotCandidateState, SnapshotArtifactPaths, SnapshotPublicationOutcome,
+        NativeV2VsockSnapshotCandidateState, SnapshotArtifactPaths, SnapshotPublicationOutcome,
         publish_native_snapshot_artifacts_with, publish_snapshot_artifacts_with,
     };
     use bangbang_runtime::snapshot_balloon_v2_9::{
@@ -2343,6 +2345,7 @@ mod tests {
     use bangbang_runtime::snapshot_serial_v2_7::{
         NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
     };
+    use bangbang_runtime::snapshot_vsock_v2_12::NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
     use bangbang_runtime::startup::Arm64BootResources;
     use bangbang_runtime::{BackendError, VmmActionError, VmmController};
 
@@ -2359,8 +2362,8 @@ mod tests {
         ProcessSnapshotV2NetworkLoadRequest, ProcessSnapshotV2RootLoadCompletion,
         ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess,
         ProcessSnapshotV2SerialLoadRequest, ProcessSnapshotV2StorageLoadRequest,
-        ProcessSnapshotV2StorageLoadSuccess, ProcessVmm, ProcessVmnetAuthority,
-        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
+        ProcessSnapshotV2StorageLoadSuccess, ProcessSnapshotV2VsockLoadRequest, ProcessVmm,
+        ProcessVmnetAuthority, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
     };
     use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
 
@@ -3751,6 +3754,174 @@ mod tests {
                 commit,
             ))
         }
+
+        fn load_prepared_snapshot_v2_vsock(
+            &mut self,
+            request: ProcessSnapshotV2VsockLoadRequest<'_>,
+        ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+            let ProcessSnapshotV2VsockLoadRequest {
+                controller: _,
+                vmnet_authority: _,
+                #[cfg(target_os = "macos")]
+                    contained_restore_authority: _,
+                pci_enabled,
+                input,
+                candidate,
+                memory,
+                cancellation,
+            } = request;
+            if !self.snapshot_operations_succeed {
+                return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                    BackendError::InvalidState("test snapshot load failed"),
+                ));
+            }
+            let expected_transport = if pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            };
+            let candidate = candidate
+                .prepare(
+                    &memory,
+                    expected_transport,
+                    input.network_overrides(),
+                    input.vsock_override(),
+                )
+                .map_err(NativeV2SnapshotLoadError::VsockPreparation)?;
+            let drives = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::block_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = DriveConfigInput::new(
+                        config.drive_id(),
+                        config.drive_id(),
+                        config.selector(),
+                        config.is_root(),
+                    )
+                    .with_is_read_only(config.is_read_only())
+                    .with_cache_type(config.cache_type())
+                    .with_io_engine(config.io_engine());
+                    if let Some(partuuid) = config.partuuid() {
+                        input = input.with_partuuid(partuuid);
+                    }
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    input.validate()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let pmem = candidate
+                .device_graph()
+                .into_iter()
+                .flat_map(SnapshotV2StorageDeviceGraph::pmem_records)
+                .map(|record| {
+                    let config = record.config();
+                    let mut input = PmemConfigInput::new(config.pmem_id(), config.selector())
+                        .with_root_device(config.is_root())
+                        .with_read_only(config.is_read_only());
+                    if let Some(rate_limiter) = config.rate_limiter() {
+                        input = input.with_rate_limiter(rate_limiter);
+                    }
+                    PmemConfig::try_from(input)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let storage_configs = candidate
+                .device_graph()
+                .map(|_| CaptureReadyStorageConfigs::new(drives, pmem));
+            let mut serial_input = SerialConfigInput::new();
+            if let Some(selector) = candidate.serial().endpoint_intent().configured_selector() {
+                serial_input = serial_input.with_serial_out_path(selector);
+            }
+            if let Some(rate_limiter) = candidate.serial().rate_limiter() {
+                serial_input = serial_input.with_rate_limiter(rate_limiter);
+            }
+            let serial_config = serial_input
+                .validate()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            let entropy_config = candidate.entropy().map(|state| state.config());
+            let balloon_config = candidate.balloon().map(|state| state.config());
+            let memory_hotplug = candidate
+                .memory_hotplug()
+                .cloned()
+                .map(|state| {
+                    PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
+                        state,
+                        candidate.memory_binding().clone(),
+                        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+                    )
+                })
+                .transpose()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?
+                .map(|topology| topology.controller());
+            let network_configs = NetworkInterfaceConfigs::from_validated(
+                candidate
+                    .network_topology()
+                    .interfaces()
+                    .iter()
+                    .map(|interface| interface.controller().clone())
+                    .collect(),
+            );
+            let mmds_state = candidate
+                .network_topology()
+                .mmds_controller()
+                .map(|config| {
+                    let mut input = MmdsConfigInput::new(config.network_interfaces().to_vec())
+                        .with_version(config.version())
+                        .with_imds_compat(config.imds_compat());
+                    if let Some(address) = config.ipv4_address() {
+                        input = input.with_ipv4_address(address);
+                    }
+                    let state = MmdsStateHandle::default();
+                    state
+                        .with_mut(|state| state.put_config(input, network_configs.as_slice()))
+                        .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?
+                        .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+                    Ok::<_, NativeV2SnapshotLoadError>(state)
+                })
+                .transpose()?;
+            let vsock_config = candidate
+                .vsock_topology()
+                .map(|topology| topology.request().config().clone());
+            if !cancellation.try_seal_commit() {
+                return Err(NativeV2SnapshotLoadError::Cancelled);
+            }
+            let boot_source = BootSourceConfigInput::new("/private/fake-api-restored-vmlinux")
+                .validate()
+                .map_err(|_| {
+                    NativeV2SnapshotLoadError::ProcessPreparation(BackendError::InvalidState(
+                        "fake snapshot boot configuration failed",
+                    ))
+                })?;
+            let machine =
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages());
+            let commit = SnapshotV2ControllerCommit::with_vsock_product_configs(
+                machine,
+                boot_source,
+                SnapshotV2VsockControllerCommitProductConfigs::new(
+                    SnapshotV2NetworkControllerCommitProductConfigs::new(
+                        SnapshotV2ControllerCommitProductConfigs::new(
+                            storage_configs,
+                            serial_config,
+                            entropy_config,
+                            balloon_config,
+                            memory_hotplug,
+                        ),
+                        network_configs,
+                        mmds_state,
+                    ),
+                    vsock_config,
+                ),
+                input.resume_vm(),
+            );
+            Ok(SnapshotV2LoadSuccess::new(
+                TestSession::without_boot_run_loop_status(),
+                commit,
+            ))
+        }
     }
 
     fn test_controller() -> ProcessVmm<TestInstanceStarter> {
@@ -3911,12 +4082,12 @@ mod tests {
             ));
         }
         let encoded = encode_snapshot_v2_state_with_compatibility_version(
-            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
             &[],
             &components,
         )
         .expect("native-v2 fixture state should encode");
-        NativeV2NetworkSnapshotCandidateState::from_network_state_v2_11(encoded)
+        NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(encoded)
             .expect("native-v2 fixture candidate should close")
             .into_current_artifact_state()
     }
@@ -8611,12 +8782,12 @@ mod tests {
         let memory_before = fs::read(&memory_path).expect("committed memory should read");
         let (candidate, _) =
             load_native_snapshot_artifacts(&SnapshotArtifactPaths::new(&state_path, &memory_path))
-                .expect("public exact-2.11 virtio-mem pair should load")
+                .expect("public exact-2.12 virtio-mem pair should load")
                 .into_current_v2_candidate()
                 .expect("public pair should retain its exact current candidate");
         let memory_hotplug = candidate
             .memory_hotplug()
-            .expect("public exact-2.11 pair should contain kind 11");
+            .expect("public exact-2.12 pair should contain kind 11");
         assert_eq!(memory_hotplug.config().total_size_mib(), 1024);
         assert_eq!(
             memory_hotplug.config_space().requested_size(),
@@ -8625,9 +8796,9 @@ mod tests {
         PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
             memory_hotplug.clone(),
             candidate.memory_binding().clone(),
-            NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+            NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         )
-        .expect("public exact-2.11 virtio-mem binding should close");
+        .expect("public exact-2.12 virtio-mem binding should close");
 
         let flush = put_action_over_socket(&mut vmm, "spf", "FlushMetrics");
         assert!(flush.starts_with("HTTP/1.1 204 No Content\r\n"));

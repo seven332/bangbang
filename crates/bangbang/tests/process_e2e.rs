@@ -1229,7 +1229,7 @@ fn executable_rejects_invalid_logger_level_as_bad_configuration() {
 }
 
 #[test]
-fn executable_rejects_snapshot_requests_without_mutating() {
+fn executable_snapshot_request_failures_do_not_mutate() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let logger_path = test_dir.path().join("snapshot-requests.log");
@@ -1277,7 +1277,7 @@ fn executable_rejects_snapshot_requests_without_mutating() {
         (
             "/snapshot/load",
             load_body,
-            r#"{"fault_message":"Snapshot and restore are not supported."}"#,
+            "snapshot artifact load failed during state final open",
             vec![
                 path_text(&load_state_path),
                 path_text(&load_memory_path),

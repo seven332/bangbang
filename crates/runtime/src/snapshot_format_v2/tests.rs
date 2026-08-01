@@ -209,7 +209,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn public_writer_stays_network_eleven_while_internal_vsock_twelve_is_dormant() {
+fn public_writer_is_vsock_twelve_and_retains_network_eleven_compatibility() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -218,7 +218,7 @@ fn public_writer_stays_network_eleven_while_internal_vsock_twelve_is_dormant() {
     );
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
-        NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
     );
     assert_eq!(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY.kind(), 11);
     assert_eq!(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY.instance(), 0);
@@ -573,8 +573,8 @@ fn public_writer_stays_network_eleven_while_internal_vsock_twelve_is_dormant() {
         decoded_network.component(NATIVE_V2_NETWORK_COMPONENT_KEY),
         Some(network)
     );
-    let decoded_current =
-        decode_snapshot_v2_state(&network_state).expect("exact 2.11 is the public current profile");
+    let decoded_current = decode_snapshot_v2_state(&network_state)
+        .expect("the compatible public decoder should retain exact 2.11");
     assert_eq!(
         decoded_current.metadata().version(),
         NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
@@ -612,12 +612,12 @@ fn public_writer_stays_network_eleven_while_internal_vsock_twelve_is_dormant() {
         &[],
         &[network, vsock],
     )
-    .expect("explicit exact 2.12 should admit dormant vsock state");
+    .expect("current exact 2.12 should admit vsock state");
     let decoded_vsock = decode_snapshot_v2_state_with_compatibility_version(
         &vsock_state,
         NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
     )
-    .expect("explicit exact 2.12 should decode dormant vsock state");
+    .expect("current exact 2.12 should decode vsock state");
     assert_eq!(
         decoded_vsock.metadata().version(),
         NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
@@ -626,15 +626,10 @@ fn public_writer_stays_network_eleven_while_internal_vsock_twelve_is_dormant() {
         decoded_vsock.component(NATIVE_V2_VSOCK_COMPONENT_KEY),
         Some(vsock)
     );
-    assert!(matches!(
-        decode_snapshot_v2_state(&vsock_state),
-        Err(SnapshotV2DecodeError::UnsupportedVersion { .. })
-    ));
+    assert!(decode_snapshot_v2_state(&vsock_state).is_ok());
     assert!(matches!(
         decode_native_snapshot_state(&vsock_state),
-        Err(NativeSnapshotFormatError::NativeV2(
-            SnapshotV2DecodeError::UnsupportedVersion { .. }
-        ))
+        Ok(NativeSnapshotState::V2(_))
     ));
     let downgraded_vsock = with_u16_field_and_checksum(&vsock_state, VERSION_MINOR_OFFSET, 11);
     assert_eq!(
@@ -718,11 +713,11 @@ fn version_policy_rejects_major_and_newer_minor_but_accepts_patch() {
         })
     );
 
-    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 12);
+    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 13);
     assert_eq!(
         decode_snapshot_v2_state(&minor),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: SnapshotFormatVersion::new(2, 12, 0),
+            found: SnapshotFormatVersion::new(2, 13, 0),
             supported: NATIVE_V2_SNAPSHOT_VERSION,
         })
     );

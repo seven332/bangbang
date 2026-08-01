@@ -1461,16 +1461,54 @@ pub(super) fn load_prepared_native_snapshot_memory_file_macos(
                     }
                 }
                 NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
-                    return Err(load_error(
-                        SnapshotArtifactLoadStage::StateDecode,
-                        SnapshotArtifactLoadFailure::NativeState(
-                            NativeSnapshotArtifactStateError::CurrentV2Profile(
-                                NativeV2SnapshotCandidateStateError::UnexpectedVersion {
-                                    found: NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
-                                },
-                            ),
-                        ),
-                    ));
+                    let candidate =
+                        NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(bytes.clone())
+                            .map_err(|source| {
+                                load_error(
+                                    SnapshotArtifactLoadStage::StateDecode,
+                                    SnapshotArtifactLoadFailure::NativeState(
+                                        NativeSnapshotArtifactStateError::CurrentV2Profile(source),
+                                    ),
+                                )
+                            })?;
+                    let (_, binding, _, _, _, _, memory_hotplug, _, _) = candidate.into_parts();
+                    match memory_hotplug {
+                        Some(memory_hotplug) => {
+                            let topology =
+                                PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
+                                    memory_hotplug,
+                                    binding,
+                                    NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+                                )
+                                .map_err(|source| {
+                                    load_error(
+                                        SnapshotArtifactLoadStage::StateDecode,
+                                        SnapshotArtifactLoadFailure::MemoryHotplugPreparation(
+                                            NativeV2MemoryHotplugSnapshotPreparationError::Topology(
+                                                source,
+                                            ),
+                                        ),
+                                    )
+                                })?;
+                            materialize_snapshot_v2_memory_hotplug_file(&topology, memory_file)
+                                .map_err(|source| {
+                                    load_error(
+                                        SnapshotArtifactLoadStage::MemoryLoad,
+                                        SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(
+                                            source,
+                                        ),
+                                    )
+                                })?
+                        }
+                        None => load_snapshot_v2_memory_file(&decoded, memory_file).map_err(
+                            |source| {
+                                load_error(
+                                    SnapshotArtifactLoadStage::MemoryLoad,
+                                    SnapshotArtifactLoadFailure::MemoryV2(source),
+                                )
+                            },
+                        )?,
+                    }
                 }
                 _ => load_snapshot_v2_memory_file(&decoded, memory_file).map_err(|source| {
                     load_error(

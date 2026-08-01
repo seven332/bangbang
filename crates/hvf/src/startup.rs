@@ -4106,6 +4106,18 @@ struct RestoredHvfSnapshotV2NetworkMmioInnerOwners {
     vsock: Option<RestoredHvfSnapshotV2VsockMmioMetadata>,
 }
 
+/// Live exact-2.12 MMIO destination parts after retry publication commits.
+#[doc(hidden)]
+pub type RestoredHvfSnapshotV2VsockMmioDestinationParts = (
+    OwnedHvfArm64BootSession,
+    Vec<NetworkInterfaceConfig>,
+    Option<CaptureReadyStorageConfigs>,
+    Option<EntropyConfig>,
+    Option<BalloonConfig>,
+    Option<SnapshotV2MemoryHotplugControllerProjection>,
+    Option<VsockConfig>,
+);
+
 /// Complete exact-2.12 MMIO owner graph with retry publication still gated.
 #[doc(hidden)]
 pub struct RestoredHvfSnapshotV2VsockMmioOwners {
@@ -4200,6 +4212,26 @@ impl RestoredHvfSnapshotV2VsockMmioOwners {
 
     pub fn shutdown(self) -> Result<(), HvfArm64BootSessionShutdownError> {
         self.base.shutdown()
+    }
+
+    /// Extracts the complete live destination projection only after the
+    /// process-level retry-publication gate has committed.
+    pub fn into_destination_parts(
+        mut self,
+    ) -> Result<RestoredHvfSnapshotV2VsockMmioDestinationParts, HvfSnapshotV2NetworkMmioRestoreError>
+    {
+        let vsock_config = self.vsock.take().map(|metadata| metadata.config);
+        let (session, configs, storage, entropy, balloon, memory_hotplug) =
+            self.base.into_destination_parts()?;
+        Ok((
+            session,
+            configs,
+            storage,
+            entropy,
+            balloon,
+            memory_hotplug,
+            vsock_config,
+        ))
     }
 }
 
@@ -4633,6 +4665,18 @@ struct RestoredHvfSnapshotV2NetworkPciInnerOwners {
     vsock: Option<RestoredHvfSnapshotV2VsockPciMetadata>,
 }
 
+/// Live exact-2.12 PCI destination parts after retry publication commits.
+#[doc(hidden)]
+pub type RestoredHvfSnapshotV2VsockPciDestinationParts = (
+    OwnedHvfArm64BootSession,
+    Vec<NetworkInterfaceConfig>,
+    Option<CaptureReadyStorageConfigs>,
+    Option<EntropyConfig>,
+    Option<BalloonConfig>,
+    Option<SnapshotV2MemoryHotplugControllerProjection>,
+    Option<VsockConfig>,
+);
+
 /// Complete exact-2.12 PCI owner graph with retry publication still gated.
 #[doc(hidden)]
 pub struct RestoredHvfSnapshotV2VsockPciOwners {
@@ -4727,6 +4771,26 @@ impl RestoredHvfSnapshotV2VsockPciOwners {
 
     pub fn shutdown(self) -> Result<(), HvfArm64BootSessionShutdownError> {
         self.base.shutdown()
+    }
+
+    /// Extracts the complete live destination projection only after the
+    /// process-level retry-publication gate has committed.
+    pub fn into_destination_parts(
+        mut self,
+    ) -> Result<RestoredHvfSnapshotV2VsockPciDestinationParts, HvfSnapshotV2NetworkPciRestoreError>
+    {
+        let vsock_config = self.vsock.take().map(|metadata| metadata.config);
+        let (session, configs, storage, entropy, balloon, memory_hotplug) =
+            self.base.into_destination_parts()?;
+        Ok((
+            session,
+            configs,
+            storage,
+            entropy,
+            balloon,
+            memory_hotplug,
+            vsock_config,
+        ))
     }
 }
 

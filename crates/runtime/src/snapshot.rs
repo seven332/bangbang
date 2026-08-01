@@ -15,7 +15,7 @@ use crate::pmem::PmemConfigs;
 use crate::serial::SerialConfig;
 use crate::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugControllerProjection;
 use crate::storage_capture::CaptureReadyStorageConfigs;
-use crate::vsock::{VsockBackendSelector, VsockBackendSelectorError};
+use crate::vsock::{VsockBackendSelector, VsockBackendSelectorError, VsockConfig};
 
 const REDACTED: &str = "<redacted>";
 
@@ -30,6 +30,7 @@ type SnapshotV2ControllerCommitParts = (
     Option<SnapshotV2MemoryHotplugControllerProjection>,
     NetworkInterfaceConfigs,
     Option<MmdsStateHandle>,
+    Option<VsockConfig>,
     bool,
 );
 
@@ -44,13 +45,43 @@ pub struct SnapshotV2ControllerCommitProductConfigs {
     memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
 }
 
-/// Complete current exact-2.11 controller product, including destination-only
+/// Complete retained exact-2.11 controller product, including destination-only
 /// network selectors and the optional fresh MMDS owner.
 #[doc(hidden)]
 pub struct SnapshotV2NetworkControllerCommitProductConfigs {
     product: SnapshotV2ControllerCommitProductConfigs,
     network_configs: NetworkInterfaceConfigs,
     mmds_state: Option<MmdsStateHandle>,
+}
+
+/// Complete current exact-2.12 controller product, including destination-only
+/// vsock configuration and every retained exact-2.11 projection.
+#[doc(hidden)]
+pub struct SnapshotV2VsockControllerCommitProductConfigs {
+    product: SnapshotV2NetworkControllerCommitProductConfigs,
+    vsock_config: Option<VsockConfig>,
+}
+
+impl SnapshotV2VsockControllerCommitProductConfigs {
+    /// Closes every exact-2.12 controller projection before publication.
+    pub fn new(
+        product: SnapshotV2NetworkControllerCommitProductConfigs,
+        vsock_config: Option<VsockConfig>,
+    ) -> Self {
+        Self {
+            product,
+            vsock_config,
+        }
+    }
+}
+
+impl fmt::Debug for SnapshotV2VsockControllerCommitProductConfigs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotV2VsockControllerCommitProductConfigs")
+            .field("configuration", &REDACTED)
+            .finish()
+    }
 }
 
 impl SnapshotV2NetworkControllerCommitProductConfigs {
@@ -163,6 +194,7 @@ pub struct SnapshotV2ControllerCommit {
     memory_hotplug: Option<SnapshotV2MemoryHotplugControllerProjection>,
     network_configs: NetworkInterfaceConfigs,
     mmds_state: Option<MmdsStateHandle>,
+    vsock_config: Option<VsockConfig>,
     resume_requested: bool,
 }
 
@@ -184,6 +216,7 @@ impl SnapshotV2ControllerCommit {
             memory_hotplug: None,
             network_configs: NetworkInterfaceConfigs::new(),
             mmds_state: None,
+            vsock_config: None,
             resume_requested,
         }
     }
@@ -207,6 +240,7 @@ impl SnapshotV2ControllerCommit {
             memory_hotplug: None,
             network_configs: NetworkInterfaceConfigs::new(),
             mmds_state: None,
+            vsock_config: None,
             resume_requested,
         })
     }
@@ -231,6 +265,7 @@ impl SnapshotV2ControllerCommit {
             memory_hotplug: None,
             network_configs: NetworkInterfaceConfigs::new(),
             mmds_state: None,
+            vsock_config: None,
             resume_requested,
         }
     }
@@ -256,6 +291,7 @@ impl SnapshotV2ControllerCommit {
             memory_hotplug: None,
             network_configs: NetworkInterfaceConfigs::new(),
             mmds_state: None,
+            vsock_config: None,
             resume_requested,
         }
     }
@@ -279,6 +315,7 @@ impl SnapshotV2ControllerCommit {
             memory_hotplug: None,
             network_configs: NetworkInterfaceConfigs::new(),
             mmds_state: None,
+            vsock_config: None,
             resume_requested,
         }
     }
@@ -305,6 +342,7 @@ impl SnapshotV2ControllerCommit {
             memory_hotplug: None,
             network_configs: NetworkInterfaceConfigs::new(),
             mmds_state: None,
+            vsock_config: None,
             resume_requested,
         }
     }
@@ -334,6 +372,7 @@ impl SnapshotV2ControllerCommit {
             memory_hotplug: None,
             network_configs: NetworkInterfaceConfigs::new(),
             mmds_state: None,
+            vsock_config: None,
             resume_requested,
         }
     }
@@ -364,6 +403,7 @@ impl SnapshotV2ControllerCommit {
             memory_hotplug: None,
             network_configs: NetworkInterfaceConfigs::new(),
             mmds_state: None,
+            vsock_config: None,
             resume_requested,
         }
     }
@@ -398,11 +438,12 @@ impl SnapshotV2ControllerCommit {
             memory_hotplug,
             network_configs: NetworkInterfaceConfigs::new(),
             mmds_state: None,
+            vsock_config: None,
             resume_requested,
         }
     }
 
-    /// Retains current exact-2.11 serial, optional prior products, complete
+    /// Retains exact-2.11 serial, optional prior products, complete
     /// override-resolved network configuration, and a fresh optional MMDS
     /// handle as one atomic destination value.
     #[doc(hidden)]
@@ -438,6 +479,52 @@ impl SnapshotV2ControllerCommit {
             memory_hotplug,
             network_configs,
             mmds_state,
+            vsock_config: None,
+            resume_requested,
+        }
+    }
+
+    /// Retains current exact-2.12 serial, optional prior products, complete
+    /// override-resolved network/MMDS state, and optional destination vsock
+    /// configuration as one atomic destination value.
+    #[doc(hidden)]
+    pub fn with_vsock_product_configs(
+        machine_config: MachineConfig,
+        boot_source_config: BootSourceConfig,
+        configs: SnapshotV2VsockControllerCommitProductConfigs,
+        resume_requested: bool,
+    ) -> Self {
+        let SnapshotV2VsockControllerCommitProductConfigs {
+            product:
+                SnapshotV2NetworkControllerCommitProductConfigs {
+                    product:
+                        SnapshotV2ControllerCommitProductConfigs {
+                            storage_configs,
+                            serial_config,
+                            entropy_config,
+                            balloon_config,
+                            memory_hotplug,
+                        },
+                    network_configs,
+                    mmds_state,
+                },
+            vsock_config,
+        } = configs;
+        let (drive_configs, pmem_configs) = storage_configs
+            .map(CaptureReadyStorageConfigs::into_parts)
+            .unwrap_or_default();
+        Self {
+            machine_config,
+            boot_source_config,
+            drive_configs: DriveConfigs::from_validated(drive_configs),
+            pmem_configs: PmemConfigs::from_validated(pmem_configs),
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug,
+            network_configs,
+            mmds_state,
+            vsock_config,
             resume_requested,
         }
     }
@@ -458,6 +545,7 @@ impl SnapshotV2ControllerCommit {
             self.memory_hotplug,
             self.network_configs,
             self.mmds_state,
+            self.vsock_config,
             self.resume_requested,
         )
     }
@@ -896,7 +984,6 @@ pub(crate) enum SnapshotV2CreateRejection {
 pub(crate) enum SnapshotV2LoadRejection {
     MemoryBackend,
     LoadClockRealtime,
-    LoadVsockOverride,
     DeprecatedFields,
     MachineProfile,
     BootSource,
@@ -1170,9 +1257,6 @@ pub(crate) fn classify_v2_load_request(
     }
     if input.clock_realtime {
         return Err(SnapshotV2LoadRejection::LoadClockRealtime);
-    }
-    if input.vsock_override.is_some() {
-        return Err(SnapshotV2LoadRejection::LoadVsockOverride);
     }
     if input.deprecated_fields_used {
         return Err(SnapshotV2LoadRejection::DeprecatedFields);
@@ -1755,6 +1839,14 @@ mod tests {
             ),
             Ok(())
         );
+        assert_eq!(
+            classify_v2_load(
+                &file_load().with_vsock_override(SnapshotVsockOverride::new("vsock")),
+                true,
+                clean_v2_load_profile(),
+            ),
+            Ok(())
+        );
 
         let request_cases = [
             (
@@ -1767,10 +1859,6 @@ mod tests {
             (
                 file_load().with_clock_realtime(true),
                 SnapshotV2LoadRejection::LoadClockRealtime,
-            ),
-            (
-                file_load().with_vsock_override(SnapshotVsockOverride::new("vsock")),
-                SnapshotV2LoadRejection::LoadVsockOverride,
             ),
             (
                 file_load().with_deprecated_fields_used(true),
