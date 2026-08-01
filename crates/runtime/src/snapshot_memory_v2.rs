@@ -162,7 +162,7 @@ impl SnapshotV2MemoryBinding {
         encode_binding(self)
     }
 
-    fn image_header(
+    pub(crate) fn image_header(
         &self,
     ) -> Result<[u8; NATIVE_V2_MEMORY_HEADER_BYTES], SnapshotV2MemoryBindingError> {
         let encoded = self.encode()?;
@@ -849,7 +849,7 @@ fn load_snapshot_v2_memory_binding_from_file(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SnapshotV2MemoryLoadStage {
+pub(crate) enum SnapshotV2MemoryLoadStage {
     Preflight,
     Metadata,
     Mapping,
@@ -885,13 +885,13 @@ fn load_snapshot_v2_memory_binding_from_file_with_hook(
     Ok(memory)
 }
 
-struct ValidatedSnapshotV2MemorySource {
+pub(crate) struct ValidatedSnapshotV2MemorySource {
     file: Arc<File>,
     facts: FileFacts,
 }
 
 impl ValidatedSnapshotV2MemorySource {
-    fn new_with_hook(
+    pub(crate) fn new_with_hook(
         binding: &SnapshotV2MemoryBinding,
         file: File,
         mut hook: impl FnMut(SnapshotV2MemoryLoadStage, &File),
@@ -915,11 +915,15 @@ impl ValidatedSnapshotV2MemorySource {
         })
     }
 
-    fn file(&self) -> &Arc<File> {
+    pub(crate) fn file(&self) -> &Arc<File> {
         &self.file
     }
 
-    fn verify_unchanged(&self) -> Result<(), SnapshotV2MemoryLoadError> {
+    pub(crate) const fn facts(&self) -> FileFacts {
+        self.facts
+    }
+
+    pub(crate) fn verify_unchanged(&self) -> Result<(), SnapshotV2MemoryLoadError> {
         if inspect_file(self.file.as_ref())? == self.facts {
             Ok(())
         } else {
@@ -934,7 +938,6 @@ impl ValidatedSnapshotV2MemorySource {
 /// loader. This verifier therefore checks the exact output position, length,
 /// regular-file identity, header, zero padding, and source stability without
 /// applying the final loader's read-only policy.
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn verify_snapshot_v2_memory_image_output(
     binding: &SnapshotV2MemoryBinding,
     file: &mut File,
@@ -999,7 +1002,7 @@ fn verify_memory_metadata(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileFacts {
+pub(crate) struct FileFacts {
     device: u64,
     inode: u64,
     mode: u32,
@@ -1012,7 +1015,33 @@ struct FileFacts {
     descriptor_flags: i32,
 }
 
-fn inspect_file(file: &File) -> Result<FileFacts, SnapshotV2MemoryLoadError> {
+impl FileFacts {
+    pub(crate) const fn length(self) -> u64 {
+        self.length
+    }
+
+    pub(crate) const fn is_read_write(self) -> bool {
+        self.status_flags & libc::O_ACCMODE == libc::O_RDWR
+    }
+
+    pub(crate) const fn is_append(self) -> bool {
+        self.status_flags & libc::O_APPEND != 0
+    }
+
+    pub(crate) const fn is_close_on_exec(self) -> bool {
+        self.descriptor_flags & libc::FD_CLOEXEC != 0
+    }
+
+    pub(crate) const fn is_regular(self) -> bool {
+        self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+    }
+
+    pub(crate) const fn same_object(self, other: Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+}
+
+pub(crate) fn inspect_file(file: &File) -> Result<FileFacts, SnapshotV2MemoryLoadError> {
     let facts = inspect_file_facts(file)?;
     if facts.status_flags & libc::O_ACCMODE != libc::O_RDONLY {
         return Err(SnapshotV2MemoryLoadError::DescriptorNotReadOnly);
@@ -1024,7 +1053,7 @@ fn inspect_file(file: &File) -> Result<FileFacts, SnapshotV2MemoryLoadError> {
     Ok(facts)
 }
 
-fn inspect_file_facts(file: &File) -> Result<FileFacts, SnapshotV2MemoryLoadError> {
+pub(crate) fn inspect_file_facts(file: &File) -> Result<FileFacts, SnapshotV2MemoryLoadError> {
     // SAFETY: `file` owns a live descriptor and these commands have no pointer
     // arguments.
     let status_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };

@@ -16,7 +16,15 @@ use crate::snapshot_memory_v2::{
 };
 
 mod codec;
+mod materialize;
 mod writer;
+
+pub use materialize::{
+    SnapshotV2DiffMaterializationBaseFile, SnapshotV2DiffMaterializationError,
+    SnapshotV2DiffMaterializationStage, apply_snapshot_v2_diff_layer_file,
+    apply_snapshot_v2_diff_layer_file_with_cancel, promote_snapshot_v2_diff_zero_root_file,
+    promote_snapshot_v2_diff_zero_root_file_with_cancel,
+};
 
 pub use writer::{
     SnapshotV2DiffSelection, SnapshotV2DiffSelectionError, SnapshotV2DiffVerifyError,
