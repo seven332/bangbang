@@ -518,25 +518,40 @@ where
         base,
         selection,
         is_cancelled,
-        |identity| getrandom::fill(identity).map_err(|_| ()),
-        |buffer, additional| buffer.try_reserve_exact(additional),
+        SnapshotV2DiffWritePolicy {
+            fill_identity: |identity: &mut [u8; IMAGE_ID_BYTES]| {
+                getrandom::fill(identity).map_err(|_| ())
+            },
+            reserve_copy_buffer: |buffer: &mut Vec<u8>, additional| {
+                buffer.try_reserve_exact(additional)
+            },
+            read_guest: |memory: &GuestMemory, destination: &mut [u8], address| {
+                memory.read_slice(destination, address).map_err(|_| ())
+            },
+        },
     )
 }
 
-fn write_snapshot_v2_diff_layer_with_policy<W, C, I, R>(
+struct SnapshotV2DiffWritePolicy<I, R, G> {
+    fill_identity: I,
+    reserve_copy_buffer: R,
+    read_guest: G,
+}
+
+fn write_snapshot_v2_diff_layer_with_policy<W, C, I, R, G>(
     memory: &GuestMemory,
     writer: &mut W,
     base: SnapshotV2DiffBase,
     selection: &SnapshotV2DiffSelection,
     mut is_cancelled: C,
-    mut fill_identity: I,
-    mut reserve_copy_buffer: R,
+    mut policy: SnapshotV2DiffWritePolicy<I, R, G>,
 ) -> Result<SnapshotV2DiffLayerBinding, SnapshotV2DiffWriteError>
 where
     W: Write + Seek,
     C: FnMut(SnapshotV2DiffWriteStage) -> bool,
     I: FnMut(&mut [u8; IMAGE_ID_BYTES]) -> Result<(), ()>,
     R: FnMut(&mut Vec<u8>, usize) -> Result<(), TryReserveError>,
+    G: FnMut(&GuestMemory, &mut [u8], GuestAddress) -> Result<(), ()>,
 {
     check_write_cancelled(&mut is_cancelled, SnapshotV2DiffWriteStage::InitialPosition)?;
     if !selection.matches_memory_topology(memory) {
@@ -545,7 +560,8 @@ where
     preflight_empty_output(writer)?;
 
     let mut identity = [0_u8; IMAGE_ID_BYTES];
-    fill_identity(&mut identity).map_err(|()| SnapshotV2DiffWriteError::IdentityUnavailable)?;
+    (policy.fill_identity)(&mut identity)
+        .map_err(|()| SnapshotV2DiffWriteError::IdentityUnavailable)?;
     let result = snapshot_v2_memory_binding_from_memory_with_version_and_id(
         memory,
         NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
@@ -570,7 +586,7 @@ where
             source: SnapshotV2DiffLayerBindingError::LengthOverflow,
         })?;
     let mut chunk = Vec::new();
-    reserve_copy_buffer(&mut chunk, copy_length)
+    (policy.reserve_copy_buffer)(&mut chunk, copy_length)
         .map_err(|source| SnapshotV2DiffWriteError::CopyBufferAllocationFailed { source })?;
     chunk.resize(copy_length, 0);
 
@@ -635,8 +651,7 @@ where
                     .ok_or(SnapshotV2DiffWriteError::LayerBinding {
                         source: SnapshotV2DiffLayerBindingError::LengthOverflow,
                     })?;
-            memory
-                .read_slice(destination, address)
+            (policy.read_guest)(memory, destination, address)
                 .map_err(|_| SnapshotV2DiffWriteError::GuestMemoryRead { stage })?;
             write_all_stage(writer, destination, stage)?;
             copied = copied.checked_add(length as u64).ok_or({

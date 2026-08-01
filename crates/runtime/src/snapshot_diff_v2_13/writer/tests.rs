@@ -55,11 +55,18 @@ where
         base,
         selection,
         is_cancelled,
-        |identity| {
-            *identity = RESULT_ID_BYTES;
-            Ok(())
+        SnapshotV2DiffWritePolicy {
+            fill_identity: |identity: &mut [u8; IMAGE_ID_BYTES]| {
+                *identity = RESULT_ID_BYTES;
+                Ok(())
+            },
+            reserve_copy_buffer: |buffer: &mut Vec<u8>, additional| {
+                buffer.try_reserve_exact(additional)
+            },
+            read_guest: |memory: &GuestMemory, destination: &mut [u8], address| {
+                memory.read_slice(destination, address).map_err(|_| ())
+            },
         },
-        |buffer, additional| buffer.try_reserve_exact(additional),
     )
 }
 
@@ -148,6 +155,15 @@ fn dirty_host_pages_expand_to_guest_pages_and_reject_invalid_inputs() {
             &[GuestAddress::new(start + 64 * 1024)]
         ),
         Err(SnapshotV2DiffSelectionError::OutOfTopology)
+    ));
+    let overflowing_page = GuestAddress::new(u64::MAX - (NATIVE_V2_MEMORY_GUEST_GRANULE - 1));
+    assert!(matches!(
+        SnapshotV2DiffSelection::try_from_dirty_pages(
+            &memory,
+            NATIVE_V2_MEMORY_GUEST_GRANULE,
+            &[overflowing_page],
+        ),
+        Err(SnapshotV2DiffSelectionError::AddressOverflow)
     ));
 }
 
@@ -436,8 +452,15 @@ fn writer_rejects_nonempty_nonzero_identity_and_copy_allocation_failures_before_
             SnapshotV2DiffBase::Zero,
             &selection,
             |_| false,
-            |_| Err(()),
-            |buffer, additional| buffer.try_reserve_exact(additional),
+            SnapshotV2DiffWritePolicy {
+                fill_identity: |_: &mut [u8; IMAGE_ID_BYTES]| Err(()),
+                reserve_copy_buffer: |buffer: &mut Vec<u8>, additional| {
+                    buffer.try_reserve_exact(additional)
+                },
+                read_guest: |memory: &GuestMemory, destination: &mut [u8], address| {
+                    memory.read_slice(destination, address).map_err(|_| ())
+                },
+            },
         ),
         Err(SnapshotV2DiffWriteError::IdentityUnavailable)
     ));
@@ -451,11 +474,16 @@ fn writer_rejects_nonempty_nonzero_identity_and_copy_allocation_failures_before_
             SnapshotV2DiffBase::Zero,
             &selection,
             |_| false,
-            |identity| {
-                *identity = RESULT_ID_BYTES;
-                Ok(())
+            SnapshotV2DiffWritePolicy {
+                fill_identity: |identity: &mut [u8; IMAGE_ID_BYTES]| {
+                    *identity = RESULT_ID_BYTES;
+                    Ok(())
+                },
+                reserve_copy_buffer: |_: &mut Vec<u8>, _: usize| Err(allocation_error()),
+                read_guest: |memory: &GuestMemory, destination: &mut [u8], address| {
+                    memory.read_slice(destination, address).map_err(|_| ())
+                },
             },
-            |_, _| Err(allocation_error()),
         ),
         Err(SnapshotV2DiffWriteError::CopyBufferAllocationFailed { .. })
     ));
@@ -685,6 +713,31 @@ fn writer_handles_short_io_and_redacts_failures_and_seek_mismatches() {
             stage: SnapshotV2DiffWriteStage::Data { extent_index: 0 },
         })
     ));
+
+    let mut inaccessible = Cursor::new(Vec::new());
+    assert!(matches!(
+        write_snapshot_v2_diff_layer_with_policy(
+            &memory,
+            &mut inaccessible,
+            SnapshotV2DiffBase::Zero,
+            &selection,
+            |_| false,
+            SnapshotV2DiffWritePolicy {
+                fill_identity: |identity: &mut [u8; IMAGE_ID_BYTES]| {
+                    *identity = RESULT_ID_BYTES;
+                    Ok(())
+                },
+                reserve_copy_buffer: |buffer: &mut Vec<u8>, additional| {
+                    buffer.try_reserve_exact(additional)
+                },
+                read_guest: |_: &GuestMemory, _: &mut [u8], _: GuestAddress| Err(()),
+            },
+        ),
+        Err(SnapshotV2DiffWriteError::GuestMemoryRead {
+            stage: SnapshotV2DiffWriteStage::Data { extent_index: 0 },
+        })
+    ));
+    assert!(!inaccessible.into_inner().is_empty());
 }
 
 #[test]
