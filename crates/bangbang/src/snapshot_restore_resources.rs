@@ -338,6 +338,14 @@ impl SnapshotRestoreAbortOutcome {
         }
     }
 
+    const fn from_cleanup_failed(cleanup_failed: bool) -> Self {
+        if cleanup_failed {
+            Self::terminal(true)
+        } else {
+            Self::retryable()
+        }
+    }
+
     fn merge(self, other: Self) -> Self {
         Self {
             disposition: if self.disposition == SnapshotRestoreResourceDisposition::Terminal
@@ -1645,6 +1653,7 @@ impl RequestedSnapshotSerialRestoreResources {
                 .merge(abort_contained_transaction(contained_transaction));
             return Err(cancelled_batch_error().with_abort_outcome(outcome));
         }
+        let mut abort_later = || SnapshotRestoreAbortOutcome::retryable();
         complete_serial_restore_resources(
             resource_keys,
             bindings,
@@ -1653,6 +1662,7 @@ impl RequestedSnapshotSerialRestoreResources {
             block_count,
             pmem_count,
             serial.is_some(),
+            &mut abort_later,
             &cancelled,
         )
     }
@@ -1667,6 +1677,7 @@ fn complete_serial_restore_resources(
     block_count: usize,
     pmem_count: usize,
     expects_serial: bool,
+    abort_later: &mut impl FnMut() -> SnapshotRestoreAbortOutcome,
     cancelled: &impl Fn() -> bool,
 ) -> Result<PreparedSnapshotSerialRestoreResources, SnapshotRestoreResourceError> {
     if prepared.len() != resource_keys.len()
@@ -1675,7 +1686,8 @@ fn complete_serial_restore_resources(
             .zip(&resource_keys)
             .any(|(owner, key)| owner.key() != key)
     {
-        let outcome = abort_serial_restore_resources(prepared)
+        let outcome = abort_later()
+            .merge(abort_serial_restore_resources(prepared))
             .merge(abort_contained_transaction(contained_transaction));
         return Err(SnapshotRestoreResourceError::terminal(
             SnapshotRestoreResourceStage::Binding,
@@ -1687,7 +1699,8 @@ fn complete_serial_restore_resources(
     let mut prepared = prepared.into_iter();
     for key in &resource_keys {
         let Some(owner) = prepared.next() else {
-            let outcome = abort_serial_restore_resource_iter(prepared)
+            let outcome = abort_later()
+                .merge(abort_serial_restore_resource_iter(prepared))
                 .merge(abort_serial_restore_bindings(bindings.into_values()))
                 .merge(abort_contained_transaction(contained_transaction));
             return Err(SnapshotRestoreResourceError::terminal(
@@ -1697,8 +1710,8 @@ fn complete_serial_restore_resources(
             .with_abort_outcome(outcome));
         };
         if owner.key() != key {
-            let outcome = owner
-                .abort()
+            let outcome = abort_later()
+                .merge(owner.abort())
                 .merge(abort_serial_restore_resource_iter(prepared))
                 .merge(abort_serial_restore_bindings(bindings.into_values()))
                 .merge(abort_contained_transaction(contained_transaction));
@@ -1710,9 +1723,8 @@ fn complete_serial_restore_resources(
         }
         if let Err(rejection) = bindings.bind(key, owner) {
             let reason = rejection.reason();
-            let outcome = rejection
-                .into_value()
-                .abort()
+            let outcome = abort_later()
+                .merge(rejection.into_value().abort())
                 .merge(abort_serial_restore_resource_iter(prepared))
                 .merge(abort_serial_restore_bindings(bindings.into_values()))
                 .merge(abort_contained_transaction(contained_transaction));
@@ -1724,7 +1736,10 @@ fn complete_serial_restore_resources(
         }
     }
     if let Some(extra) = prepared.next() {
-        let outcome = abort_serial_restore_resource_iter(std::iter::once(extra).chain(prepared))
+        let outcome = abort_later()
+            .merge(abort_serial_restore_resource_iter(
+                std::iter::once(extra).chain(prepared),
+            ))
             .merge(abort_serial_restore_bindings(bindings.into_values()))
             .merge(abort_contained_transaction(contained_transaction));
         return Err(SnapshotRestoreResourceError::terminal(
@@ -1737,7 +1752,10 @@ fn complete_serial_restore_resources(
         Ok(bindings) => bindings,
         Err(incomplete) => {
             let missing_count = incomplete.missing_count();
-            let outcome = abort_serial_restore_bindings(incomplete.into_bindings().into_values())
+            let outcome = abort_later()
+                .merge(abort_serial_restore_bindings(
+                    incomplete.into_bindings().into_values(),
+                ))
                 .merge(abort_contained_transaction(contained_transaction));
             return Err(SnapshotRestoreResourceError::terminal(
                 SnapshotRestoreResourceStage::Completion,
@@ -1755,7 +1773,7 @@ fn complete_serial_restore_resources(
         expects_serial,
     };
     if cancelled() {
-        let outcome = prepared.abort();
+        let outcome = abort_later().merge(prepared.abort());
         return Err(cancelled_batch_error().with_abort_outcome(outcome));
     }
     Ok(prepared)
@@ -2106,8 +2124,18 @@ fn reserve_contained_serial_vsock_resources(
             Some(request.reserve_contained(claim, broker, namespace))
         }
         (None, None) => None,
-        (Some(_), None) | (None, Some(_)) => {
+        (Some(_), None) => {
             let outcome = abort_prepared_drive_claims(claims)
+                .merge(abort_contained_transaction(Some(transaction)));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::ContainedReservation,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        (None, Some(facets)) => {
+            let outcome = abort_contained_vsock_facets(Some(facets))
+                .merge(abort_prepared_drive_claims(claims))
                 .merge(abort_contained_transaction(Some(transaction)));
             return Err(SnapshotRestoreResourceError::terminal(
                 SnapshotRestoreResourceStage::ContainedReservation,
@@ -2134,9 +2162,10 @@ fn abort_serial_vsock_reservation(
             serial_identity: _,
             vsock,
         } => {
+            let outcome = abort_reserved_vsock(vsock);
             drop(serial);
             drop(drives);
-            abort_reserved_vsock(vsock)
+            outcome
         }
         SnapshotSerialVsockReservation::Contained {
             claims,
@@ -2391,6 +2420,7 @@ impl LocallyPreparedSnapshotSerialVsockRestoreResources {
     pub(crate) fn publish_vsock(
         self,
         cancelled: &impl Fn() -> bool,
+        abort_network: &mut impl FnMut() -> bool,
     ) -> Result<PreparedSnapshotSerialVsockRestoreBatch, SnapshotRestoreResourceError> {
         let Self {
             resource_keys,
@@ -2408,13 +2438,18 @@ impl LocallyPreparedSnapshotSerialVsockRestoreResources {
                 let local = match reserved.prepare_local(cancelled) {
                     Ok(local) => local,
                     Err(source) => {
-                        let outcome = abort_serial_restore_resources(prepared)
-                            .merge(abort_contained_transaction(contained_transaction));
+                        let outcome =
+                            SnapshotRestoreAbortOutcome::from_cleanup_failed(abort_network())
+                                .merge(abort_serial_restore_resources(prepared))
+                                .merge(abort_contained_transaction(contained_transaction));
                         return Err(snapshot_vsock_error(source).with_abort_outcome(outcome));
                     }
                 };
                 if cancelled() {
                     let outcome = abort_local_vsock(Some(local))
+                        .merge(SnapshotRestoreAbortOutcome::from_cleanup_failed(
+                            abort_network(),
+                        ))
                         .merge(abort_serial_restore_resources(prepared))
                         .merge(abort_contained_transaction(contained_transaction));
                     return Err(cancelled_batch_error().with_abort_outcome(outcome));
@@ -2422,8 +2457,10 @@ impl LocallyPreparedSnapshotSerialVsockRestoreResources {
                 match local.publish(cancelled) {
                     Ok(vsock) => Some(vsock),
                     Err(source) => {
-                        let outcome = abort_serial_restore_resources(prepared)
-                            .merge(abort_contained_transaction(contained_transaction));
+                        let outcome =
+                            SnapshotRestoreAbortOutcome::from_cleanup_failed(abort_network())
+                                .merge(abort_serial_restore_resources(prepared))
+                                .merge(abort_contained_transaction(contained_transaction));
                         return Err(snapshot_vsock_error(source).with_abort_outcome(outcome));
                     }
                 }
@@ -2431,6 +2468,14 @@ impl LocallyPreparedSnapshotSerialVsockRestoreResources {
             None => None,
         };
 
+        let mut vsock = vsock;
+        let mut later_aborted = false;
+        let mut abort_later = || {
+            later_aborted = true;
+            prepared_vsock_abort_outcome(vsock.take()).merge(
+                SnapshotRestoreAbortOutcome::from_cleanup_failed(abort_network()),
+            )
+        };
         let serial = match complete_serial_restore_resources(
             resource_keys,
             bindings,
@@ -2439,18 +2484,27 @@ impl LocallyPreparedSnapshotSerialVsockRestoreResources {
             block_count,
             pmem_count,
             expects_serial,
+            &mut abort_later,
             cancelled,
         )
-        .and_then(PreparedSnapshotSerialRestoreResources::into_serial_batch)
+        .and_then(|prepared| prepared.into_serial_batch_with_abort_later(&mut abort_later))
         {
             Ok(serial) => serial,
             Err(source) => {
-                return Err(source.with_abort_outcome(prepared_vsock_abort_outcome(vsock)));
+                let outcome = prepared_vsock_abort_outcome(vsock).merge(if later_aborted {
+                    SnapshotRestoreAbortOutcome::retryable()
+                } else {
+                    SnapshotRestoreAbortOutcome::from_cleanup_failed(abort_network())
+                });
+                return Err(source.with_abort_outcome(outcome));
             }
         };
         if vsock.is_some() != vsock_key.is_some() {
-            let outcome =
-                abort_prepared_serial_batch(serial).merge(prepared_vsock_abort_outcome(vsock));
+            let outcome = prepared_vsock_abort_outcome(vsock)
+                .merge(SnapshotRestoreAbortOutcome::from_cleanup_failed(
+                    abort_network(),
+                ))
+                .merge(abort_prepared_serial_batch(serial));
             return Err(SnapshotRestoreResourceError::terminal(
                 SnapshotRestoreResourceStage::Completion,
                 SnapshotRestoreResourceErrorKind::OwnerClassMismatch,
@@ -3707,14 +3761,22 @@ pub(crate) struct PreparedSnapshotSerialRestoreResources {
 
 impl PreparedSnapshotSerialRestoreResources {
     pub(crate) fn into_serial_batch(
+        self,
+    ) -> Result<PreparedSnapshotSerialRestoreBatch, SnapshotRestoreResourceError> {
+        let mut abort_later = || SnapshotRestoreAbortOutcome::retryable();
+        self.into_serial_batch_with_abort_later(&mut abort_later)
+    }
+
+    fn into_serial_batch_with_abort_later(
         mut self,
+        abort_later: &mut impl FnMut() -> SnapshotRestoreAbortOutcome,
     ) -> Result<PreparedSnapshotSerialRestoreBatch, SnapshotRestoreResourceError> {
         let expected_count = self
             .block_count
             .checked_add(self.pmem_count)
             .and_then(|count| count.checked_add(usize::from(self.expects_serial)));
         if expected_count != Some(self.resource_keys.len()) {
-            let outcome = self.abort();
+            let outcome = abort_later().merge(self.abort());
             return Err(SnapshotRestoreResourceError::terminal(
                 SnapshotRestoreResourceStage::Take,
                 SnapshotRestoreResourceErrorKind::InvalidSerialSet,
@@ -3723,7 +3785,7 @@ impl PreparedSnapshotSerialRestoreResources {
         }
         let mut owners = Vec::new();
         if owners.try_reserve_exact(self.resource_keys.len()).is_err() {
-            let outcome = self.abort();
+            let outcome = abort_later().merge(self.abort());
             return Err(SnapshotRestoreResourceError::retryable(
                 SnapshotRestoreResourceStage::Take,
                 SnapshotRestoreResourceErrorKind::InvalidSerialSet,
@@ -3735,7 +3797,7 @@ impl PreparedSnapshotSerialRestoreResources {
                 Ok(owner) if owner.key() == key => owners.push(owner),
                 Ok(owner) => {
                     owners.push(owner);
-                    let outcome = self.abort_with_taken(owners);
+                    let outcome = abort_later().merge(self.abort_with_taken(owners));
                     return Err(SnapshotRestoreResourceError::terminal(
                         SnapshotRestoreResourceStage::Take,
                         SnapshotRestoreResourceErrorKind::InvalidSerialSet,
@@ -3743,7 +3805,7 @@ impl PreparedSnapshotSerialRestoreResources {
                     .with_abort_outcome(outcome));
                 }
                 Err(source) => {
-                    let outcome = self.abort_with_taken(owners);
+                    let outcome = abort_later().merge(self.abort_with_taken(owners));
                     return Err(SnapshotRestoreResourceError::terminal(
                         SnapshotRestoreResourceStage::Take,
                         SnapshotRestoreResourceErrorKind::Take(source),
@@ -3762,7 +3824,10 @@ impl PreparedSnapshotSerialRestoreResources {
         } = self;
         if let Err(unconsumed) = bindings.finish() {
             let unconsumed_count = unconsumed.unconsumed_count();
-            let outcome = abort_serial_restore_bindings(unconsumed.into_bindings().into_values())
+            let outcome = abort_later()
+                .merge(abort_serial_restore_bindings(
+                    unconsumed.into_bindings().into_values(),
+                ))
                 .merge(abort_serial_restore_resources(owners))
                 .merge(abort_contained_transaction(contained_transaction));
             return Err(SnapshotRestoreResourceError::terminal(
@@ -3805,7 +3870,8 @@ impl PreparedSnapshotSerialRestoreResources {
             }
         });
         if !valid_order {
-            let outcome = abort_serial_restore_resources(owners)
+            let outcome = abort_later()
+                .merge(abort_serial_restore_resources(owners))
                 .merge(abort_contained_transaction(contained_transaction));
             return Err(SnapshotRestoreResourceError::terminal(
                 SnapshotRestoreResourceStage::Finish,
@@ -3820,7 +3886,8 @@ impl PreparedSnapshotSerialRestoreResources {
             || pmems.try_reserve_exact(pmem_count).is_err()
             || claims.try_reserve_exact(owners.len()).is_err()
         {
-            let outcome = abort_serial_restore_resources(owners)
+            let outcome = abort_later()
+                .merge(abort_serial_restore_resources(owners))
                 .merge(abort_contained_transaction(contained_transaction));
             return Err(SnapshotRestoreResourceError::retryable(
                 SnapshotRestoreResourceStage::Finish,
@@ -3867,7 +3934,8 @@ impl PreparedSnapshotSerialRestoreResources {
             drop(blocks);
             drop(pmems);
             drop(serial);
-            let outcome = abort_prepared_drive_claims(claims)
+            let outcome = abort_later()
+                .merge(abort_prepared_drive_claims(claims))
                 .merge(abort_contained_transaction(contained_transaction));
             return Err(SnapshotRestoreResourceError::terminal(
                 SnapshotRestoreResourceStage::Finish,

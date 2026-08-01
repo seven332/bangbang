@@ -22184,13 +22184,38 @@ fn abort_local_process_snapshot_v2_vsock_resources(
     }
 }
 
-fn abort_process_snapshot_v2_vsock_values(
+fn abort_process_snapshot_v2_vsock_transaction<B>(
     values: impl DoubleEndedIterator<Item = PreparedProcessSnapshotV2VsockRestoreResource>,
-) -> ProcessSnapshotV2VsockAbortEvidence {
-    values.rev().fold(
-        ProcessSnapshotV2VsockAbortEvidence::clean(),
-        |evidence, value| evidence.merge(value.abort()),
-    )
+    mut network: Option<PreparedProcessSnapshotV2NetworkRestoreCompletion<B>>,
+    files: Option<PreparedSnapshotDriveRestoreCompletion>,
+) -> ProcessSnapshotV2VsockAbortEvidence
+where
+    B: ProcessVmnetBackend,
+{
+    let mut evidence = ProcessSnapshotV2VsockAbortEvidence::clean();
+    for value in values.rev() {
+        if matches!(
+            value.resource_class(),
+            SnapshotRestoreResourceClass::BlockBacking
+                | SnapshotRestoreResourceClass::PmemBacking
+                | SnapshotRestoreResourceClass::SerialSink
+        ) && let Some(completion) = network.take()
+        {
+            evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::from_cleanup_uncertain(
+                completion.abort().is_err(),
+            ));
+        }
+        evidence = evidence.merge(value.abort());
+    }
+    if let Some(completion) = network {
+        evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::from_cleanup_uncertain(
+            completion.abort().is_err(),
+        ));
+    }
+    if files.is_some_and(|completion| completion.abort().is_err()) {
+        evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::terminal(true));
+    }
+    evidence
 }
 
 fn abort_process_snapshot_v2_vsock_completions<B>(
@@ -22200,13 +22225,7 @@ fn abort_process_snapshot_v2_vsock_completions<B>(
 where
     B: ProcessVmnetBackend,
 {
-    let network_uncertain = network.is_some_and(|completion| completion.abort().is_err());
-    let files_uncertain = files.is_some_and(|completion| completion.abort().is_err());
-    if network_uncertain || files_uncertain {
-        ProcessSnapshotV2VsockAbortEvidence::terminal(true)
-    } else {
-        ProcessSnapshotV2VsockAbortEvidence::clean()
-    }
+    abort_process_snapshot_v2_vsock_transaction(std::iter::empty(), network, files)
 }
 
 fn process_snapshot_v2_vsock_cleanup_error(
@@ -22397,41 +22416,40 @@ where
         )
         .with_abort_evidence(evidence));
     }
+    let mut network_rollback = Some((network_completion, network_resources));
     let prepared_files = {
         let publish_cancelled =
             || cancelled(ProcessSnapshotV2VsockRestoreResourceStage::VsockPublication);
-        match local.publish_vsock(&publish_cancelled) {
+        let mut abort_network = || match network_rollback.take() {
+            Some((completion, resources)) => {
+                abort_completed_process_snapshot_v2_network_resources(completion, resources)
+            }
+            None => false,
+        };
+        match local.publish_vsock(&publish_cancelled, &mut abort_network) {
             Ok(prepared) => prepared,
             Err(source) => {
-                let cleanup_uncertain = abort_completed_process_snapshot_v2_network_resources(
-                    network_completion,
-                    network_resources,
-                );
                 return Err(ProcessSnapshotV2VsockRestoreResourceError::from_files(
                     ProcessSnapshotV2VsockRestoreResourceStage::VsockPublication,
                     source,
-                )
-                .with_cleanup_uncertain(cleanup_uncertain));
+                ));
             }
         }
     };
+    let Some((network_completion, network_resources)) = network_rollback.take() else {
+        return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+            ProcessSnapshotV2VsockRestoreResourceStage::VsockPublication,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+        )
+        .with_cleanup_uncertain(true));
+    };
     let (serial_batch, vsock) = prepared_files.into_parts();
     let (blocks, pmems, serial_output, file_completion) = serial_batch.into_parts();
+    let mut owner_mismatch = false;
     for block in blocks {
         let (key, backing) = block.into_parts();
         if binding_keys.get(owners.len()) != Some(&key) {
-            drop(backing);
-            let evidence = abort_process_snapshot_v2_vsock_values(owners.into_iter()).merge(
-                abort_process_snapshot_v2_vsock_completions(
-                    Some(network_completion),
-                    Some(file_completion),
-                ),
-            );
-            return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
-                ProcessSnapshotV2VsockRestoreResourceStage::Binding,
-                ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
-            )
-            .with_abort_evidence(evidence));
+            owner_mismatch = true;
         }
         owners.push(PreparedProcessSnapshotV2VsockRestoreResource::Block(
             backing,
@@ -22440,36 +22458,14 @@ where
     for pmem in pmems {
         let (key, backing) = pmem.into_parts();
         if binding_keys.get(owners.len()) != Some(&key) {
-            drop(backing);
-            let evidence = abort_process_snapshot_v2_vsock_values(owners.into_iter()).merge(
-                abort_process_snapshot_v2_vsock_completions(
-                    Some(network_completion),
-                    Some(file_completion),
-                ),
-            );
-            return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
-                ProcessSnapshotV2VsockRestoreResourceStage::Binding,
-                ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
-            )
-            .with_abort_evidence(evidence));
+            owner_mismatch = true;
         }
         owners.push(PreparedProcessSnapshotV2VsockRestoreResource::Pmem(backing));
     }
     if let Some(serial_output) = serial_output {
         let (key, output) = serial_output.into_parts();
         if binding_keys.get(owners.len()) != Some(&key) {
-            drop(output);
-            let evidence = abort_process_snapshot_v2_vsock_values(owners.into_iter()).merge(
-                abort_process_snapshot_v2_vsock_completions(
-                    Some(network_completion),
-                    Some(file_completion),
-                ),
-            );
-            return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
-                ProcessSnapshotV2VsockRestoreResourceStage::Binding,
-                ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
-            )
-            .with_abort_evidence(evidence));
+            owner_mismatch = true;
         }
         owners.push(PreparedProcessSnapshotV2VsockRestoreResource::Serial(
             output,
@@ -22477,18 +22473,7 @@ where
     }
     for (key, resource) in network_keys.iter().zip(network_resources) {
         if binding_keys.get(owners.len()) != Some(key) {
-            drop(resource);
-            let evidence = abort_process_snapshot_v2_vsock_values(owners.into_iter()).merge(
-                abort_process_snapshot_v2_vsock_completions(
-                    Some(network_completion),
-                    Some(file_completion),
-                ),
-            );
-            return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
-                ProcessSnapshotV2VsockRestoreResourceStage::Binding,
-                ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
-            )
-            .with_abort_evidence(evidence));
+            owner_mismatch = true;
         }
         owners.push(PreparedProcessSnapshotV2VsockRestoreResource::Network(
             resource,
@@ -22496,43 +22481,23 @@ where
     }
     if let Some((key, resource)) = vsock {
         if binding_keys.get(owners.len()) != Some(&key) {
-            let evidence = resource.abort().map_or_else(
-                |_| ProcessSnapshotV2VsockAbortEvidence::terminal(true),
-                |disposition| {
-                    if disposition == VsockRestoreDisposition::Terminal {
-                        ProcessSnapshotV2VsockAbortEvidence::terminal(false)
-                    } else {
-                        ProcessSnapshotV2VsockAbortEvidence::clean()
-                    }
-                },
-            );
-            let evidence = evidence
-                .merge(abort_process_snapshot_v2_vsock_values(owners.into_iter()))
-                .merge(abort_process_snapshot_v2_vsock_completions(
-                    Some(network_completion),
-                    Some(file_completion),
-                ));
-            return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
-                ProcessSnapshotV2VsockRestoreResourceStage::Binding,
-                ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
-            )
-            .with_abort_evidence(evidence));
+            owner_mismatch = true;
         }
         owners.push(PreparedProcessSnapshotV2VsockRestoreResource::Vsock(
             resource,
         ));
     }
-    if owners.len() != binding_keys.len()
+    if owner_mismatch
+        || owners.len() != binding_keys.len()
         || owners
             .iter()
             .zip(&binding_keys)
             .any(|(owner, key)| owner.resource_class() != key.resource_class())
     {
-        let evidence = abort_process_snapshot_v2_vsock_values(owners.into_iter()).merge(
-            abort_process_snapshot_v2_vsock_completions(
-                Some(network_completion),
-                Some(file_completion),
-            ),
+        let evidence = abort_process_snapshot_v2_vsock_transaction(
+            owners.into_iter(),
+            Some(network_completion),
+            Some(file_completion),
         );
         return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
             ProcessSnapshotV2VsockRestoreResourceStage::Binding,
@@ -22544,14 +22509,11 @@ where
     let mut owner_iter = owners.into_iter();
     for key in &binding_keys {
         let Some(owner) = owner_iter.next() else {
-            let evidence = abort_process_snapshot_v2_vsock_values(owner_iter)
-                .merge(abort_process_snapshot_v2_vsock_values(
-                    bindings.into_values(),
-                ))
-                .merge(abort_process_snapshot_v2_vsock_completions(
-                    Some(network_completion),
-                    Some(file_completion),
-                ));
+            let evidence = abort_process_snapshot_v2_vsock_transaction(
+                bindings.into_values().chain(owner_iter),
+                Some(network_completion),
+                Some(file_completion),
+            );
             return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
                 ProcessSnapshotV2VsockRestoreResourceStage::Binding,
                 ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
@@ -22560,17 +22522,14 @@ where
         };
         if let Err(rejection) = bindings.bind(key, owner) {
             let reason = rejection.reason();
-            let evidence = rejection
-                .into_value()
-                .abort()
-                .merge(abort_process_snapshot_v2_vsock_values(owner_iter))
-                .merge(abort_process_snapshot_v2_vsock_values(
-                    bindings.into_values(),
-                ))
-                .merge(abort_process_snapshot_v2_vsock_completions(
-                    Some(network_completion),
-                    Some(file_completion),
-                ));
+            let evidence = abort_process_snapshot_v2_vsock_transaction(
+                bindings
+                    .into_values()
+                    .chain(std::iter::once(rejection.into_value()))
+                    .chain(owner_iter),
+                Some(network_completion),
+                Some(file_completion),
+            );
             return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
                 ProcessSnapshotV2VsockRestoreResourceStage::Binding,
                 ProcessSnapshotV2VsockRestoreResourceErrorKind::Binding(reason),
@@ -22579,16 +22538,14 @@ where
         }
     }
     if let Some(extra_owner) = owner_iter.next() {
-        let evidence = extra_owner
-            .abort()
-            .merge(abort_process_snapshot_v2_vsock_values(owner_iter))
-            .merge(abort_process_snapshot_v2_vsock_values(
-                bindings.into_values(),
-            ))
-            .merge(abort_process_snapshot_v2_vsock_completions(
-                Some(network_completion),
-                Some(file_completion),
-            ));
+        let evidence = abort_process_snapshot_v2_vsock_transaction(
+            bindings
+                .into_values()
+                .chain(std::iter::once(extra_owner))
+                .chain(owner_iter),
+            Some(network_completion),
+            Some(file_completion),
+        );
         return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
             ProcessSnapshotV2VsockRestoreResourceStage::Binding,
             ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
@@ -22598,12 +22555,11 @@ where
     let bindings = match bindings.complete() {
         Ok(bindings) => bindings,
         Err(incomplete) => {
-            let evidence =
-                abort_process_snapshot_v2_vsock_values(incomplete.into_bindings().into_values())
-                    .merge(abort_process_snapshot_v2_vsock_completions(
-                        Some(network_completion),
-                        Some(file_completion),
-                    ));
+            let evidence = abort_process_snapshot_v2_vsock_transaction(
+                incomplete.into_bindings().into_values(),
+                Some(network_completion),
+                Some(file_completion),
+            );
             return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
                 ProcessSnapshotV2VsockRestoreResourceStage::Binding,
                 ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
@@ -22613,11 +22569,10 @@ where
     };
 
     if cancelled(ProcessSnapshotV2VsockRestoreResourceStage::Binding) {
-        let evidence = abort_process_snapshot_v2_vsock_values(bindings.into_values()).merge(
-            abort_process_snapshot_v2_vsock_completions(
-                Some(network_completion),
-                Some(file_completion),
-            ),
+        let evidence = abort_process_snapshot_v2_vsock_transaction(
+            bindings.into_values(),
+            Some(network_completion),
+            Some(file_completion),
         );
         return Err(ProcessSnapshotV2VsockRestoreResourceError::retryable(
             ProcessSnapshotV2VsockRestoreResourceStage::Binding,
@@ -22807,11 +22762,10 @@ where
             taken_count,
             handoff_failed,
         } = self;
-        let evidence = abort_process_snapshot_v2_vsock_values(bindings.into_values()).merge(
-            abort_process_snapshot_v2_vsock_completions(
-                Some(network_completion),
-                Some(file_completion),
-            ),
+        let evidence = abort_process_snapshot_v2_vsock_transaction(
+            bindings.into_values(),
+            Some(network_completion),
+            Some(file_completion),
         );
         match process_snapshot_v2_vsock_cleanup_error(evidence, taken_count != 0 || handoff_failed)
         {
@@ -22849,13 +22803,11 @@ where
             Ok(()) => (),
             Err(unconsumed) => {
                 let unconsumed_count = unconsumed.unconsumed_count();
-                let evidence = abort_process_snapshot_v2_vsock_values(
+                let evidence = abort_process_snapshot_v2_vsock_transaction(
                     unconsumed.into_bindings().into_values(),
-                )
-                .merge(abort_process_snapshot_v2_vsock_completions(
                     Some(network_completion),
                     Some(file_completion),
-                ));
+                );
                 let error = ProcessSnapshotV2VsockRestoreResourceError::terminal(
                     ProcessSnapshotV2VsockRestoreResourceStage::Finish,
                     ProcessSnapshotV2VsockRestoreResourceErrorKind::Unconsumed { unconsumed_count },
@@ -31169,6 +31121,7 @@ mod tests {
     use std::num::NonZeroUsize;
     #[cfg(target_os = "macos")]
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::net::UnixListener;
     #[cfg(target_os = "macos")]
     use std::os::unix::net::{UnixDatagram, UnixStream};
@@ -37963,6 +37916,7 @@ mod tests {
         maximum_packet_size: usize,
         batch_limits: Option<(Option<u16>, Option<u16>)>,
         direct_virtio_header: Option<(bool, bool)>,
+        stop_boundary_check: Option<((u64, u64), Option<PathBuf>)>,
     }
 
     impl VmnetInterfaceBackend for RecordingVmnetPacketIoBackend {
@@ -38017,6 +37971,17 @@ mod tests {
 
         fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError> {
             push_recorded_event(&self.events, format!("stop:{}", interface.iface_id));
+            if let Some((identity, socket)) = &self.stop_boundary_check {
+                push_recorded_event(
+                    &self.events,
+                    format!(
+                        "stop-between-vsock-and-files:{}:{}",
+                        interface.iface_id,
+                        socket.as_ref().is_none_or(|socket| !socket.exists())
+                            && descriptor_identity_is_open(*identity)
+                    ),
+                );
+            }
             if let Some(status) = self.stop_status {
                 return Err(VmnetError::new(VmnetOperation::StopInterface, status));
             }
@@ -38103,6 +38068,7 @@ mod tests {
         maximum_packet_sizes: VecDeque<usize>,
         batch_limits: VecDeque<(Option<u16>, Option<u16>)>,
         direct_virtio_headers: VecDeque<(bool, bool)>,
+        stop_boundary_checks: VecDeque<((u64, u64), Option<PathBuf>)>,
         next_realized_mac: u8,
     }
 
@@ -38181,6 +38147,26 @@ mod tests {
             self.direct_virtio_headers.push_back((available, enabled));
             self
         }
+
+        fn with_next_stop_boundary_check(
+            mut self,
+            retained_file: &Path,
+            removed_socket: PathBuf,
+        ) -> Self {
+            let metadata =
+                fs::metadata(retained_file).expect("rollback-order backing should exist");
+            self.stop_boundary_checks
+                .push_back(((metadata.dev(), metadata.ino()), Some(removed_socket)));
+            self
+        }
+
+        fn with_next_stop_file_boundary_check(mut self, retained_file: &Path) -> Self {
+            let metadata =
+                fs::metadata(retained_file).expect("rollback-order backing should exist");
+            self.stop_boundary_checks
+                .push_back(((metadata.dev(), metadata.ino()), None));
+            self
+        }
     }
 
     impl ProcessVmnetPacketIoBackendFactory for RecordingVmnetPacketIoBackendFactory {
@@ -38213,8 +38199,24 @@ mod tests {
                 maximum_packet_size: self.maximum_packet_sizes.pop_front().unwrap_or(2048),
                 batch_limits: self.batch_limits.pop_front(),
                 direct_virtio_header: self.direct_virtio_headers.pop_front(),
+                stop_boundary_check: self.stop_boundary_checks.pop_front(),
             }
         }
+    }
+
+    fn descriptor_identity_is_open(expected: (u64, u64)) -> bool {
+        (0..crate::FIRECRACKER_DEFAULT_NOFILE_LIMIT).any(|descriptor| {
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `metadata` is writable and `fstat` only inspects the candidate descriptor.
+            if unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) } != 0 {
+                return false;
+            }
+            // SAFETY: Successful `fstat` initialized the complete structure.
+            let metadata = unsafe { metadata.assume_init() };
+            u64::try_from(metadata.st_dev)
+                .ok()
+                .is_some_and(|device| (device, metadata.st_ino) == expected)
+        })
     }
 
     fn push_recorded_event(events: &Arc<Mutex<Vec<String>>>, event: String) {
@@ -41541,25 +41543,53 @@ mod tests {
             .map(|interface| SnapshotNetworkOverride::new(interface.iface_id(), "vmnet:shared"))
             .collect::<Vec<_>>();
         let vsock = fake_native_v2_vsock_state(SnapshotV2DeviceTransportKind::Mmio);
-        let (candidate, memory) = native_v2_vsock_pre_access_product_candidate(
-            Some(network),
-            Some(vsock),
-            Some(device_graph),
-            serial_config,
+        let prepare_plan = || {
+            let (candidate, memory) = native_v2_vsock_pre_access_product_candidate(
+                Some(network.clone()),
+                Some(vsock.clone()),
+                Some(device_graph.clone()),
+                serial_config.clone(),
+            );
+            let candidate = prepare_process_snapshot_v2_vsock_candidate(
+                candidate,
+                &memory,
+                SnapshotV2DeviceTransportKind::Mmio,
+                &network_overrides,
+                Some(&SnapshotVsockOverride::new(&destination)),
+            )
+            .expect("full exact-2.12 product should prepare pre-access");
+            super::prepare_process_snapshot_v2_vsock_resource_plan(
+                candidate,
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("full exact-2.12 resource plan should prepare")
+        };
+
+        let rollback_plan = prepare_plan();
+        let mut rollback_factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_mac)
+            .with_next_stop_boundary_check(block_file.path(), destination.clone());
+        let rollback_events = rollback_factory.events();
+        let rollback = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            rollback_plan,
+            None,
+            "private-full-product-rollback",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut rollback_factory,
+            |_| false,
+        )
+        .expect("the full exact-2.12 rollback probe should prepare");
+        rollback
+            .abort()
+            .expect("the untouched full exact-2.12 product should unwind cleanly");
+        assert!(
+            recorded_events(&rollback_events)
+                .iter()
+                .any(|event| event == "stop-between-vsock-and-files:eth0:true"),
+            "rollback must remove vsock, then stop network, while file owners remain live"
         );
-        let candidate = prepare_process_snapshot_v2_vsock_candidate(
-            candidate,
-            &memory,
-            SnapshotV2DeviceTransportKind::Mmio,
-            &network_overrides,
-            Some(&SnapshotVsockOverride::new(&destination)),
-        )
-        .expect("full exact-2.12 product should prepare pre-access");
-        let plan = super::prepare_process_snapshot_v2_vsock_resource_plan(
-            candidate,
-            ProcessVmnetAuthority::Direct,
-        )
-        .expect("full exact-2.12 resource plan should prepare");
+
+        let plan = prepare_plan();
         let mut factory =
             RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(expected_mac);
         let events = factory.events();
@@ -41623,6 +41653,61 @@ mod tests {
                 .iter()
                 .any(|event| event == "stop:eth0"),
             "full-product unwind must stop the network provider"
+        );
+
+        fs::write(&destination, b"private replacement")
+            .expect("the preexisting destination probe should be created");
+        let failed_plan = prepare_plan();
+        let mut failed_factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_mac)
+            .with_next_stop_file_boundary_check(block_file.path());
+        let failed_events = failed_factory.events();
+        let error = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            failed_plan,
+            None,
+            "private-full-product-publication-failure",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut failed_factory,
+            |_| false,
+        )
+        .expect_err("a preexisting destination must reject final vsock publication");
+        assert_eq!(
+            error.stage,
+            super::ProcessSnapshotV2VsockRestoreResourceStage::VsockPublication
+        );
+        assert!(!error.cleanup_uncertain());
+        assert_eq!(
+            fs::read(&destination).expect("the preexisting destination should remain"),
+            b"private replacement"
+        );
+        assert!(
+            recorded_events(&failed_events)
+                .iter()
+                .any(|event| event == "stop-between-vsock-and-files:eth0:true"),
+            "publication failure must stop network while earlier file owners remain live"
+        );
+
+        let uncertain_plan = prepare_plan();
+        let mut uncertain_factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_mac)
+            .with_next_stop_status(Some(VmnetStatus::Failure));
+        let uncertain = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            uncertain_plan,
+            None,
+            "private-full-product-publication-cleanup-uncertainty",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut uncertain_factory,
+            |_| false,
+        )
+        .expect_err("publication failure must retain provider cleanup uncertainty");
+        assert_eq!(
+            uncertain.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(uncertain.cleanup_uncertain());
+        assert_eq!(
+            fs::read(&destination).expect("the replacement should survive uncertain cleanup"),
+            b"private replacement"
         );
     }
 
