@@ -631,6 +631,25 @@ fn descriptor_policy_rejects_mutable_special_aliasing_and_invalid_output_files()
         Err(SnapshotV2DiffMaterializationError::SourceOutputAlias { .. })
     ));
 
+    let complete = write_complete(&memory, "source-alias-complete");
+    let next = write_layer(
+        &memory,
+        SnapshotV2DiffBase::Image(complete.binding.clone()),
+        &[],
+        "source-alias-next",
+    );
+    let (_source_alias_output, mut staging) = TestFile::create_empty("source-alias-output");
+    assert!(matches!(
+        apply_snapshot_v2_diff_layer_file(
+            SnapshotV2DiffMaterializationBaseFile::Complete(next.file.open_read()),
+            next.file.open_read(),
+            &mut staging,
+        ),
+        Err(SnapshotV2DiffMaterializationError::SourceAlias {
+            stage: SnapshotV2DiffMaterializationStage::SourceValidation
+        })
+    ));
+
     let (nonempty_file, mut nonempty) = TestFile::create_empty("nonempty-output");
     nonempty
         .write_all(&[1])

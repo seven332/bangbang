@@ -170,6 +170,11 @@ pub enum SnapshotV2DiffMaterializationError {
         /// Output-preflight checkpoint.
         stage: SnapshotV2DiffMaterializationStage,
     },
+    /// The adopted base and next layer name the same source object.
+    SourceAlias {
+        /// Source-validation checkpoint.
+        stage: SnapshotV2DiffMaterializationStage,
+    },
     /// The staged complete result failed detached output verification.
     ResultVerification {
         /// Result-verification checkpoint.
@@ -198,6 +203,7 @@ impl SnapshotV2DiffMaterializationError {
             | Self::InvalidRoute { stage }
             | Self::InvalidOutput { stage }
             | Self::SourceOutputAlias { stage }
+            | Self::SourceAlias { stage }
             | Self::ResultVerification { stage, .. } => *stage,
         }
     }
@@ -221,6 +227,7 @@ impl fmt::Debug for SnapshotV2DiffMaterializationError {
             Self::InvalidRoute { .. } => "route",
             Self::InvalidOutput { .. } => "output",
             Self::SourceOutputAlias { .. } => "alias",
+            Self::SourceAlias { .. } => "source alias",
             Self::ResultVerification { .. } => "verification",
         };
         formatter
@@ -250,6 +257,7 @@ impl fmt::Display for SnapshotV2DiffMaterializationError {
             Self::InvalidRoute { .. } => "found invalid route arithmetic",
             Self::InvalidOutput { .. } => "rejected the staging descriptor",
             Self::SourceOutputAlias { .. } => "rejected a source/output alias",
+            Self::SourceAlias { .. } => "rejected a source alias",
             Self::ResultVerification { .. } => "result verification failed",
         };
         write!(
@@ -278,7 +286,8 @@ impl std::error::Error for SnapshotV2DiffMaterializationError {
             | Self::MissingCoverage { .. }
             | Self::InvalidRoute { .. }
             | Self::InvalidOutput { .. }
-            | Self::SourceOutputAlias { .. } => None,
+            | Self::SourceOutputAlias { .. }
+            | Self::SourceAlias { .. } => None,
         }
     }
 }
@@ -421,8 +430,12 @@ where
 }
 
 struct ValidatedLayerSource {
-    file: File,
+    source: ValidatedLayerFile,
     binding: SnapshotV2DiffLayerBinding,
+}
+
+struct ValidatedLayerFile {
+    file: File,
     facts: FileFacts,
     role: SourceRole,
 }
@@ -503,13 +516,19 @@ impl ValidatedLayerSource {
             });
         }
         Ok(Self {
-            file,
+            source: ValidatedLayerFile { file, facts, role },
             binding,
-            facts,
-            role,
         })
     }
 
+    fn into_file_and_result(self) -> (ValidatedLayerFile, SnapshotV2MemoryBinding) {
+        let Self { source, binding } = self;
+        let SnapshotV2DiffLayerBinding { result, .. } = binding;
+        (source, result)
+    }
+}
+
+impl ValidatedLayerFile {
     fn verify_unchanged(
         &self,
         observation: SourceObservation,
@@ -539,7 +558,7 @@ impl ValidatedBase {
     fn facts(&self) -> FileFacts {
         match self {
             Self::Complete(source) => source.facts(),
-            Self::ZeroRoot(source) => source.facts,
+            Self::ZeroRoot(source) => source.source.facts,
         }
     }
 
@@ -560,7 +579,7 @@ impl ValidatedBase {
                     .verify_unchanged()
                     .map_err(|source| SnapshotV2DiffMaterializationError::Source { stage, source })
             }
-            Self::ZeroRoot(source) => source.verify_unchanged(observation, policy),
+            Self::ZeroRoot(source) => source.source.verify_unchanged(observation, policy),
         }
     }
 }
@@ -603,8 +622,13 @@ fn promote_with_policy(
     }
 
     policy.checkpoint(Stage::LineagePlanning)?;
-    let target = root.binding.result().clone();
-    let routes = build_routes(&target, &root.binding, Inheritance::Zero, policy)?;
+    let routes = build_routes(
+        root.binding.result(),
+        &root.binding,
+        Inheritance::Zero,
+        policy,
+    )?;
+    let (root, target) = root.into_file_and_result();
     execute(target, routes, &root, None, staging, policy)
 }
 
@@ -626,6 +650,7 @@ fn apply_with_policy(
 
     let base = match base {
         SnapshotV2DiffMaterializationBaseFile::Complete(file) => {
+            reject_source_alias(&next.source, &file)?;
             let source =
                 ValidatedSnapshotV2MemorySource::new_with_hook(predecessor, file, |_, file| {
                     policy.source_hook(
@@ -641,6 +666,7 @@ fn apply_with_policy(
             ValidatedBase::Complete(source)
         }
         SnapshotV2DiffMaterializationBaseFile::ZeroRoot(file) => {
+            reject_source_alias(&next.source, &file)?;
             let root = ValidatedLayerSource::new(file, SourceRole::ZeroRoot, policy)?;
             if !matches!(root.binding.base(), SnapshotV2DiffBase::Zero) {
                 return Err(SnapshotV2DiffMaterializationError::InvalidZeroRoot {
@@ -657,13 +683,27 @@ fn apply_with_policy(
     };
 
     policy.checkpoint(Stage::LineagePlanning)?;
-    let target = next.binding.result().clone();
     let inheritance = match &base {
         ValidatedBase::Complete(_) => Inheritance::Complete(predecessor),
         ValidatedBase::ZeroRoot(root) => Inheritance::ZeroRoot(&root.binding),
     };
-    let routes = build_routes(&target, &next.binding, inheritance, policy)?;
+    let routes = build_routes(next.binding.result(), &next.binding, inheritance, policy)?;
+    let (next, target) = next.into_file_and_result();
     execute(target, routes, &next, Some(&base), staging, policy)
+}
+
+fn reject_source_alias(
+    next: &ValidatedLayerFile,
+    base: &File,
+) -> Result<(), SnapshotV2DiffMaterializationError> {
+    let stage = SnapshotV2DiffMaterializationStage::SourceValidation;
+    let base_facts = inspect_file(base)
+        .map_err(|source| SnapshotV2DiffMaterializationError::Source { stage, source })?;
+    if next.facts.same_object(base_facts) {
+        Err(SnapshotV2DiffMaterializationError::SourceAlias { stage })
+    } else {
+        Ok(())
+    }
 }
 
 fn build_routes(
@@ -944,7 +984,7 @@ fn append_route(
 fn execute(
     target: SnapshotV2MemoryBinding,
     routes: Vec<Route>,
-    next: &ValidatedLayerSource,
+    next: &ValidatedLayerFile,
     base: Option<&ValidatedBase>,
     staging: &mut File,
     policy: &mut impl MaterializationPolicy,
@@ -1140,7 +1180,7 @@ fn execute(
 
 fn source_file<'a>(
     source: RouteSource,
-    next: &'a ValidatedLayerSource,
+    next: &'a ValidatedLayerFile,
     base: Option<&'a ValidatedBase>,
 ) -> Option<&'a File> {
     match source {
@@ -1150,7 +1190,7 @@ fn source_file<'a>(
             Some(ValidatedBase::ZeroRoot(_)) | None => None,
         },
         RouteSource::ZeroRoot => match base {
-            Some(ValidatedBase::ZeroRoot(source)) => Some(&source.file),
+            Some(ValidatedBase::ZeroRoot(source)) => Some(&source.source.file),
             Some(ValidatedBase::Complete(_)) | None => None,
         },
         RouteSource::Zero => None,
@@ -1158,7 +1198,7 @@ fn source_file<'a>(
 }
 
 fn verify_sources(
-    next: &ValidatedLayerSource,
+    next: &ValidatedLayerFile,
     base: Option<&ValidatedBase>,
     observation: SourceObservation,
     policy: &mut impl MaterializationPolicy,
