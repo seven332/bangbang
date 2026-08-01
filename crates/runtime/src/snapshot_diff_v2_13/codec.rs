@@ -4,10 +4,7 @@ use crc64::crc64;
 
 use crate::memory::{GuestAddress, GuestMemoryRange};
 use crate::snapshot_format::SnapshotFormatVersion;
-use crate::snapshot_memory_v2::{
-    NATIVE_V2_MEMORY_ALIGNMENT, NATIVE_V2_MEMORY_GUEST_GRANULE, SnapshotV2MemoryImageId,
-    decode_snapshot_v2_memory_binding_payload,
-};
+use crate::snapshot_memory_v2::{NATIVE_V2_MEMORY_ALIGNMENT, NATIVE_V2_MEMORY_GUEST_GRANULE};
 
 use super::{
     FallibleReserve, NATIVE_V2_DIFF_EXTENT_BYTES, NATIVE_V2_DIFF_HEADER_BYTES,
@@ -38,8 +35,9 @@ const FILE_LENGTH_OFFSET: usize = 56;
 const CHECKSUM_OFFSET: usize = 64;
 const BASE_IMAGE_ID_OFFSET: usize = 72;
 const BASE_IMAGE_ID_BYTES: usize = 16;
-const RESERVED_OFFSET: usize = 88;
-const RESERVED_BYTES: usize = 8;
+const PREDECESSOR_BINDING_LENGTH_OFFSET: usize = 88;
+const RESERVED_OFFSET: usize = 92;
+const RESERVED_BYTES: usize = 4;
 const EXTENT_GPA_OFFSET: usize = 0;
 const EXTENT_LENGTH_OFFSET: usize = 8;
 const EXTENT_FILE_OFFSET: usize = 16;
@@ -59,7 +57,11 @@ pub(super) fn encode_with_reserve<R: ReservePolicy>(
     binding: &SnapshotV2DiffLayerBinding,
     reserve: &mut R,
 ) -> Result<Vec<u8>, SnapshotV2DiffLayerBindingError> {
-    let layout = calculate_layout(binding.result(), binding.data_extents().len())?;
+    let layout = calculate_layout(
+        binding.base(),
+        binding.result(),
+        binding.data_extents().len(),
+    )?;
     if binding.version() != NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
         || binding.metadata_length() != layout.metadata_length
         || binding.data_offset() != layout.data_offset
@@ -78,6 +80,15 @@ pub(super) fn encode_with_reserve<R: ReservePolicy>(
         .result()
         .encode()
         .map_err(|source| SnapshotV2DiffLayerBindingError::ResultBinding { source })?;
+    let predecessor = binding
+        .base()
+        .binding()
+        .map(|binding| {
+            binding
+                .encode()
+                .map_err(|source| SnapshotV2DiffLayerBindingError::PredecessorBinding { source })
+        })
+        .transpose()?;
     let metadata_length = usize::try_from(layout.metadata_length)
         .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?;
     if metadata_length > NATIVE_V2_DIFF_MAX_METADATA_BYTES {
@@ -99,7 +110,7 @@ pub(super) fn encode_with_reserve<R: ReservePolicy>(
     bytes.extend_from_slice(&NATIVE_V2_DIFF_PROFILE.to_le_bytes());
     let (base_kind, base_image_id) = match binding.base() {
         SnapshotV2DiffBase::Zero => (BASE_ZERO, [0_u8; BASE_IMAGE_ID_BYTES]),
-        SnapshotV2DiffBase::Image(image_id) => (BASE_IMAGE, image_id.to_bytes()),
+        SnapshotV2DiffBase::Image(binding) => (BASE_IMAGE, binding.image_id().to_bytes()),
     };
     bytes.extend_from_slice(&base_kind.to_le_bytes());
     bytes.extend_from_slice(&FLAGS.to_le_bytes());
@@ -128,11 +139,19 @@ pub(super) fn encode_with_reserve<R: ReservePolicy>(
     bytes.extend_from_slice(&binding.file_length().to_le_bytes());
     bytes.extend_from_slice(&binding.metadata_checksum().to_le_bytes());
     bytes.extend_from_slice(&base_image_id);
+    bytes.extend_from_slice(
+        &u32::try_from(predecessor.as_ref().map_or(0, Vec::len))
+            .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?
+            .to_le_bytes(),
+    );
     bytes.extend_from_slice(&[0_u8; RESERVED_BYTES]);
     if bytes.len() != NATIVE_V2_DIFF_HEADER_BYTES {
         return Err(SnapshotV2DiffLayerBindingError::InvalidLength);
     }
     bytes.extend_from_slice(&result);
+    if let Some(predecessor) = predecessor {
+        bytes.extend_from_slice(&predecessor);
+    }
     for extent in binding.data_extents() {
         bytes.extend_from_slice(&extent.range().start().raw_value().to_le_bytes());
         bytes.extend_from_slice(&extent.range().size().to_le_bytes());
@@ -183,9 +202,11 @@ pub(super) fn decode_with_reserve<R: ReservePolicy>(
         return Err(SnapshotV2DiffLayerBindingError::InvalidHeader);
     }
     let base_bytes = read_array::<BASE_IMAGE_ID_BYTES>(bytes, BASE_IMAGE_ID_OFFSET)?;
-    let base = match read_u16(bytes, BASE_KIND_OFFSET)? {
-        BASE_ZERO if base_bytes == [0_u8; BASE_IMAGE_ID_BYTES] => SnapshotV2DiffBase::Zero,
-        BASE_IMAGE => SnapshotV2DiffBase::Image(SnapshotV2MemoryImageId::from_bytes(base_bytes)),
+    let predecessor_length = usize::try_from(read_u32(bytes, PREDECESSOR_BINDING_LENGTH_OFFSET)?)
+        .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?;
+    let base_is_image = match read_u16(bytes, BASE_KIND_OFFSET)? {
+        BASE_ZERO if base_bytes == [0_u8; BASE_IMAGE_ID_BYTES] && predecessor_length == 0 => false,
+        BASE_IMAGE if predecessor_length != 0 => true,
         _ => return Err(SnapshotV2DiffLayerBindingError::InvalidBase),
     };
     let count = usize::try_from(read_u32(bytes, EXTENT_COUNT_OFFSET)?)
@@ -197,6 +218,7 @@ pub(super) fn decode_with_reserve<R: ReservePolicy>(
         .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?;
     let expected_metadata_length = NATIVE_V2_DIFF_HEADER_BYTES
         .checked_add(result_length)
+        .and_then(|length| length.checked_add(predecessor_length))
         .and_then(|length| {
             count
                 .checked_mul(NATIVE_V2_DIFF_EXTENT_BYTES)
@@ -240,9 +262,28 @@ pub(super) fn decode_with_reserve<R: ReservePolicy>(
     let result_bytes = bytes
         .get(result_start..result_end)
         .ok_or(SnapshotV2DiffLayerBindingError::InvalidLength)?;
-    let result = decode_snapshot_v2_memory_binding_payload(result_bytes)
+    let result = reserve
+        .decode_memory_binding(result_bytes)
         .map_err(|source| SnapshotV2DiffLayerBindingError::ResultBinding { source })?;
-    let layout = calculate_layout(&result, count)?;
+    let predecessor_start = result_end;
+    let predecessor_end = predecessor_start
+        .checked_add(predecessor_length)
+        .ok_or(SnapshotV2DiffLayerBindingError::LengthOverflow)?;
+    let base = if base_is_image {
+        let predecessor_bytes = bytes
+            .get(predecessor_start..predecessor_end)
+            .ok_or(SnapshotV2DiffLayerBindingError::InvalidLength)?;
+        let predecessor = reserve
+            .decode_memory_binding(predecessor_bytes)
+            .map_err(|source| SnapshotV2DiffLayerBindingError::PredecessorBinding { source })?;
+        if predecessor.image_id().to_bytes() != base_bytes {
+            return Err(SnapshotV2DiffLayerBindingError::PredecessorBindingMismatch);
+        }
+        SnapshotV2DiffBase::Image(predecessor)
+    } else {
+        SnapshotV2DiffBase::Zero
+    };
+    let layout = calculate_layout(&base, &result, count)?;
     if layout.metadata_length
         != u64::try_from(metadata_length)
             .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?
@@ -256,7 +297,7 @@ pub(super) fn decode_with_reserve<R: ReservePolicy>(
         .reserve_extents(&mut data_extents, count)
         .map_err(|source| SnapshotV2DiffLayerBindingError::MetadataAllocationFailed { source })?;
     for index in 0..count {
-        let offset = result_end
+        let offset = predecessor_end
             .checked_add(
                 index
                     .checked_mul(NATIVE_V2_DIFF_EXTENT_BYTES)
