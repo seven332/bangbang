@@ -137,20 +137,17 @@ API socket.
 | `corpus:design` | The pinned whole file includes process model, isolation, API, device, guest, resource, and Linux mechanism claims. Runtime seccomp now has a terminal macOS conclusion. | audit; broader lifecycle, device, resource, and architecture claims remain owned across later #1348 waves. |
 | `corpus:getting-started` | The pinned whole file includes executable, jailer, KVM/Linux host, configuration, boot, and device claims. Its runtime seccomp references now have terminal macOS conclusions. | audit; setup, artifacts, operator workflow, deployment, and other claims remain owned across later #1348 waves. |
 
-## Terminal record set through #1384
+## Current Record Set
 
-Exactly 23 of the 29 process-family records are terminal. Twenty-one are
-`implemented-and-verified`: the 19 `I+V` argument rows and the two `I+V`
-semantic rows above. `--no-seccomp` and `--seccomp-filter` are the two
-`proven-platform-impossible` records. Six remain `audit-required`: two argument
-rows, one snapshot-containing semantic record, the aggregate run operation, and
-the two broad corpus records.
+Of the 29 process-family records, 25 are
+`implemented-and-verified`: 21 argument leaves, the three process semantics,
+and the aggregate run operation. `--no-seccomp` and `--seccomp-filter` are
+the two `proven-platform-impossible` records. Only the broad
+`corpus:design` and `corpus:getting-started` records remain
+`audit-required` for their repository-wide claims.
 
-The repository validates overlay structure and tracked references with
-`cargo run -p bangbang-firecracker-capability-audit --locked -- validate` and
-validates the exact pinned identity set with `compare --firecracker <checkout>`.
-The final parent gate intentionally continues to fail while these and other
-families contain nonterminal records.
+Validation and pinned-source comparison commands live in
+[Testing Guide](../../../docs/testing.md#firecracker-capability-inventory).
 
 ## Offline seccompiler public tool
 

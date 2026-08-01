@@ -1,13 +1,8 @@
 # Firecracker v1.16.0 storage closure contract
 
-This ledger is the checked closure record for #1471, the final aggregate child
-of #1450 under #1348, completed by #1634's native-v2 pmem snapshot
-certification under #1534. It covers exactly 40 directly owned Firecracker
-v1.16.0 storage identities, and all 40 are `implemented-and-verified`.
-
-The generated source manifest remains 381 identities, the overlay retains 37
-local semantic identities and 418 total records. At the #1634 checkpoint the
-global disposition counts were 238/160/3/17.
+This ledger owns exactly 40 Firecracker v1.16.0 storage identities selected by
+#1471. All 40 are `implemented-and-verified`, including native-v2 pmem
+snapshot certification.
 
 ## Evidence keys
 

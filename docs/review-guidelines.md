@@ -17,45 +17,22 @@ failing scenario, impacted file or behavior, and the smallest credible fix.
 
 ## Required Verification
 
-Run the repository checks before opening or updating a pull request:
+Use the canonical command list and signed-target selection rules in
+[Testing Guide](testing.md#running-tests). Reviewers should confirm that the PR
+body lists only checks actually run on the reviewed head and explains any
+intentional omission.
 
-```sh
-cargo fmt --all -- --check
-cargo check --workspace --all-targets --all-features --locked
-cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
-cargo test -p bangbang-hvf --lib --all-features --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo clippy -p bangbang --test executable_hvf_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
-cargo clippy -p bangbang --test app_sandbox_process_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
-cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings
-cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings
-cargo clippy -p bangbang-launcher --test production_bundle_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-```
+Changes to signing, entitlements, host-resource policy, launcher behavior, or
+macOS isolation must retain both the signed `app_sandbox` and
+`production_bundle` boundaries. Run them through
+`scripts/run-integration-tests.sh` on supported Apple Silicon; hosted CI may
+use the wrapper's explicit `--allow-unsupported` path to validate build and
+signing before skipping unavailable HVF execution.
 
-On macOS Apple Silicon, also run `scripts/run-integration-tests.sh` for signed
-HVF-backed integration targets. These tests should not be skipped or ignored on
-hosts that support HVF. Hosted CI may use
-`scripts/run-integration-tests.sh --allow-unsupported` to validate build/sign
-behavior without executing HVF when the runner does not support it.
-Changes to signing, entitlements, host-resource policy, the launcher, or macOS
-isolation must retain both `app_sandbox` and `production_bundle` targets in that
-wrapper. The former is the narrow containment-building-block gate. The latter
-must exercise the fixed production topology, separately inspect both code
-objects, reject modified nested code, and launch a real sandboxed HVF guest.
-
-Reviewers should confirm the PR body lists the checks that were run. If any
-command is intentionally skipped, the PR should explain why the skipped command
-does not add useful signal for that change.
-
-Do not list verification commands that were not actually run on the reviewed
-head. If a command is copied from a template, either run it or remove it from
-the PR body.
-
-Add targeted smoke tests when the PR changes process startup, CLI behavior, API
-socket serving, signal handling, filesystem cleanup, FFI, or platform gating.
-For example, API server changes should usually be exercised with a real Unix
-socket request, not only by calling parser helpers.
+Add targeted public-boundary smoke tests for changes to process startup, CLI
+behavior, API sockets, signals, filesystem cleanup, FFI, or platform gating.
+For example, an API-server change should normally use a real Unix socket rather
+than only parser helpers.
 
 ## Correctness and Compatibility
 

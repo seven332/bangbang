@@ -5,14 +5,11 @@ the delivered aarch64 PL031 RTC, VMGenID, VMClock, public live/capture-ready
 PVTime, and focused native-v2 portable time/clone restore portions of exactly
 one aggregate identity:
 `semantic.device:rtc-vmclock-vmgenid-and-pvtime`. That identity remains
-`audit-required` because optional-device composition and broader cross-host
-time-source portability remain under
-[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). #1529
-therefore advances the checked contract without changing the inventory
-disposition or global count. #1578 later activates the device-free public
-lifecycle, #1589 carries this unchanged time component into exact single-root
-native-v2 `2.4.0`, and #1616/#1617 carry it unchanged into the current rooted
-or rootless regular-file multi-block `2.5.0` lifecycle.
+`audit-required` for its remaining production-observation and broader
+cross-host time-source certification under
+[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). The required
+native-v2 time component is otherwise carried unchanged from exact 2.3 through
+current 2.12 and composes with every current optional-device product.
 
 ## Evidence keys
 
@@ -93,7 +90,7 @@ or rootless regular-file multi-block `2.5.0` lifecycle.
 
 | Identity | Current disposition | Exact contract and remaining handoff |
 | --- | --- | --- |
-| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, public per-vCPU PVTime measurement/accounting/publication/discovery, native-v2 `2.3.0` introduction plus unchanged `2.4.0` and `2.5.0` carriage, repeated immutable clone restore, recapture, failure classification, redaction, and signed multi-vCPU guest observation are implemented and verified. The public device-free 2.3, single-root 2.4, and rooted/rootless regular-file multi-block 2.5 lifecycle/production compositions are implemented. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** retains optional-device composition, broader cross-host time-source migration/clone portability, and terminal disposition. |
+| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, public per-vCPU PVTime measurement/accounting/publication/discovery, exact native-v2 2.3 introduction through unchanged current 2.12 carriage, repeated immutable clone restore, recapture, failure classification, redaction, and signed multi-vCPU guest observation are implemented and verified. Every current optional-device product composes the same required time component. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** retains the remaining production-observation, broader cross-host time-source migration/clone portability, and terminal disposition. |
 
 ## VMClock state and version contract
 
@@ -113,13 +110,12 @@ or rootless regular-file multi-block `2.5.0` lifecycle.
   the typed ABI from that memory page, so old local artifacts keep their prior
   meaning without inventing state. Every new capture reads the live page while
   vCPU execution and auxiliary publishers are quiesced.
-- Native-v2 `2.3.0` stores the same exact ABI inside `BANGTM2\0`, together with
-  portable placement, notification, policy, and per-vCPU PVTime state.
-  Exact `2.4.0` and current `2.5.0` retain that exact component before
-  mandatory device-graph kind 7; only kind 7's profile changes between those
-  versions. Structural readers still admit valid `2.2.x` containers, but the
-  complete typed HVF platform decoder requires kind 6 and therefore at least
-  minor 3.
+- Native-v2 `2.3.0` stores the same exact ABI inside `BANGTM2\0`, together
+  with portable placement, notification, policy, and per-vCPU PVTime state.
+  Exact `2.4.0` through current `2.12.0` retain that component unchanged
+  before their versioned device graph. Structural readers still admit valid
+  `2.2.x` containers, but the complete typed HVF platform decoder requires
+  kind 6 and therefore at least minor 3.
 
 ## Restore ordering and terminality
 
@@ -161,11 +157,10 @@ it is not a claim of alarm delivery or source-wall-clock freezing.
 
 ## Explicit remaining handoff
 
-This ledger does not claim KVM's ARM steal-time device attribute, public
-native-v2 create/load/describe/version activation, general production-session
-composition, or arbitrary cross-host time-source portability. The aggregate
-#1481 certification proves the live/capture-ready coexistence boundary, while
-#1529 proves focused native-v2 artifact, clone, and restored-guest behavior.
-Wave 6 #1490 must still connect that internal result to the public production
-lifecycle and complete broader migration/clone portability certification before
-the aggregate inventory record can become terminal.
+This ledger does not claim KVM's ARM steal-time device attribute, complete
+time-specific observation across every production profile, or arbitrary
+cross-host time-source portability. Public native-v2 create/load/describe and
+version selection are active through current 2.12, and every optional product
+retains the same required time component. Wave 6 #1490 retains the focused
+remaining production observation and broader migration/clone portability
+certification before the aggregate inventory record can become terminal.

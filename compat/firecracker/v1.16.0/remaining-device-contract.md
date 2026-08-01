@@ -6,20 +6,13 @@ replacing their row-specific semantic contracts. The selector contains exactly
 85 identities: 52 balloon, 19 memory-hotplug, seven entropy, six serial, and
 one time/identity aggregate.
 
-The original #1481 checkpoint had 77 terminal rows and eight Wave 6 handoffs.
-The exact 2.7 serial closure in #1652 made 78 rows terminal, and #1666's exact
-2.8 entropy snapshot certification made 80 rows terminal. #1681's exact 2.9
-balloon snapshot certification made 82 rows terminal. #1698's exact 2.10
-virtio-mem snapshot certification now makes 84 rows
-`implemented-and-verified`; one time/identity row remains `audit-required`
-because its remaining public-production composition and broad time-source
-portability certification belong to
+Eighty-four rows are `implemented-and-verified`; one time/identity row
+remains `audit-required` because its remaining public-production composition
+and broad time-source portability certification belong to
 [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). The
 repository-wide observability, tools, and specification work belongs to
 [Wave 7 #1491](https://github.com/seven332/bangbang/issues/1491), but zero rows
-in this 85-record selector are handed to Wave 7. Global inventory totals remain
-242 implemented, 156 audit-required, three missing-platform-feasible, and 17
-proven-platform-impossible.
+in this 85-record selector are handed to Wave 7.
 
 ## Evidence keys
 
