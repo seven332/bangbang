@@ -442,6 +442,11 @@ fn predecessor_identity_and_extent_mutations_reject_canonically() {
 
     for (field_offset, value, expected) in [
         (directory + EXTENT_GPA_OFFSET, start + 1, "unaligned GPA"),
+        (
+            directory + EXTENT_GPA_OFFSET,
+            u64::MAX - (4096 - 1),
+            "overflowing GPA range",
+        ),
         (directory + EXTENT_LENGTH_OFFSET, 0, "empty range"),
         (directory + EXTENT_LENGTH_OFFSET, 4097, "unaligned length"),
         (

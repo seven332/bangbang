@@ -14,7 +14,7 @@ use super::{
     NATIVE_V2_DIFF_MAGIC, NATIVE_V2_DIFF_MAX_EXTENTS, NATIVE_V2_DIFF_MAX_METADATA_BYTES,
     NATIVE_V2_DIFF_PROFILE, NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION, ReservePolicy,
     SnapshotV2DiffBase, SnapshotV2DiffDataExtent, SnapshotV2DiffLayerBinding,
-    SnapshotV2DiffLayerBindingError, build_binding, calculate_layout,
+    SnapshotV2DiffLayerBindingError, align_up, build_binding, calculate_layout,
 };
 
 const FLAGS: u32 = 0;
@@ -294,16 +294,6 @@ pub(super) fn metadata_checksum(bytes: &[u8]) -> Result<u64, SnapshotV2DiffLayer
     let checksum = crc64(0, before);
     let checksum = crc64(checksum, &[0_u8; size_of::<u64>()]);
     Ok(crc64(checksum, after))
-}
-
-fn align_up(value: u64, alignment: u64) -> Result<u64, SnapshotV2DiffLayerBindingError> {
-    let mask = alignment
-        .checked_sub(1)
-        .ok_or(SnapshotV2DiffLayerBindingError::LengthOverflow)?;
-    value
-        .checked_add(mask)
-        .map(|value| value & !mask)
-        .ok_or(SnapshotV2DiffLayerBindingError::LengthOverflow)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, SnapshotV2DiffLayerBindingError> {
