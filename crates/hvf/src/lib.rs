@@ -32,6 +32,7 @@ mod snapshot_v2_multi_block_platform;
 mod snapshot_v2_network_platform;
 mod snapshot_v2_platform;
 mod snapshot_v2_storage_platform;
+mod snapshot_v2_vsock_platform;
 mod startup;
 mod topology;
 mod vcpu;
@@ -228,6 +229,18 @@ pub use snapshot_v2_storage_platform::{
     prepare_hvf_snapshot_v2_storage_entropy_mmio_platform_plan,
     prepare_hvf_snapshot_v2_storage_mmio_platform_plan,
     prepare_hvf_snapshot_v2_storage_pci_platform_plan,
+};
+pub use snapshot_v2_vsock_platform::{
+    HvfSnapshotV2VsockMmioEndpointPlan, HvfSnapshotV2VsockMmioPlatformPlan,
+    HvfSnapshotV2VsockMmioProcessConfig, HvfSnapshotV2VsockPciEndpointPlan,
+    HvfSnapshotV2VsockPciPlatformPlan, HvfSnapshotV2VsockPlatformPlanStage,
+    HvfSnapshotV2VsockPreparedEndpoint, HvfSnapshotV2VsockPreparedMemory,
+    HvfSnapshotV2VsockPreparedProduct, HvfSnapshotV2VsockPreparedProductParts,
+    HvfSnapshotV2VsockProcessResourceIdentity, HvfSnapshotV2VsockProductKind,
+    PrepareHvfSnapshotV2VsockPlatformPlanError, prepare_hvf_snapshot_v2_vsock_mmio_platform_plan,
+    prepare_hvf_snapshot_v2_vsock_mmio_platform_plan_with_cancel,
+    prepare_hvf_snapshot_v2_vsock_pci_platform_plan,
+    prepare_hvf_snapshot_v2_vsock_pci_platform_plan_with_cancel,
 };
 pub use startup::{
     HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonCaptureState,
