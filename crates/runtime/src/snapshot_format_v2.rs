@@ -7,6 +7,7 @@ use crc64::crc64;
 
 use crate::snapshot_balloon_v2_9::NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+use crate::snapshot_diff_v2_13::NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_format::{SnapshotArchitecture, SnapshotFormatVersion, SnapshotIntegrity};
 use crate::snapshot_memory_hotplug_v2_10::NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION;
@@ -50,7 +51,7 @@ pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVers
 
 /// Newest compatibility version understood through an explicit internal seam.
 const NATIVE_V2_LATEST_KNOWN_COMPATIBILITY_VERSION: SnapshotFormatVersion =
-    NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
+    NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION;
 
 /// Exact native-v2 version of the complete legacy device-free platform profile.
 ///
@@ -113,6 +114,12 @@ const _: () = assert!(
             == NATIVE_V2_SNAPSHOT_VERSION.minor()
         && NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.patch()
             == NATIVE_V2_SNAPSHOT_VERSION.patch()
+);
+const _: () = assert!(
+    NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
+        && NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION.minor()
+            == NATIVE_V2_SNAPSHOT_VERSION.minor() + 1
+        && NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION.patch() == NATIVE_V2_SNAPSHOT_VERSION.patch()
 );
 
 /// Fixed native-v2 state header size.
@@ -192,6 +199,10 @@ const PRODUCTION_SEMANTIC_COMPONENTS: &[CatalogEntry] = &[
     CatalogEntry {
         id: NATIVE_V2_VSOCK_COMPONENT_KEY.kind,
         introduced_minor: 12,
+    },
+    CatalogEntry {
+        id: NATIVE_V2_DIFF_COMPONENT_KEY.kind,
+        introduced_minor: 13,
     },
 ];
 
@@ -313,10 +324,16 @@ pub const NATIVE_V2_NETWORK_COMPONENT_KEY: SnapshotV2ComponentKey =
 
 /// Canonical identity of the optional singleton native-v2 vsock state.
 ///
-/// This semantic component is introduced by exact 2.12. Public product
-/// profiles remain at 2.11 until the later activation slice.
+/// This semantic component is introduced by exact 2.12.
 pub const NATIVE_V2_VSOCK_COMPONENT_KEY: SnapshotV2ComponentKey =
     SnapshotV2ComponentKey::new(13, 0);
+
+/// Canonical identity of the optional singleton native-v2 Diff layer.
+///
+/// This semantic component is introduced by the dormant exact-2.13
+/// compatibility seam. Public product profiles remain exact 2.12 until the
+/// later activation slice.
+pub const NATIVE_V2_DIFF_COMPONENT_KEY: SnapshotV2ComponentKey = SnapshotV2ComponentKey::new(14, 0);
 
 impl fmt::Debug for SnapshotV2ComponentKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
