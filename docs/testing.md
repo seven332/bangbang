@@ -687,9 +687,11 @@ UART/metrics state, explicitly resumes and repauses it, then shuts it down. A
 second fresh process restores the same pair with resume intent through
 already-opened contained state/memory/root descriptors after both artifact
 paths are replaced, uses the ordinary action gate to reach `Running`, pauses,
-and shuts down. The replacements remain untouched. The second ignored test
-exercises complete MMIO and PCI root-owner commit/rollback boundaries. This
-group is part of the default integration set and must run without
+and shuts down. The replacements remain untouched. Additional ignored seams
+exercise complete MMIO and PCI root-owner commit/rollback boundaries,
+exact-2.11 network owner transactions, and exact-2.12 vsock owner transactions
+over both MMIO and PCI. This group is part of the default integration set and
+must run without
 `--allow-unsupported` on supported Apple Silicon. It adds no API, CLI,
 config-file, or environment activation for native-v2.
 

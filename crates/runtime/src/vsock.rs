@@ -7112,6 +7112,7 @@ impl VirtioVsockTransportResetPublication {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioVsockTransportResetAttempt {
     Inactive,
+    AlreadyPending,
     QueueEmpty,
     Published(VirtioVsockTransportResetPublication),
 }
@@ -7120,7 +7121,7 @@ impl VirtioVsockTransportResetAttempt {
     pub const fn publication(self) -> Option<VirtioVsockTransportResetPublication> {
         match self {
             Self::Published(publication) => Some(publication),
-            Self::Inactive | Self::QueueEmpty => None,
+            Self::Inactive | Self::AlreadyPending | Self::QueueEmpty => None,
         }
     }
 
@@ -7738,6 +7739,7 @@ pub enum VirtioVsockDeviceCaptureError {
     InactiveResetAttemptMismatch,
     ActiveResetAttemptMissing,
     PublishedResetWithoutGate,
+    PendingResetWithoutGate,
     EmptyResetAttemptWithPendingDescriptor,
 }
 
@@ -7810,6 +7812,8 @@ impl fmt::Display for VirtioVsockDeviceCaptureError {
             }
             Self::PublishedResetWithoutGate => formatter
                 .write_str("published vsock reset capture does not have the source RX gate armed"),
+            Self::PendingResetWithoutGate => formatter
+                .write_str("pending vsock reset capture does not have the source RX gate armed"),
             Self::EmptyResetAttemptWithPendingDescriptor => formatter
                 .write_str("empty vsock reset capture still has an available event descriptor"),
         }
@@ -8774,6 +8778,9 @@ impl VirtioVsockDevice {
             (true, VirtioVsockTransportResetAttempt::Published(_)) if !self.pending_event_ack => {
                 return Err(VirtioVsockDeviceCaptureError::PublishedResetWithoutGate);
             }
+            (true, VirtioVsockTransportResetAttempt::AlreadyPending) if !self.pending_event_ack => {
+                return Err(VirtioVsockDeviceCaptureError::PendingResetWithoutGate);
+            }
             (true, VirtioVsockTransportResetAttempt::QueueEmpty)
                 if event_available_count != Some(0) =>
             {
@@ -8972,6 +8979,9 @@ impl VirtioVsockDevice {
     ) -> Result<VirtioVsockTransportResetAttempt, VirtioVsockTransportResetError> {
         if !self.is_activated() {
             return Ok(VirtioVsockTransportResetAttempt::Inactive);
+        }
+        if self.pending_event_ack {
+            return Ok(VirtioVsockTransportResetAttempt::AlreadyPending);
         }
         let Some(event_queue) = self.active_event_queue.as_mut() else {
             return Ok(VirtioVsockTransportResetAttempt::Inactive);
@@ -18392,7 +18402,7 @@ mod tests {
     }
 
     #[test]
-    fn virtio_vsock_repeated_transport_reset_preserves_existing_ack_gate_when_queue_is_empty() {
+    fn virtio_vsock_repeated_transport_reset_preserves_existing_ack_gate_and_descriptors() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
         let metrics = SharedVsockDeviceMetrics::default();
@@ -18403,7 +18413,18 @@ mod tests {
             0,
             TestDescriptor::writable(TEST_VSOCK_EVENT_PAYLOAD, 4, None),
         );
-        write_vsock_event_available_heads(&mut memory, &[0]);
+        write_vsock_event_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_EVENT_PAYLOAD
+                    .checked_add(0x100)
+                    .expect("second event payload should fit"),
+                4,
+                None,
+            ),
+        );
+        write_vsock_event_available_heads(&mut memory, &[0, 1]);
         write_guest_u16(
             &mut memory,
             vsock_event_used_ring_avail_event_address(),
@@ -18426,12 +18447,22 @@ mod tests {
 
         let repeated = handler
             .prepare_vsock_transport_reset(&mut memory, &metrics)
-            .expect("empty repeated reset should remain nonfatal");
+            .expect("pending repeated reset should remain nonfatal");
 
-        assert_eq!(repeated, VirtioVsockTransportResetAttempt::QueueEmpty);
+        assert_eq!(repeated, VirtioVsockTransportResetAttempt::AlreadyPending);
         assert!(handler.activation_handler().pending_event_ack());
         assert_eq!(read_vsock_event_used_index(&memory), 1);
-        assert_eq!(metrics.snapshot().ev_queue_event_fails(), 1);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .active_event_dispatch_queue()
+                .expect("event queue should remain active")
+                .available_ring()
+                .next_avail(),
+            1,
+            "repeated reset must not consume another guest descriptor"
+        );
+        assert!(metrics.snapshot().is_empty());
     }
 
     #[test]
@@ -26484,6 +26515,14 @@ mod tests {
                 VirtioVsockTransportResetAttempt::Inactive
             ),
             Err(VirtioVsockDeviceCaptureError::ActiveResetAttemptMissing)
+        ));
+        assert!(matches!(
+            handler.capture_vsock_state(
+                &config,
+                &memory,
+                VirtioVsockTransportResetAttempt::AlreadyPending
+            ),
+            Err(VirtioVsockDeviceCaptureError::PendingResetWithoutGate)
         ));
 
         let publisher_path = unique_socket_path("capture-publisher");

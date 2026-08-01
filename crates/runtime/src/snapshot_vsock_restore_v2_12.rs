@@ -7,10 +7,12 @@
 //! route, VM, vCPU, or platform authority.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestMemory, GuestMemoryRange};
-use crate::mmio::MmioRegion;
+use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::PciSbdf;
 use crate::snapshot::{
     SnapshotVsockOverride, SnapshotVsockSelectorError, SnapshotVsockSelectors,
@@ -30,11 +32,15 @@ use crate::snapshot_vsock_v2_12::{
 };
 use crate::storage_capture::StorageDeviceOrigin;
 use crate::virtio::{VirtioDeviceType, VirtioDeviceTypeError};
-use crate::virtio_pci::{VirtioPciEndpointError, VirtioPciIdentity, VirtioPciTransportState};
+use crate::virtio_pci::{
+    PreparedVirtioPciEndpoint, VirtioPciEndpointError, VirtioPciIdentity, VirtioPciTransportState,
+};
 use crate::vsock::{
-    VIRTIO_VSOCK_DEVICE_ID, VirtioVsockActiveQueuesCaptureState, VirtioVsockDeviceCaptureError,
+    VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES, VirtioVsockActiveQueuesCaptureState,
+    VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceCaptureError,
     VirtioVsockDeviceCaptureState, VirtioVsockMmioCaptureState, VirtioVsockPciCaptureState,
-    VirtioVsockQueueCaptureState, VsockConfig, VsockConfigInput,
+    VirtioVsockQueueCaptureState, VirtioVsockReconstructionError,
+    VirtioVsockReconstructionResource, VsockConfig, VsockConfigInput,
 };
 
 const REDACTED: &str = "<redacted>";
@@ -190,6 +196,77 @@ impl PreparedSnapshotV2VsockPciState {
     ) {
         (self.origin, self.sbdf, self.bar_range, self.capture)
     }
+
+    /// Consumes checked PCI state into one complete retained endpoint.
+    ///
+    /// The caller supplies the destination endpoint resource, fixed dispatcher
+    /// region, and fresh message registry. Function, BAR, dispatcher,
+    /// interrupt-resource, run-loop, session, and VM ownership remain outside
+    /// this value.
+    #[doc(hidden)]
+    pub fn into_pci_endpoint(
+        self,
+        config: &VsockConfig,
+        destination_memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+        region_id: MmioRegionId,
+        messages: GuestMessageInterruptRegistry,
+    ) -> Result<PreparedSnapshotV2VsockPciEndpoint, SnapshotV2VsockPciEndpointError> {
+        if resource.captured_selector() != self.capture.device().backend_selector()
+            || resource.destination_selector().path() != config.uds_path()
+            || self.capture.device().guest_cid() != u64::from(config.guest_cid())
+        {
+            return Err(SnapshotV2VsockPciEndpointError::ResourceIdentity);
+        }
+        let expected = PreparedSnapshotV2VsockRestoreState::Pci(self.clone())
+            .into_destination_normalized_state(config)
+            .map_err(|_| SnapshotV2VsockPciEndpointError::ExpectedState)?;
+        let Self {
+            origin,
+            sbdf,
+            bar_range,
+            capture,
+        } = self;
+        let retained = capture.transport().clone();
+        let prepared = capture
+            .reconstruct_snapshot_device(destination_memory, resource)
+            .map_err(SnapshotV2VsockPciEndpointError::Device)?;
+        let activation_is_active = prepared.device().is_activated();
+        let (guest_cid, uds_path, config_space, device) = prepared.into_parts();
+        let device_type = VirtioDeviceType::new(VIRTIO_VSOCK_DEVICE_ID)
+            .map_err(SnapshotV2VsockPciEndpointError::DeviceType)?;
+        let identity = VirtioPciIdentity::new(device_type, config_space.available_features())
+            .with_config_generation(retained.device_registers().config_generation());
+        let endpoint = PreparedVirtioPciEndpoint::new(
+            identity,
+            &VIRTIO_VSOCK_QUEUE_SIZES,
+            config_space,
+            device,
+            activation_is_active,
+            false,
+            &retained,
+            sbdf,
+            bar_range,
+            region_id,
+            messages,
+        )
+        .map_err(SnapshotV2VsockPciEndpointError::Endpoint)?;
+        let recaptured = endpoint
+            .endpoint()
+            .transport_state()
+            .map_err(SnapshotV2VsockPciEndpointError::Endpoint)?;
+        if recaptured != retained {
+            return Err(SnapshotV2VsockPciEndpointError::StateMismatch);
+        }
+
+        Ok(PreparedSnapshotV2VsockPciEndpoint {
+            guest_cid,
+            uds_path,
+            expected,
+            origin,
+            endpoint,
+        })
+    }
 }
 
 impl fmt::Debug for PreparedSnapshotV2VsockPciState {
@@ -198,6 +275,110 @@ impl fmt::Debug for PreparedSnapshotV2VsockPciState {
             .debug_struct("PreparedSnapshotV2VsockPciState")
             .field("state", &REDACTED)
             .finish()
+    }
+}
+
+/// One checked exact-2.12 vsock endpoint awaiting PCI publication.
+#[doc(hidden)]
+pub struct PreparedSnapshotV2VsockPciEndpoint {
+    guest_cid: u32,
+    uds_path: PathBuf,
+    expected: SnapshotV2VsockState,
+    origin: StorageDeviceOrigin,
+    endpoint: PreparedVirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice>,
+}
+
+/// Consumed exact-2.12 vsock continuation and retained PCI endpoint.
+#[doc(hidden)]
+pub type PreparedSnapshotV2VsockPciEndpointParts = (
+    u32,
+    PathBuf,
+    SnapshotV2VsockState,
+    StorageDeviceOrigin,
+    PreparedVirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice>,
+);
+
+impl PreparedSnapshotV2VsockPciEndpoint {
+    pub const fn guest_cid(&self) -> u32 {
+        self.guest_cid
+    }
+
+    pub fn uds_path(&self) -> &Path {
+        &self.uds_path
+    }
+
+    pub const fn expected_state(&self) -> &SnapshotV2VsockState {
+        &self.expected
+    }
+
+    pub const fn origin(&self) -> StorageDeviceOrigin {
+        self.origin
+    }
+
+    pub const fn endpoint(
+        &self,
+    ) -> &PreparedVirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
+        &self.endpoint
+    }
+
+    pub fn into_parts(self) -> PreparedSnapshotV2VsockPciEndpointParts {
+        (
+            self.guest_cid,
+            self.uds_path,
+            self.expected,
+            self.origin,
+            self.endpoint,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2VsockPciEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2VsockPciEndpoint")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Redacted failure while materializing one checked vsock PCI endpoint.
+#[doc(hidden)]
+pub enum SnapshotV2VsockPciEndpointError {
+    ResourceIdentity,
+    ExpectedState,
+    Device(VirtioVsockReconstructionError),
+    DeviceType(VirtioDeviceTypeError),
+    Endpoint(VirtioPciEndpointError),
+    StateMismatch,
+}
+
+impl fmt::Debug for SnapshotV2VsockPciEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2VsockPciEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ResourceIdentity => "native-v2 vsock PCI resource identity is invalid",
+            Self::ExpectedState => "native-v2 vsock PCI destination state is invalid",
+            Self::Device(_) => "native-v2 vsock PCI device reconstruction failed",
+            Self::DeviceType(_) => "native-v2 vsock PCI device type is invalid",
+            Self::Endpoint(_) => "native-v2 vsock PCI endpoint construction failed",
+            Self::StateMismatch => "native-v2 vsock PCI endpoint state does not match",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2VsockPciEndpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Device(source) => Some(source),
+            Self::DeviceType(source) => Some(source),
+            Self::Endpoint(source) => Some(source),
+            Self::ResourceIdentity | Self::ExpectedState | Self::StateMismatch => None,
+        }
     }
 }
 

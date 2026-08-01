@@ -1,15 +1,99 @@
 use std::cell::Cell;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::memory::{GuestAddress, GuestMemoryLayout};
+use crate::message_interrupt::{
+    GuestMessage, GuestMessageInterrupt, GuestMessageInterruptRegistry,
+    GuestMessageInterruptSignalError,
+};
+use crate::mmio::MmioRegionId;
 use crate::snapshot::SnapshotVsockSelectorError;
+use crate::snapshot_device_v2::SnapshotV2DeviceTransport;
 use crate::snapshot_device_v2::snapshot_v2_device_key_for_test;
 use crate::snapshot_restore::{SnapshotRestorePublicId, SnapshotRestoreResourceClass};
 use crate::snapshot_vsock_v2_12::NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
+use crate::vsock::{
+    SuppliedVsockListener, VirtioVsockReconstructionResource, VsockBackendSelector,
+    VsockGuestConnector,
+};
 
 use super::*;
 
 const INACTIVE_MMIO_HEX: &str = include_str!("../snapshot_vsock_v2_12/fixtures/inactive-mmio.hex");
 const ACTIVE_PCI_HEX: &str = include_str!("../snapshot_vsock_v2_12/fixtures/active-pci.hex");
+static NEXT_LISTENER_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct RejectingGuestConnector;
+
+impl VsockGuestConnector for RejectingGuestConnector {
+    fn connect(&mut self, _host_port: u32) -> std::io::Result<UnixStream> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+}
+
+#[derive(Debug)]
+struct TestMessageRoute(GuestMessage);
+
+impl GuestMessageInterrupt for TestMessageRoute {
+    fn matches(&self, message: GuestMessage) -> bool {
+        self.0 == message
+    }
+
+    fn signal(&self, message: GuestMessage) -> Result<(), GuestMessageInterruptSignalError> {
+        if self.matches(message) {
+            Ok(())
+        } else {
+            Err(GuestMessageInterruptSignalError::new(
+                "test route rejected an unknown message",
+                false,
+            ))
+        }
+    }
+}
+
+fn vsock_message_registry(state: &SnapshotV2VsockState) -> GuestMessageInterruptRegistry {
+    let SnapshotV2DeviceTransport::Pci(pci) = state.transport() else {
+        panic!("test vsock should use PCI");
+    };
+    let routes: Vec<Arc<dyn GuestMessageInterrupt>> = pci
+        .msix()
+        .entries()
+        .iter()
+        .map(|entry| {
+            let address = (u64::from(entry.message_address_high()) << 32)
+                | u64::from(entry.message_address_low());
+            Arc::new(TestMessageRoute(GuestMessage::new(
+                address,
+                entry.message_data(),
+            ))) as Arc<dyn GuestMessageInterrupt>
+        })
+        .collect();
+    GuestMessageInterruptRegistry::new(routes)
+        .expect("vsock message registry should contain every retained vector")
+}
+
+fn supplied_vsock_resource(
+    captured: VsockBackendSelector,
+    destination: VsockBackendSelector,
+) -> VirtioVsockReconstructionResource {
+    let listener_path = std::path::Path::new("/tmp").join(format!(
+        "bb-vsock-{}-{}.sock",
+        std::process::id(),
+        NEXT_LISTENER_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let listener = UnixListener::bind(&listener_path)
+        .expect("test reconstruction listener should bind before handoff");
+    std::fs::remove_file(&listener_path)
+        .expect("test reconstruction listener should unlink after bind");
+    VirtioVsockReconstructionResource::with_destination_selector(
+        captured,
+        destination,
+        SuppliedVsockListener::new(listener).with_guest_connector(RejectingGuestConnector),
+    )
+}
 
 fn decode_hex(value: &str) -> Vec<u8> {
     let value = value.split_whitespace().collect::<String>();
@@ -183,6 +267,114 @@ fn explicit_override_changes_only_destination_intent() {
     let debug = format!("{topology:?} {:?}", topology.request());
     assert!(!debug.contains(destination));
     assert!(!debug.contains(captured.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn active_pci_state_materializes_one_exact_destination_endpoint() {
+    let portable = state(ACTIVE_PCI_HEX);
+    let memory = memory_for(&portable);
+    let destination = std::path::Path::new("/tmp").join(format!(
+        "bangbang-vsock-restored-pci-{}.sock",
+        std::process::id()
+    ));
+    let requested = SnapshotVsockOverride::new(&destination);
+    let topology = PreparedSnapshotV2VsockRestoreTopology::prepare(
+        portable.clone(),
+        Some(&requested),
+        SnapshotV2DeviceTransportKind::Pci,
+        &memory,
+    )
+    .expect("active PCI topology should prepare");
+    let expected = topology
+        .state()
+        .clone()
+        .into_destination_normalized_state(topology.request().config())
+        .expect("checked PCI state should normalize to the destination");
+    let config = topology.request().config().clone();
+    let captured_selector = portable.backend_selector().clone();
+    let destination_selector = VsockBackendSelector::try_from_path(&destination)
+        .expect("destination selector should validate");
+    let messages = vsock_message_registry(&portable);
+    let (_, prepared) = topology.into_parts();
+    let PreparedSnapshotV2VsockRestoreState::Pci(prepared) = prepared else {
+        panic!("prepared state should retain PCI transport");
+    };
+    let origin = prepared.origin();
+    let sbdf = prepared.sbdf();
+    let bar_range = prepared.bar_range();
+    let mut resource = supplied_vsock_resource(captured_selector, destination_selector);
+    let endpoint = prepared
+        .into_pci_endpoint(
+            &config,
+            &memory,
+            &mut resource,
+            MmioRegionId::new(700),
+            messages,
+        )
+        .expect("checked PCI state should materialize");
+
+    assert!(resource.is_consumed());
+    assert_eq!(endpoint.guest_cid(), config.guest_cid());
+    assert_eq!(endpoint.uds_path(), destination);
+    assert_eq!(endpoint.expected_state(), &expected);
+    assert_eq!(endpoint.origin(), origin);
+    assert_eq!(endpoint.endpoint().sbdf(), sbdf);
+    assert_eq!(endpoint.endpoint().bar_range(), bar_range);
+    assert_eq!(endpoint.endpoint().region_id(), MmioRegionId::new(700));
+    assert!(
+        endpoint
+            .endpoint()
+            .endpoint()
+            .transport_state()
+            .expect("reconstructed transport should recapture")
+            .is_device_activated()
+    );
+    let debug = format!("{endpoint:?}");
+    assert!(debug.contains(REDACTED));
+    assert!(!debug.contains(destination.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn pci_endpoint_rejects_mismatched_destination_without_consuming_resource() {
+    let portable = state(ACTIVE_PCI_HEX);
+    let memory = memory_for(&portable);
+    let destination = "/tmp/bangbang-vsock-expected-pci.sock";
+    let topology = PreparedSnapshotV2VsockRestoreTopology::prepare(
+        portable.clone(),
+        Some(&SnapshotVsockOverride::new(destination)),
+        SnapshotV2DeviceTransportKind::Pci,
+        &memory,
+    )
+    .expect("active PCI topology should prepare");
+    let config = topology.request().config().clone();
+    let messages = vsock_message_registry(&portable);
+    let (_, prepared) = topology.into_parts();
+    let PreparedSnapshotV2VsockRestoreState::Pci(prepared) = prepared else {
+        panic!("prepared state should retain PCI transport");
+    };
+    let wrong_destination =
+        VsockBackendSelector::try_from_path("/tmp/bangbang-vsock-wrong-pci.sock")
+            .expect("wrong test selector should still validate");
+    let mut resource =
+        supplied_vsock_resource(portable.backend_selector().clone(), wrong_destination);
+    let error = prepared
+        .into_pci_endpoint(
+            &config,
+            &memory,
+            &mut resource,
+            MmioRegionId::new(700),
+            messages,
+        )
+        .expect_err("mismatched destination selector should reject");
+
+    assert!(matches!(
+        error,
+        SnapshotV2VsockPciEndpointError::ResourceIdentity
+    ));
+    assert!(!resource.is_consumed());
+    let diagnostic = format!("{error:?} {error}");
+    assert!(!diagnostic.contains(destination));
+    assert!(!diagnostic.contains("bangbang-vsock-wrong-pci"));
 }
 
 #[test]

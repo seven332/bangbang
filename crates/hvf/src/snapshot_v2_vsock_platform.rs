@@ -986,6 +986,24 @@ impl HvfSnapshotV2VsockPciPlatformPlan {
             && matches_vsock_identity_pci(self.vsock.as_ref(), vsock)
             && self.binding_keys == binding_keys
     }
+
+    pub(crate) fn into_owner_parts(self) -> HvfSnapshotV2VsockPciPlatformOwnerParts {
+        HvfSnapshotV2VsockPciPlatformOwnerParts {
+            kind: self.kind,
+            base: self.base,
+            vsock: self.vsock,
+            serial_resource_present: self.serial_resource_present,
+            binding_keys: self.binding_keys,
+        }
+    }
+}
+
+pub(crate) struct HvfSnapshotV2VsockPciPlatformOwnerParts {
+    pub(crate) kind: HvfSnapshotV2VsockProductKind,
+    pub(crate) base: HvfSnapshotV2NetworkPciPlatformPlan,
+    pub(crate) vsock: Option<HvfSnapshotV2VsockPciEndpointPlan>,
+    pub(crate) serial_resource_present: bool,
+    pub(crate) binding_keys: Vec<SnapshotRestoreResourceKey>,
 }
 
 impl fmt::Debug for HvfSnapshotV2VsockPciPlatformPlan {
