@@ -15,6 +15,14 @@ use crate::snapshot_memory_v2::{
 };
 
 mod codec;
+mod writer;
+
+pub use writer::{
+    SnapshotV2DiffSelection, SnapshotV2DiffSelectionError, SnapshotV2DiffVerifyError,
+    SnapshotV2DiffVerifyStage, SnapshotV2DiffWriteError, SnapshotV2DiffWriteStage,
+    verify_snapshot_v2_diff_layer_output, write_snapshot_v2_diff_layer,
+    write_snapshot_v2_diff_layer_with_cancel,
+};
 
 #[cfg(test)]
 mod tests;

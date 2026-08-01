@@ -564,7 +564,8 @@ where
 {
     check_cancelled(&mut is_cancelled, SnapshotV2MemoryIoStage::InitialPosition)?;
     preflight_empty_output(writer)?;
-    let binding = binding_from_memory_with_version(memory, version, image_id)?;
+    let binding =
+        snapshot_v2_memory_binding_from_memory_with_version_and_id(memory, version, image_id)?;
     let header = binding.image_header()?;
 
     check_cancelled(&mut is_cancelled, SnapshotV2MemoryIoStage::Header)?;
@@ -1143,7 +1144,7 @@ fn open_regular_final(path: &Path) -> Result<File, SnapshotV2MemoryLoadError> {
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
-fn binding_from_memory_with_version(
+pub(crate) fn snapshot_v2_memory_binding_from_memory_with_version_and_id(
     memory: &GuestMemory,
     version: SnapshotFormatVersion,
     image_id: SnapshotV2MemoryImageId,
