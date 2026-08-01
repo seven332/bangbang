@@ -595,13 +595,34 @@ fn spawn_binder(
         .set_write_timeout(Some(BINDER_TIMEOUT))
         .map_err(|error| AnchoredSocketError::Io(error.kind()))?;
 
-    let executable = env::current_exe().map_err(|error| AnchoredSocketError::Io(error.kind()))?;
+    let executable = binder_executable()?;
     let executable = CString::new(executable.as_os_str().as_bytes())
         .map_err(|_| AnchoredSocketError::Invalid)?;
+    #[cfg(not(test))]
     let argument = CString::new(BINDER_ARGUMENT).map_err(|_| AnchoredSocketError::Invalid)?;
+    #[cfg(not(test))]
     let argv = [
         executable.as_ptr().cast_mut(),
         argument.as_ptr().cast_mut(),
+        std::ptr::null_mut(),
+    ];
+    #[cfg(test)]
+    let ignored = CString::new("--ignored").map_err(|_| AnchoredSocketError::Invalid)?;
+    #[cfg(test)]
+    let exact = CString::new("--exact").map_err(|_| AnchoredSocketError::Invalid)?;
+    #[cfg(test)]
+    let binder_test = CString::new("anchored_socket::tests::binder_process_entry")
+        .map_err(|_| AnchoredSocketError::Invalid)?;
+    #[cfg(test)]
+    let single_thread =
+        CString::new("--test-threads=1").map_err(|_| AnchoredSocketError::Invalid)?;
+    #[cfg(test)]
+    let argv = [
+        executable.as_ptr().cast_mut(),
+        ignored.as_ptr().cast_mut(),
+        exact.as_ptr().cast_mut(),
+        binder_test.as_ptr().cast_mut(),
+        single_thread.as_ptr().cast_mut(),
         std::ptr::null_mut(),
     ];
     let environment = spawn_environment()?;
@@ -652,6 +673,10 @@ fn spawn_binder(
     validate_listener_descriptor(listener.as_raw_fd(), role)?;
     binder.wait_until(BINDER_TIMEOUT)?;
     Ok((listener, identity))
+}
+
+fn binder_executable() -> Result<std::path::PathBuf, AnchoredSocketError> {
+    env::current_exe().map_err(|error| AnchoredSocketError::Io(error.kind()))
 }
 
 fn spawn_connector(
@@ -1819,6 +1844,12 @@ mod tests {
     use bangbang_session::SessionId;
 
     use super::*;
+
+    #[test]
+    #[ignore = "private binder subprocess entry point"]
+    fn binder_process_entry() {
+        assert!(run_binder());
+    }
 
     #[test]
     fn binder_protocol_is_closed_and_redacted() {

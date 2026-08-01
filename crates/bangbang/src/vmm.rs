@@ -232,7 +232,7 @@ use bangbang_runtime::snapshot_memory::{
 };
 use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
     NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2MemoryHotplugTopology,
-    SnapshotV2MemoryHotplugControllerProjection,
+    SnapshotV2MemoryHotplugControllerProjection, SnapshotV2MemoryHotplugState,
 };
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
@@ -253,6 +253,7 @@ use bangbang_runtime::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
     SnapshotV2SerialStateCaptureError,
 };
+use bangbang_runtime::snapshot_vsock_restore_v2_12::PreparedSnapshotV2VsockRestoreState;
 use bangbang_runtime::snapshot_vsock_v2_12::{
     SnapshotV2VsockState, SnapshotV2VsockStateCaptureError,
 };
@@ -311,13 +312,16 @@ use crate::host_network::vmnet::{
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_restore_resources::{
-    PreparedSnapshotRootBackingLease, PreparedSnapshotRootRestoreCompletion,
-    PreparedSnapshotRootRestoreCompletionError, PreparedSnapshotV2MultiBlockDestinationCommitError,
+    LocallyPreparedSnapshotSerialVsockRestoreResources, PreparedSnapshotDriveRestoreCompletion,
+    PreparedSnapshotDriveRestoreCompletionError, PreparedSnapshotRootBackingLease,
+    PreparedSnapshotRootRestoreCompletion, PreparedSnapshotRootRestoreCompletionError,
+    PreparedSnapshotV2MultiBlockDestinationCommitError,
     PreparedSnapshotV2MultiBlockDestinationConstructionError,
     PreparedSnapshotV2MultiBlockRestoreBundle, PreparedSnapshotV2StorageDestinationCommitError,
     PreparedSnapshotV2StorageDestinationConstructionError, PreparedSnapshotV2StorageRestoreBundle,
-    RequestedSnapshotRestoreResources, SnapshotRestoreResourceDisposition,
-    SnapshotRestoreResourceError, SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
+    RequestedSnapshotRestoreResources, RequestedSnapshotSerialVsockRestoreResources,
+    SnapshotRestoreResourceDisposition, SnapshotRestoreResourceError,
+    SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
     SnapshotV2MultiBlockRestoreBundleError, SnapshotV2StorageRestoreBundleError,
 };
 #[cfg(target_os = "macos")]
@@ -329,7 +333,8 @@ use crate::snapshot_serial_restore::{
 };
 #[cfg(target_os = "macos")]
 use crate::vsock_restore::{
-    PreparedVsockRestoreResource, VsockRestoreDisposition, VsockRestoreError,
+    ActiveVsockRestoreGuard, PreparedVsockRestoreResource, RequestedVsockRestoreResource,
+    VsockRestoreAdoptionError, VsockRestoreDisposition, VsockRestoreError,
     prepare_vsock_restore_resource,
 };
 
@@ -20145,7 +20150,24 @@ fn prepare_process_snapshot_v2_network_restore_plan(
     candidate: PreparedNativeV2NetworkSnapshotCandidateState,
     authority: ProcessVmnetAuthority,
 ) -> Result<PreparedProcessSnapshotV2NetworkRestorePlan, ProcessSnapshotV2NetworkRestorePlanError> {
-    let interfaces = candidate.topology().interfaces();
+    let resources = prepare_process_snapshot_v2_network_resource_plan(
+        candidate.topology(),
+        candidate.manifest(),
+        authority,
+    )?;
+    Ok(PreparedProcessSnapshotV2NetworkRestorePlan {
+        candidate,
+        resources,
+    })
+}
+
+fn prepare_process_snapshot_v2_network_resource_plan(
+    topology: &PreparedSnapshotV2NetworkRestoreTopology,
+    manifest: &SnapshotRestoreManifest,
+    authority: ProcessVmnetAuthority,
+) -> Result<PreparedProcessSnapshotV2NetworkResourcePlan, ProcessSnapshotV2NetworkRestorePlanError>
+{
+    let interfaces = topology.interfaces();
     let mut vmnet_configs = Vec::new();
     vmnet_configs
         .try_reserve_exact(interfaces.len())
@@ -20176,9 +20198,8 @@ fn prepare_process_snapshot_v2_network_restore_plan(
     for interface in interfaces {
         if interface.resource_key().resource_class()
             != SnapshotRestoreResourceClass::NetworkPacketIo
-            || !candidate.manifest().is_overridden(interface.resource_key())
-            || candidate
-                .manifest()
+            || !manifest.is_overridden(interface.resource_key())
+            || manifest
                 .resources()
                 .binary_search(interface.resource_key())
                 .is_err()
@@ -20204,16 +20225,13 @@ fn prepare_process_snapshot_v2_network_restore_plan(
     }
     let resources = PreparedProcessSnapshotV2NetworkResourcePlan {
         interfaces: resource_interfaces,
-        mmds_state: candidate.topology().mmds_state().cloned(),
-        mmds_controller: candidate.topology().mmds_controller().cloned(),
+        mmds_state: topology.mmds_state().cloned(),
+        mmds_controller: topology.mmds_controller().cloned(),
         vmnet_configs,
         all_mmds,
         authority,
     };
-    Ok(PreparedProcessSnapshotV2NetworkRestorePlan {
-        candidate,
-        resources,
-    })
+    Ok(resources)
 }
 
 type ProcessSnapshotV2NetworkRestorePlanBuilder = fn(
@@ -20274,6 +20292,486 @@ type ProcessSnapshotV2VsockCandidatePreparer = fn(
 // Keep the exact-2.12 value-only pre-access gate type-checked without
 // activating public load/restore dispatch or acquiring host authority.
 const _: ProcessSnapshotV2VsockCandidatePreparer = prepare_process_snapshot_v2_vsock_candidate;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessSnapshotV2VsockRestoreResourceStage {
+    Plan,
+    Reservation,
+    FilePreparation,
+    NetworkPreparation,
+    VsockPublication,
+    Binding,
+    Take,
+    Finish,
+}
+
+enum ProcessSnapshotV2VsockRestoreResourceErrorKind {
+    CandidateMismatch,
+    Allocation,
+    Cancelled,
+    Files(SnapshotRestoreResourceError),
+    FileCompletion(PreparedSnapshotDriveRestoreCompletionError),
+    NetworkPlan(ProcessSnapshotV2NetworkRestorePlanError),
+    Network(ProcessSnapshotV2NetworkRestoreResourceError),
+    BindingAllocation(SnapshotRestoreBindingAllocationError),
+    Binding(SnapshotRestoreBindingRejectionReason),
+    Take(SnapshotRestoreTakeError),
+    Unconsumed { unconsumed_count: usize },
+}
+
+impl fmt::Debug for ProcessSnapshotV2VsockRestoreResourceErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CandidateMismatch => formatter
+                .write_str("ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch"),
+            Self::Allocation => {
+                formatter.write_str("ProcessSnapshotV2VsockRestoreResourceErrorKind::Allocation")
+            }
+            Self::Cancelled => {
+                formatter.write_str("ProcessSnapshotV2VsockRestoreResourceErrorKind::Cancelled")
+            }
+            Self::Files(source) => formatter
+                .debug_tuple("ProcessSnapshotV2VsockRestoreResourceErrorKind::Files")
+                .field(source)
+                .finish(),
+            Self::FileCompletion(source) => formatter
+                .debug_tuple("ProcessSnapshotV2VsockRestoreResourceErrorKind::FileCompletion")
+                .field(source)
+                .finish(),
+            Self::NetworkPlan(source) => formatter
+                .debug_tuple("ProcessSnapshotV2VsockRestoreResourceErrorKind::NetworkPlan")
+                .field(source)
+                .finish(),
+            Self::Network(source) => formatter
+                .debug_tuple("ProcessSnapshotV2VsockRestoreResourceErrorKind::Network")
+                .field(source)
+                .finish(),
+            Self::BindingAllocation(source) => formatter
+                .debug_tuple("ProcessSnapshotV2VsockRestoreResourceErrorKind::BindingAllocation")
+                .field(source)
+                .finish(),
+            Self::Binding(reason) => formatter
+                .debug_tuple("ProcessSnapshotV2VsockRestoreResourceErrorKind::Binding")
+                .field(reason)
+                .finish(),
+            Self::Take(source) => formatter
+                .debug_tuple("ProcessSnapshotV2VsockRestoreResourceErrorKind::Take")
+                .field(source)
+                .finish(),
+            Self::Unconsumed { unconsumed_count } => formatter
+                .debug_struct("ProcessSnapshotV2VsockRestoreResourceErrorKind::Unconsumed")
+                .field("unconsumed_count", unconsumed_count)
+                .finish(),
+        }
+    }
+}
+
+pub(crate) struct ProcessSnapshotV2VsockRestoreResourceError {
+    stage: ProcessSnapshotV2VsockRestoreResourceStage,
+    kind: ProcessSnapshotV2VsockRestoreResourceErrorKind,
+    disposition: ProcessSnapshotV2NetworkRestoreResourceDisposition,
+    cleanup_uncertain: bool,
+}
+
+impl ProcessSnapshotV2VsockRestoreResourceError {
+    fn retryable(
+        stage: ProcessSnapshotV2VsockRestoreResourceStage,
+        kind: ProcessSnapshotV2VsockRestoreResourceErrorKind,
+    ) -> Self {
+        Self {
+            stage,
+            kind,
+            disposition: ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable,
+            cleanup_uncertain: false,
+        }
+    }
+
+    fn terminal(
+        stage: ProcessSnapshotV2VsockRestoreResourceStage,
+        kind: ProcessSnapshotV2VsockRestoreResourceErrorKind,
+    ) -> Self {
+        Self {
+            stage,
+            kind,
+            disposition: ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal,
+            cleanup_uncertain: false,
+        }
+    }
+
+    fn from_files(
+        stage: ProcessSnapshotV2VsockRestoreResourceStage,
+        source: SnapshotRestoreResourceError,
+    ) -> Self {
+        let cleanup_uncertain = source.cleanup_failed();
+        let disposition = match source.disposition() {
+            SnapshotRestoreResourceDisposition::Retryable => {
+                ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+            }
+            SnapshotRestoreResourceDisposition::Terminal => {
+                ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+            }
+        };
+        Self {
+            stage,
+            kind: ProcessSnapshotV2VsockRestoreResourceErrorKind::Files(source),
+            disposition,
+            cleanup_uncertain,
+        }
+    }
+
+    fn from_network(
+        stage: ProcessSnapshotV2VsockRestoreResourceStage,
+        source: ProcessSnapshotV2NetworkRestoreResourceError,
+    ) -> Self {
+        let cleanup_uncertain = source.cleanup_uncertain
+            || matches!(
+                &source.kind,
+                ProcessSnapshotV2NetworkRestoreResourceErrorKind::Provider(
+                    ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
+                )
+            );
+        Self {
+            stage,
+            disposition: source.disposition(),
+            cleanup_uncertain,
+            kind: ProcessSnapshotV2VsockRestoreResourceErrorKind::Network(source),
+        }
+    }
+
+    fn with_cleanup_uncertain(mut self, cleanup_uncertain: bool) -> Self {
+        self.cleanup_uncertain |= cleanup_uncertain;
+        if self.cleanup_uncertain {
+            self.disposition = ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal;
+        }
+        self
+    }
+
+    fn with_abort_evidence(mut self, evidence: ProcessSnapshotV2VsockAbortEvidence) -> Self {
+        if evidence.terminal {
+            self.disposition = ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal;
+        }
+        self.with_cleanup_uncertain(evidence.cleanup_uncertain)
+    }
+
+    pub(crate) const fn disposition(&self) -> ProcessSnapshotV2NetworkRestoreResourceDisposition {
+        self.disposition
+    }
+
+    pub(crate) const fn cleanup_uncertain(&self) -> bool {
+        self.cleanup_uncertain
+    }
+}
+
+impl fmt::Debug for ProcessSnapshotV2VsockRestoreResourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessSnapshotV2VsockRestoreResourceError")
+            .field("stage", &self.stage)
+            .field("kind", &self.kind)
+            .field("disposition", &self.disposition)
+            .field("cleanup_uncertain", &self.cleanup_uncertain)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for ProcessSnapshotV2VsockRestoreResourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.12 process restore resources failed at {:?} ({:?})",
+            self.stage, self.disposition
+        )?;
+        if self.cleanup_uncertain {
+            formatter.write_str("; cleanup is uncertain")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProcessSnapshotV2VsockRestoreResourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::Files(source) => Some(source),
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::FileCompletion(source) => Some(source),
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::NetworkPlan(source) => Some(source),
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::Network(source) => Some(source),
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::BindingAllocation(source) => {
+                Some(source)
+            }
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::Allocation
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::Cancelled
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::Binding(_)
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::Take(_)
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::Unconsumed { .. } => None,
+        }
+    }
+}
+
+/// Complete value-only exact-2.12 process resource plan.
+pub(crate) struct PreparedProcessSnapshotV2VsockResourcePlan {
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+    balloon: Option<SnapshotV2BalloonState>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+    network_topology: PreparedSnapshotV2NetworkRestoreTopology,
+    vsock_state: Option<PreparedSnapshotV2VsockRestoreState>,
+    vsock_config: Option<VsockConfig>,
+    files: RequestedSnapshotSerialVsockRestoreResources,
+    network: PreparedProcessSnapshotV2NetworkResourcePlan,
+    network_keys: Vec<SnapshotRestoreResourceKey>,
+    network_resources: Vec<PreparedProcessSnapshotV2NetworkRestoreResource>,
+    binding_keys: Vec<SnapshotRestoreResourceKey>,
+    owners: Vec<PreparedProcessSnapshotV2VsockRestoreResource>,
+    bindings: SnapshotRestoreBindings<PreparedProcessSnapshotV2VsockRestoreResource>,
+}
+
+impl fmt::Debug for PreparedProcessSnapshotV2VsockResourcePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProcessSnapshotV2VsockResourcePlan")
+            .field("resource_count", &self.bindings.manifest().len())
+            .field("network_count", &self.network.interface_count())
+            .field("has_vsock", &self.vsock_state.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PreparedProcessSnapshotV2VsockResourcePlan {
+    fn is_coherent(&self) -> bool {
+        let manifest = self.bindings.manifest();
+        self.owners.is_empty()
+            && self.network_resources.is_empty()
+            && self.binding_keys.len() == manifest.len()
+            && self.binding_keys == manifest.resources()
+            && self.network_keys.len() == self.network.interface_count()
+            && self
+                .network_keys
+                .iter()
+                .zip(self.network.resource_keys())
+                .all(|(retained, planned)| retained == planned)
+            && self
+                .files
+                .file_resource_keys()
+                .chain(self.network_keys.iter())
+                .chain(self.files.vsock_key())
+                .eq(self.binding_keys.iter())
+            && self
+                .files
+                .file_resource_keys()
+                .all(|key| !manifest.is_overridden(key))
+            && self
+                .network_keys
+                .iter()
+                .all(|key| manifest.is_overridden(key))
+            && self
+                .files
+                .vsock_key()
+                .is_none_or(|key| manifest.is_overridden(key) == self.files.vsock_is_overridden())
+            && self.vsock_state.is_some() == self.files.vsock_key().is_some()
+            && self.vsock_config.is_some() == self.files.vsock_key().is_some()
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn drop_last_binding_key_for_test(&mut self) {
+        self.binding_keys.pop();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn duplicate_first_binding_key_for_test(&mut self) {
+        if let Some(key) = self.binding_keys.first().cloned() {
+            self.binding_keys.push(key);
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn corrupt_first_binding_class_for_test(&mut self) {
+        if let Some(key) = self.binding_keys.first_mut() {
+            *key = SnapshotRestoreResourceKey::new(
+                key.device_key(),
+                key.public_id().clone(),
+                SnapshotRestoreResourceClass::SerialSink,
+            );
+        }
+    }
+}
+
+fn prepare_process_snapshot_v2_vsock_resource_plan(
+    candidate: PreparedNativeV2VsockSnapshotCandidateState,
+    authority: ProcessVmnetAuthority,
+) -> Result<PreparedProcessSnapshotV2VsockResourcePlan, ProcessSnapshotV2VsockRestoreResourceError>
+{
+    let (
+        bytes,
+        binding,
+        device_graph,
+        serial,
+        entropy,
+        balloon,
+        memory_hotplug,
+        network_topology,
+        vsock_topology,
+        manifest,
+    ) = candidate.into_parts();
+    let network =
+        prepare_process_snapshot_v2_network_resource_plan(&network_topology, &manifest, authority)
+            .map_err(|source| ProcessSnapshotV2VsockRestoreResourceError {
+                stage: ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+                kind: ProcessSnapshotV2VsockRestoreResourceErrorKind::NetworkPlan(source),
+                disposition: ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable,
+                cleanup_uncertain: false,
+            })?;
+    let mut network_keys = Vec::new();
+    network_keys
+        .try_reserve_exact(network.resource_keys().len())
+        .map_err(|_| {
+            ProcessSnapshotV2VsockRestoreResourceError::retryable(
+                ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::Allocation,
+            )
+        })?;
+    for key in network.resource_keys() {
+        network_keys.push(key.try_clone().map_err(|_| {
+            ProcessSnapshotV2VsockRestoreResourceError::retryable(
+                ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::Allocation,
+            )
+        })?);
+    }
+    let mut network_resources = Vec::new();
+    network_resources
+        .try_reserve_exact(network_keys.len())
+        .map_err(|_| {
+            ProcessSnapshotV2VsockRestoreResourceError::retryable(
+                ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::Allocation,
+            )
+        })?;
+
+    let (vsock, vsock_state, vsock_config) = match vsock_topology {
+        Some(topology) => {
+            let (request, state) = topology.into_parts();
+            let (key, selectors, config, overridden) = request.into_parts();
+            if config.uds_path() != selectors.destination().path() {
+                return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+                    ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+                    ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+                ));
+            }
+            (
+                Some((
+                    key,
+                    RequestedVsockRestoreResource::from_resolved(selectors, overridden),
+                )),
+                Some(state),
+                Some(config),
+            )
+        }
+        None => (None, None, None),
+    };
+    let files = RequestedSnapshotSerialVsockRestoreResources::try_from_native_v2_serial_and_vsock(
+        device_graph.as_ref(),
+        &serial,
+        vsock,
+    )
+    .map_err(|source| {
+        ProcessSnapshotV2VsockRestoreResourceError::from_files(
+            ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+            source,
+        )
+    })?;
+
+    let expected_count = files
+        .file_resource_keys()
+        .len()
+        .checked_add(network_keys.len())
+        .and_then(|count| count.checked_add(usize::from(files.vsock_key().is_some())))
+        .ok_or_else(|| {
+            ProcessSnapshotV2VsockRestoreResourceError::terminal(
+                ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+            )
+        })?;
+    let expected_keys = files
+        .file_resource_keys()
+        .chain(network_keys.iter())
+        .chain(files.vsock_key());
+    if manifest.len() != expected_count
+        || manifest
+            .resources()
+            .iter()
+            .zip(expected_keys)
+            .any(|(actual, expected)| actual != expected)
+        || files
+            .file_resource_keys()
+            .any(|key| manifest.is_overridden(key))
+        || network_keys.iter().any(|key| !manifest.is_overridden(key))
+        || files
+            .vsock_key()
+            .is_some_and(|key| manifest.is_overridden(key) != files.vsock_is_overridden())
+        || vsock_state.is_some() != files.vsock_key().is_some()
+        || vsock_config.is_some() != files.vsock_key().is_some()
+    {
+        return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+            ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+        ));
+    }
+    let mut binding_keys = Vec::new();
+    binding_keys
+        .try_reserve_exact(manifest.len())
+        .map_err(|_| {
+            ProcessSnapshotV2VsockRestoreResourceError::retryable(
+                ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::Allocation,
+            )
+        })?;
+    for key in manifest.resources() {
+        binding_keys.push(key.try_clone().map_err(|_| {
+            ProcessSnapshotV2VsockRestoreResourceError::retryable(
+                ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::Allocation,
+            )
+        })?);
+    }
+    let mut owners = Vec::new();
+    owners.try_reserve_exact(manifest.len()).map_err(|_| {
+        ProcessSnapshotV2VsockRestoreResourceError::retryable(
+            ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::Allocation,
+        )
+    })?;
+    let bindings = manifest.try_into_bindings().map_err(|source| {
+        ProcessSnapshotV2VsockRestoreResourceError::retryable(
+            ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::BindingAllocation(source),
+        )
+    })?;
+    Ok(PreparedProcessSnapshotV2VsockResourcePlan {
+        bytes,
+        binding,
+        device_graph,
+        serial,
+        entropy,
+        balloon,
+        memory_hotplug,
+        network_topology,
+        vsock_state,
+        vsock_config,
+        files,
+        network,
+        network_keys,
+        network_resources,
+        binding_keys,
+        owners,
+        bindings,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessSnapshotV2NetworkRestoreResourceDisposition {
@@ -21579,6 +22077,1077 @@ where
         resource_count,
     })
 }
+
+enum PreparedProcessSnapshotV2VsockRestoreResource {
+    Block(BlockFileBacking),
+    Pmem(PmemFileBacking),
+    Serial(SerialOutputFile),
+    Network(PreparedProcessSnapshotV2NetworkRestoreResource),
+    Vsock(PreparedVsockRestoreResource),
+}
+
+impl PreparedProcessSnapshotV2VsockRestoreResource {
+    const fn resource_class(&self) -> SnapshotRestoreResourceClass {
+        match self {
+            Self::Block(_) => SnapshotRestoreResourceClass::BlockBacking,
+            Self::Pmem(_) => SnapshotRestoreResourceClass::PmemBacking,
+            Self::Serial(_) => SnapshotRestoreResourceClass::SerialSink,
+            Self::Network(_) => SnapshotRestoreResourceClass::NetworkPacketIo,
+            Self::Vsock(_) => SnapshotRestoreResourceClass::VsockEndpoint,
+        }
+    }
+
+    fn abort(self) -> ProcessSnapshotV2VsockAbortEvidence {
+        match self {
+            Self::Block(backing) => {
+                drop(backing);
+                ProcessSnapshotV2VsockAbortEvidence::clean()
+            }
+            Self::Pmem(backing) => {
+                drop(backing);
+                ProcessSnapshotV2VsockAbortEvidence::clean()
+            }
+            Self::Serial(output) => {
+                drop(output);
+                ProcessSnapshotV2VsockAbortEvidence::clean()
+            }
+            Self::Network(resource) => {
+                drop(resource);
+                ProcessSnapshotV2VsockAbortEvidence::clean()
+            }
+            Self::Vsock(vsock) => match vsock.abort() {
+                Ok(VsockRestoreDisposition::Retryable) => {
+                    ProcessSnapshotV2VsockAbortEvidence::clean()
+                }
+                Ok(VsockRestoreDisposition::Terminal) => {
+                    ProcessSnapshotV2VsockAbortEvidence::terminal(false)
+                }
+                Err(_) => ProcessSnapshotV2VsockAbortEvidence::terminal(true),
+            },
+        }
+    }
+}
+
+impl fmt::Debug for PreparedProcessSnapshotV2VsockRestoreResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProcessSnapshotV2VsockRestoreResource")
+            .field("class", &self.resource_class())
+            .field("state", &"<owned>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessSnapshotV2VsockAbortEvidence {
+    terminal: bool,
+    cleanup_uncertain: bool,
+}
+
+impl ProcessSnapshotV2VsockAbortEvidence {
+    const fn clean() -> Self {
+        Self {
+            terminal: false,
+            cleanup_uncertain: false,
+        }
+    }
+
+    const fn terminal(cleanup_uncertain: bool) -> Self {
+        Self {
+            terminal: true,
+            cleanup_uncertain,
+        }
+    }
+
+    const fn from_cleanup_uncertain(cleanup_uncertain: bool) -> Self {
+        if cleanup_uncertain {
+            Self::terminal(true)
+        } else {
+            Self::clean()
+        }
+    }
+
+    const fn merge(self, other: Self) -> Self {
+        Self {
+            terminal: self.terminal || other.terminal,
+            cleanup_uncertain: self.cleanup_uncertain || other.cleanup_uncertain,
+        }
+    }
+}
+
+fn abort_local_process_snapshot_v2_vsock_resources(
+    local: LocallyPreparedSnapshotSerialVsockRestoreResources,
+) -> ProcessSnapshotV2VsockAbortEvidence {
+    match local.abort() {
+        Ok(()) => ProcessSnapshotV2VsockAbortEvidence::clean(),
+        Err(source) => ProcessSnapshotV2VsockAbortEvidence::terminal(source.cleanup_failed()),
+    }
+}
+
+fn abort_process_snapshot_v2_vsock_transaction<B>(
+    values: impl DoubleEndedIterator<Item = PreparedProcessSnapshotV2VsockRestoreResource>,
+    mut network: Option<PreparedProcessSnapshotV2NetworkRestoreCompletion<B>>,
+    files: Option<PreparedSnapshotDriveRestoreCompletion>,
+) -> ProcessSnapshotV2VsockAbortEvidence
+where
+    B: ProcessVmnetBackend,
+{
+    let mut evidence = ProcessSnapshotV2VsockAbortEvidence::clean();
+    for value in values.rev() {
+        if matches!(
+            value.resource_class(),
+            SnapshotRestoreResourceClass::BlockBacking
+                | SnapshotRestoreResourceClass::PmemBacking
+                | SnapshotRestoreResourceClass::SerialSink
+        ) && let Some(completion) = network.take()
+        {
+            evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::from_cleanup_uncertain(
+                completion.abort().is_err(),
+            ));
+        }
+        evidence = evidence.merge(value.abort());
+    }
+    if let Some(completion) = network {
+        evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::from_cleanup_uncertain(
+            completion.abort().is_err(),
+        ));
+    }
+    if files.is_some_and(|completion| completion.abort().is_err()) {
+        evidence = evidence.merge(ProcessSnapshotV2VsockAbortEvidence::terminal(true));
+    }
+    evidence
+}
+
+fn abort_process_snapshot_v2_vsock_completions<B>(
+    network: Option<PreparedProcessSnapshotV2NetworkRestoreCompletion<B>>,
+    files: Option<PreparedSnapshotDriveRestoreCompletion>,
+) -> ProcessSnapshotV2VsockAbortEvidence
+where
+    B: ProcessVmnetBackend,
+{
+    abort_process_snapshot_v2_vsock_transaction(std::iter::empty(), network, files)
+}
+
+fn process_snapshot_v2_vsock_cleanup_error(
+    evidence: ProcessSnapshotV2VsockAbortEvidence,
+    consumed: bool,
+) -> Option<ProcessSnapshotV2VsockRestoreResourceError> {
+    if !evidence.terminal && !evidence.cleanup_uncertain && !consumed {
+        return None;
+    }
+    Some(
+        ProcessSnapshotV2VsockRestoreResourceError::terminal(
+            ProcessSnapshotV2VsockRestoreResourceStage::Finish,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+        )
+        .with_abort_evidence(evidence),
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn prepare_process_snapshot_v2_vsock_restore_resources_with_factory<B, F, C>(
+    plan: PreparedProcessSnapshotV2VsockResourcePlan,
+    contained_authority: Option<&ContainedSnapshotRestoreAuthority>,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    factory: &mut F,
+    cancelled: C,
+) -> Result<PreparedProcessSnapshotV2VsockRestoreBatch<B>, ProcessSnapshotV2VsockRestoreResourceError>
+where
+    B: ProcessVmnetBackend,
+    F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    C: Fn(ProcessSnapshotV2VsockRestoreResourceStage) -> bool,
+{
+    if !plan.is_coherent() {
+        return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+            ProcessSnapshotV2VsockRestoreResourceStage::Plan,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+        ));
+    }
+    let PreparedProcessSnapshotV2VsockResourcePlan {
+        bytes,
+        binding,
+        device_graph,
+        serial,
+        entropy,
+        balloon,
+        memory_hotplug,
+        network_topology,
+        vsock_state,
+        vsock_config,
+        files,
+        network,
+        network_keys,
+        mut network_resources,
+        binding_keys,
+        mut owners,
+        mut bindings,
+    } = plan;
+    if cancelled(ProcessSnapshotV2VsockRestoreResourceStage::Reservation) {
+        return Err(ProcessSnapshotV2VsockRestoreResourceError::retryable(
+            ProcessSnapshotV2VsockRestoreResourceStage::Reservation,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::Cancelled,
+        ));
+    }
+    let reserved = {
+        let file_cancelled = || cancelled(ProcessSnapshotV2VsockRestoreResourceStage::Reservation);
+        files
+            .reserve(contained_authority, &file_cancelled)
+            .map_err(|source| {
+                ProcessSnapshotV2VsockRestoreResourceError::from_files(
+                    ProcessSnapshotV2VsockRestoreResourceStage::Reservation,
+                    source,
+                )
+            })?
+    };
+    let local = {
+        let file_cancelled =
+            || cancelled(ProcessSnapshotV2VsockRestoreResourceStage::FilePreparation);
+        reserved.prepare_files(&file_cancelled).map_err(|source| {
+            ProcessSnapshotV2VsockRestoreResourceError::from_files(
+                ProcessSnapshotV2VsockRestoreResourceStage::FilePreparation,
+                source,
+            )
+        })?
+    };
+
+    if cancelled(ProcessSnapshotV2VsockRestoreResourceStage::NetworkPreparation) {
+        let evidence = abort_local_process_snapshot_v2_vsock_resources(local);
+        return Err(ProcessSnapshotV2VsockRestoreResourceError::retryable(
+            ProcessSnapshotV2VsockRestoreResourceStage::NetworkPreparation,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::Cancelled,
+        )
+        .with_abort_evidence(evidence));
+    }
+    let mut network_batch = {
+        let mut network_cancelled =
+            |_| cancelled(ProcessSnapshotV2VsockRestoreResourceStage::NetworkPreparation);
+        match prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            network,
+            destination_instance_id,
+            mmds_data_store_limit_bytes,
+            factory,
+            &mut network_cancelled,
+        ) {
+            Ok(batch) => batch,
+            Err(source) => {
+                let evidence = abort_local_process_snapshot_v2_vsock_resources(local);
+                return Err(ProcessSnapshotV2VsockRestoreResourceError::from_network(
+                    ProcessSnapshotV2VsockRestoreResourceStage::NetworkPreparation,
+                    source,
+                )
+                .with_abort_evidence(evidence));
+            }
+        }
+    };
+    for (index, key) in network_keys.iter().enumerate() {
+        if cancelled(ProcessSnapshotV2VsockRestoreResourceStage::NetworkPreparation) {
+            let evidence = ProcessSnapshotV2VsockAbortEvidence::from_cleanup_uncertain(
+                abort_unfinished_process_snapshot_v2_network_resources(
+                    network_batch,
+                    network_resources,
+                ),
+            )
+            .merge(abort_local_process_snapshot_v2_vsock_resources(local));
+            return Err(ProcessSnapshotV2VsockRestoreResourceError::retryable(
+                ProcessSnapshotV2VsockRestoreResourceStage::NetworkPreparation,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::Cancelled,
+            )
+            .with_abort_evidence(evidence));
+        }
+        let resource = match network_batch.take(key) {
+            Ok(resource) => resource,
+            Err(source) => {
+                let evidence = ProcessSnapshotV2VsockAbortEvidence::from_cleanup_uncertain(
+                    abort_unfinished_process_snapshot_v2_network_resources(
+                        network_batch,
+                        network_resources,
+                    ),
+                )
+                .merge(abort_local_process_snapshot_v2_vsock_resources(local));
+                return Err(ProcessSnapshotV2VsockRestoreResourceError::from_network(
+                    ProcessSnapshotV2VsockRestoreResourceStage::NetworkPreparation,
+                    source,
+                )
+                .with_abort_evidence(evidence));
+            }
+        };
+        if !network_batch.resource_matches(index, &resource) {
+            network_resources.push(resource);
+            let evidence = ProcessSnapshotV2VsockAbortEvidence::from_cleanup_uncertain(
+                abort_unfinished_process_snapshot_v2_network_resources(
+                    network_batch,
+                    network_resources,
+                ),
+            )
+            .merge(abort_local_process_snapshot_v2_vsock_resources(local));
+            return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+                ProcessSnapshotV2VsockRestoreResourceStage::NetworkPreparation,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+            )
+            .with_abort_evidence(evidence));
+        }
+        network_resources.push(resource);
+    }
+    let network_completion = match network_batch.finish() {
+        Ok(completion) => completion,
+        Err(source) => {
+            drop(network_resources);
+            let evidence = abort_local_process_snapshot_v2_vsock_resources(local);
+            return Err(ProcessSnapshotV2VsockRestoreResourceError::from_network(
+                ProcessSnapshotV2VsockRestoreResourceStage::NetworkPreparation,
+                source,
+            )
+            .with_abort_evidence(evidence));
+        }
+    };
+
+    if cancelled(ProcessSnapshotV2VsockRestoreResourceStage::VsockPublication) {
+        let evidence = ProcessSnapshotV2VsockAbortEvidence::from_cleanup_uncertain(
+            abort_completed_process_snapshot_v2_network_resources(
+                network_completion,
+                network_resources,
+            ),
+        )
+        .merge(abort_local_process_snapshot_v2_vsock_resources(local));
+        return Err(ProcessSnapshotV2VsockRestoreResourceError::retryable(
+            ProcessSnapshotV2VsockRestoreResourceStage::VsockPublication,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::Cancelled,
+        )
+        .with_abort_evidence(evidence));
+    }
+    let mut network_rollback = Some((network_completion, network_resources));
+    let prepared_files = {
+        let publish_cancelled =
+            || cancelled(ProcessSnapshotV2VsockRestoreResourceStage::VsockPublication);
+        let mut abort_network = || match network_rollback.take() {
+            Some((completion, resources)) => {
+                abort_completed_process_snapshot_v2_network_resources(completion, resources)
+            }
+            None => false,
+        };
+        match local.publish_vsock(&publish_cancelled, &mut abort_network) {
+            Ok(prepared) => prepared,
+            Err(source) => {
+                return Err(ProcessSnapshotV2VsockRestoreResourceError::from_files(
+                    ProcessSnapshotV2VsockRestoreResourceStage::VsockPublication,
+                    source,
+                ));
+            }
+        }
+    };
+    let Some((network_completion, network_resources)) = network_rollback.take() else {
+        return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+            ProcessSnapshotV2VsockRestoreResourceStage::VsockPublication,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+        )
+        .with_cleanup_uncertain(true));
+    };
+    let (serial_batch, vsock) = prepared_files.into_parts();
+    let (blocks, pmems, serial_output, file_completion) = serial_batch.into_parts();
+    let mut owner_mismatch = false;
+    for block in blocks {
+        let (key, backing) = block.into_parts();
+        if binding_keys.get(owners.len()) != Some(&key) {
+            owner_mismatch = true;
+        }
+        owners.push(PreparedProcessSnapshotV2VsockRestoreResource::Block(
+            backing,
+        ));
+    }
+    for pmem in pmems {
+        let (key, backing) = pmem.into_parts();
+        if binding_keys.get(owners.len()) != Some(&key) {
+            owner_mismatch = true;
+        }
+        owners.push(PreparedProcessSnapshotV2VsockRestoreResource::Pmem(backing));
+    }
+    if let Some(serial_output) = serial_output {
+        let (key, output) = serial_output.into_parts();
+        if binding_keys.get(owners.len()) != Some(&key) {
+            owner_mismatch = true;
+        }
+        owners.push(PreparedProcessSnapshotV2VsockRestoreResource::Serial(
+            output,
+        ));
+    }
+    for (key, resource) in network_keys.iter().zip(network_resources) {
+        if binding_keys.get(owners.len()) != Some(key) {
+            owner_mismatch = true;
+        }
+        owners.push(PreparedProcessSnapshotV2VsockRestoreResource::Network(
+            resource,
+        ));
+    }
+    if let Some((key, resource)) = vsock {
+        if binding_keys.get(owners.len()) != Some(&key) {
+            owner_mismatch = true;
+        }
+        owners.push(PreparedProcessSnapshotV2VsockRestoreResource::Vsock(
+            resource,
+        ));
+    }
+    if owner_mismatch
+        || owners.len() != binding_keys.len()
+        || owners
+            .iter()
+            .zip(&binding_keys)
+            .any(|(owner, key)| owner.resource_class() != key.resource_class())
+    {
+        let evidence = abort_process_snapshot_v2_vsock_transaction(
+            owners.into_iter(),
+            Some(network_completion),
+            Some(file_completion),
+        );
+        return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+            ProcessSnapshotV2VsockRestoreResourceStage::Binding,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+        )
+        .with_abort_evidence(evidence));
+    }
+
+    let mut owner_iter = owners.into_iter();
+    for key in &binding_keys {
+        let Some(owner) = owner_iter.next() else {
+            let evidence = abort_process_snapshot_v2_vsock_transaction(
+                bindings.into_values().chain(owner_iter),
+                Some(network_completion),
+                Some(file_completion),
+            );
+            return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+                ProcessSnapshotV2VsockRestoreResourceStage::Binding,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+            )
+            .with_abort_evidence(evidence));
+        };
+        if let Err(rejection) = bindings.bind(key, owner) {
+            let reason = rejection.reason();
+            let evidence = abort_process_snapshot_v2_vsock_transaction(
+                bindings
+                    .into_values()
+                    .chain(std::iter::once(rejection.into_value()))
+                    .chain(owner_iter),
+                Some(network_completion),
+                Some(file_completion),
+            );
+            return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+                ProcessSnapshotV2VsockRestoreResourceStage::Binding,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::Binding(reason),
+            )
+            .with_abort_evidence(evidence));
+        }
+    }
+    if let Some(extra_owner) = owner_iter.next() {
+        let evidence = abort_process_snapshot_v2_vsock_transaction(
+            bindings
+                .into_values()
+                .chain(std::iter::once(extra_owner))
+                .chain(owner_iter),
+            Some(network_completion),
+            Some(file_completion),
+        );
+        return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+            ProcessSnapshotV2VsockRestoreResourceStage::Binding,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+        )
+        .with_abort_evidence(evidence));
+    }
+    let bindings = match bindings.complete() {
+        Ok(bindings) => bindings,
+        Err(incomplete) => {
+            let evidence = abort_process_snapshot_v2_vsock_transaction(
+                incomplete.into_bindings().into_values(),
+                Some(network_completion),
+                Some(file_completion),
+            );
+            return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+                ProcessSnapshotV2VsockRestoreResourceStage::Binding,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+            )
+            .with_abort_evidence(evidence));
+        }
+    };
+
+    if cancelled(ProcessSnapshotV2VsockRestoreResourceStage::Binding) {
+        let evidence = abort_process_snapshot_v2_vsock_transaction(
+            bindings.into_values(),
+            Some(network_completion),
+            Some(file_completion),
+        );
+        return Err(ProcessSnapshotV2VsockRestoreResourceError::retryable(
+            ProcessSnapshotV2VsockRestoreResourceStage::Binding,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::Cancelled,
+        )
+        .with_abort_evidence(evidence));
+    }
+    let resource_count = binding_keys.len();
+    Ok(PreparedProcessSnapshotV2VsockRestoreBatch {
+        bytes,
+        binding,
+        device_graph,
+        serial,
+        entropy,
+        balloon,
+        memory_hotplug,
+        network_topology,
+        vsock_state,
+        vsock_config,
+        binding_keys,
+        bindings,
+        file_completion,
+        network_completion,
+        resource_count,
+        taken_count: 0,
+        handoff_failed: false,
+    })
+}
+
+pub(crate) struct PreparedProcessSnapshotV2VsockRestoreBatch<B>
+where
+    B: ProcessVmnetBackend,
+{
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+    balloon: Option<SnapshotV2BalloonState>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+    network_topology: PreparedSnapshotV2NetworkRestoreTopology,
+    vsock_state: Option<PreparedSnapshotV2VsockRestoreState>,
+    vsock_config: Option<VsockConfig>,
+    binding_keys: Vec<SnapshotRestoreResourceKey>,
+    bindings: PreparedSnapshotRestoreBindings<PreparedProcessSnapshotV2VsockRestoreResource>,
+    file_completion: PreparedSnapshotDriveRestoreCompletion,
+    network_completion: PreparedProcessSnapshotV2NetworkRestoreCompletion<B>,
+    resource_count: usize,
+    taken_count: usize,
+    handoff_failed: bool,
+}
+
+impl<B> PreparedProcessSnapshotV2VsockRestoreBatch<B>
+where
+    B: ProcessVmnetBackend,
+{
+    pub(crate) fn resource_keys(&self) -> &[SnapshotRestoreResourceKey] {
+        &self.binding_keys
+    }
+
+    pub(crate) const fn vsock_state(&self) -> Option<&PreparedSnapshotV2VsockRestoreState> {
+        self.vsock_state.as_ref()
+    }
+
+    pub(crate) const fn vsock_config(&self) -> Option<&VsockConfig> {
+        self.vsock_config.as_ref()
+    }
+
+    pub(crate) fn remaining_count(&self) -> usize {
+        self.bindings.remaining_count()
+    }
+
+    fn take_bound(
+        &mut self,
+        key: &SnapshotRestoreResourceKey,
+    ) -> Result<
+        PreparedProcessSnapshotV2VsockRestoreResource,
+        ProcessSnapshotV2VsockRestoreResourceError,
+    > {
+        let resource = self.bindings.take(key).map_err(|source| {
+            ProcessSnapshotV2VsockRestoreResourceError::terminal(
+                ProcessSnapshotV2VsockRestoreResourceStage::Take,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::Take(source),
+            )
+        })?;
+        self.taken_count = self.taken_count.saturating_add(1);
+        Ok(resource)
+    }
+
+    fn wrong_typed_resource(
+        &mut self,
+        resource: PreparedProcessSnapshotV2VsockRestoreResource,
+    ) -> ProcessSnapshotV2VsockRestoreResourceError {
+        self.handoff_failed = true;
+        let evidence = resource.abort();
+        ProcessSnapshotV2VsockRestoreResourceError::terminal(
+            ProcessSnapshotV2VsockRestoreResourceStage::Take,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+        )
+        .with_abort_evidence(evidence)
+    }
+
+    pub(crate) fn take_block(
+        &mut self,
+        key: &SnapshotRestoreResourceKey,
+    ) -> Result<BlockFileBacking, ProcessSnapshotV2VsockRestoreResourceError> {
+        match self.take_bound(key)? {
+            PreparedProcessSnapshotV2VsockRestoreResource::Block(backing) => Ok(backing),
+            resource => Err(self.wrong_typed_resource(resource)),
+        }
+    }
+
+    pub(crate) fn take_pmem(
+        &mut self,
+        key: &SnapshotRestoreResourceKey,
+    ) -> Result<PmemFileBacking, ProcessSnapshotV2VsockRestoreResourceError> {
+        match self.take_bound(key)? {
+            PreparedProcessSnapshotV2VsockRestoreResource::Pmem(backing) => Ok(backing),
+            resource => Err(self.wrong_typed_resource(resource)),
+        }
+    }
+
+    pub(crate) fn take_serial(
+        &mut self,
+        key: &SnapshotRestoreResourceKey,
+    ) -> Result<SerialOutputFile, ProcessSnapshotV2VsockRestoreResourceError> {
+        match self.take_bound(key)? {
+            PreparedProcessSnapshotV2VsockRestoreResource::Serial(output) => Ok(output),
+            resource => Err(self.wrong_typed_resource(resource)),
+        }
+    }
+
+    pub(crate) fn take_network(
+        &mut self,
+        key: &SnapshotRestoreResourceKey,
+    ) -> Result<
+        PreparedProcessSnapshotV2NetworkRestoreResource,
+        ProcessSnapshotV2VsockRestoreResourceError,
+    > {
+        match self.take_bound(key)? {
+            PreparedProcessSnapshotV2VsockRestoreResource::Network(resource) => Ok(resource),
+            resource => Err(self.wrong_typed_resource(resource)),
+        }
+    }
+
+    pub(crate) fn adopt_vsock<T, E>(
+        &mut self,
+        key: &SnapshotRestoreResourceKey,
+        reconstruct: impl FnOnce(
+            &mut bangbang_runtime::vsock::VirtioVsockReconstructionResource,
+        ) -> Result<T, E>,
+    ) -> Result<(T, ActiveVsockRestoreGuard), ProcessSnapshotV2VsockAdoptionError<E>> {
+        let resource = self
+            .take_bound(key)
+            .map_err(ProcessSnapshotV2VsockAdoptionError::Resources)?;
+        let PreparedProcessSnapshotV2VsockRestoreResource::Vsock(resource) = resource else {
+            return Err(ProcessSnapshotV2VsockAdoptionError::Resources(
+                self.wrong_typed_resource(resource),
+            ));
+        };
+        match resource.adopt(reconstruct) {
+            Ok(adopted) => Ok(adopted),
+            Err(source) => {
+                self.handoff_failed = true;
+                Err(ProcessSnapshotV2VsockAdoptionError::Adoption(source))
+            }
+        }
+    }
+
+    pub(crate) fn abort(self) -> Result<(), ProcessSnapshotV2VsockRestoreResourceError> {
+        let Self {
+            bytes: _,
+            binding: _,
+            device_graph: _,
+            serial: _,
+            entropy: _,
+            balloon: _,
+            memory_hotplug: _,
+            network_topology: _,
+            vsock_state: _,
+            vsock_config: _,
+            binding_keys: _,
+            bindings,
+            file_completion,
+            network_completion,
+            resource_count: _,
+            taken_count,
+            handoff_failed,
+        } = self;
+        let evidence = abort_process_snapshot_v2_vsock_transaction(
+            bindings.into_values(),
+            Some(network_completion),
+            Some(file_completion),
+        );
+        match process_snapshot_v2_vsock_cleanup_error(evidence, taken_count != 0 || handoff_failed)
+        {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn finish(
+        self,
+    ) -> Result<
+        PreparedProcessSnapshotV2VsockRestoreCompletion<B>,
+        ProcessSnapshotV2VsockRestoreResourceError,
+    > {
+        let Self {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network_topology,
+            vsock_state,
+            vsock_config,
+            binding_keys,
+            bindings,
+            file_completion,
+            network_completion,
+            resource_count,
+            taken_count,
+            handoff_failed,
+        } = self;
+        match bindings.finish() {
+            Ok(()) => (),
+            Err(unconsumed) => {
+                let unconsumed_count = unconsumed.unconsumed_count();
+                let evidence = abort_process_snapshot_v2_vsock_transaction(
+                    unconsumed.into_bindings().into_values(),
+                    Some(network_completion),
+                    Some(file_completion),
+                );
+                let error = ProcessSnapshotV2VsockRestoreResourceError::terminal(
+                    ProcessSnapshotV2VsockRestoreResourceStage::Finish,
+                    ProcessSnapshotV2VsockRestoreResourceErrorKind::Unconsumed { unconsumed_count },
+                )
+                .with_abort_evidence(evidence);
+                return Err(error);
+            }
+        };
+        if handoff_failed || taken_count != resource_count {
+            let evidence = abort_process_snapshot_v2_vsock_completions(
+                Some(network_completion),
+                Some(file_completion),
+            );
+            return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+                ProcessSnapshotV2VsockRestoreResourceStage::Finish,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch,
+            )
+            .with_abort_evidence(evidence));
+        }
+        Ok(PreparedProcessSnapshotV2VsockRestoreCompletion {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network_topology,
+            vsock_state,
+            vsock_config,
+            binding_keys,
+            file_completion,
+            network_completion,
+        })
+    }
+}
+
+impl<B> fmt::Debug for PreparedProcessSnapshotV2VsockRestoreBatch<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProcessSnapshotV2VsockRestoreBatch")
+            .field("resource_count", &self.resource_count)
+            .field("remaining_count", &self.remaining_count())
+            .field("taken_count", &self.taken_count)
+            .field("handoff_failed", &self.handoff_failed)
+            .field("has_vsock", &self.vsock_state.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+pub(crate) enum ProcessSnapshotV2VsockAdoptionError<E> {
+    Resources(ProcessSnapshotV2VsockRestoreResourceError),
+    Adoption(VsockRestoreAdoptionError<E>),
+}
+
+impl<E> ProcessSnapshotV2VsockAdoptionError<E> {
+    pub(crate) fn disposition(&self) -> ProcessSnapshotV2NetworkRestoreResourceDisposition {
+        match self {
+            Self::Resources(source) => source.disposition(),
+            Self::Adoption(source) => match source.disposition() {
+                VsockRestoreDisposition::Retryable => {
+                    ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+                }
+                VsockRestoreDisposition::Terminal => {
+                    ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+                }
+            },
+        }
+    }
+}
+
+impl<E> fmt::Debug for ProcessSnapshotV2VsockAdoptionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Resources(source) => formatter
+                .debug_tuple("ProcessSnapshotV2VsockAdoptionError::Resources")
+                .field(source)
+                .finish(),
+            Self::Adoption(source) => formatter
+                .debug_tuple("ProcessSnapshotV2VsockAdoptionError::Adoption")
+                .field(source)
+                .finish(),
+        }
+    }
+}
+
+impl<E> fmt::Display for ProcessSnapshotV2VsockAdoptionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.12 vsock resource adoption failed ({:?})",
+            self.disposition()
+        )
+    }
+}
+
+pub(crate) struct PreparedProcessSnapshotV2VsockRestoreCompletion<B>
+where
+    B: ProcessVmnetBackend,
+{
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+    balloon: Option<SnapshotV2BalloonState>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+    network_topology: PreparedSnapshotV2NetworkRestoreTopology,
+    vsock_state: Option<PreparedSnapshotV2VsockRestoreState>,
+    vsock_config: Option<VsockConfig>,
+    binding_keys: Vec<SnapshotRestoreResourceKey>,
+    file_completion: PreparedSnapshotDriveRestoreCompletion,
+    network_completion: PreparedProcessSnapshotV2NetworkRestoreCompletion<B>,
+}
+
+pub(crate) type PreparedProcessSnapshotV2VsockRestoreCompletionParts<B> = (
+    Vec<u8>,
+    SnapshotV2MemoryBinding,
+    Option<SnapshotV2StorageDeviceGraph>,
+    SnapshotV2SerialState,
+    Option<SnapshotV2EntropyState>,
+    Option<SnapshotV2BalloonState>,
+    Option<SnapshotV2MemoryHotplugState>,
+    PreparedSnapshotV2NetworkRestoreTopology,
+    Option<PreparedSnapshotV2VsockRestoreState>,
+    Option<VsockConfig>,
+    Vec<SnapshotRestoreResourceKey>,
+    PreparedProcessSnapshotV2NetworkRestoreCompletion<B>,
+);
+
+impl<B> PreparedProcessSnapshotV2VsockRestoreCompletion<B>
+where
+    B: ProcessVmnetBackend,
+{
+    pub(crate) fn commit(
+        self,
+    ) -> Result<
+        PreparedProcessSnapshotV2VsockRestoreCompletionParts<B>,
+        ProcessSnapshotV2VsockRestoreResourceError,
+    > {
+        let Self {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network_topology,
+            vsock_state,
+            vsock_config,
+            binding_keys,
+            file_completion,
+            network_completion,
+        } = self;
+        if let Err(source) = file_completion.commit() {
+            let cleanup_uncertain = network_completion.abort().is_err();
+            return Err(ProcessSnapshotV2VsockRestoreResourceError::terminal(
+                ProcessSnapshotV2VsockRestoreResourceStage::Finish,
+                ProcessSnapshotV2VsockRestoreResourceErrorKind::FileCompletion(source),
+            )
+            .with_cleanup_uncertain(cleanup_uncertain));
+        }
+        Ok((
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network_topology,
+            vsock_state,
+            vsock_config,
+            binding_keys,
+            network_completion,
+        ))
+    }
+
+    pub(crate) fn abort(self) -> Result<(), ProcessSnapshotV2VsockRestoreResourceError> {
+        let evidence = abort_process_snapshot_v2_vsock_completions(
+            Some(self.network_completion),
+            Some(self.file_completion),
+        );
+        match process_snapshot_v2_vsock_cleanup_error(evidence, false) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<B> fmt::Debug for PreparedProcessSnapshotV2VsockRestoreCompletion<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (&self.binding, &self.serial);
+        formatter
+            .debug_struct("PreparedProcessSnapshotV2VsockRestoreCompletion")
+            .field("state_bytes", &self.bytes.len())
+            .field("memory_binding", &"<redacted>")
+            .field("has_storage", &self.device_graph.is_some())
+            .field("serial", &"<redacted>")
+            .field("has_entropy", &self.entropy.is_some())
+            .field("has_balloon", &self.balloon.is_some())
+            .field("has_memory_hotplug", &self.memory_hotplug.is_some())
+            .field("network_count", &self.network_topology.interfaces().len())
+            .field("has_vsock", &self.vsock_state.is_some())
+            .field(
+                "vsock_config",
+                &self.vsock_config.as_ref().map(|_| "<redacted>"),
+            )
+            .field("resource_count", &self.binding_keys.len())
+            .field("file_completion", &"<provisional>")
+            .field("network_completion", &"<provisional>")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+fn prepare_process_snapshot_v2_vsock_restore_resources<C>(
+    plan: PreparedProcessSnapshotV2VsockResourcePlan,
+    contained_authority: Option<&ContainedSnapshotRestoreAuthority>,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    cancelled: C,
+) -> Result<
+    PreparedProcessSnapshotV2VsockRestoreBatch<SystemVmnetInterfaceBackend>,
+    ProcessSnapshotV2VsockRestoreResourceError,
+>
+where
+    C: Fn(ProcessSnapshotV2VsockRestoreResourceStage) -> bool,
+{
+    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+    prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+        plan,
+        contained_authority,
+        destination_instance_id,
+        mmds_data_store_limit_bytes,
+        &mut factory,
+        cancelled,
+    )
+}
+
+type SystemPreparedProcessSnapshotV2VsockRestoreBatch =
+    PreparedProcessSnapshotV2VsockRestoreBatch<SystemVmnetInterfaceBackend>;
+type SystemPreparedProcessSnapshotV2VsockRestoreCompletion =
+    PreparedProcessSnapshotV2VsockRestoreCompletion<SystemVmnetInterfaceBackend>;
+type SystemPreparedProcessSnapshotV2VsockRestoreCompletionParts =
+    PreparedProcessSnapshotV2VsockRestoreCompletionParts<SystemVmnetInterfaceBackend>;
+type SystemPrepareProcessSnapshotV2VsockRestoreResourcesFn = fn(
+    PreparedProcessSnapshotV2VsockResourcePlan,
+    Option<&ContainedSnapshotRestoreAuthority>,
+    &str,
+    usize,
+    fn(ProcessSnapshotV2VsockRestoreResourceStage) -> bool,
+) -> Result<
+    SystemPreparedProcessSnapshotV2VsockRestoreBatch,
+    ProcessSnapshotV2VsockRestoreResourceError,
+>;
+
+const _: fn(
+    PreparedNativeV2VsockSnapshotCandidateState,
+    ProcessVmnetAuthority,
+) -> Result<
+    PreparedProcessSnapshotV2VsockResourcePlan,
+    ProcessSnapshotV2VsockRestoreResourceError,
+> = prepare_process_snapshot_v2_vsock_resource_plan;
+const _: fn(&ProcessSnapshotV2VsockRestoreResourceError) -> bool =
+    ProcessSnapshotV2VsockRestoreResourceError::cleanup_uncertain;
+const _: SystemPrepareProcessSnapshotV2VsockRestoreResourcesFn =
+    prepare_process_snapshot_v2_vsock_restore_resources::<
+        fn(ProcessSnapshotV2VsockRestoreResourceStage) -> bool,
+    >;
+const _: fn(&SystemPreparedProcessSnapshotV2VsockRestoreBatch) -> &[SnapshotRestoreResourceKey] =
+    SystemPreparedProcessSnapshotV2VsockRestoreBatch::resource_keys;
+const _: fn(
+    &SystemPreparedProcessSnapshotV2VsockRestoreBatch,
+) -> Option<&PreparedSnapshotV2VsockRestoreState> =
+    SystemPreparedProcessSnapshotV2VsockRestoreBatch::vsock_state;
+const _: fn(&SystemPreparedProcessSnapshotV2VsockRestoreBatch) -> Option<&VsockConfig> =
+    SystemPreparedProcessSnapshotV2VsockRestoreBatch::vsock_config;
+const _: fn(&SystemPreparedProcessSnapshotV2VsockRestoreBatch) -> usize =
+    SystemPreparedProcessSnapshotV2VsockRestoreBatch::remaining_count;
+const _: fn(
+    &mut SystemPreparedProcessSnapshotV2VsockRestoreBatch,
+    &SnapshotRestoreResourceKey,
+) -> Result<BlockFileBacking, ProcessSnapshotV2VsockRestoreResourceError> =
+    SystemPreparedProcessSnapshotV2VsockRestoreBatch::take_block;
+const _: fn(
+    &mut SystemPreparedProcessSnapshotV2VsockRestoreBatch,
+    &SnapshotRestoreResourceKey,
+) -> Result<PmemFileBacking, ProcessSnapshotV2VsockRestoreResourceError> =
+    SystemPreparedProcessSnapshotV2VsockRestoreBatch::take_pmem;
+const _: fn(
+    &mut SystemPreparedProcessSnapshotV2VsockRestoreBatch,
+    &SnapshotRestoreResourceKey,
+) -> Result<SerialOutputFile, ProcessSnapshotV2VsockRestoreResourceError> =
+    SystemPreparedProcessSnapshotV2VsockRestoreBatch::take_serial;
+const _: fn(
+    &mut SystemPreparedProcessSnapshotV2VsockRestoreBatch,
+    &SnapshotRestoreResourceKey,
+) -> Result<
+    PreparedProcessSnapshotV2NetworkRestoreResource,
+    ProcessSnapshotV2VsockRestoreResourceError,
+> = SystemPreparedProcessSnapshotV2VsockRestoreBatch::take_network;
+const _: fn(
+    SystemPreparedProcessSnapshotV2VsockRestoreBatch,
+) -> Result<(), ProcessSnapshotV2VsockRestoreResourceError> =
+    SystemPreparedProcessSnapshotV2VsockRestoreBatch::abort;
+const _: fn(
+    SystemPreparedProcessSnapshotV2VsockRestoreBatch,
+) -> Result<
+    SystemPreparedProcessSnapshotV2VsockRestoreCompletion,
+    ProcessSnapshotV2VsockRestoreResourceError,
+> = SystemPreparedProcessSnapshotV2VsockRestoreBatch::finish;
+const _: fn(
+    SystemPreparedProcessSnapshotV2VsockRestoreCompletion,
+) -> Result<
+    SystemPreparedProcessSnapshotV2VsockRestoreCompletionParts,
+    ProcessSnapshotV2VsockRestoreResourceError,
+> = SystemPreparedProcessSnapshotV2VsockRestoreCompletion::commit;
+const _: fn(
+    SystemPreparedProcessSnapshotV2VsockRestoreCompletion,
+) -> Result<(), ProcessSnapshotV2VsockRestoreResourceError> =
+    SystemPreparedProcessSnapshotV2VsockRestoreCompletion::abort;
+
+fn typecheck_process_snapshot_v2_vsock_adoption(
+    batch: &mut SystemPreparedProcessSnapshotV2VsockRestoreBatch,
+    key: &SnapshotRestoreResourceKey,
+) {
+    let _ = batch.adopt_vsock::<(), ()>(key, |_| Err(()));
+}
+
+const _: fn(&mut SystemPreparedProcessSnapshotV2VsockRestoreBatch, &SnapshotRestoreResourceKey) =
+    typecheck_process_snapshot_v2_vsock_adoption;
 
 trait ProcessSnapshotV2NetworkResourcePlanInput {
     fn into_resource_plan(self) -> PreparedProcessSnapshotV2NetworkResourcePlan;
@@ -29552,6 +31121,7 @@ mod tests {
     use std::num::NonZeroUsize;
     #[cfg(target_os = "macos")]
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::net::UnixListener;
     #[cfg(target_os = "macos")]
     use std::os::unix::net::{UnixDatagram, UnixStream};
@@ -29723,6 +31293,10 @@ mod tests {
     };
     use bangbang_session::SessionId;
     use bangbang_session::VmnetAuthority;
+    #[cfg(target_os = "macos")]
+    use bangbang_session::macos::socket_broker::{
+        SocketBrokerMessage, receive_socket_broker_message, send_socket_broker_message,
+    };
     #[cfg(target_os = "macos")]
     use bangbang_session::macos::vhost_user_broker::{
         VhostUserBrokerMessage, receive_vhost_user_broker_message, send_vhost_user_broker_message,
@@ -29933,11 +31507,29 @@ mod tests {
             Self::create_with_bytes(name, b"")
         }
 
+        fn absent(name: &str) -> Self {
+            loop {
+                let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+                let path = PathBuf::from("/tmp")
+                    .join(format!("bb-vmm-{}-{id}-{name}", std::process::id()));
+                if !path.exists() {
+                    return Self { path };
+                }
+            }
+        }
+
         fn create_with_bytes(name: &str, bytes: &[u8]) -> Self {
             let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
             let path =
                 std::env::temp_dir().join(format!("bb-vmm-{}-{id}-{name}", std::process::id()));
             fs::write(&path, bytes).expect("test backing file should be written");
+            Self { path }
+        }
+
+        fn create_sized_at(path: PathBuf, len: u64) -> Self {
+            let file = File::create(&path).expect("sized test backing should create");
+            file.set_len(len)
+                .expect("sized test backing should retain exact geometry");
             Self { path }
         }
 
@@ -36324,6 +37916,7 @@ mod tests {
         maximum_packet_size: usize,
         batch_limits: Option<(Option<u16>, Option<u16>)>,
         direct_virtio_header: Option<(bool, bool)>,
+        stop_boundary_check: Option<((u64, u64), Option<PathBuf>)>,
     }
 
     impl VmnetInterfaceBackend for RecordingVmnetPacketIoBackend {
@@ -36378,6 +37971,17 @@ mod tests {
 
         fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError> {
             push_recorded_event(&self.events, format!("stop:{}", interface.iface_id));
+            if let Some((identity, socket)) = &self.stop_boundary_check {
+                push_recorded_event(
+                    &self.events,
+                    format!(
+                        "stop-between-vsock-and-files:{}:{}",
+                        interface.iface_id,
+                        socket.as_ref().is_none_or(|socket| !socket.exists())
+                            && descriptor_identity_is_open(*identity)
+                    ),
+                );
+            }
             if let Some(status) = self.stop_status {
                 return Err(VmnetError::new(VmnetOperation::StopInterface, status));
             }
@@ -36464,6 +38068,7 @@ mod tests {
         maximum_packet_sizes: VecDeque<usize>,
         batch_limits: VecDeque<(Option<u16>, Option<u16>)>,
         direct_virtio_headers: VecDeque<(bool, bool)>,
+        stop_boundary_checks: VecDeque<((u64, u64), Option<PathBuf>)>,
         next_realized_mac: u8,
     }
 
@@ -36542,6 +38147,26 @@ mod tests {
             self.direct_virtio_headers.push_back((available, enabled));
             self
         }
+
+        fn with_next_stop_boundary_check(
+            mut self,
+            retained_file: &Path,
+            removed_socket: PathBuf,
+        ) -> Self {
+            let metadata =
+                fs::metadata(retained_file).expect("rollback-order backing should exist");
+            self.stop_boundary_checks
+                .push_back(((metadata.dev(), metadata.ino()), Some(removed_socket)));
+            self
+        }
+
+        fn with_next_stop_file_boundary_check(mut self, retained_file: &Path) -> Self {
+            let metadata =
+                fs::metadata(retained_file).expect("rollback-order backing should exist");
+            self.stop_boundary_checks
+                .push_back(((metadata.dev(), metadata.ino()), None));
+            self
+        }
     }
 
     impl ProcessVmnetPacketIoBackendFactory for RecordingVmnetPacketIoBackendFactory {
@@ -36574,8 +38199,24 @@ mod tests {
                 maximum_packet_size: self.maximum_packet_sizes.pop_front().unwrap_or(2048),
                 batch_limits: self.batch_limits.pop_front(),
                 direct_virtio_header: self.direct_virtio_headers.pop_front(),
+                stop_boundary_check: self.stop_boundary_checks.pop_front(),
             }
         }
+    }
+
+    fn descriptor_identity_is_open(expected: (u64, u64)) -> bool {
+        (0..crate::FIRECRACKER_DEFAULT_NOFILE_LIMIT).any(|descriptor| {
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `metadata` is writable and `fstat` only inspects the candidate descriptor.
+            if unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) } != 0 {
+                return false;
+            }
+            // SAFETY: Successful `fstat` initialized the complete structure.
+            let metadata = unsafe { metadata.assume_init() };
+            u64::try_from(metadata.st_dev)
+                .ok()
+                .is_some_and(|device| (device, metadata.st_ino) == expected)
+        })
     }
 
     fn push_recorded_event(events: &Arc<Mutex<Vec<String>>>, event: String) {
@@ -36994,6 +38635,55 @@ mod tests {
         .expect("fake native-v2 storage graph fixture should decode")
     }
 
+    #[cfg(target_os = "macos")]
+    fn fake_native_v2_mixed_storage_graph_with_backings()
+    -> (SnapshotV2StorageDeviceGraph, TempFilePath, TempFilePath) {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+            ^ (u64::from(std::process::id()) << 16);
+        let block_selector = format!("/tmp/bb-b-{:08x}", id & u64::from(u32::MAX));
+        let pmem_selector = format!("/tmp/bb-p-{:05x}", id & 0x000f_ffff);
+        assert_eq!(block_selector.len(), "logical-selector-0".len());
+        assert_eq!(pmem_selector.len(), "pmem-selector-0".len());
+        assert!(!Path::new(&block_selector).exists());
+        assert!(!Path::new(&pmem_selector).exists());
+
+        let mut bytes = fixture_hex_bytes(include_str!(
+            "../../runtime/src/snapshot_device_v2_6/fixtures/mixed-block-root-mmio.hex"
+        ));
+        for (captured, destination) in [
+            ("logical-selector-0", block_selector.as_str()),
+            ("pmem-selector-0", pmem_selector.as_str()),
+        ] {
+            let matches = bytes
+                .windows(captured.len())
+                .enumerate()
+                .filter_map(|(index, bytes)| (bytes == captured.as_bytes()).then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "fixture selector should occur exactly once"
+            );
+            let start = matches[0];
+            let end = start + destination.len();
+            bytes[start..end].copy_from_slice(destination.as_bytes());
+        }
+        let graph = SnapshotV2StorageDeviceGraph::decode(
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &bytes,
+        )
+        .expect("selector-rebound mixed storage graph should decode");
+        let block = TempFilePath::create_sized_at(
+            PathBuf::from(block_selector),
+            graph.block_records()[0].block().backing_bytes(),
+        );
+        let pmem = TempFilePath::create_sized_at(
+            PathBuf::from(pmem_selector),
+            graph.pmem_records()[0].pmem().file_bytes(),
+        );
+        (graph, block, pmem)
+    }
+
     fn fake_native_v2_entropy_state(
         transport: SnapshotV2DeviceTransportKind,
     ) -> SnapshotV2EntropyState {
@@ -37085,9 +38775,11 @@ mod tests {
         .expect("fake native-v2 vsock fixture should decode")
     }
 
-    fn native_v2_vsock_pre_access_candidate(
+    fn native_v2_vsock_pre_access_product_candidate(
         network: Option<SnapshotV2NetworkState>,
         vsock: Option<SnapshotV2VsockState>,
+        device_graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial_config: SerialConfig,
     ) -> (NativeV2VsockSnapshotCandidateState, GuestMemory) {
         let range = GuestMemoryRange::new(GuestAddress::new(0), 0x0040_0000)
             .expect("exact-2.12 pre-access memory range should validate");
@@ -37136,11 +38828,16 @@ mod tests {
         .expect("exact-2.12 pre-access memory should encode")
         .encode()
         .expect("exact-2.12 pre-access binding should encode");
+        let device_graph = device_graph.as_ref().map(|graph| {
+            graph
+                .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                .expect("exact-2.12 pre-access storage graph should encode")
+        });
         let serial_device = SerialMmioDevice::discarding()
             .capture_state()
             .expect("exact-2.12 pre-access serial device should capture");
         let serial = SnapshotV2SerialState::try_from_capture_ready(CaptureReadySerialState::new(
-            SerialConfig::default(),
+            serial_config,
             serial_device,
         ))
         .expect("exact-2.12 pre-access serial should validate")
@@ -37156,18 +38853,23 @@ mod tests {
                 .encode(NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION)
                 .expect("exact-2.12 pre-access vsock should encode")
         });
-        let mut components = vec![
-            SnapshotV2Component::new(
-                NATIVE_V2_MEMORY_COMPONENT_KEY,
+        let mut components = vec![SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &binding,
+        )];
+        if let Some(device_graph) = device_graph.as_deref() {
+            components.push(SnapshotV2Component::new(
+                NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
                 SnapshotV2ComponentDisposition::Semantic,
-                &binding,
-            ),
-            SnapshotV2Component::new(
-                NATIVE_V2_SERIAL_COMPONENT_KEY,
-                SnapshotV2ComponentDisposition::Semantic,
-                &serial,
-            ),
-        ];
+                device_graph,
+            ));
+        }
+        components.push(SnapshotV2Component::new(
+            NATIVE_V2_SERIAL_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &serial,
+        ));
         if let Some(network) = network.as_deref() {
             components.push(SnapshotV2Component::new(
                 NATIVE_V2_NETWORK_COMPONENT_KEY,
@@ -37191,6 +38893,77 @@ mod tests {
         let candidate = NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(encoded)
             .expect("exact-2.12 pre-access candidate should close");
         (candidate, memory)
+    }
+
+    fn native_v2_vsock_pre_access_candidate(
+        network: Option<SnapshotV2NetworkState>,
+        vsock: Option<SnapshotV2VsockState>,
+    ) -> (NativeV2VsockSnapshotCandidateState, GuestMemory) {
+        native_v2_vsock_pre_access_product_candidate(network, vsock, None, SerialConfig::default())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepared_native_v2_vsock_resource_plan(
+        destination: &Path,
+        with_network: bool,
+    ) -> (
+        super::PreparedProcessSnapshotV2VsockResourcePlan,
+        Option<GuestMacAddress>,
+    ) {
+        prepared_native_v2_vsock_resource_plan_with_serial(
+            destination,
+            with_network,
+            SerialConfig::default(),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepared_native_v2_vsock_resource_plan_with_serial(
+        destination: &Path,
+        with_network: bool,
+        serial_config: SerialConfig,
+    ) -> (
+        super::PreparedProcessSnapshotV2VsockResourcePlan,
+        Option<GuestMacAddress>,
+    ) {
+        let network =
+            with_network.then(|| fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio));
+        let expected_mac = network.as_ref().and_then(|state| {
+            state
+                .interfaces()
+                .first()
+                .and_then(|interface| interface.profile().guest_mac())
+        });
+        let network_overrides = network
+            .as_ref()
+            .map(|state| {
+                state
+                    .interfaces()
+                    .iter()
+                    .map(|interface| {
+                        SnapshotNetworkOverride::new(interface.iface_id(), "vmnet:shared")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let vsock = fake_native_v2_vsock_state(SnapshotV2DeviceTransportKind::Mmio);
+        let (candidate, memory) =
+            native_v2_vsock_pre_access_product_candidate(network, Some(vsock), None, serial_config);
+        let vsock_override = SnapshotVsockOverride::new(destination);
+        let candidate = prepare_process_snapshot_v2_vsock_candidate(
+            candidate,
+            &memory,
+            SnapshotV2DeviceTransportKind::Mmio,
+            &network_overrides,
+            Some(&vsock_override),
+        )
+        .expect("canonical exact-2.12 candidate should prepare");
+        let plan = super::prepare_process_snapshot_v2_vsock_resource_plan(
+            candidate,
+            ProcessVmnetAuthority::Direct,
+        )
+        .expect("canonical exact-2.12 resource plan should prepare");
+        (plan, expected_mac)
     }
 
     #[derive(Default)]
@@ -39353,6 +41126,1004 @@ mod tests {
                 transport
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_resource_plan_corruption_fails_before_host_access() {
+        for mutation in 0..3 {
+            let socket = TempFilePath::absent(&format!("v2-plan-{mutation}.sock"));
+            let destination = socket.path().to_path_buf();
+            let (mut plan, _) = prepared_native_v2_vsock_resource_plan(&destination, false);
+            match mutation {
+                0 => plan.drop_last_binding_key_for_test(),
+                1 => plan.duplicate_first_binding_key_for_test(),
+                2 => plan.corrupt_first_binding_class_for_test(),
+                _ => continue,
+            }
+            let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+            let events = factory.events();
+
+            let error = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+                plan,
+                None,
+                "private-plan-corruption-instance",
+                bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                &mut factory,
+                |_| false,
+            )
+            .expect_err("a corrupted complete plan must fail before authority access");
+
+            assert_eq!(
+                error.stage,
+                super::ProcessSnapshotV2VsockRestoreResourceStage::Plan
+            );
+            assert!(matches!(
+                error.kind,
+                super::ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch
+            ));
+            assert_eq!(
+                error.disposition(),
+                super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+            );
+            assert!(!destination.exists());
+            assert!(recorded_events(&events).is_empty());
+            assert!(!format!("{error:?} {error}").contains(destination.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_value_plan_accepts_every_resource_family_combination() {
+        for mask in 0_u8..32 {
+            let has_block = mask & 0b00001 != 0;
+            let has_pmem = mask & 0b00010 != 0;
+            let has_serial = mask & 0b00100 != 0;
+            let has_network = mask & 0b01000 != 0;
+            let has_vsock = mask & 0b10000 != 0;
+            let device_graph = (has_block || has_pmem).then(|| {
+                fake_native_v2_storage_device_graph(
+                    SnapshotV2DeviceTransportKind::Mmio,
+                    has_block,
+                    has_pmem,
+                )
+            });
+            let block_count = device_graph
+                .as_ref()
+                .map_or(0, |graph| graph.block_records().len());
+            let pmem_count = device_graph
+                .as_ref()
+                .map_or(0, |graph| graph.pmem_records().len());
+            let serial_config = if has_serial {
+                SerialConfigInput::new()
+                    .with_serial_out_path(format!("/tmp/bb-v2-plan-serial-{mask}"))
+                    .validate()
+                    .expect("configured exact-2.12 serial should validate")
+            } else {
+                SerialConfig::default()
+            };
+            let network = has_network
+                .then(|| fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio));
+            let network_count = network.as_ref().map_or(0, |state| state.interfaces().len());
+            let network_overrides = network
+                .as_ref()
+                .map(|state| {
+                    state
+                        .interfaces()
+                        .iter()
+                        .map(|interface| {
+                            SnapshotNetworkOverride::new(interface.iface_id(), "vmnet:shared")
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let vsock =
+                has_vsock.then(|| fake_native_v2_vsock_state(SnapshotV2DeviceTransportKind::Mmio));
+            let vsock_override = has_vsock
+                .then(|| SnapshotVsockOverride::new(format!("/tmp/bb-v2-plan-{mask}.sock")));
+            let (candidate, memory) = native_v2_vsock_pre_access_product_candidate(
+                network,
+                vsock,
+                device_graph,
+                serial_config,
+            );
+            let candidate = prepare_process_snapshot_v2_vsock_candidate(
+                candidate,
+                &memory,
+                SnapshotV2DeviceTransportKind::Mmio,
+                &network_overrides,
+                vsock_override.as_ref(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("resource-family mask {mask:#07b} should prepare pre-access: {error}")
+            });
+            let plan = super::prepare_process_snapshot_v2_vsock_resource_plan(
+                candidate,
+                ProcessVmnetAuthority::Direct,
+            )
+            .unwrap_or_else(|error| {
+                panic!("resource-family mask {mask:#07b} should plan: {error}")
+            });
+
+            let mut expected_classes = Vec::new();
+            for _ in 0..block_count {
+                expected_classes.push(
+                    bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::BlockBacking,
+                );
+            }
+            for _ in 0..pmem_count {
+                expected_classes.push(
+                    bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::PmemBacking,
+                );
+            }
+            if has_serial {
+                expected_classes.push(
+                    bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::SerialSink,
+                );
+            }
+            for _ in 0..network_count {
+                expected_classes.push(
+                    bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::NetworkPacketIo,
+                );
+            }
+            if has_vsock {
+                expected_classes.push(
+                    bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::VsockEndpoint,
+                );
+            }
+            assert!(plan.is_coherent());
+            assert_eq!(
+                plan.binding_keys
+                    .iter()
+                    .map(
+                        bangbang_runtime::snapshot_restore::SnapshotRestoreResourceKey::resource_class
+                    )
+                    .collect::<Vec<_>>(),
+                expected_classes,
+                "resource-family mask {mask:#07b} must retain canonical class order"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_vsock_batch_is_redacted_and_adopts_exactly_once() {
+        let socket = TempFilePath::absent("v2-adopt.sock");
+        let destination = socket.path().to_path_buf();
+        let (plan, _) = prepared_native_v2_vsock_resource_plan(&destination, false);
+        assert!(!format!("{plan:?}").contains(destination.to_string_lossy().as_ref()));
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let mut batch = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            plan,
+            None,
+            "private-single-adoption-instance",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("canonical direct vsock resources should prepare");
+        assert!(destination.exists());
+        assert_eq!(batch.remaining_count(), 1);
+        assert!(batch.vsock_state().is_some());
+        assert!(batch.vsock_config().is_some());
+        assert!(!format!("{batch:?}").contains(destination.to_string_lossy().as_ref()));
+        let key = batch
+            .resource_keys()
+            .iter()
+            .find(|key| {
+                key.resource_class()
+                    == bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::VsockEndpoint
+            })
+            .expect("the exact vsock key should be present")
+            .clone();
+        let wrong_class = bangbang_runtime::snapshot_restore::SnapshotRestoreResourceKey::new(
+            key.device_key(),
+            key.public_id().clone(),
+            bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::SerialSink,
+        );
+
+        let wrong = batch
+            .adopt_vsock::<(), ()>(&wrong_class, |_| Ok(()))
+            .expect_err("a wrong-class key must not consume the vsock owner");
+        assert_eq!(
+            wrong.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(matches!(
+            wrong,
+            super::ProcessSnapshotV2VsockAdoptionError::Resources(ref source)
+                if matches!(
+                    source.kind,
+                    super::ProcessSnapshotV2VsockRestoreResourceErrorKind::Take(
+                        bangbang_runtime::snapshot_restore::SnapshotRestoreTakeError::WrongClass
+                    )
+                )
+        ));
+        assert_eq!(batch.remaining_count(), 1);
+
+        let ((), guard) = batch
+            .adopt_vsock(&key, |resource| resource.consume_for_test())
+            .expect("the exact vsock owner should adopt once");
+        assert_eq!(batch.remaining_count(), 0);
+        let repeated = batch
+            .adopt_vsock::<(), ()>(&key, |_| Ok(()))
+            .expect_err("the exact vsock owner must not be adopted twice");
+        assert!(matches!(
+            repeated,
+            super::ProcessSnapshotV2VsockAdoptionError::Resources(ref source)
+                if matches!(
+                    source.kind,
+                    super::ProcessSnapshotV2VsockRestoreResourceErrorKind::Take(
+                        bangbang_runtime::snapshot_restore::SnapshotRestoreTakeError::AlreadyTaken
+                    )
+                )
+        ));
+
+        let completion = batch
+            .finish()
+            .expect("a fully consumed aggregate batch should finish");
+        assert!(destination.exists());
+        completion
+            .abort()
+            .expect("the empty file/network completions should abort cleanly");
+        drop(guard);
+        assert!(!destination.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_failed_vsock_adoption_cannot_finish_the_batch() {
+        for consume_before_failure in [false, true] {
+            let socket =
+                TempFilePath::absent(&format!("v2-adopt-failure-{consume_before_failure}.sock"));
+            let destination = socket.path().to_path_buf();
+            let (plan, _) = prepared_native_v2_vsock_resource_plan(&destination, false);
+            let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+            let mut batch =
+                super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+                    plan,
+                    None,
+                    "private-failed-adoption-instance",
+                    bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                    &mut factory,
+                    |_| false,
+                )
+                .expect("canonical direct vsock resources should prepare");
+            let key = batch.resource_keys()[0].clone();
+            let private_source = "private aggregate adoption failure";
+
+            let adoption = batch
+                .adopt_vsock(&key, |resource| {
+                    if consume_before_failure {
+                        resource
+                            .consume_for_test()
+                            .expect("the test endpoint should consume once");
+                    }
+                    Err::<(), _>(private_source)
+                })
+                .expect_err("the injected reconstruction failure should be retained");
+            assert_eq!(
+                adoption.disposition(),
+                if consume_before_failure {
+                    super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+                } else {
+                    super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+                }
+            );
+            assert_eq!(batch.remaining_count(), 0);
+            assert!(!destination.exists());
+            let diagnostics = format!("{adoption:?} {adoption}");
+            assert!(!diagnostics.contains(private_source));
+            assert!(!diagnostics.contains(destination.to_string_lossy().as_ref()));
+
+            let error = batch
+                .finish()
+                .expect_err("a failed typed handoff must prevent aggregate completion");
+            assert_eq!(
+                error.stage,
+                super::ProcessSnapshotV2VsockRestoreResourceStage::Finish
+            );
+            assert!(matches!(
+                error.kind,
+                super::ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch
+            ));
+            assert_eq!(
+                error.disposition(),
+                super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+            );
+            assert!(!error.cleanup_uncertain());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_configured_serial_shares_the_typed_aggregate_boundary() {
+        let serial_path = TempFilePath::create("v2-serial.log");
+        let socket = TempFilePath::absent("v2-serial-vsock.sock");
+        let destination = socket.path().to_path_buf();
+        let serial_config = SerialConfigInput::new()
+            .with_serial_out_path(serial_path.path().to_string_lossy())
+            .validate()
+            .expect("configured exact-2.12 serial should validate");
+        let (plan, _) = prepared_native_v2_vsock_resource_plan_with_serial(
+            &destination,
+            false,
+            serial_config.clone(),
+        );
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let mut batch = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            plan,
+            None,
+            "private-serial-vsock-instance",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("configured serial and vsock should prepare atomically");
+        assert_eq!(
+            batch
+                .resource_keys()
+                .iter()
+                .map(bangbang_runtime::snapshot_restore::SnapshotRestoreResourceKey::resource_class)
+                .collect::<Vec<_>>(),
+            [
+                bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::SerialSink,
+                bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::VsockEndpoint,
+            ]
+        );
+        let serial_key = batch.resource_keys()[0].clone();
+        let vsock_key = batch.resource_keys()[1].clone();
+        let serial = batch
+            .take_serial(&serial_key)
+            .expect("the configured serial owner should take once");
+        let ((), guard) = batch
+            .adopt_vsock(&vsock_key, |resource| resource.consume_for_test())
+            .expect("the exact vsock owner should adopt once");
+        let completion = batch
+            .finish()
+            .expect("the fully consumed serial/vsock batch should finish");
+        drop(serial);
+        completion
+            .abort()
+            .expect("direct serial/vsock completion should abort cleanly");
+        drop(guard);
+        assert!(!destination.exists());
+
+        let (partial_plan, _) =
+            prepared_native_v2_vsock_resource_plan_with_serial(&destination, false, serial_config);
+        let mut partial = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            partial_plan,
+            None,
+            "private-partial-serial-vsock-instance",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("the same serial/vsock product should prepare after clean rollback");
+        let serial_key = partial.resource_keys()[0].clone();
+        drop(
+            partial
+                .take_serial(&serial_key)
+                .expect("one serial owner should escape before aggregate abort"),
+        );
+        let error = partial
+            .abort()
+            .expect_err("abort after a typed owner escapes must remain terminal");
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(!error.cleanup_uncertain());
+        assert!(!destination.exists());
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains(destination.to_string_lossy().as_ref()));
+        assert!(!diagnostics.contains(serial_path.path().to_string_lossy().as_ref()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_full_resource_product_prepares_and_unwinds_atomically() {
+        let (device_graph, block_file, pmem_file) =
+            fake_native_v2_mixed_storage_graph_with_backings();
+        let serial_file = TempFilePath::create("v2-full-serial.log");
+        let socket = TempFilePath::absent("v2-full.sock");
+        let destination = socket.path().to_path_buf();
+        let serial_config = SerialConfigInput::new()
+            .with_serial_out_path(serial_file.path().to_string_lossy())
+            .validate()
+            .expect("full-product configured serial should validate");
+        let network = fake_native_v2_network_state(SnapshotV2DeviceTransportKind::Mmio);
+        let expected_mac = network.interfaces()[0]
+            .profile()
+            .guest_mac()
+            .expect("full-product network profile should retain its MAC");
+        let network_overrides = network
+            .interfaces()
+            .iter()
+            .map(|interface| SnapshotNetworkOverride::new(interface.iface_id(), "vmnet:shared"))
+            .collect::<Vec<_>>();
+        let vsock = fake_native_v2_vsock_state(SnapshotV2DeviceTransportKind::Mmio);
+        let prepare_plan = || {
+            let (candidate, memory) = native_v2_vsock_pre_access_product_candidate(
+                Some(network.clone()),
+                Some(vsock.clone()),
+                Some(device_graph.clone()),
+                serial_config.clone(),
+            );
+            let candidate = prepare_process_snapshot_v2_vsock_candidate(
+                candidate,
+                &memory,
+                SnapshotV2DeviceTransportKind::Mmio,
+                &network_overrides,
+                Some(&SnapshotVsockOverride::new(&destination)),
+            )
+            .expect("full exact-2.12 product should prepare pre-access");
+            super::prepare_process_snapshot_v2_vsock_resource_plan(
+                candidate,
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("full exact-2.12 resource plan should prepare")
+        };
+
+        let rollback_plan = prepare_plan();
+        let mut rollback_factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_mac)
+            .with_next_stop_boundary_check(block_file.path(), destination.clone());
+        let rollback_events = rollback_factory.events();
+        let rollback = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            rollback_plan,
+            None,
+            "private-full-product-rollback",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut rollback_factory,
+            |_| false,
+        )
+        .expect("the full exact-2.12 rollback probe should prepare");
+        rollback
+            .abort()
+            .expect("the untouched full exact-2.12 product should unwind cleanly");
+        assert!(
+            recorded_events(&rollback_events)
+                .iter()
+                .any(|event| event == "stop-between-vsock-and-files:eth0:true"),
+            "rollback must remove vsock, then stop network, while file owners remain live"
+        );
+
+        let plan = prepare_plan();
+        let mut factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(expected_mac);
+        let events = factory.events();
+        let mut batch = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            plan,
+            None,
+            "private-full-product-instance",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("the complete exact-2.12 resource product should prepare atomically");
+        use bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::{
+            BlockBacking, NetworkPacketIo, PmemBacking, SerialSink, VsockEndpoint,
+        };
+        assert_eq!(
+            batch
+                .resource_keys()
+                .iter()
+                .map(bangbang_runtime::snapshot_restore::SnapshotRestoreResourceKey::resource_class)
+                .collect::<Vec<_>>(),
+            [
+                BlockBacking,
+                PmemBacking,
+                SerialSink,
+                NetworkPacketIo,
+                VsockEndpoint,
+            ]
+        );
+        let keys = batch.resource_keys().to_vec();
+        let block = batch
+            .take_block(&keys[0])
+            .expect("the exact block owner should take once");
+        let pmem = batch
+            .take_pmem(&keys[1])
+            .expect("the exact pmem owner should take once");
+        let serial = batch
+            .take_serial(&keys[2])
+            .expect("the exact serial owner should take once");
+        let network = batch
+            .take_network(&keys[3])
+            .expect("the exact network owner should take once");
+        let ((), guard) = batch
+            .adopt_vsock(&keys[4], |resource| resource.consume_for_test())
+            .expect("the exact vsock owner should adopt once");
+        let completion = batch
+            .finish()
+            .expect("the fully consumed exact-2.12 resource product should finish");
+        drop((block, pmem, serial, network));
+        completion
+            .abort()
+            .expect("full direct completions should unwind cleanly");
+        drop(guard);
+
+        assert!(!destination.exists());
+        assert!(block_file.path().exists());
+        assert!(pmem_file.path().exists());
+        assert!(serial_file.path().exists());
+        assert!(
+            recorded_events(&events)
+                .iter()
+                .any(|event| event == "stop:eth0"),
+            "full-product unwind must stop the network provider"
+        );
+
+        fs::write(&destination, b"private replacement")
+            .expect("the preexisting destination probe should be created");
+        let failed_plan = prepare_plan();
+        let mut failed_factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_mac)
+            .with_next_stop_file_boundary_check(block_file.path());
+        let failed_events = failed_factory.events();
+        let error = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            failed_plan,
+            None,
+            "private-full-product-publication-failure",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut failed_factory,
+            |_| false,
+        )
+        .expect_err("a preexisting destination must reject final vsock publication");
+        assert_eq!(
+            error.stage,
+            super::ProcessSnapshotV2VsockRestoreResourceStage::VsockPublication
+        );
+        assert!(!error.cleanup_uncertain());
+        assert_eq!(
+            fs::read(&destination).expect("the preexisting destination should remain"),
+            b"private replacement"
+        );
+        assert!(
+            recorded_events(&failed_events)
+                .iter()
+                .any(|event| event == "stop-between-vsock-and-files:eth0:true"),
+            "publication failure must stop network while earlier file owners remain live"
+        );
+
+        let uncertain_plan = prepare_plan();
+        let mut uncertain_factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(expected_mac)
+            .with_next_stop_status(Some(VmnetStatus::Failure));
+        let uncertain = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            uncertain_plan,
+            None,
+            "private-full-product-publication-cleanup-uncertainty",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut uncertain_factory,
+            |_| false,
+        )
+        .expect_err("publication failure must retain provider cleanup uncertainty");
+        assert_eq!(
+            uncertain.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(uncertain.cleanup_uncertain());
+        assert_eq!(
+            fs::read(&destination).expect("the replacement should survive uncertain cleanup"),
+            b"private replacement"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_contained_vsock_only_product_uses_one_generation() {
+        let root = TempFilePath::create("v2-contained-unused-root");
+        let fixture = contained_restore_authority_for_test(root.path(), true);
+        let destination_reference = Path::new("bangbang-grant:vsock-directory/restored.sock");
+        let published = fixture
+            .vsock_directory_path_for_test()
+            .join("restored.sock");
+        let (plan, _) = prepared_native_v2_vsock_resource_plan(destination_reference, false);
+        let launcher = fixture.socket_broker_for_test();
+        let session = fixture.session_for_test();
+        let broker = std::thread::spawn(move || {
+            let activation = receive_socket_broker_message(&launcher)
+                .expect("contained test broker should receive activation");
+            assert!(activation.descriptor.is_none());
+            assert!(matches!(
+                activation.message,
+                SocketBrokerMessage::Activate {
+                    session: observed,
+                    sequence: 1,
+                    ..
+                } if observed == session
+            ));
+            send_socket_broker_message(
+                &launcher,
+                &SocketBrokerMessage::Ready {
+                    session,
+                    sequence: 1,
+                },
+                None,
+            )
+            .expect("contained test broker should confirm activation");
+
+            let shutdown = receive_socket_broker_message(&launcher)
+                .expect("contained test broker should receive shutdown");
+            let sequence = match shutdown.message {
+                SocketBrokerMessage::Shutdown {
+                    session: observed,
+                    sequence,
+                } if observed == session => sequence,
+                message => panic!("unexpected contained broker shutdown: {message:?}"),
+            };
+            assert!(shutdown.descriptor.is_none());
+            send_socket_broker_message(
+                &launcher,
+                &SocketBrokerMessage::Complete { session, sequence },
+                None,
+            )
+            .expect("contained test broker should confirm shutdown");
+        });
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let mut batch = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            plan,
+            Some(fixture.authority()),
+            "private-contained-vsock-instance",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("zero-file contained vsock should prepare in one aggregate transaction");
+        assert!(published.exists());
+        let overlap = fixture
+            .authority()
+            .prepare_files(&[], Some(destination_reference), &|| false)
+            .expect_err("the aggregate completion must retain its one generation");
+        assert_eq!(
+            overlap.kind(),
+            crate::contained_session::ContainedSnapshotRestoreErrorKind::Busy
+        );
+        let vsock_key = batch.resource_keys()[0].clone();
+        let ((), guard) = batch
+            .adopt_vsock(&vsock_key, |resource| resource.consume_for_test())
+            .expect("the contained endpoint should adopt exactly once");
+        broker
+            .join()
+            .expect("the contained test broker should finish cleanly");
+        let completion = batch
+            .finish()
+            .expect("the consumed contained vsock batch should finish");
+        let (_, _, _, _, _, _, _, _, _, _, _, network_completion) = completion
+            .commit()
+            .expect("the contained generation should commit once");
+        network_completion
+            .abort()
+            .expect("the empty network completion should abort cleanly");
+        drop(guard);
+        assert!(!published.exists());
+        let diagnostics = format!("{overlap:?} {overlap}");
+        assert!(!diagnostics.contains("vsock-directory"));
+        assert!(!diagnostics.contains("restored.sock"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_unconsumed_finish_cleans_and_allows_retry() {
+        let socket = TempFilePath::absent("v2-unconsumed.sock");
+        let destination = socket.path().to_path_buf();
+        let (plan, _) = prepared_native_v2_vsock_resource_plan(&destination, false);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let batch = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            plan,
+            None,
+            "private-unconsumed-instance",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("canonical direct vsock resources should prepare");
+        assert!(destination.exists());
+
+        let error = batch
+            .finish()
+            .expect_err("success must reject an unconsumed manifest owner");
+        assert_eq!(
+            error.stage,
+            super::ProcessSnapshotV2VsockRestoreResourceStage::Finish
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2VsockRestoreResourceErrorKind::Unconsumed {
+                unconsumed_count: 1
+            }
+        ));
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(!error.cleanup_uncertain());
+        assert!(!destination.exists());
+
+        let (retry_plan, _) = prepared_native_v2_vsock_resource_plan(&destination, false);
+        let retry = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            retry_plan,
+            None,
+            "private-unconsumed-retry",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("conclusive cleanup should permit an exact retry");
+        retry
+            .abort()
+            .expect("the retried aggregate batch should abort cleanly");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_cancellation_restores_every_aggregate_phase() {
+        use super::ProcessSnapshotV2VsockRestoreResourceStage::{
+            Binding, FilePreparation, NetworkPreparation, Reservation, VsockPublication,
+        };
+
+        for cancelled_stage in [
+            Reservation,
+            FilePreparation,
+            NetworkPreparation,
+            VsockPublication,
+            Binding,
+        ] {
+            let socket = TempFilePath::absent(&format!("v2-cancel-{cancelled_stage:?}.sock"));
+            let destination = socket.path().to_path_buf();
+            let (plan, _) = prepared_native_v2_vsock_resource_plan(&destination, false);
+            let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+            let events = factory.events();
+
+            let error = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+                plan,
+                None,
+                "private-stage-cancellation",
+                bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                &mut factory,
+                |stage| stage == cancelled_stage,
+            )
+            .expect_err("the selected aggregate stage should cancel");
+
+            assert_eq!(error.stage, cancelled_stage);
+            assert_eq!(
+                error.disposition(),
+                super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable,
+                "confirmed rollback should keep {cancelled_stage:?} retryable"
+            );
+            assert!(!error.cleanup_uncertain());
+            assert!(!destination.exists());
+            assert!(recorded_events(&events).is_empty());
+
+            let (retry_plan, _) = prepared_native_v2_vsock_resource_plan(&destination, false);
+            let retry = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+                retry_plan,
+                None,
+                "private-stage-cancellation-retry",
+                bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                &mut factory,
+                |_| false,
+            )
+            .expect("confirmed rollback should permit an exact retry");
+            retry
+                .abort()
+                .expect("the retried aggregate batch should abort cleanly");
+            assert!(!destination.exists());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_publishes_vsock_only_after_network_completion() {
+        let socket = TempFilePath::absent("v2-order.sock");
+        let destination = socket.path().to_path_buf();
+        let (plan, expected_mac) = prepared_native_v2_vsock_resource_plan(&destination, true);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        if let Some(expected_mac) = expected_mac {
+            factory = factory.with_next_realized_mac(expected_mac);
+        }
+        let events = factory.events();
+        let checked_prepublication = Cell::new(false);
+
+        let mut batch = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            plan,
+            None,
+            "private-network-before-vsock-instance",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |stage| {
+                if stage == super::ProcessSnapshotV2VsockRestoreResourceStage::VsockPublication
+                    && !checked_prepublication.replace(true)
+                {
+                    assert!(!destination.exists());
+                    assert!(
+                        recorded_events(&events)
+                            .iter()
+                            .any(|event| event == "start:eth0"),
+                        "network packet I/O must be started before vsock publication"
+                    );
+                }
+                false
+            },
+        )
+        .expect("network and vsock resources should prepare in canonical order");
+        assert!(checked_prepublication.get());
+        assert!(destination.exists());
+
+        let network_key = batch
+            .resource_keys()
+            .iter()
+            .find(|key| {
+                key.resource_class()
+                    == bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::NetworkPacketIo
+            })
+            .expect("the exact network key should be present")
+            .clone();
+        let vsock_key = batch
+            .resource_keys()
+            .iter()
+            .find(|key| {
+                key.resource_class()
+                    == bangbang_runtime::snapshot_restore::SnapshotRestoreResourceClass::VsockEndpoint
+            })
+            .expect("the exact vsock key should be present")
+            .clone();
+        let network = batch
+            .take_network(&network_key)
+            .expect("the exact network owner should take once");
+        let ((), guard) = batch
+            .adopt_vsock(&vsock_key, |resource| resource.consume_for_test())
+            .expect("the exact vsock owner should adopt once");
+        let completion = batch
+            .finish()
+            .expect("the complete network/vsock product should finish");
+        drop(network);
+        let (_, _, _, _, _, _, _, _, _, _, _, network_completion) = completion
+            .commit()
+            .expect("the aggregate file authority should commit");
+        network_completion
+            .abort()
+            .expect("the transferred network completion should abort cleanly");
+        drop(guard);
+        assert!(!destination.exists());
+        assert!(
+            recorded_events(&events)
+                .iter()
+                .any(|event| event == "stop:eth0"),
+            "aggregate abort must stop the completed network provider"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_postpublication_cancellation_unwinds_socket_and_provider() {
+        let socket = TempFilePath::absent("v2-binding-cancel.sock");
+        let destination = socket.path().to_path_buf();
+        let (plan, expected_mac) = prepared_native_v2_vsock_resource_plan(&destination, true);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        if let Some(expected_mac) = expected_mac {
+            factory = factory.with_next_realized_mac(expected_mac);
+        }
+        let events = factory.events();
+        let observed_binding = Cell::new(false);
+
+        let error = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            plan,
+            None,
+            "private-postpublication-cancellation",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |stage| {
+                if stage == super::ProcessSnapshotV2VsockRestoreResourceStage::Binding {
+                    observed_binding.set(true);
+                    assert!(destination.exists());
+                    assert!(
+                        recorded_events(&events)
+                            .iter()
+                            .any(|event| event == "start:eth0")
+                    );
+                    true
+                } else {
+                    false
+                }
+            },
+        )
+        .expect_err("binding cancellation should unwind the published aggregate");
+
+        assert!(observed_binding.get());
+        assert_eq!(
+            error.stage,
+            super::ProcessSnapshotV2VsockRestoreResourceStage::Binding
+        );
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable
+        );
+        assert!(!error.cleanup_uncertain());
+        assert!(!destination.exists());
+        let events = recorded_events(&events);
+        let started = events
+            .iter()
+            .position(|event| event == "start:eth0")
+            .expect("network provider should start");
+        let stopped = events
+            .iter()
+            .position(|event| event == "stop:eth0")
+            .expect("network provider should stop during rollback");
+        assert!(started < stopped);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_provider_cleanup_uncertainty_is_terminal() {
+        let socket = TempFilePath::absent("v2-provider-uncertain.sock");
+        let destination = socket.path().to_path_buf();
+        let (plan, expected_mac) = prepared_native_v2_vsock_resource_plan(&destination, true);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .recording_packet_event_lifecycle()
+            .with_next_packet_event_status(Some(VmnetStatus::Failure))
+            .with_next_stop_status(Some(VmnetStatus::Failure));
+        if let Some(expected_mac) = expected_mac {
+            factory = factory.with_next_realized_mac(expected_mac);
+        }
+
+        let error = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            plan,
+            None,
+            "private-provider-cleanup-uncertainty",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect_err("unconfirmed provider cleanup must fail the aggregate terminally");
+
+        assert_eq!(
+            error.stage,
+            super::ProcessSnapshotV2VsockRestoreResourceStage::NetworkPreparation
+        );
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(error.cleanup_uncertain());
+        assert!(!destination.exists());
+        assert!(!format!("{error:?} {error}").contains(destination.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_minor_twelve_ordinary_drop_cleans_unconsumed_socket_and_provider() {
+        let socket = TempFilePath::absent("v2-drop-cleanup.sock");
+        let destination = socket.path().to_path_buf();
+        let (plan, expected_mac) = prepared_native_v2_vsock_resource_plan(&destination, true);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        if let Some(expected_mac) = expected_mac {
+            factory = factory.with_next_realized_mac(expected_mac);
+        }
+        let events = factory.events();
+        let batch = super::prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
+            plan,
+            None,
+            "private-drop-cleanup",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect("drop-cleanup aggregate should prepare");
+        assert!(destination.exists());
+
+        drop(batch);
+
+        assert!(!destination.exists());
+        assert!(
+            recorded_events(&events)
+                .iter()
+                .any(|event| event == "stop:eth0"),
+            "ordinary aggregate drop must stop the retained provider"
+        );
     }
 
     #[test]

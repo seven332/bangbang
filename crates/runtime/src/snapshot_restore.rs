@@ -268,12 +268,12 @@ pub enum SnapshotRestoreResourceClass {
     BlockBacking,
     /// File backing for a restored virtio-pmem device.
     PmemBacking,
-    /// Destination endpoint for a restored virtio-vsock device.
-    VsockEndpoint,
     /// Destination output for the restored singleton serial device.
     SerialSink,
     /// Fresh packet-I/O owner for one restored network interface.
     NetworkPacketIo,
+    /// Destination endpoint for a restored virtio-vsock device.
+    VsockEndpoint,
 }
 
 impl SnapshotRestoreResourceClass {
@@ -1585,6 +1585,31 @@ mod tests {
                 .filter(|key| key.resource_class() == SnapshotRestoreResourceClass::VsockEndpoint)
                 .count(),
             1
+        );
+        let classes = without_override
+            .resources()
+            .iter()
+            .map(SnapshotRestoreResourceKey::resource_class)
+            .collect::<Vec<_>>();
+        let serial_index = classes
+            .iter()
+            .position(|class| *class == SnapshotRestoreResourceClass::SerialSink)
+            .expect("configured serial should be present");
+        let network_index = classes
+            .iter()
+            .position(|class| *class == SnapshotRestoreResourceClass::NetworkPacketIo)
+            .expect("network should be present");
+        let vsock_index = classes
+            .iter()
+            .position(|class| *class == SnapshotRestoreResourceClass::VsockEndpoint)
+            .expect("vsock should be present");
+        assert!(
+            serial_index < network_index && network_index < vsock_index,
+            "exact-2.12 resources must retain storage/serial/network/vsock order"
+        );
+        assert_eq!(
+            classes.last(),
+            Some(&SnapshotRestoreResourceClass::VsockEndpoint)
         );
 
         let overridden = SnapshotRestoreManifest::try_from_native_v2_vsock_state(

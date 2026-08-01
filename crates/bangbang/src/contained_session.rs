@@ -2454,7 +2454,7 @@ mod platform {
             file_requests.try_reserve_exact(files.len()).map_err(|_| {
                 ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
             })?;
-            if files.is_empty() {
+            if files.is_empty() && vsock_reference.is_none() {
                 return Err(ContainedSnapshotRestoreError::new(
                     ContainedSnapshotRestoreErrorKind::InvalidRequest,
                 ));
@@ -2789,7 +2789,7 @@ mod platform {
             mut self,
         ) -> Result<ContainedSnapshotRestoreReservationParts, ContainedSnapshotRestoreError>
         {
-            let valid = self.expected_file_count != 0
+            let valid = (self.expected_file_count != 0 || self.expects_vsock)
                 && self.file_claims.len() == self.expected_file_count
                 && if self.expects_vsock {
                     self.directory_claims.len() == 1
@@ -4380,6 +4380,23 @@ mod platform {
                 self.broker.invalidate();
             }
 
+            pub(crate) const fn session_for_test(&self) -> SessionId {
+                self.authority.session
+            }
+
+            pub(crate) fn socket_broker_for_test(&self) -> UnixDatagram {
+                self._launcher
+                    .try_clone()
+                    .expect("test socket broker endpoint should clone")
+            }
+
+            pub(crate) fn vsock_directory_path_for_test(&self) -> &Path {
+                self._vsock_directory
+                    .as_ref()
+                    .expect("test fixture should include a vsock directory")
+                    .path()
+            }
+
             pub(crate) fn assert_authorities_available(&self, with_vsock: bool) {
                 assert_contained_restore_authorities_available(self, with_vsock);
             }
@@ -4728,6 +4745,82 @@ mod platform {
                 consumed.kind(),
                 super::ContainedSnapshotRestoreErrorKind::Authority
             );
+        }
+
+        #[test]
+        fn contained_restore_zero_file_vsock_uses_one_reversible_generation() {
+            let fixture = contained_restore_authority_with_grants_for_test(
+                file_grant_authority_for_test(),
+                true,
+            );
+            let reference = Path::new("bangbang-grant:vsock-directory/restored.sock");
+            let no_resource_checks = Cell::new(0);
+            let error = fixture
+                .authority
+                .prepare_files(&[], None, &|| {
+                    no_resource_checks.set(no_resource_checks.get() + 1);
+                    false
+                })
+                .expect_err("an entirely empty contained request must remain invalid");
+            assert_eq!(
+                error.kind(),
+                super::ContainedSnapshotRestoreErrorKind::InvalidRequest
+            );
+            assert_eq!(no_resource_checks.get(), 0);
+            fixture.assert_authorities_available(true);
+
+            let checks = Cell::new(0);
+            let reserved = fixture
+                .authority
+                .prepare_files(&[], Some(reference), &|| {
+                    checks.set(checks.get() + 1);
+                    false
+                })
+                .expect("a vsock-only contained request should reserve");
+            let cancellation_check_count = checks.get();
+            assert!(cancellation_check_count > 0);
+            let (files, vsock, transaction) = reserved
+                .into_file_parts()
+                .expect("a coherent zero-file vsock reservation should split");
+            assert!(files.is_empty());
+            let (directory, broker, namespace) =
+                vsock.expect("the exact vsock facets should remain present");
+            drop(namespace);
+            broker.abort().expect("broker authority should restore");
+            directory
+                .abort()
+                .expect("directory authority should restore");
+            transaction
+                .abort()
+                .expect("the sole generation should abort after every facet");
+            fixture.assert_authorities_available(true);
+
+            for cancelled_at in 1..=cancellation_check_count {
+                let checks = Cell::new(0);
+                let error = fixture
+                    .authority
+                    .prepare_files(&[], Some(reference), &|| {
+                        let next = checks.get() + 1;
+                        checks.set(next);
+                        next == cancelled_at
+                    })
+                    .expect_err("each zero-file vsock checkpoint should be cancellable");
+                assert_eq!(
+                    error.kind(),
+                    super::ContainedSnapshotRestoreErrorKind::Cancelled
+                );
+                assert!(!error.is_terminal());
+                assert!(!error.cleanup_failed());
+                fixture.assert_authorities_available(true);
+            }
+
+            fixture
+                .authority
+                .prepare_files(&[], Some(reference), &|| false)
+                .expect("confirmed rollback should permit a clean retry")
+                .abort()
+                .expect("retried vsock-only reservation should abort cleanly");
+            fixture.assert_authorities_available(true);
         }
 
         #[test]
