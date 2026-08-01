@@ -6,9 +6,9 @@ use std::time::Instant;
 
 use bangbang_runtime::memory::GuestMemory;
 use bangbang_runtime::serial::{
-    SerialConfig, SerialConfigError, SerialConfigInput, SerialMmioDevice, SerialStdio,
-    SerialStdioError, SerialStdioInput, SerialStdioRestoration, SerialStdioRestorationError,
-    SharedSerialOutput,
+    SerialConfig, SerialConfigError, SerialConfigInput, SerialMmioDevice, SerialOutputFile,
+    SerialStdio, SerialStdioError, SerialStdioInput, SerialStdioRestoration,
+    SerialStdioRestorationError, SharedSerialOutput,
 };
 use bangbang_runtime::snapshot_device_v2_5::SnapshotV2MultiBlockRestorePlanError;
 use bangbang_runtime::snapshot_device_v2_6::{
@@ -49,6 +49,219 @@ pub(crate) type PreparedSnapshotV2SerialRestoreOwnerParts = (
     Option<SerialStdioRestoration>,
     Option<SerialConfig>,
 );
+
+/// One fresh serial endpoint whose process-stdio restoration authority remains
+/// provisional until its enclosing destination shuts down.
+pub(crate) struct PreparedSnapshotV2SerialEndpoint {
+    serial: Option<SerialMmioDevice<SharedSerialOutput>>,
+    input: Option<SerialStdioInput>,
+    restoration: Option<SerialStdioRestoration>,
+    config: Option<SerialConfig>,
+}
+
+pub(crate) type PreparedSnapshotV2SerialEndpointParts = (
+    SerialMmioDevice<SharedSerialOutput>,
+    Option<SerialStdioInput>,
+    Option<SerialStdioRestoration>,
+    SerialConfig,
+);
+
+impl PreparedSnapshotV2SerialEndpoint {
+    pub(crate) fn into_parts(
+        mut self,
+    ) -> Result<PreparedSnapshotV2SerialEndpointParts, PreparedSnapshotV2SerialEndpointCleanupError>
+    {
+        match (self.serial.take(), self.config.take()) {
+            (Some(serial), Some(config)) => {
+                Ok((serial, self.input.take(), self.restoration.take(), config))
+            }
+            (serial, config) => {
+                self.serial = serial;
+                self.config = config;
+                Err(PreparedSnapshotV2SerialEndpointCleanupError {
+                    restoration: self.cleanup(),
+                })
+            }
+        }
+    }
+
+    pub(crate) fn abort(mut self) -> Result<(), PreparedSnapshotV2SerialEndpointCleanupError> {
+        match self.cleanup() {
+            Some(restoration) => Err(PreparedSnapshotV2SerialEndpointCleanupError {
+                restoration: Some(restoration),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn cleanup(&mut self) -> Option<SerialStdioRestorationError> {
+        {
+            let _input = self.input.take();
+        }
+        {
+            let _serial = self.serial.take();
+        }
+        {
+            let _config = self.config.take();
+        }
+        self.restoration
+            .take()
+            .and_then(|restoration| restoration.finish().err())
+    }
+}
+
+impl Drop for PreparedSnapshotV2SerialEndpoint {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2SerialEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2SerialEndpoint")
+            .field("has_input", &self.input.is_some())
+            .field("state", &"<private-provisional>")
+            .finish()
+    }
+}
+
+pub(crate) struct PreparedSnapshotV2SerialEndpointCleanupError {
+    restoration: Option<SerialStdioRestorationError>,
+}
+
+impl fmt::Debug for PreparedSnapshotV2SerialEndpointCleanupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2SerialEndpointCleanupError")
+            .field("restoration_failed", &self.restoration.is_some())
+            .finish()
+    }
+}
+
+impl fmt::Display for PreparedSnapshotV2SerialEndpointCleanupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("snapshot serial endpoint cleanup failed")
+    }
+}
+
+impl std::error::Error for PreparedSnapshotV2SerialEndpointCleanupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.restoration
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+pub(crate) enum SnapshotV2SerialEndpointPreparationError {
+    Stdio(SerialStdioError),
+    SerialConfig(SerialConfigError),
+    InvalidResourceSet,
+}
+
+impl fmt::Debug for SnapshotV2SerialEndpointPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotV2SerialEndpointPreparationError")
+            .field(
+                "stage",
+                &match self {
+                    Self::Stdio(_) => "stdio",
+                    Self::SerialConfig(_) => "serial-config",
+                    Self::InvalidResourceSet => "resource-set",
+                },
+            )
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotV2SerialEndpointPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("snapshot serial endpoint preparation failed")
+    }
+}
+
+impl std::error::Error for SnapshotV2SerialEndpointPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Stdio(source) => Some(source),
+            Self::SerialConfig(source) => Some(source),
+            Self::InvalidResourceSet => None,
+        }
+    }
+}
+
+/// Constructs only the fresh serial endpoint. File/grant completion remains
+/// owned by the caller's aggregate transaction.
+pub(crate) fn prepare_native_v2_serial_restore_endpoint(
+    state: SnapshotV2SerialState,
+    configured_output: Option<SerialOutputFile>,
+) -> Result<PreparedSnapshotV2SerialEndpoint, SnapshotV2SerialEndpointPreparationError> {
+    prepare_native_v2_serial_restore_endpoint_with(
+        state,
+        configured_output,
+        SerialStdio::from_process_standard_streams,
+    )
+}
+
+fn prepare_native_v2_serial_restore_endpoint_with<S>(
+    state: SnapshotV2SerialState,
+    configured_output: Option<SerialOutputFile>,
+    prepare_stdio: S,
+) -> Result<PreparedSnapshotV2SerialEndpoint, SnapshotV2SerialEndpointPreparationError>
+where
+    S: FnOnce() -> Result<SerialStdio, SerialStdioError>,
+{
+    let (endpoint_intent, rate_limiter, device_state) = state.into_parts();
+    let (output, input, restoration, config) = match endpoint_intent {
+        SnapshotV2SerialEndpointIntent::DefaultProcessStdio => {
+            if configured_output.is_some() {
+                return Err(SnapshotV2SerialEndpointPreparationError::InvalidResourceSet);
+            }
+            let mut config = SerialConfigInput::new();
+            if let Some(rate_limiter) = rate_limiter {
+                config = config.with_rate_limiter(rate_limiter);
+            }
+            let config = config
+                .validate()
+                .map_err(SnapshotV2SerialEndpointPreparationError::SerialConfig)?;
+            let stdio = prepare_stdio().map_err(SnapshotV2SerialEndpointPreparationError::Stdio)?;
+            let (output, input, restoration) = stdio.into_restorable_parts();
+            (
+                SharedSerialOutput::with_rate_limiter(output, rate_limiter),
+                input,
+                Some(restoration),
+                config,
+            )
+        }
+        SnapshotV2SerialEndpointIntent::ConfiguredOutput { selector } => {
+            let Some(output) = configured_output else {
+                return Err(SnapshotV2SerialEndpointPreparationError::InvalidResourceSet);
+            };
+            let mut config = SerialConfigInput::new().with_serial_out_path(selector);
+            if let Some(rate_limiter) = rate_limiter {
+                config = config.with_rate_limiter(rate_limiter);
+            }
+            let config = config
+                .validate()
+                .map_err(SnapshotV2SerialEndpointPreparationError::SerialConfig)?;
+            (
+                SharedSerialOutput::with_rate_limiter(output, rate_limiter),
+                None,
+                None,
+                config,
+            )
+        }
+    };
+    let serial = SerialMmioDevice::from_capture_state_with_shared_output(output, device_state);
+    Ok(PreparedSnapshotV2SerialEndpoint {
+        serial: Some(serial),
+        input,
+        restoration,
+        config: Some(config),
+    })
+}
 
 impl PreparedSnapshotV2SerialRestoreOwners {
     pub(crate) fn block_count(&self) -> usize {
@@ -896,67 +1109,9 @@ where
         });
     }
 
-    let (endpoint_intent, rate_limiter, device_state) = state.into_parts();
-    let (output, input, restoration, serial_config) = match endpoint_intent {
-        SnapshotV2SerialEndpointIntent::DefaultProcessStdio => {
-            let mut config = SerialConfigInput::new();
-            if let Some(rate_limiter) = rate_limiter {
-                config = config.with_rate_limiter(rate_limiter);
-            }
-            let serial_config = match config.validate() {
-                Ok(config) => config,
-                Err(source) => {
-                    let completion_abort =
-                        abort_unassembled(blocks, pmems, prepared_serial, completion);
-                    return Err(SnapshotV2SerialRestoreBundleError::SerialConfig {
-                        source,
-                        completion_abort,
-                    });
-                }
-            };
-            if prepared_serial.is_some() {
-                let completion_abort =
-                    abort_unassembled(blocks, pmems, prepared_serial, completion);
-                return Err(SnapshotV2SerialRestoreBundleError::InvalidResourceSet {
-                    owners_cleanup: None,
-                    completion_abort,
-                });
-            }
-            let stdio = match prepare_stdio() {
-                Ok(stdio) => stdio,
-                Err(source) => {
-                    let completion_abort =
-                        abort_unassembled(blocks, pmems, prepared_serial, completion);
-                    return Err(SnapshotV2SerialRestoreBundleError::Stdio {
-                        source,
-                        completion_abort,
-                    });
-                }
-            };
-            let (output, input, restoration) = stdio.into_restorable_parts();
-            (
-                SharedSerialOutput::with_rate_limiter(output, rate_limiter),
-                input,
-                Some(restoration),
-                serial_config,
-            )
-        }
-        SnapshotV2SerialEndpointIntent::ConfiguredOutput { selector } => {
-            let mut config = SerialConfigInput::new().with_serial_out_path(selector);
-            if let Some(rate_limiter) = rate_limiter {
-                config = config.with_rate_limiter(rate_limiter);
-            }
-            let serial_config = match config.validate() {
-                Ok(config) => config,
-                Err(source) => {
-                    let completion_abort =
-                        abort_unassembled(blocks, pmems, prepared_serial, completion);
-                    return Err(SnapshotV2SerialRestoreBundleError::SerialConfig {
-                        source,
-                        completion_abort,
-                    });
-                }
-            };
+    let configured_output = match state.endpoint_intent() {
+        SnapshotV2SerialEndpointIntent::DefaultProcessStdio if prepared_serial.is_none() => None,
+        SnapshotV2SerialEndpointIntent::ConfiguredOutput { .. } => {
             let Some(serial) = prepared_serial.as_ref() else {
                 let completion_abort =
                     abort_unassembled(blocks, pmems, prepared_serial, completion);
@@ -978,24 +1133,59 @@ where
                     completion_abort,
                 });
             }
-            let Some(serial) = prepared_serial.take() else {
-                let completion_abort =
-                    abort_unassembled(blocks, pmems, prepared_serial, completion);
-                return Err(SnapshotV2SerialRestoreBundleError::InvalidResourceSet {
-                    owners_cleanup: None,
-                    completion_abort,
-                });
-            };
-            let (_, output) = serial.into_parts();
-            (
-                SharedSerialOutput::with_rate_limiter(output, rate_limiter),
-                None,
-                None,
-                serial_config,
-            )
+            prepared_serial
+                .take()
+                .map(PreparedSnapshotSerialRestoreOutput::into_parts)
+                .map(|(_, output)| output)
+        }
+        SnapshotV2SerialEndpointIntent::DefaultProcessStdio => {
+            let completion_abort = abort_unassembled(blocks, pmems, prepared_serial, completion);
+            return Err(SnapshotV2SerialRestoreBundleError::InvalidResourceSet {
+                owners_cleanup: None,
+                completion_abort,
+            });
         }
     };
-    let serial = SerialMmioDevice::from_capture_state_with_shared_output(output, device_state);
+    let endpoint = match prepare_native_v2_serial_restore_endpoint_with(
+        state,
+        configured_output,
+        prepare_stdio,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(source) => {
+            let completion_abort = abort_unassembled(blocks, pmems, prepared_serial, completion);
+            return Err(match source {
+                SnapshotV2SerialEndpointPreparationError::Stdio(source) => {
+                    SnapshotV2SerialRestoreBundleError::Stdio {
+                        source,
+                        completion_abort,
+                    }
+                }
+                SnapshotV2SerialEndpointPreparationError::SerialConfig(source) => {
+                    SnapshotV2SerialRestoreBundleError::SerialConfig {
+                        source,
+                        completion_abort,
+                    }
+                }
+                SnapshotV2SerialEndpointPreparationError::InvalidResourceSet => {
+                    SnapshotV2SerialRestoreBundleError::InvalidResourceSet {
+                        owners_cleanup: None,
+                        completion_abort,
+                    }
+                }
+            });
+        }
+    };
+    let (serial, input, restoration, serial_config) = match endpoint.into_parts() {
+        Ok(parts) => parts,
+        Err(_) => {
+            let completion_abort = abort_unassembled(blocks, pmems, prepared_serial, completion);
+            return Err(SnapshotV2SerialRestoreBundleError::InvalidResourceSet {
+                owners_cleanup: None,
+                completion_abort,
+            });
+        }
+    };
     let owners = PreparedSnapshotV2SerialRestoreOwners {
         blocks,
         pmems,

@@ -483,6 +483,7 @@ pub(crate) struct HvfSnapshotV2NetworkMmioShellPlan<'a> {
     pub(crate) block_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
     pub(crate) network_interrupts: &'a [GuestInterruptLine],
     pub(crate) pmem_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
+    pub(crate) following_interrupt: Option<GuestInterruptLine>,
     pub(crate) entropy_interrupt: Option<GuestInterruptLine>,
     pub(crate) memory_hotplug_interrupt: Option<GuestInterruptLine>,
     pub(crate) serial_interrupt: GuestInterruptLine,
@@ -3148,6 +3149,14 @@ fn prepare_process_shell(
                         );
                     }
                 }
+                if let Some(following_interrupt) = plan.following_interrupt
+                    && allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != following_interrupt
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
+                }
                 if let Some(entropy_interrupt) = plan.entropy_interrupt
                     && allocator
                         .allocate()
@@ -5685,6 +5694,7 @@ pub(crate) mod tests {
             block_records: &[],
             network_interrupts: &[],
             pmem_records: &[],
+            following_interrupt: None,
             entropy_interrupt: None,
             memory_hotplug_interrupt: None,
             serial_interrupt: serial.interrupt_line,
@@ -5708,6 +5718,63 @@ pub(crate) mod tests {
                 .interrupt_line,
             serial.interrupt_line,
         );
+    }
+
+    #[test]
+    fn network_mmio_shell_replays_a_following_endpoint_before_fixed_interrupts() {
+        let (state, following_interrupt, serial_interrupt, vmgenid_interrupt, vmclock_interrupt) =
+            product_entropy_interrupt_platform_fixture(product_process_platform_fixture(), &[]);
+        let shell_plan = HvfSnapshotV2NetworkMmioShellPlan {
+            balloon_interrupt: None,
+            command_line: None,
+            block_records: &[],
+            network_interrupts: &[],
+            pmem_records: &[],
+            following_interrupt: Some(following_interrupt),
+            entropy_interrupt: None,
+            memory_hotplug_interrupt: None,
+            serial_interrupt,
+            vmgenid_interrupt,
+            vmclock_interrupt,
+        };
+
+        prepare_process_shell(
+            Some(HvfSnapshotV2ProcessShellRestore::NetworkMmio {
+                shell: restored_serial_shell().into(),
+                plan: shell_plan,
+            }),
+            &state,
+            b"authenticated product FDT bytes are not reparsed",
+        )
+        .expect("a following exact-2.12 endpoint should preserve product interrupt order");
+
+        let wrong_interrupt =
+            GuestInterruptLine::new(following_interrupt.raw_value().saturating_add(1))
+                .expect("wrong following interrupt should validate structurally");
+        let shell_plan = HvfSnapshotV2NetworkMmioShellPlan {
+            balloon_interrupt: None,
+            command_line: None,
+            block_records: &[],
+            network_interrupts: &[],
+            pmem_records: &[],
+            following_interrupt: Some(wrong_interrupt),
+            entropy_interrupt: None,
+            memory_hotplug_interrupt: None,
+            serial_interrupt,
+            vmgenid_interrupt,
+            vmclock_interrupt,
+        };
+        assert!(matches!(
+            prepare_process_shell(
+                Some(HvfSnapshotV2ProcessShellRestore::NetworkMmio {
+                    shell: restored_serial_shell().into(),
+                    plan: shell_plan,
+                }),
+                &state,
+                b"authenticated product FDT bytes are not reparsed",
+            ),
+            Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity)
+        ));
     }
 
     #[test]

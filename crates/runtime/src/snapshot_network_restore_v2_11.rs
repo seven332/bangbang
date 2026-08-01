@@ -76,7 +76,7 @@ pub enum SnapshotV2NetworkRestorePreparationStage {
 }
 
 /// One exact destination entry paired with its portable continuation.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreparedSnapshotV2NetworkRestoreInterface {
     source_index: u16,
     resource_key: SnapshotRestoreResourceKey,
@@ -813,7 +813,7 @@ impl std::error::Error for SnapshotV2NetworkPciEndpointError {
 ///
 /// The value owns no descriptor, provider, packet owner, callback, metric,
 /// datastore, token, session, device, platform slot, or VM authority.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreparedSnapshotV2NetworkRestoreTopology {
     transport_kind: SnapshotV2DeviceTransportKind,
     interfaces: Vec<PreparedSnapshotV2NetworkRestoreInterface>,

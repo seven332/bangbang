@@ -118,6 +118,18 @@ pub(crate) enum ActiveVsockRestoreGuard {
     Contained(AnchoredSocketGuard),
 }
 
+impl ActiveVsockRestoreGuard {
+    pub(crate) fn cleanup(self) -> Result<(), ()> {
+        match self {
+            Self::Direct(guard) => guard.cleanup().map_err(|_| ()),
+            Self::Contained(guard) => {
+                drop(guard);
+                Ok(())
+            }
+        }
+    }
+}
+
 impl fmt::Debug for ActiveVsockRestoreGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

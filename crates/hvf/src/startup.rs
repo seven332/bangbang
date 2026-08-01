@@ -156,6 +156,7 @@ use bangbang_runtime::snapshot_network_v2_11::{
     SnapshotV2NetworkInterfaceState,
 };
 use bangbang_runtime::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
+use bangbang_runtime::snapshot_vsock_restore_v2_12::PreparedSnapshotV2VsockRestoreState;
 use bangbang_runtime::snapshot_vsock_v2_12::{
     NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION, SnapshotV2VsockState,
     SnapshotV2VsockStateCaptureError,
@@ -219,7 +220,8 @@ use bangbang_runtime::vmclock::{VMCLOCK_ABI_SIZE, VmClockAbi, VmClockRestoreUpda
 use bangbang_runtime::vsock::{
     VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES, VirtioVsockCaptureValidation,
     VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockMmioCaptureState,
-    VirtioVsockPciCaptureState, VsockConfig, VsockHostWakeup, VsockMmioLayout,
+    VirtioVsockPciCaptureState, VirtioVsockReconstructionResource, VsockConfig, VsockHostWakeup,
+    VsockMmioDeviceRegistration, VsockMmioLayout,
 };
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
 use crc64::crc64;
@@ -324,6 +326,10 @@ use crate::snapshot_v2_platform::{
 use crate::snapshot_v2_storage_platform::{
     HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioPlatformPlanParts,
     HvfSnapshotV2StoragePciPlatformPlan, HvfSnapshotV2StoragePciPlatformPlanParts,
+};
+use crate::snapshot_v2_vsock_platform::{
+    HvfSnapshotV2VsockMmioEndpointPlan, HvfSnapshotV2VsockMmioPlatformOwnerParts,
+    HvfSnapshotV2VsockMmioPlatformPlan, HvfSnapshotV2VsockProductKind,
 };
 use crate::topology::{HvfVcpuTopologyError, prepare_ordered_mpidrs};
 use crate::vcpu::{
@@ -3640,6 +3646,7 @@ struct HvfSnapshotV2MemoryHotplugMmioInterruptPlan {
 struct HvfSnapshotV2NetworkMmioInterruptPlan {
     balloon: Option<GuestInterruptLine>,
     network: Vec<GuestInterruptLine>,
+    following: Option<GuestInterruptLine>,
     entropy: Option<GuestInterruptLine>,
     memory_hotplug: Option<GuestInterruptLine>,
     serial: GuestInterruptLine,
@@ -3803,6 +3810,139 @@ impl fmt::Display for HvfSnapshotV2NetworkMmioRestoreError {
 
 impl std::error::Error for HvfSnapshotV2NetworkMmioRestoreError {}
 
+/// Stable aggregate stage for exact-2.12 MMIO vsock reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum HvfSnapshotV2VsockMmioRestoreStage {
+    Product,
+    Handler { index: usize },
+    InterruptSetup,
+    Platform,
+    Registration { index: usize },
+    Vsock,
+    Entropy,
+    MemoryHotplug,
+    RetryScheduler,
+    RetryDeadline,
+    Recapture,
+    Assembly,
+}
+
+/// Bounded, redacted exact-2.12 MMIO aggregate reconstruction error.
+#[doc(hidden)]
+pub struct HvfSnapshotV2VsockMmioRestoreError {
+    stage: HvfSnapshotV2VsockMmioRestoreStage,
+    disposition: HvfSnapshotV2NetworkMmioRestoreDisposition,
+}
+
+fn network_mmio_stage_to_vsock(
+    stage: HvfSnapshotV2NetworkMmioRestoreStage,
+    interface_count: usize,
+) -> HvfSnapshotV2VsockMmioRestoreStage {
+    match stage {
+        HvfSnapshotV2NetworkMmioRestoreStage::Product => {
+            HvfSnapshotV2VsockMmioRestoreStage::Product
+        }
+        HvfSnapshotV2NetworkMmioRestoreStage::Handler { index } => {
+            HvfSnapshotV2VsockMmioRestoreStage::Handler { index }
+        }
+        HvfSnapshotV2NetworkMmioRestoreStage::InterruptSetup => {
+            HvfSnapshotV2VsockMmioRestoreStage::InterruptSetup
+        }
+        HvfSnapshotV2NetworkMmioRestoreStage::Platform => {
+            HvfSnapshotV2VsockMmioRestoreStage::Platform
+        }
+        HvfSnapshotV2NetworkMmioRestoreStage::Registration { index }
+            if index == interface_count =>
+        {
+            HvfSnapshotV2VsockMmioRestoreStage::Vsock
+        }
+        HvfSnapshotV2NetworkMmioRestoreStage::Registration { index } => {
+            HvfSnapshotV2VsockMmioRestoreStage::Registration { index }
+        }
+        HvfSnapshotV2NetworkMmioRestoreStage::Entropy => {
+            HvfSnapshotV2VsockMmioRestoreStage::Entropy
+        }
+        HvfSnapshotV2NetworkMmioRestoreStage::MemoryHotplug => {
+            HvfSnapshotV2VsockMmioRestoreStage::MemoryHotplug
+        }
+        HvfSnapshotV2NetworkMmioRestoreStage::RetryScheduler => {
+            HvfSnapshotV2VsockMmioRestoreStage::RetryScheduler
+        }
+        HvfSnapshotV2NetworkMmioRestoreStage::RetryDeadline => {
+            HvfSnapshotV2VsockMmioRestoreStage::RetryDeadline
+        }
+        HvfSnapshotV2NetworkMmioRestoreStage::Recapture => {
+            HvfSnapshotV2VsockMmioRestoreStage::Recapture
+        }
+        HvfSnapshotV2NetworkMmioRestoreStage::Assembly => {
+            HvfSnapshotV2VsockMmioRestoreStage::Assembly
+        }
+    }
+}
+
+impl HvfSnapshotV2VsockMmioRestoreError {
+    fn preflight(stage: HvfSnapshotV2VsockMmioRestoreStage) -> Self {
+        Self {
+            stage,
+            disposition: HvfSnapshotV2NetworkMmioRestoreDisposition::Retryable,
+        }
+    }
+
+    fn from_network(source: HvfSnapshotV2NetworkMmioRestoreError, interface_count: usize) -> Self {
+        let stage = network_mmio_stage_to_vsock(source.stage(), interface_count);
+        Self {
+            stage,
+            disposition: source.disposition(),
+        }
+    }
+
+    pub const fn stage(&self) -> HvfSnapshotV2VsockMmioRestoreStage {
+        self.stage
+    }
+
+    pub const fn disposition(&self) -> HvfSnapshotV2NetworkMmioRestoreDisposition {
+        self.disposition
+    }
+
+    pub const fn is_terminal(&self) -> bool {
+        !matches!(
+            self.disposition,
+            HvfSnapshotV2NetworkMmioRestoreDisposition::Retryable
+        )
+    }
+
+    pub const fn has_incomplete_cleanup(&self) -> bool {
+        matches!(
+            self.disposition,
+            HvfSnapshotV2NetworkMmioRestoreDisposition::TerminalCleanup
+        )
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2VsockMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2VsockMmioRestoreError")
+            .field("stage", &self.stage)
+            .field("disposition", &self.disposition)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2VsockMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.12 MMIO vsock reconstruction failed at {:?} ({:?})",
+            self.stage, self.disposition
+        )
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2VsockMmioRestoreError {}
+
 /// Complete exact-2.11 MMIO owner graph with retry publication still gated.
 #[doc(hidden)]
 pub struct RestoredHvfSnapshotV2NetworkMmioOwners {
@@ -3951,6 +4091,136 @@ impl fmt::Debug for RestoredHvfSnapshotV2NetworkMmioOwners {
             .field("state", &"<redacted>")
             .finish()
     }
+}
+
+struct RestoredHvfSnapshotV2VsockMmioMetadata {
+    config: VsockConfig,
+    expected: SnapshotV2VsockState,
+    metrics: SharedVsockDeviceMetrics,
+}
+
+struct RestoredHvfSnapshotV2NetworkMmioInnerOwners {
+    network: RestoredHvfSnapshotV2NetworkMmioOwners,
+    vsock: Option<RestoredHvfSnapshotV2VsockMmioMetadata>,
+}
+
+/// Complete exact-2.12 MMIO owner graph with retry publication still gated.
+#[doc(hidden)]
+pub struct RestoredHvfSnapshotV2VsockMmioOwners {
+    base: RestoredHvfSnapshotV2NetworkMmioOwners,
+    kind: HvfSnapshotV2VsockProductKind,
+    serial_resource_present: bool,
+    binding_keys: Vec<bangbang_runtime::snapshot_restore::SnapshotRestoreResourceKey>,
+    vsock: Option<RestoredHvfSnapshotV2VsockMmioMetadata>,
+}
+
+impl RestoredHvfSnapshotV2VsockMmioOwners {
+    pub const fn session(&self) -> &OwnedHvfArm64BootSession {
+        self.base.session()
+    }
+
+    pub fn session_mut(&mut self) -> &mut OwnedHvfArm64BootSession {
+        self.base.session_mut()
+    }
+
+    pub fn configs(&self) -> &[NetworkInterfaceConfig] {
+        self.base.configs()
+    }
+
+    pub fn expected_network(&self) -> &[SnapshotV2NetworkInterfaceState] {
+        self.base.expected()
+    }
+
+    pub const fn mmds_state(&self) -> Option<&SnapshotV2MmdsState> {
+        self.base.mmds_state()
+    }
+
+    pub const fn mmds_config(&self) -> Option<&MmdsConfig> {
+        self.base.mmds_config()
+    }
+
+    pub const fn storage_configs(&self) -> Option<&CaptureReadyStorageConfigs> {
+        self.base.storage_configs()
+    }
+
+    pub const fn entropy_config(&self) -> Option<EntropyConfig> {
+        self.base.entropy_config()
+    }
+
+    pub const fn balloon_config(&self) -> Option<BalloonConfig> {
+        self.base.balloon_config()
+    }
+
+    pub const fn memory_hotplug_state(&self) -> Option<&SnapshotV2MemoryHotplugState> {
+        self.base.memory_hotplug_state()
+    }
+
+    pub const fn memory_hotplug_controller(
+        &self,
+    ) -> Option<&SnapshotV2MemoryHotplugControllerProjection> {
+        self.base.memory_hotplug_controller()
+    }
+
+    pub const fn kind(&self) -> HvfSnapshotV2VsockProductKind {
+        self.kind
+    }
+
+    pub const fn serial_resource_present(&self) -> bool {
+        self.serial_resource_present
+    }
+
+    pub fn resource_keys(
+        &self,
+    ) -> &[bangbang_runtime::snapshot_restore::SnapshotRestoreResourceKey] {
+        &self.binding_keys
+    }
+
+    pub fn vsock_config(&self) -> Option<&VsockConfig> {
+        self.vsock.as_ref().map(|vsock| &vsock.config)
+    }
+
+    pub fn expected_vsock(&self) -> Option<&SnapshotV2VsockState> {
+        self.vsock.as_ref().map(|vsock| &vsock.expected)
+    }
+
+    pub fn vsock_metrics(&self) -> Option<&SharedVsockDeviceMetrics> {
+        self.vsock.as_ref().map(|vsock| &vsock.metrics)
+    }
+
+    pub const fn retry_publication_is_committed(&self) -> bool {
+        self.base.retry_publication_is_committed()
+    }
+
+    pub fn commit_retry_publication(mut self) -> Self {
+        self.base = self.base.commit_retry_publication();
+        self
+    }
+
+    pub fn shutdown(self) -> Result<(), HvfArm64BootSessionShutdownError> {
+        self.base.shutdown()
+    }
+}
+
+impl fmt::Debug for RestoredHvfSnapshotV2VsockMmioOwners {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoredHvfSnapshotV2VsockMmioOwners")
+            .field("kind", &self.kind)
+            .field("interface_count", &self.base.configs().len())
+            .field("has_vsock", &self.vsock.is_some())
+            .field(
+                "retry_publication_committed",
+                &self.retry_publication_is_committed(),
+            )
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+struct HvfSnapshotV2VsockMmioRestoreInput<'a> {
+    endpoint: HvfSnapshotV2VsockMmioEndpointPlan,
+    resource: &'a mut VirtioVsockReconstructionResource,
+    metrics: SharedVsockDeviceMetrics,
 }
 
 /// Typed guest-memory handoff for one exact-2.11 PCI network product.
@@ -17867,6 +18137,7 @@ impl OwnedHvfArm64BootSession {
                     block_records: &[],
                     network_interrupts: &interrupts.network,
                     pmem_records: &[],
+                    following_interrupt: interrupts.following,
                     entropy_interrupt: interrupts.entropy,
                     memory_hotplug_interrupt: interrupts.memory_hotplug,
                     serial_interrupt: interrupts.serial,
@@ -18166,13 +18437,125 @@ impl OwnedHvfArm64BootSession {
             plan,
             profiles,
             network_metrics,
+            None,
             now,
             cancelled,
         )
+        .map(|owners| owners.network)
+    }
+
+    /// Reconstructs one complete exact-2.12 MMIO vsock owner graph while
+    /// keeping retry wake publication closed for the process-level check.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_snapshot_v2_vsock_mmio(
+        state: HvfSnapshotV2PlatformState,
+        memory_input: HvfSnapshotV2NetworkMmioMemoryInput,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        plan: HvfSnapshotV2VsockMmioPlatformPlan,
+        profiles: Vec<NetworkDeviceProfile>,
+        network_metrics: SharedNetworkInterfaceMetricsRegistry,
+        vsock_resource: Option<&mut VirtioVsockReconstructionResource>,
+        vsock_metrics: SharedVsockDeviceMetrics,
+        now: Instant,
+    ) -> Result<RestoredHvfSnapshotV2VsockMmioOwners, HvfSnapshotV2VsockMmioRestoreError> {
+        Self::restore_snapshot_v2_vsock_mmio_with_cancel(
+            state,
+            memory_input,
+            process_shell,
+            serial_input,
+            plan,
+            profiles,
+            network_metrics,
+            vsock_resource,
+            vsock_metrics,
+            now,
+            |_| false,
+        )
+    }
+
+    /// Reconstructs exact-2.12 MMIO vsock ownership with stable cancellation
+    /// checkpoints.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_snapshot_v2_vsock_mmio_with_cancel<C>(
+        state: HvfSnapshotV2PlatformState,
+        memory_input: HvfSnapshotV2NetworkMmioMemoryInput,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        plan: HvfSnapshotV2VsockMmioPlatformPlan,
+        profiles: Vec<NetworkDeviceProfile>,
+        network_metrics: SharedNetworkInterfaceMetricsRegistry,
+        vsock_resource: Option<&mut VirtioVsockReconstructionResource>,
+        vsock_metrics: SharedVsockDeviceMetrics,
+        now: Instant,
+        mut cancelled: C,
+    ) -> Result<RestoredHvfSnapshotV2VsockMmioOwners, HvfSnapshotV2VsockMmioRestoreError>
+    where
+        C: FnMut(HvfSnapshotV2VsockMmioRestoreStage) -> bool,
+    {
+        let interface_count = plan.network().len();
+        let HvfSnapshotV2VsockMmioPlatformOwnerParts {
+            kind,
+            base,
+            vsock,
+            serial_resource_present,
+            binding_keys,
+        } = plan.into_owner_parts();
+        let input = match (vsock, vsock_resource) {
+            (None, None) => None,
+            (Some(endpoint), Some(resource)) => Some(HvfSnapshotV2VsockMmioRestoreInput {
+                endpoint,
+                resource,
+                metrics: vsock_metrics,
+            }),
+            (None, Some(_)) | (Some(_), None) => {
+                return Err(HvfSnapshotV2VsockMmioRestoreError::preflight(
+                    HvfSnapshotV2VsockMmioRestoreStage::Product,
+                ));
+            }
+        };
+        let mut mapped_cancelled =
+            |stage| cancelled(network_mmio_stage_to_vsock(stage, interface_count));
+        let owners = Self::restore_snapshot_v2_network_mmio_inner(
+            state,
+            memory_input,
+            process_shell,
+            serial_input,
+            base,
+            profiles,
+            network_metrics,
+            input,
+            now,
+            &mut mapped_cancelled,
+        )
+        .map_err(|source| {
+            HvfSnapshotV2VsockMmioRestoreError::from_network(source, interface_count)
+        })?;
+        if owners.vsock.is_some() != kind.has_vsock() {
+            let RestoredHvfSnapshotV2NetworkMmioInnerOwners { network, vsock: _ } = owners;
+            let cleanup_failed = network.shutdown().is_err();
+            return Err(HvfSnapshotV2VsockMmioRestoreError {
+                stage: HvfSnapshotV2VsockMmioRestoreStage::Assembly,
+                disposition: if cleanup_failed {
+                    HvfSnapshotV2NetworkMmioRestoreDisposition::TerminalCleanup
+                } else {
+                    HvfSnapshotV2NetworkMmioRestoreDisposition::Terminal
+                },
+            });
+        }
+        Ok(RestoredHvfSnapshotV2VsockMmioOwners {
+            base: owners.network,
+            kind,
+            serial_resource_present,
+            binding_keys,
+            vsock: owners.vsock,
+        })
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    fn restore_snapshot_v2_network_mmio_inner<C>(
+    fn restore_snapshot_v2_network_mmio_inner<'a, C>(
         state: HvfSnapshotV2PlatformState,
         memory_input: HvfSnapshotV2NetworkMmioMemoryInput,
         process_shell: HvfSnapshotV2RestoredSerialShell,
@@ -18180,9 +18563,10 @@ impl OwnedHvfArm64BootSession {
         plan: HvfSnapshotV2NetworkMmioPlatformPlan,
         profiles: Vec<NetworkDeviceProfile>,
         network_metrics: SharedNetworkInterfaceMetricsRegistry,
+        vsock_input: Option<HvfSnapshotV2VsockMmioRestoreInput<'a>>,
         now: Instant,
         mut cancelled: C,
-    ) -> Result<RestoredHvfSnapshotV2NetworkMmioOwners, HvfSnapshotV2NetworkMmioRestoreError>
+    ) -> Result<RestoredHvfSnapshotV2NetworkMmioInnerOwners, HvfSnapshotV2NetworkMmioRestoreError>
     where
         C: FnMut(HvfSnapshotV2NetworkMmioRestoreStage) -> bool,
     {
@@ -18203,6 +18587,36 @@ impl OwnedHvfArm64BootSession {
             vmgenid_interrupt,
             vmclock_interrupt,
         } = plan.into_owner_parts();
+        let expected_vsock = vsock_input
+            .as_ref()
+            .map(|input| {
+                let endpoint = &input.endpoint;
+                if endpoint.state().region() != endpoint.region()
+                    || endpoint.state().interrupt_line() != endpoint.interrupt_line()
+                    || endpoint.dispatcher_region_id() != endpoint.region().id()
+                    || endpoint.fdt_device().region.base
+                        != endpoint.region().range().start().raw_value()
+                    || endpoint.fdt_device().region.size != endpoint.region().range().size()
+                    || endpoint.fdt_device().interrupt_line != endpoint.interrupt_line()
+                    || endpoint.state().capture().device().guest_cid()
+                        != u64::from(endpoint.config().guest_cid())
+                {
+                    return Err(HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                        HvfSnapshotV2NetworkMmioRestoreStage::Product,
+                    ));
+                }
+                PreparedSnapshotV2VsockRestoreState::Mmio(endpoint.state().clone())
+                    .into_destination_normalized_state(endpoint.config())
+                    .map_err(|_| {
+                        HvfSnapshotV2NetworkMmioRestoreError::preflight(
+                            HvfSnapshotV2NetworkMmioRestoreStage::Product,
+                        )
+                    })
+            })
+            .transpose()?;
+        let vsock_interrupt = vsock_input
+            .as_ref()
+            .map(|input| input.endpoint.interrupt_line());
         let HvfSnapshotV2NetworkPreparedOwnerParts {
             kind: _kind,
             memory: product_memory,
@@ -18429,6 +18843,7 @@ impl OwnedHvfArm64BootSession {
         let mut validated_interrupts = Vec::new();
         let interrupt_count = usize::from(balloon_endpoint.is_some())
             .checked_add(network_interrupts.len())
+            .and_then(|count| count.checked_add(usize::from(vsock_interrupt.is_some())))
             .and_then(|count| count.checked_add(usize::from(entropy_endpoint.is_some())))
             .and_then(|count| count.checked_add(usize::from(memory_hotplug_endpoint.is_some())))
             .ok_or_else(|| {
@@ -18447,6 +18862,7 @@ impl OwnedHvfArm64BootSession {
             .map(|endpoint| endpoint.interrupt_line())
             .into_iter()
             .chain(network_interrupts.iter().copied())
+            .chain(vsock_interrupt)
             .chain(entropy_endpoint.map(|endpoint| endpoint.interrupt_line()))
             .chain(memory_hotplug_endpoint.map(|endpoint| endpoint.interrupt_line()))
         {
@@ -18464,7 +18880,8 @@ impl OwnedHvfArm64BootSession {
         }
 
         let additional_registration_capacity = interface_count
-            .checked_add(usize::from(entropy.is_some()))
+            .checked_add(usize::from(vsock_input.is_some()))
+            .and_then(|count| count.checked_add(usize::from(entropy.is_some())))
             .and_then(|count| count.checked_add(usize::from(memory_hotplug.is_some())))
             .ok_or_else(|| {
                 HvfSnapshotV2NetworkMmioRestoreError::preflight(
@@ -18474,6 +18891,7 @@ impl OwnedHvfArm64BootSession {
         let interrupts = HvfSnapshotV2NetworkMmioInterruptPlan {
             balloon: balloon_endpoint.map(|endpoint| endpoint.interrupt_line()),
             network: network_interrupts.clone(),
+            following: vsock_interrupt,
             entropy: entropy_endpoint.map(|endpoint| endpoint.interrupt_line()),
             memory_hotplug: memory_hotplug_endpoint.map(|endpoint| endpoint.interrupt_line()),
             serial: serial_interrupt,
@@ -18595,7 +19013,10 @@ impl OwnedHvfArm64BootSession {
         if session.restored_snapshot_v2_memory_binding.as_ref() != Some(&expected_binding)
             || !session.runtime_resources.network_devices.is_empty()
             || !session.runtime_resources.pci_network_devices.is_empty()
+            || session.runtime_resources.vsock_device.is_some()
+            || session.runtime_resources.pci_vsock_device.is_some()
             || !session.network_interrupt_lines.is_empty()
+            || session.vsock_interrupt_line.is_some()
             || session.network_retry_wakeup_scheduler.thread.is_some()
             || session
                 .restored_snapshot_v2_mmio_registrations
@@ -18605,6 +19026,9 @@ impl OwnedHvfArm64BootSession {
                         .leases
                         .len()
                         .checked_add(interface_count)
+                        .and_then(|required| {
+                            required.checked_add(usize::from(vsock_input.is_some()))
+                        })
                         .is_none_or(|required| required > registrations.leases.capacity())
                 })
         {
@@ -18689,6 +19113,133 @@ impl OwnedHvfArm64BootSession {
         }
         session.runtime_resources.network_devices = runtime_devices;
         session.network_interrupt_lines = network_interrupts;
+
+        let vsock_metadata = if let Some(vsock_input) = vsock_input {
+            let stage = HvfSnapshotV2NetworkMmioRestoreStage::Registration {
+                index: interface_count,
+            };
+            if cancelled(stage) {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session, stage,
+                ));
+            }
+            let HvfSnapshotV2VsockMmioRestoreInput {
+                endpoint,
+                resource,
+                metrics,
+            } = vsock_input;
+            let region = endpoint.region();
+            let interrupt_line = endpoint.interrupt_line();
+            let fdt_device = endpoint.fdt_device();
+            let config = endpoint.config().clone();
+            let capture = endpoint.state().capture().clone();
+            if resource.captured_selector() != capture.device().backend_selector()
+                || resource.destination_selector().path() != config.uds_path()
+            {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session, stage,
+                ));
+            }
+            let expected = match expected_vsock {
+                Some(expected) => expected,
+                None => {
+                    return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                        session, stage,
+                    ));
+                }
+            };
+            let request = [MmioRegionRequest::new(
+                region.range().start(),
+                region.range().size(),
+            )];
+            let registration = VsockMmioDeviceRegistration::from_restored(
+                config.guest_cid(),
+                config.uds_path().to_path_buf(),
+                region,
+            );
+            let dispatcher_preflight = session
+                .restored_snapshot_v2_mmio_registrations
+                .as_ref()
+                .is_some_and(|_| {
+                    session
+                        .mmio_dispatcher
+                        .lock()
+                        .ok()
+                        .is_some_and(|dispatcher| {
+                            dispatcher
+                                .validate_owned_handler(region.id(), &request)
+                                .is_ok()
+                        })
+                });
+            if !dispatcher_preflight {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session, stage,
+                ));
+            }
+            let reconstruction = session
+                .backend
+                .mapped_guest_memory()
+                .ok()
+                .and_then(|memory| capture.reconstruct_snapshot_handler(memory, resource).ok());
+            let Some(handler) = reconstruction else {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session, stage,
+                ));
+            };
+            let registration_result = {
+                let registrations = session.restored_snapshot_v2_mmio_registrations.as_ref();
+                match (registrations, session.mmio_dispatcher.lock()) {
+                    (Some(registrations), Ok(mut dispatcher)) => dispatcher
+                        .register_owned_handler(
+                            &registrations.owner,
+                            region.id(),
+                            &request,
+                            handler,
+                        )
+                        .ok(),
+                    (None, _) | (_, Err(_)) => None,
+                }
+            };
+            let Some(lease) = registration_result else {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session, stage,
+                ));
+            };
+            let retained = session
+                .restored_snapshot_v2_mmio_registrations
+                .as_mut()
+                .is_some_and(|registrations| {
+                    registrations.leases.push(lease);
+                    registrations.leases.last().is_some_and(|lease| {
+                        lease.region_id() == region.id() && lease.regions() == [region]
+                    })
+                });
+            if !retained {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session, stage,
+                ));
+            }
+            let retained_metrics = metrics.clone();
+            session.runtime_resources.vsock_device = Some(Arm64BootVsockDevice {
+                registration,
+                fdt_device,
+            });
+            session.vsock_interrupt_line = Some(interrupt_line);
+            session.vsock_device_metrics = metrics;
+            Some(RestoredHvfSnapshotV2VsockMmioMetadata {
+                config,
+                expected,
+                metrics: retained_metrics,
+            })
+        } else {
+            if expected_vsock.is_some() {
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2NetworkMmioRestoreStage::Assembly,
+                ));
+            }
+            None
+        };
 
         if entropy.is_some() && cancelled(HvfSnapshotV2NetworkMmioRestoreStage::Entropy) {
             return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
@@ -18857,6 +19408,44 @@ impl OwnedHvfArm64BootSession {
                 HvfSnapshotV2NetworkMmioRestoreStage::Recapture,
             ));
         }
+        let recapture_metrics = vsock_metadata.as_ref().map_or_else(
+            || session.shared_vsock_device_metrics(),
+            |vsock| vsock.metrics.clone(),
+        );
+        let recaptured_vsock = match session.capture_ready_vsock_state(
+            vsock_metadata.as_ref().map(|vsock| vsock.config.clone()),
+            &recapture_metrics,
+            &guard,
+        ) {
+            Ok(captured) => match captured
+                .map(HvfArm64BootVsockCaptureState::try_into_snapshot_v2)
+                .transpose()
+            {
+                Ok(captured) => captured,
+                Err(_) => {
+                    drop(guard);
+                    return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                        session,
+                        HvfSnapshotV2NetworkMmioRestoreStage::Recapture,
+                    ));
+                }
+            },
+            Err(_) => {
+                drop(guard);
+                return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                    session,
+                    HvfSnapshotV2NetworkMmioRestoreStage::Recapture,
+                ));
+            }
+        };
+        let expected_recapture = vsock_metadata.as_ref().map(|vsock| &vsock.expected);
+        if recaptured_vsock.as_ref() != expected_recapture {
+            drop(guard);
+            return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
+                session,
+                HvfSnapshotV2NetworkMmioRestoreStage::Recapture,
+            ));
+        }
         drop(guard);
 
         if cancelled(HvfSnapshotV2NetworkMmioRestoreStage::Assembly) {
@@ -18865,18 +19454,21 @@ impl OwnedHvfArm64BootSession {
                 HvfSnapshotV2NetworkMmioRestoreStage::Assembly,
             ));
         }
-        Ok(RestoredHvfSnapshotV2NetworkMmioOwners {
-            session,
-            configs,
-            expected,
-            mmds_state,
-            mmds_config,
-            storage_configs,
-            entropy_config,
-            balloon_config,
-            memory_hotplug_state,
-            memory_hotplug_controller,
-            retry_publication_gate: Some(retry_publication_gate),
+        Ok(RestoredHvfSnapshotV2NetworkMmioInnerOwners {
+            network: RestoredHvfSnapshotV2NetworkMmioOwners {
+                session,
+                configs,
+                expected,
+                mmds_state,
+                mmds_config,
+                storage_configs,
+                entropy_config,
+                balloon_config,
+                memory_hotplug_state,
+                memory_hotplug_controller,
+                retry_publication_gate: Some(retry_publication_gate),
+            },
+            vsock: vsock_metadata,
         })
     }
 
@@ -23465,6 +24057,7 @@ impl OwnedHvfArm64BootSession {
                     block_records: &prepared_owner.planned_block_records,
                     network_interrupts: &interrupts.network,
                     pmem_records: &prepared_owner.planned_pmem_records,
+                    following_interrupt: interrupts.following,
                     entropy_interrupt: interrupts.entropy,
                     memory_hotplug_interrupt: interrupts.memory_hotplug,
                     serial_interrupt: interrupts.serial,
@@ -26739,6 +27332,7 @@ impl OwnedHvfArm64BootSession {
         let had_entropy = self.runtime_resources.entropy_device.is_some();
         let had_memory_hotplug = self.runtime_resources.memory_hotplug_device.is_some();
         let had_network = !self.runtime_resources.network_devices.is_empty();
+        let had_vsock = self.runtime_resources.vsock_device.is_some();
         let Some(registrations) = self.restored_snapshot_v2_mmio_registrations.as_mut() else {
             return Ok(());
         };
@@ -26779,6 +27373,8 @@ impl OwnedHvfArm64BootSession {
         self.runtime_resources.pmem_devices.clear();
         self.runtime_resources.network_devices.clear();
         self.network_interrupt_lines.clear();
+        self.runtime_resources.vsock_device = None;
+        self.vsock_interrupt_line = None;
         self.runtime_resources.balloon_device = None;
         self.balloon_interrupt_line = None;
         self.runtime_resources.entropy_device = None;
@@ -26799,6 +27395,9 @@ impl OwnedHvfArm64BootSession {
         }
         if had_network {
             self.network_interface_metrics = SharedNetworkInterfaceMetricsRegistry::default();
+        }
+        if had_vsock {
+            self.vsock_device_metrics = SharedVsockDeviceMetrics::default();
         }
         self.restored_snapshot_v2_mmio_registrations = None;
         Ok(())
