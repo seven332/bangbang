@@ -170,6 +170,73 @@ pub(super) fn decode(
     decode_with_reserve(bytes, &mut reserve)
 }
 
+pub(super) fn preflight_metadata_length(
+    header: &[u8],
+) -> Result<usize, SnapshotV2DiffLayerBindingError> {
+    if header.len() != NATIVE_V2_DIFF_HEADER_BYTES {
+        return Err(SnapshotV2DiffLayerBindingError::InvalidLength);
+    }
+    if read_array::<8>(header, MAGIC_OFFSET)? != NATIVE_V2_DIFF_MAGIC {
+        return Err(SnapshotV2DiffLayerBindingError::InvalidMagic);
+    }
+    let version = SnapshotFormatVersion::new(
+        read_u16(header, VERSION_MAJOR_OFFSET)?,
+        read_u16(header, VERSION_MINOR_OFFSET)?,
+        read_u16(header, VERSION_PATCH_OFFSET)?,
+    );
+    if version != NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION {
+        return Err(SnapshotV2DiffLayerBindingError::UnsupportedVersion);
+    }
+    if usize::from(read_u16(header, HEADER_BYTES_OFFSET)?) != NATIVE_V2_DIFF_HEADER_BYTES
+        || read_u16(header, PROFILE_OFFSET)? != NATIVE_V2_DIFF_PROFILE
+        || read_u32(header, FLAGS_OFFSET)? != FLAGS
+        || u64::from(read_u32(header, GUEST_GRANULE_OFFSET)?) != NATIVE_V2_MEMORY_GUEST_GRANULE
+        || usize::try_from(read_u32(header, EXTENT_BYTES_OFFSET)?)
+            .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?
+            != NATIVE_V2_DIFF_EXTENT_BYTES
+        || header
+            .get(RESERVED_OFFSET..RESERVED_OFFSET + RESERVED_BYTES)
+            .is_none_or(|reserved| reserved.iter().any(|byte| *byte != 0))
+    {
+        return Err(SnapshotV2DiffLayerBindingError::InvalidHeader);
+    }
+
+    let base_bytes = read_array::<BASE_IMAGE_ID_BYTES>(header, BASE_IMAGE_ID_OFFSET)?;
+    let predecessor_length = usize::try_from(read_u32(header, PREDECESSOR_BINDING_LENGTH_OFFSET)?)
+        .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?;
+    match read_u16(header, BASE_KIND_OFFSET)? {
+        BASE_ZERO if base_bytes == [0_u8; BASE_IMAGE_ID_BYTES] && predecessor_length == 0 => {}
+        BASE_IMAGE if predecessor_length != 0 => {}
+        _ => return Err(SnapshotV2DiffLayerBindingError::InvalidBase),
+    }
+
+    let count = usize::try_from(read_u32(header, EXTENT_COUNT_OFFSET)?)
+        .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?;
+    if count > NATIVE_V2_DIFF_MAX_EXTENTS {
+        return Err(SnapshotV2DiffLayerBindingError::CountOutOfBounds);
+    }
+    let result_length = usize::try_from(read_u32(header, RESULT_BINDING_LENGTH_OFFSET)?)
+        .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?;
+    let expected = NATIVE_V2_DIFF_HEADER_BYTES
+        .checked_add(result_length)
+        .and_then(|length| length.checked_add(predecessor_length))
+        .and_then(|length| {
+            count
+                .checked_mul(NATIVE_V2_DIFF_EXTENT_BYTES)
+                .and_then(|extent_bytes| length.checked_add(extent_bytes))
+        })
+        .ok_or(SnapshotV2DiffLayerBindingError::LengthOverflow)?;
+    if expected > NATIVE_V2_DIFF_MAX_METADATA_BYTES {
+        return Err(SnapshotV2DiffLayerBindingError::MetadataTooLarge);
+    }
+    let encoded = usize::try_from(read_u64(header, METADATA_LENGTH_OFFSET)?)
+        .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?;
+    if encoded != expected {
+        return Err(SnapshotV2DiffLayerBindingError::InvalidLength);
+    }
+    Ok(encoded)
+}
+
 pub(super) fn decode_with_reserve<R: ReservePolicy>(
     bytes: &[u8],
     reserve: &mut R,
@@ -177,30 +244,10 @@ pub(super) fn decode_with_reserve<R: ReservePolicy>(
     if bytes.len() < NATIVE_V2_DIFF_HEADER_BYTES {
         return Err(SnapshotV2DiffLayerBindingError::InvalidLength);
     }
-    if read_array::<8>(bytes, MAGIC_OFFSET)? != NATIVE_V2_DIFF_MAGIC {
-        return Err(SnapshotV2DiffLayerBindingError::InvalidMagic);
-    }
-    let version = SnapshotFormatVersion::new(
-        read_u16(bytes, VERSION_MAJOR_OFFSET)?,
-        read_u16(bytes, VERSION_MINOR_OFFSET)?,
-        read_u16(bytes, VERSION_PATCH_OFFSET)?,
-    );
-    if version != NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION {
-        return Err(SnapshotV2DiffLayerBindingError::UnsupportedVersion);
-    }
-    if usize::from(read_u16(bytes, HEADER_BYTES_OFFSET)?) != NATIVE_V2_DIFF_HEADER_BYTES
-        || read_u16(bytes, PROFILE_OFFSET)? != NATIVE_V2_DIFF_PROFILE
-        || read_u32(bytes, FLAGS_OFFSET)? != FLAGS
-        || u64::from(read_u32(bytes, GUEST_GRANULE_OFFSET)?) != NATIVE_V2_MEMORY_GUEST_GRANULE
-        || usize::try_from(read_u32(bytes, EXTENT_BYTES_OFFSET)?)
-            .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?
-            != NATIVE_V2_DIFF_EXTENT_BYTES
-        || bytes
-            .get(RESERVED_OFFSET..RESERVED_OFFSET + RESERVED_BYTES)
-            .is_none_or(|reserved| reserved.iter().any(|byte| *byte != 0))
-    {
-        return Err(SnapshotV2DiffLayerBindingError::InvalidHeader);
-    }
+    let header = bytes
+        .get(..NATIVE_V2_DIFF_HEADER_BYTES)
+        .ok_or(SnapshotV2DiffLayerBindingError::InvalidLength)?;
+    let metadata_length = preflight_metadata_length(header)?;
     let base_bytes = read_array::<BASE_IMAGE_ID_BYTES>(bytes, BASE_IMAGE_ID_OFFSET)?;
     let predecessor_length = usize::try_from(read_u32(bytes, PREDECESSOR_BINDING_LENGTH_OFFSET)?)
         .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?;
@@ -211,26 +258,9 @@ pub(super) fn decode_with_reserve<R: ReservePolicy>(
     };
     let count = usize::try_from(read_u32(bytes, EXTENT_COUNT_OFFSET)?)
         .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?;
-    if count > NATIVE_V2_DIFF_MAX_EXTENTS {
-        return Err(SnapshotV2DiffLayerBindingError::CountOutOfBounds);
-    }
     let result_length = usize::try_from(read_u32(bytes, RESULT_BINDING_LENGTH_OFFSET)?)
         .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?;
-    let expected_metadata_length = NATIVE_V2_DIFF_HEADER_BYTES
-        .checked_add(result_length)
-        .and_then(|length| length.checked_add(predecessor_length))
-        .and_then(|length| {
-            count
-                .checked_mul(NATIVE_V2_DIFF_EXTENT_BYTES)
-                .and_then(|extent_bytes| length.checked_add(extent_bytes))
-        })
-        .ok_or(SnapshotV2DiffLayerBindingError::LengthOverflow)?;
-    if expected_metadata_length > NATIVE_V2_DIFF_MAX_METADATA_BYTES {
-        return Err(SnapshotV2DiffLayerBindingError::MetadataTooLarge);
-    }
-    let metadata_length = usize::try_from(read_u64(bytes, METADATA_LENGTH_OFFSET)?)
-        .map_err(|_| SnapshotV2DiffLayerBindingError::LengthOverflow)?;
-    if metadata_length != expected_metadata_length || bytes.len() != metadata_length {
+    if bytes.len() != metadata_length {
         return Err(SnapshotV2DiffLayerBindingError::InvalidLength);
     }
     let data_offset = read_u64(bytes, DATA_OFFSET_OFFSET)?;
