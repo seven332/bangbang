@@ -132,6 +132,22 @@ pub struct SnapshotV2MemoryBinding {
 }
 
 impl SnapshotV2MemoryBinding {
+    /// Fallibly duplicates this bounded binding without hiding allocation.
+    pub fn try_clone(&self) -> Result<Self, SnapshotV2MemoryBindingError> {
+        let mut extents = Vec::new();
+        extents
+            .try_reserve_exact(self.extents.len())
+            .map_err(|source| SnapshotV2MemoryBindingError::MetadataAllocationFailed { source })?;
+        extents.extend_from_slice(&self.extents);
+        Ok(Self {
+            version: self.version,
+            image_id: self.image_id,
+            extents,
+            file_length: self.file_length,
+            metadata_checksum: self.metadata_checksum,
+        })
+    }
+
     /// Returns the exact admitted memory metadata version.
     pub const fn version(&self) -> SnapshotFormatVersion {
         self.version

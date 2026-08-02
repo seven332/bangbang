@@ -45,6 +45,7 @@ pub mod snapshot_diff_v2_13;
 pub mod snapshot_entropy_v2_8;
 pub mod snapshot_format;
 pub mod snapshot_format_v2;
+pub mod snapshot_lineage;
 pub mod snapshot_memory;
 pub mod snapshot_memory_hotplug_v2_10;
 pub mod snapshot_memory_v2;

@@ -17008,6 +17008,8 @@ fn prepares_owned_hvf_arm64_boot_session() {
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::snapshot_artifact::SnapshotCommitDurability;
+    use bangbang_runtime::snapshot_diff_v2_13::SnapshotV2DiffBase;
     use bangbang_runtime::vsock::VsockMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
@@ -17065,14 +17067,46 @@ fn prepares_owned_hvf_arm64_boot_session() {
         .expect("tracked owned session should expose guest memory")
         .dirty_tracker()
         .expect("normal tracked startup should retain one dirty epoch");
-    assert!(
-        !dirty_tracker
+    let guard = session
+        .quiesce_limiter_retry_wakeups()
+        .expect("normal boot retry work should quiesce");
+    let dirty_snapshot = session
+        .dirty_write_snapshot_quiesced(&guard)
+        .expect("normal boot dirty generation should query")
+        .expect("tracked normal boot should return a dirty generation");
+    assert_eq!(dirty_snapshot.epoch(), 0);
+    assert_eq!(
+        dirty_snapshot.pages(),
+        dirty_tracker
             .dirty_pages()
             .expect("normal boot dirty pages should query")
-            .is_empty(),
+    );
+    assert!(
+        !dirty_snapshot.pages().is_empty(),
         "kernel, FDT, and device boot population must enter the initial epoch"
     );
-    assert_eq!(session.reset_dirty_epoch_quiesced(), Ok(Some(1)));
+    assert_eq!(session.snapshot_lineage_dirty_epoch(), Some(0));
+    let diff = session
+        .begin_snapshot_v2_diff_quiesced(&guard)
+        .expect("tracked zero-root Diff input should prepare");
+    assert!(matches!(diff.base(), SnapshotV2DiffBase::Zero));
+    assert!(!diff.selection().ranges().is_empty());
+    session
+        .abort_snapshot_lineage_quiesced(diff.token(), &guard)
+        .expect("dormant Diff preparation should abort unchanged");
+    let full = session
+        .begin_full_snapshot_lineage_quiesced(&guard)
+        .expect("normal boot Full lineage should begin");
+    session
+        .complete_snapshot_lineage_publication_quiesced(
+            full,
+            SnapshotCommitDurability::Durable,
+            None,
+            &guard,
+        )
+        .expect("durable native-v1 Full should commit the dirty epoch");
+    drop(guard);
+    assert_eq!(session.snapshot_lineage_dirty_epoch(), Some(1));
     assert!(
         dirty_tracker
             .dirty_pages()
@@ -17278,7 +17312,22 @@ fn prepares_owned_hvf_arm64_boot_session() {
             .expect("VMGenID device dirty page should query"),
         vec![vmgenid_page]
     );
-    assert_eq!(session.reset_dirty_epoch_quiesced(), Ok(Some(2)));
+    let guard = session
+        .quiesce_limiter_retry_wakeups()
+        .expect("VMGenID epoch retry work should quiesce");
+    let full = session
+        .begin_full_snapshot_lineage_quiesced(&guard)
+        .expect("second Full lineage should begin");
+    session
+        .complete_snapshot_lineage_publication_quiesced(
+            full,
+            SnapshotCommitDurability::Durable,
+            None,
+            &guard,
+        )
+        .expect("second durable Full should commit the VMGenID epoch");
+    drop(guard);
+    assert_eq!(session.snapshot_lineage_dirty_epoch(), Some(2));
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
     let run_loop_control = session.run_loop_control();
@@ -19015,8 +19064,9 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
     use std::time::Instant;
 
     use bangbang_hvf::{
-        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfSnapshotV1Bundle,
-        HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession, PreparedHvfSnapshotV1Load,
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfSnapshotLineageError,
+        HvfSnapshotV1Bundle, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
+        PreparedHvfSnapshotV1Load,
     };
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput};
@@ -19034,6 +19084,7 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
     use bangbang_runtime::snapshot_device::{
         decode_snapshot_v1_device_state, encode_snapshot_v1_device_state,
     };
+    use bangbang_runtime::snapshot_lineage::LiveSnapshotLineageError;
     use bangbang_runtime::snapshot_memory::write_snapshot_memory_image;
     use bangbang_runtime::startup::prepare_snapshot_v1_device_profile;
     use bangbang_runtime::vsock::VsockMmioLayout;
@@ -19296,7 +19347,28 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
         vec![vmgenid_page],
         "snapshot memory is the clean baseline and VMGenID is the first host write"
     );
-    assert_eq!(restored_session.reset_dirty_epoch_quiesced(), Ok(Some(1)));
+    let guard = restored_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("restored retry work should quiesce before publication");
+    assert_eq!(restored_session.snapshot_lineage_dirty_epoch(), Some(0));
+    assert!(matches!(
+        restored_session.begin_snapshot_v2_diff_quiesced(&guard),
+        Err(HvfSnapshotLineageError::Lineage(
+            LiveSnapshotLineageError::DiffBaseUnavailable
+        ))
+    ));
+    let full = restored_session
+        .begin_full_snapshot_lineage_quiesced(&guard)
+        .expect("native-v1 restore should begin a Full lineage transaction");
+    restored_session
+        .complete_snapshot_lineage_publication_quiesced(
+            full,
+            SnapshotCommitDurability::Durable,
+            None,
+            &guard,
+        )
+        .expect("durable Full should commit the restored dirty epoch");
+    assert_eq!(restored_session.snapshot_lineage_dirty_epoch(), Some(1));
     assert!(
         restored_tracker
             .dirty_pages()
@@ -19304,19 +19376,15 @@ fn captures_native_v1_composite_and_keeps_source_session_usable() {
             .is_empty()
     );
 
-    let restored_state = {
-        let guard = restored_session
-            .quiesce_limiter_retry_wakeups()
-            .expect("restored retry work should quiesce before first run");
-        restored_session
-            .capture_snapshot_v1_state_at(
-                &restored_drive,
-                &bangbang_runtime::serial::SerialConfig::default(),
-                &guard,
-                Instant::now(),
-            )
-            .expect("restored destination state should recapture before first run")
-    };
+    let restored_state = restored_session
+        .capture_snapshot_v1_state_at(
+            &restored_drive,
+            &bangbang_runtime::serial::SerialConfig::default(),
+            &guard,
+            Instant::now(),
+        )
+        .expect("restored destination state should recapture before first run");
+    drop(guard);
     assert_eq!(restored_state.vcpu(), bundle.state().vcpu());
     assert_eq!(
         restored_state.interrupts().pending_interrupts,

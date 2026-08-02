@@ -237,6 +237,7 @@ use bangbang_runtime::snapshot_format_v2::{
     NATIVE_V2_LEGACY_PLATFORM_VERSION, SnapshotV2DecodeError,
     decode_snapshot_v2_state_with_compatibility_version,
 };
+use bangbang_runtime::snapshot_lineage::LiveSnapshotLineageToken;
 use bangbang_runtime::snapshot_memory::{
     SnapshotMemoryIoStage, SnapshotMemoryWriteError, write_snapshot_memory_image_with_cancel,
 };
@@ -16875,9 +16876,26 @@ pub(crate) trait NativeV1SnapshotCaptureSession: BootRunLoopSession {
 
     fn native_v1_snapshot_commit_record(bundle: Self::SnapshotBundle) -> SnapshotCommitRecord;
 
+    fn begin_native_v1_snapshot_lineage(
+        &mut self,
+        _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<Option<LiveSnapshotLineageToken>, BackendError> {
+        Ok(None)
+    }
+
+    fn abort_native_v1_snapshot_lineage(
+        &mut self,
+        _token: Option<LiveSnapshotLineageToken>,
+        _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     fn native_v1_snapshot_published(
         &mut self,
+        _token: Option<LiveSnapshotLineageToken>,
         _outcome: &SnapshotPublicationOutcome,
+        _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
     ) -> Result<(), BackendError> {
         Ok(())
     }
@@ -17165,9 +17183,26 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
 
     fn native_v2_candidate_commit_sealed(&mut self) {}
 
+    fn begin_native_v2_snapshot_lineage(
+        &mut self,
+        _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<Option<LiveSnapshotLineageToken>, BackendError> {
+        Ok(None)
+    }
+
+    fn abort_native_v2_snapshot_lineage(
+        &mut self,
+        _token: Option<LiveSnapshotLineageToken>,
+        _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     fn native_v2_snapshot_published(
         &mut self,
+        _token: Option<LiveSnapshotLineageToken>,
         _outcome: &NativeSnapshotPublicationOutcome,
+        _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
     ) -> Result<(), BackendError> {
         Ok(())
     }
@@ -17404,16 +17439,6 @@ impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
         unsafe { self.session.native_snapshot_guest_memory() }.map_err(|source| {
             BackendError::Hypervisor(format!("failed to borrow HVF guest memory: {source}"))
         })
-    }
-
-    fn reset_dirty_epoch_after_publication(&mut self) -> Result<(), BackendError> {
-        match self.session.reset_dirty_epoch_quiesced() {
-            Ok(_) => Ok(()),
-            Err(source) if source.requires_vm_teardown() => Err(BackendError::InvalidState(
-                "dirty epoch reset requires VM teardown",
-            )),
-            Err(_) => Ok(()),
-        }
     }
 }
 
@@ -17708,11 +17733,46 @@ where
         bundle.into_commit_record()
     }
 
+    fn begin_native_v1_snapshot_lineage(
+        &mut self,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<Option<LiveSnapshotLineageToken>, BackendError> {
+        self.session
+            .begin_full_snapshot_lineage_quiesced(guard)
+            .map(Some)
+            .map_err(|source| BackendError::Hypervisor(source.to_string()))
+    }
+
+    fn abort_native_v1_snapshot_lineage(
+        &mut self,
+        token: Option<LiveSnapshotLineageToken>,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<(), BackendError> {
+        let token = token.ok_or(BackendError::InvalidState(
+            "native-v1 snapshot lineage token is missing",
+        ))?;
+        self.session
+            .abort_snapshot_lineage_quiesced(token, guard)
+            .map_err(|source| BackendError::Hypervisor(source.to_string()))
+    }
+
     fn native_v1_snapshot_published(
         &mut self,
-        _outcome: &SnapshotPublicationOutcome,
+        token: Option<LiveSnapshotLineageToken>,
+        outcome: &SnapshotPublicationOutcome,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
     ) -> Result<(), BackendError> {
-        self.reset_dirty_epoch_after_publication()
+        let token = token.ok_or(BackendError::InvalidState(
+            "native-v1 snapshot lineage token is missing",
+        ))?;
+        self.session
+            .complete_snapshot_lineage_publication_quiesced(
+                token,
+                outcome.durability(),
+                None,
+                guard,
+            )
+            .map_err(|source| BackendError::Hypervisor(source.to_string()))
     }
 }
 
@@ -18275,11 +18335,52 @@ impl NativeV2SnapshotCaptureSession
         self.session.resume_after_snapshot_v2_capture()
     }
 
+    fn begin_native_v2_snapshot_lineage(
+        &mut self,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<Option<LiveSnapshotLineageToken>, BackendError> {
+        self.session
+            .begin_full_snapshot_lineage_quiesced(guard)
+            .map(Some)
+            .map_err(|source| BackendError::Hypervisor(source.to_string()))
+    }
+
+    fn abort_native_v2_snapshot_lineage(
+        &mut self,
+        token: Option<LiveSnapshotLineageToken>,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<(), BackendError> {
+        let token = token.ok_or(BackendError::InvalidState(
+            "native-v2 snapshot lineage token is missing",
+        ))?;
+        self.session
+            .abort_snapshot_lineage_quiesced(token, guard)
+            .map_err(|source| BackendError::Hypervisor(source.to_string()))
+    }
+
     fn native_v2_snapshot_published(
         &mut self,
-        _outcome: &NativeSnapshotPublicationOutcome,
+        token: Option<LiveSnapshotLineageToken>,
+        outcome: &NativeSnapshotPublicationOutcome,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
     ) -> Result<(), BackendError> {
-        self.reset_dirty_epoch_after_publication()
+        let token = token.ok_or(BackendError::InvalidState(
+            "native-v2 snapshot lineage token is missing",
+        ))?;
+        let binding = outcome
+            .state()
+            .v2_memory_binding()
+            .ok_or(BackendError::InvalidState(
+                "native-v2 publication has no memory binding",
+            ))?;
+        self.session
+            .complete_snapshot_lineage_publication_quiesced(
+                token,
+                outcome.durability(),
+                Some(binding),
+                guard,
+            )
+            .map_err(|source| BackendError::Hypervisor(source.to_string()))
     }
 }
 
@@ -31265,6 +31366,14 @@ where
                             NativeV1SnapshotCaptureError::Auxiliary { source },
                         )
                     })?;
+                let lineage_token =
+                    session
+                        .begin_native_v1_snapshot_lineage(&guard)
+                        .map_err(|source| {
+                            native_v1_snapshot_transaction_error_before_staging(
+                                NativeV1SnapshotCaptureError::Supervisor { source },
+                            )
+                        })?;
                 let result = destination.publish(|writer| {
                     let bundle = Self::capture_native_v1_snapshot_with_guard(
                         session,
@@ -31285,9 +31394,13 @@ where
                     }
                     Ok(record)
                 });
-                if let Ok(outcome) = &result
-                    && let Err(source) = session.native_v1_snapshot_published(outcome)
-                {
+                let lineage_result = match &result {
+                    Ok(outcome) => {
+                        session.native_v1_snapshot_published(lineage_token, outcome, &guard)
+                    }
+                    Err(_) => session.abort_native_v1_snapshot_lineage(lineage_token, &guard),
+                };
+                if let Err(source) = lineage_result {
                     terminal_status.record(BootRunLoopWorkerStatus::Failed(source.to_string()));
                     terminal_admission.shutdown();
                     terminal_pause_gate.shutdown();
@@ -33297,6 +33410,14 @@ where
                         )
                     })?;
 
+                let lineage_token = session
+                    .begin_native_v2_snapshot_lineage(&guard)
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Supervisor { source },
+                        )
+                    })?;
+
                 let result = destination.publish(|writer| {
                     let state = capture_and_recover_native_v2_state(
                         session,
@@ -33335,6 +33456,15 @@ where
                     Ok(state)
                 });
 
+                let lineage_result = match &result {
+                    Ok(outcome) => session.native_v2_snapshot_published(
+                        lineage_token,
+                        outcome,
+                        &guard,
+                    ),
+                    Err(_) => session.abort_native_v2_snapshot_lineage(lineage_token, &guard),
+                };
+
                 let terminal_capture = result
                     .as_ref()
                     .err()
@@ -33348,9 +33478,7 @@ where
                     terminal_admission.shutdown();
                     terminal_pause_gate.shutdown();
                     let _ = session.run_loop_control().request_stop();
-                } else if let Ok(outcome) = &result
-                    && let Err(source) = session.native_v2_snapshot_published(outcome)
-                {
+                } else if let Err(source) = lineage_result {
                     terminal_status.record(BootRunLoopWorkerStatus::Failed(source.to_string()));
                     terminal_admission.shutdown();
                     terminal_pause_gate.shutdown();
@@ -34661,6 +34789,7 @@ mod tests {
         decode_snapshot_v2_state_with_compatibility_version,
         encode_snapshot_v2_state_with_compatibility_version,
     };
+    use bangbang_runtime::snapshot_lineage::LiveSnapshotLineageToken;
     use bangbang_runtime::snapshot_memory::{SnapshotMemoryBinding, write_snapshot_memory_image};
     use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
         NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
@@ -38388,6 +38517,7 @@ mod tests {
         snapshot_auxiliary_quiescence: Arc<FakeSnapshotAuxiliaryQuiescenceState>,
         native_snapshot_memory: Option<GuestMemory>,
         native_snapshot_events: Arc<Mutex<Vec<&'static str>>>,
+        native_snapshot_lineage_events: Arc<Mutex<Vec<&'static str>>>,
         native_snapshot_panic: bool,
         native_snapshot_cancel_before_seal: Option<NativeV1SnapshotCaptureCancellation>,
         native_snapshot_publication_error: Option<BackendError>,
@@ -38467,6 +38597,7 @@ mod tests {
                 snapshot_auxiliary_quiescence: Arc::default(),
                 native_snapshot_memory: None,
                 native_snapshot_events: Arc::default(),
+                native_snapshot_lineage_events: Arc::default(),
                 native_snapshot_panic: false,
                 native_snapshot_cancel_before_seal: None,
                 native_snapshot_publication_error: None,
@@ -38523,6 +38654,10 @@ mod tests {
 
         fn native_snapshot_events(&self) -> Arc<Mutex<Vec<&'static str>>> {
             Arc::clone(&self.native_snapshot_events)
+        }
+
+        fn native_snapshot_lineage_events(&self) -> Arc<Mutex<Vec<&'static str>>> {
+            Arc::clone(&self.native_snapshot_lineage_events)
         }
 
         fn native_v2_generation_events(&self) -> Arc<Mutex<Vec<(&'static str, u64)>>> {
@@ -39341,10 +39476,39 @@ mod tests {
             .expect("fake native-v1 commit should validate")
         }
 
+        fn begin_native_v1_snapshot_lineage(
+            &mut self,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        ) -> Result<Option<LiveSnapshotLineageToken>, BackendError> {
+            self.native_snapshot_lineage_events
+                .lock()
+                .expect("fake lineage events should lock")
+                .push("v1-begin");
+            Ok(None)
+        }
+
+        fn abort_native_v1_snapshot_lineage(
+            &mut self,
+            _token: Option<LiveSnapshotLineageToken>,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        ) -> Result<(), BackendError> {
+            self.native_snapshot_lineage_events
+                .lock()
+                .expect("fake lineage events should lock")
+                .push("v1-abort");
+            Ok(())
+        }
+
         fn native_v1_snapshot_published(
             &mut self,
+            _token: Option<LiveSnapshotLineageToken>,
             _outcome: &SnapshotPublicationOutcome,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
         ) -> Result<(), BackendError> {
+            self.native_snapshot_lineage_events
+                .lock()
+                .expect("fake lineage events should lock")
+                .push("v1-published");
             self.native_snapshot_events
                 .lock()
                 .expect("fake native snapshot events should lock")
@@ -41074,10 +41238,39 @@ mod tests {
                 .push(("seal", self.native_v2_topology_generation));
         }
 
+        fn begin_native_v2_snapshot_lineage(
+            &mut self,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        ) -> Result<Option<LiveSnapshotLineageToken>, BackendError> {
+            self.native_snapshot_lineage_events
+                .lock()
+                .expect("fake lineage events should lock")
+                .push("v2-begin");
+            Ok(None)
+        }
+
+        fn abort_native_v2_snapshot_lineage(
+            &mut self,
+            _token: Option<LiveSnapshotLineageToken>,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        ) -> Result<(), BackendError> {
+            self.native_snapshot_lineage_events
+                .lock()
+                .expect("fake lineage events should lock")
+                .push("v2-abort");
+            Ok(())
+        }
+
         fn native_v2_snapshot_published(
             &mut self,
+            _token: Option<LiveSnapshotLineageToken>,
             _outcome: &NativeSnapshotPublicationOutcome,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
         ) -> Result<(), BackendError> {
+            self.native_snapshot_lineage_events
+                .lock()
+                .expect("fake lineage events should lock")
+                .push("v2-published");
             self.native_snapshot_events
                 .lock()
                 .expect("fake native snapshot events should lock")
@@ -64481,6 +64674,7 @@ mod tests {
             .with_wait_for_stop(false)
             .with_wait_for_wakeup(true);
         let events = session.native_snapshot_events();
+        let lineage_events = session.native_snapshot_lineage_events();
         let auxiliary = session.snapshot_auxiliary_quiescence();
         let supervisor =
             BootRunLoopSupervisor::start(session, NonZeroUsize::new(96).expect("non-zero"))
@@ -64536,6 +64730,12 @@ mod tests {
             "aux-drop",
         ]));
         assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        assert!(
+            lineage_events
+                .lock()
+                .expect("candidate lineage events should lock")
+                .is_empty()
+        );
 
         supervisor
             .capture_native_v2_network_candidate(request(
@@ -64546,6 +64746,12 @@ mod tests {
         assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 2);
         assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 2);
         assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        assert!(
+            lineage_events
+                .lock()
+                .expect("candidate retry lineage events should lock")
+                .is_empty()
+        );
         drop(supervisor);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
@@ -64570,6 +64776,7 @@ mod tests {
             .with_wait_for_stop(false)
             .with_wait_for_wakeup(true);
         let events = session.native_snapshot_events();
+        let lineage_events = session.native_snapshot_lineage_events();
         let auxiliary = session.snapshot_auxiliary_quiescence();
         let supervisor =
             BootRunLoopSupervisor::start(session, NonZeroUsize::new(94).expect("non-zero"))
@@ -64618,6 +64825,12 @@ mod tests {
                 ])
         );
         assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        assert!(
+            lineage_events
+                .lock()
+                .expect("candidate lineage events should lock")
+                .is_empty()
+        );
 
         supervisor
             .capture_native_v2_memory_hotplug_candidate(request(
@@ -66028,6 +66241,7 @@ mod tests {
             .with_wait_for_stop(false)
             .with_wait_for_wakeup(true);
         let events = session.native_snapshot_events();
+        let lineage_events = session.native_snapshot_lineage_events();
         let auxiliary = session.snapshot_auxiliary_quiescence();
         let supervisor =
             BootRunLoopSupervisor::start(session, NonZeroUsize::new(64).expect("non-zero limit"))
@@ -66111,6 +66325,13 @@ mod tests {
         assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 2);
         assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
         second_directory.assert_no_staging();
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("native-v2 recapture lineage events should lock")
+                .as_slice(),
+            ["v2-begin", "v2-published", "v2-begin", "v2-published",]
+        );
 
         drop(supervisor);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
@@ -66200,6 +66421,7 @@ mod tests {
             .with_wait_for_stop(false)
             .with_wait_for_wakeup(true);
         let events = session.native_snapshot_events();
+        let lineage_events = session.native_snapshot_lineage_events();
         let supervisor =
             BootRunLoopSupervisor::start(session, NonZeroUsize::new(66).expect("non-zero limit"))
                 .expect("native-v2 publication supervisor should start");
@@ -66252,6 +66474,13 @@ mod tests {
             )
             .expect("a fresh operation should publish after recovery");
         load_native_snapshot_artifacts(&retry_paths).expect("the retry native-v2 pair should load");
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("retry lineage events should lock")
+                .as_slice(),
+            ["v2-begin", "v2-abort", "v2-begin", "v2-published",]
+        );
         retry_directory.assert_no_staging();
 
         drop(supervisor);
@@ -66382,6 +66611,7 @@ mod tests {
             .with_wait_for_stop(false)
             .with_wait_for_wakeup(true);
         let events = session.native_snapshot_events();
+        let lineage_events = session.native_snapshot_lineage_events();
         let supervisor =
             BootRunLoopSupervisor::start(session, NonZeroUsize::new(60).expect("non-zero limit"))
                 .expect("native publication supervisor should start");
@@ -66411,6 +66641,13 @@ mod tests {
             Some(b"fake-native-v1-state".as_slice())
         );
         assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("native-v1 lineage events should lock")
+                .as_slice(),
+            ["v1-begin", "v1-published"]
+        );
         let event_snapshot = events
             .lock()
             .expect("native publication events should lock")
@@ -66477,6 +66714,13 @@ mod tests {
             SnapshotCommitDurability::Durable
         );
         load_snapshot_artifacts(&output_paths).expect("move-only output pair should load");
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("native-v1 recapture lineage events should lock")
+                .as_slice(),
+            ["v1-begin", "v1-published", "v1-begin", "v1-published",]
+        );
         output_directory.assert_no_staging();
 
         drop(supervisor);
@@ -66624,6 +66868,7 @@ mod tests {
             .with_wait_for_stop(false)
             .with_wait_for_wakeup(true);
         let events = session.native_snapshot_events();
+        let lineage_events = session.native_snapshot_lineage_events();
         let auxiliary = session.snapshot_auxiliary_quiescence();
         let supervisor =
             BootRunLoopSupervisor::start(session, NonZeroUsize::new(59).expect("non-zero limit"))
@@ -66661,6 +66906,13 @@ mod tests {
                 .expect("seal cancellation events should lock")
                 .contains(&"published")
         );
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("seal-cancel lineage events should lock")
+                .as_slice(),
+            ["v1-begin", "v1-abort"]
+        );
 
         supervisor
             .publish_native_v1_snapshot(
@@ -66670,6 +66922,13 @@ mod tests {
                 NativeV1SnapshotCaptureCancellation::default(),
             )
             .expect("fresh operation should publish after seal cancellation");
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("seal-cancel retry lineage events should lock")
+                .as_slice(),
+            ["v1-begin", "v1-abort", "v1-begin", "v1-published",]
+        );
         assert!(paths.state().is_file());
         assert!(paths.memory().is_file());
         directory.assert_no_staging();

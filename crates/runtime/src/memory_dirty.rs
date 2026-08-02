@@ -83,6 +83,43 @@ pub enum GuestMemoryDirtyTrackerAccessError {
     InvalidState(&'static str),
 }
 
+/// One immutable observation of a quiesced shared dirty generation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GuestMemoryDirtySnapshot {
+    page_size: u64,
+    epoch: u64,
+    pages: Vec<GuestAddress>,
+}
+
+impl GuestMemoryDirtySnapshot {
+    /// Returns the host/source page granularity used by this generation.
+    pub const fn page_size(&self) -> u64 {
+        self.page_size
+    }
+
+    /// Returns the exact observed dirty generation.
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Returns dirty page starts in ascending region/page order.
+    pub fn pages(&self) -> &[GuestAddress] {
+        &self.pages
+    }
+}
+
+impl fmt::Debug for GuestMemoryDirtySnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestMemoryDirtySnapshot")
+            .field("page_size", &self.page_size)
+            .field("epoch", &self.epoch)
+            .field("pages", &"<redacted>")
+            .field("page_count", &self.pages.len())
+            .finish()
+    }
+}
+
 impl fmt::Display for GuestMemoryDirtyTrackerAccessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -183,6 +220,31 @@ impl GuestMemoryDirtyTracker {
             region.append_dirty_pages(self.page_size, &mut pages)?;
         }
         Ok(pages)
+    }
+
+    /// Snapshot one exact generation while external quiescence excludes writes.
+    ///
+    /// The topology read lock is held across page collection. Callers must also
+    /// exclude every bitmap writer and epoch reset until this method returns.
+    pub fn snapshot_quiesced(
+        &self,
+    ) -> Result<GuestMemoryDirtySnapshot, GuestMemoryDirtyTrackerAccessError> {
+        let regions = read_unpoisoned(&self.regions);
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let mut pages = Vec::new();
+        for region in regions.iter() {
+            region.append_dirty_pages(self.page_size, &mut pages)?;
+        }
+        if self.epoch.load(Ordering::Acquire) != epoch {
+            return Err(GuestMemoryDirtyTrackerAccessError::InvalidState(
+                "dirty-page epoch changed during a quiesced snapshot",
+            ));
+        }
+        Ok(GuestMemoryDirtySnapshot {
+            page_size: self.page_size,
+            epoch,
+            pages,
+        })
     }
 
     pub(crate) fn insert_region(
@@ -464,14 +526,27 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+        let snapshot = tracker
+            .snapshot_quiesced()
+            .expect("quiesced generation should snapshot");
+        assert_eq!(snapshot.page_size(), PAGE_SIZE);
+        assert_eq!(snapshot.epoch(), 0);
+        assert_eq!(
+            snapshot.pages(),
+            [0x1000, 0x2000, 0x3000, 0x4000]
+                .map(GuestAddress::new)
+                .as_slice()
+        );
+        let debug = format!("{snapshot:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("GuestAddress"));
         assert_eq!(tracker.clear_quiesced(), 1);
         assert_eq!(tracker.epoch(), 1);
-        assert!(
-            tracker
-                .dirty_pages()
-                .expect("query should succeed")
-                .is_empty()
-        );
+        let snapshot = tracker
+            .snapshot_quiesced()
+            .expect("new generation should snapshot");
+        assert_eq!(snapshot.epoch(), 1);
+        assert!(snapshot.pages().is_empty());
         assert_eq!(tracker.clear_quiesced(), 2);
     }
 
@@ -490,7 +565,21 @@ mod tests {
             tracker.dirty_pages().expect("query should succeed"),
             [GuestAddress::new(0x2000), GuestAddress::new(0x3000)]
         );
+        assert_eq!(
+            tracker
+                .snapshot_quiesced()
+                .expect("inserted topology should snapshot")
+                .pages(),
+            [GuestAddress::new(0x2000), GuestAddress::new(0x3000)]
+        );
         assert!(tracker.remove_region(range(0x2000, 2)));
+        assert!(
+            tracker
+                .snapshot_quiesced()
+                .expect("removed topology should snapshot")
+                .pages()
+                .is_empty()
+        );
         assert!(!tracker.remove_region(range(0x2000, 2)));
     }
 
