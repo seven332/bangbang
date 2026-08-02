@@ -422,17 +422,17 @@ without claiming KVM's registration mechanism.
 artifact support. The checked
 [aggregate remaining-device contract](../compat/firecracker/v1.16.0/remaining-device-contract.md)
 selects exactly 85 records across balloon, memory hotplug, entropy, serial, and
-time/identity: 84 are terminal and only the time/identity aggregate remains
-`audit-required` for its Wave 6 terminal handoff. One public signed process profile composes
+time/identity; all 85 are terminal. One public signed process profile composes
 the full device set over default MMIO and product PCI, including concurrent
 virtio-mem and balloon control, entropy retry pressure, greater-than-FIFO
 default serial input across pause, ordered snapshot preflight rejection, and
 same-name process/control-resource reuse. Focused tests pin the five-device
 preflight order and bounded MMIO/PCI owner release/reuse; a production-bundle
 test proves independent default-stdio sessions across two
-launcher/sandboxed-worker pairs. The one retained record belongs to
-[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490); none belongs
-to Wave 7 #1491. Exact native-v2 2.7 supplies the serial artifact and
+launcher/sandboxed-worker pairs. The checked
+[Wave 6 snapshot contract](../compat/firecracker/v1.16.0/snapshot-wave6-contract.md)
+adds the direct fixed-production time/identity transition and closes that final
+producer row; none of the 85 belongs to Wave 7 #1491. Exact native-v2 2.7 supplies the serial artifact and
 restored-device contract, exact 2.8 supplies entropy encoding, exact 2.9
 supplies balloon encoding, exact 2.10 supplies virtio-mem encoding, exact
 2.11 supplies network/MMDS encoding,
@@ -440,9 +440,9 @@ fresh owner reconstruction, immutable clone, and signed direct/contained
 continuation, and exact 2.12 supplies vsock encoding, override, reset/RX/TX,
 listener, multistream, cursor, clone, and contained cleanup behavior. The
 required time/identity component is encoded and restored unchanged through
-current 2.13 and composes with every current optional-device product. Its
-aggregate remains nonterminal only for the production-observation and broader
-cross-host time-source certification recorded in the checked contract.
+current 2.13 and composes with every current optional-device product. The
+terminal evidence covers deterministic compatibility and same-host
+cross-process clones; it makes no distinct-physical-host success claim.
 
 Balloon inflate, accepted hinting, and free-page reporting use whole-range
 validation, per-owner segmentation, inward host-page alignment, and Darwin
@@ -875,8 +875,10 @@ and semantics are deliberately Bangbang-native: valid Firecracker bitcode and
 raw KVM state are rejected. Exact identities, deliberate differences, and
 portable, process, transaction, and signed evidence are pinned in the
 [snapshot-editor state contract](../compat/firecracker/v1.16.0/snapshot-editor-contract.md).
-Broader snapshot-version/backend/portability certification remains assigned to
-#1543.
+The exact
+[Wave 6 snapshot contract](../compat/firecracker/v1.16.0/snapshot-wave6-contract.md)
+composes those tools with the complete version/backend and bounded portability
+matrix.
 
 ## Runtime Isolation Platform Exclusions
 
@@ -1623,10 +1625,13 @@ epoch; failed rollback poisons the paused VM and prevents resume without
 misreporting artifact visibility. State/memory artifacts remain immutable and
 File/COW guest memory is private to each destination. Writable external drive
 files deliberately remain shared, are not COW clones, and require operator
-serialization. Native-v2 Uffd, per-drive overrides, editing tools,
-Firecracker bytes, live-peer migration, and broader portability remain
-deferred or excluded; unknown HVF feasibility should not be reported as a
-platform limit by default. Bangbang quiesces its own network access and joins
+serialization. Current native-v2 deliberately rejects Uffd, while the frozen
+native-v1 reader retains the reviewed macOS pager. The pinned Firecracker v1.16
+schema has no per-drive load override, and the supported exact complete-set
+drive transaction needs no invented field. Firecracker bytes, live-peer
+migration, and unconstrained portability remain excluded; state tools are
+terminal in the checked Wave 6 composition. Unknown HVF feasibility should not
+be reported as a platform limit by default. Bangbang quiesces its own network access and joins
 vsock polling; it does not persist vmnet/vsock peer-owned host or kernel
 buffers. Instead, kind 12 reconstructs fresh network sessions and kind 13
 closes source streams and reconstructs empty-work socket ownership. bangbang
@@ -2888,8 +2893,9 @@ into pristine normal processes, validates the exact default FDT/UART/RTC/time
 shell before HVF, installs fresh destination serial output, and commits a
 closed supervisor session initially Paused before ordinary lifecycle resume.
 At that slice no public process action invoked the v2 path; #1578 and #1589
-subsequently activated the narrow public lifecycle. Optional devices and
-broader cross-host portability remain Wave 6 work.
+subsequently activated the narrow public lifecycle. Later profiles and the
+checked Wave 6 contract close all current optional-device products. Explicit
+distinct-host CPU/fleet pairs remain #1491 work.
 
 VMGenID/SysGenID and VMClock are supported-target device families, but they are
 not part of the minimal RTC device. The backend-neutral arm64 FDT builder emits
@@ -2931,8 +2937,8 @@ even if cleanup succeeds, so no partial destination runs. Signed cross-process
 coverage proves both saved VMGenID halves change, the VMClock sequence is stable
 and even, both counters change, and RTC time does not regress. The exact
 [time/identity ledger](../compat/firecracker/v1.16.0/time-identity-contract.md)
-keeps optional-device profiles and broader cross-host portability as separate
-work. Native-v2 #1529 applies the same ordered clone identity transition after
+and the Wave 6 contract close optional-device and fixed-production composition
+while recording zero tested distinct-host success pairs. Native-v2 #1529 applies the same ordered clone identity transition after
 fresh PL031 and PVTime reconstruction; signed three-vCPU guest evidence proves
 VMGenID-before-VMClock notification, destination-current RTC, preserved PVTime,
 repeat immutable loads, and recapture-to-restore.
@@ -4118,9 +4124,11 @@ Their eventual support level should follow the endpoint matrix:
   current ceiling `v2.13.0` and describes exact v1/v2 versions. Both public
   native-v2 memory rebase commands plus deterministic snapshot inspection and
   reviewed register editing are available with the transactions described
-  above. Remaining work includes native-v2 Uffd, per-drive overrides,
-  Firecracker artifact compatibility, authentication, live-peer migration,
-  and broader cross-host portability
+  above. The exact Wave 6 ledger makes this supported snapshot set terminal.
+  Current native-v2 Uffd, Firecracker artifact bytes, live-peer migration, and
+  untested cross-host success are explicit nonclaims; the pinned load schema
+  contains no per-drive override. Artifact authentication and encryption
+  remain operator/security boundaries rather than implied format features.
 - balloon producers are implemented across live queue/discard/reporting and
   exact native-v2 2.9 serialized/restored state; absent guest statistics remain
   omitted rather than emitted as synthetic zero fields, guest PFNs remain

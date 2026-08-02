@@ -189,8 +189,9 @@ Pending `V1N1` cannot reach a running or paused snapshot source because its
 start gate fires before backend construction. Empty custom or explicit `None`
 leaves the ordinary no-template snapshot profile unchanged.
 
-Wave 6 retains ownership of broader snapshot profiles and multi-vCPU/device
-schemas. Wave 7 owns cross-host portability and the five public
+The terminal [Wave 6 snapshot contract](snapshot-wave6-contract.md) records
+the broader multi-vCPU/device profiles and this deliberate no-custom-template
+snapshot gate. Wave 7 owns cross-host portability and the five public
 `cpu-template-helper` commands and arguments.
 
 ## Security and signed evidence

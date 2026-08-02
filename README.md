@@ -25,6 +25,10 @@ Each detailed subject has one primary document:
   owns the pinned structural scope, reviewed dispositions, and evidence rules.
 - [Snapshot Feasibility](docs/snapshot-feasibility.md) owns bangbang-native
   snapshot formats, version behavior, capture/restore semantics, and nonclaims.
+- [Wave 6 Snapshot Certification](compat/firecracker/v1.16.0/snapshot-wave6-contract.md)
+  owns the exact 70-record load, artifact, device, tool, time/identity, and
+  bounded-portability evidence ledger; only its two external network
+  aggregates remain nonterminal for #1378/#1491.
 - [`bangbang-pager-v1` Protocol](docs/snapshot-pager-protocol.md) owns the pager
   wire and lifecycle contract.
 - [macOS Host Security Model](docs/security.md) owns authority, containment,

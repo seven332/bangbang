@@ -211,11 +211,15 @@ Challenge checkpoints:
 
 CPU templates and register modifiers were completed by their sibling issues;
 #1395 and #1396 complete the guest-CPU primitive and public shared dirty epochs.
-Diff snapshot serialization and dynamic CPU topology remain separate work.
+Diff snapshot serialization is terminal in the checked
+[Wave 6 snapshot contract](snapshot-wave6-contract.md); dynamic CPU topology
+remains separate work.
 #1392's cache presentation consumes the configured vCPU count but neither
 changes these machine/memory bounds nor caps that count to one matched host
 performance level. The exact 2M exclusion does not by itself certify the
 aggregate machine schema; #1408 certifies that schema and its GET/PUT/PATCH
 surface only after combining every terminal machine field, transactional
 controller behavior, startup realization, and signed evidence. Generalized
-snapshot artifacts remain separate Wave 6 work.
+snapshot artifacts and their exact machine/memory compatibility policy are
+terminal in the Wave 6 contract; unsupported custom templates and dynamic CPU
+topology remain explicit separate boundaries.

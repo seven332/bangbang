@@ -1418,11 +1418,60 @@
     {
       "id": "api-operation:PUT /snapshot/load",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /snapshot/load.",
+      "summary": "Implement the strict Firecracker-shaped PUT /snapshot/load operation across frozen native-v1 File/Uffd and exact native-v2 2.3 through 2.13 File/COW profiles: parse and redact the complete request, require a pristine destination, open state once, validate the state-memory and external-authority transaction before mutation, commit Paused first, optionally resume through the ordinary VM action, and classify unsafe post-mutation failures as terminal. Bangbang artifacts and the macOS pager remain intentionally distinct from Firecracker bytes and Linux UFFD.",
       "source_refs": [
         "api-operation:PUT /snapshot/load"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict SnapshotLoadParams parsing and redacted values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot_load_input_from_request and public response mapping"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "one-open native family load preparation publication and terminality"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "pristine destination backend override dirty tracking and architecture policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "exact 70-record load artifact device tool and portability certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete valid malformed duplicate unknown and redaction parser matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "native-v1 native-v2 File Uffd Diff authority retry and terminal tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed immutable cross-process snapshot load and restored guest matrices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fixed launcher App Sandbox contained snapshot load matrices"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /vsock",
@@ -2207,11 +2256,50 @@
     {
       "id": "api-path:/snapshot/load",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /snapshot/load.",
+      "summary": "Route only exact PUT /snapshot/load to the strict snapshot-load parser and public action. Wrong methods or non-exact paths reject before request projection, artifact access, authority adoption, or VM mutation; valid loads use the checked native family and Paused-first lifecycle.",
       "source_refs": [
         "api-path:/snapshot/load"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact snapshot load route and method dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot load request projection and response"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public snapshot load execution"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "exact Wave 6 load path ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact and non-exact snapshot route tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot load API success and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fixed production snapshot load endpoints"
+        }
+      ]
     },
     {
       "id": "api-path:/version",
@@ -4529,7 +4617,7 @@
     {
       "id": "api-property:FullVmConfiguration.memory-hotplug",
       "family": "api-contract",
-      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:FullVmConfiguration.memory-hotplug; strict API/model behavior, sparse shared-aperture ownership, live MMIO/PCI execution, metrics, and capture-ready evidence are mapped in the checked memory-hotplug closure contract. Native-v1 optional-device serialization remains under Wave 6.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:FullVmConfiguration.memory-hotplug; strict API/model behavior, sparse shared-aperture ownership, live MMIO/PCI execution, metrics, capture-ready evidence, and exact native-v2 2.10 through 2.13 serialization are mapped in the checked memory-hotplug and Wave 6 contracts. Frozen native-v1 deliberately retains no optional virtio-mem profile.",
       "source_refs": [
         "api-property:FullVmConfiguration.memory-hotplug"
       ],
@@ -5215,20 +5303,108 @@
     {
       "id": "api-property:MemoryBackend.backend_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MemoryBackend.backend_path.",
+      "summary": "Require and redact the snapshot memory backend path, retain the selected file or pager authority instead of reopening a substituted pathname, bind it to the independently verified state image, and keep its ownership through destination publication or bounded cleanup.",
       "source_refs": [
         "api-property:MemoryBackend.backend_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "required redacted MemoryBackend backend_path parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "retained File and pager backend authority preparation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "SnapshotMemoryBackend path ownership and redaction"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-paging-contract.md",
+          "anchor": "frozen native-v1 Uffd path and connected-stream policy"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "File COW pager binding authority and containment ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "missing duplicate invalid and redacted backend path tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed retained File and pager backend evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "contained backend grants after pathname replacement"
+        }
+      ]
     },
     {
       "id": "api-property:MemoryBackend.backend_type",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MemoryBackend.backend_type.",
+      "summary": "Accept exactly the pinned File and Uffd backend tokens. File selects retained private File/COW memory for frozen native-v1 and native-v2; Uffd selects only the frozen native-v1 macOS pager profile, while current native-v2 rejects it before pager, memory, or HVF adoption. No Linux UFFD descriptor or wire compatibility is claimed.",
       "source_refs": [
         "api-property:MemoryBackend.backend_type"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact File and Uffd MemoryBackend token parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "native family backend profile dispatch and preflight"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "native-v1 and native-v2 backend classifiers"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-paging-contract.md",
+          "anchor": "macOS pager evidence and Linux UFFD nonclaim"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "checked File Uffd and mechanism compatibility boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "backend type parser matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "File Uffd family routing and rejection tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fixed production File and frozen pager certification"
+        }
+      ]
     },
     {
       "id": "api-property:MemoryHotplugConfig.block_size_mib",
@@ -5937,20 +6113,108 @@
     {
       "id": "api-property:NetworkOverride.host_dev_name",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property NetworkOverride.host_dev_name.",
+      "summary": "Require one nonempty redacted destination backend selector for each saved network interface in exact native-v2 2.11 through 2.13. The selector is clone-local input, is never serialized as host authority, and is resolved only after the complete override set and artifact graph validate.",
       "source_refs": [
         "api-property:NetworkOverride.host_dev_name"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "NetworkOverride host_dev_name parsing and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "destination network selector authority preparation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "complete clone-local selector validation and canonicalization"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "checked network override and clone portability ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict nested override and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct network clone override certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained network clone override certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "missing duplicate unknown and exact-order override tests"
+        }
+      ]
     },
     {
       "id": "api-property:NetworkOverride.iface_id",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property NetworkOverride.iface_id.",
+      "summary": "Require each snapshot network override to name one exact saved interface ID. The complete set is duplicate-free, rejects missing and unknown IDs before authority access, and is canonicalized into saved device order before fresh destination-owner construction.",
       "source_refs": [
         "api-property:NetworkOverride.iface_id"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "required NetworkOverride iface_id parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "saved-interface override planning before resource access"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "exact interface identity set validation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "checked network override and clone portability ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "missing malformed and duplicate nested identity tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed exact-set network clone override certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained exact-set network clone certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "missing duplicate unknown and exact-order override tests"
+        }
+      ]
     },
     {
       "id": "api-property:PartialDrive.drive_id",
@@ -6667,11 +6931,60 @@
     {
       "id": "api-property:SnapshotLoadParams.clock_realtime",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.clock_realtime.",
+      "summary": "Parse and preserve clock_realtime, accept false or omission in the supported aarch64 profile, and reject true during mutation-free request preflight because the pinned adjustment is x86-only. Supported destinations reconstruct PL031 from destination wall time and restore VMGenID, VMClock, and downtime-excluding PVTime under the checked portable policy.",
       "source_refs": [
         "api-property:SnapshotLoadParams.clock_realtime"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "SnapshotLoadParams clock_realtime parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "clock_realtime request projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_platform.rs",
+          "anchor": "destination time and identity restoration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "aarch64 clock_realtime mutation-free rejection policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "time identity and load-field closure"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/time-identity-contract.md",
+          "anchor": "PL031 VMGenID VMClock and PVTime policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "clock_realtime parser type default and duplicate tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "assert_production_snapshot_time_identity_transition"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "aarch64_clock_realtime_is_rejected_at_request_preflight"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotLoadParams.enable_diff_snapshots",
@@ -6719,20 +7032,118 @@
     {
       "id": "api-property:SnapshotLoadParams.mem_backend",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.mem_backend.",
+      "summary": "Implement the strict MemoryBackend alternative to deprecated mem_file_path: require exactly one form, accept only File or Uffd plus a required path, redact authority, and route the pair through native-family profile preflight. File covers frozen native-v1 and native-v2 private File/COW; Uffd covers only the frozen native-v1 reviewed macOS pager profile.",
       "source_refs": [
         "api-property:SnapshotLoadParams.mem_backend"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "mutually exclusive strict MemoryBackend parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "MemoryBackend request projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "File and Uffd native-family resource preparation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "backend profile classification and redaction"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-paging-contract.md",
+          "anchor": "frozen native-v1 Uffd product certification"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "File COW pager and backend compatibility ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete MemoryBackend valid and malformed matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "backend family routing rejection retry and terminal tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fixed production File and pager backend evidence"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotLoadParams.mem_file_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.mem_file_path.",
+      "summary": "Retain the deprecated required-alternative mem_file_path as exact File-backend syntax, reject it when mem_backend is also present, record deprecated use, redact the path, and load through the same retained private File/COW state-memory transaction without reopening substituted pathnames.",
       "source_refs": [
         "api-property:SnapshotLoadParams.mem_file_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "deprecated mem_file_path normalization and accounting"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "normalized File backend projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "retained File backend load transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "File backend value ownership and redaction"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "deprecated and structured File backend closure"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "deprecated field success exclusivity duplicate type and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "deprecated field projection and metrics tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed immutable File snapshot destinations"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "production File loads after pathname replacement"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotLoadParams.network_overrides",
@@ -6780,20 +7191,118 @@
     {
       "id": "api-property:SnapshotLoadParams.resume_vm",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.resume_vm.",
+      "summary": "Parse resume_vm with a false default, always validate and publish a restored destination as Paused first, and invoke the ordinary resume action only after the complete session commits. False leaves the VM explicitly Paused; true records ordinary resume latency and never bypasses restore terminality.",
       "source_refs": [
         "api-property:SnapshotLoadParams.resume_vm"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "resume_vm parsing and default"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "resume intent projection and latency accounting"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "Paused-first load commit followed by ordinary resume"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "snapshot load controller commit and VM state action"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "Paused and automatic destination matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "resume default true false malformed and duplicate tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "Paused and resumed load response and latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed explicit-Paused and automatic guest destinations"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "production explicit-Paused recapture and automatic continuation"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotLoadParams.snapshot_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.snapshot_path.",
+      "summary": "Require and redact one snapshot state path, open or adopt it exactly once, retain its file and parent authority, select the native family from verified bytes, bind it to the selected memory input, and resist pathname substitution through commit or bounded cleanup.",
       "source_refs": [
         "api-property:SnapshotLoadParams.snapshot_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "required redacted snapshot_path parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot state path request projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "one-open state family dispatch and retained authority"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_artifact.rs",
+          "anchor": "prepared native state and memory ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "state path family binding authority and redaction ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "missing duplicate malformed and redacted snapshot path tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "family mismatch one-open substitution and cleanup tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct immutable state inputs"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "contained retained state grants after pathname replacement"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotLoadParams.track_dirty_pages",
@@ -7936,11 +8445,60 @@
     {
       "id": "api-schema:MemoryBackend",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema MemoryBackend.",
+      "summary": "Implement the complete strict MemoryBackend object with required backend_type and backend_path, no unknown or duplicate fields, exact File/Uffd tokens, redacted diagnostics, and native-family-specific backend admission. File maps to retained private File/COW memory; Uffd maps only to the frozen native-v1 reviewed macOS pager profile.",
       "source_refs": [
         "api-schema:MemoryBackend"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict SnapshotMemBackendRequestBody schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "MemoryBackend projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "File and Uffd backend family preparation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "typed backend policy and redaction"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-paging-contract.md",
+          "anchor": "frozen Uffd macOS pager profile"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "MemoryBackend exact schema and mechanism ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete required unknown duplicate type and value matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "backend profile and pre-access rejection tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fixed product File and external pager evidence"
+        }
+      ]
     },
     {
       "id": "api-schema:MemoryHotplugConfig",
@@ -8191,11 +8749,55 @@
     {
       "id": "api-schema:NetworkOverride",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema NetworkOverride.",
+      "summary": "Implement the complete strict NetworkOverride object with exactly required iface_id and host_dev_name fields, no unknowns or duplicates, redacted selector values, complete-set validation against saved exact-2.11 through 2.13 interfaces, and fresh destination backend ownership. No source host authority is serialized or reused.",
       "source_refs": [
         "api-schema:NetworkOverride"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict SnapshotNetworkOverrideRequestBody schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "network override resource preparation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "exact complete override-set policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "NetworkOverride exact schema and clone ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "nested required unknown duplicate malformed and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct original and override network clones"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained original and override network clones"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "complete-set identity order and selector tests"
+        }
+      ]
     },
     {
       "id": "api-schema:PartialDrive",
@@ -8457,11 +9059,60 @@
     {
       "id": "api-schema:SnapshotLoadParams",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema SnapshotLoadParams.",
+      "summary": "Implement the complete strict Firecracker v1.16 SnapshotLoadParams shape: required snapshot_path; exactly one deprecated mem_file_path or structured mem_backend; dirty-tracking, resume, network/vsock override, and aarch64 clock policy; duplicate and unknown rejection; redaction; and normalized projection into the pristine Paused-first native-family load transaction. The pinned schema has no drive override field.",
       "source_refs": [
         "api-schema:SnapshotLoadParams"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete strict SnapshotLoadParams parser and normalization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "complete snapshot load request projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "native family load resource and publication transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "typed backend dirty override resume and architecture policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "exact load schema artifact mechanism and nonclaim certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete valid malformed required duplicate unknown and redaction matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "projection response metric and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed public native family and device load matrices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fixed production contained load schema and lifecycle matrices"
+        }
+      ]
     },
     {
       "id": "api-schema:TokenBucket",
@@ -9980,29 +10631,176 @@
     {
       "id": "corpus:snapshot-random-clones",
       "family": "snapshots",
-      "summary": "Audit all applicable capability claims owned by the pinned snapshot-random-clones source corpus.",
+      "summary": "Implement and verify the applicable clone-entropy contract: every boot and restore has a nonzero VMGenID, every restore replaces it before Paused publication and notifies the guest before the ordered VMClock notification, and optional virtio-rng destinations own fresh host entropy sources with no random bytes or source identity serialized. Repeated immutable same-host cross-process clones receive distinct VMGenIDs and resume guest observation; production recapture proves the same identity/time transition through contained authority. Userspace-cached entropy and the documented post-resume notification race remain operator/guest concerns.",
       "source_refs": [
         "corpus:snapshot-random-clones"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_platform.rs",
+          "anchor": "VMGenID then VMClock restore transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "fresh destination entropy source ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "fresh VMGenID and portable time identity preparation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vmclock.rs",
+          "anchor": "ordered VMClock update and notification state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "clone identity entropy production and portability closure"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/time-identity-contract.md",
+          "anchor": "VMGenID VMClock clone ordering and evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed immutable fresh-process clone identity and continuation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed multi-vCPU repeated clone identity and entropy ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "assert_production_snapshot_time_identity_transition and entropy clone matrices"
+        }
+      ]
     },
     {
       "id": "corpus:snapshot-support",
       "family": "snapshots",
-      "summary": "Audit all applicable capability claims owned by the pinned snapshot-support source corpus.",
+      "summary": "Implement and verify the applicable Firecracker snapshot-support semantics through Bangbang-native artifacts: strict Paused Full and Diff creation; frozen native-v1 File and reviewed macOS external paging; exact native-v2 2.3 through 2.13 File/COW loading; complete 1-32-vCPU architecture, time, storage, serial, entropy, balloon, virtio-mem, network/MMDS, and vsock state; external authority transactions; repeated immutable destinations; tools; and finite failure, cancellation, redaction, and cleanup behavior. Firecracker bytes, Linux UFFD wire identity, live-peer migration, and untested cross-host success are excluded.",
       "source_refs": [
         "corpus:snapshot-support"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public native family create load resources publication and failure policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2.rs",
+          "anchor": "complete portable architecture time and device graph capture"
+        },
+        {
+          "kind": "local",
+          "path": "crates/pager/src/lib.rs",
+          "anchor": "bounded frozen native-v1 external pager protocol"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_artifact.rs",
+          "anchor": "closed native state memory and lineage artifact ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "Diff and rebase certification"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-paging-contract.md",
+          "anchor": "external paging certification"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "exact 70-record combined certification and nonclaims"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct snapshot device and tool matrices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fixed production App Sandbox snapshot matrices"
+        }
+      ]
     },
     {
       "id": "corpus:snapshot-versioning",
       "family": "snapshots",
-      "summary": "Native-v2 provides bounded exact profile decoding from device-free 2.3 through Full 2.12 and Diff 2.13, exact version/description output, immutable repeated File/COW and zero-root/result-bound Diff loads, and both public native-v2 rebase commands with final-state-only semantics. Firecracker-byte interoperability, native-v2 Uffd, broader artifact evolution, external paging, cross-host portability, and the full version matrix remain audit-required under https://github.com/seven332/bangbang/issues/1543.",
+      "summary": "Implement and verify the Bangbang-native version contract: frozen native-v1 File/Uffd readers; exact native-v2 2.3 portable time through the monotonic optional-device ladder to Full 2.12 and Diff 2.13; bounded exact compatible-minor dispatch; version and description commands; fixed legacy fixtures; immutable repeated loads; final-state-only Diff/rebase; and deterministic architecture, page-size, feature, profile, topology, component, lineage, and memory-binding rejection. Bangbang never accepts or emits Firecracker bitcode/v10, and no distinct-physical-host success pair is claimed.",
       "source_refs": [
         "corpus:snapshot-versioning"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "one-open family profile and memory dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_artifact.rs",
+          "anchor": "prepared native-v1 and native-v2 profile ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_format_v2.rs",
+          "anchor": "native-v2 envelope exact and compatible version dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "version inspection and version-aware editor/rebase execution"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "Full Diff version and final-state rebase evidence"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "frozen and exact native profile inspection"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "exact native family version ladder and portability policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed fixed-version and current-profile process evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "production version description Full Diff and legacy dispatch evidence"
+        }
+      ]
     },
     {
       "id": "corpus:specification",
@@ -11162,12 +11960,71 @@
     {
       "id": "semantic.device:rtc-vmclock-vmgenid-and-pvtime",
       "family": "serial-and-time",
-      "summary": "The aarch64 PL031 no-alarm device, RTC metrics and destination-wall-clock reconstruction, VMGenID startup plus fresh post-restore replacement/notification, complete typed VMClock startup/capture/backward-compatible native-v1 restore, and public aligned per-vCPU PVTime measurement, bounded accounting, atomic publication, SMCCC discovery, capture-ready continuity, and signed Linux contention/idle/pause certification are implemented and verified. Native-v2 2.3 additionally encodes portable time/identity state, reconstructs destination PL031 and downtime-excluding PVTime, performs ordered fresh VMGenID and saved-counter VMClock notification, supports repeated immutable clone restore and recapture, and has signed multi-vCPU restored-guest evidence. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains this aggregate for public production lifecycle composition and broader cross-host time-source migration/clone portability.",
+      "summary": "Implement and verify the aarch64 PL031 no-alarm device, destination-wall-clock reconstruction, fresh nonzero VMGenID startup and ordered post-restore replacement/notification, complete typed 112-byte VMClock capture/update/notification, and aligned per-vCPU PVTime measurement, accounting, publication, discovery, and downtime exclusion. Native-v2 exact 2.3 through current Full 2.12 and Diff 2.13 carry the same required component. Signed multi-vCPU guests observe repeated immutable clone identity and clock transitions; every rooted/rootless MMIO/PCI fixed-production Paused recapture directly proves fresh VMGenID and changed VMClock while preserving all other canonical time/profile/device facts except numeric limiter ages and retry countdowns, whose presence and type remain checked. Deterministic destination checks and same-host cross-process evidence are terminal; zero distinct-physical-host success pairs were tested.",
       "source_refs": [
         "corpus:device-api",
         "corpus:snapshot-random-clones"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_platform.rs",
+          "anchor": "preflight ordered time identity restore and terminal boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "paused portable time capture and guest-memory agreement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pvtime.rs",
+          "anchor": "per-vCPU placement measurement and cumulative state"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "destination RTC VMGenID VMClock and PVTime preparation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vmclock.rs",
+          "anchor": "complete ABI validation and ordered update publication"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "terminal Wave 6 time identity production and portability certification"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/time-identity-contract.md",
+          "anchor": "exact ABI policy ordering failure and signed evidence ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed repeated immutable cross-process time identity clones"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed Linux PVTime discovery and steal-time accounting"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed three-vCPU restore notification recapture and measurement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "assert_production_snapshot_time_identity_transition in four storage cells"
+        }
+      ]
     },
     {
       "id": "semantic.device:serial-stdin-stdout-rx-and-restore",
@@ -11825,12 +12682,71 @@
     {
       "id": "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
       "family": "snapshots",
-      "summary": "Native-v2 exact-2.13 Diff now has tracked and untracked selection, zero-root and predecessor lineage, repeated GPA-layer composition, successful-commit dirty reset, no-side-effect failure, complete state, public create/load, MMIO/PCI, direct/contained/production/App Sandbox evidence, and both rebase tools. Native-v2 Uffd, broader external paging and memory-backend coverage, and final aggregate certification remain audit-required under https://github.com/seven332/bangbang/issues/1543.",
+      "summary": "Implement and verify exact native-v2 2.13 Diff with tracked and conservative untracked selection, zero-root and predecessor lineage, repeated GPA-layer composition, complete state, commit-only dirty reset, failure rollback, File/COW public create/load, every 64-device MMIO/PCI product, direct/contained/production App Sandbox evidence, and both failure-atomic rebase commands. The strict File/Uffd API is complete: frozen native-v1 retains eager File and reviewed macOS external paging, while native-v2 Uffd rejects at its documented profile gate. This is not Linux UFFD wire compatibility, sparse-byte compatibility, state merging, or Firecracker artifact compatibility.",
       "source_refs": [
         "corpus:snapshot-page-faults",
         "corpus:snapshot-support"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public Full Diff File Uffd dispatch publication and cleanup"
+        },
+        {
+          "kind": "local",
+          "path": "crates/pager/src/lib.rs",
+          "anchor": "frozen native-v1 external paging mechanism"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "dirty tracking and native family memory backend policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_diff_v2_13.rs",
+          "anchor": "exact Diff lineage layer and complete-result contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase.rs",
+          "anchor": "failure-atomic complete-result rebase transaction"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "exact Diff lineage rebase and process ledger"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-paging-contract.md",
+          "anchor": "frozen external pager implementation and signed evidence"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "terminal combined Diff backend and portability certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed native-v2 Diff and native-v1 pager process certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fixed production Diff App Sandbox and pager certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual rebase command success failure cancellation and redaction matrix"
+        }
+      ]
     },
     {
       "id": "semantic.snapshot:editor-rebase-and-inspection",
@@ -11992,11 +12908,65 @@
     {
       "id": "semantic.snapshot:multi-vcpu-drives-devices-and-mmds",
       "family": "snapshots",
-      "summary": "The current native-v2 2.11 Full/File profile serializes and restores a complete typed 1–32-vCPU platform with GIC, topology, timers, portable time/identity, applied CPU evidence, required serial state, and independently optional rooted/rootless regular-file storage, entropy, balloon, virtio-mem, and network/MMDS state over coherent MMIO or PCI. Signed direct and contained product matrices certify all 32 optional-component products, exact clone-local network overrides, fresh destination owners, guest continuation, recapture, immutable state/memory, deliberate shared writable external prefixes, volatile private pmem tails, lossy network/MMDS sessions, finite failure classification, and cleanup. It deliberately excludes vhost-user, vsock, boot timer, source backend/session authority, Diff/native-v2 Uffd, and Firecracker artifact compatibility. The aggregate remains audit-required for vsock encoding and public restore, editing/tools, broader version evolution, and unconstrained artifact or host portability.",
+      "summary": "Implement and verify a complete typed 1-32-vCPU native-v2 platform with GIC, timers, portable time/identity, applied CPU evidence, required serial, and independently optional rooted/rootless regular-file block/pmem storage, entropy, balloon, virtio-mem, network/MMDS, and vsock over coherent MMIO or PCI. Full 2.12 and Diff 2.13 close all 64 optional-component products; signed direct and fixed-production matrices prove exact external authority, override sets, fresh owners, Paused/automatic continuation, recapture, immutable state/memory, shared writable backing epochs, volatile private pmem tails, lossy sessions, finite failure classification, and cleanup. Vhost-user, boot timer, live peers, native-v2 Uffd, Firecracker bytes, and unconstrained cross-host execution remain excluded.",
       "source_refs": [
         "corpus:snapshot-support"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public complete product create load and authority transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2.rs",
+          "anchor": "complete multi-vCPU architecture time and optional-device capture"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_platform.rs",
+          "anchor": "complete MMIO and PCI destination reconstruction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_artifact.rs",
+          "anchor": "Full and Diff profile state memory binding"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_device_v2.rs",
+          "anchor": "bounded ordered portable device graph"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-wave6-contract.md",
+          "anchor": "terminal multi-vCPU device transport authority and portability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct multi-vCPU storage and every optional-device continuation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2/tests.rs",
+          "anchor": "exact_minor_thirteen_diff_closes_all_sixty_four_mmio_and_pci_products"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed complete owner graph restore and failure evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fixed production contained storage and optional-device matrices"
+        }
+      ]
     },
     {
       "id": "semantic.snapshot:network-vsock-overrides-portability-and-clones",

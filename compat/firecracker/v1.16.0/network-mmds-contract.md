@@ -171,11 +171,12 @@ before session creation.
 - #1378 remains open. This contract does not claim an Apple-approved production
   vmnet start, external packet connectivity, service failure, crash reclamation,
   or credentialed concurrent connectivity.
-- #1490 retains Diff/native-v2-Uffd work, artifact editing/version evolution,
-  and unconstrained migration/host portability. Exact 2.11 network/MMDS bytes,
-  reconstruction, overrides, and clone-session freshness are terminal here;
-  current 2.12 composes them unchanged with optional vsock. Peer-owned vmnet
-  packets and active MMDS TCP sessions are intentionally not persisted.
+- The checked [Wave 6 snapshot contract](snapshot-wave6-contract.md) makes
+  Diff, version/tool composition, exact 2.11 network/MMDS bytes,
+  reconstruction, overrides, and clone-session freshness terminal. Current
+  2.12 composes them unchanged with optional vsock and 2.13 with Diff.
+  Peer-owned vmnet packets and active MMDS TCP sessions are intentionally not
+  persisted; #1491 owns any explicit future host/fleet portability pair.
 - #1491 owns the separate network-performance corpus, global metric schema and
   timing reconciliation, and performance validation. Correctness-critical
   network/MMDS producers already exist; this ledger does not claim throughput

@@ -2,9 +2,10 @@
 
 This is the checked closure ledger for the 15 Firecracker v1.16.0 identities
 selected by bangbang's native-v2 differential snapshot and public rebase-tool
-delivery. Thirteen exact leaves are `implemented-and-verified`; two mixed
-aggregates remain `audit-required` for their named downstream owners. The
-immutable upstream baseline is Firecracker commit
+delivery. All fifteen identities are `implemented-and-verified`; the two mixed
+aggregates compose this focused evidence with the checked
+[Wave 6 snapshot contract](snapshot-wave6-contract.md). The immutable upstream
+baseline is Firecracker commit
 `d83d72b710361a10294480131377b1b00b163af8`.
 
 The two snapshot-editor state aggregates formerly retained here are now
@@ -91,6 +92,11 @@ continues to own only the Diff/create/version/rebase identities below.
   `executable_reports_native_snapshot_versions_before_socket_publication` and
   `sandboxed_bundle_reports_current_native_v2_snapshot_version` pin the direct
   and production App Sandbox command result.
+- **WAVE6** — `snapshot-wave6-contract.md` composes exact native-v1 external
+  paging, the complete load/backend schema, exact native-v2 2.3–2.13 profile
+  evolution, all device products, production time/identity recapture, and the
+  bounded same-host portability policy without claiming Firecracker bytes,
+  Linux UFFD wire identity, or an untested cross-host success pair.
 
 ## Exact 15-record ledger
 
@@ -109,8 +115,8 @@ continues to own only the Diff/create/version/rebase identities below.
 | `tool-argument:snapshot-editor/edit-memory/rebase/memory-path` | `implemented-and-verified` | `FC-REBASE` | `LOCAL-TOOLS + LOCAL-REBASE` | `REBASE-CORE` | `TOOLS-PROCESS + SIGNED-DIFF` | `terminal` |
 | `tool-operation:rebase-snap/rebase` | `implemented-and-verified` | `FC-REBASE` | `LOCAL-TOOLS + LOCAL-REBASE` | `REBASE-CORE` | `TOOLS-PROCESS + SIGNED-DIFF` | `terminal` |
 | `tool-operation:snapshot-editor/edit-memory/rebase` | `implemented-and-verified` | `FC-REBASE` | `LOCAL-TOOLS + LOCAL-REBASE` | `REBASE-CORE` | `TOOLS-PROCESS + SIGNED-DIFF` | `terminal` |
-| `semantic.snapshot:diff-dirty-tracking-and-memory-backends` | `audit-required` | `FC-DIFF` | `LOCAL-DIFF subset` | `DIFF-PORTABLE` | `SIGNED-DIFF + PRODUCTION-DIFF` | [#1543](https://github.com/seven332/bangbang/issues/1543) |
-| `corpus:snapshot-versioning` | `audit-required` | `FC-DIFF + FC-REBASE subset` | `LOCAL-DIFF + LOCAL-TOOLS + LOCAL-REBASE subset` | `DIFF-PORTABLE + REBASE-CORE` | `TOOLS-PROCESS + SIGNED-DIFF + PRODUCTION-DIFF` | [#1543](https://github.com/seven332/bangbang/issues/1543) |
+| `semantic.snapshot:diff-dirty-tracking-and-memory-backends` | `implemented-and-verified` | `FC-DIFF` | `LOCAL-DIFF + WAVE6` | `DIFF-PORTABLE + REBASE-CORE + WAVE6` | `SIGNED-DIFF + PRODUCTION-DIFF + WAVE6` | `terminal` |
+| `corpus:snapshot-versioning` | `implemented-and-verified` | `FC-DIFF + FC-REBASE` | `LOCAL-DIFF + LOCAL-TOOLS + LOCAL-REBASE + WAVE6` | `DIFF-PORTABLE + REBASE-CORE + WAVE6` | `TOOLS-PROCESS + SIGNED-DIFF + PRODUCTION-DIFF + WAVE6` | `terminal` |
 
 ## Observable native-v2 Diff contract
 
@@ -155,13 +161,13 @@ continues to own only the Diff/create/version/rebase identities below.
   failure preserves both inputs; after exchange, failures report uncertainty
   and never claim rollback. The Diff remains byte- and inode-immutable.
 
-## Retained boundaries
+## Certification boundaries
 
-The two mixed ledger rows remain open by design. #1543 owns broad
-snapshot-version, dirty-memory-backend, native-v2 Uffd, Firecracker-byte,
-external-paging, cross-host, and full 70-record certification. Snapshot-editor
-inspection, VM-state/register editing, and the two mixed editor aggregates are
-terminal only in the separate twelve-record state contract. No terminal row
-here claims live-peer preservation, state merging, Linux/KVM dirty-bitmap
-mechanics, Linux sparse-byte compatibility, or broader tool and artifact
-portability.
+The two mixed ledger rows are terminal only through the exact Wave 6
+composition. Frozen native-v1 owns eager File plus reviewed macOS external
+paging; current native-v2 deliberately rejects Uffd at its profile gate.
+Snapshot-editor inspection, VM-state/register editing, and the two editor
+aggregates remain detailed in the separate twelve-record state contract. No
+terminal row here claims live-peer preservation, state merging, Linux/KVM
+dirty-bitmap mechanics, Linux UFFD or sparse-byte compatibility, Firecracker
+artifact bytes, or a distinct-host success pair.

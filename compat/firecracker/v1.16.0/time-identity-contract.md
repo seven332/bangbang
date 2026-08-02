@@ -1,15 +1,13 @@
 # Firecracker v1.16.0 time and identity contract
 
-This ledger is the checked closure record through #1529 under #1348. It covers
-the delivered aarch64 PL031 RTC, VMGenID, VMClock, public live/capture-ready
-PVTime, and focused native-v2 portable time/clone restore portions of exactly
-one aggregate identity:
-`semantic.device:rtc-vmclock-vmgenid-and-pvtime`. That identity remains
-`audit-required` for its remaining production-observation and broader
-cross-host time-source certification under
-[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). The required
-native-v2 time component is otherwise carried unchanged from exact 2.3 through
-current 2.12 and composes with every current optional-device product.
+This ledger is the checked terminal record for the aarch64 PL031 RTC, VMGenID,
+VMClock, public live/capture-ready PVTime, native-v2 portable time/clone
+restore, and production recapture portions of exactly one aggregate identity:
+`semantic.device:rtc-vmclock-vmgenid-and-pvtime`. That identity is
+`implemented-and-verified` through the exact
+[Wave 6 snapshot contract](snapshot-wave6-contract.md). The required native-v2
+time component is carried unchanged from exact 2.3 through Full 2.12 and Diff
+2.13 and composes with every current optional-device product.
 
 ## Evidence keys
 
@@ -84,13 +82,21 @@ current 2.12 and composes with every current optional-device product.
   `stolen time PV`, aggregate `/proc/stat` steal ticks become nonzero and
   monotonic under a hidden real-delay contention probe, stay unchanged after
   the probe is disabled, and topology capture values stay unchanged across a
-  completed pause interval.
+  completed pause interval. The fixed-production
+  `normal_bundle_certifies_native_v2_storage_epochs_over_mmio_and_pci` matrix
+  invokes `assert_production_snapshot_time_identity_transition` in every
+  rooted/rootless x MMIO/PCI cell: each retained source and Paused recapture
+  pair is canonical and independently memory-bound, keeps the exact
+  profile/machine/topology/transport/device graph after normalizing only
+  numeric limiter ages and retry countdowns, keeps their presence/type and
+  every non-VMClock time fact, and has nonzero unequal VMGenIDs plus a changed
+  exact 112-byte VMClock fingerprint without logging either value.
 
 ## Exact one-record ledger
 
 | Identity | Current disposition | Exact contract and remaining handoff |
 | --- | --- | --- |
-| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, public per-vCPU PVTime measurement/accounting/publication/discovery, exact native-v2 2.3 introduction through unchanged current 2.12 carriage, repeated immutable clone restore, recapture, failure classification, redaction, and signed multi-vCPU guest observation are implemented and verified. Every current optional-device product composes the same required time component. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** retains the remaining production-observation, broader cross-host time-source migration/clone portability, and terminal disposition. |
+| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | `implemented-and-verified` | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, public per-vCPU PVTime measurement/accounting/publication/discovery, exact native-v2 2.3 introduction through Full 2.12 and Diff 2.13 carriage, repeated immutable clone restore, recapture, failure classification, redaction, signed multi-vCPU guest observation, and the four-cell fixed-production before/after assertion are terminal under the Wave 6 contract. |
 
 ## VMClock state and version contract
 
@@ -112,10 +118,10 @@ current 2.12 and composes with every current optional-device product.
   vCPU execution and auxiliary publishers are quiesced.
 - Native-v2 `2.3.0` stores the same exact ABI inside `BANGTM2\0`, together
   with portable placement, notification, policy, and per-vCPU PVTime state.
-  Exact `2.4.0` through current `2.12.0` retain that component unchanged
-  before their versioned device graph. Structural readers still admit valid
-  `2.2.x` containers, but the complete typed HVF platform decoder requires
-  kind 6 and therefore at least minor 3.
+  Exact `2.4.0` through Full `2.12.0` and Diff `2.13.0` retain that component
+  unchanged before their versioned device graph. Structural readers still
+  admit valid `2.2.x` containers, but the complete typed HVF platform decoder
+  requires kind 6 and therefore at least minor 3.
 
 ## Restore ordering and terminality
 
@@ -155,12 +161,14 @@ control, interrupt-mask, raw interrupt status, and masked interrupt status start
 at zero. This is the complete supported Firecracker aarch64 no-interrupt subset;
 it is not a claim of alarm delivery or source-wall-clock freezing.
 
-## Explicit remaining handoff
+## Certification boundary
 
-This ledger does not claim KVM's ARM steal-time device attribute, complete
-time-specific observation across every production profile, or arbitrary
+This ledger does not claim KVM's ARM steal-time device attribute or arbitrary
 cross-host time-source portability. Public native-v2 create/load/describe and
-version selection are active through current 2.12, and every optional product
-retains the same required time component. Wave 6 #1490 retains the focused
-remaining production observation and broader migration/clone portability
-certification before the aggregate inventory record can become terminal.
+version selection are active through current Diff 2.13, and every optional
+product retains the same required time component. The checked evidence proves
+deterministic destination policy and repeated same-host cross-process clones;
+it contains zero tested distinct-physical-host success pairs. Explicit future
+CPU/host/fleet pair selection remains owned by
+[#1491](https://github.com/seven332/bangbang/issues/1491), without reopening
+this terminal time/identity producer.
