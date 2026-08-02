@@ -142,9 +142,9 @@ pub use snapshot_document::{
     HvfNativeSnapshotDocumentReplaceError, HvfNativeSnapshotInspectionError,
     HvfNativeSnapshotPlatformRef, HvfNativeSnapshotRegisterRemovalError,
     HvfNativeSnapshotRegisterRemovalOutcome, HvfNativeSnapshotRegisterRemovalReport,
-    HvfNativeSnapshotRegisterRemovalStatus, HvfNativeSnapshotVcpuRef,
-    HvfNativeSnapshotVcpuRegisterRemovalReport, HvfNativeSnapshotVcpuState,
-    HvfNativeSnapshotVcpuStatesInspection, HvfNativeSnapshotVcpus,
+    HvfNativeSnapshotRegisterRemovalRequest, HvfNativeSnapshotRegisterRemovalStatus,
+    HvfNativeSnapshotVcpuRef, HvfNativeSnapshotVcpuRegisterRemovalReport,
+    HvfNativeSnapshotVcpuState, HvfNativeSnapshotVcpuStatesInspection, HvfNativeSnapshotVcpus,
     HvfNativeSnapshotVmStateInspection,
 };
 pub use snapshot_restore::{

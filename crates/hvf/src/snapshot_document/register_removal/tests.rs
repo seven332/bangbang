@@ -115,14 +115,15 @@ fn registry_is_exact_unique_and_pinned_to_firecracker_v1_16() {
         .iter()
         .map(|register| register.id)
         .collect::<Vec<_>>();
-    let request = ReviewedRequest::try_new(&ids).expect("all 67 exact IDs should be accepted");
+    let request = HvfNativeSnapshotRegisterRemovalRequest::try_new(&ids)
+        .expect("all 67 exact IDs should be accepted");
     assert_eq!(request.targets(), request.targets.as_slice());
 }
 
 #[test]
 fn request_validation_rejects_empty_unknown_and_duplicate_ids_without_values() {
     assert!(matches!(
-        ReviewedRequest::try_new(&[]),
+        HvfNativeSnapshotRegisterRemovalRequest::try_new(&[]),
         Err(HvfNativeSnapshotRegisterRemovalError::EmptyRequest)
     ));
 
@@ -152,6 +153,24 @@ fn request_validation_rejects_empty_unknown_and_duplicate_ids_without_values() {
         assert!(!rendered.contains(&TPIDR2_EL0.to_string()));
         assert!(!rendered.contains("6030"));
     }
+
+    let request = HvfNativeSnapshotRegisterRemovalRequest::try_new(&[DBGBVR0, TPIDR2_EL0])
+        .expect("reviewed request should validate");
+    assert_eq!(request.request_count(), 2);
+    let rendered = format!("{request:?}");
+    assert!(!rendered.contains("6030"));
+    assert!(!rendered.contains(&DBGBVR0.to_string()));
+    assert!(!rendered.contains(&TPIDR2_EL0.to_string()));
+
+    let document = legacy_document(true);
+    let convenience = document
+        .clone()
+        .try_remove_reviewed_kvm_registers(&[DBGBVR0, TPIDR2_EL0])
+        .expect("slice convenience should transform");
+    let prevalidated = document
+        .try_remove_reviewed_kvm_register_request(&request)
+        .expect("prevalidated request should transform");
+    assert_eq!(prevalidated, convenience);
 }
 
 #[test]
@@ -560,7 +579,7 @@ fn outcome_debug_is_value_free() {
 }
 
 fn request_error(ids: &[u64]) -> HvfNativeSnapshotRegisterRemovalError {
-    match ReviewedRequest::try_new(ids) {
+    match HvfNativeSnapshotRegisterRemovalRequest::try_new(ids) {
         Ok(_) => panic!("request should have been rejected"),
         Err(error) => error,
     }
@@ -691,4 +710,172 @@ fn assert_non_optional_vcpu_state_preserved(
         after.reviewed_optional().simd_fp(),
         before.reviewed_optional().simd_fp()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn portable_state_transaction_publishes_exact_v1_v2_and_diff_documents() {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+
+    use bangbang_runtime::snapshot_state_edit::{
+        SnapshotStateEditCommit, SnapshotStateEditPaths, publish_edited_snapshot_state_with,
+    };
+
+    let mut documents = vec![inspection_native_v1_document(1), legacy_document(true)];
+    documents.push(
+        inspection_document_fixtures()
+            .into_iter()
+            .find(|document| matches!(document.state, HvfNativeSnapshotDocumentState::V2Diff(_)))
+            .expect("profile matrix should contain exact 2.13 Diff"),
+    );
+
+    for (index, document) in documents.into_iter().enumerate() {
+        let directory = RegisterEditTestDirectory::new(index);
+        let input = directory.path.join("input.state");
+        let output = directory.path.join("output.state");
+        let source_bytes = document.encode().expect("source document should encode");
+        fs::write(&input, &source_bytes).expect("source should write");
+        let source_facts = fs::metadata(&input).expect("source facts should read");
+        let source_facts = (
+            source_facts.dev(),
+            source_facts.ino(),
+            source_facts.mode(),
+            source_facts.size(),
+            source_facts.mtime(),
+            source_facts.mtime_nsec(),
+            source_facts.ctime(),
+            source_facts.ctime_nsec(),
+        );
+        let request = HvfNativeSnapshotRegisterRemovalRequest::try_new(&[DBGBVR0, TPIDR2_EL0])
+            .expect("request should validate before path access");
+        let paths = SnapshotStateEditPaths::new(&input, &output);
+
+        let outcome = publish_edited_snapshot_state_with(
+            &paths,
+            |bytes| {
+                let document = HvfNativeSnapshotDocument::decode(bytes)
+                    .map_err(RegisterEditPublicationTestError::Decode)?;
+                document
+                    .try_remove_reviewed_kvm_register_request(&request)
+                    .map_err(RegisterEditPublicationTestError::Transform)
+            },
+            |outcome| {
+                outcome
+                    .document()
+                    .encode()
+                    .map_err(RegisterEditPublicationTestError::Encode)
+            },
+            |bytes, outcome| {
+                let decoded = HvfNativeSnapshotDocument::decode(bytes)
+                    .map_err(RegisterEditPublicationTestError::Decode)?;
+                if &decoded == outcome.document() {
+                    Ok(())
+                } else {
+                    Err(RegisterEditPublicationTestError::Mismatch)
+                }
+            },
+        )
+        .expect("exact edited state should publish");
+
+        assert_eq!(outcome.commit(), SnapshotStateEditCommit::Durable);
+        assert_eq!(outcome.product().report().request_count(), 2);
+        let published_bytes = fs::read(&output).expect("published output should read");
+        let published = HvfNativeSnapshotDocument::decode(&published_bytes)
+            .expect("published document should decode");
+        assert_eq!(&published, outcome.product().document());
+        assert_eq!(
+            fs::metadata(&output)
+                .expect("published mode should read")
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(fs::read(&input).expect("source should read"), source_bytes);
+        let after = fs::metadata(&input).expect("source facts should reread");
+        assert_eq!(
+            (
+                after.dev(),
+                after.ino(),
+                after.mode(),
+                after.size(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            ),
+            source_facts
+        );
+        assert!(
+            fs::read_dir(&directory.path)
+                .expect("directory should enumerate")
+                .map(|entry| entry.expect("entry should read"))
+                .all(|entry| !entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".bangbang-snapshot-edit-"))
+        );
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum RegisterEditPublicationTestError {
+    Decode(crate::snapshot_document::HvfNativeSnapshotDocumentDecodeError),
+    Transform(HvfNativeSnapshotRegisterRemovalError),
+    Encode(crate::snapshot_document::HvfNativeSnapshotDocumentEncodeError),
+    Mismatch,
+}
+
+#[cfg(unix)]
+impl fmt::Display for RegisterEditPublicationTestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Decode(_) => "test decode failure",
+            Self::Transform(_) => "test transform failure",
+            Self::Encode(_) => "test encode failure",
+            Self::Mismatch => "test exact-document mismatch",
+        })
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for RegisterEditPublicationTestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode(source) => Some(source),
+            Self::Transform(source) => Some(source),
+            Self::Encode(source) => Some(source),
+            Self::Mismatch => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct RegisterEditTestDirectory {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl RegisterEditTestDirectory {
+    fn new(index: usize) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "bb-hvf-state-edit-{}-{index}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("test directory should create");
+        Self { path }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RegisterEditTestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }

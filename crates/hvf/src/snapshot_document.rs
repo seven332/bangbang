@@ -62,7 +62,8 @@ pub use inspection::{
 pub use register_removal::{
     HVF_NATIVE_SNAPSHOT_REVIEWED_KVM_REGISTER_COUNT, HvfNativeSnapshotRegisterRemovalError,
     HvfNativeSnapshotRegisterRemovalOutcome, HvfNativeSnapshotRegisterRemovalReport,
-    HvfNativeSnapshotRegisterRemovalStatus, HvfNativeSnapshotVcpuRegisterRemovalReport,
+    HvfNativeSnapshotRegisterRemovalRequest, HvfNativeSnapshotRegisterRemovalStatus,
+    HvfNativeSnapshotVcpuRegisterRemovalReport,
 };
 
 /// Exact semantic profile owned by one native HVF snapshot document.

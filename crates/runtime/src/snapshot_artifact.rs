@@ -35,13 +35,13 @@ use crate::snapshot_device_v2_6::{
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_diff_v2_13::{
-    NATIVE_V2_DIFF_MAGIC, SnapshotV2DiffBase, SnapshotV2DiffMaterializationError,
-    promote_snapshot_v2_diff_zero_root_file_with_cancel, verify_snapshot_v2_diff_layer_output,
-    verify_snapshot_v2_diff_layer_output_with_cancel,
+    NATIVE_V2_DIFF_MAGIC, SnapshotV2DiffBase, promote_snapshot_v2_diff_zero_root_file_with_cancel,
+    verify_snapshot_v2_diff_layer_output, verify_snapshot_v2_diff_layer_output_with_cancel,
 };
 use crate::snapshot_diff_v2_13::{
     NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION, SnapshotV2DiffLayerBinding,
-    SnapshotV2DiffStateError, SnapshotV2DiffVerifyError, decode_snapshot_v2_diff_layer_binding,
+    SnapshotV2DiffMaterializationError, SnapshotV2DiffStateError, SnapshotV2DiffVerifyError,
+    decode_snapshot_v2_diff_layer_binding,
 };
 use crate::snapshot_entropy_v2_8::{
     NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, SnapshotV2EntropyState,
@@ -50,10 +50,11 @@ use crate::snapshot_entropy_v2_8::{
 #[cfg(target_os = "macos")]
 use crate::snapshot_format::NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES;
 use crate::snapshot_format::{
-    NATIVE_V1_SNAPSHOT_VERSION, NativeSnapshotFormatError, NativeSnapshotState,
-    SnapshotFormatVersion, decode_native_snapshot_state,
+    NATIVE_V1_SNAPSHOT_VERSION, NativeSnapshotFormatError, SnapshotFormatVersion,
 };
-#[cfg(test)]
+#[cfg(target_os = "macos")]
+use crate::snapshot_format::{NativeSnapshotState, decode_native_snapshot_state};
+#[cfg(all(test, target_os = "macos"))]
 use crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
 use crate::snapshot_format_v2::{
     NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
@@ -3850,6 +3851,18 @@ impl SnapshotArtifactOutput {
 
 impl fmt::Debug for SnapshotArtifactOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.location {
+            SnapshotArtifactOutputLocation::Path(path) => {
+                let _ = path;
+            }
+            SnapshotArtifactOutputLocation::Anchored {
+                directory,
+                child,
+                tracker,
+            } => {
+                let _ = (directory, child, tracker);
+            }
+        }
         f.debug_struct("SnapshotArtifactOutput")
             .field("destination", &REDACTED)
             .finish()
@@ -3875,10 +3888,12 @@ impl SnapshotArtifactOutputs {
         )
     }
 
+    #[cfg(target_os = "macos")]
     fn state(&self) -> &SnapshotArtifactOutput {
         &self.state
     }
 
+    #[cfg(target_os = "macos")]
     fn memory(&self) -> &SnapshotArtifactOutput {
         &self.memory
     }
@@ -3886,6 +3901,7 @@ impl SnapshotArtifactOutputs {
 
 impl fmt::Debug for SnapshotArtifactOutputs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (&self.state, &self.memory);
         f.debug_struct("SnapshotArtifactOutputs")
             .field("state", &REDACTED)
             .field("memory", &REDACTED)
@@ -3904,6 +3920,7 @@ pub struct SnapshotMemoryStagingWriter {
 }
 
 impl SnapshotMemoryStagingWriter {
+    #[cfg(target_os = "macos")]
     fn new(file: File, closed: Arc<AtomicBool>) -> Self {
         Self {
             file: Some(file),
@@ -4008,6 +4025,7 @@ pub struct SnapshotStagingOwnership {
 }
 
 impl SnapshotStagingOwnership {
+    #[cfg(target_os = "macos")]
     fn new(
         artifact: SnapshotArtifactKind,
         directory_identity: SnapshotArtifactIdentity,
@@ -5431,13 +5449,14 @@ pub fn load_prepared_native_snapshot_memory_file(
 pub fn load_prepared_native_snapshot_memory_file_with_cancel<C>(
     prepared: PreparedNativeSnapshotState,
     file: File,
-    mut is_cancelled: C,
+    is_cancelled: C,
 ) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError>
 where
     C: FnMut() -> bool,
 {
     #[cfg(target_os = "macos")]
     {
+        let mut is_cancelled = is_cancelled;
         load_prepared_native_snapshot_memory_file_macos(prepared, file, &mut is_cancelled)
     }
     #[cfg(not(target_os = "macos"))]
@@ -5481,13 +5500,14 @@ pub fn load_prepared_native_snapshot_memory_path(
 pub fn load_prepared_native_snapshot_memory_path_with_cancel<C>(
     prepared: PreparedNativeSnapshotState,
     path: &Path,
-    mut is_cancelled: C,
+    is_cancelled: C,
 ) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError>
 where
     C: FnMut() -> bool,
 {
     #[cfg(target_os = "macos")]
     {
+        let mut is_cancelled = is_cancelled;
         load_prepared_native_snapshot_memory_path_macos(prepared, path, &mut is_cancelled)
     }
     #[cfg(not(target_os = "macos"))]

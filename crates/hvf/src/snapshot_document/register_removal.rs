@@ -523,14 +523,20 @@ const REVIEWED_KVM_REGISTERS: [ReviewedKvmRegister;
     },
 ];
 
-#[derive(Debug)]
-struct ReviewedRequest {
+/// Opaque, value-free validated request for reviewed KVM register removal.
+///
+/// Construction performs exact registry, empty, and duplicate validation. The
+/// resulting value retains only semantic targets and their count, so a caller
+/// can validate before any path access without retaining submitted IDs.
+#[derive(Clone)]
+pub struct HvfNativeSnapshotRegisterRemovalRequest {
     targets: [Target; HVF_NATIVE_SNAPSHOT_REVIEWED_KVM_REGISTER_COUNT],
     len: usize,
 }
 
-impl ReviewedRequest {
-    fn try_new(ids: &[u64]) -> Result<Self, HvfNativeSnapshotRegisterRemovalError> {
+impl HvfNativeSnapshotRegisterRemovalRequest {
+    /// Validates one nonempty ordered request against the exact reviewed table.
+    pub fn try_new(ids: &[u64]) -> Result<Self, HvfNativeSnapshotRegisterRemovalError> {
         if ids.is_empty() {
             return Err(HvfNativeSnapshotRegisterRemovalError::EmptyRequest);
         }
@@ -566,8 +572,23 @@ impl ReviewedRequest {
         Ok(request)
     }
 
+    /// Returns the validated number of requested registers.
+    pub const fn request_count(&self) -> usize {
+        self.len
+    }
+
     fn targets(&self) -> &[Target] {
         self.targets.get(..self.len).unwrap_or_default()
+    }
+}
+
+impl fmt::Debug for HvfNativeSnapshotRegisterRemovalRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfNativeSnapshotRegisterRemovalRequest")
+            .field("request_count", &self.len)
+            .field("targets", &"<redacted>")
+            .finish()
     }
 }
 
@@ -579,7 +600,19 @@ impl HvfNativeSnapshotDocument {
         register_ids: &[u64],
     ) -> Result<HvfNativeSnapshotRegisterRemovalOutcome, HvfNativeSnapshotRegisterRemovalError>
     {
-        let request = ReviewedRequest::try_new(register_ids)?;
+        let request = HvfNativeSnapshotRegisterRemovalRequest::try_new(register_ids)?;
+        self.try_remove_reviewed_kvm_register_request(&request)
+    }
+
+    /// Applies one already-validated reviewed KVM register-removal request.
+    ///
+    /// This seam lets path-based callers complete value-free request admission
+    /// before opening or inspecting the snapshot state input.
+    pub fn try_remove_reviewed_kvm_register_request(
+        self,
+        request: &HvfNativeSnapshotRegisterRemovalRequest,
+    ) -> Result<HvfNativeSnapshotRegisterRemovalOutcome, HvfNativeSnapshotRegisterRemovalError>
+    {
         let vcpu_count = self.vcpu_count();
         let mut replacements = Vec::new();
         replacements
@@ -594,7 +627,7 @@ impl HvfNativeSnapshotDocument {
         let mut not_present_count = 0_usize;
         for state in self.vcpus() {
             let state = HvfNativeSnapshotVcpuState::from(state);
-            let (replacement, vcpu_report) = transform_vcpu(state, &request)?;
+            let (replacement, vcpu_report) = transform_vcpu(state, request)?;
             removed_count += vcpu_report.removed_count();
             not_present_count += vcpu_report.not_present_count();
             replacements.push(replacement);
@@ -617,7 +650,7 @@ impl HvfNativeSnapshotDocument {
 
 fn transform_vcpu(
     state: HvfNativeSnapshotVcpuState,
-    request: &ReviewedRequest,
+    request: &HvfNativeSnapshotRegisterRemovalRequest,
 ) -> Result<
     (
         HvfNativeSnapshotVcpuState,
