@@ -6,10 +6,9 @@ replacing their row-specific semantic contracts. The selector contains exactly
 85 identities: 52 balloon, 19 memory-hotplug, seven entropy, six serial, and
 one time/identity aggregate.
 
-Eighty-four rows are `implemented-and-verified`; one time/identity row
-remains `audit-required` because its remaining public-production composition
-and broad time-source portability certification belong to
-[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). The
+All 85 rows are `implemented-and-verified`. The time/identity row composes its
+focused and signed guest evidence with the fixed-production recapture proof in
+the checked [Wave 6 snapshot contract](snapshot-wave6-contract.md). The
 repository-wide observability, tools, and specification work belongs to
 [Wave 7 #1491](https://github.com/seven332/bangbang/issues/1491), but zero rows
 in this 85-record selector are handed to Wave 7.
@@ -113,7 +112,8 @@ in this 85-record selector are handed to Wave 7.
   `signed_executable_creates_and_restores_native_v2_snapshot_across_processes`,
   `guest_boot::certifies_linux_pvtime_contention_idle_and_paused_accounting`,
   `hvf_lifecycle::native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progress`,
-  and `AGG-SIGNED`.
+  `launcher::assert_production_snapshot_time_identity_transition`, and
+  `AGG-SIGNED`.
 - `BALLOON-SNAPSHOT` — completed by
   [#1681](https://github.com/seven332/bangbang/issues/1681): exact 2.9 kind-10
   queue/statistics/hint/accounting/transport encoding, fresh destination
@@ -137,11 +137,13 @@ in this 85-record selector are handed to Wave 7.
   UART/RX/pending-intent encoding, fresh authorized endpoint reconstruction,
   destination terminal/FIFO policy, direct and contained serial-only plus
   MMIO/PCI-storage certification, and signed restored-guest behavior.
-- `W6-TIME` — exact owner
-  [#1490](https://github.com/seven332/bangbang/issues/1490): connect #1529's
-  implemented portable time/identity graph and repeat-clone restore to the
-  public production lifecycle, then certify broader cross-host time-source
-  migration/clone portability.
+- `W6-TIME` — the terminal `snapshot-wave6-contract.md` composition: every
+  rooted/rootless x MMIO/PCI fixed-production Paused recapture has a fresh
+  VMGenID and changed VMClock while preserving the exact profile, topology,
+  device graph except numeric limiter ages/retry countdowns, and remaining
+  time state. Those relative timer fields retain their presence and type. The
+  evidence is same-host cross-process and makes no untested distinct-host
+  success claim.
 - `W7` — exact out-of-selector owner
   [#1491](https://github.com/seven332/bangbang/issues/1491): repository-wide
   observability, public tools, and applicable specification outcomes only.
@@ -234,7 +236,7 @@ in this 85-record selector are handed to Wave 7.
 | `api-property:SerialDevice.serial_out_path` | [serial](serial-contract.md) | `implemented-and-verified` | `S-IMPL` | `S-FOCUSED` | `S-SIGNED + PRODUCTION-SERIAL` | `terminal` |
 | `api-schema:SerialDevice` | [serial](serial-contract.md) | `implemented-and-verified` | `S-IMPL` | `S-FOCUSED` | `S-SIGNED + PRODUCTION-SERIAL` | `terminal` |
 | `semantic.device:serial-stdin-stdout-rx-and-restore` | [serial](serial-contract.md) | `implemented-and-verified` | `S-IMPL` | `S-FOCUSED` | `S-SIGNED + PRODUCTION-SERIAL` | `terminal` |
-| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | [time-identity](time-identity-contract.md) | `audit-required` | `T-IMPL` | `T-FOCUSED` | `T-SIGNED` | `W6-TIME` |
+| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | [time-identity](time-identity-contract.md) | `implemented-and-verified` | `T-IMPL` | `T-FOCUSED` | `T-SIGNED + W6-TIME` | `terminal` |
 
 ## Closure boundary
 
@@ -257,8 +259,8 @@ products. Serial, entropy, balloon, and virtio-mem endpoints, metrics,
 notifiers, interrupts, dispatchers, routes, shared-aperture mappings, timers,
 schedulers, and cleanup owners are fresh per destination; retained portable
 state and signed direct/contained restored-guest continuation are implemented.
-Only the time/identity aggregate remains nonterminal in this selector.
-This contract still does not claim Firecracker artifact compatibility,
-arbitrary cross-host time-source portability, or Wave 7 aggregate
-observability. #1529 separately proves the focused native-v2 PVTime/identity
-clone boundary without changing that aggregate row's disposition.
+The fixed production time/identity transition makes the final producer row
+terminal. This contract still does not claim Firecracker artifact
+compatibility, arbitrary cross-host time-source portability, or Wave 7
+aggregate observability. #1491 owns any explicit future CPU/host/fleet pair;
+it does not reopen this 85-row producer ledger.

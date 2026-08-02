@@ -42,6 +42,7 @@ use bangbang_pager::{
     ReferencePeerTermination,
 };
 use bangbang_runtime::balloon::VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
+use bangbang_runtime::memory::GuestAddress;
 use bangbang_runtime::mmds::MmdsVersion;
 use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonState;
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
@@ -53,6 +54,7 @@ use bangbang_runtime::snapshot_format_v2::{
     encode_snapshot_v2_state_with_compatibility_version,
 };
 use bangbang_runtime::snapshot_memory_hotplug_v2_10::SnapshotV2MemoryHotplugState;
+use bangbang_runtime::snapshot_memory_v2::load_snapshot_v2_memory_path;
 use bangbang_runtime::snapshot_network_v2_11::{
     SnapshotV2NetworkBackendClass, SnapshotV2NetworkLimiterState, SnapshotV2NetworkState,
 };
@@ -7498,6 +7500,8 @@ fn run_native_v2_snapshot_epoch_grant_case(bundle: &Path, enable_pci: bool, root
         paused_fixture.recaptured_artifacts().memory.is_file(),
         "{case} recaptured memory should publish"
     );
+    let recaptured = paused_fixture.recaptured_artifacts();
+    assert_production_snapshot_time_identity_transition(&paused_fixture.opened, &recaptured, &case);
     assert_no_snapshot_staging(&paused_fixture.state_directory);
     assert_no_snapshot_staging(&paused_fixture.memory_directory);
     assert_http_status(
@@ -7643,6 +7647,256 @@ fn run_native_v2_snapshot_epoch_grant_case(bundle: &Path, enable_pci: bool, root
         fs::read(&final_artifacts.memory).expect("final epoch memory should read"),
         memory_before,
         "{case} repeated destinations must not mutate memory"
+    );
+}
+
+struct ProductionSnapshotTimeIdentityEvidence {
+    stable_profile: serde_json::Value,
+    time: serde_json::Value,
+    vmgenid: [u8; 16],
+}
+
+fn json_difference_paths(left: &serde_json::Value, right: &serde_json::Value) -> Vec<String> {
+    fn visit(
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+        path: &str,
+        differences: &mut Vec<String>,
+    ) {
+        if differences.len() >= 16 || left == right {
+            return;
+        }
+        match (left, right) {
+            (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+                for (key, left) in left {
+                    if differences.len() >= 16 {
+                        break;
+                    }
+                    let child = format!("{path}.{key}");
+                    if let Some(right) = right.get(key) {
+                        visit(left, right, &child, differences);
+                    } else {
+                        differences.push(child);
+                    }
+                }
+                for key in right.keys().filter(|key| !left.contains_key(*key)) {
+                    if differences.len() >= 16 {
+                        break;
+                    }
+                    differences.push(format!("{path}.{key}"));
+                }
+            }
+            (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+                for index in 0..left.len().max(right.len()) {
+                    if differences.len() >= 16 {
+                        break;
+                    }
+                    let child = format!("{path}[{index}]");
+                    match (left.get(index), right.get(index)) {
+                        (Some(left), Some(right)) => visit(left, right, &child, differences),
+                        _ => differences.push(child),
+                    }
+                }
+            }
+            _ => differences.push(path.to_owned()),
+        }
+    }
+
+    let mut differences = Vec::new();
+    visit(left, right, "$", &mut differences);
+    differences
+}
+
+fn normalize_snapshot_device_relative_timers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (name, value) in fields {
+                if matches!(name.as_str(), "age_nanos" | "remaining_nanos") && value.is_number() {
+                    *value = serde_json::Value::from(0_u64);
+                } else {
+                    normalize_snapshot_device_relative_timers(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                normalize_snapshot_device_relative_timers(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn production_snapshot_time_identity_evidence(
+    artifacts: &SnapshotEpochArtifactSet,
+    context: &str,
+) -> ProductionSnapshotTimeIdentityEvidence {
+    let state_bytes = fs::read(&artifacts.state)
+        .unwrap_or_else(|error| panic!("{context} state should read: {error}"));
+    let document = HvfNativeSnapshotDocument::decode(&state_bytes)
+        .unwrap_or_else(|error| panic!("{context} state should decode: {error}"));
+    let canonical = document
+        .encode()
+        .unwrap_or_else(|error| panic!("{context} state should encode: {error}"));
+    assert!(
+        canonical == state_bytes,
+        "{context} state should use its canonical exact profile"
+    );
+
+    let inspection = document
+        .inspect_vm_state()
+        .to_pretty_json()
+        .unwrap_or_else(|error| panic!("{context} state should inspect: {error}"));
+    let inspection: serde_json::Value = serde_json::from_str(&inspection)
+        .unwrap_or_else(|error| panic!("{context} inspection should parse: {error}"));
+    let stable = |field| {
+        inspection
+            .get(field)
+            .cloned()
+            .unwrap_or_else(|| panic!("{context} inspection should contain stable {field} state"))
+    };
+    let mut stable_profile = serde_json::json!({
+        "schema": stable("schema"),
+        "view": stable("view"),
+        "family": stable("family"),
+        "profile": stable("profile"),
+        "version": stable("version"),
+        "machine": stable("machine"),
+        "topology": stable("topology"),
+        "devices": stable("devices"),
+        "diff": stable("diff"),
+    });
+    normalize_snapshot_device_relative_timers(&mut stable_profile["devices"]);
+    let time = inspection
+        .get("time")
+        .cloned()
+        .unwrap_or_else(|| panic!("{context} inspection should contain time state"));
+    let vmgenid = time
+        .get("vmgenid")
+        .and_then(|value| value.get("range"))
+        .unwrap_or_else(|| panic!("{context} inspection should contain VMGenID range"));
+    assert!(
+        vmgenid.get("size").and_then(serde_json::Value::as_u64) == Some(16),
+        "{context} VMGenID range should remain exactly 16 bytes"
+    );
+    let vmgenid_start = vmgenid
+        .get("start")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.strip_prefix("0x"))
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
+        .unwrap_or_else(|| panic!("{context} VMGenID range should use canonical hexadecimal"));
+
+    let structural = decode_snapshot_v2_state(&state_bytes)
+        .unwrap_or_else(|error| panic!("{context} structural state should decode: {error}"));
+    let memory = load_snapshot_v2_memory_path(&structural, &artifacts.memory)
+        .unwrap_or_else(|error| panic!("{context} memory should match its state: {error}"));
+    let mut vmgenid_bytes = [0_u8; 16];
+    memory
+        .read_slice(&mut vmgenid_bytes, GuestAddress::new(vmgenid_start))
+        .unwrap_or_else(|error| panic!("{context} VMGenID memory should read: {error}"));
+    assert!(
+        vmgenid_bytes.iter().any(|byte| *byte != 0),
+        "{context} VMGenID should be nonzero"
+    );
+
+    ProductionSnapshotTimeIdentityEvidence {
+        stable_profile,
+        time,
+        vmgenid: vmgenid_bytes,
+    }
+}
+
+fn assert_production_snapshot_time_identity_transition(
+    source: &SnapshotEpochArtifactSet,
+    recaptured: &SnapshotEpochArtifactSet,
+    context: &str,
+) {
+    let source = production_snapshot_time_identity_evidence(source, context);
+    let recaptured = production_snapshot_time_identity_evidence(recaptured, context);
+    assert!(
+        source.vmgenid != recaptured.vmgenid,
+        "{context} contained restore should publish a fresh VMGenID"
+    );
+    for field in [
+        "schema", "view", "family", "profile", "version", "machine", "topology", "devices", "diff",
+    ] {
+        let source_field = source
+            .stable_profile
+            .get(field)
+            .expect("stable source profile field is constructed above");
+        let recaptured_field = recaptured
+            .stable_profile
+            .get(field)
+            .expect("stable recaptured profile field is constructed above");
+        assert!(
+            source_field == recaptured_field,
+            "{context} recapture should preserve stable {field} state; differing paths: {:?}",
+            json_difference_paths(source_field, recaptured_field)
+        );
+    }
+
+    let mut source_time = source.time;
+    let mut recaptured_time = recaptured.time;
+    for time in [&source_time, &recaptured_time] {
+        assert!(
+            time.get("rtc_restore_policy")
+                .and_then(serde_json::Value::as_str)
+                == Some("destination-system-time-reset"),
+            "{context} RTC restore policy should remain destination-time reset"
+        );
+        assert!(
+            time.get("vmgenid_restore_policy")
+                .and_then(serde_json::Value::as_str)
+                == Some("regenerate-and-notify"),
+            "{context} VMGenID restore policy should remain regenerate-and-notify"
+        );
+        assert!(
+            time.get("vmclock_restore_policy")
+                .and_then(serde_json::Value::as_str)
+                == Some("increment-and-notify"),
+            "{context} VMClock restore policy should remain increment-and-notify"
+        );
+        assert!(
+            time.get("pvtime_restore_policy")
+                .and_then(serde_json::Value::as_str)
+                == Some("preserve-cumulative-exclude-downtime"),
+            "{context} PVTime policy should continue to exclude snapshot downtime"
+        );
+        assert!(
+            time.get("vmclock_abi")
+                .and_then(|value| value.get("algorithm"))
+                .and_then(serde_json::Value::as_str)
+                == Some("sha256"),
+            "{context} VMClock inspection should use the reviewed fingerprint algorithm"
+        );
+        assert!(
+            time.get("vmclock_abi")
+                .and_then(|value| value.get("byte_length"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(112),
+            "{context} VMClock ABI should remain exactly 112 bytes"
+        );
+    }
+
+    let source_vmclock = source_time
+        .get("vmclock_abi")
+        .and_then(|value| value.get("digest"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("{context} source VMClock fingerprint should exist"));
+    let recaptured_vmclock = recaptured_time
+        .get("vmclock_abi")
+        .and_then(|value| value.get("digest"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("{context} recaptured VMClock fingerprint should exist"));
+    assert!(
+        source_vmclock != recaptured_vmclock,
+        "{context} contained restore should advance VMClock before Paused publication"
+    );
+    source_time["vmclock_abi"]["digest"] = serde_json::Value::String("<normalized>".to_owned());
+    recaptured_time["vmclock_abi"]["digest"] = serde_json::Value::String("<normalized>".to_owned());
+    assert!(
+        source_time == recaptured_time,
+        "{context} recapture should change only the reviewed VMClock ABI fingerprint in canonical time state"
     );
 }
 

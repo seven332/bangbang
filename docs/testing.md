@@ -722,7 +722,7 @@ test:
 | Rebase transaction and command behavior | `sparse_cross_directory_and_repeated_rebases_are_exact`, the complete injected race/failure/cleanup matrix, `both_commands_materialize_byte_identical_complete_images`, `sequential_commands_apply_repeated_lineage_exactly`, signal/substitution cases, and the shared 0/1/2/3/130/143 outcome tests |
 | Signed real-HVF chain | `signed_native_v2_diff_process_loads_zero_root_and_rebased_products` creates tracked and untracked layers, invokes both separately signed tools, restores a contained PCI result, and recaptures its exact predecessor |
 | Ordinary product and App Sandbox boundary | `normal_bundle_certifies_native_v2_diff_snapshot_grants_and_app_sandbox` creates and loads a tracked zero-root Diff through exact path-scoped outputs plus post-adoption replacement of every descriptor-backed source/input pathname over MMIO and PCI, describes `v2.13.0`, publishes Paused, resumes to real guest `SYSTEM_OFF`, and proves immutability and cleanup |
-| Inventory closure | `snapshot_diff_rebase_terminal_policy_is_stable` pins thirteen terminal leaves, two retained #1543 mixed aggregates, exact evidence paths, the checked ledger, and the snapshot-editor state-ledger handoff |
+| Inventory closure | `snapshot_diff_rebase_terminal_policy_is_stable` pins all fifteen terminal rows, exact evidence paths, the checked ledger, the snapshot-editor state-ledger handoff, and the Wave 6 aggregate composition |
 
 Use these focused commands while changing this surface, then run the full
 repository matrix and complete signed wrapper:
@@ -736,6 +736,38 @@ cargo test -p bangbang-hvf --lib --all-features --locked exact_minor_thirteen_di
 cargo check -p bangbang-snapshot-tools --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 scripts/run-integration-tests.sh --test native_v2_process
 scripts/run-integration-tests.sh --test production_bundle -- --exact normal_bundle_certifies_native_v2_diff_snapshot_grants_and_app_sandbox
+```
+
+### Wave 6 snapshot certification
+
+`snapshot_wave6_terminal_policy_is_stable` independently reproduces the exact
+70-record boundary: 26 API identities, the 27-record snapshot source family,
+one snapshot-version process argument, and 16 explicit producer handoffs. It
+requires 68 terminal evidence-bearing rows, retains only the two network
+aggregates for #1378/#1491, compares the exact set with
+`snapshot-wave6-contract.md`, and pins the repository totals at
+296/102/3/17.
+
+The one new product observation lives inside the existing
+`normal_bundle_certifies_native_v2_storage_epochs_over_mmio_and_pci` lifecycle.
+Immediately after each rooted/rootless x MMIO/PCI Paused destination recapture,
+`assert_production_snapshot_time_identity_transition` independently validates
+the source and recaptured state-memory bindings, requires a fresh nonzero
+VMGenID and changed exact 112-byte VMClock fingerprint, and compares every
+other canonical profile and time fact without logging confidential values.
+The device comparison normalizes only numeric limiter `age_nanos` and retry
+`remaining_nanos` values while retaining their presence/type and comparing the
+rest of the device graph exactly. The ordinary explicit resume, guest
+completion, immutability, grant, cleanup, and session assertions then continue
+unchanged.
+
+Use these focused checks while changing the Wave 6 ledger or assertion:
+
+```sh
+cargo test -p bangbang-firecracker-capability-audit --test checked_inventory snapshot_wave6_terminal_policy_is_stable --locked
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+cargo run -p bangbang-firecracker-capability-audit --locked -- compare --firecracker ../firecracker
+scripts/run-integration-tests.sh --test production_bundle -- normal_bundle_certifies_native_v2_storage_epochs_over_mmio_and_pci --exact
 ```
 
 ### Snapshot-editor state certification
@@ -2662,9 +2694,9 @@ connection exchange through the signed executable, including sustained
 bidirectional streams and multi-stream retention in both directions. They
 do not claim that bangbang can boot an arbitrary distro image through its
 default init, that full networking compatibility is complete, that RTC alarm
-interrupts, public time-state restoration outside the focused native-v2
-profile, cross-host clock portability, or broader RTC-adjacent behavior beyond
-the checked PL031/VMGenID/VMClock/PVTime contract is supported, or that full
+interrupts, KVM's ARM steal-time attribute, distinct-host clock portability,
+or broader RTC-adjacent behavior beyond the checked
+PL031/VMGenID/VMClock/PVTime contract is supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
 Exact native-v2 2.11 network/MMDS encoding, restore, and fresh clone-local
 sessions have their own signed certification; live-peer migration, external

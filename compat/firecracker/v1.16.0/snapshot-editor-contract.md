@@ -170,9 +170,10 @@ the signed certification covers current Full 2.12 and Diff 2.13 products on
 macOS Apple Silicon.
 
 `corpus:snapshot-versioning` and
-`semantic.snapshot:diff-dirty-tracking-and-memory-backends` remain
-`audit-required` under
-[#1543](https://github.com/seven332/bangbang/issues/1543). This contract does
-not claim native-v2 Uffd, external paging/backend equivalence, Firecracker
-snapshot bytes, arbitrary KVM-register editing, live-peer migration, or broad
-cross-host portability, and it does not close #1490.
+`semantic.snapshot:diff-dirty-tracking-and-memory-backends` are terminal by
+composing this state/tool evidence, the Diff/rebase evidence, and the exact
+[Wave 6 snapshot contract](snapshot-wave6-contract.md). Current native-v2
+deliberately rejects Uffd while the frozen native-v1 reader owns the reviewed
+macOS pager profile. This contract does not claim Linux UFFD equivalence,
+Firecracker snapshot bytes, arbitrary KVM-register editing, live-peer
+migration, or an untested distinct-host success pair.

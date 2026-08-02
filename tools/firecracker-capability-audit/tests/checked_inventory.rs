@@ -516,22 +516,24 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 276);
-    assert_eq!(count(Disposition::AuditRequired), 122);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 296);
+    assert_eq!(count(Disposition::AuditRequired), 102);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
 
 #[test]
 fn snapshot_diff_rebase_terminal_policy_is_stable() {
-    const TERMINAL: [&str; 13] = [
+    const TERMINAL: [&str; 15] = [
         "api-operation:PUT /snapshot/create",
         "api-path:/snapshot/create",
         "api-property:SnapshotCreateParams.mem_file_path",
         "api-property:SnapshotCreateParams.snapshot_path",
         "api-property:SnapshotCreateParams.snapshot_type",
         "api-schema:SnapshotCreateParams",
+        "corpus:snapshot-versioning",
         "firecracker-argument:snapshot-version",
+        "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
         "tool-argument:rebase-snap/base-file",
         "tool-argument:rebase-snap/diff-file",
         "tool-argument:snapshot-editor/edit-memory/rebase/diff-path",
@@ -557,17 +559,6 @@ fn snapshot_diff_rebase_terminal_policy_is_stable() {
         "tool-argument:snapshot-editor/edit-memory/rebase/memory-path",
         "tool-operation:snapshot-editor/edit-memory/rebase",
     ];
-    const RETAINED: [(&str, &str); 2] = [
-        (
-            "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
-            "https://github.com/seven332/bangbang/issues/1543",
-        ),
-        (
-            "corpus:snapshot-versioning",
-            "https://github.com/seven332/bangbang/issues/1543",
-        ),
-    ];
-
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|tools| tools.parent())
@@ -590,10 +581,7 @@ fn snapshot_diff_rebase_terminal_policy_is_stable() {
         418,
         "the checked v1.16.0 overlay identity count drifted"
     );
-    let expected_ids = TERMINAL
-        .into_iter()
-        .chain(RETAINED.iter().map(|(id, _)| *id))
-        .collect::<BTreeSet<_>>();
+    let expected_ids = TERMINAL.into_iter().collect::<BTreeSet<_>>();
     assert_eq!(expected_ids.len(), 15, "Diff/rebase ledger must stay exact");
 
     for id in TERMINAL {
@@ -682,25 +670,6 @@ fn snapshot_diff_rebase_terminal_policy_is_stable() {
         }
     }
 
-    for (id, downstream) in RETAINED {
-        let capability = by_id
-            .get(id)
-            .unwrap_or_else(|| panic!("retained Diff/rebase aggregate must exist: {id}"));
-        assert_eq!(
-            capability.disposition,
-            Disposition::AuditRequired,
-            "mixed Diff/rebase aggregate must not be promoted: {id}"
-        );
-        assert!(
-            capability.implementation.is_empty() && capability.validation.is_empty(),
-            "retained aggregate must not acquire terminal evidence: {id}"
-        );
-        assert!(
-            capability.summary.contains(downstream),
-            "retained aggregate must name its exact downstream owner: {id}"
-        );
-    }
-
     let rows = contract
         .lines()
         .filter(|line| line.starts_with("| `"))
@@ -733,19 +702,6 @@ fn snapshot_diff_rebase_terminal_policy_is_stable() {
         assert!(row.contains("`implemented-and-verified`"));
         assert!(row.ends_with("| `terminal` |"));
     }
-    for (id, downstream) in RETAINED {
-        let row_prefix = format!("| `{id}` |");
-        let row = rows
-            .iter()
-            .copied()
-            .find(|row| row.starts_with(&row_prefix))
-            .unwrap_or_else(|| panic!("retained Diff/rebase row must exist: {id}"));
-        assert_eq!(contract.matches(&row_prefix).count(), 1);
-        assert!(row.contains("`audit-required`"));
-        assert!(row.contains(downstream));
-        assert!(!row.ends_with("| `terminal` |"));
-    }
-
     for required in [
         "d83d72b710361a10294480131377b1b00b163af8",
         "src/firecracker/swagger/firecracker.yaml",
@@ -777,7 +733,7 @@ fn snapshot_diff_rebase_terminal_policy_is_stable() {
         "normal_bundle_certifies_native_v2_diff_snapshot_grants_and_app_sandbox",
         "executable_reports_native_snapshot_versions_before_socket_publication",
         "sandboxed_bundle_reports_current_native_v2_snapshot_version",
-        "https://github.com/seven332/bangbang/issues/1543",
+        "snapshot-wave6-contract.md",
     ] {
         assert!(
             contract.contains(required),
@@ -820,7 +776,7 @@ fn snapshot_editor_terminal_policy_is_stable() {
         "corpus:snapshot-editor",
         "semantic.snapshot:editor-rebase-and-inspection",
     ];
-    const RETAINED: [&str; 2] = [
+    const WAVE_6_TERMINAL: [&str; 2] = [
         "corpus:snapshot-versioning",
         "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
     ];
@@ -965,24 +921,22 @@ fn snapshot_editor_terminal_policy_is_stable() {
         );
     }
 
-    for id in RETAINED {
+    for id in WAVE_6_TERMINAL {
         let capability = by_id
             .get(id)
-            .unwrap_or_else(|| panic!("retained #1543 record must exist: {id}"));
+            .unwrap_or_else(|| panic!("Wave 6 terminal record must exist: {id}"));
         assert_eq!(
             capability.disposition,
-            Disposition::AuditRequired,
-            "#1543 record must remain nonterminal: {id}"
+            Disposition::ImplementedAndVerified,
+            "Wave 6 composed record must remain terminal: {id}"
         );
         assert!(
-            capability.implementation.is_empty() && capability.validation.is_empty(),
-            "#1543 record must not acquire terminal evidence: {id}"
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "Wave 6 composed record must retain terminal evidence: {id}"
         );
         assert!(
-            capability
-                .summary
-                .contains("https://github.com/seven332/bangbang/issues/1543"),
-            "#1543 record must retain its exact owner: {id}"
+            !capability.summary.contains("issues/1543"),
+            "Wave 6 composed record must not retain pending #1543 ownership: {id}"
         );
     }
 
@@ -1036,14 +990,266 @@ fn snapshot_editor_terminal_policy_is_stable() {
         "resumes only on request",
         "SYSTEM_OFF",
         "Firecracker bitcode",
-        "https://github.com/seven332/bangbang/issues/1543",
-        "does not close #1490",
+        "snapshot-wave6-contract.md",
     ] {
         assert!(
             contract.contains(required),
             "snapshot-editor contract must pin {required}"
         );
     }
+}
+
+#[test]
+fn snapshot_wave6_terminal_policy_is_stable() {
+    const API: [&str; 26] = [
+        "api-operation:PUT /snapshot/create",
+        "api-operation:PUT /snapshot/load",
+        "api-path:/snapshot/create",
+        "api-path:/snapshot/load",
+        "api-property:SnapshotCreateParams.mem_file_path",
+        "api-property:SnapshotCreateParams.snapshot_path",
+        "api-property:SnapshotCreateParams.snapshot_type",
+        "api-property:SnapshotLoadParams.clock_realtime",
+        "api-property:SnapshotLoadParams.enable_diff_snapshots",
+        "api-property:SnapshotLoadParams.mem_backend",
+        "api-property:SnapshotLoadParams.mem_file_path",
+        "api-property:SnapshotLoadParams.network_overrides",
+        "api-property:SnapshotLoadParams.resume_vm",
+        "api-property:SnapshotLoadParams.snapshot_path",
+        "api-property:SnapshotLoadParams.track_dirty_pages",
+        "api-property:SnapshotLoadParams.vsock_override",
+        "api-property:MemoryBackend.backend_path",
+        "api-property:MemoryBackend.backend_type",
+        "api-property:NetworkOverride.host_dev_name",
+        "api-property:NetworkOverride.iface_id",
+        "api-property:VsockOverride.uds_path",
+        "api-schema:SnapshotCreateParams",
+        "api-schema:SnapshotLoadParams",
+        "api-schema:MemoryBackend",
+        "api-schema:NetworkOverride",
+        "api-schema:VsockOverride",
+    ];
+    const SNAPSHOTS: [&str; 27] = [
+        "corpus:snapshot-editor",
+        "corpus:snapshot-network-clones",
+        "corpus:snapshot-page-faults",
+        "corpus:snapshot-random-clones",
+        "corpus:snapshot-support",
+        "corpus:snapshot-versioning",
+        "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
+        "semantic.snapshot:editor-rebase-and-inspection",
+        "semantic.snapshot:full-create-load-and-public-lifecycle",
+        "semantic.snapshot:multi-vcpu-drives-devices-and-mmds",
+        "semantic.snapshot:network-vsock-overrides-portability-and-clones",
+        "tool-argument:rebase-snap/base-file",
+        "tool-argument:rebase-snap/diff-file",
+        "tool-argument:snapshot-editor/edit-memory/rebase/diff-path",
+        "tool-argument:snapshot-editor/edit-memory/rebase/memory-path",
+        "tool-argument:snapshot-editor/edit-vmstate/remove-regs/output-path",
+        "tool-argument:snapshot-editor/edit-vmstate/remove-regs/regs",
+        "tool-argument:snapshot-editor/edit-vmstate/remove-regs/vmstate-path",
+        "tool-argument:snapshot-editor/info-vmstate/vcpu-states/vmstate-path",
+        "tool-argument:snapshot-editor/info-vmstate/version/vmstate-path",
+        "tool-argument:snapshot-editor/info-vmstate/vm-state/vmstate-path",
+        "tool-operation:rebase-snap/rebase",
+        "tool-operation:snapshot-editor/edit-memory/rebase",
+        "tool-operation:snapshot-editor/edit-vmstate/remove-regs",
+        "tool-operation:snapshot-editor/info-vmstate/vcpu-states",
+        "tool-operation:snapshot-editor/info-vmstate/version",
+        "tool-operation:snapshot-editor/info-vmstate/vm-state",
+    ];
+    const PROCESS: [&str; 1] = ["firecracker-argument:snapshot-version"];
+    const PRODUCERS: [&str; 16] = [
+        "corpus:ballooning",
+        "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
+        "corpus:memory-hotplug",
+        "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
+        "corpus:entropy",
+        "semantic.device:entropy-queues-limits-metrics-and-state",
+        "semantic.device:serial-stdin-stdout-rx-and-restore",
+        "semantic.device:rtc-vmclock-vmgenid-and-pvtime",
+        "corpus:pmem",
+        "semantic.storage:pmem-root-mapping-flush-and-state",
+        "corpus:mmds-user-guide",
+        "corpus:network-setup",
+        "semantic.mmds:tcp-token-session-and-isolation",
+        "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+        "corpus:vsock",
+        "semantic.vsock:snapshot-override-reset-and-rx-gating",
+    ];
+    const RETAINED: [(&str, &[&str]); 2] = [
+        (
+            "corpus:network-setup",
+            &["https://github.com/seven332/bangbang/issues/1378"],
+        ),
+        (
+            "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+            &[
+                "https://github.com/seven332/bangbang/issues/1378",
+                "https://github.com/seven332/bangbang/issues/1491",
+            ],
+        ),
+    ];
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let by_id = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+    let retained = RETAINED
+        .iter()
+        .map(|(id, owners)| (*id, *owners))
+        .collect::<BTreeMap<_, _>>();
+
+    let groups = [
+        API.as_slice(),
+        SNAPSHOTS.as_slice(),
+        PROCESS.as_slice(),
+        PRODUCERS.as_slice(),
+    ];
+    let mut wave_ids = BTreeSet::new();
+    for group in groups {
+        for id in group {
+            assert!(wave_ids.insert(*id), "Wave 6 identity is duplicated: {id}");
+        }
+    }
+    assert_eq!(wave_ids.len(), 70, "Wave 6 identity set must stay exact");
+    assert_eq!(retained.len(), 2, "Wave 6 retained set must stay exact");
+
+    let mut terminal_count = 0;
+    for id in &wave_ids {
+        let capability = by_id
+            .get(id)
+            .unwrap_or_else(|| panic!("Wave 6 capability must exist: {id}"));
+        if let Some(owners) = retained.get(id) {
+            assert_eq!(
+                capability.disposition,
+                Disposition::AuditRequired,
+                "downstream-owned network aggregate must remain nonterminal: {id}"
+            );
+            assert!(
+                capability.implementation.is_empty() && capability.validation.is_empty(),
+                "nonterminal network aggregate must not carry terminal evidence: {id}"
+            );
+            for owner in *owners {
+                assert!(
+                    capability.summary.contains(owner),
+                    "nonterminal network aggregate must name {owner}: {id}"
+                );
+            }
+            continue;
+        }
+
+        terminal_count += 1;
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "Wave 6 terminal disposition drifted: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "Wave 6 terminal evidence is incomplete: {id}"
+        );
+        assert!(
+            !capability.summary.contains("Audit the")
+                && !capability.summary.contains("Continue auditing")
+                && !capability.summary.contains("issues/1543"),
+            "Wave 6 terminal summary still names pending work: {id}"
+        );
+    }
+    assert_eq!(terminal_count, 68, "Wave 6 terminal count must stay exact");
+
+    let contract = std::fs::read_to_string(
+        repository_root.join("compat/firecracker/v1.16.0/snapshot-wave6-contract.md"),
+    )
+    .expect("checked Wave 6 snapshot contract must be readable");
+    let rows = contract
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 70, "Wave 6 contract row count drifted");
+    let mut contract_rows = BTreeMap::new();
+    for row in rows {
+        let id = row
+            .strip_prefix("| `")
+            .and_then(|row| row.split_once("` |"))
+            .map(|(id, _)| id)
+            .expect("Wave 6 ledger row must expose one identity");
+        assert!(
+            contract_rows.insert(id, row).is_none(),
+            "Wave 6 ledger identity is duplicated: {id}"
+        );
+    }
+    assert_eq!(
+        contract_rows.keys().copied().collect::<BTreeSet<_>>(),
+        wave_ids,
+        "Wave 6 contract identity set drifted"
+    );
+    for id in &wave_ids {
+        let row = contract_rows
+            .get(id)
+            .unwrap_or_else(|| panic!("Wave 6 contract row must exist: {id}"));
+        if let Some(owners) = retained.get(id) {
+            assert!(row.contains("`audit-required`"));
+            assert!(!row.ends_with("| `terminal` |"));
+            for owner in *owners {
+                assert!(row.contains(owner), "Wave 6 row must name {owner}: {id}");
+            }
+        } else {
+            assert!(row.contains("`implemented-and-verified`"));
+            assert!(row.ends_with("| `terminal` |"));
+        }
+    }
+
+    for required in [
+        "d83d72b710361a10294480131377b1b00b163af8",
+        "src/firecracker/swagger/firecracker.yaml",
+        "docs/snapshotting/snapshot-support.md",
+        "docs/snapshotting/versioning.md",
+        "docs/snapshotting/random-for-clones.md",
+        "docs/snapshotting/network-for-clones.md",
+        "docs/snapshotting/handling-page-faults-on-snapshot-resume.md",
+        "docs/snapshotting/snapshot-editor.md",
+        "bangbang-pager-v1",
+        "normal_bundle_certifies_native_v2_storage_epochs_over_mmio_and_pci",
+        "assert_production_snapshot_time_identity_transition",
+        "exact_minor_thirteen_diff_closes_all_sixty_four_mmio_and_pci_products",
+        "current_dynamic_add_and_remove_topologies_write_canonically",
+        "repeated_complete_application_handles_add_then_remove",
+        "diff_publication_commits_and_zero_root_loads_as_one_closed_pair",
+        "diff_load_accepts_a_complete_rebased_result_image",
+        "signed_native_v2_diff_process_loads_zero_root_and_rebased_products",
+        "normal_bundle_certifies_native_v2_diff_snapshot_grants_and_app_sandbox",
+        "zero tested distinct-physical-host success pairs",
+        "https://github.com/seven332/bangbang/issues/1378",
+        "https://github.com/seven332/bangbang/issues/1491",
+        "Wave 8",
+        "block- or per-drive-override field",
+    ] {
+        assert!(
+            contract.contains(required),
+            "Wave 6 snapshot contract must pin {required}"
+        );
+    }
+
+    let count = |disposition| {
+        inventory
+            .capabilities
+            .iter()
+            .filter(|capability| capability.disposition == disposition)
+            .count()
+    };
+    assert_eq!(count(Disposition::ImplementedAndVerified), 296);
+    assert_eq!(count(Disposition::AuditRequired), 102);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
 
 #[test]
@@ -1254,8 +1460,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 276);
-    assert_eq!(count(Disposition::AuditRequired), 122);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 296);
+    assert_eq!(count(Disposition::AuditRequired), 102);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -1403,8 +1609,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 276);
-    assert_eq!(count(Disposition::AuditRequired), 122);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 296);
+    assert_eq!(count(Disposition::AuditRequired), 102);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -1528,7 +1734,6 @@ fn delivery_closure_policy_is_stable() {
         "semantic.storage:block-sync-async-vhost-and-limits",
         "semantic.storage:pmem-root-mapping-flush-and-state",
     ];
-    const WAVE_6_ISSUE_URL: &str = "https://github.com/seven332/bangbang/issues/1490";
     const BALLOON_TERMINAL: [&str; 52] = [
         "api-operation:GET /balloon",
         "api-operation:GET /balloon/hinting/status",
@@ -1584,7 +1789,7 @@ fn delivery_closure_policy_is_stable() {
         "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
     ];
     const BALLOON_WAVE_6: [&str; 0] = [];
-    const TIME_IDENTITY_WAVE_6: [&str; 1] = ["semantic.device:rtc-vmclock-vmgenid-and-pvtime"];
+    const TIME_IDENTITY_TERMINAL: [&str; 1] = ["semantic.device:rtc-vmclock-vmgenid-and-pvtime"];
 
     const MEMORY_HOTPLUG_TERMINAL: [&str; 19] = [
         "api-operation:GET /hotplug/memory",
@@ -1674,8 +1879,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 276);
-    assert_eq!(count(Disposition::AuditRequired), 122);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 296);
+    assert_eq!(count(Disposition::AuditRequired), 102);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -2005,7 +2210,7 @@ fn delivery_closure_policy_is_stable() {
         .chain(ENTROPY_WAVE_6)
         .collect::<BTreeSet<_>>();
     let serial_ids = SERIAL_TERMINAL.into_iter().collect::<BTreeSet<_>>();
-    let time_identity_ids = TIME_IDENTITY_WAVE_6.into_iter().collect::<BTreeSet<_>>();
+    let time_identity_ids = TIME_IDENTITY_TERMINAL.into_iter().collect::<BTreeSet<_>>();
     assert_eq!(balloon_ids.len(), 52);
     assert_eq!(memory_hotplug_ids.len(), 19);
     assert_eq!(entropy_ids.len(), 7);
@@ -2060,15 +2265,15 @@ fn delivery_closure_policy_is_stable() {
         .chain(MEMORY_HOTPLUG_TERMINAL)
         .chain(ENTROPY_TERMINAL)
         .chain(SERIAL_TERMINAL)
+        .chain(TIME_IDENTITY_TERMINAL)
         .collect::<BTreeSet<_>>();
     let remaining_wave_6_ids = BALLOON_WAVE_6
         .into_iter()
         .chain(MEMORY_HOTPLUG_WAVE_6)
         .chain(ENTROPY_WAVE_6)
-        .chain(TIME_IDENTITY_WAVE_6)
         .collect::<BTreeSet<_>>();
-    assert_eq!(remaining_terminal_ids.len(), 84);
-    assert_eq!(remaining_wave_6_ids.len(), 1);
+    assert_eq!(remaining_terminal_ids.len(), 85);
+    assert_eq!(remaining_wave_6_ids.len(), 0);
     assert!(remaining_terminal_ids.is_disjoint(&remaining_wave_6_ids));
     assert_eq!(
         remaining_terminal_ids
@@ -2098,59 +2303,6 @@ fn delivery_closure_policy_is_stable() {
             "remaining-device terminal summary still names future aggregate work: {id}"
         );
     }
-    for id in &remaining_wave_6_ids {
-        let capability = by_id
-            .get(id)
-            .expect("Wave 6 remaining-device record must exist");
-        assert_eq!(
-            capability.disposition,
-            Disposition::AuditRequired,
-            "remaining-device Wave 6 disposition drifted: {id}"
-        );
-        assert!(
-            capability.summary.contains(WAVE_6_ISSUE_URL),
-            "remaining-device Wave 6 summary must name its exact issue URL: {id}"
-        );
-        if *id == TIME_IDENTITY_WAVE_6[0] {
-            for delivered in [
-                "Native-v2 2.3",
-                "repeated immutable clone restore",
-                "signed multi-vCPU restored-guest evidence",
-            ] {
-                assert!(
-                    capability.summary.contains(delivered),
-                    "time/identity Wave 6 summary must retain delivered {delivered}: {id}"
-                );
-            }
-            for remaining in [
-                "public production lifecycle composition",
-                "cross-host time-source migration/clone portability",
-            ] {
-                assert!(
-                    capability.summary.contains(remaining),
-                    "time/identity Wave 6 summary must name remaining {remaining}: {id}"
-                );
-            }
-            continue;
-        }
-        for outcome in ["restore", "portability", "signed restored-guest"] {
-            assert!(
-                capability.summary.contains(outcome),
-                "remaining-device Wave 6 summary must name missing {outcome}: {id}"
-            );
-        }
-        assert!(
-            capability.summary.contains("artifact")
-                || capability.summary.contains("native artifacts"),
-            "remaining-device Wave 6 summary must name missing artifact integration: {id}"
-        );
-        assert!(
-            capability.summary.contains("migration/clone")
-                || capability.summary.contains("repeated-clone"),
-            "remaining-device Wave 6 summary must name missing clone or migration outcomes: {id}"
-        );
-    }
-
     let ledger_contracts = [
         (
             "balloon-contract.md",
@@ -2239,17 +2391,13 @@ fn delivery_closure_policy_is_stable() {
             !row.contains("`W7`"),
             "selected row must not hand off to Wave 7: {id}"
         );
-        if remaining_terminal_ids.contains(id) {
-            assert!(row.contains("`implemented-and-verified`"));
-            assert!(row.ends_with("| `terminal` |"));
-        } else {
-            assert!(row.contains("`audit-required`"));
-            assert!(row.contains("`W6-"));
-        }
+        assert!(remaining_terminal_ids.contains(id));
+        assert!(row.contains("`implemented-and-verified`"));
+        assert!(row.ends_with("| `terminal` |"));
     }
     for required in [
-        "https://github.com/seven332/bangbang/issues/1490",
         "https://github.com/seven332/bangbang/issues/1491",
+        "snapshot-wave6-contract.md",
         "signed_executable_certifies_remaining_devices_over_mmio",
         "signed_executable_certifies_remaining_devices_over_product_pci",
         "aggregate_remaining_device_snapshot_preflight_failures_preserve_order_and_reuse",

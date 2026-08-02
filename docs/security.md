@@ -290,6 +290,13 @@ entropy, balloon, virtio-mem, network/MMDS, vsock, and an exact profile-3 graph
 of 1–64 ordered regular-file block/pmem records; Diff additionally binds the
 base, selected dirty pages, layer, and materialized result through kind 14.
 The graph may be rooted or rootless across the storage classes.
+The checked
+[Wave 6 snapshot contract](../compat/firecracker/v1.16.0/snapshot-wave6-contract.md)
+binds this complete profile, the strict load/backend schema, older readers,
+tools, time/identity, and direct/contained production evidence into one exact
+70-record ledger. It does not weaken the untrusted-input model, turn CRC or
+fingerprints into authentication/encryption, invent a per-drive load override,
+or claim a tested distinct-host success pair.
 Block records may mix access, engine, cache, partuuid, and limiter
 configuration; pmem records bind access/root/limiter, exact file/mapped
 geometry, queue/retry/interrupt, mapping, and transport state. Serial binds
@@ -2983,9 +2990,10 @@ The current scaffold does not implement:
 - privilege dropping
 - general-purpose host resource brokering beyond the fixed granted-vsock
   port-only and contained vhost-user exact-child connection facets
-- broader snapshot profiles or Firecracker artifact compatibility beyond the
-  exact contained native-v2 Full/File and Diff/File state-memory-root boundary, legacy
-  device-free native-v2 2.3 reader, and frozen native-v1 reader
+- Firecracker artifact compatibility, Linux UFFD wire identity, current
+  native-v2 Uffd, live-peer migration, artifact authentication/encryption, or
+  unconstrained cross-host portability beyond the exact Wave 6-certified
+  frozen native-v1 and native-v2 2.3–2.13 profiles
 - full external-network containment beyond the documented lifecycle-v5
   vmnet authority and MMDS-only fast path. Networkless production rejects
   positive vmnet authority before worker spawn, while an explicit vmnet profile
@@ -3005,8 +3013,8 @@ The current scaffold does not implement:
   [Snapshot Feasibility](snapshot-feasibility.md#native-v2-212-vsock-activation-and-certification).
 - log rotation, syslog, journald, tracing, remote telemetry, or process-global
   panic/fatal observability durability
-- a public serial streaming API, generalized serial artifact encoding/restore,
-  and destination-authorized endpoint reconstruction/portability policy
+- a public serial streaming API or serial behavior beyond the implemented
+  exact native-v2 2.7–2.13 destination-authorized endpoint reconstruction
 
 These are future security design and implementation topics. PRs that add new
 host-facing resources should update this document and include resource-specific
