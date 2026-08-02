@@ -78,6 +78,10 @@ fn write_test_image(
 fn canonical_binding_state_and_image_round_trip() {
     let memory = test_memory();
     let (image, binding) = write_test_image(&memory, TEST_ID);
+    assert_eq!(
+        binding.try_clone().expect("bounded clone should succeed"),
+        binding
+    );
     let encoded = binding.encode().expect("binding should encode");
     assert_eq!(binding.version(), NATIVE_V2_SNAPSHOT_VERSION);
     assert_ne!(encoded, TWO_EXTENT_BINDING_FIXTURE);

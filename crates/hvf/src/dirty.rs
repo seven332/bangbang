@@ -8,7 +8,8 @@ use bangbang_runtime::BackendError;
 use bangbang_runtime::machine::MAX_SUPPORTED_VCPUS;
 use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
 use bangbang_runtime::memory_dirty::{
-    GuestMemoryDirtyTracker, GuestMemoryDirtyTrackerAccessError, GuestMemoryDirtyTrackerError,
+    GuestMemoryDirtySnapshot, GuestMemoryDirtyTracker, GuestMemoryDirtyTrackerAccessError,
+    GuestMemoryDirtyTrackerError,
 };
 
 use crate::exit::HvfExceptionExit;
@@ -200,6 +201,41 @@ impl std::error::Error for HvfDirtyWriteTrackerStopError {
 pub enum HvfDirtyWriteTrackerQueryError {
     InvalidState(&'static str),
     AllocationFailed,
+}
+
+/// One immutable CPU-plus-host/device dirty generation observed under quiescence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfDirtyWriteSnapshot {
+    shared: GuestMemoryDirtySnapshot,
+}
+
+impl HvfDirtyWriteSnapshot {
+    /// Returns the source host-page granularity.
+    pub const fn page_size(&self) -> u64 {
+        self.shared.page_size()
+    }
+
+    /// Returns the exact shared dirty generation.
+    pub const fn epoch(&self) -> u64 {
+        self.shared.epoch()
+    }
+
+    /// Returns dirty host-page starts in ascending guest-address order.
+    pub fn pages(&self) -> &[GuestAddress] {
+        self.shared.pages()
+    }
+}
+
+impl fmt::Debug for HvfDirtyWriteSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfDirtyWriteSnapshot")
+            .field("page_size", &self.page_size())
+            .field("epoch", &self.epoch())
+            .field("pages", &"<redacted>")
+            .field("page_count", &self.pages().len())
+            .finish()
+    }
 }
 
 /// Failure while advancing one dirty generation under external quiescence.
@@ -606,6 +642,45 @@ impl HvfDirtyWriteTracker {
             })
     }
 
+    /// Snapshot one exact live dirty generation under external quiescence.
+    pub fn snapshot_quiesced(
+        &self,
+    ) -> Result<HvfDirtyWriteSnapshot, HvfDirtyWriteTrackerQueryError> {
+        let state = self.lock_query()?;
+        state.ensure_active().map_err(|source| match source {
+            HvfDirtyWriteFaultError::InvalidState(message) => {
+                HvfDirtyWriteTrackerQueryError::InvalidState(message)
+            }
+            _ => HvfDirtyWriteTrackerQueryError::InvalidState(
+                "dirty-write tracker cannot snapshot the shared generation",
+            ),
+        })?;
+        let shared = state
+            .dirty_tracker
+            .snapshot_quiesced()
+            .map_err(map_dirty_query_error)?;
+        if shared.page_size() != state.page_size {
+            return Err(HvfDirtyWriteTrackerQueryError::InvalidState(
+                "dirty bitmap page size does not match protected mappings",
+            ));
+        }
+        Ok(HvfDirtyWriteSnapshot { shared })
+    }
+
+    /// Return the current live dirty generation under external quiescence.
+    pub fn epoch_quiesced(&self) -> Result<u64, HvfDirtyWriteTrackerQueryError> {
+        let state = self.lock_query()?;
+        state.ensure_active().map_err(|source| match source {
+            HvfDirtyWriteFaultError::InvalidState(message) => {
+                HvfDirtyWriteTrackerQueryError::InvalidState(message)
+            }
+            _ => HvfDirtyWriteTrackerQueryError::InvalidState(
+                "dirty-write tracker cannot query the shared generation",
+            ),
+        })?;
+        Ok(state.dirty_tracker.epoch())
+    }
+
     pub(crate) fn register_owner(
         &self,
         member_index: usize,
@@ -905,6 +980,24 @@ impl HvfDirtyWriteTracker {
         self.state
             .lock()
             .map_err(|_| HvfDirtyWriteFaultError::InvalidState(TRACKER_LOCK_POISONED_MESSAGE))
+    }
+}
+
+fn map_dirty_query_error(
+    source: GuestMemoryDirtyTrackerAccessError,
+) -> HvfDirtyWriteTrackerQueryError {
+    match source {
+        GuestMemoryDirtyTrackerAccessError::MetadataAllocationFailed { .. } => {
+            HvfDirtyWriteTrackerQueryError::AllocationFailed
+        }
+        GuestMemoryDirtyTrackerAccessError::InvalidState(message) => {
+            HvfDirtyWriteTrackerQueryError::InvalidState(message)
+        }
+        GuestMemoryDirtyTrackerAccessError::UntrackedRange { .. } => {
+            HvfDirtyWriteTrackerQueryError::InvalidState(
+                "dirty bitmap does not cover mapped writable guest RAM",
+            )
+        }
     }
 }
 
@@ -1851,14 +1944,23 @@ mod tests {
             tracker.dirty_pages().expect("union should query"),
             [GuestAddress::new(0x30_000), GuestAddress::new(0x32_000)]
         );
+        let snapshot = tracker
+            .snapshot_quiesced()
+            .expect("union generation should snapshot");
+        assert_eq!(snapshot.page_size(), PAGE_SIZE);
+        assert_eq!(snapshot.epoch(), 0);
+        assert_eq!(
+            snapshot.pages(),
+            [GuestAddress::new(0x30_000), GuestAddress::new(0x32_000)]
+        );
+        assert!(format!("{snapshot:?}").contains("<redacted>"));
 
         assert_eq!(tracker.reset_epoch_quiesced(), Ok(1));
-        assert!(
-            tracker
-                .dirty_pages()
-                .expect("new epoch should query")
-                .is_empty()
-        );
+        let snapshot = tracker
+            .snapshot_quiesced()
+            .expect("new epoch should snapshot");
+        assert_eq!(snapshot.epoch(), 1);
+        assert!(snapshot.pages().is_empty());
         assert_eq!(
             mapper.calls().last(),
             Some(&ProtectionCall {

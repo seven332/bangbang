@@ -104,6 +104,7 @@ use bangbang_runtime::serial::{
     CaptureReadySerialState, SERIAL_RECEIVE_FIFO_CAPACITY, SerialConfig, SerialStdioInput,
     SharedSerialOutput, SharedSerialOutputBuffer,
 };
+use bangbang_runtime::snapshot_artifact::SnapshotCommitDurability;
 use bangbang_runtime::snapshot_balloon_v2_9::{
     NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2BalloonMmioHandler,
     PreparedSnapshotV2BalloonPciEndpoint, SnapshotV2BalloonMmioHandlerError,
@@ -133,6 +134,9 @@ use bangbang_runtime::snapshot_device_v2_6::{
     SnapshotV2StorageDeviceGraph, SnapshotV2StorageMmioTransportError,
     SnapshotV2StoragePciTransportError,
 };
+use bangbang_runtime::snapshot_diff_v2_13::{
+    SnapshotV2DiffBase, SnapshotV2DiffSelection, SnapshotV2DiffSelectionError,
+};
 use bangbang_runtime::snapshot_entropy_v2_8::{
     NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2EntropyMmioHandler,
     SnapshotV2EntropyMmioHandlerError, SnapshotV2EntropyPciEndpointError,
@@ -140,6 +144,10 @@ use bangbang_runtime::snapshot_entropy_v2_8::{
 };
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
+use bangbang_runtime::snapshot_lineage::{
+    LiveSnapshotLineage, LiveSnapshotLineageError, LiveSnapshotLineageTerminalCause,
+    LiveSnapshotLineageToken, LiveSnapshotPublishedResult,
+};
 use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
     NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2MemoryHotplugTopology,
     SnapshotV2MemoryHotplugControllerProjection, SnapshotV2MemoryHotplugMmioHandlerError,
@@ -230,7 +238,10 @@ use crate::backend::HvfBackend;
 use crate::coordinator::{
     HvfVcpuRunControl, HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError, HvfVcpuRunTerminalReport,
 };
-use crate::dirty::{HvfDirtyWriteEpochResetError, HvfDirtyWriteTrackerStartError};
+use crate::dirty::{
+    HvfDirtyWriteEpochResetError, HvfDirtyWriteSnapshot, HvfDirtyWriteTrackerQueryError,
+    HvfDirtyWriteTrackerStartError,
+};
 use crate::gic::{
     HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError, HvfGicInterruptLineAllocator,
     HvfGicMetadata, HvfGicMsiConfiguration, HvfGicMsiDeviceInterruptResourceError,
@@ -3500,7 +3511,7 @@ pub struct OwnedHvfArm64BootSession {
     runtime_resources: Arm64BootRuntimeResources,
     restored_snapshot_v2_mmio_registrations: Option<HvfSnapshotV2MultiBlockMmioRegistrations>,
     restored_snapshot_v2_pci_pmem_ranges: Option<Vec<GuestMemoryRange>>,
-    restored_snapshot_v2_memory_binding: Option<SnapshotV2MemoryBinding>,
+    snapshot_lineage: LiveSnapshotLineage,
     restored_snapshot_v2_machine: Option<HvfSnapshotV2MachineState>,
     cpu_template_application: Option<crate::cpu_template::HvfArm64CpuTemplateApplicationState>,
     pci_validation_endpoint: Option<HvfArm64BootPciValidationEndpoint>,
@@ -3538,6 +3549,343 @@ pub struct OwnedHvfArm64BootSession {
     vmgenid_interrupt_line: GuestInterruptLine,
     vmclock_interrupt_line: GuestInterruptLine,
     boot_registers: Option<HvfArm64BootRegisters>,
+}
+
+fn initial_dirty_epoch(runtime_resources: &Arm64BootRuntimeResources) -> Option<u64> {
+    runtime_resources
+        .machine_config
+        .track_dirty_pages()
+        .then_some(0)
+}
+
+fn fresh_snapshot_lineage(runtime_resources: &Arm64BootRuntimeResources) -> LiveSnapshotLineage {
+    initial_dirty_epoch(runtime_resources).map_or_else(
+        || LiveSnapshotLineage::unavailable(None),
+        LiveSnapshotLineage::zero,
+    )
+}
+
+fn restored_v1_snapshot_lineage(
+    runtime_resources: &Arm64BootRuntimeResources,
+) -> LiveSnapshotLineage {
+    LiveSnapshotLineage::unavailable(initial_dirty_epoch(runtime_resources))
+}
+
+fn restored_v2_snapshot_lineage(
+    binding: SnapshotV2MemoryBinding,
+    runtime_resources: &Arm64BootRuntimeResources,
+) -> LiveSnapshotLineage {
+    LiveSnapshotLineage::image(binding, initial_dirty_epoch(runtime_resources))
+}
+
+/// Prepared exact writer inputs for one dormant native-v2 Diff capture.
+pub struct HvfSnapshotV2DiffCapture {
+    token: LiveSnapshotLineageToken,
+    base: SnapshotV2DiffBase,
+    selection: SnapshotV2DiffSelection,
+}
+
+impl HvfSnapshotV2DiffCapture {
+    /// Returns the transaction authority retained by the live session.
+    pub const fn token(&self) -> LiveSnapshotLineageToken {
+        self.token
+    }
+
+    /// Returns the exact predecessor required for omitted bytes.
+    pub const fn base(&self) -> &SnapshotV2DiffBase {
+        &self.base
+    }
+
+    /// Returns the checked bounded selection for the layer writer.
+    pub const fn selection(&self) -> &SnapshotV2DiffSelection {
+        &self.selection
+    }
+
+    /// Consumes the preparation into writer-ready parts.
+    pub fn into_parts(
+        self,
+    ) -> (
+        LiveSnapshotLineageToken,
+        SnapshotV2DiffBase,
+        SnapshotV2DiffSelection,
+    ) {
+        (self.token, self.base, self.selection)
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2DiffCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2DiffCapture")
+            .field("token", &self.token)
+            .field("base", &self.base)
+            .field("selection", &self.selection)
+            .finish()
+    }
+}
+
+/// Failure while preparing or completing one owner-local live lineage step.
+#[derive(Debug)]
+pub enum HvfSnapshotLineageError {
+    DirtyQuery(HvfDirtyWriteTrackerQueryError),
+    Memory(HvfGuestMemoryMappingError),
+    Lineage(LiveSnapshotLineageError),
+    DiffSelection(SnapshotV2DiffSelectionError),
+    PublicationDurabilityUncertain,
+    DirtyEpochReset(HvfDirtyWriteEpochResetError),
+}
+
+impl fmt::Display for HvfSnapshotLineageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DirtyQuery(source) => write!(formatter, "failed to query dirty pages: {source}"),
+            Self::Memory(source) => write!(formatter, "failed to borrow guest memory: {source}"),
+            Self::Lineage(source) => write!(formatter, "invalid snapshot lineage: {source}"),
+            Self::DiffSelection(source) => {
+                write!(formatter, "invalid live Diff page selection: {source}")
+            }
+            Self::PublicationDurabilityUncertain => formatter.write_str(
+                "snapshot publication durability is uncertain; live lineage is terminal",
+            ),
+            Self::DirtyEpochReset(source) => {
+                write!(
+                    formatter,
+                    "failed to commit the published dirty epoch: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfSnapshotLineageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DirtyQuery(source) => Some(source),
+            Self::Memory(source) => Some(source),
+            Self::Lineage(source) => Some(source),
+            Self::DiffSelection(source) => Some(source),
+            Self::DirtyEpochReset(source) => Some(source),
+            Self::PublicationDurabilityUncertain => None,
+        }
+    }
+}
+
+fn complete_live_snapshot_lineage<F>(
+    lineage: &mut LiveSnapshotLineage,
+    token: LiveSnapshotLineageToken,
+    durability: SnapshotCommitDurability,
+    result_binding: Option<&SnapshotV2MemoryBinding>,
+    reset_dirty_epoch: F,
+) -> Result<(), HvfSnapshotLineageError>
+where
+    F: FnOnce() -> Result<Option<u64>, HvfDirtyWriteEpochResetError>,
+{
+    if matches!(durability, SnapshotCommitDurability::Uncertain { .. }) {
+        lineage
+            .terminalize_visible(
+                token,
+                LiveSnapshotLineageTerminalCause::PublicationDurabilityUncertain,
+            )
+            .map_err(HvfSnapshotLineageError::Lineage)?;
+        return Err(HvfSnapshotLineageError::PublicationDurabilityUncertain);
+    }
+
+    let result = match result_binding {
+        Some(binding) => match binding.try_clone() {
+            Ok(binding) => LiveSnapshotPublishedResult::NativeV2(binding),
+            Err(source) => {
+                lineage
+                    .terminalize_visible(
+                        token,
+                        LiveSnapshotLineageTerminalCause::ResultBindingUnavailable,
+                    )
+                    .map_err(HvfSnapshotLineageError::Lineage)?;
+                return Err(HvfSnapshotLineageError::Lineage(
+                    LiveSnapshotLineageError::ResultBinding(source),
+                ));
+            }
+        },
+        None => LiveSnapshotPublishedResult::NativeV1Full,
+    };
+    if let Err(source) = lineage.published_durable(token, result) {
+        let _ = lineage.terminalize_visible(
+            token,
+            LiveSnapshotLineageTerminalCause::ResultBindingUnavailable,
+        );
+        return Err(HvfSnapshotLineageError::Lineage(source));
+    }
+
+    let reset_epoch = match reset_dirty_epoch() {
+        Ok(epoch) => epoch,
+        Err(source) => {
+            lineage
+                .terminalize_visible(
+                    token,
+                    LiveSnapshotLineageTerminalCause::DirtyEpochResetFailed,
+                )
+                .map_err(HvfSnapshotLineageError::Lineage)?;
+            return Err(HvfSnapshotLineageError::DirtyEpochReset(source));
+        }
+    };
+    lineage
+        .commit_reset(token, reset_epoch)
+        .map_err(HvfSnapshotLineageError::Lineage)
+}
+
+impl OwnedHvfArm64BootSession {
+    /// Snapshot the shared CPU-plus-host/device dirty generation.
+    ///
+    /// `guard` proves that every VM, device, and auxiliary writer is excluded
+    /// across the returned value observation.
+    pub fn dirty_write_snapshot_quiesced(
+        &self,
+        _guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<Option<HvfDirtyWriteSnapshot>, HvfDirtyWriteTrackerQueryError> {
+        let snapshot = self.backend.dirty_write_snapshot_quiesced()?;
+        match (
+            self.runtime_resources.machine_config.track_dirty_pages(),
+            snapshot,
+        ) {
+            (true, Some(snapshot)) => Ok(Some(snapshot)),
+            (false, None) => Ok(None),
+            (true, None) => Err(HvfDirtyWriteTrackerQueryError::InvalidState(
+                "tracked boot session has no active dirty tracker",
+            )),
+            (false, Some(_)) => Err(HvfDirtyWriteTrackerQueryError::InvalidState(
+                "untracked boot session has an active dirty tracker",
+            )),
+        }
+    }
+
+    fn dirty_write_epoch_quiesced(
+        &self,
+        _guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<Option<u64>, HvfDirtyWriteTrackerQueryError> {
+        let epoch = self.backend.dirty_write_epoch_quiesced()?;
+        match (
+            self.runtime_resources.machine_config.track_dirty_pages(),
+            epoch,
+        ) {
+            (true, Some(epoch)) => Ok(Some(epoch)),
+            (false, None) => Ok(None),
+            (true, None) => Err(HvfDirtyWriteTrackerQueryError::InvalidState(
+                "tracked boot session has no active dirty tracker",
+            )),
+            (false, Some(_)) => Err(HvfDirtyWriteTrackerQueryError::InvalidState(
+                "untracked boot session has an active dirty tracker",
+            )),
+        }
+    }
+
+    /// Begins one actual Full publication under snapshot quiescence.
+    #[doc(hidden)]
+    pub fn begin_full_snapshot_lineage_quiesced(
+        &mut self,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<LiveSnapshotLineageToken, HvfSnapshotLineageError> {
+        let epoch = self
+            .dirty_write_epoch_quiesced(guard)
+            .map_err(HvfSnapshotLineageError::DirtyQuery)?;
+        self.snapshot_lineage
+            .begin_full(epoch)
+            .map_err(HvfSnapshotLineageError::Lineage)
+    }
+
+    /// Prepares one dormant exact-2.13 Diff base and page selection.
+    #[doc(hidden)]
+    pub fn begin_snapshot_v2_diff_quiesced(
+        &mut self,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<HvfSnapshotV2DiffCapture, HvfSnapshotLineageError> {
+        let dirty = self
+            .dirty_write_snapshot_quiesced(guard)
+            .map_err(HvfSnapshotLineageError::DirtyQuery)?;
+        let begin = self
+            .snapshot_lineage
+            .begin_diff(dirty.as_ref().map(HvfDirtyWriteSnapshot::epoch))
+            .map_err(HvfSnapshotLineageError::Lineage)?;
+        let (token, base, _) = begin.into_parts();
+        let selection = self
+            .backend
+            .mapped_guest_memory()
+            .map_err(HvfSnapshotLineageError::Memory)
+            .and_then(|memory| match &dirty {
+                Some(dirty) => SnapshotV2DiffSelection::try_from_dirty_pages(
+                    memory,
+                    dirty.page_size(),
+                    dirty.pages(),
+                )
+                .map_err(HvfSnapshotLineageError::DiffSelection),
+                None => SnapshotV2DiffSelection::all_current(memory)
+                    .map_err(HvfSnapshotLineageError::DiffSelection),
+            });
+        match selection {
+            Ok(selection) => Ok(HvfSnapshotV2DiffCapture {
+                token,
+                base,
+                selection,
+            }),
+            Err(source) => {
+                self.snapshot_lineage
+                    .abort(token)
+                    .map_err(HvfSnapshotLineageError::Lineage)?;
+                Err(source)
+            }
+        }
+    }
+
+    /// Restores the exact prior lineage after a pre-visible failure.
+    #[doc(hidden)]
+    pub fn abort_snapshot_lineage_quiesced(
+        &mut self,
+        token: LiveSnapshotLineageToken,
+        _guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<(), HvfSnapshotLineageError> {
+        self.snapshot_lineage
+            .abort(token)
+            .map_err(HvfSnapshotLineageError::Lineage)
+    }
+
+    /// Completes one visibly published result and its dirty reset atomically.
+    #[doc(hidden)]
+    pub fn complete_snapshot_lineage_publication_quiesced(
+        &mut self,
+        token: LiveSnapshotLineageToken,
+        durability: SnapshotCommitDurability,
+        result_binding: Option<&SnapshotV2MemoryBinding>,
+        _guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<(), HvfSnapshotLineageError> {
+        let tracked = self.runtime_resources.machine_config.track_dirty_pages();
+        complete_live_snapshot_lineage(
+            &mut self.snapshot_lineage,
+            token,
+            durability,
+            result_binding,
+            || {
+                if !tracked {
+                    return Ok(None);
+                }
+                self.backend
+                    .reset_dirty_epoch_quiesced()?
+                    .ok_or(HvfDirtyWriteEpochResetError::InvalidState(
+                        "tracked boot session has no active dirty tracker",
+                    ))
+                    .map(Some)
+            },
+        )
+    }
+
+    /// Returns the currently committed lineage dirty generation.
+    #[doc(hidden)]
+    pub const fn snapshot_lineage_dirty_epoch(&self) -> Option<u64> {
+        self.snapshot_lineage.current_dirty_epoch()
+    }
+
+    /// Returns whether visible ambiguity permanently ended this lineage.
+    #[doc(hidden)]
+    pub const fn snapshot_lineage_is_terminal(&self) -> bool {
+        self.snapshot_lineage.is_terminal()
+    }
 }
 
 #[derive(Debug)]
@@ -15377,21 +15725,6 @@ impl HvfArm64BootSession<'_> {
         self.backend.mapped_guest_memory()
     }
 
-    /// Advance one complete dirty generation under snapshot-ready quiescence.
-    pub fn reset_dirty_epoch_quiesced(
-        &mut self,
-    ) -> Result<Option<u64>, HvfDirtyWriteEpochResetError> {
-        if !self.runtime_resources.machine_config.track_dirty_pages() {
-            return Ok(None);
-        }
-        self.backend
-            .reset_dirty_epoch_quiesced()?
-            .ok_or(HvfDirtyWriteEpochResetError::InvalidState(
-                "tracked boot session has no active dirty tracker",
-            ))
-            .map(Some)
-    }
-
     pub fn block_interrupt_lines(&self) -> &[GuestInterruptLine] {
         &self.block_interrupt_lines
     }
@@ -18449,6 +18782,7 @@ impl OwnedHvfArm64BootSession {
             }
         };
 
+        let snapshot_lineage = fresh_snapshot_lineage(&prepared.runtime_resources);
         Ok(Self {
             runner: prepared.runner,
             backend,
@@ -18456,7 +18790,7 @@ impl OwnedHvfArm64BootSession {
             runtime_resources: prepared.runtime_resources,
             restored_snapshot_v2_mmio_registrations: None,
             restored_snapshot_v2_pci_pmem_ranges: None,
-            restored_snapshot_v2_memory_binding: None,
+            snapshot_lineage,
             restored_snapshot_v2_machine: None,
             cpu_template_application: prepared.cpu_template_application,
             pci_validation_endpoint: prepared.pci_validation_endpoint,
@@ -18731,6 +19065,8 @@ impl OwnedHvfArm64BootSession {
             pci_validation: None,
         };
 
+        let snapshot_lineage =
+            restored_v2_snapshot_lineage(parts.memory_binding, &runtime_resources);
         let mut session = Self {
             runner: parts.runner,
             backend: parts.backend,
@@ -18738,7 +19074,7 @@ impl OwnedHvfArm64BootSession {
             runtime_resources,
             restored_snapshot_v2_mmio_registrations: None,
             restored_snapshot_v2_pci_pmem_ranges: None,
-            restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
+            snapshot_lineage,
             restored_snapshot_v2_machine: Some(parts.machine),
             cpu_template_application,
             pci_validation_endpoint: None,
@@ -19523,7 +19859,7 @@ impl OwnedHvfArm64BootSession {
             }
         };
         session.network_interface_metrics = network_metrics;
-        if session.restored_snapshot_v2_memory_binding.as_ref() != Some(&expected_binding)
+        if session.restored_snapshot_v2_memory_binding() != Some(&expected_binding)
             || !session.runtime_resources.network_devices.is_empty()
             || !session.runtime_resources.pci_network_devices.is_empty()
             || session.runtime_resources.vsock_device.is_some()
@@ -20744,7 +21080,7 @@ impl OwnedHvfArm64BootSession {
                 )
         });
         if !manager_matches
-            || session.restored_snapshot_v2_memory_binding.as_ref() != Some(&expected_binding)
+            || session.restored_snapshot_v2_memory_binding() != Some(&expected_binding)
         {
             return Err(HvfSnapshotV2NetworkPciRestoreError::after_session(
                 session,
@@ -24110,6 +24446,8 @@ impl OwnedHvfArm64BootSession {
         let pmem_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let snapshot_lineage =
+            restored_v2_snapshot_lineage(parts.memory_binding, &runtime_resources);
 
         Ok(Self {
             runner: parts.runner,
@@ -24118,7 +24456,7 @@ impl OwnedHvfArm64BootSession {
             runtime_resources,
             restored_snapshot_v2_mmio_registrations: None,
             restored_snapshot_v2_pci_pmem_ranges: None,
-            restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
+            snapshot_lineage,
             restored_snapshot_v2_machine: Some(parts.machine),
             cpu_template_application,
             pci_validation_endpoint: None,
@@ -24474,6 +24812,8 @@ impl OwnedHvfArm64BootSession {
         let pmem_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let snapshot_lineage =
+            restored_v2_snapshot_lineage(parts.memory_binding, &runtime_resources);
         let session = Self {
             runner: parts.runner,
             backend: parts.backend,
@@ -24487,7 +24827,7 @@ impl OwnedHvfArm64BootSession {
                 },
             ),
             restored_snapshot_v2_pci_pmem_ranges: None,
-            restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
+            snapshot_lineage,
             restored_snapshot_v2_machine: Some(parts.machine),
             cpu_template_application,
             pci_validation_endpoint: None,
@@ -25327,6 +25667,8 @@ impl OwnedHvfArm64BootSession {
         };
         let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let snapshot_lineage =
+            restored_v2_snapshot_lineage(parts.memory_binding, &runtime_resources);
         let session = Self {
             runner: parts.runner,
             backend: parts.backend,
@@ -25340,7 +25682,7 @@ impl OwnedHvfArm64BootSession {
                 },
             ),
             restored_snapshot_v2_pci_pmem_ranges: None,
-            restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
+            snapshot_lineage,
             restored_snapshot_v2_machine: Some(parts.machine),
             cpu_template_application,
             pci_validation_endpoint: None,
@@ -26735,6 +27077,8 @@ impl OwnedHvfArm64BootSession {
             .map_or_else(SharedVsockDeviceMetrics::default, |vsock| {
                 vsock.metrics.clone()
             });
+        let snapshot_lineage =
+            restored_v2_snapshot_lineage(parts.memory_binding, &runtime_resources);
         let session = Self {
             runner: parts.runner,
             backend: parts.backend,
@@ -26742,7 +27086,7 @@ impl OwnedHvfArm64BootSession {
             runtime_resources,
             restored_snapshot_v2_mmio_registrations: None,
             restored_snapshot_v2_pci_pmem_ranges: Some(pmem_ranges),
-            restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
+            snapshot_lineage,
             restored_snapshot_v2_machine: Some(parts.machine),
             cpu_template_application,
             pci_validation_endpoint: None,
@@ -27464,6 +27808,8 @@ impl OwnedHvfArm64BootSession {
         let pmem_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let snapshot_lineage =
+            restored_v2_snapshot_lineage(parts.memory_binding, &runtime_resources);
         let session = Self {
             runner: parts.runner,
             backend: parts.backend,
@@ -27471,7 +27817,7 @@ impl OwnedHvfArm64BootSession {
             runtime_resources,
             restored_snapshot_v2_mmio_registrations: None,
             restored_snapshot_v2_pci_pmem_ranges: None,
-            restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
+            snapshot_lineage,
             restored_snapshot_v2_machine: Some(parts.machine),
             cpu_template_application,
             pci_validation_endpoint: None,
@@ -27805,6 +28151,7 @@ impl OwnedHvfArm64BootSession {
         let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         let pmem_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let snapshot_lineage = restored_v1_snapshot_lineage(&runtime_resources);
         let session = Self {
             runner,
             backend,
@@ -27812,7 +28159,7 @@ impl OwnedHvfArm64BootSession {
             runtime_resources,
             restored_snapshot_v2_mmio_registrations: None,
             restored_snapshot_v2_pci_pmem_ranges: None,
-            restored_snapshot_v2_memory_binding: None,
+            snapshot_lineage,
             restored_snapshot_v2_machine: None,
             cpu_template_application: None,
             pci_validation_endpoint: None,
@@ -28503,7 +28850,7 @@ impl OwnedHvfArm64BootSession {
     /// owner until the next complete recapture replaces it.
     #[doc(hidden)]
     pub const fn restored_snapshot_v2_memory_binding(&self) -> Option<&SnapshotV2MemoryBinding> {
-        self.restored_snapshot_v2_memory_binding.as_ref()
+        self.snapshot_lineage.current_image_binding()
     }
 
     /// Returns the inert source machine component retained by a native-v2
@@ -29269,21 +29616,6 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
         self.backend.mapped_guest_memory()
-    }
-
-    /// Advance one complete dirty generation under snapshot-ready quiescence.
-    pub fn reset_dirty_epoch_quiesced(
-        &mut self,
-    ) -> Result<Option<u64>, HvfDirtyWriteEpochResetError> {
-        if !self.runtime_resources.machine_config.track_dirty_pages() {
-            return Ok(None);
-        }
-        self.backend
-            .reset_dirty_epoch_quiesced()?
-            .ok_or(HvfDirtyWriteEpochResetError::InvalidState(
-                "tracked boot session has no active dirty tracker",
-            ))
-            .map(Some)
     }
 
     pub fn block_interrupt_lines(&self) -> &[GuestInterruptLine] {
@@ -36882,6 +37214,7 @@ fn allocate_interrupt_lines(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::error::Error as _;
     use std::fs::{self, File, OpenOptions};
@@ -36966,7 +37299,13 @@ mod tests {
         SerialMmioCaptureStateParts, SerialMmioDevice, SerialMmioState, SerialStdio,
         SharedSerialOutput, SharedSerialOutputBuffer,
     };
+    use bangbang_runtime::snapshot_artifact::{
+        SnapshotCommitDurability, SnapshotCommitDurability::Durable,
+    };
     use bangbang_runtime::snapshot_device::SnapshotV1BlockRetryState;
+    use bangbang_runtime::snapshot_lineage::{
+        LiveSnapshotLineage, LiveSnapshotLineageTerminalCause,
+    };
     use bangbang_runtime::startup::{
         ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonNotificationDispatches,
         Arm64BootBlockNotificationDispatches, Arm64BootEntropyDeviceConfig,
@@ -37019,10 +37358,11 @@ mod tests {
         HvfArm64BootStorageCaptureErrorKind, HvfArm64BootTimeIdentityRestoreError,
         HvfArm64BootTimerDeviceConfig, HvfArm64BootVmClockRestoreError,
         HvfArm64BootVmGenIdRestoreError, HvfArm64BootVsockNotificationDispatchError,
-        PCI_ENDPOINT_SLOT_COUNT, allocate_interrupt_lines, capture_hvf_snapshot_v2_time_state,
-        collect_balloon_notification_dispatches, collect_block_notification_dispatches,
-        collect_entropy_notification_dispatches, collect_memory_hotplug_notification_dispatches,
-        collect_network_notification_dispatches, collect_vsock_notification_dispatches,
+        HvfSnapshotLineageError, PCI_ENDPOINT_SLOT_COUNT, allocate_interrupt_lines,
+        capture_hvf_snapshot_v2_time_state, collect_balloon_notification_dispatches,
+        collect_block_notification_dispatches, collect_entropy_notification_dispatches,
+        collect_memory_hotplug_notification_dispatches, collect_network_notification_dispatches,
+        collect_vsock_notification_dispatches, complete_live_snapshot_lineage,
         dispatch_memory_hotplug_runtime_notifications_with_executor,
         dispatch_network_runtime_notifications_with_packet_io, dispatch_serial_input_with,
         lock_boot_mmio_dispatcher, lock_boot_mmio_dispatcher_runtime,
@@ -37043,6 +37383,7 @@ mod tests {
         update_memory_hotplug_requested_size_and_signal_interrupt, update_vmclock_and_signal_with,
     };
     use crate::coordinator::HvfVcpuRunCoordinator;
+    use crate::dirty::HvfDirtyWriteEpochResetError;
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
         HvfSys64Exit,
@@ -37060,6 +37401,89 @@ mod tests {
     const TEST_MEMORY_MIB: u64 = 8;
     const ARM64_IMAGE_HEADER_SIZE: usize = 64;
     const ARM64_IMAGE_TEXT_OFFSET_OFFSET: usize = 8;
+
+    #[test]
+    fn live_lineage_requires_durability_before_reset_and_commits_one_epoch() {
+        let mut uncertain = LiveSnapshotLineage::zero(0);
+        let token = uncertain
+            .begin_full(Some(0))
+            .expect("uncertain Full should begin");
+        let reset_called = Cell::new(false);
+        assert!(matches!(
+            complete_live_snapshot_lineage(
+                &mut uncertain,
+                token,
+                SnapshotCommitDurability::Uncertain {
+                    kind: io::ErrorKind::Other,
+                },
+                None,
+                || {
+                    reset_called.set(true);
+                    Ok(Some(1))
+                },
+            ),
+            Err(HvfSnapshotLineageError::PublicationDurabilityUncertain)
+        ));
+        assert!(!reset_called.get());
+        assert_eq!(
+            uncertain.terminal_cause(),
+            Some(LiveSnapshotLineageTerminalCause::PublicationDurabilityUncertain)
+        );
+
+        let mut durable = LiveSnapshotLineage::zero(4);
+        let token = durable
+            .begin_full(Some(4))
+            .expect("durable Full should begin");
+        let reset_called = Cell::new(false);
+        complete_live_snapshot_lineage(&mut durable, token, Durable, None, || {
+            reset_called.set(true);
+            Ok(Some(5))
+        })
+        .expect("durable publication and reset should commit");
+        assert!(reset_called.get());
+        assert_eq!(durable.current_dirty_epoch(), Some(5));
+        assert!(durable.current_image_binding().is_none());
+        assert!(!durable.is_terminal());
+    }
+
+    #[test]
+    fn live_lineage_terminalizes_every_post_visibility_reset_error() {
+        let mut allocation = LiveSnapshotLineage::zero(0);
+        let token = allocation
+            .begin_full(Some(0))
+            .expect("allocation case should begin");
+        assert!(matches!(
+            complete_live_snapshot_lineage(&mut allocation, token, Durable, None, || {
+                Err(HvfDirtyWriteEpochResetError::AllocationFailed)
+            }),
+            Err(HvfSnapshotLineageError::DirtyEpochReset(
+                HvfDirtyWriteEpochResetError::AllocationFailed
+            ))
+        ));
+        assert_eq!(
+            allocation.terminal_cause(),
+            Some(LiveSnapshotLineageTerminalCause::DirtyEpochResetFailed)
+        );
+
+        let mut invalid = LiveSnapshotLineage::zero(0);
+        let token = invalid
+            .begin_full(Some(0))
+            .expect("invalid-state case should begin");
+        assert!(matches!(
+            complete_live_snapshot_lineage(&mut invalid, token, Durable, None, || {
+                Err(HvfDirtyWriteEpochResetError::InvalidState(
+                    "injected reset failure",
+                ))
+            }),
+            Err(HvfSnapshotLineageError::DirtyEpochReset(
+                HvfDirtyWriteEpochResetError::InvalidState(_)
+            ))
+        ));
+        assert_eq!(
+            invalid.terminal_cause(),
+            Some(LiveSnapshotLineageTerminalCause::DirtyEpochResetFailed)
+        );
+    }
 
     #[derive(Debug)]
     struct UnusedUnpublishedPciInterrupt;

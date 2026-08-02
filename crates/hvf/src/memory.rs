@@ -26,8 +26,9 @@ use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
 };
 
 use crate::dirty::{
-    HvfDirtyWriteEpochResetError, HvfDirtyWriteMappingMutationError, HvfDirtyWriteTracker,
-    HvfDirtyWriteTrackerStartError, HvfDirtyWriteTrackerStopError,
+    HvfDirtyWriteEpochResetError, HvfDirtyWriteMappingMutationError, HvfDirtyWriteSnapshot,
+    HvfDirtyWriteTracker, HvfDirtyWriteTrackerQueryError, HvfDirtyWriteTrackerStartError,
+    HvfDirtyWriteTrackerStopError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1694,6 +1695,18 @@ impl HvfGuestMemoryMapping {
         self.state.reset_dirty_epoch_quiesced()
     }
 
+    pub(crate) fn dirty_write_snapshot_quiesced(
+        &self,
+    ) -> Result<Option<HvfDirtyWriteSnapshot>, HvfDirtyWriteTrackerQueryError> {
+        self.state.dirty_write_snapshot_quiesced()
+    }
+
+    pub(crate) fn dirty_write_epoch_quiesced(
+        &self,
+    ) -> Result<Option<u64>, HvfDirtyWriteTrackerQueryError> {
+        self.state.dirty_write_epoch_quiesced()
+    }
+
     pub(crate) fn active_dirty_write_tracker(
         &self,
     ) -> Result<Option<Arc<HvfDirtyWriteTracker>>, BackendError> {
@@ -1863,6 +1876,32 @@ impl HvfGuestMemoryMappingState {
                 Err(source)
             }
         }
+    }
+
+    fn dirty_write_snapshot_quiesced(
+        &self,
+    ) -> Result<Option<HvfDirtyWriteSnapshot>, HvfDirtyWriteTrackerQueryError> {
+        if self.protection_poisoned {
+            return Err(HvfDirtyWriteTrackerQueryError::InvalidState(
+                "guest memory protection rollback requires VM teardown",
+            ));
+        }
+        self.dirty_write_tracker
+            .as_ref()
+            .map(|tracker| tracker.snapshot_quiesced())
+            .transpose()
+    }
+
+    fn dirty_write_epoch_quiesced(&self) -> Result<Option<u64>, HvfDirtyWriteTrackerQueryError> {
+        if self.protection_poisoned {
+            return Err(HvfDirtyWriteTrackerQueryError::InvalidState(
+                "guest memory protection rollback requires VM teardown",
+            ));
+        }
+        self.dirty_write_tracker
+            .as_ref()
+            .map(|tracker| tracker.epoch_quiesced())
+            .transpose()
     }
 
     fn active_dirty_write_tracker(
@@ -5050,7 +5089,10 @@ mod tests {
             Some(HvfMemoryPermissions::new(true, false, true))
         );
         assert_eq!(
-            tracker.dirty_pages().expect("new dynamic RAM should query"),
+            tracker
+                .snapshot_quiesced()
+                .expect("new dynamic RAM generation should snapshot")
+                .pages(),
             vec![live_range.start()]
         );
         mapping
@@ -5058,8 +5100,9 @@ mod tests {
             .expect("tracked live RAM should unmap");
         assert!(
             tracker
-                .dirty_pages()
-                .expect("removed dynamic RAM should leave no dirty page")
+                .snapshot_quiesced()
+                .expect("removed dynamic RAM generation should snapshot")
+                .pages()
                 .is_empty()
         );
         mapping
@@ -5345,8 +5388,9 @@ mod tests {
             .expect("fresh tracked addition should remain retryable");
         assert_eq!(
             tracker
-                .dirty_pages()
-                .expect("successful addition should be wholly dirty"),
+                .snapshot_quiesced()
+                .expect("successful addition should snapshot")
+                .pages(),
             vec![live_range.start()]
         );
 
@@ -5361,8 +5405,9 @@ mod tests {
         );
         assert_eq!(
             tracker
-                .dirty_pages()
-                .expect("failed unmap should retain old epoch metadata"),
+                .snapshot_quiesced()
+                .expect("failed unmap should retain old epoch snapshot")
+                .pages(),
             vec![live_range.start()]
         );
 
@@ -5372,8 +5417,9 @@ mod tests {
             .expect("tracked unmap should retry after mapper recovery");
         assert!(
             tracker
-                .dirty_pages()
-                .expect("successful removal should drop dirty metadata")
+                .snapshot_quiesced()
+                .expect("successful removal should snapshot")
+                .pages()
                 .is_empty()
         );
         mapping.unmap_all().expect("mapping should shut down");

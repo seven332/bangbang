@@ -6,8 +6,8 @@ use bangbang_runtime::pmem::PreparedPmemDevice;
 use bangbang_runtime::{BackendError, VmBackend};
 
 use crate::dirty::{
-    HvfDirtyWriteEpochResetError, HvfDirtyWriteTracker, HvfDirtyWriteTrackerStartError,
-    HvfDirtyWriteTrackerStopError,
+    HvfDirtyWriteEpochResetError, HvfDirtyWriteSnapshot, HvfDirtyWriteTracker,
+    HvfDirtyWriteTrackerQueryError, HvfDirtyWriteTrackerStartError, HvfDirtyWriteTrackerStopError,
 };
 use crate::gic::{
     HvfGicCreator, HvfGicError, HvfGicMetadata, HvfGicMsiConfiguration, HvfGicMsiSignaler,
@@ -275,6 +275,23 @@ impl HvfBackend {
             return Ok(None);
         };
         mapping.reset_dirty_epoch_quiesced()
+    }
+
+    pub(crate) fn dirty_write_snapshot_quiesced(
+        &self,
+    ) -> Result<Option<HvfDirtyWriteSnapshot>, HvfDirtyWriteTrackerQueryError> {
+        self.guest_memory.as_ref().map_or(
+            Ok(None),
+            HvfGuestMemoryMapping::dirty_write_snapshot_quiesced,
+        )
+    }
+
+    pub(crate) fn dirty_write_epoch_quiesced(
+        &self,
+    ) -> Result<Option<u64>, HvfDirtyWriteTrackerQueryError> {
+        self.guest_memory
+            .as_ref()
+            .map_or(Ok(None), HvfGuestMemoryMapping::dirty_write_epoch_quiesced)
     }
 
     pub(crate) fn mapped_guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
