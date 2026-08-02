@@ -53,7 +53,7 @@ tools/firecracker-capability-audit
                   Checked Firecracker source/capability inventory validator
 tools/seccompiler Firecracker-compatible offline seccompiler artifact tool
 tools/snapshot-tools
-                  Firecracker-shaped native-v2 memory rebase commands
+                  Firecracker-shaped native memory rebase, inspection, and reviewed editing
 compat/firecracker/v1.16.0
                   Pinned v1.16.0 manifest, overlay, and closure ledgers
 ```
@@ -96,8 +96,9 @@ curl --unix-socket /tmp/bangbang.socket \
 Run `cargo run -p bangbang -- --help` for the accepted process arguments. The
 canonical option semantics, API state model, endpoint behavior, and exit status
 are in the [compatibility document](docs/firecracker-compatibility.md#process-startup-cli).
-The two snapshot rebase command surfaces and their transaction contract are in
-[Snapshot Rebase Tools](docs/firecracker-compatibility.md#snapshot-rebase-tools).
+The snapshot rebase, deterministic state-inspection, and reviewed register-edit
+surfaces are in [Snapshot Rebase Tools](docs/firecracker-compatibility.md#snapshot-rebase-tools)
+and [Snapshot State Inspection and Reviewed Editing](docs/firecracker-compatibility.md#snapshot-state-inspection-and-reviewed-editing).
 
 ## Production macOS Bundle
 

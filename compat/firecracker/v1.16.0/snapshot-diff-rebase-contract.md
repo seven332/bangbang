@@ -1,11 +1,16 @@
 # Firecracker v1.16.0 Diff and rebase closure contract
 
-This is the checked closure ledger for the 17 Firecracker v1.16.0 identities
+This is the checked closure ledger for the 15 Firecracker v1.16.0 identities
 selected by bangbang's native-v2 differential snapshot and public rebase-tool
-delivery. Thirteen exact leaves are `implemented-and-verified`; four mixed
+delivery. Thirteen exact leaves are `implemented-and-verified`; two mixed
 aggregates remain `audit-required` for their named downstream owners. The
 immutable upstream baseline is Firecracker commit
 `d83d72b710361a10294480131377b1b00b163af8`.
+
+The two snapshot-editor state aggregates formerly retained here are now
+terminal in the checked
+[snapshot-editor state contract](snapshot-editor-contract.md). This ledger
+continues to own only the Diff/create/version/rebase identities below.
 
 ## Evidence keys
 
@@ -87,7 +92,7 @@ immutable upstream baseline is Firecracker commit
   `sandboxed_bundle_reports_current_native_v2_snapshot_version` pin the direct
   and production App Sandbox command result.
 
-## Exact 17-record ledger
+## Exact 15-record ledger
 
 | Identity | Disposition | Upstream | Implementation | Portable/core validation | Process/signed validation | Downstream |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -105,8 +110,6 @@ immutable upstream baseline is Firecracker commit
 | `tool-operation:rebase-snap/rebase` | `implemented-and-verified` | `FC-REBASE` | `LOCAL-TOOLS + LOCAL-REBASE` | `REBASE-CORE` | `TOOLS-PROCESS + SIGNED-DIFF` | `terminal` |
 | `tool-operation:snapshot-editor/edit-memory/rebase` | `implemented-and-verified` | `FC-REBASE` | `LOCAL-TOOLS + LOCAL-REBASE` | `REBASE-CORE` | `TOOLS-PROCESS + SIGNED-DIFF` | `terminal` |
 | `semantic.snapshot:diff-dirty-tracking-and-memory-backends` | `audit-required` | `FC-DIFF` | `LOCAL-DIFF subset` | `DIFF-PORTABLE` | `SIGNED-DIFF + PRODUCTION-DIFF` | [#1543](https://github.com/seven332/bangbang/issues/1543) |
-| `semantic.snapshot:editor-rebase-and-inspection` | `audit-required` | `FC-REBASE` | `LOCAL-TOOLS + LOCAL-REBASE subset` | `REBASE-CORE` | `TOOLS-PROCESS + SIGNED-DIFF` | [#1542](https://github.com/seven332/bangbang/issues/1542) |
-| `corpus:snapshot-editor` | `audit-required` | `FC-REBASE subset` | `LOCAL-TOOLS + LOCAL-REBASE subset` | `REBASE-CORE` | `TOOLS-PROCESS + SIGNED-DIFF` | [#1542](https://github.com/seven332/bangbang/issues/1542) |
 | `corpus:snapshot-versioning` | `audit-required` | `FC-DIFF + FC-REBASE subset` | `LOCAL-DIFF + LOCAL-TOOLS + LOCAL-REBASE subset` | `DIFF-PORTABLE + REBASE-CORE` | `TOOLS-PROCESS + SIGNED-DIFF + PRODUCTION-DIFF` | [#1543](https://github.com/seven332/bangbang/issues/1543) |
 
 ## Observable native-v2 Diff contract
@@ -135,8 +138,10 @@ immutable upstream baseline is Firecracker commit
 - `rebase-snap --base-file <path> --diff-file <path>` accepts only the two
   required long options. It prints exactly: “This tool is deprecated and will be removed in the future. Please use 'snapshot-editor' instead.”
 - `snapshot-editor edit-memory rebase --memory-path <path> --diff-path <path>`
-  is the replacement. `-m` and `-d` are exact aliases; unrelated editor
-  inspection and VM-state/register commands are not implemented here.
+  is the replacement. `-m` and `-d` are exact aliases. Editor inspection and
+  VM-state/register commands are certified separately by the
+  [snapshot-editor state contract](snapshot-editor-contract.md); they are not
+  part of this rebase ledger.
 - Both frontends invoke the same macOS-only transaction. Unsupported targets
   reject before path access. Success is exit 0; operational failure is 1;
   Clap syntax/configuration failure is 2; committed-but-uncertain completion
@@ -152,10 +157,11 @@ immutable upstream baseline is Firecracker commit
 
 ## Retained boundaries
 
-The four mixed ledger rows remain open by design. #1542 owns snapshot-editor
-inspection, VM-state/register editing, and architecture-specific editing.
-#1543 owns broad snapshot-version, dirty-memory-backend, native-v2 Uffd,
-Firecracker-byte, external-paging, cross-host, and full 70-record certification.
-No terminal row here claims live-peer preservation, state merging, Linux/KVM
-dirty-bitmap mechanics, Linux sparse-byte compatibility, or broader tool and
-artifact portability.
+The two mixed ledger rows remain open by design. #1543 owns broad
+snapshot-version, dirty-memory-backend, native-v2 Uffd, Firecracker-byte,
+external-paging, cross-host, and full 70-record certification. Snapshot-editor
+inspection, VM-state/register editing, and the two mixed editor aggregates are
+terminal only in the separate twelve-record state contract. No terminal row
+here claims live-peer preservation, state merging, Linux/KVM dirty-bitmap
+mechanics, Linux sparse-byte compatibility, or broader tool and artifact
+portability.

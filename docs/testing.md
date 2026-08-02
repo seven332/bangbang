@@ -679,11 +679,14 @@ scripts/run-integration-tests.sh --test native_v2_process
 ```
 
 The wrapper builds the `bangbang` binary unit-test harness, locates and signs
-that exact test executable, then builds, separately signs, and verifies the
-`rebase-snap` and `snapshot-editor` binaries. Only the exact Diff seam receives
-their fixed test-only paths through `BANGBANG_REBASE_SNAP_PATH` and
-`BANGBANG_SNAPSHOT_EDITOR_PATH`; other private seams receive no tool
-activation. Its minimal two-vCPU guest does not touch serial or optional
+that exact test executable. One idempotent helper also builds, separately
+signs, and strictly verifies the `rebase-snap` and `snapshot-editor` binaries
+whenever either `native_v2_process` or `production_bundle` requires them, so a
+targeted production selection has no hidden group-order dependency. Only the
+exact private Diff seam receives both fixed test-only paths through
+`BANGBANG_REBASE_SNAP_PATH` and `BANGBANG_SNAPSHOT_EDITOR_PATH`; production
+bundle tests receive the signed editor path for their real product evidence.
+Other private seams receive no tool activation. Its minimal two-vCPU guest does not touch serial or optional
 devices beyond the required read-only root. The first test starts and pauses the real
 process-owned HVF supervisor, publishes one exact 2.12 Full
 serial-plus-profile-3 MMIO-root pair without entropy, resumes and repauses the
@@ -719,7 +722,7 @@ test:
 | Rebase transaction and command behavior | `sparse_cross_directory_and_repeated_rebases_are_exact`, the complete injected race/failure/cleanup matrix, `both_commands_materialize_byte_identical_complete_images`, `sequential_commands_apply_repeated_lineage_exactly`, signal/substitution cases, and the shared 0/1/2/3/130/143 outcome tests |
 | Signed real-HVF chain | `signed_native_v2_diff_process_loads_zero_root_and_rebased_products` creates tracked and untracked layers, invokes both separately signed tools, restores a contained PCI result, and recaptures its exact predecessor |
 | Ordinary product and App Sandbox boundary | `normal_bundle_certifies_native_v2_diff_snapshot_grants_and_app_sandbox` creates and loads a tracked zero-root Diff through exact path-scoped outputs plus post-adoption replacement of every descriptor-backed source/input pathname over MMIO and PCI, describes `v2.13.0`, publishes Paused, resumes to real guest `SYSTEM_OFF`, and proves immutability and cleanup |
-| Inventory closure | `snapshot_diff_rebase_terminal_policy_is_stable` pins thirteen terminal leaves, four retained mixed aggregates, exact evidence paths, the checked ledger, and #1542/#1543 ownership |
+| Inventory closure | `snapshot_diff_rebase_terminal_policy_is_stable` pins thirteen terminal leaves, two retained #1543 mixed aggregates, exact evidence paths, the checked ledger, and the snapshot-editor state-ledger handoff |
 
 Use these focused commands while changing this surface, then run the full
 repository matrix and complete signed wrapper:
@@ -734,6 +737,48 @@ cargo check -p bangbang-snapshot-tools --all-targets --all-features --locked --t
 scripts/run-integration-tests.sh --test native_v2_process
 scripts/run-integration-tests.sh --test production_bundle -- --exact normal_bundle_certifies_native_v2_diff_snapshot_grants_and_app_sandbox
 ```
+
+### Snapshot-editor state certification
+
+The state commands have a separate twelve-record closure rather than extending
+the memory-rebase ledger. Unit and actual-binary layers cover every admitted
+native profile, the deterministic redacted JSON schema, exact 67-ID request
+admission, canonical profile-preserving transformation, immutable inputs,
+owner-only no-clobber output, all path/content/parent races, injected failures,
+signals, stream closure, staging cleanup, and durable-versus-uncertain exits.
+
+The signed product layer reuses the existing real snapshot lifecycle instead
+of composing unrelated artifacts. For Full 2.12 and Diff 2.13, and for both
+MMIO and PCI, the actual supplied editor runs `version`, `vcpu-states`, and
+`vm-state` twice, removes DBGBVR0 value ID `0x6030000000138004` exactly once,
+and reinspects the distinct output. The test compares the complete JSON after
+normalizing only `vcpus[*].debug.reviewed`, pins exact profile, transport,
+memory, and Diff relationships, and proves original bytes/inode facts,
+owner-only output, and zero staging residue. It then passes only the edited
+state plus unchanged memory/layer and drives through retained launcher grants,
+replaces every adopted pathname, observes Paused, explicitly resumes, reaches
+guest `SYSTEM_OFF`, and rechecks both original and adopted artifacts.
+
+The targeted `production_bundle` group independently builds, ad-hoc signs,
+verifies with `codesign --verify --strict`, and supplies the editor; running
+`native_v2_process` first is neither required nor sufficient. Use:
+
+```sh
+cargo test -p bangbang-firecracker-capability-audit --test checked_inventory snapshot_editor_terminal_policy_is_stable --locked
+cargo test -p bangbang-snapshot-tools --all-targets --all-features --locked
+cargo test -p bangbang-runtime snapshot_state_edit --all-features --locked
+cargo test -p bangbang-hvf --lib --all-features --locked snapshot_document::inspection
+cargo test -p bangbang-hvf --lib --all-features --locked snapshot_document::register_removal
+cargo check -p bangbang-snapshot-tools --all-targets --all-features --locked --target aarch64-unknown-linux-musl
+scripts/run-integration-tests.sh --test production_bundle -- --exact normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restore
+scripts/run-integration-tests.sh --test production_bundle -- --exact normal_bundle_certifies_native_v2_diff_snapshot_grants_and_app_sandbox
+```
+
+The canonical evidence map and deliberate Firecracker-byte/KVM-vector
+differences are in the checked
+[snapshot-editor state contract](../compat/firecracker/v1.16.0/snapshot-editor-contract.md).
+These focused commands do not replace the full repository gate or the complete
+no-skip signed wrapper.
 
 ### Native-v2 2.5 compatibility transaction failure matrix
 

@@ -235,6 +235,8 @@ build_production_bundle_tests() {
     exit 1
   fi
 
+  build_signed_snapshot_tools
+
   cargo build \
     -p bangbang \
     -p bangbang-launcher \
@@ -334,58 +336,17 @@ build_executable_hvf_e2e() {
     --no-run
 }
 
-build_native_v2_process_test() {
-  local cargo_messages="$tmp_dir/cargo-test-native-v2-process.json"
-  local test_bins_file="$tmp_dir/test-bins-native-v2-process"
-  local snapshot_tools_messages="$tmp_dir/cargo-build-snapshot-tools.json"
-  local snapshot_tools_bins_file="$tmp_dir/snapshot-tools-bins"
-
-  cargo test \
-    -p bangbang \
-    --bin bangbang \
-    --all-features \
-    --locked \
-    --target "$target_triple" \
-    --no-run \
-    --message-format=json \
-    > "$cargo_messages"
-
-  python3 - "$cargo_messages" > "$test_bins_file" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as messages:
-    for line in messages:
-        message = json.loads(line)
-        target = message.get("target", {})
-        executable = message.get("executable")
-
-        if (
-            message.get("reason") == "compiler-artifact"
-            and executable is not None
-            and target.get("name") == "bangbang"
-            and "bin" in target.get("kind", [])
-            and message.get("profile", {}).get("test") is True
-        ):
-            sys.stdout.write(executable)
-            sys.stdout.write("\0")
-PY
-
-  local test_bins=()
-  local test_bin
-  while IFS= read -r -d "" test_bin; do
-    if [[ -n "$test_bin" ]]; then
-      test_bins+=("$test_bin")
+build_signed_snapshot_tools() {
+  if [[ -n "$snapshot_rebase_snap_bin" || -n "$snapshot_editor_bin" ]]; then
+    if [[ -x "$snapshot_rebase_snap_bin" && -x "$snapshot_editor_bin" ]]; then
+      return
     fi
-  done < "$test_bins_file"
-
-  if [[ "${#test_bins[@]}" -ne 1 ]]; then
-    echo "failed to locate the unique bangbang binary unit-test executable" >&2
+    echo "signed snapshot-tools state is incomplete" >&2
     exit 1
   fi
 
-  native_v2_process_bin="$tmp_dir/bangbang-native-v2-process-test"
-  scripts/sign-hvf-binary.sh "${test_bins[0]}" "$native_v2_process_bin"
+  local snapshot_tools_messages="$tmp_dir/cargo-build-snapshot-tools.json"
+  local snapshot_tools_bins_file="$tmp_dir/snapshot-tools-bins"
 
   cargo build \
     -p bangbang-snapshot-tools \
@@ -461,6 +422,60 @@ PY
   codesign --force --sign - "$snapshot_editor_bin"
   codesign --verify --strict --verbose=2 "$snapshot_rebase_snap_bin"
   codesign --verify --strict --verbose=2 "$snapshot_editor_bin"
+}
+
+build_native_v2_process_test() {
+  local cargo_messages="$tmp_dir/cargo-test-native-v2-process.json"
+  local test_bins_file="$tmp_dir/test-bins-native-v2-process"
+
+  build_signed_snapshot_tools
+
+  cargo test \
+    -p bangbang \
+    --bin bangbang \
+    --all-features \
+    --locked \
+    --target "$target_triple" \
+    --no-run \
+    --message-format=json \
+    > "$cargo_messages"
+
+  python3 - "$cargo_messages" > "$test_bins_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as messages:
+    for line in messages:
+        message = json.loads(line)
+        target = message.get("target", {})
+        executable = message.get("executable")
+
+        if (
+            message.get("reason") == "compiler-artifact"
+            and executable is not None
+            and target.get("name") == "bangbang"
+            and "bin" in target.get("kind", [])
+            and message.get("profile", {}).get("test") is True
+        ):
+            sys.stdout.write(executable)
+            sys.stdout.write("\0")
+PY
+
+  local test_bins=()
+  local test_bin
+  while IFS= read -r -d "" test_bin; do
+    if [[ -n "$test_bin" ]]; then
+      test_bins+=("$test_bin")
+    fi
+  done < "$test_bins_file"
+
+  if [[ "${#test_bins[@]}" -ne 1 ]]; then
+    echo "failed to locate the unique bangbang binary unit-test executable" >&2
+    exit 1
+  fi
+
+  native_v2_process_bin="$tmp_dir/bangbang-native-v2-process-test"
+  scripts/sign-hvf-binary.sh "${test_bins[0]}" "$native_v2_process_bin"
 }
 
 host_os="$(uname -s)"
@@ -674,6 +689,7 @@ if contains production_bundle "${selected_tests[@]}"; then
   if [[ "${#test_args[@]}" -eq 0 ]]; then
     BANGBANG_PRODUCTION_BUNDLE_PATH="$production_bundle_path" \
       BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH="$production_grant_test_bundle_path" \
+      BANGBANG_SNAPSHOT_EDITOR_PATH="$snapshot_editor_bin" \
       BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
       BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
       BANGBANG_GUEST_EXT4_ROOTFS_PATH="$guest_ext4_rootfs_path" \
@@ -688,6 +704,7 @@ if contains production_bundle "${selected_tests[@]}"; then
   else
     BANGBANG_PRODUCTION_BUNDLE_PATH="$production_bundle_path" \
       BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH="$production_grant_test_bundle_path" \
+      BANGBANG_SNAPSHOT_EDITOR_PATH="$snapshot_editor_bin" \
       BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
       BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
       BANGBANG_GUEST_EXT4_ROOTFS_PATH="$guest_ext4_rootfs_path" \

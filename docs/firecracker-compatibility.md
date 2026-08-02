@@ -815,10 +815,68 @@ applied in order to the preceding complete result.
 Rebase changes memory only. State files are never merged; restore uses the
 complete state paired with the last memory layer/result. This is deliberately
 stronger than Firecracker's Linux in-place sparse copy and does not claim its
-`SEEK_DATA`/`SEEK_HOLE` byte layout. Snapshot inspection, VM-state/register
-editing, and architecture-specific editor commands remain outside this tool
-subset. Exact identities and named evidence are pinned in the
+`SEEK_DATA`/`SEEK_HOLE` byte layout. State inspection and reviewed register
+editing are separate operations described below; they do not change this
+memory-only transaction. Exact rebase identities and named evidence are pinned in the
 [Diff and rebase closure contract](../compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md).
+
+## Snapshot State Inspection and Reviewed Editing
+
+The replacement editor also implements the pinned nested state command shape:
+
+```sh
+snapshot-editor info-vmstate version --vmstate-path <path>
+snapshot-editor info-vmstate vcpu-states --vmstate-path <path>
+snapshot-editor info-vmstate vm-state --vmstate-path <path>
+snapshot-editor edit-vmstate remove-regs <REGS>... \
+  --vmstate-path <path> --output-path <path>
+```
+
+Every path option also accepts Firecracker's exact `-v` or `-o` short alias.
+Register IDs accept decimal, `0x`/`0X` hexadecimal, and space-delimited forms.
+The complete nonempty duplicate-free request is admitted before path access
+against a closed 67-ID Firecracker v1.16.0 aarch64 scalar registry. Bangbang
+does not accept an arbitrary raw KVM vector.
+
+`version` prints one exact Bangbang-native `v<major>.<minor>.<patch>` token.
+The other two info operations emit bounded deterministic pretty JSON under
+schema `bangbang.snapshot-editor.info.v1`. Portable machine, register, memory,
+device, topology, time, and Diff semantics remain explicit. Confidential
+high-entropy state uses domain-separated SHA-256 equality fingerprints; host
+paths, descriptors, selectors, inode-derived identity, boot arguments, grants,
+and other low-entropy authority are the literal `<redacted>`, not equality
+oracles. All three operations retain the input file and parent descriptor,
+bound the exact read, and recheck source, entry, parent, content, and
+cancellation before output.
+
+`remove-regs` resets each present admitted optional value across every vCPU to
+the destination-default state and reports only removed/not-present counts. It
+never prints IDs or values. The input stays byte- and inode-immutable. The
+output must be an absent distinct child; a private owner-only `0600` file is
+encoded, decoded and semantically verified, then published without clobber and
+the directory is synchronized. Success is 0, operational failure 1, syntax 2,
+committed uncertainty 3, and precommit SIGINT/SIGTERM 130/143. No private
+`.bangbang-snapshot-edit-*` entry remains after a terminal result.
+
+The signed production runner independently builds, signs, strictly verifies,
+and supplies the actual editor even when `production_bundle` is selected
+alone. Existing real Full 2.12 and Diff 2.13 cases inspect and edit each MMIO
+and PCI state, require exactly one reviewed DBGBVR0-value removal, and compare
+the complete before/after vCPU and VM views while allowing only
+`vcpus[*].debug.reviewed` to change. The distinct edited state then loads with
+the unchanged Full memory or zero-root Diff layer and three drives through the
+fixed launcher and nested App Sandbox worker after every adopted input
+pathname is replaced. It publishes Paused, resumes only on request, reaches
+guest `SYSTEM_OFF`, and leaves original and edited artifacts immutable with no
+staging residue.
+
+The command shape follows pinned Firecracker v1.16.0, but the accepted bytes
+and semantics are deliberately Bangbang-native: valid Firecracker bitcode and
+raw KVM state are rejected. Exact identities, deliberate differences, and
+portable, process, transaction, and signed evidence are pinned in the
+[snapshot-editor state contract](../compat/firecracker/v1.16.0/snapshot-editor-contract.md).
+Broader snapshot-version/backend/portability certification remains assigned to
+#1543.
 
 ## Runtime Isolation Platform Exclusions
 
@@ -4058,10 +4116,11 @@ Their eventual support level should follow the endpoint matrix:
   recapture, fresh metrics, malformed/no-device/authority/cancellation/death
   handling, retry, redaction, containment, and cleanup. The CLI reports the
   current ceiling `v2.13.0` and describes exact v1/v2 versions. Both public
-  native-v2 memory rebase commands are available with the transaction described
-  above. Remaining work includes native-v2 Uffd, snapshot inspection and
-  register editing, per-drive overrides, Firecracker artifact compatibility,
-  authentication, live-peer migration, and broader cross-host portability
+  native-v2 memory rebase commands plus deterministic snapshot inspection and
+  reviewed register editing are available with the transactions described
+  above. Remaining work includes native-v2 Uffd, per-drive overrides,
+  Firecracker artifact compatibility, authentication, live-peer migration,
+  and broader cross-host portability
 - balloon producers are implemented across live queue/discard/reporting and
   exact native-v2 2.9 serialized/restored state; absent guest statistics remain
   omitted rather than emitted as synthetic zero fields, guest PFNs remain

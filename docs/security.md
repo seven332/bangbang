@@ -1417,6 +1417,39 @@ is resource-specific:
   it is not authentication, and a party that can rewrite the file can recompute
   it. Future payload schemas must therefore stay memory-safe and fail closed
   even for checksum-valid attacker-controlled bytes.
+- Public snapshot-editor inspection keeps that descriptor-anchored reader and
+  never serializes internal `Debug`. `vcpu-states` and `vm-state` use the fixed
+  `bangbang.snapshot-editor.info.v1` schema: portable low-risk values remain
+  explicit, confidential high-entropy guest state is visible only through
+  domain-separated SHA-256 equality fingerprints, and host paths,
+  descriptors, selectors, inode-derived identity, boot arguments, grants, and
+  other low-entropy authority are the literal `<redacted>`. Fingerprints are
+  equality oracles and must stay limited to already high-entropy state; host
+  authority or a guessable choice must never be moved into that category.
+  Output is bounded, measured before allocation, deterministic, and emitted
+  only after complete decode and cancellation checks. Version output exposes
+  only the exact admitted native version token.
+
+  Reviewed register editing grants narrower authority than Firecracker's raw
+  KVM-vector filter. The complete nonempty duplicate-free request must belong
+  to the literal 67-ID Firecracker v1.16.0 aarch64 scalar registry before path
+  access. IDs and values are discarded before filesystem work and never enter
+  summaries or diagnostics. Removal changes only an explicit optional typed
+  value to destination-default state; every other canonical inspection field
+  must remain equal apart from `vcpus[*].debug.reviewed` fingerprints.
+
+  The source file and its parent remain open and repeatedly identity/content
+  checked. The destination must be an absent distinct regular child; the
+  transaction creates an owner-only `0600` staged file, encodes and decodes the
+  typed result, verifies semantic equality, synchronizes it, publishes by an
+  exclusive hard link, synchronizes the parent, and cleans the private
+  `.bangbang-snapshot-edit-*` entry. No-clobber is an integrity property, not
+  authentication. Precommit failure or cancellation preserves both pathnames;
+  a postcommit cleanup or durability fault returns the distinct uncertainty
+  class and never claims rollback. Signed Full/Diff MMIO/PCI evidence proves
+  original state and memory/layer bytes and inode facts remain unchanged and
+  the actual edited state loads through the fixed launcher and nested App
+  Sandbox only after retained descriptor adoption and pathname replacement.
 - Native-v2 state is the current public writer and Full/File lifecycle format.
   Its first pass treats all bytes as hostile, caps the complete file at 16 MiB,
   caps feature and component counts before table traversal, uses checked
