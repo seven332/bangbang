@@ -35651,6 +35651,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::path::{Path, PathBuf};
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::{Duration, Instant};
@@ -58918,9 +58920,6 @@ mod tests {
     #[ignore = "requires the signed native_v2_process integration group"]
     fn signed_native_v2_diff_process_loads_zero_root_and_rebased_products() {
         use bangbang_hvf::decode_hvf_snapshot_v2_diff_state;
-        use bangbang_runtime::snapshot_rebase::{
-            SnapshotV2DiffRebaseCommit, SnapshotV2DiffRebasePaths, rebase_snapshot_v2_diff_paths,
-        };
 
         const ARM64_IMAGE_HEADER_SIZE: usize = 64;
         const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
@@ -58930,6 +58929,16 @@ mod tests {
         const STATE_REFERENCE: &str = "bangbang-grant:snapshot-state";
         const MEMORY_REFERENCE: &str = "bangbang-grant:snapshot-memory";
         const ROOT_REFERENCE: &str = "bangbang-grant:drive-ro";
+        const DEPRECATION_NOTICE: &str = "This tool is deprecated and will be removed in the future. Please use 'snapshot-editor' instead.\n";
+
+        let rebase_snap = PathBuf::from(
+            std::env::var_os("BANGBANG_REBASE_SNAP_PATH")
+                .expect("signed native-v2 process group should provide rebase-snap"),
+        );
+        let snapshot_editor = PathBuf::from(
+            std::env::var_os("BANGBANG_SNAPSHOT_EDITOR_PATH")
+                .expect("signed native-v2 process group should provide snapshot-editor"),
+        );
 
         let mut image = vec![0_u8; ARM64_IMAGE_HEADER_SIZE];
         image[..4].copy_from_slice(&ARM64_BRANCH_TO_SELF.to_le_bytes());
@@ -59090,26 +59099,88 @@ mod tests {
             drop(source);
 
             let memory_path = if let Some((full_directory, full_paths, _)) = &full {
-                let outcome = rebase_snapshot_v2_diff_paths(&SnapshotV2DiffRebasePaths::new(
-                    full_paths.memory(),
-                    diff_paths.memory(),
-                ))
-                .unwrap_or_else(|error| panic!("{case} rebase should commit: {error}"));
-                assert_eq!(outcome.commit(), SnapshotV2DiffRebaseCommit::Durable);
-                assert_eq!(outcome.binding(), &result_binding);
+                let deprecated_memory = full_paths
+                    .memory()
+                    .with_file_name(format!("{case}-deprecated-rebased.memory"));
+                let replacement_memory = full_paths
+                    .memory()
+                    .with_file_name(format!("{case}-replacement-rebased.memory"));
+                fs::copy(full_paths.memory(), &deprecated_memory)
+                    .expect("captured Full should copy for rebase-snap");
+                fs::copy(full_paths.memory(), &replacement_memory)
+                    .expect("captured Full should copy for snapshot-editor");
+                let diff_before =
+                    fs::read(diff_paths.memory()).expect("captured Diff memory should read");
+
+                let deprecated = Command::new(&rebase_snap)
+                    .arg("--base-file")
+                    .arg(&deprecated_memory)
+                    .arg("--diff-file")
+                    .arg(diff_paths.memory())
+                    .output()
+                    .expect("signed rebase-snap should start");
+                assert!(
+                    deprecated.status.success(),
+                    "{case} rebase-snap should succeed: {}",
+                    String::from_utf8_lossy(&deprecated.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8(deprecated.stdout)
+                        .expect("rebase-snap output should be UTF-8"),
+                    DEPRECATION_NOTICE
+                );
+                assert!(deprecated.stderr.is_empty());
+
+                let replacement = Command::new(&snapshot_editor)
+                    .args(["edit-memory", "rebase"])
+                    .arg("--memory-path")
+                    .arg(&replacement_memory)
+                    .arg("--diff-path")
+                    .arg(diff_paths.memory())
+                    .output()
+                    .expect("signed snapshot-editor should start");
+                assert!(
+                    replacement.status.success(),
+                    "{case} snapshot-editor should succeed: {}",
+                    String::from_utf8_lossy(&replacement.stderr)
+                );
+                assert!(replacement.stdout.is_empty());
+                assert!(replacement.stderr.is_empty());
+
+                assert_eq!(
+                    fs::read(&deprecated_memory).expect("rebase-snap complete result should read"),
+                    fs::read(&replacement_memory)
+                        .expect("snapshot-editor complete result should read")
+                );
+                assert_eq!(
+                    fs::read(diff_paths.memory()).expect("captured Diff should remain readable"),
+                    diff_before
+                );
+                for tool_memory in [&deprecated_memory, &replacement_memory] {
+                    let tool_paths =
+                        SnapshotArtifactPaths::new(diff_paths.state(), tool_memory.clone());
+                    let loaded = load_native_snapshot_artifacts(&tool_paths)
+                        .unwrap_or_else(|error| panic!("{case} tool result should load: {error}"));
+                    assert_eq!(
+                        loaded
+                            .state()
+                            .v2_memory_binding()
+                            .expect("tool result state should retain its memory binding"),
+                        &result_binding
+                    );
+                }
                 full_directory.assert_no_staging();
-                full_paths.memory()
+                replacement_memory
             } else {
-                diff_paths.memory()
+                diff_paths.memory().to_path_buf()
             };
-            let closed_paths =
-                SnapshotArtifactPaths::new(diff_paths.state(), memory_path.to_path_buf());
+            let closed_paths = SnapshotArtifactPaths::new(diff_paths.state(), memory_path.clone());
             load_native_snapshot_artifacts(&closed_paths)
                 .unwrap_or_else(|error| panic!("{case} closed Diff pair should load: {error}"));
 
             let mut load = SnapshotLoadInput::new(
                 diff_paths.state(),
-                SnapshotMemoryBackend::new(memory_path, SnapshotMemoryBackendType::File),
+                SnapshotMemoryBackend::new(memory_path.clone(), SnapshotMemoryBackendType::File),
             )
             .with_track_dirty_pages(tracked);
             let mut destination = ProcessVmm::with_starter(
@@ -59121,7 +59192,7 @@ mod tests {
             if contained {
                 let authority = snapshot_root_file_grant_authority_for_test(
                     diff_paths.state(),
-                    memory_path,
+                    &memory_path,
                     root.path(),
                 );
                 let restore =

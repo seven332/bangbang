@@ -207,6 +207,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bangbang-snapshot-tools"
+version = "0.1.0"
+dependencies = [
+ "bangbang-runtime",
+ "clap",
+ "libc",
+ "signal-hook",
+]
+
+[[package]]
 name = "bangbang-vhost-user"
 version = "0.1.0"
 dependencies = [

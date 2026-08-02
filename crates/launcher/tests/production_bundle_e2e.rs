@@ -2642,7 +2642,7 @@ fn run_certified_production_vsock_missing_grant_rejection(
         "reject production vsock override without its exact grant",
     );
     assert!(
-        response.contains("vsock destination transaction failed (retryable)")
+        response.contains("current-product destination transaction failed (retryable)")
             && !response.contains(fixture.selector_ref)
             && !response.contains(path_text(&fixture.vsock_directory)),
         "missing-grant production retryable fault must remain stable and redacted: {response}"
