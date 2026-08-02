@@ -263,6 +263,26 @@ impl PublicationState for NativeSnapshotArtifactState {
     }
 }
 
+impl PublicationState for NativeV2DiffSnapshotArtifactState {
+    type Outcome = NativeV2DiffSnapshotPublicationOutcome;
+
+    fn verify_memory_output(&self, file: &mut File) -> Result<(), SnapshotPublicationFailure> {
+        verify_snapshot_v2_diff_layer_output(&self.layer, file)
+            .map_err(SnapshotPublicationFailure::DiffLayerVerify)
+    }
+
+    fn state_bytes(&self) -> Result<Cow<'_, [u8]>, SnapshotPublicationFailure> {
+        Ok(Cow::Borrowed(&self.bytes))
+    }
+
+    fn into_outcome(self, durability: SnapshotCommitDurability) -> Self::Outcome {
+        NativeV2DiffSnapshotPublicationOutcome {
+            state: self,
+            durability,
+        }
+    }
+}
+
 pub(super) fn publish_snapshot_artifacts_macos_with<E, F>(
     outputs: &SnapshotArtifactOutputs,
     producer: F,
@@ -279,6 +299,16 @@ pub(super) fn publish_native_snapshot_artifacts_macos_with<E, F>(
 ) -> Result<NativeSnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
 where
     F: FnOnce(SnapshotMemoryStagingWriter) -> Result<NativeSnapshotArtifactState, E>,
+{
+    publish_artifacts_macos_with(outputs, producer)
+}
+
+pub(super) fn publish_native_v2_diff_snapshot_artifacts_macos_with<E, F>(
+    outputs: &SnapshotArtifactOutputs,
+    producer: F,
+) -> Result<NativeV2DiffSnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+where
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<NativeV2DiffSnapshotArtifactState, E>,
 {
     publish_artifacts_macos_with(outputs, producer)
 }

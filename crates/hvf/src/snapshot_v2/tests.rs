@@ -6,6 +6,7 @@ use bangbang_runtime::memory::{
 };
 use bangbang_runtime::pci::{PCI_BAR64_START, PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE};
 use bangbang_runtime::snapshot_artifact::{
+    NativeV2DiffSnapshotCandidateState, NativeV2DiffSnapshotCandidateStateError,
     NativeV2MemoryHotplugSnapshotCandidateState, NativeV2NetworkSnapshotCandidateState,
     NativeV2VsockSnapshotCandidateState,
 };
@@ -18,6 +19,9 @@ use bangbang_runtime::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_M
 use bangbang_runtime::snapshot_device_v2_6::{
     NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
     NATIVE_V2_STORAGE_DEVICE_GRAPH_SECTION_ENTRY_BYTES, SnapshotV2StorageDeviceGraph,
+};
+use bangbang_runtime::snapshot_diff_v2_13::{
+    NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION, SnapshotV2DiffBase, SnapshotV2DiffLayerBinding,
 };
 use bangbang_runtime::snapshot_entropy_v2_8::{
     NATIVE_V2_ENTROPY_STATE_HEADER_BYTES, NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES,
@@ -104,6 +108,7 @@ const DETERMINISTIC_BALLOON_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.9-fixture-id!";
 const DETERMINISTIC_MEMORY_HOTPLUG_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.10-fixture-id";
 const DETERMINISTIC_NETWORK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.11-fixture-id";
 const DETERMINISTIC_VSOCK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.12-fixture-id";
+const DETERMINISTIC_DIFF_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.13-fixture-id";
 const COMPLETE_STATE_FINGERPRINTS: [(usize, u64); 2] = [
     (4_887, 10_136_861_786_457_474_800),
     (4_983, 7_169_128_621_506_763_529),
@@ -1237,6 +1242,88 @@ pub(crate) fn complete_vsock_state_fixture(
     .unwrap_or_else(|error| {
         panic!(
             "{transport:?} storage={has_storage} entropy={has_entropy} balloon={has_balloon} memory-hotplug={has_memory_hotplug} network={has_network} vsock={has_vsock} exact-2.12 fixture failed: {error:?}"
+        )
+    })
+}
+
+fn exact_minor_thirteen_memory_binding(
+    state: Option<&SnapshotV2MemoryHotplugState>,
+) -> SnapshotV2MemoryBinding {
+    let mut ranges = aarch64::dram_layout(FIXTURE_MEMORY_MIB * MIB)
+        .expect("exact-2.13 base layout should validate")
+        .ranges()
+        .to_vec();
+    if let Some(state) = state {
+        ranges.extend(memory_hotplug_active_ranges(state));
+    }
+    let layout = GuestMemoryLayout::new(ranges).expect("exact-2.13 memory layout should validate");
+    let memory = GuestMemory::allocate(&layout).expect("exact-2.13 memory should allocate");
+    write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut Cursor::new(Vec::new()),
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact-2.13 result binding should encode")
+}
+
+fn exact_minor_thirteen_platform_fixture(
+    state: Option<SnapshotV2MemoryHotplugState>,
+    base: SnapshotV2DiffBase,
+) -> HvfSnapshotV2DiffPlatformState {
+    let capture = state.map(memory_hotplug_capture_fixture);
+    let result = exact_minor_thirteen_memory_binding(
+        capture
+            .as_ref()
+            .map(HvfSnapshotV2MemoryHotplugCaptureState::state),
+    );
+    let layer = SnapshotV2DiffLayerBinding::try_from_ranges(base, result, &[])
+        .expect("exact-2.13 layer should validate");
+    let (_, machine, global, topology, vcpus, time) = deterministic_device_graph_platform_fixture(
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+        DETERMINISTIC_DIFF_MEMORY_IMAGE_ID,
+    )
+    .into_parts();
+    HvfSnapshotV2DiffPlatformState::try_new(layer, machine, global, topology, vcpus, time, capture)
+        .expect("exact-2.13 platform fixture should validate")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_diff_state_fixture(
+    transport: SnapshotV2DeviceTransportKind,
+    has_storage: bool,
+    has_entropy: bool,
+    has_balloon: bool,
+    has_memory_hotplug: bool,
+    has_network: bool,
+    has_vsock: bool,
+    base: SnapshotV2DiffBase,
+) -> HvfSnapshotV2DiffState {
+    let memory_hotplug = has_memory_hotplug.then(|| product_memory_hotplug_fixture(transport));
+    let graph = has_storage.then(|| product_storage_fixture_with_network(transport, has_network));
+    let block_count = graph
+        .as_ref()
+        .map_or(0, |graph| graph.block_records().len());
+    let network_device = PCI_FIRST_ENDPOINT_DEVICE
+        .checked_add(1)
+        .and_then(|device| {
+            device.checked_add(u8::try_from(block_count).expect("block count should fit u8"))
+        })
+        .expect("network product endpoint should fit");
+    let balloon = has_balloon.then(|| product_balloon_fixture(transport));
+    let network = has_network.then(|| product_network_fixture(transport, network_device));
+    let vsock = has_vsock.then(|| product_vsock_fixture(transport));
+    HvfSnapshotV2DiffState::try_new(
+        exact_minor_thirteen_platform_fixture(memory_hotplug, base),
+        graph,
+        product_serial_fixture(),
+        has_entropy.then(|| memory_hotplug_product_entropy_fixture(transport)),
+        balloon,
+        network,
+        vsock,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "{transport:?} storage={has_storage} entropy={has_entropy} balloon={has_balloon} memory-hotplug={has_memory_hotplug} network={has_network} vsock={has_vsock} exact-2.13 fixture failed: {error:?}"
         )
     })
 }
@@ -2588,6 +2675,139 @@ fn exact_minor_twelve_vsock_encodes_all_sixty_four_mmio_and_pci_products() {
             assert!(!debug.contains("bangbang-vsock"));
         }
     }
+}
+
+#[test]
+fn exact_minor_thirteen_diff_closes_all_sixty_four_mmio_and_pci_products() {
+    for transport in [
+        SnapshotV2DeviceTransportKind::Mmio,
+        SnapshotV2DeviceTransportKind::Pci,
+    ] {
+        for mask in 0_u8..64 {
+            let has_storage = mask & 1 != 0;
+            let has_entropy = mask & 2 != 0;
+            let has_balloon = mask & 4 != 0;
+            let has_memory_hotplug = mask & 8 != 0;
+            let has_network = mask & 16 != 0;
+            let has_vsock = mask & 32 != 0;
+            let original = complete_diff_state_fixture(
+                transport,
+                has_storage,
+                has_entropy,
+                has_balloon,
+                has_memory_hotplug,
+                has_network,
+                has_vsock,
+                SnapshotV2DiffBase::Zero,
+            );
+            let encoded = encode_hvf_snapshot_v2_diff_state(&original)
+                .expect("complete exact-2.13 state should encode");
+            assert_eq!(
+                encode_hvf_snapshot_v2_diff_state(&original)
+                    .expect("exact-2.13 encoding should be deterministic"),
+                encoded
+            );
+            let structural = decode_snapshot_v2_state_with_compatibility_version(
+                &encoded,
+                NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("exact-2.13 state should decode structurally");
+            assert_eq!(
+                structural.metadata().component_count(),
+                9 + u32::from(has_storage)
+                    + u32::from(has_entropy)
+                    + u32::from(has_balloon)
+                    + u32::from(has_memory_hotplug)
+                    + u32::from(has_network)
+                    + u32::from(has_vsock)
+            );
+            assert_eq!(
+                structural
+                    .components()
+                    .last()
+                    .expect("exact-2.13 directory should not be empty")
+                    .key(),
+                NATIVE_V2_DIFF_COMPONENT_KEY
+            );
+            assert_eq!(
+                structural
+                    .component(NATIVE_V2_DIFF_COMPONENT_KEY)
+                    .expect("exact-2.13 Diff component should exist")
+                    .payload(),
+                original
+                    .layer()
+                    .encode()
+                    .expect("exact-2.13 Diff binding should encode")
+            );
+
+            let candidate = NativeV2DiffSnapshotCandidateState::from_diff_state_v2_13(
+                encoded.clone(),
+                original.layer().clone(),
+            )
+            .expect("exact-2.13 state and detached layer should close");
+            assert_eq!(candidate.bytes(), encoded);
+            assert_eq!(candidate.result_binding(), original.platform().memory());
+            assert_eq!(candidate.layer_binding(), original.layer());
+            assert_eq!(candidate.device_graph(), original.device_graph());
+            assert_eq!(candidate.serial(), original.serial());
+            assert_eq!(candidate.entropy(), original.entropy());
+            assert_eq!(candidate.balloon(), original.balloon());
+            assert_eq!(candidate.memory_hotplug(), original.memory_hotplug());
+            assert_eq!(candidate.network(), original.network());
+            assert_eq!(candidate.vsock(), original.vsock());
+            assert!(decode_snapshot_v2_state(&encoded).is_err());
+
+            let debug = format!("{original:?} {candidate:?}");
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains("serial-log"));
+            assert!(!debug.contains("vmnet:"));
+            assert!(!debug.contains("bangbang-vsock"));
+        }
+    }
+}
+
+#[test]
+fn exact_minor_thirteen_diff_accepts_predecessor_and_rejects_detached_layer_substitution() {
+    let predecessor = exact_minor_twelve_memory_binding(None);
+    let original = complete_diff_state_fixture(
+        SnapshotV2DeviceTransportKind::Mmio,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        SnapshotV2DiffBase::Image(predecessor.clone()),
+    );
+    let encoded = encode_hvf_snapshot_v2_diff_state(&original)
+        .expect("predecessor-root exact-2.13 state should encode");
+    let candidate = NativeV2DiffSnapshotCandidateState::from_diff_state_v2_13(
+        encoded.clone(),
+        original.layer().clone(),
+    )
+    .expect("predecessor-root state and layer should close");
+    assert_eq!(
+        candidate.layer_binding().base().binding(),
+        Some(&predecessor)
+    );
+
+    let substitute = complete_diff_state_fixture(
+        SnapshotV2DeviceTransportKind::Mmio,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        SnapshotV2DiffBase::Zero,
+    );
+    assert!(matches!(
+        NativeV2DiffSnapshotCandidateState::from_diff_state_v2_13(
+            encoded,
+            substitute.layer().clone(),
+        ),
+        Err(NativeV2DiffSnapshotCandidateStateError::LayerBindingMismatch)
+    ));
 }
 
 #[test]

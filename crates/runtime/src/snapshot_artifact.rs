@@ -33,6 +33,12 @@ use crate::snapshot_device_v2_6::{
     NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
     SnapshotV2StorageDeviceGraphDecodeError,
 };
+#[cfg(target_os = "macos")]
+use crate::snapshot_diff_v2_13::verify_snapshot_v2_diff_layer_output;
+use crate::snapshot_diff_v2_13::{
+    NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION, SnapshotV2DiffLayerBinding,
+    SnapshotV2DiffStateError, SnapshotV2DiffVerifyError, decode_snapshot_v2_diff_layer_binding,
+};
 use crate::snapshot_entropy_v2_8::{
     NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, SnapshotV2EntropyState,
     SnapshotV2EntropyStateDecodeError,
@@ -2313,6 +2319,210 @@ impl fmt::Debug for NativeV2VsockSnapshotCandidateState {
     }
 }
 
+/// Validation failure for one complete dormant exact-2.13 Diff candidate.
+#[derive(Debug)]
+pub enum NativeV2DiffSnapshotCandidateStateError {
+    /// The outer state does not contain the complete current device product.
+    Product(NativeV2SnapshotCandidateStateError),
+    /// The outer state does not contain one valid exact-2.13 Diff commitment.
+    Diff(SnapshotV2DiffStateError),
+    /// The supplied staged-layer binding differs from the state commitment.
+    LayerBindingMismatch,
+}
+
+impl fmt::Display for NativeV2DiffSnapshotCandidateStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Product(source) => {
+                write!(formatter, "invalid native-v2 Diff product: {source}")
+            }
+            Self::Diff(source) => write!(formatter, "invalid native-v2 Diff state: {source}"),
+            Self::LayerBindingMismatch => {
+                formatter.write_str("native-v2 Diff state and staged layer bindings do not match")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV2DiffSnapshotCandidateStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Product(source) => Some(source),
+            Self::Diff(source) => Some(source),
+            Self::LayerBindingMismatch => None,
+        }
+    }
+}
+
+/// One closed dormant exact native-v2 2.13 differential candidate.
+///
+/// The value retains the complete current platform/device state and the exact
+/// binding returned by the detached-layer writer. It is intentionally
+/// separate from [`NativeSnapshotArtifactState`], whose native-v2 variants
+/// continue to commit state to a complete memory image at the public 2.12
+/// boundary.
+pub struct NativeV2DiffSnapshotCandidateState {
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: Option<SnapshotV2StorageDeviceGraph>,
+    serial: SnapshotV2SerialState,
+    entropy: Option<SnapshotV2EntropyState>,
+    balloon: Option<SnapshotV2BalloonState>,
+    memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+    network: Option<SnapshotV2NetworkState>,
+    vsock: Option<SnapshotV2VsockState>,
+    layer: SnapshotV2DiffLayerBinding,
+}
+
+/// Owned exact components retained by one dormant exact-2.13 Diff candidate.
+pub type NativeV2DiffSnapshotCandidateParts = (
+    Vec<u8>,
+    SnapshotV2MemoryBinding,
+    Option<SnapshotV2StorageDeviceGraph>,
+    SnapshotV2SerialState,
+    Option<SnapshotV2EntropyState>,
+    Option<SnapshotV2BalloonState>,
+    Option<SnapshotV2MemoryHotplugState>,
+    Option<SnapshotV2NetworkState>,
+    Option<SnapshotV2VsockState>,
+    SnapshotV2DiffLayerBinding,
+);
+
+impl NativeV2DiffSnapshotCandidateState {
+    /// Validates one explicit exact-2.13 complete product against the layer
+    /// binding returned by its writer.
+    pub fn from_diff_state_v2_13(
+        bytes: Vec<u8>,
+        layer: SnapshotV2DiffLayerBinding,
+    ) -> Result<Self, NativeV2DiffSnapshotCandidateStateError> {
+        let (binding, device_graph, serial, entropy, balloon, memory_hotplug, network, vsock) =
+            decode_network_or_vsock_state(&bytes, NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION)
+                .map_err(NativeV2DiffSnapshotCandidateStateError::Product)?;
+        let state = decode_snapshot_v2_state_with_compatibility_version(
+            &bytes,
+            NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+        )
+        .map_err(NativeV2SnapshotCandidateStateError::Format)
+        .map_err(NativeV2DiffSnapshotCandidateStateError::Product)?;
+        let committed_layer = decode_snapshot_v2_diff_layer_binding(&state)
+            .map_err(NativeV2DiffSnapshotCandidateStateError::Diff)?;
+        if committed_layer != layer || committed_layer.result() != &binding {
+            return Err(NativeV2DiffSnapshotCandidateStateError::LayerBindingMismatch);
+        }
+        Ok(Self {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network,
+            vsock,
+            layer,
+        })
+    }
+
+    /// Returns the dormant exact compatibility version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
+    }
+
+    /// Returns the immutable encoded complete state.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the complete materialized result binding.
+    pub const fn result_binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.binding
+    }
+
+    /// Returns the exact detached-layer commitment.
+    pub const fn layer_binding(&self) -> &SnapshotV2DiffLayerBinding {
+        &self.layer
+    }
+
+    /// Returns optional unchanged exact-2.6 storage state.
+    pub const fn device_graph(&self) -> Option<&SnapshotV2StorageDeviceGraph> {
+        self.device_graph.as_ref()
+    }
+
+    /// Returns required unchanged exact-2.7 serial state.
+    pub const fn serial(&self) -> &SnapshotV2SerialState {
+        &self.serial
+    }
+
+    /// Returns optional unchanged exact-2.8 entropy state.
+    pub const fn entropy(&self) -> Option<&SnapshotV2EntropyState> {
+        self.entropy.as_ref()
+    }
+
+    /// Returns optional unchanged exact-2.9 balloon state.
+    pub const fn balloon(&self) -> Option<&SnapshotV2BalloonState> {
+        self.balloon.as_ref()
+    }
+
+    /// Returns optional unchanged exact-2.10 virtio-mem state.
+    pub const fn memory_hotplug(&self) -> Option<&SnapshotV2MemoryHotplugState> {
+        self.memory_hotplug.as_ref()
+    }
+
+    /// Returns optional unchanged exact-2.11 network/MMDS state.
+    pub const fn network(&self) -> Option<&SnapshotV2NetworkState> {
+        self.network.as_ref()
+    }
+
+    /// Returns optional unchanged exact-2.12 vsock state.
+    pub const fn vsock(&self) -> Option<&SnapshotV2VsockState> {
+        self.vsock.as_ref()
+    }
+
+    /// Consumes the candidate into all inseparable checked components.
+    pub fn into_parts(self) -> NativeV2DiffSnapshotCandidateParts {
+        (
+            self.bytes,
+            self.binding,
+            self.device_graph,
+            self.serial,
+            self.entropy,
+            self.balloon,
+            self.memory_hotplug,
+            self.network,
+            self.vsock,
+            self.layer,
+        )
+    }
+
+    /// Consumes this candidate into dormant Diff publication authority.
+    pub fn into_publication_state(self) -> NativeV2DiffSnapshotArtifactState {
+        let (bytes, binding, _, _, _, _, _, _, _, layer) = self.into_parts();
+        NativeV2DiffSnapshotArtifactState {
+            bytes,
+            binding,
+            layer,
+        }
+    }
+}
+
+impl fmt::Debug for NativeV2DiffSnapshotCandidateState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2DiffSnapshotCandidateState")
+            .field("version", &self.version())
+            .field("has_storage", &self.device_graph.is_some())
+            .field("has_entropy", &self.entropy.is_some())
+            .field("has_balloon", &self.balloon.is_some())
+            .field("has_memory_hotplug", &self.memory_hotplug.is_some())
+            .field("has_network", &self.network.is_some())
+            .field("has_vsock", &self.vsock.is_some())
+            .field("state", &REDACTED)
+            .field("result_binding", &REDACTED)
+            .field("layer_binding", &REDACTED)
+            .finish()
+    }
+}
+
 fn decode_device_graph_v2_4(
     bytes: &[u8],
 ) -> Result<(SnapshotV2MemoryBinding, SnapshotV2DeviceGraph), NativeV2SnapshotCandidateStateError> {
@@ -3056,7 +3266,11 @@ fn decode_network_or_vsock_state(
             .map_err(NativeV2SnapshotCandidateStateError::VsockState)
         })
         .transpose()?;
-    if expected_version != NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION && vsock.is_some() {
+    if !matches!(
+        expected_version,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION | NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
+    ) && vsock.is_some()
+    {
         return Err(NativeV2SnapshotCandidateStateError::InvalidVsockComponent);
     }
 
@@ -3800,6 +4014,7 @@ pub enum SnapshotPublicationFailure {
     MemoryWrite(SnapshotMemoryWriteError),
     MemoryVerify(SnapshotMemoryLoadError),
     MemoryV2Verify(SnapshotV2MemoryLoadError),
+    DiffLayerVerify(SnapshotV2DiffVerifyError),
     NativeState(NativeSnapshotArtifactStateError),
     Commit(SnapshotCommitError),
 }
@@ -3836,6 +4051,12 @@ impl fmt::Display for SnapshotPublicationFailure {
             Self::MemoryV2Verify(source) => {
                 write!(f, "native-v2 memory staging verification failed: {source}")
             }
+            Self::DiffLayerVerify(source) => {
+                write!(
+                    f,
+                    "native-v2 Diff layer staging verification failed: {source}"
+                )
+            }
             Self::NativeState(source) => {
                 write!(f, "snapshot state cannot be published: {source}")
             }
@@ -3850,6 +4071,7 @@ impl std::error::Error for SnapshotPublicationFailure {
             Self::MemoryWrite(source) => Some(source),
             Self::MemoryVerify(source) => Some(source),
             Self::MemoryV2Verify(source) => Some(source),
+            Self::DiffLayerVerify(source) => Some(source),
             Self::NativeState(source) => Some(source),
             Self::Commit(source) => Some(source),
             Self::UnsupportedPlatform
@@ -4051,6 +4273,86 @@ pub enum SnapshotCommitDurability {
     Durable,
     /// The state name is committed, but its final directory barrier failed.
     Uncertain { kind: io::ErrorKind },
+}
+
+/// One closed dormant exact-2.13 state-to-differential-layer commitment.
+///
+/// Construction is available only by consuming a fully validated
+/// [`NativeV2DiffSnapshotCandidateState`]. The type deliberately cannot enter
+/// current native-v2 loading or Full publication APIs.
+pub struct NativeV2DiffSnapshotArtifactState {
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    layer: SnapshotV2DiffLayerBinding,
+}
+
+impl NativeV2DiffSnapshotArtifactState {
+    /// Returns the immutable exact-2.13 state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the complete result binding committed by state and layer.
+    pub const fn result_binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.binding
+    }
+
+    /// Returns the exact detached-layer binding.
+    pub const fn layer_binding(&self) -> &SnapshotV2DiffLayerBinding {
+        &self.layer
+    }
+}
+
+impl fmt::Debug for NativeV2DiffSnapshotArtifactState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2DiffSnapshotArtifactState")
+            .field("version", &NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION)
+            .field("state", &REDACTED)
+            .field("result_binding", &REDACTED)
+            .field("layer_binding", &REDACTED)
+            .finish()
+    }
+}
+
+/// Successful or visibly committed dormant exact-2.13 Diff publication.
+pub struct NativeV2DiffSnapshotPublicationOutcome {
+    state: NativeV2DiffSnapshotArtifactState,
+    durability: SnapshotCommitDurability,
+}
+
+impl NativeV2DiffSnapshotPublicationOutcome {
+    /// Returns the exact published state-to-layer commitment.
+    pub const fn state(&self) -> &NativeV2DiffSnapshotArtifactState {
+        &self.state
+    }
+
+    /// Returns the complete materialized result binding.
+    pub const fn result_binding(&self) -> &SnapshotV2MemoryBinding {
+        self.state.result_binding()
+    }
+
+    /// Returns the post-commit durability classification.
+    pub const fn durability(&self) -> SnapshotCommitDurability {
+        self.durability
+    }
+
+    /// Consumes the outcome into its state commitment and durability.
+    pub fn into_parts(self) -> (NativeV2DiffSnapshotArtifactState, SnapshotCommitDurability) {
+        (self.state, self.durability)
+    }
+}
+
+impl fmt::Debug for NativeV2DiffSnapshotPublicationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2DiffSnapshotPublicationOutcome")
+            .field("version", &NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION)
+            .field("state", &REDACTED)
+            .field("result_binding", &REDACTED)
+            .field("durability", &self.durability)
+            .finish()
+    }
 }
 
 /// Successful or visibly committed native-family artifact publication.
@@ -4705,6 +5007,23 @@ where
     publish_native_snapshot_artifacts_to_with(&outputs, producer)
 }
 
+/// Publishes caller-produced dormant exact-2.13 Diff artifacts in one
+/// state-plus-layer transaction.
+///
+/// The layer occupies the existing second (memory) output slot. This API does
+/// not make Diff loadable or select it from public snapshot requests.
+#[doc(hidden)]
+pub fn publish_native_v2_diff_snapshot_artifacts_with<E, F>(
+    paths: &SnapshotArtifactPaths,
+    producer: F,
+) -> Result<NativeV2DiffSnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+where
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<NativeV2DiffSnapshotArtifactState, E>,
+{
+    let outputs = SnapshotArtifactOutputs::from_paths(paths);
+    publish_native_v2_diff_snapshot_artifacts_to_with(&outputs, producer)
+}
+
 /// Publishes through path-based or already-opened directory destinations.
 pub fn publish_snapshot_artifacts_to_with<E, F>(
     outputs: &SnapshotArtifactOutputs,
@@ -4741,6 +5060,33 @@ where
     #[cfg(target_os = "macos")]
     {
         publish_native_snapshot_artifacts_macos_with(outputs, producer)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (outputs, producer);
+        Err(SnapshotPublicationTransactionError::Publication(
+            publication_error(
+                SnapshotPublicationStage::PlatformCheck,
+                SnapshotArtifactVisibility::NoFinalArtifact,
+                SnapshotPublicationFailure::UnsupportedPlatform,
+            ),
+        ))
+    }
+}
+
+/// Publishes one dormant exact-2.13 state/layer pair to path or anchored
+/// destinations while retaining the established exactly-two-output contract.
+#[doc(hidden)]
+pub fn publish_native_v2_diff_snapshot_artifacts_to_with<E, F>(
+    outputs: &SnapshotArtifactOutputs,
+    producer: F,
+) -> Result<NativeV2DiffSnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+where
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<NativeV2DiffSnapshotArtifactState, E>,
+{
+    #[cfg(target_os = "macos")]
+    {
+        publish_native_v2_diff_snapshot_artifacts_macos_with(outputs, producer)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -4988,7 +5334,8 @@ use macos::{
     load_prepared_snapshot_memory_path_macos, load_snapshot_artifacts_macos,
     prepare_native_snapshot_state_file_macos, prepare_native_snapshot_state_path_macos,
     prepare_snapshot_state_file_macos, prepare_snapshot_state_path_macos,
-    publish_native_snapshot_artifacts_macos_with, publish_snapshot_artifacts_macos_with,
+    publish_native_snapshot_artifacts_macos_with,
+    publish_native_v2_diff_snapshot_artifacts_macos_with, publish_snapshot_artifacts_macos_with,
 };
 
 #[cfg(test)]

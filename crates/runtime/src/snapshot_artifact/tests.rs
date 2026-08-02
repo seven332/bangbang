@@ -15,11 +15,16 @@ use crate::snapshot_device_v2::{
 #[cfg(target_os = "macos")]
 use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 #[cfg(target_os = "macos")]
+use crate::snapshot_diff_v2_13::{
+    NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION, SnapshotV2DiffBase, SnapshotV2DiffLayerBinding,
+    SnapshotV2DiffSelection, verify_snapshot_v2_diff_layer_output, write_snapshot_v2_diff_layer,
+};
+#[cfg(target_os = "macos")]
 use crate::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
 #[cfg(target_os = "macos")]
 use crate::snapshot_format_v2::{
     NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
-    NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY,
+    NATIVE_V2_DIFF_COMPONENT_KEY, NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY,
     NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY, NATIVE_V2_NETWORK_COMPONENT_KEY,
     NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_VSOCK_COMPONENT_KEY, SnapshotV2Component,
     SnapshotV2ComponentDisposition, SnapshotV2ComponentKey,
@@ -130,6 +135,24 @@ fn generalized_publication_rejects_platform_without_invoking_producer() {
             .stage(),
         SnapshotPublicationStage::PlatformCheck
     );
+    assert!(native_error.producer().is_none());
+
+    let diff_called = std::cell::Cell::new(false);
+    let diff_error =
+        publish_native_v2_diff_snapshot_artifacts_with::<std::io::Error, _>(&paths, |_writer| {
+            diff_called.set(true);
+            Err(std::io::Error::other("Diff producer must not run"))
+        })
+        .expect_err("non-macOS Diff publication should reject at platform preflight");
+    assert!(!diff_called.get());
+    assert_eq!(
+        diff_error
+            .publication()
+            .expect("Diff platform rejection should be a publication failure")
+            .stage(),
+        SnapshotPublicationStage::PlatformCheck
+    );
+    assert!(diff_error.producer().is_none());
 }
 
 #[cfg(target_os = "macos")]
@@ -3486,6 +3509,93 @@ fn supplied_directory_anchors_publish_into_the_opened_identity() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn dormant_diff_publication_commits_direct_state_and_layer_as_one_closed_pair() {
+    let directory = TestDirectory::new("diff-direct");
+    let paths = directory.paths("state.snap", "layer.snap");
+    let outcome = publish_native_v2_diff_snapshot_artifacts_with(&paths, produce_test_diff)
+        .expect("exact-2.13 state/layer pair should publish");
+
+    assert_eq!(outcome.durability(), SnapshotCommitDurability::Durable);
+    assert_eq!(
+        fs::read(paths.state()).expect("state should read"),
+        outcome.state().bytes()
+    );
+    let mut layer = File::open(paths.memory()).expect("layer should open");
+    verify_snapshot_v2_diff_layer_output(outcome.state().layer_binding(), &mut layer)
+        .expect("published layer should match the state commitment");
+    assert_eq!(
+        outcome.result_binding(),
+        outcome.state().layer_binding().result()
+    );
+    assert!(
+        load_native_snapshot_artifacts(&paths).is_err(),
+        "the public exact-2.12 loader must stay closed to dormant Diff"
+    );
+    assert_no_staging(&directory.path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn dormant_diff_publication_uses_anchored_authority_and_rejects_extended_layer() {
+    let anchored = TestDirectory::new("diff-anchor");
+    let outputs = SnapshotArtifactOutputs::new(
+        SnapshotArtifactOutput::anchored(
+            File::open(&anchored.path).expect("state anchor should open"),
+            b"state.snap".to_vec(),
+        ),
+        SnapshotArtifactOutput::anchored(
+            File::open(&anchored.path).expect("layer anchor should open"),
+            b"layer.snap".to_vec(),
+        ),
+    );
+    let outcome = publish_native_v2_diff_snapshot_artifacts_to_with(&outputs, produce_test_diff)
+        .expect("anchored exact-2.13 pair should publish");
+    let paths = anchored.paths("state.snap", "layer.snap");
+    let mut layer = File::open(paths.memory()).expect("anchored layer should open");
+    verify_snapshot_v2_diff_layer_output(outcome.state().layer_binding(), &mut layer)
+        .expect("anchored layer should match its state commitment");
+    assert_no_staging(&anchored.path);
+
+    let invalid = TestDirectory::new("diff-long");
+    let invalid_paths = invalid.paths("state.snap", "layer.snap");
+    let error = publish_native_v2_diff_snapshot_artifacts_with(&invalid_paths, |mut writer| {
+        let memory = test_v2_memory();
+        let selection =
+            SnapshotV2DiffSelection::all_current(&memory).map_err(|source| source.to_string())?;
+        let layer = write_snapshot_v2_diff_layer(
+            &memory,
+            &mut writer,
+            SnapshotV2DiffBase::Zero,
+            &selection,
+        )
+        .map_err(|source| source.to_string())?;
+        writer
+            .write_all(&[0])
+            .map_err(|source| source.to_string())?;
+        let state = diff_v2_13_state(&layer)?;
+        NativeV2DiffSnapshotCandidateState::from_diff_state_v2_13(state, layer)
+            .map(NativeV2DiffSnapshotCandidateState::into_publication_state)
+            .map_err(|source| source.to_string())
+    })
+    .expect_err("extended layer must fail before either final is visible");
+    let publication = error
+        .publication()
+        .expect("layer verification should be a publication failure");
+    assert_eq!(
+        publication.stage(),
+        SnapshotPublicationStage::MemoryWriteVerify
+    );
+    assert!(matches!(
+        publication.failure(),
+        SnapshotPublicationFailure::DiffLayerVerify(_)
+    ));
+    assert!(!invalid_paths.state().exists());
+    assert!(!invalid_paths.memory().exists());
+    assert_no_staging(&invalid.path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn supplied_directory_children_are_revalidated_before_staging() {
     for (index, child) in [b"".as_slice(), b".", b"..", b"nested/state", b"nul\0state"]
         .into_iter()
@@ -5316,6 +5426,47 @@ fn current_v2_state(binding: &SnapshotV2MemoryBinding) -> Result<Vec<u8>, String
 }
 
 #[cfg(target_os = "macos")]
+fn diff_v2_13_state(layer: &SnapshotV2DiffLayerBinding) -> Result<Vec<u8>, String> {
+    let binding_payload = layer
+        .result()
+        .encode()
+        .map_err(|source| source.to_string())?;
+    let serial_device = SerialMmioDevice::discarding()
+        .capture_state()
+        .map_err(|source| source.to_string())?;
+    let serial_payload = SnapshotV2SerialState::try_from_capture_ready(
+        CaptureReadySerialState::new(SerialConfig::default(), serial_device),
+    )
+    .map_err(|source| source.to_string())?
+    .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+    .map_err(|source| source.to_string())?;
+    let diff_payload = layer.encode().map_err(|source| source.to_string())?;
+    let components = [
+        SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &binding_payload,
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_SERIAL_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &serial_payload,
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_DIFF_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &diff_payload,
+        ),
+    ];
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .map_err(|source| source.to_string())
+}
+
+#[cfg(target_os = "macos")]
 fn entropy_v2_8_state(
     binding: &SnapshotV2MemoryBinding,
     storage_payload: Option<&[u8]>,
@@ -5526,6 +5677,22 @@ fn produce_test_v2(
         .map_err(|source| source.to_string())?;
     let state = current_v2_state(&binding).map_err(|source| source.to_string())?;
     NativeSnapshotArtifactState::from_current_v2(state).map_err(|source| source.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn produce_test_diff(
+    mut writer: SnapshotMemoryStagingWriter,
+) -> Result<NativeV2DiffSnapshotArtifactState, String> {
+    let memory = test_v2_memory();
+    let selection =
+        SnapshotV2DiffSelection::all_current(&memory).map_err(|source| source.to_string())?;
+    let layer =
+        write_snapshot_v2_diff_layer(&memory, &mut writer, SnapshotV2DiffBase::Zero, &selection)
+            .map_err(|source| source.to_string())?;
+    let state = diff_v2_13_state(&layer)?;
+    NativeV2DiffSnapshotCandidateState::from_diff_state_v2_13(state, layer)
+        .map(NativeV2DiffSnapshotCandidateState::into_publication_state)
+        .map_err(|source| source.to_string())
 }
 
 #[cfg(target_os = "macos")]
