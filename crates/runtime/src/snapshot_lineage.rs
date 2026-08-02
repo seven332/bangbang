@@ -287,7 +287,7 @@ impl LiveSnapshotLineage {
                 self.state = LineageState::Ready(pending.prior);
                 Ok(())
             }
-            state => self.restore_after_invalid_pending_token(state),
+            state => self.restore_after_invalid_pending_token(state, token),
         }
     }
 
@@ -299,7 +299,7 @@ impl LiveSnapshotLineage {
     ) -> Result<(), LiveSnapshotLineageError> {
         let pending = match self.take_state() {
             LineageState::Pending(pending) if pending.token == token => pending,
-            state => return self.restore_after_invalid_pending_token(state),
+            state => return self.restore_after_invalid_pending_token(state, token),
         };
         let next_base = match (pending.kind, result) {
             (LiveSnapshotKind::Full, LiveSnapshotPublishedResult::NativeV1Full) => {
@@ -332,7 +332,7 @@ impl LiveSnapshotLineage {
     ) -> Result<(), LiveSnapshotLineageError> {
         let published = match self.take_state() {
             LineageState::Published(published) if published.token == token => published,
-            state => return self.restore_after_invalid_published_token(state),
+            state => return self.restore_after_invalid_published_token(state, token),
         };
         let expected = match published.prior.dirty_epoch {
             Some(epoch) => match epoch.checked_add(1) {
@@ -432,11 +432,14 @@ impl LiveSnapshotLineage {
     fn restore_after_invalid_pending_token(
         &mut self,
         state: LineageState,
+        token: LiveSnapshotLineageToken,
     ) -> Result<(), LiveSnapshotLineageError> {
         let error = match &state {
-            LineageState::Pending(_) | LineageState::Published(_) => {
-                LiveSnapshotLineageError::StaleToken
+            LineageState::Pending(_) => LiveSnapshotLineageError::StaleToken,
+            LineageState::Published(published) if published.token == token => {
+                LiveSnapshotLineageError::AwaitingDirtyReset
             }
+            LineageState::Published(_) => LiveSnapshotLineageError::StaleToken,
             LineageState::Ready(_) => LiveSnapshotLineageError::NotPending,
             LineageState::Terminal(_) => LiveSnapshotLineageError::Terminal,
         };
@@ -447,8 +450,12 @@ impl LiveSnapshotLineage {
     fn restore_after_invalid_published_token(
         &mut self,
         state: LineageState,
+        token: LiveSnapshotLineageToken,
     ) -> Result<(), LiveSnapshotLineageError> {
         let error = match &state {
+            LineageState::Pending(pending) if pending.token == token => {
+                LiveSnapshotLineageError::NotAwaitingDirtyReset
+            }
             LineageState::Pending(_) | LineageState::Published(_) => {
                 LiveSnapshotLineageError::StaleToken
             }
@@ -693,6 +700,36 @@ mod tests {
         assert!(matches!(
             lineage.abort(second),
             Err(LiveSnapshotLineageError::NotPending)
+        ));
+    }
+
+    #[test]
+    fn current_token_cannot_reset_before_visibility_or_abort_after_visibility() {
+        let mut lineage = LiveSnapshotLineage::zero(0);
+        let token = lineage.begin_full(Some(0)).expect("Full should begin");
+        assert!(matches!(
+            lineage.commit_reset(token, Some(1)),
+            Err(LiveSnapshotLineageError::NotAwaitingDirtyReset)
+        ));
+        assert!(lineage.is_pending());
+
+        lineage
+            .published_durable(token, LiveSnapshotPublishedResult::NativeV2(binding(8)))
+            .expect("durable result should record once");
+        assert!(matches!(
+            lineage.abort(token),
+            Err(LiveSnapshotLineageError::AwaitingDirtyReset)
+        ));
+        assert!(matches!(
+            lineage.published_durable(token, LiveSnapshotPublishedResult::NativeV1Full),
+            Err(LiveSnapshotLineageError::AwaitingDirtyReset)
+        ));
+        lineage
+            .commit_reset(token, Some(1))
+            .expect("first reset should commit");
+        assert!(matches!(
+            lineage.commit_reset(token, Some(1)),
+            Err(LiveSnapshotLineageError::NotAwaitingDirtyReset)
         ));
     }
 
