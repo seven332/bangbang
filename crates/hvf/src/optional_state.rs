@@ -46,6 +46,27 @@ impl<T: Copy> HvfArm64OptionalStateValue<T> {
     }
 }
 
+/// One reviewed optional register slot addressable by snapshot tooling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HvfArm64ReviewedOptionalStateTarget {
+    /// One debug breakpoint value register.
+    BreakpointValue(u8),
+    /// One debug breakpoint control register.
+    BreakpointControl(u8),
+    /// One debug watchpoint value register.
+    WatchpointValue(u8),
+    /// One debug watchpoint control register.
+    WatchpointControl(u8),
+    /// One of `SMCR_EL1`, `SMPRI_EL1`, or `TPIDR2_EL0` in restore order.
+    SmeSystemRegister(u8),
+}
+
+fn replace_with_destination_default(value: &mut HvfArm64OptionalStateValue<u64>) -> bool {
+    let removed = matches!(value, HvfArm64OptionalStateValue::Explicit(_));
+    *value = HvfArm64OptionalStateValue::DestinationDefault;
+    removed
+}
+
 /// Value-free rejection while constructing reviewed optional restore state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvfArm64ReviewedOptionalStateBuildError {
@@ -554,6 +575,145 @@ impl HvfArm64ReviewedOptionalStateRestore {
     pub const fn simd_fp(&self) -> &HvfArm64VcpuSimdFpState {
         &self.simd_fp
     }
+
+    /// Reset requested, present register values and rebuild all checked
+    /// optional-state layers.
+    pub(crate) fn try_with_destination_defaults(
+        self,
+        targets: &[HvfArm64ReviewedOptionalStateTarget],
+        removed: &mut [bool],
+    ) -> Result<Self, HvfArm64ReviewedOptionalStateBuildError> {
+        if targets.len() != removed.len() {
+            return Err(HvfArm64ReviewedOptionalStateBuildError::DebugRegisterInventory);
+        }
+
+        let Self {
+            expected_id_aa64dfr0_el1,
+            expected_sme_version,
+            breakpoints,
+            watchpoints,
+            mut sme,
+            simd_fp,
+        } = self;
+        let HvfArm64DebugRegisterRestoreState {
+            implemented_count: breakpoint_count,
+            values: mut breakpoint_values,
+            controls: mut breakpoint_controls,
+        } = breakpoints;
+        let HvfArm64DebugRegisterRestoreState {
+            implemented_count: watchpoint_count,
+            values: mut watchpoint_values,
+            controls: mut watchpoint_controls,
+        } = watchpoints;
+
+        for (target, was_removed) in targets.iter().zip(removed) {
+            *was_removed = match *target {
+                HvfArm64ReviewedOptionalStateTarget::BreakpointValue(index) => {
+                    replace_debug_slot(&mut breakpoint_values, breakpoint_count, index)?
+                }
+                HvfArm64ReviewedOptionalStateTarget::BreakpointControl(index) => {
+                    replace_debug_slot(&mut breakpoint_controls, breakpoint_count, index)?
+                }
+                HvfArm64ReviewedOptionalStateTarget::WatchpointValue(index) => {
+                    replace_debug_slot(&mut watchpoint_values, watchpoint_count, index)?
+                }
+                HvfArm64ReviewedOptionalStateTarget::WatchpointControl(index) => {
+                    replace_debug_slot(&mut watchpoint_controls, watchpoint_count, index)?
+                }
+                HvfArm64ReviewedOptionalStateTarget::SmeSystemRegister(index) => {
+                    match sme.as_mut() {
+                        Some(state) => {
+                            let value = state.system_registers.get_mut(usize::from(index)).ok_or(
+                                HvfArm64ReviewedOptionalStateBuildError::SmeConditionalInventory,
+                            )?;
+                            replace_with_destination_default(value)
+                        }
+                        None => false,
+                    }
+                }
+            };
+        }
+
+        let breakpoints = HvfArm64DebugRegisterRestoreState::try_new(
+            breakpoint_count,
+            breakpoint_values,
+            breakpoint_controls,
+        )?;
+        let watchpoints = HvfArm64DebugRegisterRestoreState::try_new(
+            watchpoint_count,
+            watchpoint_values,
+            watchpoint_controls,
+        )?;
+        let sme = sme
+            .map(|state| rebuild_sme_restore_state(state, &simd_fp))
+            .transpose()?;
+        Self::try_new(
+            expected_id_aa64dfr0_el1,
+            expected_sme_version,
+            breakpoints,
+            watchpoints,
+            sme,
+            simd_fp,
+        )
+    }
+}
+
+fn replace_debug_slot(
+    values: &mut [HvfArm64OptionalStateValue<u64>; DEBUG_REGISTER_CAPACITY],
+    implemented_count: u8,
+    index: u8,
+) -> Result<bool, HvfArm64ReviewedOptionalStateBuildError> {
+    if index >= DEBUG_REGISTER_CAPACITY as u8 {
+        return Err(HvfArm64ReviewedOptionalStateBuildError::DebugRegisterInventory);
+    }
+    if index >= implemented_count {
+        return Ok(false);
+    }
+    let value = values
+        .get_mut(usize::from(index))
+        .ok_or(HvfArm64ReviewedOptionalStateBuildError::DebugRegisterInventory)?;
+    Ok(replace_with_destination_default(value))
+}
+
+fn rebuild_sme_restore_state(
+    state: HvfArm64SmeRestoreState,
+    simd_fp: &HvfArm64VcpuSimdFpState,
+) -> Result<HvfArm64SmeRestoreState, HvfArm64ReviewedOptionalStateBuildError> {
+    let HvfArm64SmeRestoreState {
+        version,
+        identification,
+        maximum_svl_bytes,
+        pstate,
+        system_registers,
+        z_registers,
+        p_registers,
+        za_register,
+        zt0_register,
+    } = state;
+    let mut input = HvfArm64SmeRestoreStateInput::new(
+        version,
+        identification,
+        maximum_svl_bytes,
+        pstate,
+        system_registers,
+    );
+    input = match (z_registers, p_registers) {
+        (Some(z_registers), Some(p_registers)) => {
+            input.with_streaming_registers(z_registers.into_vec(), p_registers.into_vec())
+        }
+        (None, None) => input,
+        _ => {
+            return Err(HvfArm64ReviewedOptionalStateBuildError::SmeConditionalInventory);
+        }
+    };
+    input = match (za_register, zt0_register) {
+        (Some(za_register), zt0_register) => input.with_za_register(za_register, zt0_register),
+        (None, None) => input,
+        (None, Some(_)) => {
+            return Err(HvfArm64ReviewedOptionalStateBuildError::SmeConditionalInventory);
+        }
+    };
+    HvfArm64SmeRestoreState::try_new(input, simd_fp)
 }
 
 const fn breakpoint_count(id_aa64dfr0_el1: u64) -> u8 {

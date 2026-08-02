@@ -53,10 +53,16 @@ use crate::snapshot_v2::{
 const REDACTED: &str = "<redacted>";
 
 mod inspection;
+mod register_removal;
 
 pub use inspection::{
     HVF_NATIVE_SNAPSHOT_INSPECTION_MAX_JSON_BYTES, HvfNativeSnapshotInspectionError,
     HvfNativeSnapshotVcpuStatesInspection, HvfNativeSnapshotVmStateInspection,
+};
+pub use register_removal::{
+    HVF_NATIVE_SNAPSHOT_REVIEWED_KVM_REGISTER_COUNT, HvfNativeSnapshotRegisterRemovalError,
+    HvfNativeSnapshotRegisterRemovalOutcome, HvfNativeSnapshotRegisterRemovalReport,
+    HvfNativeSnapshotRegisterRemovalStatus, HvfNativeSnapshotVcpuRegisterRemovalReport,
 };
 
 /// Exact semantic profile owned by one native HVF snapshot document.

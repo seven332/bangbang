@@ -136,11 +136,15 @@ pub use snapshot_bundle::{
     decode_hvf_snapshot_v1_state, encode_hvf_snapshot_v1_state,
 };
 pub use snapshot_document::{
-    HVF_NATIVE_SNAPSHOT_INSPECTION_MAX_JSON_BYTES, HvfNativeSnapshotDocument,
-    HvfNativeSnapshotDocumentDecodeError, HvfNativeSnapshotDocumentEncodeError,
-    HvfNativeSnapshotDocumentProfile, HvfNativeSnapshotDocumentReplaceError,
-    HvfNativeSnapshotInspectionError, HvfNativeSnapshotPlatformRef, HvfNativeSnapshotVcpuRef,
-    HvfNativeSnapshotVcpuState, HvfNativeSnapshotVcpuStatesInspection, HvfNativeSnapshotVcpus,
+    HVF_NATIVE_SNAPSHOT_INSPECTION_MAX_JSON_BYTES, HVF_NATIVE_SNAPSHOT_REVIEWED_KVM_REGISTER_COUNT,
+    HvfNativeSnapshotDocument, HvfNativeSnapshotDocumentDecodeError,
+    HvfNativeSnapshotDocumentEncodeError, HvfNativeSnapshotDocumentProfile,
+    HvfNativeSnapshotDocumentReplaceError, HvfNativeSnapshotInspectionError,
+    HvfNativeSnapshotPlatformRef, HvfNativeSnapshotRegisterRemovalError,
+    HvfNativeSnapshotRegisterRemovalOutcome, HvfNativeSnapshotRegisterRemovalReport,
+    HvfNativeSnapshotRegisterRemovalStatus, HvfNativeSnapshotVcpuRef,
+    HvfNativeSnapshotVcpuRegisterRemovalReport, HvfNativeSnapshotVcpuState,
+    HvfNativeSnapshotVcpuStatesInspection, HvfNativeSnapshotVcpus,
     HvfNativeSnapshotVmStateInspection,
 };
 pub use snapshot_restore::{
