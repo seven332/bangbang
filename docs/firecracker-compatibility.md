@@ -1595,10 +1595,11 @@ TCP-session loss, old V2-token rejection, fresh-session success, immutable
 state/memory, fresh metrics, malformed state/memory, override redaction,
 cancellation, both process-death orders, retry, no-vmnet containment, and
 cleanup.
-Current native-v2 2.12 closes vsock destination values and activates them
-through the public restore path. It uses the captured selector unless one
-validated `vsock_override` replaces it; a no-device override rejects before
-authority access. Capture closes old streams and queues `TRANSPORT_RESET`.
+Exact native-v2 Full 2.12 and current Diff 2.13 close vsock destination values
+and activate them through the public restore path. It uses the captured
+selector unless one validated `vsock_override` replaces it; a no-device
+override rejects before authority access. Capture closes old streams and queues
+`TRANSPORT_RESET`.
 Restored RX waits for event acknowledgement while TX remains live and guest
 listeners persist. #1736 signed direct MMIO/PCI matrices prove simultaneous
 immutable original/override clones, Paused work gating, four fresh
@@ -1801,7 +1802,9 @@ uses an externally supplied listener/connector, creates empty connection work, a
 the snapshot-origin RX gate. The production paused producer now reconciles the
 controller/runtime/HVF MMIO-or-PCI owner, metrics, and memory, publishes reset,
 captures state, and detaches source connection work under one owner lease.
-Current native-v2 2.12 create encodes that portable capture as kind 13.
+Exact native-v2 Full 2.12 creation encodes that portable capture as kind 13;
+current Diff 2.13 creation retains kind 13 unchanged beside mandatory Diff
+kind 14.
 Destination preparation resolves the captured selector or optional override
 before resource access, publishes direct sockets with owner-only stale-safe
 atomic replacement and exact cleanup, reserves exact contained

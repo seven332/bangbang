@@ -1457,7 +1457,8 @@ is resource-specific:
   original state and memory/layer bytes and inode facts remain unchanged and
   the actual edited state loads through the fixed launcher and nested App
   Sandbox only after retained descriptor adoption and pathname replacement.
-- Native-v2 state is the current public writer and Full/File lifecycle format.
+- Native-v2 state is the current public Full/File and Diff/File lifecycle
+  format.
   Its first pass treats all bytes as hostile, caps the complete file at 16 MiB,
   caps feature and component counts before table traversal, uses checked
   conversions and arithmetic, requires canonical packed ranges and exact EOF,
@@ -1473,8 +1474,10 @@ is resource-specific:
   retains those rules and adds optional entropy kind 9. Exact `2.9.0`
   retains those rules and adds optional balloon kind 10. Exact `2.10.0`
   retains those rules and adds optional virtio-mem kind 11. Exact `2.11.0`
-  retains those rules and adds optional network/MMDS kind 12. Current `2.12.0`
-  retains those rules and adds optional vsock kind 13. The
+  retains those rules and adds optional network/MMDS kind 12. Exact Full
+  `2.12.0` retains those rules and adds optional vsock kind 13. Current Diff
+  `2.13.0` retains the complete device product and adds mandatory Diff kind 14.
+  The
   platform decoder verifies that complete directory profile without
   payload-dependent allocation, caps every inner count and length before
   reservation, allocation-free scans the closed optional debug/SME registry,

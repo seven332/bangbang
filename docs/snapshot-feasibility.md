@@ -479,13 +479,16 @@ kind `7` with profile 1; minor 5 retains kind 7 while activating profile 2's
 bounded ordered block vector; minor 6 selects profile 3; minor 7 adds required
 serial kind 8 and makes kind 7 optional; minors 8 and 9 add optional entropy
 kind 9 and balloon kind 10; minor 10 adds optional virtio-mem kind 11; minor 11
-adds optional network/MMDS kind 12; and current minor 12 adds optional vsock
-kind 13. The current writer emits `2.12.0`. The required-feature catalog remains
-empty because those semantic component kinds are the mandatory compatibility
-identities. Decoded `2.1.x`, `2.2.x`, `2.3.x`, and exact `2.4.0` through
-`2.11.0` memory bindings retain their exact admitted version so their unchanged
-paired image headers still validate; newly written bindings use `2.12.0`. No
-other identifier or future minor is reserved.
+adds optional network/MMDS kind 12; minor 12 adds optional vsock kind 13; and
+current minor 13 adds mandatory Diff kind 14 while retaining the complete
+minor-12 device product unchanged. Generic encoding and version reporting use
+`2.13.0`; public Full state/memory publication remains exact `2.12.0`, while
+public Diff state/layer publication uses exact `2.13.0`. The required-feature
+catalog remains empty because those semantic component kinds are the mandatory
+compatibility identities. Decoded `2.1.x`, `2.2.x`, `2.3.x`, and exact `2.4.0`
+through `2.13.0` memory bindings retain their exact admitted version so their
+unchanged paired image headers still validate. No other identifier or future
+minor is reserved.
 
 Decoding first checks the fixed header, version, count caps, checked length and
 offset arithmetic, exact length, whole-state CRC, complete feature inventory,
@@ -515,7 +518,7 @@ binding header followed by one 24-byte entry per ordered guest extent:
 | Offset | Width | Field | Native-v2 memory rule |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | bytes `BANGM2A\0` |
-| 8..14 | 6 | semantic version | admitted `2.1.x`, `2.2.x`, `2.3.x`, exact `2.4.0`, exact `2.5.0`, exact `2.6.0`, exact `2.7.0`, exact `2.8.0`, exact `2.9.0`, exact `2.10.0`, exact `2.11.0`, or exact `2.12.0`; current writer emits `2.12.0` |
+| 8..14 | 6 | semantic version | admitted `2.1.x`, `2.2.x`, `2.3.x`, exact `2.4.0`, exact `2.5.0`, exact `2.6.0`, exact `2.7.0`, exact `2.8.0`, exact `2.9.0`, exact `2.10.0`, exact `2.11.0`, exact `2.12.0`, or exact `2.13.0`; the Full writer emits `2.12.0` and the Diff writer emits `2.13.0` |
 | 14 | 2 | header bytes | exact `64` |
 | 16 | 4 | flags | must be zero |
 | 20 | 4 | guest granule | exact `4096` bytes |

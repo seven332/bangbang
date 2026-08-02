@@ -563,7 +563,7 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
 production catalog admits semantic memory kind 1 introduced in minor 1; the
-current `2.12.0` writer additionally admits machine/global/topology kinds 2–4
+public Full `2.12.0` writer additionally admits machine/global/topology kinds 2–4
 and per-vCPU kind 5 introduced in minor 2, singleton time kind 6 introduced in
 minor 3, optional singleton device-graph kind 7 introduced in minor 4, and
 mandatory singleton serial kind 8 introduced in minor 7, plus optional entropy
@@ -591,7 +591,8 @@ clocks. Exact `2.12.0` retains those rules and optionally appends kind 13 with
 the guest CID, inert backend selector, host-local port cursor, active
 queue/common-virtio continuation, and MMIO/PCI placement while excluding
 listeners, connections, callbacks, metrics, and other host authority. Exact
-`2.3.0` remains the
+`2.13.0` retains kinds 1–13 unchanged and requires Diff kind 14, matching the
+current compatibility ceiling and public Diff writer. Exact `2.3.0` remains the
 legacy device-free platform profile. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
 lengths, all three offsets, CRC and every truncation, feature
@@ -604,7 +605,8 @@ resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
 Native-v2 lazy-memory tests retain exact multi-extent binding and complete
-`2.1.0` compatibility fixtures while proving that new output uses `2.12.0`.
+`2.1.0` compatibility fixtures while proving that ordinary Full output uses
+`2.12.0`; Diff tests separately prove exact `2.13.0` state/layer bindings.
 They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
 binding/header/topology/length mutation, exact admitted-version retention,
 typed state profiles,
@@ -2210,7 +2212,7 @@ scripts/run-integration-tests.sh --test production_bundle -- \
   --nocapture
 ```
 
-Current native-v2 2.12 vsock continuation is certified by the separate exact
+Exact native-v2 Full 2.12 vsock continuation is certified by the separate exact
 tests
 `signed_executable_certifies_native_v2_vsock_snapshot_over_mmio`,
 `signed_executable_certifies_native_v2_vsock_snapshot_over_product_pci`, and
