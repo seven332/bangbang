@@ -516,10 +516,281 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 252);
-    assert_eq!(count(Disposition::AuditRequired), 146);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 264);
+    assert_eq!(count(Disposition::AuditRequired), 134);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
+}
+
+#[test]
+fn snapshot_diff_rebase_terminal_policy_is_stable() {
+    const TERMINAL: [&str; 13] = [
+        "api-operation:PUT /snapshot/create",
+        "api-path:/snapshot/create",
+        "api-property:SnapshotCreateParams.mem_file_path",
+        "api-property:SnapshotCreateParams.snapshot_path",
+        "api-property:SnapshotCreateParams.snapshot_type",
+        "api-schema:SnapshotCreateParams",
+        "firecracker-argument:snapshot-version",
+        "tool-argument:rebase-snap/base-file",
+        "tool-argument:rebase-snap/diff-file",
+        "tool-argument:snapshot-editor/edit-memory/rebase/diff-path",
+        "tool-argument:snapshot-editor/edit-memory/rebase/memory-path",
+        "tool-operation:rebase-snap/rebase",
+        "tool-operation:snapshot-editor/edit-memory/rebase",
+    ];
+    const API_TERMINAL: [&str; 6] = [
+        "api-operation:PUT /snapshot/create",
+        "api-path:/snapshot/create",
+        "api-property:SnapshotCreateParams.mem_file_path",
+        "api-property:SnapshotCreateParams.snapshot_path",
+        "api-property:SnapshotCreateParams.snapshot_type",
+        "api-schema:SnapshotCreateParams",
+    ];
+    const REBASE_SNAP_TERMINAL: [&str; 3] = [
+        "tool-argument:rebase-snap/base-file",
+        "tool-argument:rebase-snap/diff-file",
+        "tool-operation:rebase-snap/rebase",
+    ];
+    const SNAPSHOT_EDITOR_TERMINAL: [&str; 3] = [
+        "tool-argument:snapshot-editor/edit-memory/rebase/diff-path",
+        "tool-argument:snapshot-editor/edit-memory/rebase/memory-path",
+        "tool-operation:snapshot-editor/edit-memory/rebase",
+    ];
+    const RETAINED: [(&str, &str); 4] = [
+        (
+            "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
+            "https://github.com/seven332/bangbang/issues/1543",
+        ),
+        (
+            "semantic.snapshot:editor-rebase-and-inspection",
+            "https://github.com/seven332/bangbang/issues/1542",
+        ),
+        (
+            "corpus:snapshot-editor",
+            "https://github.com/seven332/bangbang/issues/1542",
+        ),
+        (
+            "corpus:snapshot-versioning",
+            "https://github.com/seven332/bangbang/issues/1543",
+        ),
+    ];
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let by_id = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+    let contract = std::fs::read_to_string(
+        repository_root.join("compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md"),
+    )
+    .expect("checked snapshot Diff/rebase contract must be readable");
+
+    assert_eq!(
+        inventory.capabilities.len(),
+        418,
+        "the checked v1.16.0 overlay identity count drifted"
+    );
+    let expected_ids = TERMINAL
+        .into_iter()
+        .chain(RETAINED.iter().map(|(id, _)| *id))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected_ids.len(), 17, "Diff/rebase ledger must stay exact");
+
+    for id in TERMINAL {
+        let capability = by_id
+            .get(id)
+            .unwrap_or_else(|| panic!("terminal Diff/rebase record must exist: {id}"));
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "terminal Diff/rebase disposition drifted: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "terminal Diff/rebase evidence is incomplete: {id}"
+        );
+        assert!(
+            !capability.summary.contains("Audit the")
+                && !capability.summary.contains("Continue auditing"),
+            "terminal Diff/rebase summary still names placeholder work: {id}"
+        );
+    }
+
+    let api_implementation = BTreeSet::from([
+        "crates/api/src/http.rs",
+        "crates/bangbang/src/api_server.rs",
+        "crates/bangbang/src/vmm.rs",
+        "crates/runtime/src/snapshot.rs",
+    ]);
+    let api_validation = BTreeSet::from([
+        "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+        "crates/api/src/http.rs",
+        "crates/bangbang/src/api_server.rs",
+        "crates/bangbang/src/vmm.rs",
+        "crates/launcher/tests/production_bundle_e2e.rs",
+    ]);
+    for id in API_TERMINAL {
+        let capability = by_id.get(id).expect("terminal create record must exist");
+        assert_eq!(
+            local_reference_paths(&capability.implementation),
+            Some(api_implementation.clone()),
+            "snapshot create implementation evidence drifted: {id}"
+        );
+        assert_eq!(
+            local_reference_paths(&capability.validation),
+            Some(api_validation.clone()),
+            "snapshot create validation evidence drifted: {id}"
+        );
+    }
+
+    let tool_validation = BTreeSet::from([
+        "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+        "crates/bangbang/src/vmm.rs",
+        "crates/launcher/tests/production_bundle_e2e.rs",
+        "crates/runtime/src/snapshot_rebase/tests.rs",
+        "tools/snapshot-tools/tests/cli.rs",
+    ]);
+    for (ids, frontend) in [
+        (
+            REBASE_SNAP_TERMINAL.as_slice(),
+            "tools/snapshot-tools/src/bin/rebase-snap.rs",
+        ),
+        (
+            SNAPSHOT_EDITOR_TERMINAL.as_slice(),
+            "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+        ),
+    ] {
+        let implementation = BTreeSet::from([
+            "crates/runtime/src/snapshot_rebase.rs",
+            frontend,
+            "tools/snapshot-tools/src/lib.rs",
+        ]);
+        for id in ids {
+            let capability = by_id
+                .get(id)
+                .expect("terminal rebase-tool record must exist");
+            assert_eq!(
+                local_reference_paths(&capability.implementation),
+                Some(implementation.clone()),
+                "rebase-tool implementation evidence drifted: {id}"
+            );
+            assert_eq!(
+                local_reference_paths(&capability.validation),
+                Some(tool_validation.clone()),
+                "rebase-tool validation evidence drifted: {id}"
+            );
+        }
+    }
+
+    for (id, downstream) in RETAINED {
+        let capability = by_id
+            .get(id)
+            .unwrap_or_else(|| panic!("retained Diff/rebase aggregate must exist: {id}"));
+        assert_eq!(
+            capability.disposition,
+            Disposition::AuditRequired,
+            "mixed Diff/rebase aggregate must not be promoted: {id}"
+        );
+        assert!(
+            capability.implementation.is_empty() && capability.validation.is_empty(),
+            "retained aggregate must not acquire terminal evidence: {id}"
+        );
+        assert!(
+            capability.summary.contains(downstream),
+            "retained aggregate must name its exact downstream owner: {id}"
+        );
+    }
+
+    let rows = contract
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .collect::<Vec<_>>();
+    let contract_ids = rows
+        .iter()
+        .filter_map(|line| {
+            line.strip_prefix("| `")
+                .and_then(|line| line.split_once("` |"))
+                .map(|(id, _)| id)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(rows.len(), 17, "Diff/rebase contract row count drifted");
+    assert_eq!(
+        contract_ids, expected_ids,
+        "Diff/rebase contract identity set drifted"
+    );
+    for id in TERMINAL {
+        let row_prefix = format!("| `{id}` |");
+        let row = rows
+            .iter()
+            .copied()
+            .find(|row| row.starts_with(&row_prefix))
+            .unwrap_or_else(|| panic!("terminal Diff/rebase row must exist: {id}"));
+        assert_eq!(
+            contract.matches(&row_prefix).count(),
+            1,
+            "terminal Diff/rebase row must be unique: {id}"
+        );
+        assert!(row.contains("`implemented-and-verified`"));
+        assert!(row.ends_with("| `terminal` |"));
+    }
+    for (id, downstream) in RETAINED {
+        let row_prefix = format!("| `{id}` |");
+        let row = rows
+            .iter()
+            .copied()
+            .find(|row| row.starts_with(&row_prefix))
+            .unwrap_or_else(|| panic!("retained Diff/rebase row must exist: {id}"));
+        assert_eq!(contract.matches(&row_prefix).count(), 1);
+        assert!(row.contains("`audit-required`"));
+        assert!(row.contains(downstream));
+        assert!(!row.ends_with("| `terminal` |"));
+    }
+
+    for required in [
+        "d83d72b710361a10294480131377b1b00b163af8",
+        "src/firecracker/swagger/firecracker.yaml",
+        "docs/snapshotting/snapshot-support.md",
+        "src/vmm/src/vstate/vm.rs",
+        "src/rebase-snap/src/main.rs",
+        "src/snapshot-editor/src/edit_memory.rs",
+        "rebase-snap --base-file <path> --diff-file <path>",
+        "snapshot-editor edit-memory rebase --memory-path/-m <path> --diff-path/-d <path>",
+        "This tool is deprecated and will be removed in the future. Please use 'snapshot-editor' instead.",
+        "no state merge",
+        "state-last no-clobber pair",
+        "Success is exit 0",
+        "committed-but-uncertain completion",
+        "130/143",
+        "current_dynamic_add_and_remove_topologies_write_canonically",
+        "repeated_complete_application_handles_add_then_remove",
+        "exact_minor_thirteen_diff_closes_all_sixty_four_mmio_and_pci_products",
+        "diff_publication_commits_and_zero_root_loads_as_one_closed_pair",
+        "diff_load_accepts_a_complete_rebased_result_image",
+        "tracked_zero_diff_abort_restores_exact_generation",
+        "sparse_cross_directory_and_repeated_rebases_are_exact",
+        "every_outer_precommit_stage_failure_preserves_inputs",
+        "both_commands_materialize_byte_identical_complete_images",
+        "sequential_commands_apply_repeated_lineage_exactly",
+        "signed_native_v2_diff_process_loads_zero_root_and_rebased_products",
+        "normal_bundle_certifies_native_v2_diff_snapshot_grants_and_app_sandbox",
+        "executable_reports_native_snapshot_versions_before_socket_publication",
+        "sandboxed_bundle_reports_current_native_v2_snapshot_version",
+        "https://github.com/seven332/bangbang/issues/1542",
+        "https://github.com/seven332/bangbang/issues/1543",
+    ] {
+        assert!(
+            contract.contains(required),
+            "Diff/rebase contract must pin {required}"
+        );
+    }
 }
 
 #[test]
@@ -730,8 +1001,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 252);
-    assert_eq!(count(Disposition::AuditRequired), 146);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 264);
+    assert_eq!(count(Disposition::AuditRequired), 134);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -879,8 +1150,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 252);
-    assert_eq!(count(Disposition::AuditRequired), 146);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 264);
+    assert_eq!(count(Disposition::AuditRequired), 134);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -1150,8 +1421,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 252);
-    assert_eq!(count(Disposition::AuditRequired), 146);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 264);
+    assert_eq!(count(Disposition::AuditRequired), 134);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 

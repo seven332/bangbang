@@ -1360,11 +1360,60 @@
     {
       "id": "api-operation:PUT /snapshot/create",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /snapshot/create.",
+      "summary": "Accept one strict paused-only Firecracker-shaped PUT /snapshot/create request selecting Full or Diff and two distinct output selectors, then transactionally publish either an exact native-v2 2.12 complete state/image pair or an exact-2.13 complete state/sparse GPA layer pair with state-last no-clobber and linear dirty-lineage semantics.",
       "source_refs": [
         "api-operation:PUT /snapshot/create"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict SnapshotCreateParams request parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot create request projection and response mapping"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public Full and Diff create dispatch and publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "paused-only snapshot type and output policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked snapshot create and Diff closure ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict Full and Diff request parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot request conversion and latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "portable public create failure matrix and signed native-v2 Diff process certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production and nested App Sandbox exact-2.13 Diff certification"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /snapshot/load",
@@ -2100,11 +2149,60 @@
     {
       "id": "api-path:/snapshot/create",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /snapshot/create.",
+      "summary": "Expose the strict PUT-only /snapshot/create endpoint for paused Full or Diff creation, with no fallback route and with public error/status mapping around one closed native-v2 two-output transaction.",
       "source_refs": [
         "api-path:/snapshot/create"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict SnapshotCreateParams request parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot create request projection and response mapping"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public Full and Diff create dispatch and publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "paused-only snapshot type and output policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked snapshot create and Diff closure ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict Full and Diff request parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot request conversion and latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "portable public create failure matrix and signed native-v2 Diff process certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production and nested App Sandbox exact-2.13 Diff certification"
+        }
+      ]
     },
     {
       "id": "api-path:/snapshot/load",
@@ -6395,29 +6493,176 @@
     {
       "id": "api-property:SnapshotCreateParams.mem_file_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotCreateParams.mem_file_path.",
+      "summary": "Require mem_file_path as the exact second output selector: Full publishes a complete exact-2.12 memory image there, while Diff publishes the exact-2.13 packed GPA layer there, with distinct-path, grant-authority, collision, and no-clobber enforcement.",
       "source_refs": [
         "api-property:SnapshotCreateParams.mem_file_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict SnapshotCreateParams request parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot create request projection and response mapping"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public Full and Diff create dispatch and publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "paused-only snapshot type and output policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked snapshot create and Diff closure ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict Full and Diff request parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot request conversion and latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "portable public create failure matrix and signed native-v2 Diff process certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production and nested App Sandbox exact-2.13 Diff certification"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotCreateParams.snapshot_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotCreateParams.snapshot_path.",
+      "summary": "Require snapshot_path as the exact state output selector and publish the complete exact-2.12 Full or exact-2.13 Diff state only after its companion memory artifact is durable, preserving existing destinations on every precommit failure.",
       "source_refs": [
         "api-property:SnapshotCreateParams.snapshot_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict SnapshotCreateParams request parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot create request projection and response mapping"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public Full and Diff create dispatch and publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "paused-only snapshot type and output policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked snapshot create and Diff closure ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict Full and Diff request parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot request conversion and latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "portable public create failure matrix and signed native-v2 Diff process certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production and nested App Sandbox exact-2.13 Diff certification"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotCreateParams.snapshot_type",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotCreateParams.snapshot_type.",
+      "summary": "Accept exactly Full or Diff: Full emits the stable exact-2.12 complete image and Diff emits exact-2.13 complete state plus a zero-root or predecessor-bound sparse layer, rejecting unknown values before VMM mutation.",
       "source_refs": [
         "api-property:SnapshotCreateParams.snapshot_type"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict SnapshotCreateParams request parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot create request projection and response mapping"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public Full and Diff create dispatch and publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "paused-only snapshot type and output policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked snapshot create and Diff closure ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict Full and Diff request parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot request conversion and latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "portable public create failure matrix and signed native-v2 Diff process certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production and nested App Sandbox exact-2.13 Diff certification"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotLoadParams.clock_realtime",
@@ -8154,11 +8399,60 @@
     {
       "id": "api-schema:SnapshotCreateParams",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema SnapshotCreateParams.",
+      "summary": "Parse the strict three-field SnapshotCreateParams schema with required snapshot_type, snapshot_path, and mem_file_path, reject missing, duplicate, unknown, mistyped, or trailing input, and project the closed request into one paused-only Full/Diff transaction.",
       "source_refs": [
         "api-schema:SnapshotCreateParams"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict SnapshotCreateParams request parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot create request projection and response mapping"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public Full and Diff create dispatch and publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot.rs",
+          "anchor": "paused-only snapshot type and output policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked snapshot create and Diff closure ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict Full and Diff request parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot request conversion and latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "portable public create failure matrix and signed native-v2 Diff process certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production and nested App Sandbox exact-2.13 Diff certification"
+        }
+      ]
     },
     {
       "id": "api-schema:SnapshotLoadParams",
@@ -9467,7 +9761,7 @@
     {
       "id": "corpus:snapshot-editor",
       "family": "snapshots",
-      "summary": "Audit all applicable capability claims owned by the pinned snapshot-editor source corpus.",
+      "summary": "The pinned snapshot-editor edit-memory rebase operation is implemented through the exact --memory-path/-m and --diff-path/-d surface, one shared macOS no-clobber transaction, deterministic exits, redaction, process tests, and signed real-chain evidence. Snapshot inspection, VM-state/register editing, and architecture-specific editing remain audit-required under https://github.com/seven332/bangbang/issues/1542.",
       "source_refs": [
         "corpus:snapshot-editor"
       ],
@@ -9615,7 +9909,7 @@
     {
       "id": "corpus:snapshot-versioning",
       "family": "snapshots",
-      "summary": "Native-v2 provides bounded compatible-minor decoding; exact legacy device-free 2.3, singleton-root 2.4, block-only profile-2 2.5, and storage-only profile-3 2.6 loading; and a current serial-required 2.7.0 public writer with optional unchanged profile-3 block/pmem storage over MMIO or the product PCI budget. It provides exact CLI version/description output, immutable repeated File/COW state-memory loads, fresh destination serial endpoint ownership, deliberate shared writable external backings, and explicit Firecracker incompatibility. Continue auditing editor/rebase tooling, other optional-device schema evolution, Firecracker artifact interoperability, and broad portability owned by the pinned snapshot-versioning corpus.",
+      "summary": "Native-v2 provides bounded exact profile decoding from device-free 2.3 through Full 2.12 and Diff 2.13, exact version/description output, immutable repeated File/COW and zero-root/result-bound Diff loads, and both public native-v2 rebase commands with final-state-only semantics. Firecracker-byte interoperability, native-v2 Uffd, broader artifact evolution, external paging, cross-host portability, and the full version matrix remain audit-required under https://github.com/seven332/bangbang/issues/1543.",
       "source_refs": [
         "corpus:snapshot-versioning"
       ],
@@ -10288,7 +10582,7 @@
     {
       "id": "firecracker-argument:snapshot-version",
       "family": "process",
-      "summary": "Report the current bangbang-native public writer version v2.7.0 through the early --snapshot-version command, while exact description and load retain storage-only profile-3 2.6.0, block-only profile-2 2.5.0, singleton-root 2.4.0, and device-free 2.3.0, without claiming Firecracker v10 artifact compatibility.",
+      "summary": "Report the current bangbang-native compatibility ceiling v2.13.0 through the early --snapshot-version command; public Full creation remains exact v2.12.0, Diff creation is exact v2.13.0, and exact description/load retain supported native-v2 profiles 2.3 through 2.13 without claiming Firecracker v10 artifact compatibility.",
       "source_refs": [
         "firecracker-argument:snapshot-version"
       ],
@@ -11442,7 +11736,7 @@
     {
       "id": "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
       "family": "snapshots",
-      "summary": "Current native-v2 Full/File uses retained read-only private COW memory, can activate a complete destination dirty epoch, and resets an active source epoch only after visible Full commit. Frozen native-v1 keeps eager File and the macOS Apple-Silicon Uffd compatibility path with dirty tracking disabled. Native-v2 Uffd, Diff serialization/merge/restore, broader external-paging profiles, and final aggregate certification remain for Wave 6.",
+      "summary": "Native-v2 exact-2.13 Diff now has tracked and untracked selection, zero-root and predecessor lineage, repeated GPA-layer composition, successful-commit dirty reset, no-side-effect failure, complete state, public create/load, MMIO/PCI, direct/contained/production/App Sandbox evidence, and both rebase tools. Native-v2 Uffd, broader external paging and memory-backend coverage, and final aggregate certification remain audit-required under https://github.com/seven332/bangbang/issues/1543.",
       "source_refs": [
         "corpus:snapshot-page-faults",
         "corpus:snapshot-support"
@@ -11452,7 +11746,7 @@
     {
       "id": "semantic.snapshot:editor-rebase-and-inspection",
       "family": "snapshots",
-      "summary": "Audit snapshot editor, rebase, inspection, version reporting, failure behavior, and applicable architecture semantics.",
+      "summary": "Both Firecracker-shaped rebase entrypoints implement exact native-v2 repeated memory-layer materialization through one stronger staged no-clobber macOS transaction with deterministic syntax, deprecation, signal, failure, uncertainty, redaction, and signed real-chain behavior. Snapshot inspection, VM-state/register editing, and architecture-specific editing remain audit-required under https://github.com/seven332/bangbang/issues/1542.",
       "source_refs": [
         "corpus:snapshot-editor"
       ],
@@ -12649,20 +12943,108 @@
     {
       "id": "tool-argument:rebase-snap/base-file",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool argument rebase-snap/base-file.",
+      "summary": "Require --base-file as the mutable native-v2 complete-image or zero-root-layer input to deprecated rebase-snap; validate and retain its exact inode before private materialization, then atomically replace only this pathname on durable success.",
       "source_refs": [
         "tool-argument:rebase-snap/base-file"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase.rs",
+          "anchor": "staged exact native-v2 Diff rebase transaction"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/rebase-snap.rs",
+          "anchor": "deprecated --base-file and --diff-file frontend"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "shared signal execution and outcome classification"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked rebase command and stronger transaction ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signed real-HVF Full Diff both-tool rebase load and recapture chain"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production exact-2.13 zero-root state and layer compatibility"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase/tests.rs",
+          "anchor": "transaction failure race cancellation cleanup and durability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual deprecated and replacement command process matrix"
+        }
+      ]
     },
     {
       "id": "tool-argument:rebase-snap/diff-file",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool argument rebase-snap/diff-file.",
+      "summary": "Require --diff-file as the immutable exact-2.13 successor layer to deprecated rebase-snap, prove its base lineage and complete result/GPA topology, and preserve its bytes, inode facts, and pathname through every success or failure.",
       "source_refs": [
         "tool-argument:rebase-snap/diff-file"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase.rs",
+          "anchor": "staged exact native-v2 Diff rebase transaction"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/rebase-snap.rs",
+          "anchor": "deprecated --base-file and --diff-file frontend"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "shared signal execution and outcome classification"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked rebase command and stronger transaction ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signed real-HVF Full Diff both-tool rebase load and recapture chain"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production exact-2.13 zero-root state and layer compatibility"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase/tests.rs",
+          "anchor": "transaction failure race cancellation cleanup and durability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual deprecated and replacement command process matrix"
+        }
+      ]
     },
     {
       "id": "tool-argument:seccompiler/basic",
@@ -12837,20 +13219,108 @@
     {
       "id": "tool-argument:snapshot-editor/edit-memory/rebase/diff-path",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/edit-memory/rebase/diff-path.",
+      "summary": "Require --diff-path/-d as the immutable exact-2.13 successor layer to snapshot-editor edit-memory rebase, prove its base lineage and complete result/GPA topology, and preserve its bytes, inode facts, and pathname through every outcome.",
       "source_refs": [
         "tool-argument:snapshot-editor/edit-memory/rebase/diff-path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase.rs",
+          "anchor": "staged exact native-v2 Diff rebase transaction"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "edit-memory rebase --memory-path/-m and --diff-path/-d frontend"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "shared signal execution and outcome classification"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked rebase command and stronger transaction ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signed real-HVF Full Diff both-tool rebase load and recapture chain"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production exact-2.13 zero-root state and layer compatibility"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase/tests.rs",
+          "anchor": "transaction failure race cancellation cleanup and durability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual deprecated and replacement command process matrix"
+        }
+      ]
     },
     {
       "id": "tool-argument:snapshot-editor/edit-memory/rebase/memory-path",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/edit-memory/rebase/memory-path.",
+      "summary": "Require --memory-path/-m as the mutable native-v2 complete-image or zero-root-layer input to snapshot-editor edit-memory rebase; retain its exact inode before staging and atomically replace only this pathname on durable success.",
       "source_refs": [
         "tool-argument:snapshot-editor/edit-memory/rebase/memory-path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase.rs",
+          "anchor": "staged exact native-v2 Diff rebase transaction"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "edit-memory rebase --memory-path/-m and --diff-path/-d frontend"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "shared signal execution and outcome classification"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked rebase command and stronger transaction ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signed real-HVF Full Diff both-tool rebase load and recapture chain"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production exact-2.13 zero-root state and layer compatibility"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase/tests.rs",
+          "anchor": "transaction failure race cancellation cleanup and durability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual deprecated and replacement command process matrix"
+        }
+      ]
     },
     {
       "id": "tool-argument:snapshot-editor/edit-vmstate/remove-regs/output-path",
@@ -12996,11 +13466,55 @@
     {
       "id": "tool-operation:rebase-snap/rebase",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool operation rebase-snap/rebase.",
+      "summary": "Provide the deprecated Firecracker-shaped rebase-snap operation with required --base-file and --diff-file, its stable notice, shared signal handling, redacted 0/1/2/3/130/143 outcomes, and a stronger macOS staged no-clobber native-v2 rebase transaction.",
       "source_refs": [
         "tool-operation:rebase-snap/rebase"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase.rs",
+          "anchor": "staged exact native-v2 Diff rebase transaction"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/rebase-snap.rs",
+          "anchor": "deprecated --base-file and --diff-file frontend"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "shared signal execution and outcome classification"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked rebase command and stronger transaction ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signed real-HVF Full Diff both-tool rebase load and recapture chain"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production exact-2.13 zero-root state and layer compatibility"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase/tests.rs",
+          "anchor": "transaction failure race cancellation cleanup and durability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual deprecated and replacement command process matrix"
+        }
+      ]
     },
     {
       "id": "tool-operation:seccompiler/compile",
@@ -13048,11 +13562,55 @@
     {
       "id": "tool-operation:snapshot-editor/edit-memory/rebase",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool operation snapshot-editor/edit-memory/rebase.",
+      "summary": "Provide snapshot-editor edit-memory rebase with required --memory-path/-m and --diff-path/-d, shared signal handling, redacted 0/1/2/3/130/143 outcomes, and the same stronger macOS staged no-clobber native-v2 transaction as deprecated rebase-snap.",
       "source_refs": [
         "tool-operation:snapshot-editor/edit-memory/rebase"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase.rs",
+          "anchor": "staged exact native-v2 Diff rebase transaction"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "edit-memory rebase --memory-path/-m and --diff-path/-d frontend"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "shared signal execution and outcome classification"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked rebase command and stronger transaction ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signed real-HVF Full Diff both-tool rebase load and recapture chain"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal production exact-2.13 zero-root state and layer compatibility"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase/tests.rs",
+          "anchor": "transaction failure race cancellation cleanup and durability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual deprecated and replacement command process matrix"
+        }
+      ]
     },
     {
       "id": "tool-operation:snapshot-editor/edit-vmstate/remove-regs",

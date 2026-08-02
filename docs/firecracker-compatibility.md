@@ -776,6 +776,50 @@ filter reader, runtime corpus, and process flags as public-macOS platform
 exclusions; the older install-helper wording in pinned `docs/seccompiler.md`
 does not expand the host tool into a runtime API.
 
+## Snapshot Rebase Tools
+
+The workspace provides two Firecracker-shaped native-v2 memory rebase
+frontends. The deprecated standalone form is:
+
+```sh
+rebase-snap --base-file <path> --diff-file <path>
+```
+
+It accepts only those required long options and prints the stable notice
+`This tool is deprecated and will be removed in the future. Please use 'snapshot-editor' instead.`
+on help, version, and an ordinary valid invocation. The replacement form is:
+
+```sh
+snapshot-editor edit-memory rebase --memory-path <path> --diff-path <path>
+```
+
+`-m` and `-d` are exact short aliases. Both frontends converge on one executor
+and one native-v2 transaction. They are supported only on macOS; another target
+rejects before opening or disclosing either path. Exit 0 means the replacement
+is durable, 1 is an operational failure before commit, 2 is command syntax or
+configuration failure, 3 means the replacement committed but later
+verification, cleanup, or directory durability is uncertain, and 130/143 are
+precommit SIGINT/SIGTERM cancellation. Non-help diagnostics use fixed,
+path-redacted categories.
+
+The transaction accepts a complete native-v2 image or zero-root layer as the
+mutable base and one exact-2.13 successor Diff as the immutable input. It
+validates lineage, complete result binding, and GPA topology, materializes an
+owner-only private staged complete image, synchronizes it, atomically exchanges
+it with the base, verifies the committed inode, cleans the displaced file, and
+synchronizes the parent directory. Every failure before exchange preserves both
+inputs; a failure after exchange reports uncertainty and never claims rollback.
+The Diff bytes, inode facts, and pathname remain unchanged. Repeated layers are
+applied in order to the preceding complete result.
+
+Rebase changes memory only. State files are never merged; restore uses the
+complete state paired with the last memory layer/result. This is deliberately
+stronger than Firecracker's Linux in-place sparse copy and does not claim its
+`SEEK_DATA`/`SEEK_HOLE` byte layout. Snapshot inspection, VM-state/register
+editing, and architecture-specific editor commands remain outside this tool
+subset. Exact identities and named evidence are pinned in the
+[Diff and rebase closure contract](../compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md).
+
 ## Runtime Isolation Platform Exclusions
 
 The following Linux identities have no equivalent current public macOS process
@@ -4013,10 +4057,11 @@ Their eventual support level should follow the endpoint matrix:
   gating, exact cursor continuation, immutable original/override clones,
   recapture, fresh metrics, malformed/no-device/authority/cancellation/death
   handling, retry, redaction, containment, and cleanup. The CLI reports the
-  current ceiling `v2.13.0` and describes exact v1/v2 versions. Remaining work includes
-  native-v2 Uffd, public rebase/inspection tools, per-drive overrides, editing tools,
-  Firecracker artifact compatibility, authentication, live-peer migration, and
-  broader cross-host portability
+  current ceiling `v2.13.0` and describes exact v1/v2 versions. Both public
+  native-v2 memory rebase commands are available with the transaction described
+  above. Remaining work includes native-v2 Uffd, snapshot inspection and
+  register editing, per-drive overrides, Firecracker artifact compatibility,
+  authentication, live-peer migration, and broader cross-host portability
 - balloon producers are implemented across live queue/discard/reporting and
   exact native-v2 2.9 serialized/restored state; absent guest statistics remain
   omitted rather than emitted as synthetic zero fields, guest PFNs remain

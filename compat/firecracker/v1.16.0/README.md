@@ -54,6 +54,7 @@ reviewed delta.
 | [Network and MMDS](network-mmds-contract.md) | Interface/MMDS lifecycle, authority, native-v2 state, and explicit external/performance handoffs |
 | [Vsock](vsock-contract.md) | Live Unix-socket subset, native-v2 state, clone-local authority, and exclusions |
 | [Snapshot paging](snapshot-paging-contract.md) | Pinned page-fault contract, macOS feasibility, pager protocol/consumer boundary, native-v1 reader, and terminal evidence |
+| [Snapshot Diff and rebase](snapshot-diff-rebase-contract.md) | Native-v2 2.13 differential create/load, public rebase commands, stronger no-clobber transaction, and exact retained aggregates |
 
 ## Dispositions
 
