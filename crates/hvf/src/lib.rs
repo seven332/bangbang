@@ -136,10 +136,12 @@ pub use snapshot_bundle::{
     decode_hvf_snapshot_v1_state, encode_hvf_snapshot_v1_state,
 };
 pub use snapshot_document::{
-    HvfNativeSnapshotDocument, HvfNativeSnapshotDocumentDecodeError,
-    HvfNativeSnapshotDocumentEncodeError, HvfNativeSnapshotDocumentProfile,
-    HvfNativeSnapshotDocumentReplaceError, HvfNativeSnapshotPlatformRef, HvfNativeSnapshotVcpuRef,
-    HvfNativeSnapshotVcpuState, HvfNativeSnapshotVcpus,
+    HVF_NATIVE_SNAPSHOT_INSPECTION_MAX_JSON_BYTES, HvfNativeSnapshotDocument,
+    HvfNativeSnapshotDocumentDecodeError, HvfNativeSnapshotDocumentEncodeError,
+    HvfNativeSnapshotDocumentProfile, HvfNativeSnapshotDocumentReplaceError,
+    HvfNativeSnapshotInspectionError, HvfNativeSnapshotPlatformRef, HvfNativeSnapshotVcpuRef,
+    HvfNativeSnapshotVcpuState, HvfNativeSnapshotVcpuStatesInspection, HvfNativeSnapshotVcpus,
+    HvfNativeSnapshotVmStateInspection,
 };
 pub use snapshot_restore::{
     HvfSnapshotV1PlatformError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,

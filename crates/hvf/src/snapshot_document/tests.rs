@@ -84,6 +84,132 @@ fn native_v1_document_fixture() -> (HvfSnapshotV1Bundle, Vec<u8>) {
     (bundle, bytes)
 }
 
+pub(crate) fn inspection_document_fixtures() -> Vec<HvfNativeSnapshotDocument> {
+    let (_, v1) = native_v1_document_fixture();
+    let legacy = encode_hvf_snapshot_v2_platform_state(&platform_fixture(false))
+        .expect("exact-2.3 inspection fixture should encode");
+    let device_graph =
+        encode_hvf_snapshot_v2_state(&complete_state_fixture(MMIO_GRAPH_FIXTURE_HEX))
+            .expect("exact-2.4 inspection fixture should encode");
+    let multi_block = encode_hvf_snapshot_v2_multi_block_state(
+        &complete_multi_block_state_fixture(MULTI_BLOCK_MMIO_GRAPH_FIXTURE_HEX),
+    )
+    .expect("exact-2.5 inspection fixture should encode");
+    let storage = encode_hvf_snapshot_v2_storage_state(&complete_storage_state_fixture(
+        STORAGE_MMIO_GRAPH_FIXTURE_HEX,
+    ))
+    .expect("exact-2.6 inspection fixture should encode");
+    let serial = encode_hvf_snapshot_v2_serial_state(&complete_serial_state_fixture(
+        Some(STORAGE_MMIO_GRAPH_FIXTURE_HEX),
+        SERIAL_CONFIGURED_FIXTURE_HEX,
+    ))
+    .expect("exact-2.7 inspection fixture should encode");
+    let entropy = encode_hvf_snapshot_v2_entropy_state(&complete_entropy_state_fixture(
+        None,
+        SERIAL_CONFIGURED_FIXTURE_HEX,
+        Some(ENTROPY_INACTIVE_MMIO_FIXTURE_HEX),
+        false,
+    ))
+    .expect("exact-2.8 inspection fixture should encode");
+    let balloon = encode_hvf_snapshot_v2_balloon_state(&complete_balloon_state_fixture(
+        SnapshotV2DeviceTransportKind::Mmio,
+        true,
+        true,
+        true,
+    ))
+    .expect("exact-2.9 inspection fixture should encode");
+    let memory_hotplug =
+        encode_hvf_snapshot_v2_memory_hotplug_state(&complete_memory_hotplug_state_fixture(
+            SnapshotV2DeviceTransportKind::Mmio,
+            true,
+            true,
+            true,
+            true,
+        ))
+        .expect("exact-2.10 inspection fixture should encode");
+    let network = encode_hvf_snapshot_v2_network_state(&complete_network_state_fixture(
+        SnapshotV2DeviceTransportKind::Mmio,
+        true,
+        true,
+        true,
+        true,
+        true,
+    ))
+    .expect("exact-2.11 inspection fixture should encode");
+    let vsock = encode_hvf_snapshot_v2_vsock_state(&complete_vsock_state_fixture(
+        SnapshotV2DeviceTransportKind::Mmio,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+    ))
+    .expect("exact-2.12 inspection fixture should encode");
+    let predecessor_memory_hotplug =
+        product_memory_hotplug_fixture(SnapshotV2DeviceTransportKind::Mmio);
+    let predecessor = exact_minor_twelve_memory_binding(Some(&predecessor_memory_hotplug));
+    let extent = GuestMemoryRange::new(GuestAddress::new(aarch64::DRAM_MEM_START), 4096)
+        .expect("Diff inspection fixture extent should validate");
+    let diff = encode_hvf_snapshot_v2_diff_state(&complete_diff_state_fixture(
+        SnapshotV2DeviceTransportKind::Mmio,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        SnapshotV2DiffBase::Image(predecessor),
+        &[extent],
+    ))
+    .expect("exact-2.13 inspection fixture should encode");
+
+    [
+        v1,
+        legacy,
+        device_graph,
+        multi_block,
+        storage,
+        serial,
+        entropy,
+        balloon,
+        memory_hotplug,
+        network,
+        vsock,
+        diff,
+    ]
+    .into_iter()
+    .map(|bytes| {
+        HvfNativeSnapshotDocument::decode(&bytes)
+            .expect("inspection fixture should decode as an exact document")
+    })
+    .collect()
+}
+
+pub(crate) fn inspection_native_v1_document(memory_mib: u64) -> HvfNativeSnapshotDocument {
+    let bundle = HvfSnapshotV1Bundle::try_new(memory_binding(memory_mib), native_v1_fixture())
+        .expect("native-v1 inspection fixture bundle should validate");
+    let bytes = encode_snapshot_commit_envelope(bundle.commit_record())
+        .expect("native-v1 inspection fixture should encode");
+    HvfNativeSnapshotDocument::decode(&bytes).expect("native-v1 inspection fixture should decode")
+}
+
+pub(crate) fn inspection_native_v1_document_with_pc(pc: u64) -> HvfNativeSnapshotDocument {
+    let (machine, compatibility, mut vcpu, interrupts, device) = native_v1_fixture().into_parts();
+    vcpu.general = crate::vcpu::HvfArm64VcpuGeneralRegisterState::new(
+        *vcpu.general.general_purpose_registers(),
+        pc,
+        vcpu.general.cpsr(),
+    );
+    let state = HvfSnapshotV1State::new(machine, compatibility, vcpu, interrupts, device);
+    let bundle = HvfSnapshotV1Bundle::try_new(memory_binding(1), state)
+        .expect("native-v1 inspection register fixture should validate");
+    let bytes = encode_snapshot_commit_envelope(bundle.commit_record())
+        .expect("native-v1 inspection register fixture should encode");
+    HvfNativeSnapshotDocument::decode(&bytes)
+        .expect("native-v1 inspection register fixture should decode")
+}
+
 #[test]
 fn native_v1_document_preserves_commit_memory_state_and_replacement() {
     let (bundle, bytes) = native_v1_document_fixture();

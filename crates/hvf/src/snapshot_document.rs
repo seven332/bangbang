@@ -52,6 +52,13 @@ use crate::snapshot_v2::{
 
 const REDACTED: &str = "<redacted>";
 
+mod inspection;
+
+pub use inspection::{
+    HVF_NATIVE_SNAPSHOT_INSPECTION_MAX_JSON_BYTES, HvfNativeSnapshotInspectionError,
+    HvfNativeSnapshotVcpuStatesInspection, HvfNativeSnapshotVmStateInspection,
+};
+
 /// Exact semantic profile owned by one native HVF snapshot document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvfNativeSnapshotDocumentProfile {
