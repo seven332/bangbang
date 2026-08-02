@@ -151,6 +151,37 @@ where
     }
 }
 
+pub(super) fn read_snapshot_state_file_unix_with_cancel<Cancel>(
+    path: &Path,
+    is_cancelled: Cancel,
+) -> Result<Vec<u8>, SnapshotStateReadError>
+where
+    Cancel: FnMut(SnapshotStateEditStage) -> bool,
+{
+    let mut policy = SystemEditPolicy { is_cancelled };
+    policy.checkpoint(SnapshotStateEditStage::PlatformCheck)?;
+
+    let input = adopt_input(path, &mut policy)?;
+    policy.checkpoint(SnapshotStateEditStage::InputRead)?;
+    let bytes = read_input(&input)?;
+
+    policy.checkpoint(SnapshotStateEditStage::SourceStability)?;
+    verify_read_source(&input, &bytes, SnapshotStateEditStage::SourceStability)?;
+
+    policy.checkpoint(SnapshotStateEditStage::DirectoryStability)?;
+    verify_read_directory(&input, SnapshotStateEditStage::DirectoryStability)?;
+
+    // This is the last caller-controlled checkpoint. Repeat every retained
+    // source, path, entry, and byte check after it without invoking caller code
+    // or allocating before returning the immutable capture.
+    policy.checkpoint(SnapshotStateEditStage::EntryStability)?;
+    verify_read_directory(&input, SnapshotStateEditStage::EntryStability)?;
+    verify_read_entry(&input, SnapshotStateEditStage::EntryStability)?;
+    verify_read_source(&input, &bytes, SnapshotStateEditStage::EntryStability)?;
+
+    Ok(bytes)
+}
+
 pub(super) fn publish_edited_snapshot_state_unix_with_cancel<
     T,
     E,
@@ -473,6 +504,118 @@ fn read_input(input: &AdoptedInput) -> Result<Vec<u8>, SnapshotStateEditError> {
         ));
     }
     Ok(bytes)
+}
+
+fn verify_read_source(
+    input: &AdoptedInput,
+    expected: &[u8],
+    stage: SnapshotStateEditStage,
+) -> Result<(), SnapshotStateEditError> {
+    if inspect_file(&input.file).ok() != Some(input.facts)
+        || file_identity(&input.file).ok() != Some(input.identity)
+    {
+        return Err(precommit_error(
+            stage,
+            SnapshotStateEditFailure::SourceChanged,
+        ));
+    }
+    verify_read_content(&input.file, expected, stage)
+}
+
+fn verify_read_directory(
+    input: &AdoptedInput,
+    stage: SnapshotStateEditStage,
+) -> Result<(), SnapshotStateEditError> {
+    let retained = file_identity(&input.path.directory).ok();
+    let reopened = open_directory(&input.path.parent)
+        .ok()
+        .and_then(|directory| file_identity(&directory).ok());
+    if retained == Some(input.path.directory_identity)
+        && reopened == Some(input.path.directory_identity)
+    {
+        Ok(())
+    } else {
+        Err(precommit_error(
+            stage,
+            SnapshotStateEditFailure::DirectoryChanged {
+                path: SnapshotStateEditPathRole::Input,
+            },
+        ))
+    }
+}
+
+fn verify_read_entry(
+    input: &AdoptedInput,
+    stage: SnapshotStateEditStage,
+) -> Result<(), SnapshotStateEditError> {
+    if entry_identity(&input.path.directory, &input.path.component)
+        .ok()
+        .flatten()
+        == Some(input.identity)
+    {
+        Ok(())
+    } else {
+        Err(precommit_error(
+            stage,
+            SnapshotStateEditFailure::EntryChanged {
+                path: SnapshotStateEditPathRole::Input,
+            },
+        ))
+    }
+}
+
+fn verify_read_content(
+    file: &File,
+    expected: &[u8],
+    stage: SnapshotStateEditStage,
+) -> Result<(), SnapshotStateEditError> {
+    let mut buffer = [0_u8; CONTENT_COMPARE_BYTES];
+    let mut offset = 0_usize;
+    while offset < expected.len() {
+        let count = (expected.len() - offset).min(buffer.len());
+        let chunk = buffer
+            .get_mut(..count)
+            .ok_or_else(|| precommit_error(stage, SnapshotStateEditFailure::SourceChanged))?;
+        let file_offset = u64::try_from(offset)
+            .map_err(|_| precommit_error(stage, SnapshotStateEditFailure::SourceChanged))?;
+        read_exact_at(file, chunk, file_offset).map_err(|source| {
+            precommit_error(
+                stage,
+                SnapshotStateEditFailure::Io {
+                    kind: source.kind(),
+                },
+            )
+        })?;
+        let end = offset
+            .checked_add(count)
+            .ok_or_else(|| precommit_error(stage, SnapshotStateEditFailure::SourceChanged))?;
+        if expected.get(offset..end) != Some(chunk) {
+            return Err(precommit_error(
+                stage,
+                SnapshotStateEditFailure::SourceChanged,
+            ));
+        }
+        offset = end;
+    }
+
+    let file_offset = u64::try_from(offset)
+        .map_err(|_| precommit_error(stage, SnapshotStateEditFailure::SourceChanged))?;
+    let mut extra = [0_u8; 1];
+    if file.read_at(&mut extra, file_offset).map_err(|source| {
+        precommit_error(
+            stage,
+            SnapshotStateEditFailure::Io {
+                kind: source.kind(),
+            },
+        )
+    })? != 0
+    {
+        return Err(precommit_error(
+            stage,
+            SnapshotStateEditFailure::SourceChanged,
+        ));
+    }
+    Ok(())
 }
 
 fn create_staging(directory: &File) -> Result<StagingFile<'_>, SnapshotStateEditError> {

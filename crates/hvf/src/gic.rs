@@ -5,10 +5,14 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 use bangbang_runtime::BackendError;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 use bangbang_runtime::fdt::{
     ARM64_GICV2M_MSI_IIDR_OFFSET, ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET,
-    ARM64_GICV2M_SPI_END_EXCLUSIVE, Arm64FdtError, Arm64FdtGic, Arm64FdtInterruptRange,
-    Arm64FdtMsi, Arm64FdtRegion, Arm64FdtTimerInterrupts,
+    ARM64_GICV2M_SPI_END_EXCLUSIVE,
+};
+use bangbang_runtime::fdt::{
+    Arm64FdtError, Arm64FdtGic, Arm64FdtInterruptRange, Arm64FdtMsi, Arm64FdtRegion,
+    Arm64FdtTimerInterrupts,
 };
 use bangbang_runtime::interrupt::{
     GuestInterruptLine, GuestInterruptLineError, InterruptSignalError, InterruptSink,
@@ -19,34 +23,51 @@ use bangbang_runtime::message_interrupt::{
     GuestMessageInterruptResourcesError, GuestMessageInterruptSignalError,
 };
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const GIC_REQUIRES_MACOS_15_MESSAGE: &str =
     "Hypervisor.framework GIC APIs require macOS 15.0 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const MMIO32_MEM_START: u64 = 1 << 30;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const DRAM_MEM_START: u64 = bangbang_runtime::memory::aarch64::DRAM_MEM_START;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE: &str =
     "function pointer size does not match a dynamic symbol pointer";
 const GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE: &str = "HVF GIC SPI signaler lock is poisoned";
 const GIC_MSI_SIGNALER_LOCK_POISONED_MESSAGE: &str = "HVF GIC MSI signaler lock is poisoned";
 const GIC_MSI_SIGNALER_INACTIVE_MESSAGE: &str = "HVF GIC MSI signaler is inactive";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const GIC_MSI_REGISTER_SIZE: u64 = 4;
 const GIC_ICC_RPR_MISMATCH_MESSAGE: &str =
     "restored arm64 GIC ICC_RPR_EL1 does not match captured derived state";
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_INT_EL1_VIRTUAL_TIMER: u16 = 27;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_INT_EL1_PHYSICAL_TIMER: u16 = 30;
 const FIRST_PPI_INTID: u32 = 16;
 const FIRST_SPI_INTID: u32 = 32;
 const HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0: u32 = 0x10200;
 const HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0: u32 = 0x10280;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_ICC_REG_PMR_EL1: u16 = 0xc230;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_ICC_REG_BPR0_EL1: u16 = 0xc643;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_ICC_REG_AP0R0_EL1: u16 = 0xc644;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_ICC_REG_AP1R0_EL1: u16 = 0xc648;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_ICC_REG_RPR_EL1: u16 = 0xc65b;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_ICC_REG_BPR1_EL1: u16 = 0xc663;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_ICC_REG_CTLR_EL1: u16 = 0xc664;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_ICC_REG_SRE_EL1: u16 = 0xc665;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_ICC_REG_IGRPEN0_EL1: u16 = 0xc666;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const HV_GIC_ICC_REG_IGRPEN1_EL1: u16 = 0xc667;
 
 /// One EL1 GIC ICC CPU-interface register in the captured arm64 state.
@@ -79,6 +100,7 @@ pub enum HvfArm64GicIccRegister {
 }
 
 impl HvfArm64GicIccRegister {
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     const fn raw(self) -> u16 {
         match self {
             Self::PmrEl1 => HV_GIC_ICC_REG_PMR_EL1,
@@ -134,6 +156,7 @@ impl HvfGicRegion {
         self.base.saturating_add(self.size)
     }
 
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     const fn overlaps(self, other: Self) -> bool {
         self.base < other.end_exclusive() && other.base < self.end_exclusive()
     }
@@ -649,6 +672,7 @@ pub struct HvfGicMsiInterruptAllocator {
 }
 
 impl HvfGicMsiInterruptAllocator {
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     fn from_validated_metadata(metadata: HvfGicMsiMetadata) -> Result<Self, HvfGicMsiSignalError> {
         let slot_count = usize::try_from(metadata.interrupt_range.count)
             .map_err(|_| HvfGicMsiSignalError::InvalidMetadata("interrupt count is too large"))?;
@@ -1050,6 +1074,7 @@ impl HvfGicMsiSignaler {
         }
     }
 
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     fn with_api(
         metadata: HvfGicMsiMetadata,
         api: impl HvfGicMsiSignalApi + Send + 'static,
@@ -1730,6 +1755,7 @@ trait HvfGicStateCapture: fmt::Debug {
     fn capture(&self, maximum_size: Option<usize>) -> Result<HvfGicDeviceState, HvfGicError>;
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 trait HvfGicStateApi: fmt::Debug {
     type State;
 
@@ -1914,6 +1940,7 @@ impl fmt::Debug for HvfGicIccRegisterRestorer {
 pub(crate) struct RealHvfGicCreator;
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 struct HvfGicParameters {
     distributor_size: u64,
     distributor_alignment: u64,
@@ -1926,6 +1953,7 @@ struct HvfGicParameters {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 struct HvfGicMsiParameters {
     region_size: u64,
     region_alignment: u64,
@@ -1953,6 +1981,7 @@ trait HvfGicPpiPendingApi: fmt::Debug {
     ) -> Result<(), HvfGicError>;
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 trait HvfGicApi {
     type Config;
 
@@ -2086,6 +2115,7 @@ fn create_gic_with_api(
     Ok(metadata)
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn prepare_gic_metadata_with_api(
     api: &impl HvfGicApi,
     msi: Option<HvfGicMsiConfiguration>,
@@ -2094,6 +2124,7 @@ fn prepare_gic_metadata_with_api(
     metadata_from_parameters(parameters)
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn configure_gic_with_api(
     api: &impl HvfGicApi,
     metadata: HvfGicMetadata,
@@ -2110,6 +2141,7 @@ fn configure_gic_with_api(
     Ok(())
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn query_parameters(
     api: &impl HvfGicApi,
     msi: Option<HvfGicMsiConfiguration>,
@@ -2139,6 +2171,7 @@ fn query_parameters(
     })
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn metadata_from_parameters(parameters: HvfGicParameters) -> Result<HvfGicMetadata, HvfGicError> {
     validate_parameter(
         "distributor_size",
@@ -2267,11 +2300,13 @@ fn metadata_from_parameters(parameters: HvfGicParameters) -> Result<HvfGicMetada
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 enum ParameterRule {
     NonZero,
     PowerOfTwo,
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn validate_parameter(
     name: &'static str,
     value: u64,
@@ -2289,6 +2324,7 @@ fn validate_parameter(
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn validate_msi_parameter(
     name: &'static str,
     value: u64,
@@ -2329,6 +2365,7 @@ fn validate_spi_interrupt_range(range: HvfGicInterruptRange) -> Result<(), HvfGi
     Ok(())
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn partition_spi_interrupt_range(
     complete: HvfGicInterruptRange,
     msi_count: NonZeroU32,
@@ -2370,6 +2407,7 @@ fn partition_spi_interrupt_range(
     Ok((legacy, msi))
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn validate_msi_metadata(metadata: HvfGicMsiMetadata) -> Result<(), &'static str> {
     if metadata.region.size == 0 {
         return Err("message frame is empty");
@@ -2432,6 +2470,7 @@ fn validate_spi_signal_line(
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn validate_timer_interrupts(timers: HvfGicTimerInterrupts) -> Result<(), HvfGicError> {
     validate_ppi_intid("el1_virtual_timer_intid", timers.el1_virtual_timer_intid)?;
     validate_ppi_intid("el1_physical_timer_intid", timers.el1_physical_timer_intid)?;
@@ -2478,6 +2517,7 @@ fn set_ppi_pending_with_api(
     api.set_redistributor_reg(vcpu, reg, value)
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn aligned_region_below(
     region: &'static str,
     limit: u64,
@@ -2518,6 +2558,7 @@ fn aligned_region_below(
     Ok(HvfGicRegion { base, size })
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn validate_regions_do_not_overlap(
     first_name: &'static str,
     first: HvfGicRegion,
@@ -2534,6 +2575,7 @@ fn validate_regions_do_not_overlap(
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn validate_region_below_dram(
     region_name: &'static str,
     region: HvfGicRegion,
@@ -2549,11 +2591,13 @@ fn validate_region_below_dram(
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 struct GicConfigGuard<'api, Api: HvfGicApi + ?Sized> {
     api: &'api Api,
     config: Option<Api::Config>,
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 impl<'api, Api: HvfGicApi + ?Sized> GicConfigGuard<'api, Api> {
     fn new(api: &'api Api) -> Result<Self, HvfGicError> {
         Ok(Self {
@@ -2575,6 +2619,7 @@ impl<'api, Api: HvfGicApi + ?Sized> GicConfigGuard<'api, Api> {
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 impl<Api: HvfGicApi + ?Sized> Drop for GicConfigGuard<'_, Api> {
     fn drop(&mut self) {
         if let Some(config) = self.config.take() {
@@ -2583,11 +2628,13 @@ impl<Api: HvfGicApi + ?Sized> Drop for GicConfigGuard<'_, Api> {
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 struct GicStateGuard<'api, Api: HvfGicStateApi + ?Sized> {
     api: &'api Api,
     state: Option<Api::State>,
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 impl<'api, Api: HvfGicStateApi + ?Sized> GicStateGuard<'api, Api> {
     fn new(api: &'api Api) -> Result<Self, HvfGicError> {
         Ok(Self {
@@ -2603,6 +2650,7 @@ impl<'api, Api: HvfGicStateApi + ?Sized> GicStateGuard<'api, Api> {
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 impl<Api: HvfGicStateApi + ?Sized> Drop for GicStateGuard<'_, Api> {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
@@ -2618,6 +2666,7 @@ fn capture_gic_device_state_with_api<Api: HvfGicStateApi + ?Sized>(
     capture_gic_device_state_with_api_bounded(api, None)
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn capture_gic_device_state_with_api_bounded<Api: HvfGicStateApi + ?Sized>(
     api: &Api,
     maximum_size: Option<usize>,

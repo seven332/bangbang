@@ -39,7 +39,9 @@ impl fmt::Debug for PreparedHvfArm64Cache {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostFactReadErrorKind {
+    #[cfg(any(test, target_os = "macos"))]
     InvalidName,
+    #[cfg(any(test, target_os = "macos"))]
     WrongWidth,
     System,
 }
@@ -79,9 +81,11 @@ impl fmt::Debug for HostFactReadError {
 impl fmt::Display for HostFactReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
+            #[cfg(any(test, target_os = "macos"))]
             HostFactReadErrorKind::InvalidName => {
                 f.write_str("public macOS cache fact name is invalid")
             }
+            #[cfg(any(test, target_os = "macos"))]
             HostFactReadErrorKind::WrongWidth => {
                 f.write_str("public macOS cache fact has an unexpected width")
             }

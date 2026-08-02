@@ -69,6 +69,17 @@ mod unix_tests {
 
     const SOURCE: &[u8] = b"bounded-source-state";
     const SUFFIX: &[u8] = b"-edited";
+    const READ_STAGES: [SnapshotStateEditStage; 9] = [
+        SnapshotStateEditStage::PlatformCheck,
+        SnapshotStateEditStage::InputPathValidation,
+        SnapshotStateEditStage::InputDirectoryOpen,
+        SnapshotStateEditStage::InputFileOpen,
+        SnapshotStateEditStage::InputValidation,
+        SnapshotStateEditStage::InputRead,
+        SnapshotStateEditStage::SourceStability,
+        SnapshotStateEditStage::DirectoryStability,
+        SnapshotStateEditStage::EntryStability,
+    ];
     const PRECOMMIT_STAGES: [SnapshotStateEditStage; 23] = [
         SnapshotStateEditStage::PlatformCheck,
         SnapshotStateEditStage::InputPathValidation,
@@ -282,6 +293,194 @@ mod unix_tests {
             write!(&mut name, "{byte:02x}").expect("staging name should format");
         }
         name
+    }
+
+    #[test]
+    fn read_only_capture_is_exact_and_uses_only_input_stages() {
+        let fixture = EditFixture::new("read-exact");
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let callback_order = std::rc::Rc::clone(&order);
+        let bytes = read_snapshot_state_file_with_cancel(fixture.paths.input(), move |stage| {
+            callback_order.borrow_mut().push(stage);
+            false
+        })
+        .expect("read-only capture should succeed");
+
+        assert_eq!(bytes, SOURCE);
+        assert_eq!(&*order.borrow(), &READ_STAGES);
+        fixture.assert_uncommitted_and_clean();
+    }
+
+    #[test]
+    fn every_read_stage_can_cancel_without_staging_or_output() {
+        for target in READ_STAGES {
+            let fixture = EditFixture::new(&format!("read-cancel-{target:?}"));
+            let error = read_snapshot_state_file_with_cancel(fixture.paths.input(), |stage| {
+                stage == target
+            })
+            .expect_err("target read checkpoint should cancel");
+            assert_eq!(error.stage(), target);
+            assert!(matches!(
+                error.failure(),
+                SnapshotStateEditFailure::Cancelled
+            ));
+            fixture.assert_uncommitted_and_clean();
+        }
+    }
+
+    #[test]
+    fn every_read_stage_failure_is_typed_and_redacted() {
+        for target in READ_STAGES {
+            let fixture = EditFixture::new(&format!("secret-read-failure-{target:?}"));
+            let error = with_state_edit_failures([(target, io::ErrorKind::Other)], || {
+                read_snapshot_state_file(fixture.paths.input())
+                    .expect_err("target read stage should fail")
+            });
+            assert_eq!(error.stage(), target);
+            assert!(matches!(
+                error.failure(),
+                SnapshotStateEditFailure::Io {
+                    kind: io::ErrorKind::Other
+                }
+            ));
+            let rendered = format!("{error:?} / {error}");
+            assert!(!rendered.contains("secret-read-failure"));
+            assert!(!rendered.contains(SOURCE.escape_ascii().to_string().as_str()));
+            fixture.assert_uncommitted_and_clean();
+        }
+    }
+
+    #[test]
+    fn read_only_capture_rejects_invalid_special_and_oversized_inputs() {
+        let directory = TestDirectory::new("read-input-policy");
+
+        let invalid =
+            read_snapshot_state_file(Path::new("")).expect_err("empty input path should reject");
+        assert_eq!(invalid.stage(), SnapshotStateEditStage::InputPathValidation);
+        assert!(matches!(
+            invalid.failure(),
+            SnapshotStateEditFailure::InvalidPath {
+                path: SnapshotStateEditPathRole::Input
+            }
+        ));
+
+        let missing = directory.child("missing.state");
+        let missing = read_snapshot_state_file(&missing).expect_err("missing input should reject");
+        assert_eq!(missing.stage(), SnapshotStateEditStage::InputFileOpen);
+
+        let target = directory.child("target.state");
+        fs::write(&target, SOURCE).expect("symlink target should write");
+        let link = directory.child("link.state");
+        symlink(&target, &link).expect("input symlink should create");
+        let link = read_snapshot_state_file(&link).expect_err("final symlink should reject");
+        assert_eq!(link.stage(), SnapshotStateEditStage::InputFileOpen);
+
+        let child_directory = directory.child("directory.state");
+        fs::create_dir(&child_directory).expect("input directory should create");
+        let child_directory =
+            read_snapshot_state_file(&child_directory).expect_err("directory input should reject");
+        assert_eq!(
+            child_directory.stage(),
+            SnapshotStateEditStage::InputValidation
+        );
+        assert!(matches!(
+            child_directory.failure(),
+            SnapshotStateEditFailure::InvalidInput
+        ));
+
+        let fifo = directory.child("fifo.state");
+        create_fifo(&fifo);
+        let fifo = read_snapshot_state_file(&fifo).expect_err("FIFO input should reject");
+        assert_eq!(fifo.stage(), SnapshotStateEditStage::InputValidation);
+
+        let socket = directory.child("socket.state");
+        let _listener = UnixListener::bind(&socket).expect("input socket should bind");
+        let socket = read_snapshot_state_file(&socket).expect_err("socket input should reject");
+        assert!(matches!(
+            socket.stage(),
+            SnapshotStateEditStage::InputFileOpen | SnapshotStateEditStage::InputValidation
+        ));
+
+        let oversized = directory.child("oversized.state");
+        let file = File::create(&oversized).expect("oversized input should create");
+        file.set_len(u64::try_from(SNAPSHOT_STATE_EDIT_MAX_FILE_BYTES).unwrap() + 1)
+            .expect("oversized input should size");
+        let oversized =
+            read_snapshot_state_file(&oversized).expect_err("oversized input should reject");
+        assert_eq!(oversized.stage(), SnapshotStateEditStage::InputValidation);
+        assert!(matches!(
+            oversized.failure(),
+            SnapshotStateEditFailure::InputTooLarge {
+                maximum: SNAPSHOT_STATE_EDIT_MAX_FILE_BYTES
+            }
+        ));
+    }
+
+    #[test]
+    fn read_only_capture_detects_source_entry_and_parent_replacement() {
+        let source_fixture = EditFixture::new("read-source-change");
+        let source = source_fixture.paths.input().to_path_buf();
+        let error = with_state_edit_action(
+            SnapshotStateEditStage::EntryStability,
+            move || fs::write(&source, b"changed-source-state!").expect("source should mutate"),
+            || {
+                read_snapshot_state_file(source_fixture.paths.input())
+                    .expect_err("source mutation should reject")
+            },
+        );
+        assert_eq!(error.stage(), SnapshotStateEditStage::EntryStability);
+        assert!(matches!(
+            error.failure(),
+            SnapshotStateEditFailure::SourceChanged
+        ));
+        assert!(source_fixture.directory.staging_entries().is_empty());
+        assert!(!source_fixture.paths.output().exists());
+
+        let entry_fixture = EditFixture::new("read-entry-change");
+        let source = entry_fixture.paths.input().to_path_buf();
+        let moved = entry_fixture.directory.child("retained.state");
+        let action_source = source.clone();
+        let error = with_state_edit_action(
+            SnapshotStateEditStage::EntryStability,
+            move || {
+                fs::rename(&action_source, &moved).expect("input should move");
+                fs::write(&action_source, b"foreign-input-state")
+                    .expect("foreign input should replace");
+            },
+            || read_snapshot_state_file(&source).expect_err("entry replacement should reject"),
+        );
+        assert_eq!(error.stage(), SnapshotStateEditStage::EntryStability);
+        assert!(matches!(
+            error.failure(),
+            SnapshotStateEditFailure::EntryChanged {
+                path: SnapshotStateEditPathRole::Input
+            }
+        ));
+
+        let root = TestDirectory::new("read-parent-change");
+        let parent = root.child("parent");
+        let moved_parent = root.child("retained-parent");
+        fs::create_dir(&parent).expect("input parent should create");
+        let input = parent.join("input.state");
+        fs::write(&input, SOURCE).expect("parent fixture source should write");
+        let action_parent = parent.clone();
+        let error = with_state_edit_action(
+            SnapshotStateEditStage::DirectoryStability,
+            move || {
+                fs::rename(&action_parent, &moved_parent).expect("input parent should move");
+                fs::create_dir(&action_parent).expect("foreign parent should replace");
+                fs::write(action_parent.join("input.state"), b"foreign-parent-state")
+                    .expect("foreign parent input should write");
+            },
+            || read_snapshot_state_file(&input).expect_err("parent replacement should reject"),
+        );
+        assert_eq!(error.stage(), SnapshotStateEditStage::DirectoryStability);
+        assert!(matches!(
+            error.failure(),
+            SnapshotStateEditFailure::DirectoryChanged {
+                path: SnapshotStateEditPathRole::Input
+            }
+        ));
     }
 
     #[test]
