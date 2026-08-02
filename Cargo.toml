@@ -10,6 +10,7 @@ members = [
     "crates/bangbang",
     "tools/firecracker-capability-audit",
     "tools/seccompiler",
+    "tools/snapshot-tools",
 ]
 resolver = "3"
 

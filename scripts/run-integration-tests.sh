@@ -337,6 +337,8 @@ build_executable_hvf_e2e() {
 build_native_v2_process_test() {
   local cargo_messages="$tmp_dir/cargo-test-native-v2-process.json"
   local test_bins_file="$tmp_dir/test-bins-native-v2-process"
+  local snapshot_tools_messages="$tmp_dir/cargo-build-snapshot-tools.json"
+  local snapshot_tools_bins_file="$tmp_dir/snapshot-tools-bins"
 
   cargo test \
     -p bangbang \
@@ -384,6 +386,81 @@ PY
 
   native_v2_process_bin="$tmp_dir/bangbang-native-v2-process-test"
   scripts/sign-hvf-binary.sh "${test_bins[0]}" "$native_v2_process_bin"
+
+  cargo build \
+    -p bangbang-snapshot-tools \
+    --bins \
+    --all-features \
+    --locked \
+    --target "$target_triple" \
+    --message-format=json \
+    > "$snapshot_tools_messages"
+
+  python3 - "$snapshot_tools_messages" > "$snapshot_tools_bins_file" <<'PY'
+import json
+import sys
+
+selected = {"rebase-snap", "snapshot-editor"}
+
+with open(sys.argv[1], encoding="utf-8") as messages:
+    for line in messages:
+        message = json.loads(line)
+        target = message.get("target", {})
+        executable = message.get("executable")
+        name = target.get("name")
+
+        if (
+            message.get("reason") == "compiler-artifact"
+            and executable is not None
+            and name in selected
+            and "bin" in target.get("kind", [])
+        ):
+            sys.stdout.write(name)
+            sys.stdout.write("\0")
+            sys.stdout.write(executable)
+            sys.stdout.write("\0")
+PY
+
+  local rebase_snap_source=""
+  local snapshot_editor_source=""
+  local tool_name
+  local tool_bin
+  while IFS= read -r -d "" tool_name && IFS= read -r -d "" tool_bin; do
+    case "$tool_name" in
+      rebase-snap)
+        if [[ -n "$rebase_snap_source" ]]; then
+          echo "found duplicate rebase-snap compiler artifacts" >&2
+          exit 1
+        fi
+        rebase_snap_source="$tool_bin"
+        ;;
+      snapshot-editor)
+        if [[ -n "$snapshot_editor_source" ]]; then
+          echo "found duplicate snapshot-editor compiler artifacts" >&2
+          exit 1
+        fi
+        snapshot_editor_source="$tool_bin"
+        ;;
+      *)
+        echo "found unexpected snapshot-tools compiler artifact: $tool_name" >&2
+        exit 1
+        ;;
+    esac
+  done < "$snapshot_tools_bins_file"
+
+  if [[ -z "$rebase_snap_source" || -z "$snapshot_editor_source" ]]; then
+    echo "failed to locate both snapshot-tools binary artifacts" >&2
+    exit 1
+  fi
+
+  snapshot_rebase_snap_bin="$tmp_dir/rebase-snap"
+  snapshot_editor_bin="$tmp_dir/snapshot-editor"
+  cp -p -- "$rebase_snap_source" "$snapshot_rebase_snap_bin"
+  cp -p -- "$snapshot_editor_source" "$snapshot_editor_bin"
+  codesign --force --sign - "$snapshot_rebase_snap_bin"
+  codesign --force --sign - "$snapshot_editor_bin"
+  codesign --verify --strict --verbose=2 "$snapshot_rebase_snap_bin"
+  codesign --verify --strict --verbose=2 "$snapshot_editor_bin"
 }
 
 host_os="$(uname -s)"
@@ -424,6 +501,8 @@ signed_test_names=()
 signed_test_bins=()
 executable_hvf_e2e_bangbang=""
 native_v2_process_bin=""
+snapshot_rebase_snap_bin=""
+snapshot_editor_bin=""
 app_sandbox_hvf_bin=""
 app_sandbox_bangbang_bin=""
 production_bundle_path=""
@@ -523,7 +602,27 @@ if contains native_v2_process "${selected_tests[@]}"; then
     vmm::tests::signed_native_v2_storage_destination_stays_private_and_paused_through_commit \
     vmm::tests::signed_native_v2_serial_destination_reconciles_and_recaptures_private_owner \
     vmm::tests::signed_native_v2_serial_storage_destination_preserves_mmio_and_pci_owners; do
-    if [[ "${#test_args[@]}" -eq 0 ]]; then
+    if [[ "$signed_snapshot_test" == \
+      "vmm::tests::signed_native_v2_diff_process_loads_zero_root_and_rebased_products" ]]; then
+      if [[ "${#test_args[@]}" -eq 0 ]]; then
+        BANGBANG_REBASE_SNAP_PATH="$snapshot_rebase_snap_bin" \
+          BANGBANG_SNAPSHOT_EDITOR_PATH="$snapshot_editor_bin" \
+          "$native_v2_process_bin" \
+          --test-threads=1 \
+          --ignored \
+          --exact \
+          "$signed_snapshot_test"
+      else
+        BANGBANG_REBASE_SNAP_PATH="$snapshot_rebase_snap_bin" \
+          BANGBANG_SNAPSHOT_EDITOR_PATH="$snapshot_editor_bin" \
+          "$native_v2_process_bin" \
+          --test-threads=1 \
+          --ignored \
+          --exact \
+          "$signed_snapshot_test" \
+          "${test_args[@]}"
+      fi
+    elif [[ "${#test_args[@]}" -eq 0 ]]; then
       "$native_v2_process_bin" \
         --test-threads=1 \
         --ignored \
