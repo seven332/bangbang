@@ -135,7 +135,9 @@ use bangbang_runtime::snapshot_device_v2_6::{
     SnapshotV2StoragePciTransportError,
 };
 use bangbang_runtime::snapshot_diff_v2_13::{
-    SnapshotV2DiffBase, SnapshotV2DiffSelection, SnapshotV2DiffSelectionError,
+    NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION, SnapshotV2DiffBase, SnapshotV2DiffSelection,
+    SnapshotV2DiffSelectionError, SnapshotV2DiffWriteError, SnapshotV2DiffWriteStage,
+    write_snapshot_v2_diff_layer_with_cancel,
 };
 use bangbang_runtime::snapshot_entropy_v2_8::{
     NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2EntropyMmioHandler,
@@ -277,8 +279,8 @@ use crate::snapshot_restore::{
     HvfSnapshotV1RestoreStage, PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1RuntimeMemory,
 };
 use crate::snapshot_v2::{
-    HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2FdtState,
-    HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState,
+    HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2DiffPlatformState,
+    HvfSnapshotV2FdtState, HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState,
     HvfSnapshotV2MemoryHotplugCaptureBuildError, HvfSnapshotV2MemoryHotplugCaptureState,
     HvfSnapshotV2MemoryHotplugPlatformState, HvfSnapshotV2NetworkPlatformState,
     HvfSnapshotV2PlatformState, HvfSnapshotV2PvTimeVcpuState, HvfSnapshotV2TimeState,
@@ -10904,6 +10906,8 @@ pub enum HvfArm64BootSnapshotV2CaptureError {
     FdtIdentityMismatch,
     /// Stable guest memory could not be streamed into a fresh native-v2 image.
     MemoryImage { source: SnapshotV2MemoryWriteError },
+    /// Stable selected guest memory could not be streamed into a Diff layer.
+    DiffLayer { source: SnapshotV2DiffWriteError },
     /// One member disagreed with the common processor/cache identity.
     CompatibilityMismatch { index: usize },
     /// Global GIC state was absent, duplicated, empty, or assigned incorrectly.
@@ -10944,6 +10948,9 @@ impl fmt::Display for HvfArm64BootSnapshotV2CaptureError {
             Self::MemoryImage { source } => {
                 write!(f, "native-v2 memory image capture failed: {source}")
             }
+            Self::DiffLayer { source } => {
+                write!(f, "native-v2 Diff layer capture failed: {source}")
+            }
             Self::CompatibilityMismatch { index } => {
                 write!(
                     f,
@@ -10972,6 +10979,7 @@ impl std::error::Error for HvfArm64BootSnapshotV2CaptureError {
             Self::GuestMemory { source } => Some(source),
             Self::FdtRead { source } => Some(source),
             Self::MemoryImage { source } => Some(source),
+            Self::DiffLayer { source } => Some(source),
             Self::Time { source } => Some(source),
             Self::Build { source, .. } => Some(source),
             Self::MissingBootOrigin
@@ -13649,7 +13657,8 @@ fn hvf_arm64_boot_snapshot_v2_platform_profile(
         | NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION
         | NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION
         | NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION
-        | NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION => {
+        | NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+        | NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION => {
             Some(HvfArm64BootSnapshotV2PlatformProfile::ProductProcess)
         }
         _ => None,
@@ -13710,6 +13719,44 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
             HvfSnapshotV2TimeState,
         ) -> Result<T, HvfSnapshotV2BuildError>,
     ) -> Result<T, HvfArm64BootSnapshotV2CaptureError> {
+        self.capture_with_compatibility_version_and_cancel_using_result(
+            input,
+            memory_writer,
+            version,
+            move |memory, memory_writer| {
+                write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+                    memory,
+                    memory_writer,
+                    version,
+                    is_cancelled,
+                )
+                .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })
+            },
+            finalize,
+        )
+    }
+
+    fn capture_with_compatibility_version_and_cancel_using_result<T, R, W>(
+        self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
+        version: SnapshotFormatVersion,
+        produce_result: impl FnOnce(
+            &GuestMemory,
+            &mut W,
+        ) -> Result<R, HvfArm64BootSnapshotV2CaptureError>,
+        finalize: impl FnOnce(
+            R,
+            HvfSnapshotV2MachineState,
+            HvfSnapshotV2GlobalState,
+            HvfArm64StablePausedTopologyState,
+            Vec<HvfSnapshotV2VcpuState>,
+            HvfSnapshotV2TimeState,
+        ) -> Result<T, HvfSnapshotV2BuildError>,
+    ) -> Result<T, HvfArm64BootSnapshotV2CaptureError>
+    where
+        W: std::io::Write + std::io::Seek,
+    {
         let profile = hvf_arm64_boot_snapshot_v2_platform_profile(version);
         debug_assert!(profile.is_some());
         let (stable, captures, pvtime_capture) =
@@ -13872,14 +13919,8 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
                     source,
                 }
             })?;
-        let memory_binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
-            memory,
-            memory_writer,
-            version,
-            is_cancelled,
-        )
-        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
-        finalize(memory_binding, machine, global, stable, vcpus, time).map_err(|source| {
+        let result = produce_result(memory, memory_writer)?;
+        finalize(result, machine, global, stable, vcpus, time).map_err(|source| {
             HvfArm64BootSnapshotV2CaptureError::Build {
                 stage: HvfArm64BootSnapshotV2CaptureStage::Platform,
                 source,
@@ -15312,6 +15353,51 @@ impl HvfArm64BootSession<'_> {
             move |memory, machine, global, topology, vcpus, time| {
                 HvfSnapshotV2VsockPlatformState::try_new(
                     memory, machine, global, topology, vcpus, time, capture,
+                )
+            },
+        )
+    }
+
+    /// Captures one dormant exact native-v2 2.13 platform and detached layer
+    /// from an already frozen lineage base and dirty selection.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_diff_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2DiffWriteStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<HvfSnapshotV2MemoryHotplugCaptureState>,
+        base: SnapshotV2DiffBase,
+        selection: SnapshotV2DiffSelection,
+        layer_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2DiffPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel_using_result(
+            input,
+            layer_writer,
+            NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+            move |memory, layer_writer| {
+                write_snapshot_v2_diff_layer_with_cancel(
+                    memory,
+                    layer_writer,
+                    base,
+                    &selection,
+                    is_cancelled,
+                )
+                .map_err(|source| HvfArm64BootSnapshotV2CaptureError::DiffLayer { source })
+            },
+            move |layer, machine, global, topology, vcpus, time| {
+                HvfSnapshotV2DiffPlatformState::try_new(
+                    layer, machine, global, topology, vcpus, time, capture,
                 )
             },
         )
@@ -29191,6 +29277,51 @@ impl OwnedHvfArm64BootSession {
     #[doc(hidden)]
     pub fn pause_for_snapshot_v2_capture(&mut self) -> Result<(), HvfArm64BootVcpuError> {
         self.runner.pause_for_arm64_snapshot_v2_capture()
+    }
+
+    /// Captures one dormant exact native-v2 2.13 platform and detached layer
+    /// from an already frozen lineage base and dirty selection.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_diff_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2DiffWriteStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<HvfSnapshotV2MemoryHotplugCaptureState>,
+        base: SnapshotV2DiffBase,
+        selection: SnapshotV2DiffSelection,
+        layer_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2DiffPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: &self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel_using_result(
+            input,
+            layer_writer,
+            NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+            move |memory, layer_writer| {
+                write_snapshot_v2_diff_layer_with_cancel(
+                    memory,
+                    layer_writer,
+                    base,
+                    &selection,
+                    is_cancelled,
+                )
+                .map_err(|source| HvfArm64BootSnapshotV2CaptureError::DiffLayer { source })
+            },
+            move |layer, machine, global, topology, vcpus, time| {
+                HvfSnapshotV2DiffPlatformState::try_new(
+                    layer, machine, global, topology, vcpus, time, capture,
+                )
+            },
+        )
     }
 
     /// Reconcile restored serial intents while the destination is still
@@ -49227,6 +49358,7 @@ mod tests {
         use bangbang_runtime::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+        use bangbang_runtime::snapshot_diff_v2_13::NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_entropy_v2_8::NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION;
         use bangbang_runtime::snapshot_format::NATIVE_V1_SNAPSHOT_VERSION;
         use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
@@ -49249,6 +49381,7 @@ mod tests {
             NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
             NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
             NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+            NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
         ] {
             assert_eq!(
                 hvf_arm64_boot_snapshot_v2_platform_profile(version),

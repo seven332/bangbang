@@ -45,23 +45,23 @@ use bangbang_hvf::{
     HvfSnapshotV2BalloonPciPlatformPlan, HvfSnapshotV2BalloonPciRestoreError,
     HvfSnapshotV2BalloonPreparedProduct, HvfSnapshotV2BalloonState, HvfSnapshotV2BootState,
     HvfSnapshotV2BuildError, HvfSnapshotV2DecodeError, HvfSnapshotV2DefaultProcessShell,
-    HvfSnapshotV2EncodeError, HvfSnapshotV2EntropyMmioRestoreError,
-    HvfSnapshotV2EntropyPciEndpointPlan, HvfSnapshotV2EntropyPciRestoreError,
-    HvfSnapshotV2EntropyState, HvfSnapshotV2MemoryHotplugCaptureState,
-    HvfSnapshotV2MemoryHotplugMmioPlatformPlan, HvfSnapshotV2MemoryHotplugMmioProcessConfig,
-    HvfSnapshotV2MemoryHotplugMmioRestoreError, HvfSnapshotV2MemoryHotplugPciPlatformPlan,
-    HvfSnapshotV2MemoryHotplugPciRestoreError, HvfSnapshotV2MemoryHotplugPlatformState,
-    HvfSnapshotV2MemoryHotplugPreparedProduct, HvfSnapshotV2MemoryHotplugState,
-    HvfSnapshotV2MultiBlockMmioRestoreError, HvfSnapshotV2MultiBlockPciRestoreError,
-    HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockProcessConfig,
-    HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2NetworkMmioMemoryInput,
-    HvfSnapshotV2NetworkMmioPlatformPlan, HvfSnapshotV2NetworkMmioProcessConfig,
-    HvfSnapshotV2NetworkMmioRestoreDisposition, HvfSnapshotV2NetworkMmioRestoreError,
-    HvfSnapshotV2NetworkPciMemoryInput, HvfSnapshotV2NetworkPciPlatformPlan,
-    HvfSnapshotV2NetworkPciRestoreDisposition, HvfSnapshotV2NetworkPciRestoreError,
-    HvfSnapshotV2NetworkPlatformState, HvfSnapshotV2NetworkPreparedProduct,
-    HvfSnapshotV2NetworkProcessResourceIdentity, HvfSnapshotV2NetworkState,
-    HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformState,
+    HvfSnapshotV2DiffPlatformState, HvfSnapshotV2DiffState, HvfSnapshotV2EncodeError,
+    HvfSnapshotV2EntropyMmioRestoreError, HvfSnapshotV2EntropyPciEndpointPlan,
+    HvfSnapshotV2EntropyPciRestoreError, HvfSnapshotV2EntropyState,
+    HvfSnapshotV2MemoryHotplugCaptureState, HvfSnapshotV2MemoryHotplugMmioPlatformPlan,
+    HvfSnapshotV2MemoryHotplugMmioProcessConfig, HvfSnapshotV2MemoryHotplugMmioRestoreError,
+    HvfSnapshotV2MemoryHotplugPciPlatformPlan, HvfSnapshotV2MemoryHotplugPciRestoreError,
+    HvfSnapshotV2MemoryHotplugPlatformState, HvfSnapshotV2MemoryHotplugPreparedProduct,
+    HvfSnapshotV2MemoryHotplugState, HvfSnapshotV2MultiBlockMmioRestoreError,
+    HvfSnapshotV2MultiBlockPciRestoreError, HvfSnapshotV2MultiBlockPlatformPlan,
+    HvfSnapshotV2MultiBlockProcessConfig, HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath,
+    HvfSnapshotV2NetworkMmioMemoryInput, HvfSnapshotV2NetworkMmioPlatformPlan,
+    HvfSnapshotV2NetworkMmioProcessConfig, HvfSnapshotV2NetworkMmioRestoreDisposition,
+    HvfSnapshotV2NetworkMmioRestoreError, HvfSnapshotV2NetworkPciMemoryInput,
+    HvfSnapshotV2NetworkPciPlatformPlan, HvfSnapshotV2NetworkPciRestoreDisposition,
+    HvfSnapshotV2NetworkPciRestoreError, HvfSnapshotV2NetworkPlatformState,
+    HvfSnapshotV2NetworkPreparedProduct, HvfSnapshotV2NetworkProcessResourceIdentity,
+    HvfSnapshotV2NetworkState, HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformState,
     HvfSnapshotV2RestoredSerialShell, HvfSnapshotV2RootProcessConfig,
     HvfSnapshotV2RootResourcePlan, HvfSnapshotV2RootRestoreError,
     HvfSnapshotV2SerialOnlyProcessConfig, HvfSnapshotV2SerialOnlyRestoreError,
@@ -91,11 +91,12 @@ use bangbang_hvf::{
     decode_hvf_snapshot_v2_network_state, decode_hvf_snapshot_v2_platform_state,
     decode_hvf_snapshot_v2_serial_state, decode_hvf_snapshot_v2_state,
     decode_hvf_snapshot_v2_storage_state, decode_hvf_snapshot_v2_vsock_state,
-    encode_hvf_snapshot_v2_balloon_state, encode_hvf_snapshot_v2_entropy_state,
-    encode_hvf_snapshot_v2_memory_hotplug_state, encode_hvf_snapshot_v2_multi_block_state,
-    encode_hvf_snapshot_v2_network_state, encode_hvf_snapshot_v2_serial_state,
-    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
-    encode_hvf_snapshot_v2_vsock_state, prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    encode_hvf_snapshot_v2_balloon_state, encode_hvf_snapshot_v2_diff_state,
+    encode_hvf_snapshot_v2_entropy_state, encode_hvf_snapshot_v2_memory_hotplug_state,
+    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_network_state,
+    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
+    encode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_vsock_state,
+    prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
     prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_pci_platform_plan,
@@ -178,7 +179,7 @@ use bangbang_runtime::serial::{
 };
 use bangbang_runtime::snapshot::{
     SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackendType, SnapshotNetworkOverride,
-    SnapshotV1ControllerCommit, SnapshotV2ControllerCommit,
+    SnapshotType, SnapshotV1ControllerCommit, SnapshotV2ControllerCommit,
     SnapshotV2ControllerCommitProductConfigs, SnapshotV2NetworkControllerCommitProductConfigs,
     SnapshotV2VsockControllerCommitProductConfigs, SnapshotVsockOverride,
 };
@@ -187,7 +188,9 @@ use bangbang_runtime::snapshot_artifact::SnapshotStagingTracker;
 use bangbang_runtime::snapshot_artifact::{
     LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactFamily, NativeSnapshotArtifactState,
     NativeSnapshotArtifactStateError, NativeSnapshotPublicationOutcome,
-    NativeV2BalloonSnapshotCandidateState, NativeV2EntropySnapshotCandidateState,
+    NativeV2BalloonSnapshotCandidateState, NativeV2DiffSnapshotArtifactState,
+    NativeV2DiffSnapshotCandidateState, NativeV2DiffSnapshotCandidateStateError,
+    NativeV2DiffSnapshotPublicationOutcome, NativeV2EntropySnapshotCandidateState,
     NativeV2MemoryHotplugSnapshotCandidateState, NativeV2MemoryHotplugSnapshotPreparation,
     NativeV2MemoryHotplugSnapshotPreparationError, NativeV2MultiBlockSnapshotCandidateState,
     NativeV2NetworkSnapshotCandidateState, NativeV2NetworkSnapshotPreparationError,
@@ -203,7 +206,9 @@ use bangbang_runtime::snapshot_artifact::{
     load_snapshot_artifacts, prepare_native_snapshot_state_file,
     prepare_native_snapshot_state_path, prepare_snapshot_state_file, prepare_snapshot_state_path,
     publish_native_snapshot_artifacts_to_with, publish_native_snapshot_artifacts_with,
-    publish_snapshot_artifacts_to_with, publish_snapshot_artifacts_with,
+    publish_native_v2_diff_snapshot_artifacts_to_with,
+    publish_native_v2_diff_snapshot_artifacts_with, publish_snapshot_artifacts_to_with,
+    publish_snapshot_artifacts_with,
 };
 use bangbang_runtime::snapshot_balloon_v2_9::{
     NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, SnapshotV2BalloonRestorePlan,
@@ -224,6 +229,10 @@ use bangbang_runtime::snapshot_device_v2_6::{
     NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageCleanupError,
     SnapshotV2StorageDeviceGraph, SnapshotV2StorageDeviceGraphCaptureError,
     SnapshotV2StorageRestorePlan,
+};
+use bangbang_runtime::snapshot_diff_v2_13::{
+    SnapshotV2DiffBase, SnapshotV2DiffLayerBinding, SnapshotV2DiffSelection,
+    SnapshotV2DiffWriteError, SnapshotV2DiffWriteStage,
 };
 use bangbang_runtime::snapshot_entropy_v2_8::{
     NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2EntropyTransport,
@@ -861,6 +870,46 @@ impl NativeV2SnapshotPublicationDestination {
     }
 }
 
+enum NativeV2DiffSnapshotPublicationDestination {
+    Paths(SnapshotArtifactPaths),
+    Outputs(SnapshotArtifactOutputs),
+}
+
+impl NativeV2DiffSnapshotPublicationDestination {
+    fn publish<E>(
+        self,
+        producer: impl FnOnce(
+            SnapshotMemoryStagingWriter,
+        ) -> Result<NativeV2DiffSnapshotArtifactState, E>,
+    ) -> Result<NativeV2DiffSnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+    {
+        match self {
+            Self::Paths(paths) => publish_native_v2_diff_snapshot_artifacts_with(&paths, producer),
+            Self::Outputs(outputs) => {
+                publish_native_v2_diff_snapshot_artifacts_to_with(&outputs, producer)
+            }
+        }
+    }
+}
+
+pub(crate) struct NativeV2DiffCapturePreparation {
+    token: Option<LiveSnapshotLineageToken>,
+    base: SnapshotV2DiffBase,
+    selection: SnapshotV2DiffSelection,
+}
+
+impl NativeV2DiffCapturePreparation {
+    fn into_parts(
+        self,
+    ) -> (
+        Option<LiveSnapshotLineageToken>,
+        SnapshotV2DiffBase,
+        SnapshotV2DiffSelection,
+    ) {
+        (self.token, self.base, self.selection)
+    }
+}
+
 enum NativeV2SnapshotCaptureProfile {
     Root {
         storage_configs: CaptureReadyStorageConfigs,
@@ -935,6 +984,21 @@ enum NativeV2SnapshotCaptureProfile {
         expected_vsock_metrics: Option<SharedVsockDeviceMetrics>,
         expected_transport: SnapshotV2DeviceTransportKind,
     },
+}
+
+struct NativeV2DiffSnapshotCaptureProfile {
+    serial: SnapshotV2SerialState,
+    memory_hotplug_config: Option<MemoryHotplugConfig>,
+    memory_hotplug_requested_size_mib: u64,
+    balloon_config: Option<BalloonConfig>,
+    entropy_config: Option<EntropyConfig>,
+    storage_configs: CaptureReadyStorageConfigs,
+    network_configs: Vec<NetworkInterfaceConfig>,
+    mmds_config: Option<MmdsConfig>,
+    mmds_state: MmdsStateHandle,
+    vsock_config: Option<VsockConfig>,
+    expected_vsock_metrics: Option<SharedVsockDeviceMetrics>,
+    expected_transport: SnapshotV2DeviceTransportKind,
 }
 
 struct NativeV2RootCandidateProductProfile {
@@ -1614,6 +1678,7 @@ pub(crate) enum NativeV2SnapshotCaptureStage {
     Vsock,
     Device(HvfArm64BootStorageCaptureStage),
     Memory(SnapshotV2MemoryIoStage),
+    DiffLayer(SnapshotV2DiffWriteStage),
     Encode,
     ClosedState,
     CommitSeal,
@@ -1630,6 +1695,7 @@ impl fmt::Display for NativeV2SnapshotCaptureStage {
             Self::Vsock => formatter.write_str("vsock capture"),
             Self::Device(stage) => write!(formatter, "device/{stage:?}"),
             Self::Memory(stage) => write!(formatter, "memory/{stage}"),
+            Self::DiffLayer(stage) => write!(formatter, "Diff layer/{stage}"),
             Self::Encode => formatter.write_str("state encode"),
             Self::ClosedState => formatter.write_str("closed state"),
             Self::CommitSeal => formatter.write_str("commit seal"),
@@ -1695,6 +1761,9 @@ pub(crate) enum NativeV2SnapshotCaptureError {
     CandidateState {
         source: NativeV2SnapshotCandidateStateError,
     },
+    DiffCandidateState {
+        source: NativeV2DiffSnapshotCandidateStateError,
+    },
     CoordinatorRecovery {
         source: HvfVcpuRunCoordinatorError,
     },
@@ -1727,6 +1796,7 @@ impl NativeV2SnapshotCaptureError {
             | Self::Encode { .. }
             | Self::Compose { .. }
             | Self::CandidateState { .. }
+            | Self::DiffCandidateState { .. }
             | Self::Cancelled { .. } => false,
         }
     }
@@ -2135,6 +2205,13 @@ fn native_v2_platform_capture_is_terminal(source: &HvfArm64BootSnapshotV2Capture
             SnapshotV2MemoryWriteError::Binding(_)
                 | SnapshotV2MemoryWriteError::GuestMemoryRead { .. }
         ),
+        HvfArm64BootSnapshotV2CaptureError::DiffLayer { source } => matches!(
+            source,
+            SnapshotV2DiffWriteError::TopologyChanged
+                | SnapshotV2DiffWriteError::ResultBinding { .. }
+                | SnapshotV2DiffWriteError::LayerBinding { .. }
+                | SnapshotV2DiffWriteError::GuestMemoryRead { .. }
+        ),
         HvfArm64BootSnapshotV2CaptureError::FdtAllocation
         | HvfArm64BootSnapshotV2CaptureError::Allocation => false,
     }
@@ -2212,6 +2289,12 @@ impl fmt::Display for NativeV2SnapshotCaptureError {
                     "native-v2 candidate state construction failed: {source}"
                 )
             }
+            Self::DiffCandidateState { source } => {
+                write!(
+                    formatter,
+                    "native-v2 Diff candidate construction failed: {source}"
+                )
+            }
             Self::CoordinatorRecovery { source } => {
                 write!(formatter, "native-v2 source recovery failed: {source}")
             }
@@ -2243,6 +2326,7 @@ impl std::error::Error for NativeV2SnapshotCaptureError {
             Self::Encode { source } => Some(source),
             Self::Compose { source } => Some(source),
             Self::CandidateState { source } => Some(source),
+            Self::DiffCandidateState { source } => Some(source),
             Self::CoordinatorRecovery { source } => Some(source),
             Self::TransportCapacity
             | Self::NonCanonicalSerial
@@ -9792,6 +9876,90 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
             })
             .map_err(NativeV2VsockCandidateProcessError::Transaction)
     }
+
+    /// Dormant exact-2.13 Diff adapter retained for #1757 activation.
+    ///
+    /// This performs complete request/product/resource preflight but is not
+    /// reachable from current public create dispatch.
+    fn publish_native_v2_diff_snapshot(
+        &mut self,
+        input: &SnapshotCreateInput,
+    ) -> Result<SnapshotCommitDurability, NativeV2SnapshotPublicationError> {
+        if self.controller.instance_info().state != bangbang_runtime::InstanceState::Paused {
+            return Err(NativeV2SnapshotPublicationError::Preflight(
+                VmmActionError::UnsupportedState {
+                    action: "CreateSnapshot",
+                    state: self.controller.instance_info().state,
+                },
+            ));
+        }
+        if input.snapshot_type() != SnapshotType::Diff {
+            return Err(NativeV2SnapshotPublicationError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ));
+        }
+        let NativeV2VsockCandidateProductProfile {
+            input: capture_input,
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs,
+            network_configs,
+            mmds_config,
+            mmds_state,
+            vsock_config,
+            expected_transport,
+        } = self
+            .native_v2_vsock_candidate_product_profile()
+            .map_err(NativeV2SnapshotPublicationError::Profile)?;
+        let cancellation = self.snapshot_capture_cancellation.clone();
+        let _serial = self
+            .preflight_snapshot_capture_ready(cancellation.clone())
+            .map_err(SnapshotCaptureReadyPreflightError::into_native_v2)?;
+        if self.started_session.is_none() {
+            return Err(NativeV2SnapshotPublicationError::SessionUnavailable);
+        }
+
+        let paths = SnapshotArtifactPaths::new(input.snapshot_path(), input.mem_file_path());
+        let outputs = self
+            .prepare_contained_snapshot_outputs(input)
+            .map_err(NativeV2SnapshotPublicationError::Resource)?;
+        let publication = NativeV2SnapshotPublicationRequest {
+            input: capture_input,
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs,
+            network_configs,
+            mmds_config,
+            mmds_state,
+            vsock_config,
+            expected_transport,
+            cancellation,
+        };
+        let session = self
+            .started_session
+            .as_mut()
+            .and_then(HvfProcessSession::boot_mut)
+            .ok_or(NativeV2SnapshotPublicationError::ConfigurationUnavailable)?;
+        let outcome = match outputs {
+            Some(outputs) => session
+                .publish_native_v2_diff_snapshot_to(publication, outputs)
+                .map_err(NativeV2SnapshotPublicationError::Transaction)?,
+            None => session
+                .publish_native_v2_diff_snapshot(publication, &paths)
+                .map_err(NativeV2SnapshotPublicationError::Transaction)?,
+        };
+        debug_assert_eq!(
+            self.controller.instance_info().state,
+            bangbang_runtime::InstanceState::Paused
+        );
+        Ok(outcome.durability())
+    }
 }
 
 // Keep the frozen, intentionally non-dispatched native-v1 writer type-checked
@@ -9801,6 +9969,14 @@ const _: fn(
     &SnapshotCreateInput,
 ) -> Result<SnapshotCommitDurability, NativeV1SnapshotPublicationError> =
     ProcessVmm::<HvfInstanceStartExecutor>::publish_native_v1_snapshot;
+
+// Keep the complete exact-2.13 Diff direct/contained adapter type-checked
+// without advancing current public create dispatch beyond exact 2.12.
+const _: fn(
+    &mut ProcessVmm<HvfInstanceStartExecutor>,
+    &SnapshotCreateInput,
+) -> Result<SnapshotCommitDurability, NativeV2SnapshotPublicationError> =
+    ProcessVmm::<HvfInstanceStartExecutor>::publish_native_v2_diff_snapshot;
 
 // Keep the focused exact-2.4 root candidate seam type-checked alongside the
 // public artifact transaction used by create/load dispatch.
@@ -16916,6 +17092,8 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     type NetworkState: Send + 'static;
     type VsockPlatformState: Send + 'static;
     type VsockState: Send + 'static;
+    type DiffPlatformState: Send + 'static;
+    type DiffState: Send + 'static;
 
     fn capture_native_v2_serial(
         &self,
@@ -17061,6 +17239,16 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
         cancellation: &NativeV2SnapshotCaptureCancellation,
     ) -> Result<Self::VsockPlatformState, HvfArm64BootSnapshotV2CaptureError>;
 
+    fn capture_native_v2_diff_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<Self::MemoryHotplugCaptureState>,
+        base: SnapshotV2DiffBase,
+        selection: SnapshotV2DiffSelection,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::DiffPlatformState, HvfArm64BootSnapshotV2CaptureError>;
+
     fn compose_native_v2_root(
         &self,
         platform: Self::PlatformState,
@@ -17179,6 +17367,25 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
         state: &Self::VsockState,
     ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
 
+    #[allow(clippy::too_many_arguments)]
+    fn compose_native_v2_diff(
+        &self,
+        platform: Self::DiffPlatformState,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+        network: Option<SnapshotV2NetworkState>,
+        vsock: Option<SnapshotV2VsockState>,
+    ) -> Result<Self::DiffState, HvfSnapshotV2BuildError>;
+
+    fn encode_native_v2_diff(
+        &self,
+        state: &Self::DiffState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
+
+    fn into_native_v2_diff_layer(state: Self::DiffState) -> SnapshotV2DiffLayerBinding;
+
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError>;
 
     fn native_v2_candidate_commit_sealed(&mut self) {}
@@ -17189,6 +17396,11 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     ) -> Result<Option<LiveSnapshotLineageToken>, BackendError> {
         Ok(None)
     }
+
+    fn begin_native_v2_diff_lineage(
+        &mut self,
+        _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<NativeV2DiffCapturePreparation, BackendError>;
 
     fn abort_native_v2_snapshot_lineage(
         &mut self,
@@ -17206,6 +17418,13 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     ) -> Result<(), BackendError> {
         Ok(())
     }
+
+    fn native_v2_diff_snapshot_published(
+        &mut self,
+        token: Option<LiveSnapshotLineageToken>,
+        outcome: &NativeV2DiffSnapshotPublicationOutcome,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<(), BackendError>;
 }
 
 impl<S, P> ProcessHvfBootSession<S, P> {
@@ -17793,6 +18012,8 @@ impl NativeV2SnapshotCaptureSession
     type NetworkState = HvfSnapshotV2NetworkState;
     type VsockPlatformState = HvfSnapshotV2VsockPlatformState;
     type VsockState = HvfSnapshotV2VsockState;
+    type DiffPlatformState = HvfSnapshotV2DiffPlatformState;
+    type DiffState = HvfSnapshotV2DiffState;
 
     fn capture_native_v2_serial(
         &self,
@@ -18178,6 +18399,25 @@ impl NativeV2SnapshotCaptureSession
             })
     }
 
+    fn capture_native_v2_diff_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        capture: Option<Self::MemoryHotplugCaptureState>,
+        base: SnapshotV2DiffBase,
+        selection: SnapshotV2DiffSelection,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::DiffPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        self.session.capture_snapshot_v2_diff_platform_with_cancel(
+            input,
+            capture,
+            base,
+            selection,
+            output,
+            |_| cancellation.is_cancelled(),
+        )
+    }
+
     fn compose_native_v2_root(
         &self,
         platform: Self::PlatformState,
@@ -18331,6 +18571,31 @@ impl NativeV2SnapshotCaptureSession
         encode_hvf_snapshot_v2_vsock_state(state)
     }
 
+    fn compose_native_v2_diff(
+        &self,
+        platform: Self::DiffPlatformState,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+        network: Option<SnapshotV2NetworkState>,
+        vsock: Option<SnapshotV2VsockState>,
+    ) -> Result<Self::DiffState, HvfSnapshotV2BuildError> {
+        HvfSnapshotV2DiffState::try_new(platform, graph, serial, entropy, balloon, network, vsock)
+    }
+
+    fn encode_native_v2_diff(
+        &self,
+        state: &Self::DiffState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+        encode_hvf_snapshot_v2_diff_state(state)
+    }
+
+    fn into_native_v2_diff_layer(state: Self::DiffState) -> SnapshotV2DiffLayerBinding {
+        let (_, _, _, _, _, _, _, _, layer) = state.into_parts();
+        layer
+    }
+
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
         self.session.resume_after_snapshot_v2_capture()
     }
@@ -18343,6 +18608,22 @@ impl NativeV2SnapshotCaptureSession
             .begin_full_snapshot_lineage_quiesced(guard)
             .map(Some)
             .map_err(|source| BackendError::Hypervisor(source.to_string()))
+    }
+
+    fn begin_native_v2_diff_lineage(
+        &mut self,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<NativeV2DiffCapturePreparation, BackendError> {
+        let capture = self
+            .session
+            .begin_snapshot_v2_diff_quiesced(guard)
+            .map_err(|source| BackendError::Hypervisor(source.to_string()))?;
+        let (token, base, selection) = capture.into_parts();
+        Ok(NativeV2DiffCapturePreparation {
+            token: Some(token),
+            base,
+            selection,
+        })
     }
 
     fn abort_native_v2_snapshot_lineage(
@@ -18378,6 +18659,25 @@ impl NativeV2SnapshotCaptureSession
                 token,
                 outcome.durability(),
                 Some(binding),
+                guard,
+            )
+            .map_err(|source| BackendError::Hypervisor(source.to_string()))
+    }
+
+    fn native_v2_diff_snapshot_published(
+        &mut self,
+        token: Option<LiveSnapshotLineageToken>,
+        outcome: &NativeV2DiffSnapshotPublicationOutcome,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+    ) -> Result<(), BackendError> {
+        let token = token.ok_or(BackendError::InvalidState(
+            "native-v2 Diff snapshot lineage token is missing",
+        ))?;
+        self.session
+            .complete_snapshot_lineage_publication_quiesced(
+                token,
+                outcome.durability(),
+                Some(outcome.result_binding()),
                 guard,
             )
             .map_err(|source| BackendError::Hypervisor(source.to_string()))
@@ -32364,6 +32664,208 @@ where
     }
 }
 
+fn capture_and_recover_native_v2_diff_state<S, T>(
+    session: &mut S,
+    input: HvfArm64BootSnapshotV2CaptureInput,
+    profile: NativeV2DiffSnapshotCaptureProfile,
+    guard: &S::SnapshotAuxiliaryQuiescenceGuard,
+    mut output: BoxedNativeV2SnapshotMemoryOutput,
+    cancellation: &NativeV2SnapshotCaptureCancellation,
+    close_state: impl FnOnce(
+        Vec<u8>,
+        SnapshotV2DiffLayerBinding,
+    ) -> Result<T, NativeV2SnapshotCaptureError>,
+) -> Result<(T, Option<LiveSnapshotLineageToken>), NativeV2SnapshotCaptureError>
+where
+    S: NativeV2SnapshotCaptureSession,
+{
+    let NativeV2DiffSnapshotCaptureProfile {
+        serial,
+        memory_hotplug_config,
+        memory_hotplug_requested_size_mib,
+        balloon_config,
+        entropy_config,
+        storage_configs,
+        network_configs,
+        mmds_config,
+        mmds_state,
+        vsock_config,
+        expected_vsock_metrics,
+        expected_transport,
+    } = profile;
+    let mut topology_pause_attempted = false;
+    let mut lineage_started = false;
+    let mut lineage_token = None;
+    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if cancellation.is_cancelled() {
+            return Err(native_v2_snapshot_cancelled(
+                NativeV2SnapshotCaptureStage::TopologyPause,
+            ));
+        }
+        topology_pause_attempted = true;
+        session
+            .pause_native_v2_topology()
+            .map_err(|source| NativeV2SnapshotCaptureError::TopologyPause { source })?;
+
+        let now = Instant::now();
+        if cancellation.is_cancelled() {
+            return Err(native_v2_snapshot_cancelled(
+                NativeV2SnapshotCaptureStage::Balloon,
+            ));
+        }
+        let balloon = session
+            .capture_native_v2_balloon(balloon_config, expected_transport, guard, now)
+            .map_err(|source| NativeV2SnapshotCaptureError::Balloon { source })?;
+        if cancellation.is_cancelled() {
+            return Err(native_v2_snapshot_cancelled(
+                NativeV2SnapshotCaptureStage::Balloon,
+            ));
+        }
+        let graph = if storage_configs.drives().is_empty() && storage_configs.pmem().is_empty() {
+            None
+        } else {
+            Some(
+                session
+                    .capture_native_v2_storage(
+                        &storage_configs,
+                        expected_transport,
+                        guard,
+                        now,
+                        cancellation,
+                    )
+                    .map_err(|source| match source {
+                        NativeV2SnapshotStorageCaptureError::Cancelled { stage } => {
+                            native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Device(
+                                stage,
+                            ))
+                        }
+                        source => NativeV2SnapshotCaptureError::Storage { source },
+                    })?,
+            )
+        };
+        let entropy = session
+            .capture_native_v2_entropy(entropy_config, expected_transport, guard, now)
+            .map_err(|source| NativeV2SnapshotCaptureError::Entropy { source })?;
+        if cancellation.is_cancelled() {
+            return Err(native_v2_snapshot_cancelled(
+                NativeV2SnapshotCaptureStage::MemoryHotplug,
+            ));
+        }
+        let memory_hotplug = session
+            .capture_native_v2_memory_hotplug(
+                memory_hotplug_config,
+                memory_hotplug_requested_size_mib,
+                expected_transport,
+                guard,
+            )
+            .map_err(|source| NativeV2SnapshotCaptureError::MemoryHotplug { source })?;
+        if cancellation.is_cancelled() {
+            return Err(native_v2_snapshot_cancelled(
+                NativeV2SnapshotCaptureStage::Network,
+            ));
+        }
+        let network = session
+            .capture_native_v2_network(
+                &network_configs,
+                mmds_config.as_ref(),
+                &mmds_state,
+                expected_transport,
+                guard,
+                now,
+            )
+            .map_err(|source| NativeV2SnapshotCaptureError::Network { source })?;
+        if cancellation.is_cancelled() {
+            return Err(native_v2_snapshot_cancelled(
+                NativeV2SnapshotCaptureStage::Vsock,
+            ));
+        }
+        let vsock = match vsock_config {
+            Some(config) => {
+                let expected_vsock_metrics = expected_vsock_metrics.as_ref().ok_or_else(|| {
+                    NativeV2SnapshotCaptureError::Vsock {
+                        source: NativeV2SnapshotVsockCaptureError::Live {
+                            source: HvfArm64BootVsockCaptureError::owner_unavailable(
+                                HvfArm64BootVsockCaptureDisposition::Terminal,
+                            ),
+                        },
+                    }
+                })?;
+                session
+                    .capture_native_v2_vsock(
+                        Some(config),
+                        expected_vsock_metrics,
+                        expected_transport,
+                        guard,
+                        cancellation,
+                    )
+                    .map_err(|source| NativeV2SnapshotCaptureError::Vsock { source })?
+            }
+            None => None,
+        };
+        if cancellation.is_cancelled() {
+            return Err(native_v2_snapshot_cancelled(
+                NativeV2SnapshotCaptureStage::Vsock,
+            ));
+        }
+
+        let preparation = session
+            .begin_native_v2_diff_lineage(guard)
+            .map_err(|source| NativeV2SnapshotCaptureError::Supervisor { source })?;
+        let (token, base, selection) = preparation.into_parts();
+        lineage_started = true;
+        lineage_token = token;
+        if cancellation.is_cancelled() {
+            return Err(native_v2_snapshot_cancelled(
+                NativeV2SnapshotCaptureStage::DiffLayer(SnapshotV2DiffWriteStage::InitialPosition),
+            ));
+        }
+        let platform = session
+            .capture_native_v2_diff_platform(
+                input,
+                memory_hotplug,
+                base,
+                selection,
+                &mut output,
+                cancellation,
+            )
+            .map_err(native_v2_platform_capture_error)?;
+        if cancellation.is_cancelled() {
+            return Err(native_v2_snapshot_cancelled(
+                NativeV2SnapshotCaptureStage::Encode,
+            ));
+        }
+        let state = session
+            .compose_native_v2_diff(platform, graph, serial, entropy, balloon, network, vsock)
+            .map_err(|source| NativeV2SnapshotCaptureError::Compose { source })?;
+        let encoded = session
+            .encode_native_v2_diff(&state)
+            .map_err(|source| NativeV2SnapshotCaptureError::Encode { source })?;
+        let layer = S::into_native_v2_diff_layer(state);
+        if cancellation.is_cancelled() {
+            return Err(native_v2_snapshot_cancelled(
+                NativeV2SnapshotCaptureStage::ClosedState,
+            ));
+        }
+        close_state(encoded, layer)
+    }));
+    drop(output);
+
+    let mut result = match prepared {
+        Ok(result) => result,
+        Err(_) => Err(NativeV2SnapshotCaptureError::Panic),
+    };
+    if topology_pause_attempted && let Err(source) = session.recover_native_v2_source() {
+        result = Err(NativeV2SnapshotCaptureError::CoordinatorRecovery { source });
+    }
+    if result.is_err()
+        && lineage_started
+        && let Err(source) = session.abort_native_v2_snapshot_lineage(lineage_token, guard)
+    {
+        return Err(NativeV2SnapshotCaptureError::Supervisor { source });
+    }
+    result.map(|state| (state, lineage_token))
+}
+
 impl<S> BootRunLoopSupervisor<S>
 where
     S: NativeV2SnapshotCaptureSession,
@@ -32390,6 +32892,220 @@ where
             request,
             NativeV2SnapshotPublicationDestination::Outputs(outputs),
         )
+    }
+
+    fn publish_native_v2_diff_snapshot(
+        &self,
+        request: NativeV2SnapshotPublicationRequest,
+        paths: &SnapshotArtifactPaths,
+    ) -> Result<
+        NativeV2DiffSnapshotPublicationOutcome,
+        Box<NativeV2SnapshotPublicationTransactionError>,
+    > {
+        self.publish_native_v2_diff_snapshot_to_destination(
+            request,
+            NativeV2DiffSnapshotPublicationDestination::Paths(paths.clone()),
+        )
+    }
+
+    fn publish_native_v2_diff_snapshot_to(
+        &self,
+        request: NativeV2SnapshotPublicationRequest,
+        outputs: SnapshotArtifactOutputs,
+    ) -> Result<
+        NativeV2DiffSnapshotPublicationOutcome,
+        Box<NativeV2SnapshotPublicationTransactionError>,
+    > {
+        self.publish_native_v2_diff_snapshot_to_destination(
+            request,
+            NativeV2DiffSnapshotPublicationDestination::Outputs(outputs),
+        )
+    }
+
+    fn publish_native_v2_diff_snapshot_to_destination(
+        &self,
+        request: NativeV2SnapshotPublicationRequest,
+        destination: NativeV2DiffSnapshotPublicationDestination,
+    ) -> Result<
+        NativeV2DiffSnapshotPublicationOutcome,
+        Box<NativeV2SnapshotPublicationTransactionError>,
+    > {
+        let NativeV2SnapshotPublicationRequest {
+            input,
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs,
+            network_configs,
+            mmds_config,
+            mmds_state,
+            vsock_config,
+            expected_transport,
+            cancellation,
+        } = request;
+        preflight_native_v2_vsock_capture(
+            &serial_config,
+            balloon_config,
+            entropy_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            &storage_configs,
+            &network_configs,
+            mmds_config.as_ref(),
+            &mmds_state,
+            vsock_config.as_ref(),
+            expected_transport,
+        )
+        .map_err(native_v2_snapshot_transaction_error_before_staging)?;
+        let expected_vsock_metrics = vsock_config
+            .as_ref()
+            .map(|_| {
+                self.vsock_device_metrics.clone().ok_or_else(|| {
+                    native_v2_snapshot_transaction_error_before_staging(
+                        NativeV2SnapshotCaptureError::Vsock {
+                            source: NativeV2SnapshotVsockCaptureError::Live {
+                                source: HvfArm64BootVsockCaptureError::owner_unavailable(
+                                    HvfArm64BootVsockCaptureDisposition::Terminal,
+                                ),
+                            },
+                        },
+                    )
+                })
+            })
+            .transpose()?;
+        let active_capture = self
+            .register_snapshot_capture_raw(cancellation.clone())
+            .map_err(|source| {
+                native_v2_snapshot_transaction_error_before_staging(
+                    NativeV2SnapshotCaptureError::Supervisor { source },
+                )
+            })?;
+        if !cancellation.begin_operation() {
+            return Err(native_v2_snapshot_transaction_error_before_staging(
+                native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Source),
+            ));
+        }
+        let completion_cancellation = cancellation.clone();
+        let preserve_terminal_result = Arc::new(AtomicBool::new(false));
+        let completion_terminal_result = Arc::clone(&preserve_terminal_result);
+        let terminal_status = Arc::clone(&self.status);
+        let terminal_admission = Arc::clone(&self.admission);
+        let terminal_pause_gate = Arc::clone(&self.pause_gate);
+
+        self.run_snapshot_quiesced_preserving_result_if(
+            move |session| {
+                let _active_capture = active_capture;
+                let guard = session
+                    .quiesce_snapshot_auxiliary_work()
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Auxiliary { source },
+                        )
+                    })?;
+                if cancellation.is_cancelled() {
+                    drop(guard);
+                    return Err(native_v2_snapshot_transaction_error_before_staging(
+                        native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Source),
+                    ));
+                }
+                let serial = session
+                    .capture_native_v2_serial(serial_config, &guard)
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Serial { source },
+                        )
+                    })?;
+                let serial =
+                    SnapshotV2SerialState::try_from_capture_ready(serial).map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::SerialState { source },
+                        )
+                    })?;
+
+                let mut lineage_token = None;
+                let mut captured_lineage = false;
+                let result = destination.publish(|writer| {
+                    let (state, token) = capture_and_recover_native_v2_diff_state(
+                        session,
+                        input,
+                        NativeV2DiffSnapshotCaptureProfile {
+                            serial,
+                            memory_hotplug_config,
+                            memory_hotplug_requested_size_mib,
+                            balloon_config,
+                            entropy_config,
+                            storage_configs,
+                            network_configs,
+                            mmds_config,
+                            mmds_state,
+                            vsock_config,
+                            expected_vsock_metrics,
+                            expected_transport,
+                        },
+                        &guard,
+                        Box::new(writer),
+                        &cancellation,
+                        |encoded, layer| {
+                            NativeV2DiffSnapshotCandidateState::from_diff_state_v2_13(
+                                encoded, layer,
+                            )
+                            .map(NativeV2DiffSnapshotCandidateState::into_publication_state)
+                            .map_err(|source| {
+                                NativeV2SnapshotCaptureError::DiffCandidateState { source }
+                            })
+                        },
+                    )
+                    .map_err(NativeV2SnapshotPublicationProducerError::Capture)?;
+                    lineage_token = token;
+                    captured_lineage = true;
+                    if cancellation.is_cancelled() || !cancellation.try_seal_commit() {
+                        return Err(NativeV2SnapshotPublicationProducerError::Capture(
+                            native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::CommitSeal),
+                        ));
+                    }
+                    Ok(state)
+                });
+
+                let lineage_result = match &result {
+                    Ok(outcome) => {
+                        session.native_v2_diff_snapshot_published(lineage_token, outcome, &guard)
+                    }
+                    Err(_) if captured_lineage => {
+                        session.abort_native_v2_snapshot_lineage(lineage_token, &guard)
+                    }
+                    Err(_) => Ok(()),
+                };
+
+                let terminal_capture = result
+                    .as_ref()
+                    .err()
+                    .and_then(SnapshotPublicationTransactionError::producer)
+                    .is_some_and(|producer| producer.source().is_terminal());
+                if terminal_capture {
+                    preserve_terminal_result.store(true, Ordering::Release);
+                    terminal_status.record(BootRunLoopWorkerStatus::Failed(
+                        "terminal native-v2 Diff capture failure".to_string(),
+                    ));
+                    terminal_admission.shutdown();
+                    terminal_pause_gate.shutdown();
+                    let _ = session.run_loop_control().request_stop();
+                } else if let Err(source) = lineage_result {
+                    terminal_status.record(BootRunLoopWorkerStatus::Failed(source.to_string()));
+                    terminal_admission.shutdown();
+                    terminal_pause_gate.shutdown();
+                    let _ = session.run_loop_control().request_stop();
+                }
+                drop(guard);
+                result.map_err(Box::new)
+            },
+            move || {
+                completion_cancellation.is_commit_sealed()
+                    || completion_terminal_result.load(Ordering::Acquire)
+            },
+        )
+        .map_err(native_v2_snapshot_publication_error_from_boot_run_loop_command)
     }
 
     fn capture_native_v2_root_candidate(
@@ -33577,6 +34293,9 @@ fn native_v2_platform_capture_error(
         HvfArm64BootSnapshotV2CaptureError::MemoryImage {
             source: SnapshotV2MemoryWriteError::Cancelled { stage },
         } => native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Memory(stage)),
+        HvfArm64BootSnapshotV2CaptureError::DiffLayer {
+            source: SnapshotV2DiffWriteError::Cancelled { stage },
+        } => native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::DiffLayer(stage)),
         source => NativeV2SnapshotCaptureError::Platform { source },
     }
 }
@@ -34744,19 +35463,20 @@ mod tests {
     };
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotPublicationOutcome,
-        NativeV2BalloonSnapshotCandidateState, NativeV2EntropySnapshotCandidateState,
-        NativeV2MemoryHotplugSnapshotCandidateState, NativeV2MemoryHotplugSnapshotPreparation,
-        NativeV2NetworkSnapshotCandidateState, NativeV2NetworkSnapshotPreparation,
-        NativeV2SnapshotArtifactProfile, NativeV2VsockSnapshotCandidateState,
-        NativeV2VsockSnapshotPreparationError, PreparedNativeSnapshotState,
-        PreparedNativeV2NetworkSnapshotCandidateState, PreparedNativeV2VsockSnapshotCandidateState,
-        SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotPublicationOutcome,
-        publish_snapshot_artifacts_with,
+        NativeV2BalloonSnapshotCandidateState, NativeV2DiffSnapshotPublicationOutcome,
+        NativeV2EntropySnapshotCandidateState, NativeV2MemoryHotplugSnapshotCandidateState,
+        NativeV2MemoryHotplugSnapshotPreparation, NativeV2NetworkSnapshotCandidateState,
+        NativeV2NetworkSnapshotPreparation, NativeV2SnapshotArtifactProfile,
+        NativeV2VsockSnapshotCandidateState, NativeV2VsockSnapshotPreparationError,
+        PreparedNativeSnapshotState, PreparedNativeV2NetworkSnapshotCandidateState,
+        PreparedNativeV2VsockSnapshotCandidateState, SnapshotArtifactOutputs,
+        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_artifact::{
         NativeSnapshotArtifactFamily, NativeV2SnapshotCandidateState, SnapshotArtifactOutput,
-        SnapshotCommitDurability, load_native_snapshot_artifacts, load_snapshot_artifacts,
+        SnapshotCommitDurability, SnapshotPublicationStage, load_native_snapshot_artifacts,
+        load_snapshot_artifacts,
     };
     use bangbang_runtime::snapshot_balloon_v2_9::{
         NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, SnapshotV2BalloonState,
@@ -34776,17 +35496,24 @@ mod tests {
     use bangbang_runtime::snapshot_device_v2_6::{
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
     };
+    #[cfg(target_os = "macos")]
+    use bangbang_runtime::snapshot_diff_v2_13::verify_snapshot_v2_diff_layer_output;
+    use bangbang_runtime::snapshot_diff_v2_13::{
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION, SnapshotV2DiffBase, SnapshotV2DiffLayerBinding,
+        SnapshotV2DiffSelection, SnapshotV2DiffWriteError, SnapshotV2DiffWriteStage,
+        write_snapshot_v2_diff_layer_with_cancel,
+    };
     use bangbang_runtime::snapshot_entropy_v2_8::{
         NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, SnapshotV2EntropyState,
         SnapshotV2EntropyStateCaptureError,
     };
     use bangbang_runtime::snapshot_format_v2::{
         NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
-        NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
-        NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
-        NATIVE_V2_NETWORK_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY,
-        NATIVE_V2_VSOCK_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
-        decode_snapshot_v2_state_with_compatibility_version,
+        NATIVE_V2_DIFF_COMPONENT_KEY, NATIVE_V2_ENTROPY_COMPONENT_KEY,
+        NATIVE_V2_LEGACY_PLATFORM_VERSION, NATIVE_V2_MEMORY_COMPONENT_KEY,
+        NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY, NATIVE_V2_NETWORK_COMPONENT_KEY,
+        NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_VSOCK_COMPONENT_KEY, SnapshotV2Component,
+        SnapshotV2ComponentDisposition, decode_snapshot_v2_state_with_compatibility_version,
         encode_snapshot_v2_state_with_compatibility_version,
     };
     use bangbang_runtime::snapshot_lineage::LiveSnapshotLineageToken;
@@ -34885,13 +35612,13 @@ mod tests {
         NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
         NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
         NativeV2BalloonCandidateCaptureRequest, NativeV2BalloonCandidateProfileError,
-        NativeV2EntropyCandidateCaptureRequest, NativeV2EntropyCandidateProfileError,
-        NativeV2MemoryHotplugCandidateCaptureRequest, NativeV2MemoryHotplugCandidateProfileError,
-        NativeV2MultiBlockCandidateProfileError, NativeV2NetworkCandidateProfileError,
-        NativeV2RootCandidateProcessError, NativeV2RootCandidateProfileError,
-        NativeV2SerialCandidateProfileError, NativeV2SnapshotBalloonCaptureError,
-        NativeV2SnapshotCaptureCancellation, NativeV2SnapshotCaptureError,
-        NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
+        NativeV2DiffCapturePreparation, NativeV2EntropyCandidateCaptureRequest,
+        NativeV2EntropyCandidateProfileError, NativeV2MemoryHotplugCandidateCaptureRequest,
+        NativeV2MemoryHotplugCandidateProfileError, NativeV2MultiBlockCandidateProfileError,
+        NativeV2NetworkCandidateProfileError, NativeV2RootCandidateProcessError,
+        NativeV2RootCandidateProfileError, NativeV2SerialCandidateProfileError,
+        NativeV2SnapshotBalloonCaptureError, NativeV2SnapshotCaptureCancellation,
+        NativeV2SnapshotCaptureError, NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
         NativeV2SnapshotEntropyCaptureError, NativeV2SnapshotLoadError,
         NativeV2SnapshotMemoryHotplugCaptureError, NativeV2SnapshotMultiBlockCaptureError,
         NativeV2SnapshotNetworkCaptureError, NativeV2SnapshotPublicationDestination,
@@ -38404,6 +39131,26 @@ mod tests {
         vsock: Option<SnapshotV2VsockState>,
     }
 
+    #[derive(Debug)]
+    struct FakeNativeV2DiffPlatformState {
+        binding: SnapshotV2MemoryBinding,
+        memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+        layer: SnapshotV2DiffLayerBinding,
+    }
+
+    #[derive(Debug)]
+    struct FakeNativeV2DiffState {
+        binding: SnapshotV2MemoryBinding,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+        entropy: Option<SnapshotV2EntropyState>,
+        balloon: Option<SnapshotV2BalloonState>,
+        memory_hotplug: Option<SnapshotV2MemoryHotplugState>,
+        network: Option<SnapshotV2NetworkState>,
+        vsock: Option<SnapshotV2VsockState>,
+        layer: SnapshotV2DiffLayerBinding,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FakeNativeV2RootFailure {
         Inventory,
@@ -38535,6 +39282,7 @@ mod tests {
         native_v2_root_transport: Option<SnapshotV2DeviceTransportKind>,
         native_v2_root_failure: Option<FakeNativeV2RootFailure>,
         native_v2_invalid_candidate_state: bool,
+        native_v2_diff_extend_layer: bool,
         native_v2_balloon_encode_error: bool,
         native_v2_cancel_after_pause: Option<NativeV2SnapshotCaptureCancellation>,
         native_v2_cancel_during_balloon: Option<NativeV2SnapshotCaptureCancellation>,
@@ -38615,6 +39363,7 @@ mod tests {
                 native_v2_root_transport: Some(SnapshotV2DeviceTransportKind::Mmio),
                 native_v2_root_failure: None,
                 native_v2_invalid_candidate_state: false,
+                native_v2_diff_extend_layer: false,
                 native_v2_balloon_encode_error: false,
                 native_v2_cancel_after_pause: None,
                 native_v2_cancel_during_balloon: None,
@@ -38833,6 +39582,12 @@ mod tests {
 
         fn with_native_v2_invalid_candidate_state(mut self) -> Self {
             self.native_v2_invalid_candidate_state = true;
+            self
+        }
+
+        #[cfg(target_os = "macos")]
+        const fn with_native_v2_diff_extended_layer(mut self) -> Self {
+            self.native_v2_diff_extend_layer = true;
             self
         }
 
@@ -39535,6 +40290,8 @@ mod tests {
         type NetworkState = FakeNativeV2NetworkState;
         type VsockPlatformState = FakeNativeV2VsockPlatformState;
         type VsockState = FakeNativeV2VsockState;
+        type DiffPlatformState = FakeNativeV2DiffPlatformState;
+        type DiffState = FakeNativeV2DiffState;
 
         fn capture_native_v2_serial(
             &self,
@@ -40280,6 +41037,61 @@ mod tests {
             Ok(FakeNativeV2VsockPlatformState {
                 binding,
                 memory_hotplug: capture,
+            })
+        }
+
+        fn capture_native_v2_diff_platform(
+            &mut self,
+            _input: HvfArm64BootSnapshotV2CaptureInput,
+            capture: Option<Self::MemoryHotplugCaptureState>,
+            base: SnapshotV2DiffBase,
+            selection: SnapshotV2DiffSelection,
+            output: &mut super::BoxedNativeV2SnapshotMemoryOutput,
+            cancellation: &NativeV2SnapshotCaptureCancellation,
+        ) -> Result<Self::DiffPlatformState, HvfArm64BootSnapshotV2CaptureError> {
+            assert!(
+                !self.native_snapshot_panic,
+                "fake native-v2 Diff capture panic"
+            );
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-diff-platform");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("platform", self.native_v2_topology_generation));
+            let memory = self
+                .native_snapshot_memory
+                .as_ref()
+                .expect("fake native-v2 memory should be configured");
+            let layer =
+                write_snapshot_v2_diff_layer_with_cancel(memory, output, base, &selection, |_| {
+                    cancellation.is_cancelled()
+                })
+                .map_err(|source| HvfArm64BootSnapshotV2CaptureError::DiffLayer { source })?;
+            if self.native_v2_diff_extend_layer {
+                output.write_all(&[0]).map_err(|source| {
+                    HvfArm64BootSnapshotV2CaptureError::DiffLayer {
+                        source: super::SnapshotV2DiffWriteError::Io {
+                            stage: SnapshotV2DiffWriteStage::FinalLength,
+                            kind: source.kind(),
+                        },
+                    }
+                })?;
+            }
+            let binding = layer.result().try_clone().map_err(|source| {
+                HvfArm64BootSnapshotV2CaptureError::DiffLayer {
+                    source: super::SnapshotV2DiffWriteError::ResultBinding { source },
+                }
+            })?;
+            if let Some(cancel) = &self.native_snapshot_cancel_before_seal {
+                cancel.cancel();
+            }
+            Ok(FakeNativeV2DiffPlatformState {
+                binding,
+                memory_hotplug: capture,
+                layer,
             })
         }
 
@@ -41206,6 +42018,186 @@ mod tests {
             .map_err(HvfSnapshotV2EncodeError::Container)
         }
 
+        fn compose_native_v2_diff(
+            &self,
+            platform: Self::DiffPlatformState,
+            graph: Option<SnapshotV2StorageDeviceGraph>,
+            serial: SnapshotV2SerialState,
+            entropy: Option<SnapshotV2EntropyState>,
+            balloon: Option<SnapshotV2BalloonState>,
+            network: Option<SnapshotV2NetworkState>,
+            vsock: Option<SnapshotV2VsockState>,
+        ) -> Result<Self::DiffState, HvfSnapshotV2BuildError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-diff-compose");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("compose", self.native_v2_topology_generation));
+            Ok(FakeNativeV2DiffState {
+                binding: platform.binding,
+                graph,
+                serial,
+                entropy,
+                balloon,
+                memory_hotplug: platform.memory_hotplug,
+                network,
+                vsock,
+                layer: platform.layer,
+            })
+        }
+
+        fn encode_native_v2_diff(
+            &self,
+            state: &Self::DiffState,
+        ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-diff-encode");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("encode", self.native_v2_topology_generation));
+            let memory = state
+                .binding
+                .encode()
+                .map_err(HvfSnapshotV2EncodeError::Memory)?;
+            let graph = state
+                .graph
+                .as_ref()
+                .map(|graph| {
+                    graph
+                        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::StorageDeviceGraph)
+                })
+                .transpose()?;
+            let serial = state
+                .serial
+                .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+                .map_err(HvfSnapshotV2EncodeError::SerialState)?;
+            let entropy = state
+                .entropy
+                .as_ref()
+                .map(|entropy| {
+                    entropy
+                        .encode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::EntropyState)
+                })
+                .transpose()?;
+            let balloon = state
+                .balloon
+                .as_ref()
+                .map(|balloon| {
+                    balloon
+                        .encode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::BalloonState)
+                })
+                .transpose()?;
+            let memory_hotplug = state
+                .memory_hotplug
+                .as_ref()
+                .map(|memory_hotplug| {
+                    memory_hotplug
+                        .encode(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::MemoryHotplugState)
+                })
+                .transpose()?;
+            let network = state
+                .network
+                .as_ref()
+                .map(|network| {
+                    network
+                        .encode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::NetworkState)
+                })
+                .transpose()?;
+            let vsock = state
+                .vsock
+                .as_ref()
+                .map(|vsock| {
+                    vsock
+                        .encode(NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::VsockState)
+                })
+                .transpose()?;
+            let diff = state
+                .layer
+                .encode()
+                .map_err(HvfSnapshotV2EncodeError::DiffLayer)?;
+            let mut components = vec![SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &memory,
+            )];
+            if let Some(graph) = graph.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    graph,
+                ));
+            }
+            if !self.native_v2_invalid_candidate_state {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_SERIAL_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    &serial,
+                ));
+            }
+            if let Some(entropy) = entropy.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_ENTROPY_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    entropy,
+                ));
+            }
+            if let Some(balloon) = balloon.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_BALLOON_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    balloon,
+                ));
+            }
+            if let Some(memory_hotplug) = memory_hotplug.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    memory_hotplug,
+                ));
+            }
+            if let Some(network) = network.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_NETWORK_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    network,
+                ));
+            }
+            if let Some(vsock) = vsock.as_deref() {
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_VSOCK_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    vsock,
+                ));
+            }
+            components.push(SnapshotV2Component::new(
+                NATIVE_V2_DIFF_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &diff,
+            ));
+            encode_snapshot_v2_state_with_compatibility_version(
+                NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+                &[],
+                &components,
+            )
+            .map_err(HvfSnapshotV2EncodeError::Container)
+        }
+
+        fn into_native_v2_diff_layer(state: Self::DiffState) -> SnapshotV2DiffLayerBinding {
+            state.layer
+        }
+
         fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
             self.native_snapshot_events
                 .lock()
@@ -41249,6 +42241,33 @@ mod tests {
             Ok(None)
         }
 
+        fn begin_native_v2_diff_lineage(
+            &mut self,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        ) -> Result<NativeV2DiffCapturePreparation, BackendError> {
+            self.native_snapshot_lineage_events
+                .lock()
+                .expect("fake lineage events should lock")
+                .push("v2-diff-begin");
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-diff-begin");
+            let memory = self
+                .native_snapshot_memory
+                .as_ref()
+                .ok_or(BackendError::InvalidState(
+                    "fake native-v2 Diff memory is absent",
+                ))?;
+            let selection = SnapshotV2DiffSelection::all_current(memory)
+                .map_err(|source| BackendError::Hypervisor(source.to_string()))?;
+            Ok(NativeV2DiffCapturePreparation {
+                token: None,
+                base: SnapshotV2DiffBase::Zero,
+                selection,
+            })
+        }
+
         fn abort_native_v2_snapshot_lineage(
             &mut self,
             _token: Option<LiveSnapshotLineageToken>,
@@ -41275,6 +42294,26 @@ mod tests {
                 .lock()
                 .expect("fake native snapshot events should lock")
                 .push("v2-published");
+            match self.native_snapshot_publication_error.clone() {
+                Some(source) => Err(source),
+                None => Ok(()),
+            }
+        }
+
+        fn native_v2_diff_snapshot_published(
+            &mut self,
+            _token: Option<LiveSnapshotLineageToken>,
+            _outcome: &NativeV2DiffSnapshotPublicationOutcome,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        ) -> Result<(), BackendError> {
+            self.native_snapshot_lineage_events
+                .lock()
+                .expect("fake lineage events should lock")
+                .push("v2-diff-published");
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-diff-published");
             match self.native_snapshot_publication_error.clone() {
                 Some(source) => Err(source),
                 None => Ok(()),
@@ -66005,6 +67044,26 @@ mod tests {
                 },
             }
         ));
+        assert!(!native_v2_platform_capture_is_terminal(
+            &HvfArm64BootSnapshotV2CaptureError::DiffLayer {
+                source: SnapshotV2DiffWriteError::Io {
+                    stage: SnapshotV2DiffWriteStage::FinalLength,
+                    kind: std::io::ErrorKind::WriteZero,
+                },
+            }
+        ));
+        assert!(!native_v2_platform_capture_is_terminal(
+            &HvfArm64BootSnapshotV2CaptureError::DiffLayer {
+                source: SnapshotV2DiffWriteError::Cancelled {
+                    stage: SnapshotV2DiffWriteStage::Metadata,
+                },
+            }
+        ));
+        assert!(native_v2_platform_capture_is_terminal(
+            &HvfArm64BootSnapshotV2CaptureError::DiffLayer {
+                source: SnapshotV2DiffWriteError::TopologyChanged,
+            }
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -66102,6 +67161,386 @@ mod tests {
             .expect("fresh native-v2 operation should succeed");
         load_native_snapshot_artifacts(&retry_paths).expect("fresh native-v2 pair should load");
         retry_directory.assert_no_staging();
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_diff_supervisor_orders_lineage_and_publishes_direct_and_anchored_pairs() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let lineage_events = session.native_snapshot_lineage_events();
+        let auxiliary = session.snapshot_auxiliary_quiescence();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(101).expect("non-zero"))
+                .expect("native-v2 Diff supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 101);
+        supervisor.pause().expect("Diff source should pause");
+
+        let direct = TempSnapshotDirectory::new("native-v2-diff-direct");
+        let direct_paths = direct.paths();
+        let first = supervisor
+            .publish_native_v2_diff_snapshot(
+                native_v2_test_publication_request(
+                    None,
+                    CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                    SnapshotV2DeviceTransportKind::Mmio,
+                    NativeV2SnapshotCaptureCancellation::default(),
+                ),
+                &direct_paths,
+            )
+            .expect("direct exact-2.13 Diff pair should publish");
+        assert_eq!(first.durability(), SnapshotCommitDurability::Durable);
+        assert_eq!(
+            decode_snapshot_v2_state_with_compatibility_version(
+                first.state().bytes(),
+                NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("direct Diff state should decode structurally")
+            .metadata()
+            .component_count(),
+            3
+        );
+        let mut direct_layer = File::open(direct_paths.memory()).expect("direct layer should open");
+        verify_snapshot_v2_diff_layer_output(first.state().layer_binding(), &mut direct_layer)
+            .expect("direct layer should match state");
+        assert!(load_native_snapshot_artifacts(&direct_paths).is_err());
+        assert_eq!(
+            events
+                .lock()
+                .expect("direct Diff events should lock")
+                .as_slice(),
+            [
+                "aux-acquire",
+                "v2-serial",
+                "v2-pause",
+                "v2-balloon",
+                "v2-entropy",
+                "v2-memory-hotplug",
+                "v2-network",
+                "v2-diff-begin",
+                "v2-diff-platform",
+                "v2-diff-compose",
+                "v2-diff-encode",
+                "v2-recover",
+                "v2-diff-published",
+                "aux-drop",
+            ]
+        );
+        direct.assert_no_staging();
+
+        let anchored = TempSnapshotDirectory::new("native-v2-diff-anchor");
+        let anchored_paths = anchored.paths();
+        let outputs = SnapshotArtifactOutputs::new(
+            SnapshotArtifactOutput::anchored(
+                File::open(&anchored.path).expect("state anchor should open"),
+                b"state.snap".to_vec(),
+            ),
+            SnapshotArtifactOutput::anchored(
+                File::open(&anchored.path).expect("layer anchor should open"),
+                b"memory.snap".to_vec(),
+            ),
+        );
+        let second = supervisor
+            .publish_native_v2_diff_snapshot_to(
+                native_v2_test_publication_request(
+                    None,
+                    CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                    SnapshotV2DeviceTransportKind::Mmio,
+                    NativeV2SnapshotCaptureCancellation::default(),
+                ),
+                outputs,
+            )
+            .expect("anchored exact-2.13 Diff pair should publish");
+        let mut anchored_layer =
+            File::open(anchored_paths.memory()).expect("anchored layer should open");
+        verify_snapshot_v2_diff_layer_output(second.state().layer_binding(), &mut anchored_layer)
+            .expect("anchored layer should match state");
+        assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 2);
+        assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("Diff lineage events should lock")
+                .as_slice(),
+            [
+                "v2-diff-begin",
+                "v2-diff-published",
+                "v2-diff-begin",
+                "v2-diff-published",
+            ]
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        anchored.assert_no_staging();
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_diff_cancellation_after_begin_aborts_then_allows_fresh_publication() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let cancellation = NativeV2SnapshotCaptureCancellation::default();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_snapshot_cancel_before_seal(cancellation.clone())
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let lineage_events = session.native_snapshot_lineage_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(102).expect("non-zero"))
+                .expect("native-v2 Diff cancellation supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 102);
+        supervisor.pause().expect("Diff source should pause");
+
+        let cancelled = TempSnapshotDirectory::new("native-v2-diff-cancel");
+        let cancelled_paths = cancelled.paths();
+        let error = supervisor
+            .publish_native_v2_diff_snapshot(
+                native_v2_test_publication_request(
+                    None,
+                    CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                    SnapshotV2DeviceTransportKind::Mmio,
+                    cancellation,
+                ),
+                &cancelled_paths,
+            )
+            .expect_err("cancellation after Diff begin must abort publication");
+        assert!(matches!(
+            error.producer().map(|producer| producer.source()),
+            Some(NativeV2SnapshotPublicationProducerError::Capture(
+                NativeV2SnapshotCaptureError::Cancelled {
+                    stage: NativeV2SnapshotCaptureStage::Encode,
+                }
+            ))
+        ));
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("cancelled Diff lineage should lock")
+                .as_slice(),
+            ["v2-diff-begin", "v2-abort"]
+        );
+        assert!(!cancelled_paths.state().exists());
+        assert!(!cancelled_paths.memory().exists());
+        cancelled.assert_no_staging();
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        let retry = TempSnapshotDirectory::new("native-v2-diff-cancel-retry");
+        supervisor
+            .publish_native_v2_diff_snapshot(
+                native_v2_test_publication_request(
+                    None,
+                    CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                    SnapshotV2DeviceTransportKind::Mmio,
+                    NativeV2SnapshotCaptureCancellation::default(),
+                ),
+                &retry.paths(),
+            )
+            .expect("fresh Diff operation should publish after abort");
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("retried Diff lineage should lock")
+                .as_slice(),
+            [
+                "v2-diff-begin",
+                "v2-abort",
+                "v2-diff-begin",
+                "v2-diff-published",
+            ]
+        );
+        retry.assert_no_staging();
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_diff_transaction_verification_failure_aborts_transferred_lineage() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_v2_diff_extended_layer()
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let lineage_events = session.native_snapshot_lineage_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(103).expect("non-zero"))
+                .expect("native-v2 Diff verification supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 103);
+        supervisor.pause().expect("Diff source should pause");
+
+        let directory = TempSnapshotDirectory::new("native-v2-diff-extended");
+        let paths = directory.paths();
+        let error = supervisor
+            .publish_native_v2_diff_snapshot(
+                native_v2_test_publication_request(
+                    None,
+                    CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                    SnapshotV2DeviceTransportKind::Mmio,
+                    NativeV2SnapshotCaptureCancellation::default(),
+                ),
+                &paths,
+            )
+            .expect_err("extended layer should fail transaction verification");
+        assert_eq!(
+            error
+                .publication()
+                .expect("verification should be a publication failure")
+                .stage(),
+            SnapshotPublicationStage::MemoryWriteVerify
+        );
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("verification lineage should lock")
+                .as_slice(),
+            ["v2-diff-begin", "v2-abort"]
+        );
+        assert!(!paths.state().exists());
+        assert!(!paths.memory().exists());
+        directory.assert_no_staging();
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_diff_panic_after_begin_recovers_aborts_and_terminates() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_snapshot_panic()
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let lineage_events = session.native_snapshot_lineage_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(104).expect("non-zero"))
+                .expect("native-v2 Diff panic supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 104);
+        supervisor.pause().expect("Diff source should pause");
+
+        let directory = TempSnapshotDirectory::new("native-v2-diff-panic");
+        let paths = directory.paths();
+        let error = supervisor
+            .publish_native_v2_diff_snapshot(
+                native_v2_test_publication_request(
+                    None,
+                    CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                    SnapshotV2DeviceTransportKind::Mmio,
+                    NativeV2SnapshotCaptureCancellation::default(),
+                ),
+                &paths,
+            )
+            .expect_err("caught Diff capture panic should fail publication");
+        assert!(matches!(
+            error.producer().map(|producer| producer.source()),
+            Some(NativeV2SnapshotPublicationProducerError::Capture(
+                NativeV2SnapshotCaptureError::Panic
+            ))
+        ));
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("panic Diff lineage should lock")
+                .as_slice(),
+            ["v2-diff-begin", "v2-abort"]
+        );
+        assert!(
+            events
+                .lock()
+                .expect("panic Diff events should lock")
+                .ends_with(&["v2-diff-begin", "v2-recover", "aux-drop"])
+        );
+        assert_eq!(
+            supervisor.wait_for_terminal_status(),
+            BootRunLoopWorkerStatus::Failed("terminal native-v2 Diff capture failure".to_owned())
+        );
+        assert!(!paths.state().exists());
+        assert!(!paths.memory().exists());
+        directory.assert_no_staging();
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_diff_visible_commit_survives_terminal_lineage_completion_failure() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_snapshot_publication_error(BackendError::InvalidState(
+                "Diff dirty epoch reset requires VM teardown",
+            ))
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let lineage_events = session.native_snapshot_lineage_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(105).expect("non-zero"))
+                .expect("native-v2 Diff completion supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 105);
+        supervisor.pause().expect("Diff source should pause");
+
+        let directory = TempSnapshotDirectory::new("native-v2-diff-completion");
+        let paths = directory.paths();
+        let outcome = supervisor
+            .publish_native_v2_diff_snapshot(
+                native_v2_test_publication_request(
+                    None,
+                    CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                    SnapshotV2DeviceTransportKind::Mmio,
+                    NativeV2SnapshotCaptureCancellation::default(),
+                ),
+                &paths,
+            )
+            .expect("visible Diff commit must retain its exact outcome");
+        let mut layer = File::open(paths.memory()).expect("committed Diff layer should open");
+        verify_snapshot_v2_diff_layer_output(outcome.state().layer_binding(), &mut layer)
+            .expect("committed Diff layer should remain valid");
+        assert_eq!(
+            lineage_events
+                .lock()
+                .expect("completion Diff lineage should lock")
+                .as_slice(),
+            ["v2-diff-begin", "v2-diff-published"]
+        );
+        assert_eq!(
+            supervisor.wait_for_terminal_status(),
+            BootRunLoopWorkerStatus::Failed(
+                "invalid backend state: Diff dirty epoch reset requires VM teardown".to_owned()
+            )
+        );
+        assert!(paths.state().exists());
+        assert!(paths.memory().exists());
+        directory.assert_no_staging();
 
         drop(supervisor);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
