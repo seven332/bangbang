@@ -679,9 +679,12 @@ scripts/run-integration-tests.sh --test native_v2_process
 ```
 
 The wrapper builds the `bangbang` binary unit-test harness, locates and signs
-that exact test executable, and runs only the ignored private-seam proof. Its
-minimal two-vCPU guest does not touch serial or optional devices beyond the
-required read-only root. The first test starts and pauses the real
+that exact test executable, then builds, separately signs, and verifies the
+`rebase-snap` and `snapshot-editor` binaries. Only the exact Diff seam receives
+their fixed test-only paths through `BANGBANG_REBASE_SNAP_PATH` and
+`BANGBANG_SNAPSHOT_EDITOR_PATH`; other private seams receive no tool
+activation. Its minimal two-vCPU guest does not touch serial or optional
+devices beyond the required read-only root. The first test starts and pauses the real
 process-owned HVF supervisor, publishes one exact 2.12 Full
 serial-plus-profile-3 MMIO-root pair without entropy, resumes and repauses the
 source, publishes a fresh recapture,
@@ -700,8 +703,37 @@ tracked direct-MMIO zero-root Diff, an untracked contained-PCI Full→Diff rebas
 strict optional-balloon state, both load forms, and restored-lineage recapture.
 This group is part of the default integration set and
 must run without
-`--allow-unsupported` on supported Apple Silicon. It adds no API, CLI,
-config-file, or environment activation for native-v2.
+`--allow-unsupported` on supported Apple Silicon. The tool paths are confined
+to this signed test harness and do not add production API, config-file, or
+hidden command activation.
+
+### Native-v2 2.13 Diff and rebase certification
+
+The final focused evidence is compositional. Each layer owns a distinct
+observable boundary rather than repeating the complete matrix in one signed
+test:
+
+| Boundary | Exact evidence |
+| --- | --- |
+| Format, selection, lineage, and final bytes | `current_dynamic_add_and_remove_topologies_write_canonically`, `repeated_complete_application_handles_add_then_remove`, `exact_minor_thirteen_diff_closes_all_sixty_four_mmio_and_pci_products`, and the snapshot-artifact/lineage failure suites |
+| Rebase transaction and command behavior | `sparse_cross_directory_and_repeated_rebases_are_exact`, the complete injected race/failure/cleanup matrix, `both_commands_materialize_byte_identical_complete_images`, `sequential_commands_apply_repeated_lineage_exactly`, signal/substitution cases, and the shared 0/1/2/3/130/143 outcome tests |
+| Signed real-HVF chain | `signed_native_v2_diff_process_loads_zero_root_and_rebased_products` creates tracked and untracked layers, invokes both separately signed tools, restores a contained PCI result, and recaptures its exact predecessor |
+| Ordinary product and App Sandbox boundary | `normal_bundle_certifies_native_v2_diff_snapshot_grants_and_app_sandbox` creates and loads a tracked zero-root Diff through exact path-scoped outputs plus post-adoption replacement of every descriptor-backed source/input pathname over MMIO and PCI, describes `v2.13.0`, publishes Paused, resumes to real guest `SYSTEM_OFF`, and proves immutability and cleanup |
+| Inventory closure | `snapshot_diff_rebase_terminal_policy_is_stable` pins thirteen terminal leaves, four retained mixed aggregates, exact evidence paths, the checked ledger, and #1542/#1543 ownership |
+
+Use these focused commands while changing this surface, then run the full
+repository matrix and complete signed wrapper:
+
+```sh
+cargo test -p bangbang-firecracker-capability-audit --test checked_inventory snapshot_diff_rebase_terminal_policy_is_stable --locked
+cargo test -p bangbang-snapshot-tools --all-targets --all-features --locked
+cargo test -p bangbang-runtime snapshot_diff_v2_13 --all-features --locked
+cargo test -p bangbang-runtime snapshot_rebase --all-features --locked
+cargo test -p bangbang-hvf --lib --all-features --locked exact_minor_thirteen_diff
+cargo check -p bangbang-snapshot-tools --all-targets --all-features --locked --target aarch64-unknown-linux-musl
+scripts/run-integration-tests.sh --test native_v2_process
+scripts/run-integration-tests.sh --test production_bundle -- --exact normal_bundle_certifies_native_v2_diff_snapshot_grants_and_app_sandbox
+```
 
 ### Native-v2 2.5 compatibility transaction failure matrix
 
@@ -1394,6 +1426,7 @@ cargo fmt --all -- --check
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo check --workspace --all-targets --all-features --locked
 cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl
+cargo check -p bangbang-snapshot-tools --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 cargo test -p bangbang-hvf --lib --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

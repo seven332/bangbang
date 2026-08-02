@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use bangbang_hvf::decode_hvf_snapshot_v2_vsock_state;
+use bangbang_hvf::{decode_hvf_snapshot_v2_diff_state, decode_hvf_snapshot_v2_vsock_state};
 use bangbang_launcher::{
     JailerIsolationArgument, LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME,
     OUTER_BUNDLE_NAME, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
@@ -42,6 +42,9 @@ use bangbang_runtime::balloon::VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
 use bangbang_runtime::mmds::MmdsVersion;
 use bangbang_runtime::snapshot_balloon_v2_9::SnapshotV2BalloonState;
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
+use bangbang_runtime::snapshot_diff_v2_13::{
+    SnapshotV2DiffBase, verify_snapshot_v2_diff_layer_output,
+};
 use bangbang_runtime::snapshot_format_v2::{
     NATIVE_V2_VSOCK_COMPONENT_KEY, SnapshotV2Component, decode_snapshot_v2_state,
     encode_snapshot_v2_state_with_compatibility_version,
@@ -1431,6 +1434,14 @@ fn normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restor
     let bundle = production_bundle();
     for enable_pci in [false, true] {
         run_native_v2_snapshot_grant_case(&bundle, enable_pci);
+    }
+}
+
+#[test]
+fn normal_bundle_certifies_native_v2_diff_snapshot_grants_and_app_sandbox() {
+    let bundle = production_bundle();
+    for enable_pci in [false, true] {
+        run_native_v2_diff_snapshot_grant_case(&bundle, enable_pci);
     }
 }
 
@@ -7109,6 +7120,185 @@ fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
         memory_before
     );
     assert_eq!(session_entries(), baseline_sessions);
+}
+
+fn run_native_v2_diff_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
+    let transport = if enable_pci { "pci" } else { "mmio" };
+    initialize_worker_container(bundle);
+    let baseline_sessions = session_entries();
+    let source_fixture =
+        SnapshotSourceGrantFixture::new(&format!("{transport}-diff-certification"));
+    let mut source = spawn_ready_snapshot_grant_api_launcher(
+        bundle,
+        &source_fixture.manifest,
+        source_fixture.sensitive_strings(),
+        &format!("snapshot-{transport}-diff-source"),
+        false,
+        enable_pci,
+    );
+    source_fixture.replace_source_file_pathnames();
+    configure_and_pause_snapshot_source_with_tracking(
+        &source,
+        &source_fixture.opened_metrics,
+        true,
+    );
+
+    let create = http_put(
+        &source.socket,
+        "/snapshot/create",
+        &snapshot_diff_create_body(),
+    );
+    assert_http_status(&create, 204, "create granted exact-2.13 Diff snapshot");
+    let artifacts = source_fixture.artifacts();
+    assert!(artifacts.state.is_file(), "granted Diff state should exist");
+    assert!(
+        artifacts.memory.is_file(),
+        "granted Diff layer should exist"
+    );
+    assert_no_snapshot_staging(&source_fixture.state_directory);
+    assert_no_snapshot_staging(&source_fixture.memory_directory);
+
+    let state_before = fs::read(&artifacts.state).expect("granted Diff state should read");
+    let memory_before = fs::read(&artifacts.memory).expect("granted Diff layer should read");
+    let structural =
+        decode_snapshot_v2_state(&state_before).expect("granted Diff state should decode");
+    let decoded = decode_hvf_snapshot_v2_diff_state(&structural)
+        .expect("granted Diff state should close as exact native-v2 2.13");
+    let graph = decoded
+        .device_graph()
+        .expect("granted Diff should retain all three block devices");
+    assert_eq!(graph.block_records().len(), 3);
+    assert!(graph.pmem_records().is_empty());
+    assert_eq!(
+        graph.transport_kind(),
+        if enable_pci {
+            SnapshotV2DeviceTransportKind::Pci
+        } else {
+            SnapshotV2DeviceTransportKind::Mmio
+        }
+    );
+    let layer = decoded.layer();
+    assert!(matches!(layer.base(), SnapshotV2DiffBase::Zero));
+    let selected_bytes = layer
+        .data_extents()
+        .iter()
+        .map(|extent| extent.range().size())
+        .sum::<u64>();
+    let result_bytes = layer
+        .result()
+        .extents()
+        .iter()
+        .map(|extent| extent.range().size())
+        .sum::<u64>();
+    assert!(
+        selected_bytes > 0 && selected_bytes < result_bytes,
+        "tracked {transport} boot Diff should be nonempty and sparse: selected={selected_bytes}, result={result_bytes}"
+    );
+    let mut layer_file = fs::File::open(&artifacts.memory)
+        .expect("granted Diff layer should reopen for detached verification");
+    verify_snapshot_v2_diff_layer_output(layer, &mut layer_file)
+        .expect("granted Diff layer should match its exact state binding");
+    drop(layer_file);
+    drop(decoded);
+
+    stop_running_launcher(&mut source, "granted exact-2.13 Diff source");
+    source_fixture
+        .assert_replacement_pathnames_unused("ordinary production exact-2.13 Diff source");
+    assert_eq!(session_entries(), baseline_sessions);
+
+    let describe = SnapshotDescribeGrantFixture::new(
+        &format!("{transport}-diff-valid"),
+        &artifacts.state,
+        true,
+    );
+    let describe_output = run_snapshot_describe(bundle, &describe);
+    assert_output_success(&describe_output, "granted Diff snapshot description");
+    assert_eq!(
+        String::from_utf8_lossy(&describe_output.stdout).trim(),
+        "v2.13.0"
+    );
+    assert_snapshot_output_redacted(&describe_output, &describe.sensitive_strings());
+    assert_eq!(session_entries(), baseline_sessions);
+
+    let destination_fixture =
+        SnapshotInputGrantFixture::new(&format!("{transport}-diff-paused"), artifacts);
+    let mut destination = spawn_ready_snapshot_grant_api_launcher(
+        bundle,
+        &destination_fixture.manifest,
+        destination_fixture.sensitive_strings(),
+        &format!("snapshot-{transport}-diff-destination"),
+        false,
+        enable_pci,
+    );
+    let opened = destination_fixture.replace_source_pathnames();
+    let load = http_put(
+        &destination.socket,
+        "/snapshot/load",
+        &snapshot_load_body(false),
+    );
+    assert_http_status(&load, 204, "load granted exact-2.13 Diff paused");
+    let state = http_get(&destination.socket, "/");
+    assert_http_status(&state, 200, "read granted Diff destination state");
+    assert!(state.contains(r#""state":"Paused""#));
+
+    let config = http_get(&destination.socket, "/vm/config");
+    assert_http_status(&config, 200, "read granted Diff destination config");
+    for expected in [
+        r#""drive_id":"rootfs""#,
+        r#""drive_id":"data""#,
+        r#""drive_id":"audit""#,
+        r#""is_root_device":true"#,
+        r#""is_read_only":false"#,
+        r#""is_read_only":true"#,
+        r#""cache_type":"Unsafe""#,
+        r#""cache_type":"Writeback""#,
+        r#""io_engine":"Async""#,
+        r#""io_engine":"Sync""#,
+    ] {
+        assert!(
+            config.contains(expected),
+            "{transport} Diff restore should retain {expected}; response:\n{config}"
+        );
+    }
+    assert_eq!(
+        config.matches(r#""drive_id":"#).count(),
+        3,
+        "{transport} Diff restore should commit the complete drive vector"
+    );
+    assert_http_status(
+        &http_request(
+            &destination.socket,
+            "PATCH",
+            "/vm",
+            r#"{"state":"Resumed"}"#,
+        ),
+        204,
+        "resume granted exact-2.13 Diff",
+    );
+    assert!(
+        destination
+            .wait(&format!(
+                "explicitly resumed {transport} granted exact-2.13 Diff root read"
+            ))
+            .success(),
+        "explicitly resumed {transport} Diff should power off after the root read"
+    );
+    assert_session_entries_eventually_restored(
+        &baseline_sessions,
+        &format!("ordinary production {transport} Diff destination"),
+    );
+    assert_eq!(
+        fs::read(&opened.state).expect("retained Diff state should read"),
+        state_before,
+        "{transport} Diff load must not mutate state"
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("retained Diff layer should read"),
+        memory_before,
+        "{transport} Diff load must not mutate the layer"
+    );
+    destination_fixture
+        .assert_replacement_pathnames_unused("ordinary production exact-2.13 Diff destination");
 }
 
 #[test]
@@ -14463,6 +14653,34 @@ impl SnapshotInputGrantFixture {
         self.opened.clone()
     }
 
+    fn assert_replacement_pathnames_unused(&self, context: &str) {
+        assert_eq!(
+            fs::read(&self.sources.state).expect("replacement snapshot state should read"),
+            b"replacement state must not load",
+            "{context} must not reopen the state pathname"
+        );
+        assert_eq!(
+            fs::read(&self.sources.memory).expect("replacement snapshot memory should read"),
+            b"replacement memory must not load",
+            "{context} must not reopen the memory pathname"
+        );
+        assert_eq!(
+            fs::read(&self.sources.root).expect("replacement snapshot root should read"),
+            vec![0xff_u8; 4096],
+            "{context} must not reopen the root pathname"
+        );
+        assert_eq!(
+            fs::read(&self.sources.data).expect("replacement snapshot data should read"),
+            vec![0xee_u8; 4096],
+            "{context} must not reopen the data pathname"
+        );
+        assert_eq!(
+            fs::read(&self.sources.audit).expect("replacement snapshot audit should read"),
+            vec![0xdd_u8; 4096],
+            "{context} must not reopen the audit pathname"
+        );
+    }
+
     fn sensitive_strings(&self) -> Vec<String> {
         [
             path_text(&self.manifest),
@@ -17609,13 +17827,30 @@ fn spawn_ready_snapshot_epoch_grant_api_launcher(
 }
 
 fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_path: &Path) {
+    configure_and_pause_snapshot_source_with_tracking(running, metrics_path, false);
+}
+
+fn configure_and_pause_snapshot_source_with_tracking(
+    running: &RunningApiLauncher,
+    metrics_path: &Path,
+    track_dirty_pages: bool,
+) {
+    let machine_config = if track_dirty_pages {
+        serde_json::json!({
+            "vcpu_count": 1,
+            "mem_size_mib": 256,
+            "track_dirty_pages": true,
+        })
+    } else {
+        serde_json::json!({
+            "vcpu_count": 1,
+            "mem_size_mib": 256,
+        })
+    };
     for (path, body, context) in [
         (
             "/machine-config",
-            serde_json::json!({
-                "vcpu_count": 1,
-                "mem_size_mib": 256,
-            }),
+            machine_config,
             "PUT snapshot machine config",
         ),
         (
@@ -18883,6 +19118,14 @@ fn snapshot_create_body() -> String {
     snapshot_create_body_for(SNAPSHOT_STATE_OUTPUT_REF, SNAPSHOT_MEMORY_OUTPUT_REF)
 }
 
+fn snapshot_diff_create_body() -> String {
+    snapshot_create_body_for_type(
+        "Diff",
+        SNAPSHOT_STATE_OUTPUT_REF,
+        SNAPSHOT_MEMORY_OUTPUT_REF,
+    )
+}
+
 fn repeated_snapshot_create_body() -> String {
     snapshot_create_body_for(
         SNAPSHOT_REPEAT_STATE_OUTPUT_REF,
@@ -18891,8 +19134,12 @@ fn repeated_snapshot_create_body() -> String {
 }
 
 fn snapshot_create_body_for(state: &str, memory: &str) -> String {
+    snapshot_create_body_for_type("Full", state, memory)
+}
+
+fn snapshot_create_body_for_type(snapshot_type: &str, state: &str, memory: &str) -> String {
     serde_json::to_string(&serde_json::json!({
-        "snapshot_type": "Full",
+        "snapshot_type": snapshot_type,
         "snapshot_path": state,
         "mem_file_path": memory,
     }))
