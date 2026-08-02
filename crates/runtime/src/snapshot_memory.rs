@@ -891,6 +891,7 @@ pub fn load_snapshot_memory_image_with_backing<R: Read + Seek>(
 /// integrity trailer without allocating guest memory or re-reading the data.
 /// Full CRC and GPA-range validation remains the responsibility of
 /// [`load_snapshot_memory_image`].
+#[cfg(target_os = "macos")]
 pub(crate) fn verify_snapshot_memory_image_output<R: Read + Seek>(
     binding: &SnapshotMemoryBinding,
     reader: &mut R,

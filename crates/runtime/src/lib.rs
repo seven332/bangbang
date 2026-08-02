@@ -54,6 +54,7 @@ pub mod snapshot_network_v2_11;
 pub mod snapshot_rebase;
 pub mod snapshot_restore;
 pub mod snapshot_serial_v2_7;
+pub mod snapshot_state_edit;
 pub mod snapshot_vsock_restore_v2_12;
 pub mod snapshot_vsock_v2_12;
 pub mod startup;
