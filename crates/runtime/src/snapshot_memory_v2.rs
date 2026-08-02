@@ -85,6 +85,15 @@ impl SnapshotV2MemoryImageId {
     pub(crate) const fn to_bytes(self) -> [u8; IMAGE_ID_BYTES] {
         self.0
     }
+
+    /// Returns the opaque identity bytes to trusted persistence and inspection code.
+    ///
+    /// Diagnostics must not expose this random state/image pairing identity
+    /// directly. A public inspection surface should use only a cryptographic
+    /// equality fingerprint.
+    pub const fn as_bytes(&self) -> &[u8; IMAGE_ID_BYTES] {
+        &self.0
+    }
 }
 
 impl fmt::Debug for SnapshotV2MemoryImageId {

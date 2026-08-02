@@ -1,10 +1,19 @@
 use std::io::Cursor;
 
+use bangbang_runtime::interrupt::GuestInterruptLine;
 use bangbang_runtime::machine::MachineConfigInput;
 use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange, aarch64,
 };
+use bangbang_runtime::memory_hotplug::{
+    MEMORY_HOTPLUG_DEFAULT_BLOCK_SIZE_MIB, MEMORY_HOTPLUG_DEFAULT_SLOT_SIZE_MIB,
+    MemoryHotplugConfig, MemoryHotplugConfigInput, VIRTIO_MEM_DEFAULT_REGION_ADDRESS,
+    VirtioMemConfigSpace,
+};
+use bangbang_runtime::mmio::{MmioRegion, MmioRegionId};
+use bangbang_runtime::network::{GuestMacAddress, NetworkDeviceProfile};
 use bangbang_runtime::pci::{PCI_BAR64_START, PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE};
+use bangbang_runtime::pmem::{VIRTIO_PMEM_ALIGNMENT, VirtioPmemConfigSpace};
 use bangbang_runtime::snapshot_artifact::{
     NativeV2DiffSnapshotCandidateState, NativeV2DiffSnapshotCandidateStateError,
     NativeV2MemoryHotplugSnapshotCandidateState, NativeV2NetworkSnapshotCandidateState,
@@ -12,13 +21,18 @@ use bangbang_runtime::snapshot_artifact::{
 };
 use bangbang_runtime::snapshot_balloon_v2_9::{
     NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, NATIVE_V2_BALLOON_STATE_HEADER_BYTES,
-    NATIVE_V2_BALLOON_STATE_SECTION_ENTRY_BYTES,
+    NATIVE_V2_BALLOON_STATE_MAX_ACCOUNTING_RANGES, NATIVE_V2_BALLOON_STATE_SECTION_ENTRY_BYTES,
+    SnapshotV2BalloonAccountingState, SnapshotV2BalloonPfnRange, SnapshotV2BalloonState,
 };
-use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
+use bangbang_runtime::snapshot_device_v2::{
+    SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind, SnapshotV2MmioDeviceState,
+};
 use bangbang_runtime::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_MAX_BYTES;
 use bangbang_runtime::snapshot_device_v2_6::{
     NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-    NATIVE_V2_STORAGE_DEVICE_GRAPH_SECTION_ENTRY_BYTES, SnapshotV2StorageDeviceGraph,
+    NATIVE_V2_STORAGE_DEVICE_GRAPH_MAX_RECORDS, NATIVE_V2_STORAGE_DEVICE_GRAPH_SECTION_ENTRY_BYTES,
+    SnapshotV2PmemConfig, SnapshotV2PmemDeviceRecord, SnapshotV2PmemState,
+    SnapshotV2StorageDeviceGraph,
 };
 use bangbang_runtime::snapshot_diff_v2_13::{
     NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION, SnapshotV2DiffBase, SnapshotV2DiffLayerBinding,
@@ -35,6 +49,7 @@ use bangbang_runtime::snapshot_format_v2::{
     encode_snapshot_v2_state_with_compatibility_version,
 };
 use bangbang_runtime::snapshot_memory_hotplug_v2_10::{
+    NATIVE_V2_MEMORY_HOTPLUG_MAX_BITMAP_BYTES, NATIVE_V2_MEMORY_HOTPLUG_MAX_BLOCKS,
     NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
     NATIVE_V2_MEMORY_HOTPLUG_STATE_HEADER_BYTES,
     NATIVE_V2_MEMORY_HOTPLUG_STATE_SECTION_ENTRY_BYTES, SnapshotV2MemoryHotplugState,
@@ -45,8 +60,9 @@ use bangbang_runtime::snapshot_memory_v2::{
 use bangbang_runtime::snapshot_network_v2_11::{
     NATIVE_V2_NETWORK_INTERFACE_DIRECTORY_ENTRY_BYTES,
     NATIVE_V2_NETWORK_INTERFACE_RECORD_HEADER_BYTES,
-    NATIVE_V2_NETWORK_INTERFACE_SECTION_ENTRY_BYTES, NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
-    NATIVE_V2_NETWORK_STATE_HEADER_BYTES, SnapshotV2NetworkState,
+    NATIVE_V2_NETWORK_INTERFACE_SECTION_ENTRY_BYTES, NATIVE_V2_NETWORK_MAX_INTERFACES,
+    NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, NATIVE_V2_NETWORK_STATE_HEADER_BYTES,
+    SnapshotV2NetworkInterfaceState, SnapshotV2NetworkState,
 };
 use bangbang_runtime::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
@@ -56,6 +72,7 @@ use bangbang_runtime::snapshot_vsock_v2_12::{
     NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION, NATIVE_V2_VSOCK_STATE_HEADER_BYTES,
     NATIVE_V2_VSOCK_STATE_SECTION_ENTRY_BYTES, SnapshotV2VsockState,
 };
+use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
 use bangbang_runtime::virtio_pci::VIRTIO_PCI_CAPABILITY_BAR_SIZE;
 
 use super::*;
@@ -118,7 +135,48 @@ pub(crate) fn platform_fixture(with_sme: bool) -> HvfSnapshotV2PlatformState {
     platform_fixture_with_count(2, with_sme)
 }
 
-fn platform_fixture_with_count(vcpu_count: u8, with_sme: bool) -> HvfSnapshotV2PlatformState {
+pub(crate) fn platform_fixture_with_cpu_template() -> HvfSnapshotV2PlatformState {
+    let entries = [
+        (1, HvfArm64CpuTemplateValueWidth::U32, 0xff, 0x12, 0x1234),
+        (
+            3,
+            HvfArm64CpuTemplateValueWidth::U64,
+            0xff00,
+            0x3400,
+            0xabcd,
+        ),
+        (
+            52,
+            HvfArm64CpuTemplateValueWidth::U128,
+            0xffff,
+            0x5678,
+            (1_u128 << 100) | 0xabcd,
+        ),
+    ]
+    .into_iter()
+    .map(|(tag, width, filter, logical_value, baseline)| {
+        HvfArm64CpuTemplateApplicationEntry::try_from_stable_values(
+            tag,
+            width,
+            filter,
+            logical_value,
+            baseline,
+            (baseline & !filter) | logical_value,
+        )
+        .expect("inspection CPU-template entry should validate")
+    })
+    .collect();
+    let application = HvfArm64CpuTemplateApplicationState::try_new(entries)
+        .expect("inspection CPU-template application should validate");
+    let mut platform = platform_fixture(false);
+    platform.machine.cpu_template = Some(application);
+    platform
+}
+
+pub(crate) fn platform_fixture_with_count(
+    vcpu_count: u8,
+    with_sme: bool,
+) -> HvfSnapshotV2PlatformState {
     let (_, compatibility, mandatory, interrupts, devices) = native_v1_fixture().into_parts();
     let source_identification = compatibility.identification();
     let pfr0 = if with_sme {
@@ -935,6 +993,217 @@ pub(crate) fn product_memory_hotplug_fixture(
         &bytes,
     )
     .expect("relocated virtio-mem fixture should decode")
+}
+
+pub(crate) fn maximum_storage_graph_fixture() -> SnapshotV2StorageDeviceGraph {
+    let record_count = usize::from(NATIVE_V2_STORAGE_DEVICE_GRAPH_MAX_RECORDS);
+    let mut records = Vec::with_capacity(record_count);
+    for index in 0..record_count {
+        let mut bytes = fixture_bytes(STORAGE_MMIO_GRAPH_FIXTURE_HEX);
+        relocate_storage_product_fixture(&mut bytes, false);
+        let section_directory = usize::try_from(read_wire_u64(&bytes, 48))
+            .expect("storage section directory should fit usize");
+        let common_entry =
+            section_directory + 2 * NATIVE_V2_STORAGE_DEVICE_GRAPH_SECTION_ENTRY_BYTES;
+        let common_offset = storage_section_offset(&bytes, common_entry);
+        relocate_common_queues(
+            &mut bytes,
+            common_offset,
+            PRODUCT_STORAGE_QUEUE_BASE
+                + u64::try_from(index).expect("storage index should fit") * PRODUCT_QUEUE_STRIDE,
+        );
+        let template = SnapshotV2StorageDeviceGraph::decode(
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &bytes,
+        )
+        .expect("relocated pmem template should decode");
+        let template = template
+            .pmem_records()
+            .first()
+            .expect("pmem template should contain one record");
+
+        let instance = u32::try_from(index).expect("storage record index should fit u32");
+        let config = SnapshotV2PmemConfig::try_new(
+            format!("pmem_{instance}"),
+            index == 0,
+            instance.is_multiple_of(2),
+            template.config().rate_limiter(),
+            format!("pmem-selector-{instance}"),
+        )
+        .expect("maximum pmem configuration should validate");
+        let file_bytes = VIRTIO_PMEM_ALIGNMENT + 513 + u64::from(instance);
+        let mapped_bytes = VIRTIO_PMEM_ALIGNMENT * 2;
+        let guest_start = 0x4_0000_0000 + u64::from(instance) * 0x400_000;
+        let guest_range = GuestMemoryRange::new(GuestAddress::new(guest_start), mapped_bytes)
+            .expect("maximum pmem guest range should validate");
+        let pmem = SnapshotV2PmemState::try_new(
+            file_bytes,
+            mapped_bytes,
+            guest_range,
+            VirtioPmemConfigSpace::new(guest_start, mapped_bytes),
+            template.pmem().active_queue(),
+            template.pmem().limiter(),
+            template.pmem().pending_rate_limited_queue(),
+            template.pmem().retry(),
+        )
+        .expect("maximum pmem state should validate");
+        let region = MmioRegion::new(
+            MmioRegionId::new(100 + u64::from(instance)),
+            GuestAddress::new(0xd000_0000 + u64::from(instance) * VIRTIO_MMIO_DEVICE_WINDOW_SIZE),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("maximum pmem MMIO region should validate");
+        let transport = SnapshotV2DeviceTransport::Mmio(SnapshotV2MmioDeviceState::from_parts(
+            instance % 2,
+            (instance + 1) % 2,
+            0,
+            region,
+            GuestInterruptLine::new(40 + instance)
+                .expect("maximum pmem interrupt line should validate"),
+        ));
+        records.push(
+            SnapshotV2PmemDeviceRecord::try_new(
+                instance,
+                config,
+                pmem,
+                template.virtio().clone(),
+                transport,
+            )
+            .expect("maximum pmem record should validate"),
+        );
+    }
+
+    let root_key = records
+        .first()
+        .map(SnapshotV2PmemDeviceRecord::key)
+        .expect("maximum storage graph should contain a root");
+    SnapshotV2StorageDeviceGraph::try_from_parts(
+        Some(root_key),
+        SnapshotV2DeviceTransportKind::Mmio,
+        Vec::new(),
+        records,
+    )
+    .expect("maximum storage graph should validate")
+}
+
+pub(crate) fn maximum_network_state_fixture() -> SnapshotV2NetworkState {
+    let mut interfaces = Vec::with_capacity(NATIVE_V2_NETWORK_MAX_INTERFACES);
+    for index in 0..NATIVE_V2_NETWORK_MAX_INTERFACES {
+        let mut bytes = fixture_bytes(NETWORK_INACTIVE_MMIO_FIXTURE_HEX);
+        let common_offset = network_record_section_offset(&bytes, 0, 2);
+        relocate_common_queues(
+            &mut bytes,
+            common_offset,
+            0x8014_0000
+                + u64::try_from(index).expect("network index should fit") * PRODUCT_QUEUE_STRIDE,
+        );
+        let transport_offset = network_record_section_offset(&bytes, 0, 4);
+        bytes[transport_offset + 12..transport_offset + 16].copy_from_slice(
+            &(43 + u32::try_from(index).expect("network interrupt index should fit")).to_le_bytes(),
+        );
+        write_wire_u64(
+            &mut bytes,
+            transport_offset + 16,
+            103 + u64::try_from(index).expect("network region index should fit"),
+        );
+        write_wire_u64(
+            &mut bytes,
+            transport_offset + 24,
+            0xd003_0000 + u64::try_from(index).expect("network MMIO index should fit") * 0x1000,
+        );
+        let (mut decoded, _) =
+            SnapshotV2NetworkState::decode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION, &bytes)
+                .expect("relocated network template should decode")
+                .into_parts();
+        let mut parts = decoded
+            .pop()
+            .expect("network template should contain one interface")
+            .into_parts();
+        let mac = GuestMacAddress::from_bytes([
+            0x02,
+            0,
+            0,
+            0,
+            0,
+            u8::try_from(index).expect("network index should fit u8"),
+        ]);
+        let template_profile = parts.profile;
+        parts.iface_id = format!("eth{index}");
+        parts.captured_selector = format!("vmnet:maximum-{index}");
+        parts.requested_guest_mac = Some(mac);
+        parts.profile = NetworkDeviceProfile::new(Some(mac), parts.requested_mtu)
+            .with_packet_envelope(template_profile.packet_envelope())
+            .with_feature_capabilities(template_profile.feature_capabilities());
+        interfaces.push(
+            SnapshotV2NetworkInterfaceState::try_from_parts(parts)
+                .expect("maximum network interface should validate"),
+        );
+    }
+    SnapshotV2NetworkState::try_new(interfaces, None)
+        .expect("maximum network state should validate")
+}
+
+pub(crate) fn maximum_balloon_state_fixture() -> SnapshotV2BalloonState {
+    let template = product_balloon_fixture(SnapshotV2DeviceTransportKind::Pci);
+    let ranges = (0..NATIVE_V2_BALLOON_STATE_MAX_ACCOUNTING_RANGES)
+        .map(|index| {
+            SnapshotV2BalloonPfnRange::try_new(
+                u32::try_from(index * 2).expect("balloon PFN should fit u32"),
+                1,
+            )
+            .expect("maximum balloon accounting range should validate")
+        })
+        .collect::<Vec<_>>();
+    let accounting = SnapshotV2BalloonAccountingState::try_new(
+        ranges,
+        u64::try_from(NATIVE_V2_BALLOON_STATE_MAX_ACCOUNTING_RANGES)
+            .expect("balloon range count should fit u64"),
+    )
+    .expect("maximum balloon accounting should validate");
+    SnapshotV2BalloonState::try_new(
+        template.config(),
+        template.config_space(),
+        *template.continuation(),
+        accounting,
+        template.virtio().clone(),
+        template.transport().clone(),
+    )
+    .expect("maximum balloon state should validate")
+}
+
+pub(crate) fn maximum_memory_hotplug_state_fixture() -> SnapshotV2MemoryHotplugState {
+    let template = product_memory_hotplug_fixture(SnapshotV2DeviceTransportKind::Mmio);
+    let block_size = MEMORY_HOTPLUG_DEFAULT_BLOCK_SIZE_MIB * MIB;
+    let address = VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value();
+    let address_space_end = aarch64::DRAM_MEM_START + aarch64::DRAM_MEM_MAX_SIZE;
+    let region_size = address_space_end - address;
+    let block_count = usize::try_from(region_size / block_size)
+        .expect("maximum virtio-mem block count should fit usize");
+    assert!(block_count <= NATIVE_V2_MEMORY_HOTPLUG_MAX_BLOCKS);
+    let bitmap_length = block_count.div_ceil(8);
+    assert!(bitmap_length <= NATIVE_V2_MEMORY_HOTPLUG_MAX_BITMAP_BYTES);
+    let bitmap = vec![0x55; bitmap_length];
+    let plugged_blocks = u64::try_from(block_count / 2)
+        .expect("maximum virtio-mem plugged block count should fit u64");
+    let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(
+        region_size / MIB,
+        MEMORY_HOTPLUG_DEFAULT_BLOCK_SIZE_MIB,
+        MEMORY_HOTPLUG_DEFAULT_SLOT_SIZE_MIB,
+    ))
+    .expect("maximum virtio-mem configuration should validate");
+    let config_space = VirtioMemConfigSpace::new(block_size, address, region_size)
+        .with_usable_region_size(region_size)
+        .with_plugged_size(plugged_blocks * block_size)
+        .with_requested_size(plugged_blocks * block_size);
+    SnapshotV2MemoryHotplugState::try_new(
+        config,
+        config_space,
+        None,
+        bitmap,
+        template.virtio().clone(),
+        template.transport().clone(),
+    )
+    .expect("maximum virtio-mem state should validate")
 }
 
 pub(crate) fn product_serial_fixture() -> SnapshotV2SerialState {
