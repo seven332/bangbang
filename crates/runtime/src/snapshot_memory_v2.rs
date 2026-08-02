@@ -1039,6 +1039,11 @@ impl FileFacts {
     pub(crate) const fn same_object(self, other: Self) -> bool {
         self.device == other.device && self.inode == other.inode
     }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) const fn same_identity(self, device: u64, inode: u64) -> bool {
+        self.device == device && self.inode == inode
+    }
 }
 
 pub(crate) fn inspect_file(file: &File) -> Result<FileFacts, SnapshotV2MemoryLoadError> {
