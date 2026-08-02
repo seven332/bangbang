@@ -833,6 +833,31 @@ impl HvfSnapshotV2PlatformState {
             self.time,
         )
     }
+
+    pub(crate) fn try_replace_vcpus(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        self.try_replace_vcpus_with_memory_hotplug(vcpus, None)
+    }
+
+    fn try_replace_vcpus_with_memory_hotplug(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+        memory_hotplug: Option<&SnapshotV2MemoryHotplugState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (memory, machine, global, topology, _, time) = self.into_parts();
+        let state = Self {
+            memory,
+            machine,
+            global,
+            topology,
+            vcpus,
+            time,
+        };
+        validate_platform_with_memory_hotplug(&state, memory_hotplug)?;
+        Ok(state)
+    }
 }
 
 impl fmt::Debug for HvfSnapshotV2PlatformState {
@@ -888,6 +913,14 @@ impl HvfSnapshotV2State {
     pub fn into_parts(self) -> (HvfSnapshotV2PlatformState, SnapshotV2DeviceGraph) {
         (self.platform, self.device_graph)
     }
+
+    pub(crate) fn try_replace_vcpus(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (platform, device_graph) = self.into_parts();
+        Self::try_new(platform.try_replace_vcpus(vcpus)?, device_graph)
+    }
 }
 
 impl fmt::Debug for HvfSnapshotV2State {
@@ -938,6 +971,14 @@ impl HvfSnapshotV2MultiBlockState {
     /// Consumes the complete state without discarding either owned graph.
     pub fn into_parts(self) -> (HvfSnapshotV2PlatformState, SnapshotV2MultiBlockDeviceGraph) {
         (self.platform, self.device_graph)
+    }
+
+    pub(crate) fn try_replace_vcpus(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (platform, device_graph) = self.into_parts();
+        Self::try_new(platform.try_replace_vcpus(vcpus)?, device_graph)
     }
 }
 
@@ -994,6 +1035,14 @@ impl HvfSnapshotV2StorageState {
     /// Consumes the complete state without discarding either owned graph.
     pub fn into_parts(self) -> (HvfSnapshotV2PlatformState, SnapshotV2StorageDeviceGraph) {
         (self.platform, self.device_graph)
+    }
+
+    pub(crate) fn try_replace_vcpus(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (platform, device_graph) = self.into_parts();
+        Self::try_new(platform.try_replace_vcpus(vcpus)?, device_graph)
     }
 }
 
@@ -1072,6 +1121,14 @@ impl HvfSnapshotV2SerialState {
         SnapshotV2SerialState,
     ) {
         (self.platform, self.device_graph, self.serial)
+    }
+
+    pub(crate) fn try_replace_vcpus(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (platform, device_graph, serial) = self.into_parts();
+        Self::try_new(platform.try_replace_vcpus(vcpus)?, device_graph, serial)
     }
 }
 
@@ -1160,6 +1217,19 @@ impl HvfSnapshotV2EntropyState {
         Option<SnapshotV2EntropyState>,
     ) {
         (self.platform, self.device_graph, self.serial, self.entropy)
+    }
+
+    pub(crate) fn try_replace_vcpus(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (platform, device_graph, serial, entropy) = self.into_parts();
+        Self::try_new(
+            platform.try_replace_vcpus(vcpus)?,
+            device_graph,
+            serial,
+            entropy,
+        )
     }
 }
 
@@ -1324,6 +1394,20 @@ impl HvfSnapshotV2BalloonState {
             self.serial,
             self.entropy,
             self.balloon,
+        )
+    }
+
+    pub(crate) fn try_replace_vcpus(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (platform, device_graph, serial, entropy, balloon) = self.into_parts();
+        Self::try_new(
+            platform.try_replace_vcpus(vcpus)?,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
         )
     }
 }
@@ -1642,6 +1726,19 @@ impl HvfSnapshotV2MemoryHotplugState {
             self.memory_hotplug,
         )
     }
+
+    pub(crate) fn try_replace_vcpus(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (platform, device_graph, serial, entropy, balloon, memory_hotplug) = self.into_parts();
+        let platform = HvfSnapshotV2MemoryHotplugPlatformState {
+            platform: platform
+                .try_replace_vcpus_with_memory_hotplug(vcpus, memory_hotplug.as_ref())?,
+            memory_hotplug,
+        };
+        Self::try_new(platform, device_graph, serial, entropy, balloon)
+    }
 }
 
 impl fmt::Debug for HvfSnapshotV2MemoryHotplugState {
@@ -1853,6 +1950,20 @@ impl HvfSnapshotV2NetworkState {
             self.memory_hotplug,
             self.network,
         )
+    }
+
+    pub(crate) fn try_replace_vcpus(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (platform, device_graph, serial, entropy, balloon, memory_hotplug, network) =
+            self.into_parts();
+        let platform = HvfSnapshotV2NetworkPlatformState {
+            platform: platform
+                .try_replace_vcpus_with_memory_hotplug(vcpus, memory_hotplug.as_ref())?,
+            memory_hotplug,
+        };
+        Self::try_new(platform, device_graph, serial, entropy, balloon, network)
     }
 }
 
@@ -2085,6 +2196,28 @@ impl HvfSnapshotV2VsockState {
             self.memory_hotplug,
             self.network,
             self.vsock,
+        )
+    }
+
+    pub(crate) fn try_replace_vcpus(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (platform, device_graph, serial, entropy, balloon, memory_hotplug, network, vsock) =
+            self.into_parts();
+        let platform = HvfSnapshotV2VsockPlatformState {
+            platform: platform
+                .try_replace_vcpus_with_memory_hotplug(vcpus, memory_hotplug.as_ref())?,
+            memory_hotplug,
+        };
+        Self::try_new(
+            platform,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            network,
+            vsock,
         )
     }
 }
@@ -2346,6 +2479,38 @@ impl HvfSnapshotV2DiffState {
             self.network,
             self.vsock,
             self.layer,
+        )
+    }
+
+    pub(crate) fn try_replace_vcpus(
+        self,
+        vcpus: Vec<HvfSnapshotV2VcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let (
+            platform,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network,
+            vsock,
+            layer,
+        ) = self.into_parts();
+        let platform = HvfSnapshotV2DiffPlatformState {
+            platform: platform
+                .try_replace_vcpus_with_memory_hotplug(vcpus, memory_hotplug.as_ref())?,
+            memory_hotplug,
+            layer,
+        };
+        Self::try_new(
+            platform,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            network,
+            vsock,
         )
     }
 }
