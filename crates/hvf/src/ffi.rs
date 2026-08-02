@@ -1,27 +1,39 @@
 pub(crate) const UNSUPPORTED_TARGET_MESSAGE: &str =
     "Hypervisor.framework backend currently targets macOS on Apple Silicon";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME configuration queries require macOS 15.2 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const SME_STATE_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME state capture requires macOS 15.2 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const SME_STATE_RESTORE_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME state restore requires macOS 15.2 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const SME_P_REGISTER_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME P-register capture requires macOS 15.2 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const SME_P_REGISTER_RESTORE_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME P-register restore requires macOS 15.2 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const SME_Z_REGISTER_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME Z-register capture requires macOS 15.2 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const SME_Z_REGISTER_RESTORE_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME Z-register restore requires macOS 15.2 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const SME_ZA_REGISTER_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME ZA-register capture requires macOS 15.2 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const SME_ZA_REGISTER_RESTORE_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME ZA-register restore requires macOS 15.2 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const SME_ZT0_REGISTER_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME ZT0-register capture requires macOS 15.2 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const SME_ZT0_REGISTER_RESTORE_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME ZT0-register restore requires macOS 15.2 or newer";
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const VCPU_EXEC_TIME_REQUIRES_MACOS_11_MESSAGE: &str =
     "Hypervisor.framework vCPU execution-time queries require macOS 11 or newer";
 
@@ -42,6 +54,7 @@ pub(crate) struct MachTimebaseInfo {
 }
 
 impl MachTimebaseInfo {
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) const fn new(numer: u32, denom: u32) -> Self {
         Self { numer, denom }
     }
@@ -146,8 +159,10 @@ pub(crate) const HV_SYS_REG_SP_EL1: HvSysReg = 0xe208;
 
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) struct HvSimdFpValue([u8; 16]);
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 impl HvSimdFpValue {
     const fn zeroed() -> Self {
         Self([0; 16])
@@ -159,8 +174,10 @@ impl HvSimdFpValue {
 }
 
 #[repr(C, align(16))]
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) struct HvSmeZt0Value([u8; 64]);
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 impl HvSmeZt0Value {
     const fn zeroed() -> Self {
         Self([0; 64])
@@ -177,11 +194,13 @@ impl HvSmeZt0Value {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) struct HvVcpuSmeState {
     streaming_sve_mode_enabled: bool,
     za_storage_enabled: bool,
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 impl HvVcpuSmeState {
     const fn new(streaming_sve_mode_enabled: bool, za_storage_enabled: bool) -> Self {
         Self {

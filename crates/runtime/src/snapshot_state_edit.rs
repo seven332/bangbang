@@ -409,6 +409,59 @@ impl std::error::Error for SnapshotStateEditError {
     }
 }
 
+/// Failure to capture one immutable native snapshot state input.
+pub struct SnapshotStateReadError {
+    stage: SnapshotStateEditStage,
+    failure: SnapshotStateEditFailure,
+}
+
+impl SnapshotStateReadError {
+    /// Returns the read stage that failed.
+    pub const fn stage(&self) -> SnapshotStateEditStage {
+        self.stage
+    }
+
+    /// Returns the value-redacted primary failure.
+    pub const fn failure(&self) -> &SnapshotStateEditFailure {
+        &self.failure
+    }
+}
+
+impl From<SnapshotStateEditError> for SnapshotStateReadError {
+    fn from(error: SnapshotStateEditError) -> Self {
+        Self {
+            stage: error.stage,
+            failure: error.failure,
+        }
+    }
+}
+
+impl fmt::Debug for SnapshotStateReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotStateReadError")
+            .field("stage", &self.stage)
+            .field("failure", &self.failure)
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotStateReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "snapshot state read failed during {}: {}",
+            self.stage, self.failure
+        )
+    }
+}
+
+impl std::error::Error for SnapshotStateReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.failure)
+    }
+}
+
 /// Typed caller-operation failure before the hard-link commit point.
 pub struct SnapshotStateEditOperationError<E> {
     stage: SnapshotStateEditStage,
@@ -576,6 +629,39 @@ impl<T> fmt::Debug for SnapshotStateEditOutcome<T> {
             .field("product", &REDACTED)
             .field("commit", &self.commit)
             .finish()
+    }
+}
+
+/// Captures one bounded immutable native snapshot state file.
+pub fn read_snapshot_state_file(path: &Path) -> Result<Vec<u8>, SnapshotStateReadError> {
+    read_snapshot_state_file_with_cancel(path, |_| false)
+}
+
+/// Captures one native snapshot state file with stable cancellation.
+///
+/// On Unix, the reader retains the input file and parent directory, rejects a
+/// final symlink or special file, reads the validated exact length and EOF, and
+/// repeats source, directory, entry, and content checks after the last caller
+/// callback. The callback receives only the input-related subset of
+/// [`SnapshotStateEditStage`].
+pub fn read_snapshot_state_file_with_cancel<Cancel>(
+    path: &Path,
+    is_cancelled: Cancel,
+) -> Result<Vec<u8>, SnapshotStateReadError>
+where
+    Cancel: FnMut(SnapshotStateEditStage) -> bool,
+{
+    #[cfg(unix)]
+    {
+        unix::read_snapshot_state_file_unix_with_cancel(path, is_cancelled)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, is_cancelled);
+        Err(SnapshotStateReadError {
+            stage: SnapshotStateEditStage::PlatformCheck,
+            failure: SnapshotStateEditFailure::UnsupportedPlatform,
+        })
     }
 }
 

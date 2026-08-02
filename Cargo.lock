@@ -212,8 +212,10 @@ dependencies = [
 name = "bangbang-snapshot-tools"
 version = "0.1.0"
 dependencies = [
+ "bangbang-hvf",
  "bangbang-runtime",
  "clap",
+ "crc64",
  "libc",
  "signal-hook",
 ]

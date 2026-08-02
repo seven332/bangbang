@@ -1,14 +1,23 @@
 use std::ffi::c_void;
-use std::ptr::{self, NonNull};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::ptr;
+use std::ptr::NonNull;
 
 use bangbang_runtime::memory::GuestMemoryRegion;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MACH_OK: i32 = 0;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MACH_INVALID: i32 = 1;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MACH_NO_MEMORY: i32 = 2;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MACH_OPERATION_FAILED: i32 = 3;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MACH_OWNER_BUSY: i32 = 4;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MACH_RESTORE_FAILED: i32 = 5;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MACH_THREAD_FAILED: i32 = 6;
 
 pub(crate) const MACH_FAULT_FORWARD: u32 = 0;
@@ -24,14 +33,19 @@ pub(crate) type MachFaultCallback =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MachLazyError {
     Invalid,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     Allocation,
     Operation,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     OwnerBusy,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     Restore,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     Thread,
 }
 
 #[repr(C)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct MachRegionInput {
     primary: *mut c_void,
     size: usize,
@@ -173,6 +187,7 @@ pub(crate) fn terminal_exit() -> ! {
     unsafe { libc::_exit(MACH_TERMINAL_EXIT_CODE) }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn status_result(status: i32) -> Result<(), MachLazyError> {
     match status {
         MACH_OK => Ok(()),
@@ -433,9 +448,13 @@ mod imp {
         _mapping: NonNull<c_void>,
         _region_index: usize,
         _offset: usize,
-        _contents: MachLazyContents<'_>,
+        contents: MachLazyContents<'_>,
         _writable: bool,
     ) -> Result<(), MachLazyError> {
+        let _length = match contents {
+            MachLazyContents::Data(data) => data.len(),
+            MachLazyContents::Zero { length } => length,
+        };
         Err(MachLazyError::Operation)
     }
 
