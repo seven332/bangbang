@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 const INVOCATION_ERROR: &str =
     "snapshot-editor: invalid arguments; use --help for the supported interface";
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "snapshot-editor",
     about = "Edit bangbang-native snapshot memory artifacts",
@@ -24,14 +24,14 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Command {
     /// Edit a snapshot memory artifact.
     #[command(subcommand)]
     EditMemory(EditMemoryCommand),
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum EditMemoryCommand {
     /// Apply a differential snapshot on top of a base memory image.
     Rebase {

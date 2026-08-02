@@ -11,7 +11,7 @@ const DEPRECATION_NOTICE: &str = "This tool is deprecated and will be removed in
 const INVOCATION_ERROR: &str =
     "rebase-snap: invalid arguments; use --help for the supported interface";
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "rebase-snap",
     about = "Apply a native-v2 differential memory snapshot to a base image",
