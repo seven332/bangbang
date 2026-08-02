@@ -6,6 +6,7 @@ use crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
 use crate::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, snapshot_v2_memory_binding_from_ranges_for_test,
 };
+use crate::snapshot_vsock_v2_12::NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
 
 use super::*;
 
@@ -24,8 +25,12 @@ fn predecessor_binding_with_id(
     image_id: SnapshotV2MemoryImageId,
     ranges: &[GuestMemoryRange],
 ) -> SnapshotV2MemoryBinding {
-    snapshot_v2_memory_binding_from_ranges_for_test(NATIVE_V2_SNAPSHOT_VERSION, image_id, ranges)
-        .expect("test predecessor binding should validate")
+    snapshot_v2_memory_binding_from_ranges_for_test(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        image_id,
+        ranges,
+    )
+    .expect("test predecessor binding should validate")
 }
 
 fn image_base(ranges: &[GuestMemoryRange]) -> SnapshotV2DiffBase {
@@ -374,7 +379,7 @@ fn root_empty_writer_matches_immutable_fixture_and_verifies() {
         binding.result().version(),
         NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
     );
-    assert_eq!(NATIVE_V2_SNAPSHOT_VERSION.minor(), 12);
+    assert_eq!(NATIVE_V2_SNAPSHOT_VERSION.minor(), 13);
     let bytes = output.into_inner();
     let metadata_length =
         usize::try_from(binding.metadata_length()).expect("metadata length should fit");
@@ -793,6 +798,21 @@ fn detached_verifier_rejects_mismatch_corruption_padding_and_length_changes() {
         Err(SnapshotV2DiffVerifyError::BindingMismatch)
     ));
 
+    let mut cancellation_polls = 0;
+    assert!(matches!(
+        verify_snapshot_v2_diff_layer_output_with_cancel(
+            &binding,
+            &mut Cursor::new(bytes.clone()),
+            || {
+                cancellation_polls += 1;
+                cancellation_polls == 4
+            },
+        ),
+        Err(SnapshotV2DiffVerifyError::Cancelled {
+            stage: SnapshotV2DiffVerifyStage::MetadataPadding,
+        })
+    ));
+
     let mut corrupt = bytes.clone();
     let checksum_byte = corrupt.get_mut(64).expect("checksum byte should exist");
     *checksum_byte ^= 1;
@@ -913,6 +933,7 @@ fn detached_verifier_handles_short_reads_seek_mismatch_and_allocation_failure() 
             &binding,
             &mut Cursor::new(bytes),
             |_, _| Err(allocation_error()),
+            || false,
         ),
         Err(SnapshotV2DiffVerifyError::MetadataAllocationFailed { .. })
     ));

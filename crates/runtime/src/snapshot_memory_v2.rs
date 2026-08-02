@@ -21,10 +21,10 @@ use crate::memory::{
 use crate::snapshot_diff_v2_13::NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_format::SnapshotFormatVersion;
 use crate::snapshot_format_v2::{
-    NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2Component,
-    SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
-    encode_snapshot_v2_state,
+    NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
+    SnapshotV2EncodeError, SnapshotV2State, encode_snapshot_v2_state_with_compatibility_version,
 };
+use crate::snapshot_vsock_v2_12::NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
 
 mod materialize;
 
@@ -346,7 +346,8 @@ pub fn encode_snapshot_v2_state_with_memory(
         SnapshotV2ComponentDisposition::Semantic,
         &payload,
     );
-    encode_snapshot_v2_state(&[], &[component]).map_err(SnapshotV2MemoryStateEncodeError::State)
+    encode_snapshot_v2_state_with_compatibility_version(binding.version(), &[], &[component])
+        .map_err(SnapshotV2MemoryStateEncodeError::State)
 }
 
 /// Extracts and validates the singleton memory binding from a compatible state.
@@ -492,9 +493,9 @@ pub fn write_snapshot_v2_memory_image<W: Write + Seek>(
 
 /// Streams one image for an explicit known native-v2 compatibility version.
 ///
-/// The ordinary writer remains fixed to [`NATIVE_V2_SNAPSHOT_VERSION`]. This
+/// The ordinary Full writer remains fixed to exact native-v2 2.12. This
 /// seam lets retained legacy profiles write a binding and image header at
-/// their exact version without changing current public snapshot publication.
+/// their exact version without changing public Full publication semantics.
 pub fn write_snapshot_v2_memory_image_with_compatibility_version<W: Write + Seek>(
     memory: &GuestMemory,
     writer: &mut W,
@@ -521,7 +522,7 @@ where
     write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
         memory,
         writer,
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         is_cancelled,
     )
 }
@@ -561,7 +562,7 @@ where
     write_snapshot_v2_memory_image_with_version_id_and_cancel(
         memory,
         writer,
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         image_id,
         is_cancelled,
     )

@@ -2,12 +2,13 @@
 
 This document records the implemented boundary and remaining roadmap for
 Firecracker-shaped snapshot APIs on macOS with Hypervisor.framework. bangbang
-supports a public bangbang-native Full/File lifecycle with a rooted or
-rootless ordered regular-file block-and-pmem profile-3 graph. The current
-writer is exact native-v2 2.12: it retains required complete serial state and
-independently permits optional storage, entropy, balloon, virtio-mem,
-network/MMDS, and vsock components, so all 64 optional-component products share
-one Full/File lifecycle over coherent MMIO or PCI. Exact network/MMDS
+supports public bangbang-native Full/File and Diff/File lifecycles with a
+rooted or rootless ordered regular-file block-and-pmem profile-3 graph. `Full`
+writes exact native-v2 2.12 state plus a complete memory image; `Diff` writes
+exact native-v2 2.13 state plus a detached differential layer. Both retain
+required complete serial state and independently permit optional storage,
+entropy, balloon, virtio-mem, network/MMDS, and vsock components, so all 64
+optional-component products share one coherent MMIO-or-PCI lifecycle. Exact network/MMDS
 native-v2 2.11, virtio-mem native-v2 2.10,
 balloon-profile native-v2 2.9, entropy-profile native-v2
 2.8, serial-required native-v2 2.7, storage-only native-v2 2.6, block-only
@@ -29,8 +30,10 @@ compatibility profile `2.8.0` retains that product and adds optional entropy
 component kind 9 over the selected MMIO or PCI transport. Exact `2.9.0`
 retains all earlier components and adds optional balloon component kind 10.
 Exact `2.10.0` adds optional virtio-mem component kind 11. Exact `2.11.0`
-adds optional network/MMDS component kind 12. Current `2.12.0` adds optional
-vsock component kind 13.
+adds optional network/MMDS component kind 12. Exact `2.12.0` adds optional
+vsock component kind 13. Current `2.13.0` requires final semantic kind 14,
+which commits the exact Diff base, selected GPA ranges, and complete result
+binding without changing the nested 2.12 device product.
 The storage graph may be rootless or
 select the first cross-storage record as root.
 Block records retain read-only/read-write, Sync/Async, Unsafe/Writeback,
@@ -92,9 +95,12 @@ path adds Linux UFFD wire compatibility.
 
 bangbang implements two classified native state families, exact-version
 inspection, bound guest-memory image I/O, and one macOS no-clobber two-file
-publisher/loader. The current public writer captures an accepted paused
-native-v2 2.12 source into a state/memory pair. A fresh process consumes that
-pair through retained read-only private File/COW mappings, one exact
+publisher/loader. The public writer captures an accepted paused source either
+as exact-2.12 Full state plus a complete `BANGM2A` image or as exact-2.13 Diff
+state plus a `BANGD2A` layer. A fresh process consumes a Full pair, a proven
+zero-root Diff layer privately promoted into an unlinked complete image, or a
+matching already-rebased complete Diff result through retained read-only
+private File/COW mappings and one exact
 storage-plus-serial authority transaction, optional fresh entropy owners, and
 optional fresh balloon owners plus one optional fresh unlinked shared
 virtio-mem aperture with block-granular plugged views. Network-bearing loads
@@ -138,7 +144,7 @@ explicit-Paused/recapture and automatic fresh-process clones. The contained
 matrix also covers exact grants with pathname replacement, checksum-corrupted
 state, truncated memory, graceful cancellation, both independent death orders,
 immutable inputs, and session cleanup.
-Current 2.11 adds optional network/MMDS kind 12. Signed direct and
+Exact 2.11 adds optional network/MMDS kind 12. Signed direct and
 normal-production/App Sandbox MMIO/PCI destinations cover V1 and V2 MMDS
 sources, exact explicit-Paused recapture and automatic loads, complete
 clone-local overrides, empty destination MMDS data followed by reseeding,
@@ -146,7 +152,7 @@ source TCP-session loss, old V2-token rejection, fresh V1/V2 success,
 immutable artifacts, malformed state/memory, redaction, cancellation, both
 death orders, retry, containment, and cleanup. MMDS-only contained loads
 consume no vmnet authority.
-Current 2.12 adds optional vsock kind 13. Signed direct MMIO/PCI certification
+Exact 2.12 adds optional vsock kind 13. Signed direct MMIO/PCI certification
 creates one immutable pair while both connection directions are live, proves
 their reset/loss, restores independent original-selector and override clones,
 and exercises preserved guest listeners plus fresh guest-to-host and
@@ -158,11 +164,18 @@ MMIO/PCI coverage repeats the restored-guest protocol through exact launcher
 grants and additionally covers malformed state/memory, a no-device override,
 missing authority, pathname replacement, cancellation, independent
 worker/launcher death, retry, redaction, and cleanup.
+Current 2.13 adds mandatory Diff kind 14. A tracked source selects its unified
+guest-dirty pages; an untracked source selects every current guest-memory
+range. Successful publication advances the exact memory lineage and resets a
+tracked dirty epoch only after the layer-first/state-last pair is visible.
+Cancellation or any pre-visible failure restores the prior lineage. A restored
+destination starts from the proven result binding, so later Diff recapture
+names that image as its predecessor.
 
 - `PUT /snapshot/create` and `PUT /snapshot/load` parse and normalize complete
   request bodies into debug-redacted API and runtime values before reaching VMM
 action policy. Paths and override contents are never logged or echoed.
-- Create is paused-state-only and supports only `Full` for a 1–32-vCPU source
+- Create is paused-state-only and supports `Full` and `Diff` for a 1–32-vCPU source
   with a configured boot source, complete live serial state, optional entropy,
   balloon, virtio-mem, network/MMDS, and one vsock, and zero or 1–64 ordered
   regular-file block/pmem devices. Boot timer and vhost-user are not admitted.
@@ -199,15 +212,17 @@ action policy. Paths and override contents are never logged or echoed.
   together, drained together, and have every completion plus its MMIO SPI or PCI
   MSI-X interrupt published before state capture and same-generation reopen.
   An admitted regular-file vector feeds the profile-3 graph shared by exact
-  2.6, 2.7, 2.8, 2.9, 2.10, 2.11, and current 2.12.
+  2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, and current 2.13.
   Vhost-user and any broader optional-device inventory remain followed by profile
   rejection, so they publish no artifact bytes and create no load contract.
 - An admitted create holds one scoped supervisor transaction from FIFO
   admission through publication. It failure-atomically quiesces block, PMEM,
   network, entropy retry, balloon-statistics, and virtio-mem publishers,
   preflights both final namespaces,
-  captures aggregate state including normalized vsock reset/cursor state,
-  streams complete mixed base/aperture memory,
+  captures aggregate state including normalized vsock reset/cursor state.
+  Full streams complete mixed base/aperture memory; Diff selects unified dirty
+  pages when tracking is active and every current page otherwise, then streams
+  a layer against the exact live lineage base,
   verifies and synchronizes
   the artifacts, commits memory first and state last, and invokes the explicit
   successful-publication hook before releasing auxiliary ownership and command
@@ -217,8 +232,12 @@ action policy. Paths and override contents are never logged or echoed.
   Successful-action history catches explicit-default/no-op configuration, and
   a live view catches residual state such as MMDS left by a failed patch.
   State is opened and decoded once before family routing. Native-v2 accepts
-  only `File`, retains the read-only memory descriptor, and maps guest memory
-  privately so destination writes cannot modify the pair. Frozen native-v1
+  only `File`. Full retains the read-only complete-memory descriptor. Diff
+  either retains a matching rebased complete result or verifies a zero-root
+  layer and promotes it through owner-only, pre-unlinked private staging. An
+  image-based layer presented without its exact base is rejected before guest
+  memory, resource owners, HVF, or VM construction. Destination mappings remain
+  private so guest writes cannot modify the pair. Frozen native-v1
   keeps its eager `File`, deprecated sole `mem_file_path`, and macOS
   Apple-Silicon `Uffd` behavior; v1 `Uffd` requires dirty tracking disabled and
   selects a `bangbang-pager-v1` Unix peer rather than a memory file or Linux
@@ -238,7 +257,7 @@ action policy. Paths and override contents are never logged or echoed.
   corrected request. Failures after an uncertain construction/cleanup boundary
   latch the process terminal. Create/load execution faults are typed and
   snapshot-specific while diagnostics remain path- and value-redacted.
-- `Diff`, native-v2 `Uffd`, dirty-tracked or bypassing-consumer native-v1
+- Native-v2 `Uffd`, dirty-tracked or bypassing-consumer native-v1
   `Uffd` profiles, realtime
   adjustment, per-drive overrides, unsupported device profiles, and
   incompatible artifacts retain snapshot-specific rejection boundaries.
@@ -248,8 +267,10 @@ action policy. Paths and override contents are never logged or echoed.
   records the public macOS equivalent, its direct and contained restore
   assembly, and #1555's completed signed demand/removal/entitlement
   certification.
-  Full/File load can enable a clean destination dirty epoch, independently of
-  the source, and a tracked source resets only after visible Full publication.
+  Full/File or Diff/File load can enable a clean destination dirty epoch,
+  independently of the source. A tracked source resets only after visible Full
+  or Diff publication, and uncertain post-commit reset failures require source
+  teardown rather than risking stale dirty lineage.
   Parser and invalid-lifecycle failures still do not record snapshot latency;
   admitted success, capability rejection, and execution failure do.
 - The checked
@@ -259,7 +280,7 @@ action policy. Paths and override contents are never logged or echoed.
   authority, empty restored work, reset acknowledgement/RX gating, live TX,
   reconnect through preserved listeners, override/no-device behavior,
   independent immutable clones, cursor continuation, and bounded portability.
-- `--snapshot-version` prints the current writer version `v2.12.0`.
+- `--snapshot-version` prints the current supported ceiling `v2.13.0`.
   `--describe-snapshot <PATH>` opens a bounded regular file with the same
   nonblocking, path-redacted startup-file policy, classifies and fully
   validates either native-v1 or native-v2, and prints its exact embedded
@@ -288,7 +309,7 @@ action policy. Paths and override contents are never logged or echoed.
   unique override set naming every saved interface; MMDS-only selectors require
   no contained grant or vmnet authority. Missing, duplicate, and unknown
   interface IDs reject with selector values redacted before construction.
-  Current 2.12 vsock loads then resolve the captured selector or one
+  Exact 2.12 Full and exact 2.13 Diff vsock loads then resolve the captured selector or one
   `vsock_override` through the same exact no-fallback transaction. A no-device
   override, wrong resource class, substitution, missing/extra grant, or changed
   identity rejects before publication with selector and authority values
@@ -309,8 +330,9 @@ action policy. Paths and override contents are never logged or echoed.
   anonymous eager profile; native-v2 retains private File/COW mappings. A
   separate path layer can publish that image with either validated commit kind
   and load the committed pair. The public process transaction supplies the
-  publisher-owned staging writer to complete capture and requires a composite
-  commit; the public load transaction consumes only that committed kind-2 pair.
+  publisher-owned staging writer to complete capture and requires a closed
+  Full image or Diff layer commitment; the public load transaction consumes
+  only a matching state/result pair.
 - Signed Apple Silicon executable coverage retains the exact 2.5 block and
   exact 2.6 storage regressions, adds rooted pmem-only/rootless mixed ×
   MMIO/PCI profile-3 certification, and certifies exact 2.7 serial-only plus
@@ -1115,12 +1137,15 @@ already-authorized `GuestMemory`. Exact ranges, retained live-FDT
 address/length/checksum, destination cache facts, time metadata, guest ABI
 bytes, PVTime records, identity destinations, and notification lines are
 checked before VM creation. Legacy 2.3 additionally parses those bytes as its
-exact default process shell. Exact 2.4 through current 2.12 instead require the
+exact default process shell. Exact 2.4 through 2.12 and the current 2.13 result
+product instead require the
 source-product profile word and derive the versioned product shell from the
 typed machine, transport, interrupt, optional storage graph, required serial
 component from 2.7 onward, optional entropy component from 2.8 onward, and
 optional 2.9 balloon, 2.10 virtio-mem, 2.11 network/MMDS, and 2.12 vsock
-components after checking every cross-binding. The
+components after checking every cross-binding. Exact 2.13 additionally closes
+the kind-14 Diff lineage, selection, and result binding before reconstructing
+that unchanged result product. The
 focused guard then creates VM, memory/dirty tracking, exact GIC, the
 complete never-run topology, retained CPU-template targets, common identity,
 global GIC, and canonical per-vCPU state. It next creates a fresh PL031,
@@ -2515,6 +2540,7 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | Native-v2 2.10 virtio-mem activation and certification (implemented compatibility profile) | #1697 adds optional exact virtio-mem kind 11 after required serial and independently optional unchanged storage/entropy/balloon. It binds configuration, features, config space, queue, common virtio and MMIO/PCI placement, and a canonical plugged bitmap to exact kind-1 mixed File/COW memory extents while restoring one fresh shared aperture and destination-local owners. #1698 certifies all eight virtio-mem-bearing products, byte-first retained-memory proof, partial UNPLUG, driver-reprobe UNPLUG_ALL/replug, later PLUG/final UNPLUG, explicit-Paused recapture, automatic clones, immutable inputs, malformed state/memory, cancellation/death, and contained cleanup. Current 2.12 retains this component unchanged. | Fixed exact codec, 523,264-block/65,408-byte bitmap/128-KiB component/16-MiB state bounds, hostile geometry/extent/memory/product fixtures; materialization and dynamic-mapping tests; public all-sixteen-product and same-process peer matrices; signed HVF recapture/rollback; signed direct MMIO/PCI explicit/automatic restored Linux continuation; signed normal production/App Sandbox granted create/load, pathname replacement, recapture, checksum-corrupted state, truncated memory, cancellation, worker/launcher death, redaction, immutable reuse, destination-only metrics, and cleanup; retained exact 2.3–2.9 readers. |
 | Native-v2 2.11 network/MMDS activation and certification (implemented compatibility profile) | #1715 adds optional exact kind 12 after required serial and independently optional unchanged storage/entropy/balloon/virtio-mem. It retains portable ordered interface, queue, limiter/retry, MMIO/PCI placement, and MMDS protocol configuration while excluding host backend owners, handles, packets, connections, data, tokens, metrics, and clocks. Every load requires a complete redacted clone-local selector set and reconstructs fresh network/MMDS owners. #1716 certifies all 32 products plus signed V1/V2 guest-visible clone loss/freshness and containment. Current 2.12 retains this component unchanged. | Fixed exact `BANGNW2\0`/`BANGNI2\0`/`BANGMD2\0` codecs, 16-interface/83,552-byte worst-case/512-KiB component/16-MiB state bounds, hostile graph/override/resource/stage fixtures, signed HVF recapture/rollback, signed direct and normal production/App Sandbox MMIO/PCI explicit-Paused recapture and automatic restore, empty/reseeded MMDS, old-session/token loss, fresh session success, immutable inputs, malformed state/memory, missing/duplicate/unknown override redaction, cancellation, worker/launcher death, retry, no-vmnet containment, and cleanup; retained exact 2.3–2.10 readers. |
 | Native-v2 2.12 vsock activation and certification (implemented current profile) | #1735 adds optional exact kind 13 after required serial and independently optional unchanged storage/entropy/balloon/virtio-mem/network. It retains CID, logical selector, host-local cursor, queue/common-virtio, reset/interrupt, and coherent MMIO/PCI placement while excluding live connections, accepts, packets, wakeups, deadlines, metrics, descriptors, grants, sessions, and host handles. #1736 certifies all 64 products plus reset/RX/TX, preserved-listener, fresh multistream/half-close, original/override, immutable-clone, cursor, failure, containment, redaction, and cleanup behavior. | Fixed exact `BANGVS2\0` codec, 640-byte worst-case/64-KiB component/16-MiB state bounds, hostile graph/override/resource/stage fixtures, signed HVF reconstruction/rollback, signed direct MMIO/PCI simultaneous explicit-Paused and automatic clones, old-stream reset, queued Paused work, 4 guest-to-host plus 16 host-to-guest 4-KiB streams, half-close, cursor continuation, recapture, immutable inputs, and fresh metrics; signed normal production/App Sandbox MMIO/PCI grants, replacement safety, malformed state/memory, no-device override, missing authority, cancellation, worker/launcher death, retry, redaction, containment, and cleanup; retained exact 2.3–2.11 readers. |
+| Native-v2 2.13 Diff activation (implemented current profile) | #1757 keeps Full exact 2.12 and activates exact-2.13 Diff with mandatory kind 14. Tracked sources select unified dirty pages; untracked sources select every current page. Publication remains layer-first/state-last and advances lineage only after visibility. Load accepts a proven zero-root layer or its matching rebased complete result, rejects a standalone image-based layer before host construction, and initializes restored lineage from the exact result. Public rebase CLI and exhaustive capability promotion remain later slices. | Strict runtime/HVF state-layer-result closure; zero-root private pre-unlinked promotion; rebased-result loading; image-base, mismatch, future-version, cancellation, durability/reset, dynamic virtio-mem, direct/contained, MMIO/PCI, optional-device, recapture, and signed process evidence; retained exact native-v1 and native-v2 2.3–2.12 behavior. |
 | Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence and complete publication transaction (implemented for native-v1 baseline) | #1162 introduced acknowledged RAII quiescence for block and entropy; #1389 added the topology-wide SMP pause barrier and PMEM guard; #1390 includes network, acquires all four failure-atomically, drains tokens only after complete acknowledgement, preserves in-flight/deferred/deadline work, and holds the worker lease through commit plus the post-publication hook. Process API/MMDS/controller and periodic work are serialized by the synchronous owner borrow. | Deterministic scheduler, supervisor, cancellation/seal, publication-visibility, process/API serialization, and fresh-retry tests plus combined signed SMP pause and one-vCPU baseline publication evidence. |
 | Complete dirty epochs and public tracking (implemented) | #1395 supplies fail-closed HVF protection/fault retry. #1396 adds the shared `GuestMemory` bitmap, and #1698 extends signed dynamic-memory evidence across translation DFSC `0x05`/`0x06`/`0x07`, level-three permission DFSC `0x0f`, ordinary stores, and cache-maintenance writes while retaining exact owned-IPA checks. Every current bounded host/device writer, conservative discard, protected wholly-dirty dynamic RAM, destination load ordering, and post-visible-Full reset/rollback/poison semantics remain covered. Machine and load tracking flags are enabled without adding Diff artifacts. | Exact/repeated/concurrent host and CPU union, discard, block-granular dynamic mapping, load override/VMGenID, publication/cancellation/reset failures, and public transaction tests plus signed normal boot/load, restored virtio-mem, two-vCPU current-device, and two-epoch exact-set evidence. |
@@ -2562,11 +2588,12 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | Legacy native-v1 public endpoint activation (implemented, writer superseded) | #1276 originally routed create and load for the admitted native-v1 profile, preserved Firecracker-shaped response/latency/deprecation behavior, committed load as `Paused` before applying `resume_vm`, and exposed typed redacted execution faults. #1578 supersedes only public create with native-v2 and retains native-v1 as an exact family-selected reader. | Runtime/process/API tests, immutable native-v1 fixtures, focused Uffd compatibility coverage, and signed frozen-v1 File dispatch through the current public family router. |
 | Native-v1 PL031, VMGenID, and VMClock restore (implemented) | #1477 adds the exact validated 112-byte VMClock ABI to nested `BANGDEV\0` 1.1.0 while loading legacy 1.0.0 from bound memory, reconstructs PL031 from destination wall clock with no alarm state, and performs VMGenID replacement/notification before the fenced VMClock counter update/notification after aggregate restore and before resume. Any failure after the first identity commit is terminal. | ABI/codec/memory-agreement and legacy unit tests; every VMClock write and signal disposition; aggregate ordering and cleanup terminality; PL031 destination-time/no-alarm tests; signed two-destination guest polling of both VMGenID halves, stable sequence and both VMClock counters, RTC monotonicity, and continuation. |
 
-Shared dirty epochs are complete; Diff artifacts and optional resources remain
-their own issue-sized areas. The public create and restore transactions are
-deliberately limited to the native-v1 baseline.
+Shared dirty epochs, exact-2.13 Diff artifacts, and the complete supported
+optional-device product are active. Public Full remains exact 2.12; public Diff
+is exact 2.13. Public rebase/inspection tooling and exhaustive certification
+remain separate issue-sized areas.
 
 bangbang reports unsupported only for request shapes and profiles outside that
-baseline. Accepted Full create and File load requests use the production
-publisher/loader; native envelope version reporting and read-only inspection
+boundary. Accepted Full/Diff create and File load requests use the production
+publisher/loader; native envelope version reporting and read-only description
 remain available independently.

@@ -10377,7 +10377,7 @@ mod tests {
             (
                 "scd",
                 r#"{"snapshot_type":"Diff","snapshot_path":"private-diff-state-1254","mem_file_path":"private-diff-memory-1254"}"#,
-                "Snapshot and restore are not supported.",
+                "failed to create snapshot",
             ),
         ] {
             let response = request_over_socket(

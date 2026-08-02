@@ -34,7 +34,11 @@ use crate::snapshot_device_v2_6::{
     SnapshotV2StorageDeviceGraphDecodeError,
 };
 #[cfg(target_os = "macos")]
-use crate::snapshot_diff_v2_13::verify_snapshot_v2_diff_layer_output;
+use crate::snapshot_diff_v2_13::{
+    NATIVE_V2_DIFF_MAGIC, SnapshotV2DiffBase, SnapshotV2DiffMaterializationError,
+    promote_snapshot_v2_diff_zero_root_file_with_cancel, verify_snapshot_v2_diff_layer_output,
+    verify_snapshot_v2_diff_layer_output_with_cancel,
+};
 use crate::snapshot_diff_v2_13::{
     NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION, SnapshotV2DiffLayerBinding,
     SnapshotV2DiffStateError, SnapshotV2DiffVerifyError, decode_snapshot_v2_diff_layer_binding,
@@ -49,13 +53,14 @@ use crate::snapshot_format::{
     NATIVE_V1_SNAPSHOT_VERSION, NativeSnapshotFormatError, NativeSnapshotState,
     SnapshotFormatVersion, decode_native_snapshot_state,
 };
+#[cfg(test)]
+use crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
 use crate::snapshot_format_v2::{
     NATIVE_V2_BALLOON_COMPONENT_KEY, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
     NATIVE_V2_ENTROPY_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
     NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY, NATIVE_V2_NETWORK_COMPONENT_KEY,
-    NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, NATIVE_V2_VSOCK_COMPONENT_KEY,
-    SnapshotV2ComponentDisposition, SnapshotV2DecodeError,
-    decode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_SERIAL_COMPONENT_KEY, NATIVE_V2_VSOCK_COMPONENT_KEY, SnapshotV2ComponentDisposition,
+    SnapshotV2DecodeError, decode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_format_v2::{NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES, decode_snapshot_v2_state};
@@ -69,16 +74,16 @@ use crate::snapshot_memory_hotplug_v2_10::{
     SnapshotV2MemoryHotplugBindingError, SnapshotV2MemoryHotplugPreparationError,
     SnapshotV2MemoryHotplugState, SnapshotV2MemoryHotplugStateDecodeError,
 };
+#[cfg(target_os = "macos")]
+use crate::snapshot_memory_v2::{
+    NATIVE_V2_MEMORY_MAGIC, load_snapshot_v2_memory_file, verify_snapshot_v2_memory_image_output,
+};
 use crate::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryHotplugMaterializationError,
     SnapshotV2MemoryHotplugMaterializationStage, SnapshotV2MemoryLoadError,
     SnapshotV2MemoryStateError, decode_snapshot_v2_memory_binding,
     materialize_snapshot_v2_memory_hotplug_file,
     materialize_snapshot_v2_memory_hotplug_file_with_cancel,
-};
-#[cfg(target_os = "macos")]
-use crate::snapshot_memory_v2::{
-    load_snapshot_v2_memory_file, verify_snapshot_v2_memory_image_output,
 };
 use crate::snapshot_network_restore_v2_11::{
     PreparedSnapshotV2NetworkRestoreTopology, SnapshotV2NetworkRestorePreparationError,
@@ -145,6 +150,8 @@ pub enum NativeV2SnapshotArtifactProfile {
     NetworkStateV2_11,
     /// Exact 2.12 profile with optional unchanged devices and vsock.
     VsockStateV2_12,
+    /// Exact 2.13 differential profile with the complete unchanged device product.
+    DiffStateV2_13,
 }
 
 /// Validation failure for one owned native snapshot artifact state.
@@ -166,15 +173,17 @@ pub enum NativeSnapshotArtifactStateError {
         state: SnapshotFormatVersion,
         memory: SnapshotFormatVersion,
     },
-    /// Publication accepts only the exact current native-v2 writer version.
+    /// Full publication accepts only exact native-v2 2.12 state and memory.
     NonCurrentV2Publication {
         state: SnapshotFormatVersion,
         memory: SnapshotFormatVersion,
     },
     /// A compatible native-v2 state does not satisfy one exact state profile.
     V2Profile(NativeV2SnapshotCandidateStateError),
-    /// The exact current native-v2 state does not satisfy its required device profile.
+    /// The exact-2.12 Full state does not satisfy its required device profile.
     CurrentV2Profile(NativeV2SnapshotCandidateStateError),
+    /// The exact-2.13 state does not satisfy the complete Diff profile.
+    DiffV2Profile(NativeV2DiffSnapshotCandidateStateError),
 }
 
 impl fmt::Display for NativeSnapshotArtifactStateError {
@@ -192,7 +201,7 @@ impl fmt::Display for NativeSnapshotArtifactStateError {
             ),
             Self::NonCurrentV2Publication { state, memory } => write!(
                 formatter,
-                "native-v2 publication requires current state and memory versions; found state {state} and memory {memory}"
+                "native-v2 Full publication requires exact-2.12 state and memory versions; found state {state} and memory {memory}"
             ),
             Self::V2Profile(source) => {
                 write!(formatter, "invalid compatible native-v2 profile: {source}")
@@ -200,8 +209,11 @@ impl fmt::Display for NativeSnapshotArtifactStateError {
             Self::CurrentV2Profile(source) => {
                 write!(
                     formatter,
-                    "invalid current native-v2 device profile: {source}"
+                    "invalid exact-2.12 Full native-v2 device profile: {source}"
                 )
+            }
+            Self::DiffV2Profile(source) => {
+                write!(formatter, "invalid native-v2 Diff profile: {source}")
             }
         }
     }
@@ -215,6 +227,7 @@ impl std::error::Error for NativeSnapshotArtifactStateError {
             Self::Memory(source) => Some(source),
             Self::V2Profile(source) => Some(source),
             Self::CurrentV2Profile(source) => Some(source),
+            Self::DiffV2Profile(source) => Some(source),
             Self::UnexpectedFamily { .. }
             | Self::V2VersionMismatch { .. }
             | Self::NonCurrentV2Publication { .. } => None,
@@ -247,7 +260,10 @@ impl NativeSnapshotArtifactState {
         }
     }
 
-    /// Validates exact current-version native-v2 bytes for publication.
+    /// Validates exact-2.12 Full native-v2 bytes for publication.
+    ///
+    /// The legacy method name is retained for source compatibility; exact-2.13
+    /// Diff uses [`NativeV2DiffSnapshotCandidateState`].
     pub fn from_current_v2(bytes: Vec<u8>) -> Result<Self, NativeSnapshotArtifactStateError> {
         NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(bytes)
             .map(NativeV2VsockSnapshotCandidateState::into_current_artifact_state)
@@ -380,7 +396,8 @@ impl NativeSnapshotArtifactState {
         else {
             return Ok(());
         };
-        if *version == NATIVE_V2_SNAPSHOT_VERSION && binding.version() == NATIVE_V2_SNAPSHOT_VERSION
+        if *version == NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+            && binding.version() == NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
         {
             let (actual_binding, _, _, _, _, _, _, _) = decode_vsock_state_v2_12(bytes)
                 .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
@@ -1886,8 +1903,8 @@ impl fmt::Debug for NativeV2NetworkSnapshotCandidateState {
     }
 }
 
-/// Stable exact-2.12 preparation checkpoints delegated to owner-free device
-/// topology producers.
+/// Stable current-product preparation checkpoints delegated to owner-free
+/// device topology producers for exact-2.12 Full and exact-2.13 Diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeV2VsockSnapshotPreparationStage {
     /// One checkpoint in optional vsock topology preparation.
@@ -1896,11 +1913,13 @@ pub enum NativeV2VsockSnapshotPreparationStage {
     Network(SnapshotV2NetworkRestorePreparationStage),
 }
 
-/// One prepared exact-2.12 candidate with complete owner-free topology.
+/// One prepared exact-2.12 Full or exact-2.13 Diff candidate with complete
+/// owner-free topology.
 ///
 /// This value owns no descriptor, provider, socket, packet-I/O owner, callback,
 /// metric, datastore, platform slot, VM, vCPU, or HVF authority.
-pub struct PreparedNativeV2VsockSnapshotCandidateState {
+pub struct PreparedNativeV2CurrentSnapshotCandidateState {
+    version: SnapshotFormatVersion,
     bytes: Vec<u8>,
     binding: SnapshotV2MemoryBinding,
     device_graph: Option<SnapshotV2StorageDeviceGraph>,
@@ -1913,7 +1932,7 @@ pub struct PreparedNativeV2VsockSnapshotCandidateState {
     manifest: SnapshotRestoreManifest,
 }
 
-/// Owned exact components of one prepared native-v2 2.12 candidate.
+/// Owned exact components of one prepared native-v2 current-product candidate.
 pub type PreparedNativeV2VsockSnapshotCandidateParts = (
     Vec<u8>,
     SnapshotV2MemoryBinding,
@@ -1927,10 +1946,17 @@ pub type PreparedNativeV2VsockSnapshotCandidateParts = (
     SnapshotRestoreManifest,
 );
 
-impl PreparedNativeV2VsockSnapshotCandidateState {
+/// Prepared exact-2.12 Full product retained for source compatibility.
+pub type PreparedNativeV2VsockSnapshotCandidateState =
+    PreparedNativeV2CurrentSnapshotCandidateState;
+
+/// Prepared exact-2.13 Diff product after state/layer/result closure.
+pub type PreparedNativeV2DiffSnapshotCandidateState = PreparedNativeV2CurrentSnapshotCandidateState;
+
+impl PreparedNativeV2CurrentSnapshotCandidateState {
     /// Returns the exact candidate compatibility version.
     pub const fn version(&self) -> SnapshotFormatVersion {
-        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+        self.version
     }
 
     /// Returns the unchanged immutable encoded state bytes.
@@ -2000,10 +2026,10 @@ impl PreparedNativeV2VsockSnapshotCandidateState {
     }
 }
 
-impl fmt::Debug for PreparedNativeV2VsockSnapshotCandidateState {
+impl fmt::Debug for PreparedNativeV2CurrentSnapshotCandidateState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("PreparedNativeV2VsockSnapshotCandidateState")
+            .debug_struct("PreparedNativeV2CurrentSnapshotCandidateState")
             .field("version", &self.version())
             .field("has_storage", &self.device_graph.is_some())
             .field("has_entropy", &self.entropy.is_some())
@@ -2024,7 +2050,7 @@ impl fmt::Debug for PreparedNativeV2VsockSnapshotCandidateState {
     }
 }
 
-/// Failure while preparing one exact-2.12 artifact candidate.
+/// Failure while preparing one exact-2.12 Full or exact-2.13 Diff candidate.
 pub enum NativeV2VsockSnapshotPreparationError {
     /// Caller network overrides were supplied without saved network state.
     NetworkOverridesWithoutDevice,
@@ -2260,6 +2286,7 @@ impl NativeV2VsockSnapshotCandidateState {
         };
 
         Ok(PreparedNativeV2VsockSnapshotCandidateState {
+            version: NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
             bytes,
             binding,
             device_graph,
@@ -2319,7 +2346,7 @@ impl fmt::Debug for NativeV2VsockSnapshotCandidateState {
     }
 }
 
-/// Validation failure for one complete dormant exact-2.13 Diff candidate.
+/// Validation failure for one complete exact-2.13 Diff candidate.
 #[derive(Debug)]
 pub enum NativeV2DiffSnapshotCandidateStateError {
     /// The outer state does not contain the complete current device product.
@@ -2354,7 +2381,7 @@ impl std::error::Error for NativeV2DiffSnapshotCandidateStateError {
     }
 }
 
-/// One closed dormant exact native-v2 2.13 differential candidate.
+/// One closed exact native-v2 2.13 differential candidate.
 ///
 /// The value retains the complete current platform/device state and the exact
 /// binding returned by the detached-layer writer. It is intentionally
@@ -2374,7 +2401,7 @@ pub struct NativeV2DiffSnapshotCandidateState {
     layer: SnapshotV2DiffLayerBinding,
 }
 
-/// Owned exact components retained by one dormant exact-2.13 Diff candidate.
+/// Owned exact components retained by one exact-2.13 Diff candidate.
 pub type NativeV2DiffSnapshotCandidateParts = (
     Vec<u8>,
     SnapshotV2MemoryBinding,
@@ -2389,6 +2416,22 @@ pub type NativeV2DiffSnapshotCandidateParts = (
 );
 
 impl NativeV2DiffSnapshotCandidateState {
+    /// Validates one exact-2.13 complete product against its embedded layer
+    /// commitment.
+    pub fn from_committed_diff_state_v2_13(
+        bytes: Vec<u8>,
+    ) -> Result<Self, NativeV2DiffSnapshotCandidateStateError> {
+        let state = decode_snapshot_v2_state_with_compatibility_version(
+            &bytes,
+            NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+        )
+        .map_err(NativeV2SnapshotCandidateStateError::Format)
+        .map_err(NativeV2DiffSnapshotCandidateStateError::Product)?;
+        let layer = decode_snapshot_v2_diff_layer_binding(&state)
+            .map_err(NativeV2DiffSnapshotCandidateStateError::Diff)?;
+        Self::from_diff_state_v2_13(bytes, layer)
+    }
+
     /// Validates one explicit exact-2.13 complete product against the layer
     /// binding returned by its writer.
     pub fn from_diff_state_v2_13(
@@ -2423,7 +2466,7 @@ impl NativeV2DiffSnapshotCandidateState {
         })
     }
 
-    /// Returns the dormant exact compatibility version.
+    /// Returns the exact compatibility version.
     pub const fn version(&self) -> SnapshotFormatVersion {
         NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
     }
@@ -2478,6 +2521,107 @@ impl NativeV2DiffSnapshotCandidateState {
         self.vsock.as_ref()
     }
 
+    /// Prepares the complete exact-2.13 owner-free restore product after the
+    /// layer has already been closed into loaded result memory.
+    pub fn prepare(
+        self,
+        destination_memory: &GuestMemory,
+        transport_kind: SnapshotV2DeviceTransportKind,
+        network_overrides: &[SnapshotNetworkOverride],
+        requested_vsock_override: Option<&SnapshotVsockOverride>,
+    ) -> Result<PreparedNativeV2DiffSnapshotCandidateState, NativeV2VsockSnapshotPreparationError>
+    {
+        self.prepare_with_cancel(
+            destination_memory,
+            transport_kind,
+            network_overrides,
+            requested_vsock_override,
+            |_| false,
+        )
+    }
+
+    /// Prepares the exact-2.13 owner-free restore product with cancellation.
+    pub fn prepare_with_cancel<C>(
+        self,
+        destination_memory: &GuestMemory,
+        transport_kind: SnapshotV2DeviceTransportKind,
+        network_overrides: &[SnapshotNetworkOverride],
+        requested_vsock_override: Option<&SnapshotVsockOverride>,
+        mut is_cancelled: C,
+    ) -> Result<PreparedNativeV2DiffSnapshotCandidateState, NativeV2VsockSnapshotPreparationError>
+    where
+        C: FnMut(NativeV2VsockSnapshotPreparationStage) -> bool,
+    {
+        let Self {
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network,
+            vsock,
+            layer: _,
+        } = self;
+        let vsock_topology = PreparedSnapshotV2VsockRestoreTopology::prepare_optional_with_cancel(
+            vsock,
+            requested_vsock_override,
+            transport_kind,
+            destination_memory,
+            |stage| is_cancelled(NativeV2VsockSnapshotPreparationStage::Vsock(stage)),
+        )
+        .map_err(NativeV2VsockSnapshotPreparationError::Vsock)?;
+        let manifest = SnapshotRestoreManifest::try_from_native_v2_vsock_state(
+            device_graph.as_ref(),
+            &serial,
+            network.as_ref(),
+            vsock_topology.as_ref().map(|topology| {
+                (
+                    topology.request().resource_key(),
+                    topology.request().is_overridden(),
+                )
+            }),
+        )
+        .map_err(NativeV2VsockSnapshotPreparationError::Manifest)?;
+        let network_topology = match network {
+            Some(network) => {
+                let topology = PreparedSnapshotV2NetworkRestoreTopology::prepare_with_cancel(
+                    network,
+                    network_overrides,
+                    |stage| is_cancelled(NativeV2VsockSnapshotPreparationStage::Network(stage)),
+                )
+                .map_err(NativeV2VsockSnapshotPreparationError::Network)?;
+                if topology.transport_kind() != transport_kind {
+                    return Err(NativeV2VsockSnapshotPreparationError::DestinationTransport);
+                }
+                topology
+            }
+            None => {
+                if !network_overrides.is_empty() {
+                    return Err(
+                        NativeV2VsockSnapshotPreparationError::NetworkOverridesWithoutDevice,
+                    );
+                }
+                PreparedSnapshotV2NetworkRestoreTopology::empty(transport_kind)
+            }
+        };
+
+        Ok(PreparedNativeV2CurrentSnapshotCandidateState {
+            version: NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+            bytes,
+            binding,
+            device_graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network_topology,
+            vsock_topology,
+            manifest,
+        })
+    }
+
     /// Consumes the candidate into all inseparable checked components.
     pub fn into_parts(self) -> NativeV2DiffSnapshotCandidateParts {
         (
@@ -2494,7 +2638,7 @@ impl NativeV2DiffSnapshotCandidateState {
         )
     }
 
-    /// Consumes this candidate into dormant Diff publication authority.
+    /// Consumes this candidate into Diff publication authority.
     pub fn into_publication_state(self) -> NativeV2DiffSnapshotArtifactState {
         let (bytes, binding, _, _, _, _, _, _, _, layer) = self.into_parts();
         NativeV2DiffSnapshotArtifactState {
@@ -3292,7 +3436,7 @@ fn classify_native_v2_profile(
 ) -> Result<NativeV2SnapshotArtifactProfile, NativeV2SnapshotCandidateStateError> {
     let state = decode_snapshot_v2_state_with_compatibility_version(
         bytes,
-        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
     )
     .map_err(NativeV2SnapshotCandidateStateError::Format)?;
     let version = state.metadata().version();
@@ -3384,6 +3528,18 @@ fn classify_native_v2_profile(
             decode_vsock_state_v2_12(bytes)?;
             Ok(NativeV2SnapshotArtifactProfile::VsockStateV2_12)
         }
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION => {
+            let (actual_binding, _, _, _, _, _, _, _) =
+                decode_network_or_vsock_state(bytes, NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION)?;
+            let layer = decode_snapshot_v2_diff_layer_binding(&state)
+                .map_err(NativeV2SnapshotCandidateStateError::DiffState)?;
+            if layer.result() != &actual_binding {
+                return Err(NativeV2SnapshotCandidateStateError::DiffState(
+                    SnapshotV2DiffStateError::ResultBindingMismatch,
+                ));
+            }
+            Ok(NativeV2SnapshotArtifactProfile::DiffStateV2_13)
+        }
         _ => Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version }),
     }
 }
@@ -3457,6 +3613,8 @@ pub enum NativeV2SnapshotCandidateStateError {
     InvalidVsockComponent,
     /// The optional vsock payload is invalid.
     VsockState(SnapshotV2VsockStateDecodeError),
+    /// The exact-2.13 state does not contain one closed Diff commitment.
+    DiffState(SnapshotV2DiffStateError),
 }
 
 impl fmt::Display for NativeV2SnapshotCandidateStateError {
@@ -3564,6 +3722,12 @@ impl fmt::Display for NativeV2SnapshotCandidateStateError {
                     "invalid native-v2 candidate vsock state: {source}"
                 )
             }
+            Self::DiffState(source) => {
+                write!(
+                    formatter,
+                    "invalid native-v2 candidate Diff state: {source}"
+                )
+            }
         }
     }
 }
@@ -3583,6 +3747,7 @@ impl std::error::Error for NativeV2SnapshotCandidateStateError {
             Self::MemoryHotplugBinding(source) => Some(source),
             Self::NetworkState(source) => Some(source),
             Self::VsockState(source) => Some(source),
+            Self::DiffState(source) => Some(source),
             Self::UnexpectedVersion { .. }
             | Self::VersionMismatch { .. }
             | Self::MissingDeviceGraph
@@ -4275,11 +4440,11 @@ pub enum SnapshotCommitDurability {
     Uncertain { kind: io::ErrorKind },
 }
 
-/// One closed dormant exact-2.13 state-to-differential-layer commitment.
+/// One closed exact-2.13 state-to-differential-layer commitment.
 ///
 /// Construction is available only by consuming a fully validated
 /// [`NativeV2DiffSnapshotCandidateState`]. The type deliberately cannot enter
-/// current native-v2 loading or Full publication APIs.
+/// exact-2.12 Full loading or publication APIs.
 pub struct NativeV2DiffSnapshotArtifactState {
     bytes: Vec<u8>,
     binding: SnapshotV2MemoryBinding,
@@ -4315,7 +4480,7 @@ impl fmt::Debug for NativeV2DiffSnapshotArtifactState {
     }
 }
 
-/// Successful or visibly committed dormant exact-2.13 Diff publication.
+/// Successful or visibly committed exact-2.13 Diff publication.
 pub struct NativeV2DiffSnapshotPublicationOutcome {
     state: NativeV2DiffSnapshotArtifactState,
     durability: SnapshotCommitDurability,
@@ -4429,6 +4594,9 @@ pub enum SnapshotArtifactLoadStage {
     MemoryDirectoryOpen,
     MemoryOpen,
     MemoryTypeCheck,
+    MemoryClassification,
+    MemoryMaterialization,
+    MemoryStaging,
     MemoryLoad,
 }
 
@@ -4447,6 +4615,9 @@ impl fmt::Display for SnapshotArtifactLoadStage {
             Self::MemoryDirectoryOpen => "memory directory open",
             Self::MemoryOpen => "memory final open",
             Self::MemoryTypeCheck => "memory file type check",
+            Self::MemoryClassification => "memory artifact classification",
+            Self::MemoryMaterialization => "memory artifact materialization",
+            Self::MemoryStaging => "memory materialization staging",
             Self::MemoryLoad => "memory image load",
         };
         f.write_str(name)
@@ -4469,6 +4640,10 @@ pub enum SnapshotArtifactLoadFailure {
     MemoryV2(SnapshotV2MemoryLoadError),
     MemoryHotplugPreparation(NativeV2MemoryHotplugSnapshotPreparationError),
     MemoryHotplugMaterialization(SnapshotV2MemoryHotplugMaterializationError),
+    DiffVerification(SnapshotV2DiffVerifyError),
+    DiffMaterialization(SnapshotV2DiffMaterializationError),
+    DiffBaseUnavailable,
+    Cancelled,
 }
 
 impl fmt::Display for SnapshotArtifactLoadFailure {
@@ -4504,6 +4679,16 @@ impl fmt::Display for SnapshotArtifactLoadFailure {
             Self::MemoryHotplugMaterialization(source) => {
                 write!(f, "invalid native-v2 virtio-mem memory image: {source}")
             }
+            Self::DiffVerification(source) => {
+                write!(f, "invalid native-v2 Diff layer: {source}")
+            }
+            Self::DiffMaterialization(source) => {
+                write!(f, "native-v2 Diff materialization failed: {source}")
+            }
+            Self::DiffBaseUnavailable => {
+                f.write_str("native-v2 Diff layer requires its exact base image")
+            }
+            Self::Cancelled => f.write_str("snapshot artifact loading was cancelled"),
         }
     }
 }
@@ -4518,12 +4703,16 @@ impl std::error::Error for SnapshotArtifactLoadFailure {
             Self::MemoryV2(source) => Some(source),
             Self::MemoryHotplugPreparation(source) => Some(source),
             Self::MemoryHotplugMaterialization(source) => Some(source),
+            Self::DiffVerification(source) => Some(source),
+            Self::DiffMaterialization(source) => Some(source),
             Self::UnsupportedPlatform
             | Self::InvalidFinalPath { .. }
             | Self::NotRegularFile { .. }
             | Self::StateTooLarge { .. }
             | Self::LengthOverflow
-            | Self::Io(_) => None,
+            | Self::Io(_)
+            | Self::DiffBaseUnavailable
+            | Self::Cancelled => None,
         }
     }
 }
@@ -4756,7 +4945,7 @@ impl LoadedNativeSnapshotArtifacts {
         Ok((candidate, memory))
     }
 
-    /// Consumes one exact current 2.12 pair into the vsock load handoff.
+    /// Consumes one exact 2.12 Full pair into the vsock load handoff.
     ///
     /// The state bytes are neither reopened nor re-encoded, and the already
     /// loaded guest memory remains bound to the candidate derived from them.
@@ -4775,6 +4964,28 @@ impl LoadedNativeSnapshotArtifacts {
         let candidate = NativeV2VsockSnapshotCandidateState::from_vsock_state_v2_12(bytes)
             .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
         debug_assert_eq!(candidate.memory_binding(), &binding);
+        Ok((candidate, memory))
+    }
+
+    /// Consumes one exact 2.13 state/result pair into the Diff load handoff.
+    ///
+    /// The immutable state is reclosed against its embedded kind-14 commitment,
+    /// and the already loaded guest memory remains bound to its complete result.
+    pub fn into_v2_13_diff_candidate(
+        self,
+    ) -> Result<(NativeV2DiffSnapshotCandidateState, GuestMemory), NativeSnapshotArtifactStateError>
+    {
+        let actual = self.family();
+        let (state, memory) = self.into_parts();
+        let (bytes, binding) = state.into_v2_parts().map_err(|_| {
+            NativeSnapshotArtifactStateError::UnexpectedFamily {
+                expected: NativeSnapshotArtifactFamily::V2,
+                actual,
+            }
+        })?;
+        let candidate = NativeV2DiffSnapshotCandidateState::from_committed_diff_state_v2_13(bytes)
+            .map_err(NativeSnapshotArtifactStateError::DiffV2Profile)?;
+        debug_assert_eq!(candidate.result_binding(), &binding);
         Ok((candidate, memory))
     }
 
@@ -5007,11 +5218,10 @@ where
     publish_native_snapshot_artifacts_to_with(&outputs, producer)
 }
 
-/// Publishes caller-produced dormant exact-2.13 Diff artifacts in one
+/// Publishes caller-produced exact-2.13 Diff artifacts in one
 /// state-plus-layer transaction.
 ///
-/// The layer occupies the existing second (memory) output slot. This API does
-/// not make Diff loadable or select it from public snapshot requests.
+/// The layer occupies the existing second (memory) output slot.
 #[doc(hidden)]
 pub fn publish_native_v2_diff_snapshot_artifacts_with<E, F>(
     paths: &SnapshotArtifactPaths,
@@ -5074,7 +5284,7 @@ where
     }
 }
 
-/// Publishes one dormant exact-2.13 state/layer pair to path or anchored
+/// Publishes one exact-2.13 state/layer pair to path or anchored
 /// destinations while retaining the established exactly-two-output contract.
 #[doc(hidden)]
 pub fn publish_native_v2_diff_snapshot_artifacts_to_with<E, F>(
@@ -5214,13 +5424,25 @@ pub fn load_prepared_native_snapshot_memory_file(
     prepared: PreparedNativeSnapshotState,
     file: File,
 ) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError> {
+    load_prepared_native_snapshot_memory_file_with_cancel(prepared, file, || false)
+}
+
+/// Loads one opened memory artifact with cooperative cancellation.
+pub fn load_prepared_native_snapshot_memory_file_with_cancel<C>(
+    prepared: PreparedNativeSnapshotState,
+    file: File,
+    mut is_cancelled: C,
+) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError>
+where
+    C: FnMut() -> bool,
+{
     #[cfg(target_os = "macos")]
     {
-        load_prepared_native_snapshot_memory_file_macos(prepared, file)
+        load_prepared_native_snapshot_memory_file_macos(prepared, file, &mut is_cancelled)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (prepared, file);
+        let _ = (prepared, file, is_cancelled);
         Err(load_error(
             SnapshotArtifactLoadStage::PlatformCheck,
             SnapshotArtifactLoadFailure::UnsupportedPlatform,
@@ -5252,13 +5474,25 @@ pub fn load_prepared_native_snapshot_memory_path(
     prepared: PreparedNativeSnapshotState,
     path: &Path,
 ) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError> {
+    load_prepared_native_snapshot_memory_path_with_cancel(prepared, path, || false)
+}
+
+/// Opens and loads memory against prepared state with cooperative cancellation.
+pub fn load_prepared_native_snapshot_memory_path_with_cancel<C>(
+    prepared: PreparedNativeSnapshotState,
+    path: &Path,
+    mut is_cancelled: C,
+) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError>
+where
+    C: FnMut() -> bool,
+{
     #[cfg(target_os = "macos")]
     {
-        load_prepared_native_snapshot_memory_path_macos(prepared, path)
+        load_prepared_native_snapshot_memory_path_macos(prepared, path, &mut is_cancelled)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (prepared, path);
+        let _ = (prepared, path, is_cancelled);
         Err(load_error(
             SnapshotArtifactLoadStage::PlatformCheck,
             SnapshotArtifactLoadFailure::UnsupportedPlatform,

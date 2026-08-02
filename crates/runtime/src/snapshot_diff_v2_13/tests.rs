@@ -10,15 +10,16 @@ use crate::snapshot_artifact::{
     NativeV2SnapshotCandidateStateError,
 };
 use crate::snapshot_format_v2::{
-    NATIVE_V2_DIFF_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION,
-    SnapshotV2Component, SnapshotV2ComponentDisposition, SnapshotV2ComponentKey,
-    SnapshotV2DecodeError, decode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_DIFF_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component,
+    SnapshotV2ComponentDisposition, SnapshotV2ComponentKey, SnapshotV2DecodeError,
+    decode_snapshot_v2_state_with_compatibility_version,
     encode_snapshot_v2_state_with_compatibility_version,
 };
 use crate::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError, SnapshotV2MemoryImageId,
     decode_snapshot_v2_memory_binding_payload, snapshot_v2_memory_binding_from_ranges_for_test,
 };
+use crate::snapshot_vsock_v2_12::NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
 
 use super::*;
 
@@ -79,8 +80,12 @@ fn predecessor_binding_with_id(
     image_id: SnapshotV2MemoryImageId,
     ranges: &[GuestMemoryRange],
 ) -> SnapshotV2MemoryBinding {
-    snapshot_v2_memory_binding_from_ranges_for_test(NATIVE_V2_SNAPSHOT_VERSION, image_id, ranges)
-        .expect("test predecessor binding should validate")
+    snapshot_v2_memory_binding_from_ranges_for_test(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+        image_id,
+        ranges,
+    )
+    .expect("test predecessor binding should validate")
 }
 
 fn predecessor_binding(ranges: &[GuestMemoryRange]) -> SnapshotV2MemoryBinding {
@@ -268,7 +273,7 @@ fn checked_construction_rejects_identity_version_and_extent_failures() {
     ));
 
     let old_result = snapshot_v2_memory_binding_from_ranges_for_test(
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         RESULT_ID,
         &[range(start, 64 * 1024)],
     )
@@ -774,14 +779,14 @@ fn state_decoder_cross_checks_component_profile_and_result_binding() {
     );
 
     let old_state_bytes = encode_snapshot_v2_state_with_compatibility_version(
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         &[],
         &[memory],
     )
     .expect("current memory-only state should encode");
     let old_state = decode_snapshot_v2_state_with_compatibility_version(
         &old_state_bytes,
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
     )
     .expect("current memory-only state should decode");
     assert!(matches!(
@@ -879,7 +884,7 @@ fn state_decoder_cross_checks_component_profile_and_result_binding() {
             NativeV2SnapshotCandidateStateError::Format(
                 SnapshotV2DecodeError::UnsupportedVersion {
                     found: NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
-                    supported: NATIVE_V2_SNAPSHOT_VERSION,
+                    supported: NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
                 }
             )
         ))

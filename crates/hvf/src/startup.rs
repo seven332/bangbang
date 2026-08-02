@@ -3580,7 +3580,7 @@ fn restored_v2_snapshot_lineage(
     LiveSnapshotLineage::image(binding, initial_dirty_epoch(runtime_resources))
 }
 
-/// Prepared exact writer inputs for one dormant native-v2 Diff capture.
+/// Prepared exact writer inputs for one native-v2 Diff capture.
 pub struct HvfSnapshotV2DiffCapture {
     token: LiveSnapshotLineageToken,
     base: SnapshotV2DiffBase,
@@ -3793,7 +3793,7 @@ impl OwnedHvfArm64BootSession {
             .map_err(HvfSnapshotLineageError::Lineage)
     }
 
-    /// Prepares one dormant exact-2.13 Diff base and page selection.
+    /// Prepares one exact-2.13 Diff base and page selection.
     #[doc(hidden)]
     pub fn begin_snapshot_v2_diff_quiesced(
         &mut self,
@@ -15358,7 +15358,7 @@ impl HvfArm64BootSession<'_> {
         )
     }
 
-    /// Captures one dormant exact native-v2 2.13 platform and detached layer
+    /// Captures one exact native-v2 2.13 platform and detached layer
     /// from an already frozen lineage base and dirty selection.
     #[doc(hidden)]
     pub fn capture_snapshot_v2_diff_platform_with_cancel<
@@ -29279,7 +29279,7 @@ impl OwnedHvfArm64BootSession {
         self.runner.pause_for_arm64_snapshot_v2_capture()
     }
 
-    /// Captures one dormant exact native-v2 2.13 platform and detached layer
+    /// Captures one exact native-v2 2.13 platform and detached layer
     /// from an already frozen lineage base and dirty selection.
     #[doc(hidden)]
     pub fn capture_snapshot_v2_diff_platform_with_cancel<

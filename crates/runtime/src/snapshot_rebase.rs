@@ -1,4 +1,4 @@
-//! Failure-atomic path transaction for dormant native-v2 Diff rebases.
+//! Failure-atomic path transaction for native-v2 Diff rebases.
 //!
 //! Mutation is anchored to retained directory descriptors and every stable
 //! identity is rechecked before the atomic exchange. Darwin does not expose an
@@ -11,7 +11,7 @@
 //!
 //! Ordinary errors and panic unwinding clean only an identity-matching private
 //! staging entry. Abrupt process termination such as `SIGKILL` can leave a
-//! random staging or displaced-base entry because this dormant transaction has
+//! random staging or displaced-base entry because this transaction has
 //! no selected persistent supervisor or recovery ledger.
 
 use std::fmt;

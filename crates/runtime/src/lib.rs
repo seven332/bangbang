@@ -4087,7 +4087,7 @@ mod tests {
     }
 
     #[test]
-    fn controller_private_native_v2_create_profile_is_fail_closed() {
+    fn controller_private_native_v2_create_profile_accepts_full_and_diff() {
         fn admitted() -> VmmController {
             let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
             controller
@@ -4122,7 +4122,7 @@ mod tests {
         supported.instance_info.state = InstanceState::Paused;
         assert_eq!(
             supported.preflight_create_snapshot_v2(&snapshot_create_input(SnapshotType::Diff)),
-            Err(VmmActionError::SnapshotUnsupported)
+            Ok(())
         );
 
         let mut represented_machine = admitted();

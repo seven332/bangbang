@@ -86,17 +86,17 @@ use bangbang_hvf::{
     PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2NetworkMmioOwners,
     RestoredHvfSnapshotV2NetworkPciOwners, RestoredHvfSnapshotV2Platform,
     RestoredHvfSnapshotV2VsockMmioOwners, RestoredHvfSnapshotV2VsockPciOwners,
-    decode_hvf_snapshot_v2_balloon_state, decode_hvf_snapshot_v2_entropy_state,
-    decode_hvf_snapshot_v2_memory_hotplug_state, decode_hvf_snapshot_v2_multi_block_state,
-    decode_hvf_snapshot_v2_network_state, decode_hvf_snapshot_v2_platform_state,
-    decode_hvf_snapshot_v2_serial_state, decode_hvf_snapshot_v2_state,
-    decode_hvf_snapshot_v2_storage_state, decode_hvf_snapshot_v2_vsock_state,
-    encode_hvf_snapshot_v2_balloon_state, encode_hvf_snapshot_v2_diff_state,
-    encode_hvf_snapshot_v2_entropy_state, encode_hvf_snapshot_v2_memory_hotplug_state,
-    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_network_state,
-    encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
-    encode_hvf_snapshot_v2_storage_state, encode_hvf_snapshot_v2_vsock_state,
-    prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
+    decode_hvf_snapshot_v2_balloon_state, decode_hvf_snapshot_v2_diff_state,
+    decode_hvf_snapshot_v2_entropy_state, decode_hvf_snapshot_v2_memory_hotplug_state,
+    decode_hvf_snapshot_v2_multi_block_state, decode_hvf_snapshot_v2_network_state,
+    decode_hvf_snapshot_v2_platform_state, decode_hvf_snapshot_v2_serial_state,
+    decode_hvf_snapshot_v2_state, decode_hvf_snapshot_v2_storage_state,
+    decode_hvf_snapshot_v2_vsock_state, encode_hvf_snapshot_v2_balloon_state,
+    encode_hvf_snapshot_v2_diff_state, encode_hvf_snapshot_v2_entropy_state,
+    encode_hvf_snapshot_v2_memory_hotplug_state, encode_hvf_snapshot_v2_multi_block_state,
+    encode_hvf_snapshot_v2_network_state, encode_hvf_snapshot_v2_serial_state,
+    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
+    encode_hvf_snapshot_v2_vsock_state, prepare_hvf_snapshot_v2_balloon_mmio_platform_plan,
     prepare_hvf_snapshot_v2_balloon_pci_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_mmio_platform_plan,
     prepare_hvf_snapshot_v2_memory_hotplug_pci_platform_plan,
@@ -198,13 +198,16 @@ use bangbang_runtime::snapshot_artifact::{
     NativeV2SnapshotCandidateState, NativeV2SnapshotCandidateStateError,
     NativeV2StorageSnapshotCandidateState, NativeV2VsockSnapshotCandidateState,
     NativeV2VsockSnapshotPreparationError, PreparedNativeSnapshotState,
-    PreparedNativeV2NetworkSnapshotCandidateState, PreparedNativeV2VsockSnapshotCandidateState,
-    SnapshotArtifactLoadError, SnapshotArtifactOutput, SnapshotArtifactOutputs,
-    SnapshotArtifactPaths, SnapshotCommitDurability, SnapshotMemoryStagingWriter,
-    SnapshotPublicationOutcome, SnapshotPublicationTransactionError,
-    load_prepared_native_snapshot_memory_file, load_prepared_native_snapshot_memory_path,
-    load_snapshot_artifacts, prepare_native_snapshot_state_file,
-    prepare_native_snapshot_state_path, prepare_snapshot_state_file, prepare_snapshot_state_path,
+    PreparedNativeV2CurrentSnapshotCandidateState, PreparedNativeV2NetworkSnapshotCandidateState,
+    PreparedNativeV2VsockSnapshotCandidateState, SnapshotArtifactLoadError, SnapshotArtifactOutput,
+    SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotCommitDurability,
+    SnapshotMemoryStagingWriter, SnapshotPublicationOutcome, SnapshotPublicationTransactionError,
+    load_prepared_native_snapshot_memory_file,
+    load_prepared_native_snapshot_memory_file_with_cancel,
+    load_prepared_native_snapshot_memory_path,
+    load_prepared_native_snapshot_memory_path_with_cancel, load_snapshot_artifacts,
+    prepare_native_snapshot_state_file, prepare_native_snapshot_state_path,
+    prepare_snapshot_state_file, prepare_snapshot_state_path,
     publish_native_snapshot_artifacts_to_with, publish_native_snapshot_artifacts_with,
     publish_native_v2_diff_snapshot_artifacts_to_with,
     publish_native_v2_diff_snapshot_artifacts_with, publish_snapshot_artifacts_to_with,
@@ -231,8 +234,8 @@ use bangbang_runtime::snapshot_device_v2_6::{
     SnapshotV2StorageRestorePlan,
 };
 use bangbang_runtime::snapshot_diff_v2_13::{
-    SnapshotV2DiffBase, SnapshotV2DiffLayerBinding, SnapshotV2DiffSelection,
-    SnapshotV2DiffWriteError, SnapshotV2DiffWriteStage,
+    NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION, SnapshotV2DiffBase, SnapshotV2DiffLayerBinding,
+    SnapshotV2DiffSelection, SnapshotV2DiffWriteError, SnapshotV2DiffWriteStage,
 };
 use bangbang_runtime::snapshot_entropy_v2_8::{
     NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2EntropyTransport,
@@ -560,6 +563,18 @@ pub(crate) struct ProcessSnapshotV2VsockLoadRequest<'a> {
     pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
+pub(crate) struct ProcessSnapshotV2DiffLoadRequest<'a> {
+    pub(crate) controller: &'a VmmController,
+    pub(crate) vmnet_authority: ProcessVmnetAuthority,
+    #[cfg(target_os = "macos")]
+    pub(crate) contained_restore_authority: Option<&'a ContainedSnapshotRestoreAuthority>,
+    pub(crate) pci_enabled: bool,
+    pub(crate) input: &'a SnapshotLoadInput,
+    pub(crate) candidate: NativeV2DiffSnapshotCandidateState,
+    pub(crate) memory: GuestMemory,
+    pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
 pub(crate) trait InstanceStartExecutor {
     type Session: ProcessSessionDiagnostics;
 
@@ -698,6 +713,24 @@ pub(crate) trait InstanceStartExecutor {
         Err(NativeV2SnapshotPublicationError::ConfigurationUnavailable)
     }
 
+    fn publish_snapshot_v2_diff(
+        &mut self,
+        _session: &mut Self::Session,
+        _request: NativeV2SnapshotPublicationRequest,
+        _paths: &SnapshotArtifactPaths,
+    ) -> Result<NativeV2DiffSnapshotPublicationOutcome, NativeV2SnapshotPublicationError> {
+        Err(NativeV2SnapshotPublicationError::ConfigurationUnavailable)
+    }
+
+    fn publish_snapshot_v2_diff_to(
+        &mut self,
+        _session: &mut Self::Session,
+        _request: NativeV2SnapshotPublicationRequest,
+        _outputs: SnapshotArtifactOutputs,
+    ) -> Result<NativeV2DiffSnapshotPublicationOutcome, NativeV2SnapshotPublicationError> {
+        Err(NativeV2SnapshotPublicationError::ConfigurationUnavailable)
+    }
+
     fn load_snapshot_v1(
         &mut self,
         controller: &VmmController,
@@ -805,6 +838,34 @@ pub(crate) trait InstanceStartExecutor {
     ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
         Err(NativeV2SnapshotLoadError::ProcessPreparation(
             BackendError::InvalidState("native-v2 vsock snapshot loading is unavailable"),
+        ))
+    }
+
+    fn load_prepared_snapshot_v2_diff(
+        &mut self,
+        _request: ProcessSnapshotV2DiffLoadRequest<'_>,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        Err(NativeV2SnapshotLoadError::ProcessPreparation(
+            BackendError::InvalidState("native-v2 differential snapshot loading is unavailable"),
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn load_prepared_snapshot_v2_current_product(
+        &mut self,
+        _controller: &VmmController,
+        _vmnet_authority: ProcessVmnetAuthority,
+        _contained_restore_authority: Option<&ContainedSnapshotRestoreAuthority>,
+        _pci_enabled: bool,
+        _input: &SnapshotLoadInput,
+        _platform: HvfSnapshotV2PlatformState,
+        _candidate: PreparedNativeV2CurrentSnapshotCandidateState,
+        _memory: GuestMemory,
+        _cancellation: NativeV2SnapshotCaptureCancellation,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        Err(NativeV2SnapshotLoadError::ProcessPreparation(
+            BackendError::InvalidState("native-v2 current-product loading is unavailable"),
         ))
     }
 
@@ -3478,7 +3539,7 @@ impl fmt::Display for NativeV2VsockDestinationLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "native-v2 2.12 {:?} vsock destination transaction failed ({})",
+            "native-v2 exact-2.12/2.13 {:?} current-product destination transaction failed ({})",
             self.transport,
             if self.terminal {
                 "terminal"
@@ -3856,14 +3917,14 @@ impl fmt::Display for NativeV2SnapshotLoadError {
             Self::VsockPreparation(source) => {
                 write!(
                     formatter,
-                    "native-v2 2.12 vsock topology preparation failed: {source}"
+                    "native-v2 exact-2.12/2.13 vsock topology preparation failed: {source}"
                 )
             }
             #[cfg(target_os = "macos")]
             Self::VsockRestoreResources(source) => {
                 write!(
                     formatter,
-                    "native-v2 2.12 process resource preparation failed: {source}"
+                    "native-v2 exact-2.12/2.13 process resource preparation failed: {source}"
                 )
             }
             #[cfg(target_os = "macos")]
@@ -6798,8 +6859,11 @@ where
     }
 
     fn create_snapshot(&mut self, input: SnapshotCreateInput) -> Result<VmmData, VmmActionError> {
-        self.publish_native_v2_snapshot(&input)
-            .map_err(native_v2_snapshot_publication_action_error)?;
+        match input.snapshot_type() {
+            SnapshotType::Full => self.publish_native_v2_snapshot(&input),
+            SnapshotType::Diff => self.publish_native_v2_diff_snapshot(&input),
+        }
+        .map_err(native_v2_snapshot_publication_action_error)?;
         Ok(VmmData::Empty)
     }
 
@@ -7605,14 +7669,18 @@ where
             profile,
             NativeV2SnapshotArtifactProfile::NetworkStateV2_11
                 | NativeV2SnapshotArtifactProfile::VsockStateV2_12
+                | NativeV2SnapshotArtifactProfile::DiffStateV2_13
         ) && !input.network_overrides().is_empty()
         {
             return Err(NativeV2SnapshotLoadError::NetworkPreparation(
                 NativeV2NetworkSnapshotPreparationError::OverridesWithoutNetwork,
             ));
         }
-        if !matches!(profile, NativeV2SnapshotArtifactProfile::VsockStateV2_12)
-            && input.vsock_override().is_some()
+        if !matches!(
+            profile,
+            NativeV2SnapshotArtifactProfile::VsockStateV2_12
+                | NativeV2SnapshotArtifactProfile::DiffStateV2_13
+        ) && input.vsock_override().is_some()
         {
             return Err(NativeV2SnapshotLoadError::Preflight(
                 VmmActionError::SnapshotUnsupported,
@@ -7634,7 +7702,8 @@ where
             | NativeV2SnapshotArtifactProfile::BalloonStateV2_9
             | NativeV2SnapshotArtifactProfile::MemoryHotplugStateV2_10
             | NativeV2SnapshotArtifactProfile::NetworkStateV2_11
-            | NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
+            | NativeV2SnapshotArtifactProfile::VsockStateV2_12
+            | NativeV2SnapshotArtifactProfile::DiffStateV2_13 => {
                 self.starter
                     .preflight_snapshot_v2_root_process(self.pci_enabled)
                     .map_err(NativeV2SnapshotLoadError::Preflight)?;
@@ -7674,10 +7743,16 @@ where
             .transpose()?;
         debug_assert!(files.next().is_none());
         let artifacts = match memory {
-            Some(file) => load_prepared_native_snapshot_memory_file(state, file),
-            None => {
-                load_prepared_native_snapshot_memory_path(state, input.mem_backend().backend_path())
+            Some(file) => {
+                load_prepared_native_snapshot_memory_file_with_cancel(state, file, || {
+                    self.snapshot_capture_cancellation.is_cancelled()
+                })
             }
+            None => load_prepared_native_snapshot_memory_path_with_cancel(
+                state,
+                input.mem_backend().backend_path(),
+                || self.snapshot_capture_cancellation.is_cancelled(),
+            ),
         }
         .map_err(|source| {
             let source = NativeV2SnapshotLoadError::Artifact(source);
@@ -8055,6 +8130,45 @@ where
                 let restored = self
                     .starter
                     .load_prepared_snapshot_v2_vsock(ProcessSnapshotV2VsockLoadRequest {
+                        controller: &self.controller,
+                        vmnet_authority: self.vmnet_authority,
+                        #[cfg(target_os = "macos")]
+                        contained_restore_authority: self.contained_restore_authority.as_ref(),
+                        pci_enabled: self.pci_enabled,
+                        input,
+                        candidate,
+                        memory,
+                        cancellation: self.snapshot_capture_cancellation.clone(),
+                    })
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let (session, controller_commit) = restored.into_parts();
+                self.started_session = Some(session);
+                Ok(self.controller.commit_snapshot_v2_load(controller_commit))
+            }
+            NativeV2SnapshotArtifactProfile::DiffStateV2_13 => {
+                let (candidate, memory) = artifacts
+                    .into_v2_13_diff_candidate()
+                    .map_err(NativeV2SnapshotLoadError::ArtifactState)
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let restored = self
+                    .starter
+                    .load_prepared_snapshot_v2_diff(ProcessSnapshotV2DiffLoadRequest {
                         controller: &self.controller,
                         vmnet_authority: self.vmnet_authority,
                         #[cfg(target_os = "macos")]
@@ -9562,6 +9676,11 @@ where
         self.controller
             .preflight_create_snapshot_v2_request(input)
             .map_err(NativeV2SnapshotPublicationError::Preflight)?;
+        if input.snapshot_type() != SnapshotType::Full {
+            return Err(NativeV2SnapshotPublicationError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ));
+        }
         let NativeV2VsockCandidateProductProfile {
             input: capture_input,
             serial_config,
@@ -9616,6 +9735,82 @@ where
             None => self
                 .starter
                 .publish_snapshot_v2(session, publication, &paths)?,
+        };
+        debug_assert_eq!(
+            self.controller.instance_info().state,
+            bangbang_runtime::InstanceState::Paused
+        );
+        Ok(outcome.durability())
+    }
+
+    /// Publishes one exact-2.13 differential state/layer pair.
+    pub(crate) fn publish_native_v2_diff_snapshot(
+        &mut self,
+        input: &SnapshotCreateInput,
+    ) -> Result<SnapshotCommitDurability, NativeV2SnapshotPublicationError> {
+        self.controller
+            .preflight_create_snapshot_v2_request(input)
+            .map_err(NativeV2SnapshotPublicationError::Preflight)?;
+        if input.snapshot_type() != SnapshotType::Diff {
+            return Err(NativeV2SnapshotPublicationError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ));
+        }
+        let NativeV2VsockCandidateProductProfile {
+            input: capture_input,
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs,
+            network_configs,
+            mmds_config,
+            mmds_state,
+            vsock_config,
+            expected_transport,
+        } = self
+            .native_v2_vsock_candidate_product_profile()
+            .map_err(NativeV2SnapshotPublicationError::Profile)?;
+        let cancellation = self.snapshot_capture_cancellation.clone();
+        let _serial = self
+            .preflight_snapshot_capture_ready(cancellation.clone())
+            .map_err(SnapshotCaptureReadyPreflightError::into_native_v2)?;
+        if self.started_session.is_none() {
+            return Err(NativeV2SnapshotPublicationError::SessionUnavailable);
+        }
+
+        let paths = SnapshotArtifactPaths::new(input.snapshot_path(), input.mem_file_path());
+        let outputs = self
+            .prepare_contained_snapshot_outputs(input)
+            .map_err(NativeV2SnapshotPublicationError::Resource)?;
+        let session = self
+            .started_session
+            .as_mut()
+            .ok_or(NativeV2SnapshotPublicationError::SessionUnavailable)?;
+        let publication = NativeV2SnapshotPublicationRequest {
+            input: capture_input,
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs,
+            network_configs,
+            mmds_config,
+            mmds_state,
+            vsock_config,
+            expected_transport,
+            cancellation,
+        };
+        let outcome = match outputs {
+            Some(outputs) => {
+                self.starter
+                    .publish_snapshot_v2_diff_to(session, publication, outputs)?
+            }
+            None => self
+                .starter
+                .publish_snapshot_v2_diff(session, publication, &paths)?,
         };
         debug_assert_eq!(
             self.controller.instance_info().state,
@@ -9876,90 +10071,6 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
             })
             .map_err(NativeV2VsockCandidateProcessError::Transaction)
     }
-
-    /// Dormant exact-2.13 Diff adapter retained for #1757 activation.
-    ///
-    /// This performs complete request/product/resource preflight but is not
-    /// reachable from current public create dispatch.
-    fn publish_native_v2_diff_snapshot(
-        &mut self,
-        input: &SnapshotCreateInput,
-    ) -> Result<SnapshotCommitDurability, NativeV2SnapshotPublicationError> {
-        if self.controller.instance_info().state != bangbang_runtime::InstanceState::Paused {
-            return Err(NativeV2SnapshotPublicationError::Preflight(
-                VmmActionError::UnsupportedState {
-                    action: "CreateSnapshot",
-                    state: self.controller.instance_info().state,
-                },
-            ));
-        }
-        if input.snapshot_type() != SnapshotType::Diff {
-            return Err(NativeV2SnapshotPublicationError::Preflight(
-                VmmActionError::SnapshotUnsupported,
-            ));
-        }
-        let NativeV2VsockCandidateProductProfile {
-            input: capture_input,
-            serial_config,
-            entropy_config,
-            balloon_config,
-            memory_hotplug_config,
-            memory_hotplug_requested_size_mib,
-            storage_configs,
-            network_configs,
-            mmds_config,
-            mmds_state,
-            vsock_config,
-            expected_transport,
-        } = self
-            .native_v2_vsock_candidate_product_profile()
-            .map_err(NativeV2SnapshotPublicationError::Profile)?;
-        let cancellation = self.snapshot_capture_cancellation.clone();
-        let _serial = self
-            .preflight_snapshot_capture_ready(cancellation.clone())
-            .map_err(SnapshotCaptureReadyPreflightError::into_native_v2)?;
-        if self.started_session.is_none() {
-            return Err(NativeV2SnapshotPublicationError::SessionUnavailable);
-        }
-
-        let paths = SnapshotArtifactPaths::new(input.snapshot_path(), input.mem_file_path());
-        let outputs = self
-            .prepare_contained_snapshot_outputs(input)
-            .map_err(NativeV2SnapshotPublicationError::Resource)?;
-        let publication = NativeV2SnapshotPublicationRequest {
-            input: capture_input,
-            serial_config,
-            entropy_config,
-            balloon_config,
-            memory_hotplug_config,
-            memory_hotplug_requested_size_mib,
-            storage_configs,
-            network_configs,
-            mmds_config,
-            mmds_state,
-            vsock_config,
-            expected_transport,
-            cancellation,
-        };
-        let session = self
-            .started_session
-            .as_mut()
-            .and_then(HvfProcessSession::boot_mut)
-            .ok_or(NativeV2SnapshotPublicationError::ConfigurationUnavailable)?;
-        let outcome = match outputs {
-            Some(outputs) => session
-                .publish_native_v2_diff_snapshot_to(publication, outputs)
-                .map_err(NativeV2SnapshotPublicationError::Transaction)?,
-            None => session
-                .publish_native_v2_diff_snapshot(publication, &paths)
-                .map_err(NativeV2SnapshotPublicationError::Transaction)?,
-        };
-        debug_assert_eq!(
-            self.controller.instance_info().state,
-            bangbang_runtime::InstanceState::Paused
-        );
-        Ok(outcome.durability())
-    }
 }
 
 // Keep the frozen, intentionally non-dispatched native-v1 writer type-checked
@@ -9969,14 +10080,6 @@ const _: fn(
     &SnapshotCreateInput,
 ) -> Result<SnapshotCommitDurability, NativeV1SnapshotPublicationError> =
     ProcessVmm::<HvfInstanceStartExecutor>::publish_native_v1_snapshot;
-
-// Keep the complete exact-2.13 Diff direct/contained adapter type-checked
-// without advancing current public create dispatch beyond exact 2.12.
-const _: fn(
-    &mut ProcessVmm<HvfInstanceStartExecutor>,
-    &SnapshotCreateInput,
-) -> Result<SnapshotCommitDurability, NativeV2SnapshotPublicationError> =
-    ProcessVmm::<HvfInstanceStartExecutor>::publish_native_v2_diff_snapshot;
 
 // Keep the focused exact-2.4 root candidate seam type-checked alongside the
 // public artifact transaction used by create/load dispatch.
@@ -10008,7 +10111,7 @@ const _: fn(
     -> Result<NativeV2NetworkSnapshotCandidateState, NativeV2NetworkCandidateProcessError> =
     ProcessVmm::<HvfInstanceStartExecutor>::capture_native_v2_network_candidate;
 
-// Keep the current exact-2.12 vsock candidate seam type-checked alongside the
+// Keep the exact-2.12 Full vsock candidate seam type-checked alongside the
 // public create, load, and artifact-authority transaction.
 const _: fn(
     &mut ProcessVmm<HvfInstanceStartExecutor>,
@@ -10206,6 +10309,9 @@ impl HvfInstanceStartExecutor {
             NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
                 NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
             }
+            NativeV2SnapshotArtifactProfile::DiffStateV2_13 => {
+                NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
+            }
         };
         let structural = decode_snapshot_v2_state_with_compatibility_version(bytes, version)
             .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
@@ -10248,6 +10354,10 @@ impl HvfInstanceStartExecutor {
             }
             NativeV2SnapshotArtifactProfile::VsockStateV2_12 => {
                 decode_hvf_snapshot_v2_vsock_state(&structural)
+                    .map_err(NativeV2SnapshotLoadError::Decode)?;
+            }
+            NativeV2SnapshotArtifactProfile::DiffStateV2_13 => {
+                decode_hvf_snapshot_v2_diff_state(&structural)
                     .map_err(NativeV2SnapshotLoadError::Decode)?;
             }
         }
@@ -14921,6 +15031,32 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             .map_err(NativeV2SnapshotPublicationError::Transaction)
     }
 
+    fn publish_snapshot_v2_diff(
+        &mut self,
+        session: &mut Self::Session,
+        request: NativeV2SnapshotPublicationRequest,
+        paths: &SnapshotArtifactPaths,
+    ) -> Result<NativeV2DiffSnapshotPublicationOutcome, NativeV2SnapshotPublicationError> {
+        session
+            .boot_mut()
+            .ok_or(NativeV2SnapshotPublicationError::ConfigurationUnavailable)?
+            .publish_native_v2_diff_snapshot(request, paths)
+            .map_err(NativeV2SnapshotPublicationError::Transaction)
+    }
+
+    fn publish_snapshot_v2_diff_to(
+        &mut self,
+        session: &mut Self::Session,
+        request: NativeV2SnapshotPublicationRequest,
+        outputs: SnapshotArtifactOutputs,
+    ) -> Result<NativeV2DiffSnapshotPublicationOutcome, NativeV2SnapshotPublicationError> {
+        session
+            .boot_mut()
+            .ok_or(NativeV2SnapshotPublicationError::ConfigurationUnavailable)?
+            .publish_native_v2_diff_snapshot_to(request, outputs)
+            .map_err(NativeV2SnapshotPublicationError::Transaction)
+    }
+
     fn load_snapshot_v1(
         &mut self,
         controller: &VmmController,
@@ -16124,12 +16260,6 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 VmmActionError::SnapshotUnsupported,
             ));
         }
-        let boot = native_v2_boot_source_config(platform.machine().boot())
-            .map_err(NativeV2SnapshotLoadError::BootMetadata)?;
-        let machine = snapshot_destination_machine_config(
-            platform.machine().machine(),
-            input.track_dirty_pages(),
-        );
         drop((
             graph,
             serial,
@@ -16151,6 +16281,149 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 |_| cancellation.is_cancelled(),
             )
             .map_err(NativeV2SnapshotLoadError::VsockPreparation)?;
+        self.load_prepared_snapshot_v2_current_product(
+            controller,
+            vmnet_authority,
+            contained_restore_authority,
+            pci_enabled,
+            input,
+            platform,
+            candidate,
+            memory,
+            cancellation,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_prepared_snapshot_v2_diff(
+        &mut self,
+        request: ProcessSnapshotV2DiffLoadRequest<'_>,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        let ProcessSnapshotV2DiffLoadRequest {
+            controller,
+            vmnet_authority,
+            contained_restore_authority,
+            pci_enabled,
+            input,
+            candidate,
+            memory,
+            cancellation,
+        } = request;
+        self.preflight_snapshot_v2_root_process(pci_enabled)
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+        let expected_transport = if pci_enabled {
+            SnapshotV2DeviceTransportKind::Pci
+        } else {
+            SnapshotV2DeviceTransportKind::Mmio
+        };
+
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            candidate.bytes(),
+            NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+        )
+        .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
+        let decoded = decode_hvf_snapshot_v2_diff_state(&structural)
+            .map_err(NativeV2SnapshotLoadError::Decode)?;
+        if decoded.platform().memory() != candidate.result_binding()
+            || decoded.device_graph() != candidate.device_graph()
+            || decoded.serial() != candidate.serial()
+            || decoded.entropy() != candidate.entropy()
+            || decoded.balloon() != candidate.balloon()
+            || decoded.memory_hotplug() != candidate.memory_hotplug()
+            || decoded.network() != candidate.network()
+            || decoded.vsock() != candidate.vsock()
+            || decoded.layer() != candidate.layer_binding()
+        {
+            return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+        }
+        let (platform, graph, serial, entropy, balloon, memory_hotplug, network, vsock, layer) =
+            decoded.into_parts();
+        if graph
+            .as_ref()
+            .is_some_and(|graph| graph.transport_kind() != expected_transport)
+            || entropy
+                .as_ref()
+                .is_some_and(|state| state.transport().kind() != expected_transport)
+            || balloon
+                .as_ref()
+                .is_some_and(|state| state.transport().kind() != expected_transport)
+            || memory_hotplug
+                .as_ref()
+                .is_some_and(|state| state.transport().kind() != expected_transport)
+            || network.as_ref().is_some_and(|state| {
+                state
+                    .interfaces()
+                    .iter()
+                    .any(|interface| interface.transport().kind() != expected_transport)
+            })
+            || vsock
+                .as_ref()
+                .is_some_and(|state| state.transport().kind() != expected_transport)
+        {
+            return Err(NativeV2SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ));
+        }
+        drop((
+            graph,
+            serial,
+            entropy,
+            balloon,
+            memory_hotplug,
+            network,
+            vsock,
+            layer,
+        ));
+
+        // The state/layer/result closure has already completed. Selector
+        // resolution and resource planning still remain owner-free here.
+        let candidate = candidate
+            .prepare_with_cancel(
+                &memory,
+                expected_transport,
+                input.network_overrides(),
+                input.vsock_override(),
+                |_| cancellation.is_cancelled(),
+            )
+            .map_err(NativeV2SnapshotLoadError::VsockPreparation)?;
+        self.load_prepared_snapshot_v2_current_product(
+            controller,
+            vmnet_authority,
+            contained_restore_authority,
+            pci_enabled,
+            input,
+            platform,
+            candidate,
+            memory,
+            cancellation,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn load_prepared_snapshot_v2_current_product(
+        &mut self,
+        controller: &VmmController,
+        vmnet_authority: ProcessVmnetAuthority,
+        contained_restore_authority: Option<&ContainedSnapshotRestoreAuthority>,
+        pci_enabled: bool,
+        input: &SnapshotLoadInput,
+        platform: HvfSnapshotV2PlatformState,
+        candidate: PreparedNativeV2CurrentSnapshotCandidateState,
+        memory: GuestMemory,
+        cancellation: NativeV2SnapshotCaptureCancellation,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        let expected_transport = if pci_enabled {
+            SnapshotV2DeviceTransportKind::Pci
+        } else {
+            SnapshotV2DeviceTransportKind::Mmio
+        };
+        let boot = native_v2_boot_source_config(platform.machine().boot())
+            .map_err(NativeV2SnapshotLoadError::BootMetadata)?;
+        let machine = snapshot_destination_machine_config(
+            platform.machine().machine(),
+            input.track_dirty_pages(),
+        );
         let resource_plan =
             prepare_process_snapshot_v2_vsock_resource_plan(candidate, vmnet_authority)
                 .map_err(NativeV2SnapshotLoadError::VsockRestoreResources)?;
@@ -21468,7 +21741,7 @@ impl fmt::Display for ProcessSnapshotV2VsockRestoreResourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "exact-2.12 process restore resources failed at {:?} ({:?})",
+            "native-v2 exact-2.12/2.13 process restore resources failed at {:?} ({:?})",
             self.stage, self.disposition
         )?;
         if self.cleanup_uncertain {
@@ -21498,7 +21771,8 @@ impl std::error::Error for ProcessSnapshotV2VsockRestoreResourceError {
     }
 }
 
-/// Complete value-only exact-2.12 process resource plan.
+/// Complete value-only process resource plan shared by exact-2.12 Full and
+/// exact-2.13 Diff.
 pub(crate) struct PreparedProcessSnapshotV2VsockResourcePlan {
     bytes: Vec<u8>,
     binding: SnapshotV2MemoryBinding,
@@ -24034,7 +24308,7 @@ impl<E> fmt::Display for ProcessSnapshotV2VsockAdoptionError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "exact-2.12 vsock resource adoption failed ({:?})",
+            "native-v2 exact-2.12/2.13 vsock resource adoption failed ({:?})",
             self.disposition()
         )
     }
@@ -24303,7 +24577,7 @@ enum ProcessSnapshotV2VsockMmioRestoreDisposition {
     TerminalCleanup,
 }
 
-/// Bounded process-level failure for one exact-2.12 MMIO owner transaction.
+/// Bounded process-level failure for one exact-2.12/2.13 MMIO owner transaction.
 struct ProcessSnapshotV2VsockMmioRestoreError {
     stage: ProcessSnapshotV2VsockMmioRestoreStage,
     disposition: ProcessSnapshotV2VsockMmioRestoreDisposition,
@@ -24435,7 +24709,7 @@ impl fmt::Display for ProcessSnapshotV2VsockMmioRestoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "exact-2.12 process MMIO vsock reconstruction failed at {:?} ({:?})",
+            "native-v2 exact-2.12/2.13 process MMIO reconstruction failed at {:?} ({:?})",
             self.stage, self.disposition
         )
     }
@@ -24443,7 +24717,7 @@ impl fmt::Display for ProcessSnapshotV2VsockMmioRestoreError {
 
 impl std::error::Error for ProcessSnapshotV2VsockMmioRestoreError {}
 
-/// Complete unpublished process/HVF exact-2.12 MMIO owner graph.
+/// Complete unpublished process/HVF exact-2.12/2.13 MMIO owner graph.
 ///
 /// Explicit shutdown preserves the irreversible lifetime order: HVF/session,
 /// active socket publication, network provider and metrics leases, file and
@@ -24725,7 +24999,7 @@ enum ProcessSnapshotV2VsockPciRestoreDisposition {
     TerminalCleanup,
 }
 
-/// Bounded process-level failure for one exact-2.12 PCI owner transaction.
+/// Bounded process-level failure for one exact-2.12/2.13 PCI owner transaction.
 struct ProcessSnapshotV2VsockPciRestoreError {
     stage: ProcessSnapshotV2VsockPciRestoreStage,
     disposition: ProcessSnapshotV2VsockPciRestoreDisposition,
@@ -24856,7 +25130,7 @@ impl fmt::Display for ProcessSnapshotV2VsockPciRestoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "exact-2.12 process PCI vsock reconstruction failed at {:?} ({:?})",
+            "native-v2 exact-2.12/2.13 process PCI reconstruction failed at {:?} ({:?})",
             self.stage, self.disposition
         )
     }
@@ -24864,7 +25138,7 @@ impl fmt::Display for ProcessSnapshotV2VsockPciRestoreError {
 
 impl std::error::Error for ProcessSnapshotV2VsockPciRestoreError {}
 
-/// Complete unpublished process/HVF exact-2.12 PCI owner graph.
+/// Complete unpublished process/HVF exact-2.12/2.13 PCI owner graph.
 ///
 /// Explicit shutdown preserves the irreversible lifetime order: HVF/session,
 /// active socket publication, network provider and metrics leases, file and
@@ -26006,7 +26280,7 @@ where
             PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
                 state,
                 binding.clone(),
-                NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+                binding.version(),
             )
         })
         .transpose()
@@ -26844,7 +27118,7 @@ where
             PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
                 state,
                 binding.clone(),
-                NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+                binding.version(),
             )
         })
         .transpose()
@@ -35463,14 +35737,15 @@ mod tests {
     };
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotPublicationOutcome,
-        NativeV2BalloonSnapshotCandidateState, NativeV2DiffSnapshotPublicationOutcome,
-        NativeV2EntropySnapshotCandidateState, NativeV2MemoryHotplugSnapshotCandidateState,
-        NativeV2MemoryHotplugSnapshotPreparation, NativeV2NetworkSnapshotCandidateState,
-        NativeV2NetworkSnapshotPreparation, NativeV2SnapshotArtifactProfile,
-        NativeV2VsockSnapshotCandidateState, NativeV2VsockSnapshotPreparationError,
-        PreparedNativeSnapshotState, PreparedNativeV2NetworkSnapshotCandidateState,
-        PreparedNativeV2VsockSnapshotCandidateState, SnapshotArtifactOutputs,
-        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
+        NativeV2BalloonSnapshotCandidateState, NativeV2DiffSnapshotCandidateState,
+        NativeV2DiffSnapshotPublicationOutcome, NativeV2EntropySnapshotCandidateState,
+        NativeV2MemoryHotplugSnapshotCandidateState, NativeV2MemoryHotplugSnapshotPreparation,
+        NativeV2NetworkSnapshotCandidateState, NativeV2NetworkSnapshotPreparation,
+        NativeV2SnapshotArtifactProfile, NativeV2VsockSnapshotCandidateState,
+        NativeV2VsockSnapshotPreparationError, PreparedNativeSnapshotState,
+        PreparedNativeV2NetworkSnapshotCandidateState, PreparedNativeV2VsockSnapshotCandidateState,
+        SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotPublicationOutcome,
+        publish_snapshot_artifacts_with,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_artifact::{
@@ -35612,13 +35887,14 @@ mod tests {
         NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
         NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
         NativeV2BalloonCandidateCaptureRequest, NativeV2BalloonCandidateProfileError,
-        NativeV2DiffCapturePreparation, NativeV2EntropyCandidateCaptureRequest,
-        NativeV2EntropyCandidateProfileError, NativeV2MemoryHotplugCandidateCaptureRequest,
-        NativeV2MemoryHotplugCandidateProfileError, NativeV2MultiBlockCandidateProfileError,
-        NativeV2NetworkCandidateProfileError, NativeV2RootCandidateProcessError,
-        NativeV2RootCandidateProfileError, NativeV2SerialCandidateProfileError,
-        NativeV2SnapshotBalloonCaptureError, NativeV2SnapshotCaptureCancellation,
-        NativeV2SnapshotCaptureError, NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
+        NativeV2DiffCapturePreparation, NativeV2DiffSnapshotPublicationDestination,
+        NativeV2EntropyCandidateCaptureRequest, NativeV2EntropyCandidateProfileError,
+        NativeV2MemoryHotplugCandidateCaptureRequest, NativeV2MemoryHotplugCandidateProfileError,
+        NativeV2MultiBlockCandidateProfileError, NativeV2NetworkCandidateProfileError,
+        NativeV2RootCandidateProcessError, NativeV2RootCandidateProfileError,
+        NativeV2SerialCandidateProfileError, NativeV2SnapshotBalloonCaptureError,
+        NativeV2SnapshotCaptureCancellation, NativeV2SnapshotCaptureError,
+        NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
         NativeV2SnapshotEntropyCaptureError, NativeV2SnapshotLoadError,
         NativeV2SnapshotMemoryHotplugCaptureError, NativeV2SnapshotMultiBlockCaptureError,
         NativeV2SnapshotNetworkCaptureError, NativeV2SnapshotPublicationDestination,
@@ -35631,17 +35907,17 @@ mod tests {
         ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
         ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
         ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessSnapshotV2BalloonLoadRequest,
-        ProcessSnapshotV2EntropyLoadRequest, ProcessSnapshotV2MemoryHotplugLoadRequest,
-        ProcessSnapshotV2MultiBlockLoadRequest, ProcessSnapshotV2MultiBlockLoadSuccess,
-        ProcessSnapshotV2NetworkLoadRequest, ProcessSnapshotV2NetworkRestorePlanError,
-        ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
-        ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2SerialLoadRequest,
-        ProcessSnapshotV2StorageLoadRequest, ProcessSnapshotV2StorageLoadSuccess,
-        ProcessSnapshotV2VsockLoadRequest, ProcessVmm, ProcessVmnetAuthority,
-        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
-        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
-        prepare_process_snapshot_v2_network_restore_plan,
+        ProcessSnapshotV2DiffLoadRequest, ProcessSnapshotV2EntropyLoadRequest,
+        ProcessSnapshotV2MemoryHotplugLoadRequest, ProcessSnapshotV2MultiBlockLoadRequest,
+        ProcessSnapshotV2MultiBlockLoadSuccess, ProcessSnapshotV2NetworkLoadRequest,
+        ProcessSnapshotV2NetworkRestorePlanError, ProcessSnapshotV2RootLoadCompletion,
+        ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess,
+        ProcessSnapshotV2SerialLoadRequest, ProcessSnapshotV2StorageLoadRequest,
+        ProcessSnapshotV2StorageLoadSuccess, ProcessSnapshotV2VsockLoadRequest, ProcessVmm,
+        ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
+        SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
+        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        native_v2_platform_capture_is_terminal, prepare_process_snapshot_v2_network_restore_plan,
         prepare_process_snapshot_v2_vsock_candidate, require_native_v1_composite_record,
         snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
@@ -36972,6 +37248,213 @@ mod tests {
             .map_err(|source| NativeV2SnapshotPublicationError::Transaction(Box::new(source)))
     }
 
+    fn publish_fake_native_v2_diff_snapshot(
+        session: &mut FakeSession,
+        request: NativeV2SnapshotPublicationRequest,
+        destination: NativeV2DiffSnapshotPublicationDestination,
+    ) -> Result<NativeV2DiffSnapshotPublicationOutcome, NativeV2SnapshotPublicationError> {
+        let NativeV2SnapshotPublicationRequest {
+            input: _,
+            serial_config,
+            entropy_config,
+            balloon_config,
+            memory_hotplug_config,
+            memory_hotplug_requested_size_mib,
+            storage_configs,
+            network_configs,
+            mmds_config,
+            vsock_config,
+            expected_transport: transport,
+            ..
+        } = request;
+        let has_block = !storage_configs.drives().is_empty();
+        let has_pmem = !storage_configs.pmem().is_empty();
+        let has_network = !network_configs.is_empty();
+        let has_vsock = vsock_config.is_some();
+        session.native_snapshot_publication_count += 1;
+        let memory_hotplug = memory_hotplug_config.map(|config| {
+            fake_native_v2_memory_hotplug_state_for_request(
+                transport,
+                config,
+                memory_hotplug_requested_size_mib,
+            )
+        });
+        let memory = fake_native_v2_publication_memory(memory_hotplug.as_ref());
+
+        destination
+            .publish(|mut writer| {
+                session.native_snapshot_producer_count += 1;
+                let selection = SnapshotV2DiffSelection::all_current(&memory)
+                    .expect("fake Diff selection should cover valid memory");
+                let layer = write_snapshot_v2_diff_layer_with_cancel(
+                    &memory,
+                    &mut writer,
+                    SnapshotV2DiffBase::Zero,
+                    &selection,
+                    |_| false,
+                )
+                .map_err(|source| {
+                    NativeV2SnapshotPublicationProducerError::Capture(
+                        NativeV2SnapshotCaptureError::Platform {
+                            source: HvfArm64BootSnapshotV2CaptureError::DiffLayer { source },
+                        },
+                    )
+                })?;
+                let memory = layer.result().encode().map_err(|source| {
+                    NativeV2SnapshotPublicationProducerError::Capture(
+                        NativeV2SnapshotCaptureError::Encode {
+                            source: HvfSnapshotV2EncodeError::Memory(source),
+                        },
+                    )
+                })?;
+                let graph = (has_block || has_pmem).then(|| {
+                    fake_native_v2_storage_device_graph(transport, has_block, has_pmem)
+                        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                        .expect("fixed fake native-v2 graph should encode")
+                });
+                let serial_device = SerialMmioDevice::discarding()
+                    .capture_state()
+                    .expect("fake serial device should capture");
+                let serial = SnapshotV2SerialState::try_from_capture_ready(
+                    CaptureReadySerialState::new(serial_config, serial_device),
+                )
+                .expect("fake serial state should capture")
+                .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+                .expect("fake serial state should encode");
+                let entropy = entropy_config.map(|_| {
+                    fake_native_v2_entropy_state(transport)
+                        .encode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION)
+                        .expect("fake entropy state should encode")
+                });
+                let balloon = balloon_config.map(|_| {
+                    fake_native_v2_balloon_state(transport)
+                        .encode(NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION)
+                        .expect("fake balloon state should encode")
+                });
+                let memory_hotplug = memory_hotplug.as_ref().map(|state| {
+                    state
+                        .encode(NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION)
+                        .expect("fake virtio-mem state should encode")
+                });
+                let network = has_network.then(|| {
+                    let state = fake_native_v2_network_state(transport);
+                    let state = if mmds_config.is_none() && state.mmds().is_some() {
+                        let (interfaces, _) = state.into_parts();
+                        let interfaces = interfaces
+                            .into_iter()
+                            .map(|interface| {
+                                let parts = interface.into_parts();
+                                SnapshotV2NetworkInterfaceState::try_from_parts(
+                                    SnapshotV2NetworkInterfaceStateParts {
+                                        backend: SnapshotV2NetworkBackendClass::Vmnet,
+                                        ..parts
+                                    },
+                                )
+                                .expect("fake provider-backed network interface should validate")
+                            })
+                            .collect();
+                        SnapshotV2NetworkState::try_new(interfaces, None)
+                            .expect("fake network state without MMDS should validate")
+                    } else {
+                        state
+                    };
+                    state
+                        .encode(NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION)
+                        .expect("fake network state should encode")
+                });
+                let vsock = has_vsock.then(|| {
+                    fake_native_v2_vsock_state(transport)
+                        .encode(NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION)
+                        .expect("fake vsock state should encode")
+                });
+                let diff = layer.encode().map_err(|source| {
+                    NativeV2SnapshotPublicationProducerError::Capture(
+                        NativeV2SnapshotCaptureError::Encode {
+                            source: HvfSnapshotV2EncodeError::DiffLayer(source),
+                        },
+                    )
+                })?;
+                let mut components = Vec::with_capacity(9);
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_MEMORY_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    &memory,
+                ));
+                if let Some(graph) = &graph {
+                    components.push(SnapshotV2Component::new(
+                        NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+                        SnapshotV2ComponentDisposition::Semantic,
+                        graph,
+                    ));
+                }
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_SERIAL_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    &serial,
+                ));
+                if let Some(entropy) = &entropy {
+                    components.push(SnapshotV2Component::new(
+                        NATIVE_V2_ENTROPY_COMPONENT_KEY,
+                        SnapshotV2ComponentDisposition::Semantic,
+                        entropy,
+                    ));
+                }
+                if let Some(balloon) = &balloon {
+                    components.push(SnapshotV2Component::new(
+                        NATIVE_V2_BALLOON_COMPONENT_KEY,
+                        SnapshotV2ComponentDisposition::Semantic,
+                        balloon,
+                    ));
+                }
+                if let Some(memory_hotplug) = &memory_hotplug {
+                    components.push(SnapshotV2Component::new(
+                        NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY,
+                        SnapshotV2ComponentDisposition::Semantic,
+                        memory_hotplug,
+                    ));
+                }
+                if let Some(network) = &network {
+                    components.push(SnapshotV2Component::new(
+                        NATIVE_V2_NETWORK_COMPONENT_KEY,
+                        SnapshotV2ComponentDisposition::Semantic,
+                        network,
+                    ));
+                }
+                if let Some(vsock) = &vsock {
+                    components.push(SnapshotV2Component::new(
+                        NATIVE_V2_VSOCK_COMPONENT_KEY,
+                        SnapshotV2ComponentDisposition::Semantic,
+                        vsock,
+                    ));
+                }
+                components.push(SnapshotV2Component::new(
+                    NATIVE_V2_DIFF_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    &diff,
+                ));
+                let encoded = encode_snapshot_v2_state_with_compatibility_version(
+                    NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+                    &[],
+                    &components,
+                )
+                .map_err(|source| {
+                    NativeV2SnapshotPublicationProducerError::Capture(
+                        NativeV2SnapshotCaptureError::Encode {
+                            source: HvfSnapshotV2EncodeError::Container(source),
+                        },
+                    )
+                })?;
+                NativeV2DiffSnapshotCandidateState::from_diff_state_v2_13(encoded, layer)
+                    .map(NativeV2DiffSnapshotCandidateState::into_publication_state)
+                    .map_err(|source| {
+                        NativeV2SnapshotPublicationProducerError::Capture(
+                            NativeV2SnapshotCaptureError::DiffCandidateState { source },
+                        )
+                    })
+            })
+            .map_err(|source| NativeV2SnapshotPublicationError::Transaction(Box::new(source)))
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct DiagnosticSession {
         status: BootRunLoopMetricStatus,
@@ -37465,6 +37948,40 @@ mod tests {
                 session,
                 request,
                 NativeV2SnapshotPublicationDestination::Outputs(outputs),
+            )
+        }
+
+        fn publish_snapshot_v2_diff(
+            &mut self,
+            session: &mut Self::Session,
+            request: NativeV2SnapshotPublicationRequest,
+            paths: &SnapshotArtifactPaths,
+        ) -> Result<NativeV2DiffSnapshotPublicationOutcome, NativeV2SnapshotPublicationError>
+        {
+            if self.snapshot_publication_failure {
+                return Err(NativeV2SnapshotPublicationError::ConfigurationUnavailable);
+            }
+            publish_fake_native_v2_diff_snapshot(
+                session,
+                request,
+                NativeV2DiffSnapshotPublicationDestination::Paths(paths.clone()),
+            )
+        }
+
+        fn publish_snapshot_v2_diff_to(
+            &mut self,
+            session: &mut Self::Session,
+            request: NativeV2SnapshotPublicationRequest,
+            outputs: SnapshotArtifactOutputs,
+        ) -> Result<NativeV2DiffSnapshotPublicationOutcome, NativeV2SnapshotPublicationError>
+        {
+            if self.snapshot_publication_failure {
+                return Err(NativeV2SnapshotPublicationError::ConfigurationUnavailable);
+            }
+            publish_fake_native_v2_diff_snapshot(
+                session,
+                request,
+                NativeV2DiffSnapshotPublicationDestination::Outputs(outputs),
             )
         }
 
@@ -38690,6 +39207,90 @@ mod tests {
                 ),
                 input.resume_vm(),
             );
+            let session = match self.result {
+                FakeSnapshotLoadResult::ResumeFailure => FakeSession::with_resume_result(
+                    77,
+                    BackendError::Hypervisor("private-resume-sentinel".to_owned()),
+                ),
+                FakeSnapshotLoadResult::Success | FakeSnapshotLoadResult::Terminal => {
+                    FakeSession::new(77)
+                }
+            };
+            Ok(SnapshotV2LoadSuccess::new(session, commit))
+        }
+
+        fn load_prepared_snapshot_v2_diff(
+            &mut self,
+            request: ProcessSnapshotV2DiffLoadRequest<'_>,
+        ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+            let ProcessSnapshotV2DiffLoadRequest {
+                controller,
+                vmnet_authority,
+                #[cfg(target_os = "macos")]
+                    contained_restore_authority: _,
+                pci_enabled,
+                input,
+                candidate,
+                memory,
+                cancellation,
+            } = request;
+            let expected_transport = if pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            };
+            if candidate.version() != NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
+                || candidate
+                    .device_graph()
+                    .is_some_and(|graph| graph.transport_kind() != expected_transport)
+                || candidate
+                    .entropy()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+                || candidate
+                    .balloon()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+                || candidate
+                    .memory_hotplug()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+                || candidate.network().is_some_and(|state| {
+                    state
+                        .interfaces()
+                        .iter()
+                        .any(|interface| interface.transport().kind() != expected_transport)
+                })
+                || candidate
+                    .vsock()
+                    .is_some_and(|state| state.transport().kind() != expected_transport)
+            {
+                return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+            }
+            let candidate = candidate
+                .prepare(
+                    &memory,
+                    expected_transport,
+                    input.network_overrides(),
+                    input.vsock_override(),
+                )
+                .map_err(NativeV2SnapshotLoadError::VsockPreparation)?;
+            if candidate.version() != NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION {
+                return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+            }
+            if !cancellation.try_seal_commit() {
+                return Err(NativeV2SnapshotLoadError::Cancelled);
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.last_vmnet_authority = Some(vmnet_authority);
+            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            if self.result == FakeSnapshotLoadResult::Terminal {
+                return Err(NativeV2SnapshotLoadError::ProcessTerminal);
+            }
+
+            let boot_source = BootSourceConfigInput::new("/private/restored-vmlinux")
+                .validate()
+                .expect("fake restored boot source should validate");
+            let machine =
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages());
+            let commit = SnapshotV2ControllerCommit::new(machine, boot_source, input.resume_vm());
             let session = match self.result {
                 FakeSnapshotLoadResult::ResumeFailure => FakeSession::with_resume_result(
                     77,
@@ -44499,6 +45100,60 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn native_v2_diff_snapshot_load_fixture(
+        name: &str,
+        resume_vm: bool,
+    ) -> (TempSnapshotDirectory, SnapshotLoadInput) {
+        native_v2_diff_snapshot_load_fixture_with_memory_hotplug(name, resume_vm, None)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_v2_diff_snapshot_load_fixture_with_memory_hotplug(
+        name: &str,
+        resume_vm: bool,
+        memory_hotplug: Option<(MemoryHotplugConfig, u64)>,
+    ) -> (TempSnapshotDirectory, SnapshotLoadInput) {
+        let directory = TempSnapshotDirectory::new(name);
+        let paths = directory.paths();
+        let mut session = FakeSession::new(0);
+        let (memory_hotplug_config, memory_hotplug_requested_size_mib) = memory_hotplug
+            .map_or((None, 0), |(config, requested_size_mib)| {
+                (Some(config), requested_size_mib)
+            });
+        publish_fake_native_v2_diff_snapshot(
+            &mut session,
+            NativeV2SnapshotPublicationRequest {
+                input: native_v2_test_capture_input(),
+                serial_config: SerialConfig::default(),
+                entropy_config: None,
+                balloon_config: None,
+                memory_hotplug_config,
+                memory_hotplug_requested_size_mib,
+                storage_configs: native_v2_root_storage_configs(),
+                network_configs: Vec::new(),
+                mmds_config: None,
+                mmds_state: MmdsStateHandle::new(bangbang_runtime::mmds::MmdsState::new(
+                    bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                )),
+                vsock_config: None,
+                expected_transport: SnapshotV2DeviceTransportKind::Mmio,
+                cancellation: NativeV2SnapshotCaptureCancellation::default(),
+            },
+            NativeV2DiffSnapshotPublicationDestination::Paths(paths.clone()),
+        )
+        .expect("native-v2 Diff load fixture should publish");
+        let input = SnapshotLoadInput::new(
+            paths.state().to_path_buf(),
+            SnapshotMemoryBackend::new(
+                paths.memory().to_path_buf(),
+                SnapshotMemoryBackendType::File,
+            ),
+        )
+        .with_resume_vm(resume_vm);
+        (directory, input)
+    }
+
+    #[cfg(target_os = "macos")]
     fn native_v2_balloon_snapshot_load_fixture(
         name: &str,
         resume_vm: bool,
@@ -44958,6 +45613,60 @@ mod tests {
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
             "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn public_native_v2_diff_load_materializes_zero_root_and_dispatches_paused_session() {
+        let (snapshot, load) =
+            native_v2_diff_snapshot_load_fixture("public-diff-load-paused", false);
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let calls = starter.calls();
+        let mut vmm = ProcessVmm::with_starter("demo-diff", "0.1.0", "bangbang", starter);
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::LoadSnapshot(load)),
+            Ok(VmmData::Empty)
+        );
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("public Diff load should retain one session")
+                .resume_count,
+            0
+        );
+        assert!(vmm.controller.boot_source_config().is_some());
+        snapshot.assert_no_staging();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn public_native_v2_diff_load_materializes_dynamic_memory_hotplug_topology() {
+        const MIB: u64 = 1024 * 1024;
+
+        let memory_hotplug =
+            fake_native_v2_memory_hotplug_state(SnapshotV2DeviceTransportKind::Mmio);
+        let requested_size_mib = memory_hotplug.config_space().requested_size() / MIB;
+        let (snapshot, load) = native_v2_diff_snapshot_load_fixture_with_memory_hotplug(
+            "public-diff-memory-hotplug-load",
+            false,
+            Some((memory_hotplug.config(), requested_size_mib)),
+        );
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let calls = starter.calls();
+        let mut vmm =
+            ProcessVmm::with_starter("demo-diff-memory-hotplug", "0.1.0", "bangbang", starter);
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::LoadSnapshot(load)),
+            Ok(VmmData::Empty)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        snapshot.assert_no_staging();
     }
 
     #[test]
@@ -55247,22 +55956,37 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn runtime_snapshot_create_policy_admits_network_without_session_barrier() {
+        let diff_directory = TempSnapshotDirectory::new("native-v2-diff-policy");
+        let diff_paths = diff_directory.paths();
         let mut diff = configured_vmm(FakeStarter::success(15));
         diff.handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
         diff.handle_action(VmmAction::Pause)
             .expect("running instance should pause");
         assert_eq!(
-            diff.handle_action(snapshot_create_action(SnapshotType::Diff)),
-            Err(VmmActionError::SnapshotUnsupported)
+            diff.handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Diff,
+                diff_paths.state(),
+                diff_paths.memory(),
+            ))),
+            Ok(VmmData::Empty)
         );
+        let diff_session = diff
+            .started_session
+            .as_ref()
+            .expect("session should remain available");
+        assert_eq!(diff_session.snapshot_create_barrier_count, 0);
+        assert_eq!(diff_session.native_snapshot_publication_count, 1);
+        assert_eq!(diff_session.native_snapshot_producer_count, 1);
+        let (candidate, _) = load_native_snapshot_artifacts(&diff_paths)
+            .expect("published zero-root Diff snapshot should load")
+            .into_v2_13_diff_candidate()
+            .expect("published snapshot should retain exact 2.13");
         assert_eq!(
-            diff.started_session
-                .as_ref()
-                .expect("session should remain available")
-                .snapshot_create_barrier_count,
-            0
+            candidate.result_binding().version(),
+            NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
         );
+        diff_directory.assert_no_staging();
 
         let directory = TempSnapshotDirectory::new("native-v2-network-policy");
         let paths = directory.paths();
@@ -55546,7 +56270,7 @@ mod tests {
         let (candidate, _) = load_native_snapshot_artifacts(&paths)
             .expect("public exact-2.12 vsock pair should load")
             .into_current_v2_candidate()
-            .expect("public exact-2.12 vsock pair should retain the current candidate");
+            .expect("public exact-2.12 vsock pair should retain the Full candidate");
         assert_eq!(
             candidate.version(),
             NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
@@ -58117,7 +58841,7 @@ mod tests {
             Ok(VmmData::Empty)
         );
         let recaptured = load_native_snapshot_artifacts(&recaptured_paths)
-            .expect("restored destination should publish current exact-2.12 state");
+            .expect("restored destination should publish exact-2.12 Full state");
         assert_eq!(
             recaptured
                 .state()
@@ -58187,6 +58911,264 @@ mod tests {
             fs::read(first_paths.memory()).expect("contained replacement memory should remain"),
             b"replacement memory"
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires the signed native_v2_process integration group"]
+    fn signed_native_v2_diff_process_loads_zero_root_and_rebased_products() {
+        use bangbang_hvf::decode_hvf_snapshot_v2_diff_state;
+        use bangbang_runtime::snapshot_rebase::{
+            SnapshotV2DiffRebaseCommit, SnapshotV2DiffRebasePaths, rebase_snapshot_v2_diff_paths,
+        };
+
+        const ARM64_IMAGE_HEADER_SIZE: usize = 64;
+        const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
+        const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
+        const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+        const ARM64_BRANCH_TO_SELF: u32 = 0x1400_0000;
+        const STATE_REFERENCE: &str = "bangbang-grant:snapshot-state";
+        const MEMORY_REFERENCE: &str = "bangbang-grant:snapshot-memory";
+        const ROOT_REFERENCE: &str = "bangbang-grant:drive-ro";
+
+        let mut image = vec![0_u8; ARM64_IMAGE_HEADER_SIZE];
+        image[..4].copy_from_slice(&ARM64_BRANCH_TO_SELF.to_le_bytes());
+        image[ARM64_IMAGE_SIZE_OFFSET..ARM64_IMAGE_SIZE_OFFSET + 8]
+            .copy_from_slice(&(ARM64_IMAGE_HEADER_SIZE as u64).to_le_bytes());
+        image[ARM64_IMAGE_MAGIC_OFFSET..ARM64_IMAGE_MAGIC_OFFSET + 4]
+            .copy_from_slice(&ARM64_IMAGE_MAGIC.to_le_bytes());
+        let kernel = TempFilePath::create_with_bytes("signed-native-v2-diff-kernel", &image);
+
+        for (case, pci_enabled, tracked, full_first, contained) in [
+            ("mmio-zero-root", false, true, false, false),
+            ("mmio-untracked-zero-root", false, false, false, false),
+            ("pci-rebased", true, false, true, true),
+        ] {
+            let root = TempFilePath::create_with_bytes(
+                &format!("signed-native-v2-diff-{case}-root"),
+                &[0_u8; 512],
+            );
+            let mut source = ProcessVmm::with_starter(
+                format!("native-v2-diff-{case}-source"),
+                "0.1.0",
+                "bangbang",
+                HvfInstanceStartExecutor::default(),
+            );
+            if contained {
+                source = source
+                    .with_grant_authority(Some(root_file_grant_authority_for_test(root.path())));
+            }
+            source.pci_enabled = pci_enabled;
+            source.starter.pci_enabled = pci_enabled;
+            source
+                .handle_action(VmmAction::PutMachineConfig(
+                    MachineConfigInput::new(1, 16).with_track_dirty_pages(tracked),
+                ))
+                .unwrap_or_else(|error| panic!("{case} machine should configure: {error}"));
+            source
+                .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                    kernel.path(),
+                )))
+                .unwrap_or_else(|error| panic!("{case} boot source should configure: {error}"));
+            let root_selector = if contained {
+                Path::new(ROOT_REFERENCE)
+            } else {
+                root.path()
+            };
+            source
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("root", "root", root_selector, true)
+                        .with_is_read_only(true)
+                        .with_io_engine(DriveIoEngine::Sync),
+                ))
+                .unwrap_or_else(|error| panic!("{case} root should configure: {error}"));
+            source
+                .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(4, false)))
+                .unwrap_or_else(|error| panic!("{case} balloon should configure: {error}"));
+            source
+                .handle_action(VmmAction::InstanceStart)
+                .unwrap_or_else(|error| panic!("{case} source should start: {error}"));
+            source
+                .handle_action(VmmAction::Pause)
+                .unwrap_or_else(|error| panic!("{case} source should pause: {error}"));
+
+            let full = full_first.then(|| {
+                let directory = TempSnapshotDirectory::new(&format!("{case}-full"));
+                let paths = directory.paths();
+                source
+                    .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                        SnapshotType::Full,
+                        paths.state(),
+                        paths.memory(),
+                    )))
+                    .unwrap_or_else(|error| panic!("{case} Full should publish: {error}"));
+                let loaded =
+                    load_native_snapshot_artifacts(&paths).expect("signed Full pair should load");
+                assert_eq!(
+                    loaded
+                        .state()
+                        .v2_profile()
+                        .expect("signed Full profile should classify"),
+                    NativeV2SnapshotArtifactProfile::VsockStateV2_12
+                );
+                let binding = loaded
+                    .state()
+                    .v2_memory_binding()
+                    .expect("signed Full should retain its binding")
+                    .clone();
+                directory.assert_no_staging();
+                (directory, paths, binding)
+            });
+
+            let diff_directory = TempSnapshotDirectory::new(&format!("{case}-diff"));
+            let diff_paths = diff_directory.paths();
+            source
+                .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                    SnapshotType::Diff,
+                    diff_paths.state(),
+                    diff_paths.memory(),
+                )))
+                .unwrap_or_else(|error| panic!("{case} Diff should publish: {error}"));
+            let state_bytes =
+                fs::read(diff_paths.state()).expect("signed Diff state should remain readable");
+            let structural = decode_snapshot_v2_state_with_compatibility_version(
+                &state_bytes,
+                NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("signed Diff state should decode structurally");
+            let decoded = decode_hvf_snapshot_v2_diff_state(&structural)
+                .expect("signed Diff state should close semantically");
+            assert!(decoded.balloon().is_some());
+            assert_eq!(
+                decoded
+                    .device_graph()
+                    .expect("signed Diff should retain its root")
+                    .transport_kind(),
+                if pci_enabled {
+                    SnapshotV2DeviceTransportKind::Pci
+                } else {
+                    SnapshotV2DeviceTransportKind::Mmio
+                }
+            );
+            let layer = decoded.layer().clone();
+            let result_binding = layer.result().clone();
+            let selected_bytes = layer
+                .data_extents()
+                .iter()
+                .map(|extent| extent.range().size())
+                .sum::<u64>();
+            let result_bytes = result_binding
+                .extents()
+                .iter()
+                .map(|extent| extent.range().size())
+                .sum::<u64>();
+            if tracked {
+                assert!(matches!(layer.base(), SnapshotV2DiffBase::Zero));
+                assert!(
+                    selected_bytes < result_bytes,
+                    "tracked boot Diff should select only guest-dirty pages"
+                );
+            } else {
+                assert_eq!(selected_bytes, result_bytes);
+                if full_first {
+                    assert!(matches!(layer.base(), SnapshotV2DiffBase::Image(_)));
+                    assert_eq!(
+                        layer
+                            .base()
+                            .binding()
+                            .expect("Full-following Diff should name its predecessor"),
+                        &full
+                            .as_ref()
+                            .expect("Full-following case should retain its base")
+                            .2
+                    );
+                } else {
+                    assert!(matches!(layer.base(), SnapshotV2DiffBase::Zero));
+                }
+            }
+            drop(decoded);
+            drop(source);
+
+            let memory_path = if let Some((full_directory, full_paths, _)) = &full {
+                let outcome = rebase_snapshot_v2_diff_paths(&SnapshotV2DiffRebasePaths::new(
+                    full_paths.memory(),
+                    diff_paths.memory(),
+                ))
+                .unwrap_or_else(|error| panic!("{case} rebase should commit: {error}"));
+                assert_eq!(outcome.commit(), SnapshotV2DiffRebaseCommit::Durable);
+                assert_eq!(outcome.binding(), &result_binding);
+                full_directory.assert_no_staging();
+                full_paths.memory()
+            } else {
+                diff_paths.memory()
+            };
+            let closed_paths =
+                SnapshotArtifactPaths::new(diff_paths.state(), memory_path.to_path_buf());
+            load_native_snapshot_artifacts(&closed_paths)
+                .unwrap_or_else(|error| panic!("{case} closed Diff pair should load: {error}"));
+
+            let mut load = SnapshotLoadInput::new(
+                diff_paths.state(),
+                SnapshotMemoryBackend::new(memory_path, SnapshotMemoryBackendType::File),
+            )
+            .with_track_dirty_pages(tracked);
+            let mut destination = ProcessVmm::with_starter(
+                format!("native-v2-diff-{case}-destination"),
+                "0.1.0",
+                "bangbang",
+                HvfInstanceStartExecutor::default(),
+            );
+            if contained {
+                let authority = snapshot_root_file_grant_authority_for_test(
+                    diff_paths.state(),
+                    memory_path,
+                    root.path(),
+                );
+                let restore =
+                    contained_restore_authority_with_grants_for_test(authority.clone(), false);
+                destination = destination
+                    .with_grant_authority(Some(authority))
+                    .with_contained_restore_authority(Some(restore.into_authority()));
+                load = SnapshotLoadInput::new(
+                    STATE_REFERENCE,
+                    SnapshotMemoryBackend::new(MEMORY_REFERENCE, SnapshotMemoryBackendType::File),
+                )
+                .with_track_dirty_pages(tracked);
+            }
+            destination.pci_enabled = pci_enabled;
+            destination.starter.pci_enabled = pci_enabled;
+            destination
+                .handle_action(VmmAction::LoadSnapshot(load))
+                .unwrap_or_else(|error| panic!("{case} destination should load: {error}"));
+            assert_eq!(destination.instance_info().state, InstanceState::Paused);
+            assert_eq!(destination.drive_configs().len(), 1);
+            assert!(destination.controller.balloon_config().is_some());
+
+            let recapture_directory = TempSnapshotDirectory::new(&format!("{case}-recapture"));
+            let recapture_paths = recapture_directory.paths();
+            destination
+                .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                    SnapshotType::Diff,
+                    recapture_paths.state(),
+                    recapture_paths.memory(),
+                )))
+                .unwrap_or_else(|error| panic!("{case} destination should recapture: {error}"));
+            let recaptured = NativeV2DiffSnapshotCandidateState::from_committed_diff_state_v2_13(
+                fs::read(recapture_paths.state()).expect("recaptured exact-2.13 state should read"),
+            )
+            .expect("recaptured exact-2.13 state should close");
+            assert_eq!(
+                recaptured
+                    .layer_binding()
+                    .base()
+                    .binding()
+                    .expect("restored recapture should name its loaded predecessor"),
+                &result_binding
+            );
+            recapture_directory.assert_no_staging();
+            diff_directory.assert_no_staging();
+            drop(destination);
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -59486,7 +60468,7 @@ mod tests {
             .expect("empty-drive source should pause");
         drive
             .publish_native_v2_snapshot(&drive_input)
-            .expect("serial-only source should publish current exact-2.12 state");
+            .expect("serial-only source should publish exact-2.12 Full state");
         assert_eq!(
             drive
                 .started_session
@@ -59502,7 +60484,7 @@ mod tests {
         let (candidate, _) = load_native_snapshot_artifacts(&drive_paths)
             .expect("serial-only pair should load")
             .into_current_v2_candidate()
-            .expect("serial-only pair should close as current exact 2.12");
+            .expect("serial-only pair should close as exact-2.12 Full");
         assert!(candidate.device_graph().is_none());
         drive_directory.assert_no_staging();
 
@@ -59562,7 +60544,7 @@ mod tests {
                 optional_paths.state(),
                 optional_paths.memory(),
             ))
-            .expect("balloon source should publish current exact-2.12 state");
+            .expect("balloon source should publish exact-2.12 Full state");
         assert_eq!(
             optional.starter.snapshot_storage_preflight_calls, 1,
             "balloon publication should preflight the storage owner set"
@@ -59570,7 +60552,7 @@ mod tests {
         let (candidate, _) = load_native_snapshot_artifacts(&optional_paths)
             .expect("balloon publication should load")
             .into_current_v2_candidate()
-            .expect("balloon publication should close as current exact 2.12");
+            .expect("balloon publication should close as exact-2.12 Full");
         assert!(candidate.balloon().is_some());
         optional_directory.assert_no_staging();
 
@@ -59598,7 +60580,7 @@ mod tests {
             .expect("custom serial source should pause");
         serial
             .publish_native_v2_snapshot(&serial_input)
-            .expect("configured serial state should publish in current exact 2.12");
+            .expect("configured serial state should publish in exact-2.12 Full");
         assert_eq!(
             serial
                 .started_session
@@ -59614,7 +60596,7 @@ mod tests {
         let (candidate, _) = load_native_snapshot_artifacts(&serial_paths)
             .expect("configured serial snapshot should load")
             .into_current_v2_candidate()
-            .expect("configured serial snapshot should close as current exact 2.12");
+            .expect("configured serial snapshot should close as exact-2.12 Full");
         assert_eq!(
             candidate.serial().rate_limiter(),
             Some(SerialRateLimiterConfig::new(1, None, 1_000))
@@ -67213,7 +68195,14 @@ mod tests {
         let mut direct_layer = File::open(direct_paths.memory()).expect("direct layer should open");
         verify_snapshot_v2_diff_layer_output(first.state().layer_binding(), &mut direct_layer)
             .expect("direct layer should match state");
-        assert!(load_native_snapshot_artifacts(&direct_paths).is_err());
+        let (loaded_candidate, _) = load_native_snapshot_artifacts(&direct_paths)
+            .expect("the direct zero-root Diff pair should materialize")
+            .into_v2_13_diff_candidate()
+            .expect("the materialized pair should retain its exact Diff closure");
+        assert_eq!(
+            loaded_candidate.layer_binding(),
+            first.state().layer_binding()
+        );
         assert_eq!(
             events
                 .lock()

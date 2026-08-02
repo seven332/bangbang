@@ -12,10 +12,12 @@ use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VE
 use crate::snapshot_diff_v2_13::NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_format_v2::{
     NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION, SnapshotV2ComponentKey, decode_snapshot_v2_state,
+    encode_snapshot_v2_state,
 };
 use crate::snapshot_memory_hotplug_v2_10::NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_network_v2_11::NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION;
 use crate::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
+use crate::snapshot_vsock_v2_12::NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
 
 use super::*;
 
@@ -83,7 +85,10 @@ fn canonical_binding_state_and_image_round_trip() {
         binding
     );
     let encoded = binding.encode().expect("binding should encode");
-    assert_eq!(binding.version(), NATIVE_V2_SNAPSHOT_VERSION);
+    assert_eq!(
+        binding.version(),
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+    );
     assert_ne!(encoded, TWO_EXTENT_BINDING_FIXTURE);
 
     assert_eq!(
@@ -122,7 +127,10 @@ fn canonical_binding_state_and_image_round_trip() {
         encode_snapshot_v2_state_with_memory(&binding).expect("typed state should encode");
     assert_ne!(state_bytes, TWO_EXTENT_STATE_FIXTURE);
     let state = decode_snapshot_v2_state(&state_bytes).expect("typed state should decode");
-    assert_eq!(state.metadata().version(), NATIVE_V2_SNAPSHOT_VERSION);
+    assert_eq!(
+        state.metadata().version(),
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+    );
     assert_eq!(
         decode_snapshot_v2_memory_binding(&state).expect("memory component should decode"),
         binding
@@ -156,7 +164,7 @@ fn canonical_binding_state_and_image_round_trip() {
 }
 
 #[test]
-fn explicit_minor_four_through_dormant_thirteen_memory_images_round_trip() {
+fn explicit_minor_four_through_thirteen_memory_images_round_trip() {
     let memory = test_memory();
     let mut output = Cursor::new(Vec::new());
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
@@ -567,15 +575,13 @@ fn explicit_minor_four_through_dormant_thirteen_memory_images_round_trip() {
             &[component],
         )
         .expect("minor-thirteen memory state should encode internally");
-    assert!(matches!(
-        crate::snapshot_format_v2::decode_snapshot_v2_state(&state_bytes),
-        Err(
-            crate::snapshot_format_v2::SnapshotV2DecodeError::UnsupportedVersion {
-                found: NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
-                supported: NATIVE_V2_SNAPSHOT_VERSION,
-            }
-        )
-    ));
+    assert_eq!(
+        crate::snapshot_format_v2::decode_snapshot_v2_state(&state_bytes)
+            .expect("minor-thirteen should be admitted by the public structural decoder")
+            .metadata()
+            .version(),
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
+    );
     let state = crate::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version(
         &state_bytes,
         NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
@@ -588,7 +594,10 @@ fn explicit_minor_four_through_dormant_thirteen_memory_images_round_trip() {
     );
 
     let (_, default_binding) = write_test_image(&memory, TEST_ID);
-    assert_eq!(default_binding.version(), NATIVE_V2_SNAPSHOT_VERSION);
+    assert_eq!(
+        default_binding.version(),
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+    );
 
     for version in [
         NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION,

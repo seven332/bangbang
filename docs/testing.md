@@ -682,7 +682,7 @@ The wrapper builds the `bangbang` binary unit-test harness, locates and signs
 that exact test executable, and runs only the ignored private-seam proof. Its
 minimal two-vCPU guest does not touch serial or optional devices beyond the
 required read-only root. The first test starts and pauses the real
-process-owned HVF supervisor, publishes one current 2.12
+process-owned HVF supervisor, publishes one exact 2.12 Full
 serial-plus-profile-3 MMIO-root pair without entropy, resumes and repauses the
 source, publishes a fresh recapture,
 and drops the source. It
@@ -695,7 +695,10 @@ paths are replaced, uses the ordinary action gate to reach `Running`, pauses,
 and shuts down. The replacements remain untouched. Additional ignored seams
 exercise complete MMIO and PCI root-owner commit/rollback boundaries,
 exact-2.11 network owner transactions, and exact-2.12 vsock owner transactions
-over both MMIO and PCI. This group is part of the default integration set and
+over both MMIO and PCI. The exact-2.13 activation seam additionally proves a
+tracked direct-MMIO zero-root Diff, an untracked contained-PCI Full→Diff rebase,
+strict optional-balloon state, both load forms, and restored-lineage recapture.
+This group is part of the default integration set and
 must run without
 `--allow-unsupported` on supported Apple Silicon. It adds no API, CLI,
 config-file, or environment activation for native-v2.
@@ -1543,7 +1546,7 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
-- exact external snapshot grants creating current native-v2 2.12
+- exact external snapshot grants creating exact native-v2 2.12 Full
   serial-plus-profile-3 rooted three-drive MMIO and PCI pairs without entropy
   into separate output directories, reusing both retained
   directories for a second successful pair, preserving all finals on
@@ -1757,9 +1760,9 @@ punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
 separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
-checks exact `v2.12.0` output for `--snapshot-version`, exact description of
+checks exact `v2.13.0` output for `--snapshot-version`, exact description of
 native-v1, legacy `2.3.0`, `2.4.0`, `2.5.0`, `2.6.0`, `2.7.0`, `2.8.0`, and
-`2.9.0`, `2.10.0`, `2.11.0`, and current `2.12.0` native-v2 fixtures, plus
+`2.9.0`, `2.10.0`, `2.11.0`, and `2.12.0` native-v2 fixtures, plus
 explicit pinned
 Firecracker/unknown incompatibility. It also
 covers missing, non-regular,

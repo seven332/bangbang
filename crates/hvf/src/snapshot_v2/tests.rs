@@ -2739,6 +2739,11 @@ fn exact_minor_thirteen_diff_closes_all_sixty_four_mmio_and_pci_products() {
                     .encode()
                     .expect("exact-2.13 Diff binding should encode")
             );
+            assert_eq!(
+                decode_hvf_snapshot_v2_diff_state(&structural)
+                    .expect("the strict HVF exact-2.13 decoder should close the product"),
+                original
+            );
 
             let candidate = NativeV2DiffSnapshotCandidateState::from_diff_state_v2_13(
                 encoded.clone(),
@@ -2755,7 +2760,10 @@ fn exact_minor_thirteen_diff_closes_all_sixty_four_mmio_and_pci_products() {
             assert_eq!(candidate.memory_hotplug(), original.memory_hotplug());
             assert_eq!(candidate.network(), original.network());
             assert_eq!(candidate.vsock(), original.vsock());
-            assert!(decode_snapshot_v2_state(&encoded).is_err());
+            assert!(
+                decode_snapshot_v2_state(&encoded).is_ok(),
+                "the public structural ceiling should include exact 2.13"
+            );
 
             let debug = format!("{original:?} {candidate:?}");
             assert!(debug.contains("<redacted>"));

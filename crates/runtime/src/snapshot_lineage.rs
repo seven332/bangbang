@@ -66,7 +66,7 @@ pub enum LiveSnapshotLineageTerminalCause {
     DirtyEpochMismatch,
 }
 
-/// Prepared exact base and generation for one dormant Diff capture.
+/// Prepared exact base and generation for one Diff capture.
 pub struct LiveSnapshotDiffBegin {
     token: LiveSnapshotLineageToken,
     base: SnapshotV2DiffBase,
@@ -260,6 +260,11 @@ impl LiveSnapshotLineage {
     ) -> Result<LiveSnapshotDiffBegin, LiveSnapshotLineageError> {
         let ready = self.validate_begin(observed_dirty_epoch)?;
         let base = match &ready.base {
+            // An untracked capture selects every current page, so no omitted
+            // byte depends on a predecessor and Zero is an exact base. A
+            // tracked capture may omit clean pages and still requires a
+            // proven zero or image predecessor.
+            ReadyBase::Unavailable if observed_dirty_epoch.is_none() => SnapshotV2DiffBase::Zero,
             ReadyBase::Unavailable => return Err(LiveSnapshotLineageError::DiffBaseUnavailable),
             ReadyBase::Zero => SnapshotV2DiffBase::Zero,
             ReadyBase::Image(binding) => SnapshotV2DiffBase::Image(
@@ -657,7 +662,21 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_lineage_rejects_diff_but_allows_full() {
+    fn untracked_all_page_diff_uses_zero_when_no_predecessor_is_available() {
+        let mut lineage = LiveSnapshotLineage::unavailable(None);
+        let begin = lineage
+            .begin_diff(None)
+            .expect("untracked all-page Diff should not require a predecessor");
+        assert!(matches!(begin.base(), SnapshotV2DiffBase::Zero));
+        assert_eq!(begin.dirty_epoch(), None);
+        lineage
+            .abort(begin.token())
+            .expect("Diff should abort cleanly");
+        assert!(!lineage.is_pending());
+    }
+
+    #[test]
+    fn tracked_unavailable_lineage_rejects_diff_but_allows_full() {
         let mut lineage = LiveSnapshotLineage::unavailable(Some(0));
         assert!(matches!(
             lineage.begin_diff(Some(0)),
