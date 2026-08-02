@@ -83,8 +83,9 @@ terminal. The directly reviewed identities that do not change disposition are:
 | Remaining snapshot load aggregates | `api-operation:PUT /snapshot/load`; `api-path:/snapshot/load`; `api-schema:SnapshotLoadParams` | `audit-required`; #1543 owns the broad load/schema certification beyond the already implemented exact native-family profiles and leaves. |
 | Snapshot semantics | `semantic.snapshot:full-create-load-and-public-lifecycle` | `implemented-and-verified`; the public lineage advances from device-free native-v2 2.3 through exact 2.12 Full with all 64 optional-device products, while exact 2.13 Diff adds mandatory base/selection/result kind 14 and retains all earlier readers. Zero-root and matching rebased results load through direct, contained, ordinary-production, and App Sandbox boundaries. |
 | Snapshot network/vsock clone semantics | `semantic.snapshot:network-vsock-overrides-portability-and-clones` | `implemented-and-verified`; exact 2.11 supplies complete clone-local network overrides and fresh network/MMDS sessions, while exact 2.12 supplies captured-or-overridden vsock authority, reset/RX/TX, preserved listeners, multistream/half-close, clone-local cursors, immutable independent clones, containment, redaction, and cleanup. Portability is bounded to compatible Bangbang-native File/COW destinations and excludes Firecracker bytes, live-peer migration, automatic socket/grant migration, and unconstrained cross-host execution. |
-| Snapshot Diff/rebase leaves | Six snapshot-create leaves plus `tool-operation:rebase-snap/rebase`, `tool-operation:snapshot-editor/edit-memory/rebase`, and their four arguments | `implemented-and-verified`; exact-2.13 tracked/untracked/repeated Diff and both public rebase commands are closed by the checked [17-record ledger](snapshot-diff-rebase-contract.md). |
-| Retained mixed snapshot aggregates | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `semantic.snapshot:editor-rebase-and-inspection`; `corpus:snapshot-editor`; `corpus:snapshot-versioning` | `audit-required`; the delivered Diff/rebase subset is named, while #1542 retains inspection/register editing and #1543 retains native-v2 Uffd, broad version/backend/portability, and aggregate certification. |
+| Snapshot Diff/rebase leaves | Six snapshot-create leaves plus `tool-operation:rebase-snap/rebase`, `tool-operation:snapshot-editor/edit-memory/rebase`, and their four arguments | `implemented-and-verified`; exact-2.13 tracked/untracked/repeated Diff and both public rebase commands are closed by the checked [15-record ledger](snapshot-diff-rebase-contract.md). |
+| Snapshot editor state | Three `info-vmstate` operations and path arguments; `edit-vmstate remove-regs` and its three arguments; `semantic.snapshot:editor-rebase-and-inspection`; `corpus:snapshot-editor` | `implemented-and-verified`; deterministic redacted inspection, finite reviewed editing, immutable no-clobber publication, and signed Full/Diff MMIO/PCI product restoration are closed by the checked [twelve-record ledger](snapshot-editor-contract.md). |
+| Retained mixed snapshot aggregates | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `corpus:snapshot-versioning` | `audit-required`; #1543 retains native-v2 Uffd, broad version/backend/portability, and aggregate certification. |
 | Remaining snapshot composition | `semantic.snapshot:multi-vcpu-drives-devices-and-mmds` | `audit-required`; #1543 owns per-drive overrides and broader cross-profile composition beyond the certified exact complete-set products. |
 | Snapshot tracking leaves | `api-property:SnapshotLoadParams.enable_diff_snapshots`; `api-property:SnapshotLoadParams.track_dirty_pages` | Already `implemented-and-verified`; they select complete destination dirty tracking and compose with the separately certified exact-2.13 create/rebase boundary. |
 | Broad specifications | `corpus:specification`; `semantic.specification:api-availability-stability-and-failure-information`; `semantic.specification:performance-resource-and-telemetry-outcomes` | `audit-required`; applicable repository-wide outcomes remain Wave 7 work after their producers stabilize. |
@@ -95,11 +96,12 @@ Those exact identities establish the following non-overlapping handoffs:
 
 - The snapshot producer now has terminal exact-2.12 Full and exact-2.13 Diff
   create/load behavior for the complete 64-product graph, plus both public
-  memory-rebase commands and retained exact 2.3–2.12/frozen-native-v1 readers.
-  #1542 still owns inspection/register editing. #1543 still owns native-v2
-  Uffd, per-drive overrides, broad version/backend/portability work, remaining
-  load/schema aggregates, and final cross-profile certification; completed
-  Diff/rebase leaves do not promote those mixed records.
+  memory-rebase commands, deterministic state inspection, finite reviewed
+  register editing, and retained exact 2.3–2.12/frozen-native-v1 readers.
+  #1543 still owns native-v2 Uffd, per-drive overrides, broad
+  version/backend/portability work, remaining load/schema aggregates, and
+  final cross-profile certification; completed editor leaves do not promote
+  those mixed records.
 - Wave 7 owns `cpu-template-helper`, host-side kernel/rootfs construction,
   heterogeneous-fleet CPU-template outcomes, and applicable repository-wide
   specification outcomes after producers stabilize.

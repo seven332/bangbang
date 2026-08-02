@@ -29,7 +29,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use bangbang_hvf::{decode_hvf_snapshot_v2_diff_state, decode_hvf_snapshot_v2_vsock_state};
+use bangbang_hvf::{
+    HvfNativeSnapshotDocument, decode_hvf_snapshot_v2_diff_state,
+    decode_hvf_snapshot_v2_vsock_state,
+};
 use bangbang_launcher::{
     JailerIsolationArgument, LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME,
     OUTER_BUNDLE_NAME, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
@@ -66,6 +69,7 @@ use vhost_user_block::{
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
 const GRANT_TEST_BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH";
+const SNAPSHOT_EDITOR_ENV: &str = "BANGBANG_SNAPSHOT_EDITOR_PATH";
 const GUEST_KERNEL_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
 const GUEST_INITRD_ENV: &str = "BANGBANG_GUEST_INITRD_PATH";
 const GUEST_EXT4_ROOTFS_ENV: &str = "BANGBANG_GUEST_EXT4_ROOTFS_PATH";
@@ -222,6 +226,8 @@ const SNAPSHOT_STATE_CHILD: &str = "state-1368.snap";
 const SNAPSHOT_MEMORY_CHILD: &str = "memory-1368.snap";
 const SNAPSHOT_REPEAT_STATE_CHILD: &str = "state-repeat-1368.snap";
 const SNAPSHOT_REPEAT_MEMORY_CHILD: &str = "memory-repeat-1368.snap";
+const SNAPSHOT_EDITOR_OUTPUT_CHILD: &str = "state-editor-1776.snap";
+const SNAPSHOT_EDITOR_DBGBVR0: &str = "0x6030000000138004";
 const SNAPSHOT_ROOT_BOOT_ARGS: &str = "console=null reboot=k panic=0 quiet loglevel=1 root=/dev/vda ro rootwait init=/bangbang-direct-rootfs-init bangbang.native-v2-root-snapshot=1";
 const SNAPSHOT_BLOCK_BOOT_ARGS: &str =
     "console=null reboot=k panic=1 quiet loglevel=1 rdinit=/snapshot-block-init";
@@ -478,6 +484,16 @@ fn grant_test_bundle() -> PathBuf {
             .is_file(),
         "grant exerciser bundle must carry a visible test-only marker"
     );
+    path
+}
+
+fn snapshot_editor() -> PathBuf {
+    let path = std::env::var_os(SNAPSHOT_EDITOR_ENV)
+        .filter(|value| !value.is_empty())
+        .expect("signed runner must provide the snapshot-editor path");
+    let path = PathBuf::from(path);
+    assert_eq!(path.file_name(), Some(OsStr::new("snapshot-editor")));
+    assert!(path.is_file(), "snapshot-editor must be a regular file");
     path
 }
 
@@ -7027,7 +7043,11 @@ fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
     assert_snapshot_output_redacted(&mismatch_output, &mismatch.sensitive_strings());
     assert_eq!(session_entries(), baseline_sessions);
 
-    let paused_fixture = SnapshotInputGrantFixture::new(&format!("{transport}-paused"), artifacts);
+    let editor =
+        certify_signed_snapshot_editor(&artifacts, state_before, memory_before, transport, false);
+
+    let paused_fixture =
+        SnapshotInputGrantFixture::new(&format!("{transport}-paused"), editor.artifacts.clone());
     let mut paused = spawn_ready_snapshot_grant_api_launcher(
         bundle,
         &paused_fixture.manifest,
@@ -7084,6 +7104,10 @@ fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
             .success(),
         "explicitly resumed {transport} granted snapshot should power off after the root read"
     );
+    editor.assert_opened_artifacts_unchanged(
+        &next_artifacts,
+        &format!("explicitly resumed {transport} edited Full restore"),
+    );
     assert_eq!(session_entries(), baseline_sessions);
 
     let resumed_fixture =
@@ -7111,13 +7135,9 @@ fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
             .success(),
         "automatically resumed {transport} granted snapshot should power off after the root read"
     );
-    assert_eq!(
-        fs::read(&final_artifacts.state).expect("final state should read"),
-        state_before
-    );
-    assert_eq!(
-        fs::read(&final_artifacts.memory).expect("final memory should read"),
-        memory_before
+    editor.assert_opened_artifacts_unchanged(
+        &final_artifacts,
+        &format!("automatically resumed {transport} edited Full restore"),
     );
     assert_eq!(session_entries(), baseline_sessions);
 }
@@ -7220,8 +7240,13 @@ fn run_native_v2_diff_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
     assert_snapshot_output_redacted(&describe_output, &describe.sensitive_strings());
     assert_eq!(session_entries(), baseline_sessions);
 
-    let destination_fixture =
-        SnapshotInputGrantFixture::new(&format!("{transport}-diff-paused"), artifacts);
+    let editor =
+        certify_signed_snapshot_editor(&artifacts, state_before, memory_before, transport, true);
+
+    let destination_fixture = SnapshotInputGrantFixture::new(
+        &format!("{transport}-diff-paused"),
+        editor.artifacts.clone(),
+    );
     let mut destination = spawn_ready_snapshot_grant_api_launcher(
         bundle,
         &destination_fixture.manifest,
@@ -7287,15 +7312,9 @@ fn run_native_v2_diff_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
         &baseline_sessions,
         &format!("ordinary production {transport} Diff destination"),
     );
-    assert_eq!(
-        fs::read(&opened.state).expect("retained Diff state should read"),
-        state_before,
-        "{transport} Diff load must not mutate state"
-    );
-    assert_eq!(
-        fs::read(&opened.memory).expect("retained Diff layer should read"),
-        memory_before,
-        "{transport} Diff load must not mutate the layer"
+    editor.assert_opened_artifacts_unchanged(
+        &opened,
+        &format!("explicitly resumed {transport} edited Diff restore"),
     );
     destination_fixture
         .assert_replacement_pathnames_unused("ordinary production exact-2.13 Diff destination");
@@ -12877,6 +12896,37 @@ struct SnapshotArtifactSet {
     root: PathBuf,
     data: PathBuf,
     audit: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotEditorFileFacts {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    owner: u32,
+    group: u32,
+    links: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+#[derive(Debug)]
+struct SnapshotEditorViews {
+    vcpus: serde_json::Value,
+    vm: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct SnapshotEditorCertification {
+    artifacts: SnapshotArtifactSet,
+    original_state: PathBuf,
+    original_state_bytes: Vec<u8>,
+    original_state_facts: SnapshotEditorFileFacts,
+    edited_state_bytes: Vec<u8>,
+    edited_state_facts: SnapshotEditorFileFacts,
+    memory_bytes: Vec<u8>,
+    memory_facts: SnapshotEditorFileFacts,
 }
 
 #[derive(Debug, Clone)]
@@ -19158,6 +19208,410 @@ fn snapshot_load_body(resume_vm: bool) -> String {
     .expect("snapshot load body should serialize")
 }
 
+fn snapshot_editor_file_facts(path: &Path) -> SnapshotEditorFileFacts {
+    let metadata =
+        fs::symlink_metadata(path).expect("snapshot editor artifact metadata should read");
+    assert!(
+        metadata.file_type().is_file(),
+        "snapshot editor artifact must be a regular file"
+    );
+    SnapshotEditorFileFacts {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        owner: metadata.uid(),
+        group: metadata.gid(),
+        links: metadata.nlink(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+    }
+}
+
+fn run_snapshot_editor_info(editor: &Path, view: &str, state: &Path) -> Output {
+    let mut command = Command::new(editor);
+    command
+        .args(["info-vmstate", view, "--vmstate-path"])
+        .arg(state);
+    run_with_timeout(
+        &mut command,
+        PROCESS_TIMEOUT,
+        &format!("signed snapshot-editor {view}"),
+    )
+}
+
+fn assert_snapshot_editor_output_redacted(output: &Output, sensitive_paths: &[&Path]) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for path in sensitive_paths {
+        let value = path_text(path);
+        assert!(
+            !stdout.contains(value),
+            "snapshot editor stdout exposed a path"
+        );
+        assert!(
+            !stderr.contains(value),
+            "snapshot editor stderr exposed a path"
+        );
+    }
+    assert!(
+        !stdout.contains(SNAPSHOT_EDITOR_DBGBVR0),
+        "snapshot editor stdout exposed a register ID"
+    );
+    assert!(
+        !stderr.contains(SNAPSHOT_EDITOR_DBGBVR0),
+        "snapshot editor stderr exposed a register ID"
+    );
+}
+
+fn run_snapshot_editor_info_twice(editor: &Path, view: &str, state: &Path) -> Vec<u8> {
+    let first = run_snapshot_editor_info(editor, view, state);
+    assert_output_success(&first, &format!("first signed snapshot-editor {view}"));
+    assert!(
+        first.stderr.is_empty(),
+        "successful snapshot-editor {view} must not emit stderr"
+    );
+    assert_snapshot_editor_output_redacted(&first, &[state]);
+
+    let second = run_snapshot_editor_info(editor, view, state);
+    assert_output_success(&second, &format!("second signed snapshot-editor {view}"));
+    assert!(
+        second.stderr.is_empty(),
+        "repeated snapshot-editor {view} must not emit stderr"
+    );
+    assert_snapshot_editor_output_redacted(&second, &[state]);
+    assert_eq!(
+        second.stdout, first.stdout,
+        "snapshot-editor {view} output must be deterministic"
+    );
+    first.stdout
+}
+
+fn inspect_with_signed_snapshot_editor(
+    editor: &Path,
+    state: &Path,
+    transport: &str,
+    is_diff: bool,
+) -> SnapshotEditorViews {
+    let (version, minor, profile) = if is_diff {
+        ("v2.13.0\n", 13_u64, "diff-state-v2.13")
+    } else {
+        ("v2.12.0\n", 12_u64, "vsock-state-v2.12")
+    };
+    let version_output = run_snapshot_editor_info_twice(editor, "version", state);
+    assert_eq!(version_output, version.as_bytes());
+
+    let vcpus_output = run_snapshot_editor_info_twice(editor, "vcpu-states", state);
+    let vm_output = run_snapshot_editor_info_twice(editor, "vm-state", state);
+    let vcpus: serde_json::Value = serde_json::from_slice(&vcpus_output)
+        .expect("signed snapshot-editor vCPU output should be JSON");
+    let vm: serde_json::Value = serde_json::from_slice(&vm_output)
+        .expect("signed snapshot-editor VM output should be JSON");
+
+    for (view, value) in [("vcpu-states", &vcpus), ("vm-state", &vm)] {
+        assert_eq!(value["schema"], "bangbang.snapshot-editor.info.v1");
+        assert_eq!(value["view"], view);
+        assert_eq!(value["family"], "native-v2");
+        assert_eq!(value["profile"], profile);
+        assert_eq!(
+            value["version"],
+            serde_json::json!({"major": 2, "minor": minor, "patch": 0})
+        );
+        let states = value["vcpus"]
+            .as_array()
+            .expect("signed snapshot-editor vCPUs should be an array");
+        assert_eq!(states.len(), 1, "production snapshot should have one vCPU");
+        assert_eq!(states[0]["index"], 0);
+        assert!(
+            states[0]["general"]["pc"]
+                .as_str()
+                .is_some_and(|pc| pc.starts_with("0x")),
+            "inspection must retain value-bearing portable registers"
+        );
+        assert!(
+            states[0]["debug"]["reviewed"].is_object(),
+            "production snapshot must contain reviewed debug state"
+        );
+    }
+    assert_eq!(vcpus["vcpus"], vm["vcpus"]);
+    assert!(
+        vm.to_string().contains("<redacted>"),
+        "VM inspection must contain literal authority redaction"
+    );
+    assert!(
+        vm["memory"]["file_length"]
+            .as_u64()
+            .is_some_and(|len| len > 0),
+        "VM inspection must retain a concrete memory binding"
+    );
+    assert_eq!(vm["devices"]["storage"]["transport_kind"], transport);
+    assert_eq!(vm["devices"]["storage"]["record_count"], 3);
+    assert_eq!(vm["devices"]["storage"]["block_record_count"], 3);
+    assert_eq!(vm["devices"]["storage"]["pmem_record_count"], 0);
+
+    if is_diff {
+        assert_eq!(vm["diff"]["compatibility"], "v2.13");
+        assert_eq!(vm["diff"]["base"]["kind"], "zero");
+        assert!(vm["diff"]["base"]["binding"].is_null());
+        assert!(
+            vm["diff"]["extent_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "production Diff inspection must retain a nonempty sparse layer"
+        );
+        assert_eq!(vm["diff"]["result"], vm["memory"]);
+        assert_eq!(
+            vm["diff"]["relationship"],
+            serde_json::json!({
+                "base_is_image": false,
+                "base_and_result_are_distinct": true,
+                "result_matches_vm_memory": true,
+                "omitted_bytes_inherit_base": true,
+            })
+        );
+    } else {
+        assert!(vm["diff"].is_null());
+    }
+
+    SnapshotEditorViews { vcpus, vm }
+}
+
+fn normalize_snapshot_editor_reviewed_fingerprints(
+    mut value: serde_json::Value,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let states = value["vcpus"]
+        .as_array_mut()
+        .expect("snapshot-editor vCPUs should remain an array");
+    let mut fingerprints = Vec::with_capacity(states.len());
+    for state in states {
+        let reviewed = state["debug"]["reviewed"].clone();
+        assert!(
+            reviewed.is_object(),
+            "reviewed debug fingerprint must be present"
+        );
+        fingerprints.push(reviewed);
+        state["debug"]["reviewed"] = serde_json::Value::String("<normalized>".to_owned());
+    }
+    (value, fingerprints)
+}
+
+fn assert_snapshot_editor_views_change_only_reviewed_debug(
+    before: &SnapshotEditorViews,
+    after: &SnapshotEditorViews,
+) {
+    for (view, before, after) in [
+        ("vcpu-states", &before.vcpus, &after.vcpus),
+        ("vm-state", &before.vm, &after.vm),
+    ] {
+        let (before_normalized, before_fingerprints) =
+            normalize_snapshot_editor_reviewed_fingerprints(before.clone());
+        let (after_normalized, after_fingerprints) =
+            normalize_snapshot_editor_reviewed_fingerprints(after.clone());
+        assert_eq!(
+            before_normalized, after_normalized,
+            "snapshot-editor {view} changed state outside reviewed debug fingerprints"
+        );
+        assert_eq!(before_fingerprints.len(), 1);
+        assert_eq!(after_fingerprints.len(), 1);
+        assert_ne!(
+            before_fingerprints, after_fingerprints,
+            "snapshot-editor {view} must demonstrate the reviewed debug edit"
+        );
+    }
+}
+
+fn assert_snapshot_editor_views_redacted(views: &SnapshotEditorViews, sensitive_paths: &[&Path]) {
+    let output = format!("{}{}", views.vcpus, views.vm);
+    for path in sensitive_paths {
+        assert!(
+            !output.contains(path_text(path)),
+            "snapshot-editor JSON exposed product path authority"
+        );
+    }
+}
+
+fn certify_signed_snapshot_editor(
+    artifacts: &SnapshotArtifactSet,
+    original_state_bytes: Vec<u8>,
+    memory_bytes: Vec<u8>,
+    transport: &str,
+    is_diff: bool,
+) -> SnapshotEditorCertification {
+    let editor = snapshot_editor();
+    let original_state = artifacts.state.clone();
+    let original_state_facts = snapshot_editor_file_facts(&original_state);
+    let memory_facts = snapshot_editor_file_facts(&artifacts.memory);
+    assert_eq!(
+        fs::read(&original_state).expect("snapshot-editor source state should read"),
+        original_state_bytes
+    );
+    assert_eq!(
+        fs::read(&artifacts.memory).expect("snapshot-editor memory should read"),
+        memory_bytes
+    );
+
+    let before = inspect_with_signed_snapshot_editor(&editor, &original_state, transport, is_diff);
+    assert_snapshot_editor_views_redacted(
+        &before,
+        &[
+            &original_state,
+            &artifacts.memory,
+            &artifacts.root,
+            &artifacts.data,
+            &artifacts.audit,
+        ],
+    );
+    let edited_state = original_state
+        .parent()
+        .expect("snapshot state should have a parent")
+        .join(SNAPSHOT_EDITOR_OUTPUT_CHILD);
+    assert!(
+        !edited_state.exists(),
+        "snapshot-editor output must begin absent"
+    );
+    let mut command = Command::new(&editor);
+    command
+        .args(["edit-vmstate", "remove-regs", SNAPSHOT_EDITOR_DBGBVR0])
+        .arg("--vmstate-path")
+        .arg(&original_state)
+        .arg("--output-path")
+        .arg(&edited_state);
+    let edit = run_with_timeout(
+        &mut command,
+        PROCESS_TIMEOUT,
+        "signed snapshot-editor reviewed register removal",
+    );
+    assert_output_success(&edit, "signed snapshot-editor reviewed register removal");
+    assert_eq!(
+        edit.stdout,
+        b"vcpu 0: removed 1, not-present 0\ntotal: requested 1, removed 1, not-present 0\n"
+    );
+    assert!(
+        edit.stderr.is_empty(),
+        "successful snapshot-editor edit must not emit stderr"
+    );
+    assert_snapshot_editor_output_redacted(&edit, &[&original_state, &edited_state]);
+
+    assert_eq!(
+        fs::read(&original_state).expect("snapshot-editor source state should remain readable"),
+        original_state_bytes,
+        "snapshot-editor must not change source bytes"
+    );
+    assert_eq!(
+        snapshot_editor_file_facts(&original_state),
+        original_state_facts,
+        "snapshot-editor must not change source inode facts"
+    );
+    assert_eq!(
+        fs::read(&artifacts.memory).expect("snapshot-editor memory should remain readable"),
+        memory_bytes,
+        "state editing must not change memory or Diff bytes"
+    );
+    assert_eq!(
+        snapshot_editor_file_facts(&artifacts.memory),
+        memory_facts,
+        "state editing must not change memory or Diff inode facts"
+    );
+
+    let edited_state_facts = snapshot_editor_file_facts(&edited_state);
+    assert_ne!(
+        (edited_state_facts.device, edited_state_facts.inode),
+        (original_state_facts.device, original_state_facts.inode),
+        "snapshot-editor output must use a distinct inode"
+    );
+    assert_eq!(edited_state_facts.mode & 0o7777, 0o600);
+    assert_eq!(edited_state_facts.links, 1);
+    let edited_state_bytes =
+        fs::read(&edited_state).expect("snapshot-editor output state should read");
+    assert_ne!(edited_state_bytes, original_state_bytes);
+    let edited_document = HvfNativeSnapshotDocument::decode(&edited_state_bytes)
+        .expect("snapshot-editor output must decode canonically");
+    assert_eq!(
+        edited_document
+            .encode()
+            .expect("snapshot-editor output must re-encode"),
+        edited_state_bytes,
+        "snapshot-editor output must be canonical"
+    );
+
+    let after = inspect_with_signed_snapshot_editor(&editor, &edited_state, transport, is_diff);
+    assert_snapshot_editor_views_redacted(
+        &after,
+        &[
+            &original_state,
+            &edited_state,
+            &artifacts.memory,
+            &artifacts.root,
+            &artifacts.data,
+            &artifacts.audit,
+        ],
+    );
+    assert_snapshot_editor_views_change_only_reviewed_debug(&before, &after);
+    assert_no_snapshot_staging(
+        original_state
+            .parent()
+            .expect("snapshot state should have a parent"),
+    );
+    assert_no_snapshot_staging(
+        artifacts
+            .memory
+            .parent()
+            .expect("snapshot memory should have a parent"),
+    );
+
+    let mut edited_artifacts = artifacts.clone();
+    edited_artifacts.state = edited_state;
+    SnapshotEditorCertification {
+        artifacts: edited_artifacts,
+        original_state,
+        original_state_bytes,
+        original_state_facts,
+        edited_state_bytes,
+        edited_state_facts,
+        memory_bytes,
+        memory_facts,
+    }
+}
+
+impl SnapshotEditorCertification {
+    fn assert_original_state_unchanged(&self, context: &str) {
+        assert_eq!(
+            fs::read(&self.original_state).expect("original snapshot state should remain readable"),
+            self.original_state_bytes,
+            "{context} must preserve original snapshot state bytes"
+        );
+        assert_eq!(
+            snapshot_editor_file_facts(&self.original_state),
+            self.original_state_facts,
+            "{context} must preserve original snapshot state inode facts"
+        );
+    }
+
+    fn assert_opened_artifacts_unchanged(&self, opened: &SnapshotArtifactSet, context: &str) {
+        self.assert_original_state_unchanged(context);
+        assert_eq!(
+            fs::read(&opened.state).expect("opened edited snapshot state should remain readable"),
+            self.edited_state_bytes,
+            "{context} must preserve edited snapshot state bytes"
+        );
+        assert_eq!(
+            snapshot_editor_file_facts(&opened.state),
+            self.edited_state_facts,
+            "{context} must preserve edited snapshot state inode facts"
+        );
+        assert_eq!(
+            fs::read(&opened.memory).expect("opened snapshot memory should remain readable"),
+            self.memory_bytes,
+            "{context} must preserve Full memory or Diff layer bytes"
+        );
+        assert_eq!(
+            snapshot_editor_file_facts(&opened.memory),
+            self.memory_facts,
+            "{context} must preserve Full memory or Diff layer inode facts"
+        );
+    }
+}
+
 fn assert_no_snapshot_staging(directory: &Path) {
     let staging = fs::read_dir(directory)
         .expect("snapshot directory should remain readable")
@@ -19169,6 +19623,7 @@ fn assert_no_snapshot_staging(directory: &Path) {
             let name = name.to_string_lossy();
             name.starts_with(".bangbang-snapshot-state-")
                 || name.starts_with(".bangbang-snapshot-memory-")
+                || name.starts_with(".bangbang-snapshot-edit-")
         })
         .collect::<Vec<_>>();
     assert!(staging.is_empty(), "snapshot staging remains: {staging:?}");

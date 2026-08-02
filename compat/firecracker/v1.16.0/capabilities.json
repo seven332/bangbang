@@ -9761,11 +9761,100 @@
     {
       "id": "corpus:snapshot-editor",
       "family": "snapshots",
-      "summary": "The pinned snapshot-editor edit-memory rebase operation is implemented through the exact --memory-path/-m and --diff-path/-d surface, one shared macOS no-clobber transaction, deterministic exits, redaction, process tests, and signed real-chain evidence. Snapshot inspection, VM-state/register editing, and architecture-specific editing remain audit-required under https://github.com/seven332/bangbang/issues/1542.",
+      "summary": "Implement the pinned snapshot-editor command corpus for Bangbang-native artifacts: exact edit-memory rebase; deterministic version, vCPU-state, and VM-state inspection; and reviewed aarch64 register removal through a finite 67-ID registry. Descriptor-anchored reads, redacted canonical JSON, immutable inputs, distinct owner-only no-clobber outputs, deterministic exits, actual-binary tests, signed Full/Diff MMIO/PCI editing, and fixed-launcher App Sandbox restore are verified. Firecracker bitcode, arbitrary KVM vectors, and broader artifact portability are explicit non-claims.",
       "source_refs": [
         "corpus:snapshot-editor"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection.rs",
+          "anchor": "canonical confidentiality-aware native snapshot inspection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal.rs",
+          "anchor": "finite reviewed Firecracker aarch64 register removal"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase.rs",
+          "anchor": "staged exact native-v2 Diff rebase transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit.rs",
+          "anchor": "descriptor-anchored native state read and edit transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/unix.rs",
+          "anchor": "Unix no-clobber publication and durability implementation"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "complete pinned snapshot-editor command surface"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "shared rebase inspection edit signal and outcome execution"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked memory rebase closure ledger"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked twelve-record state inspection and edit closure ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signed real-HVF both-tool rebase load and recapture chain"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection/tests.rs",
+          "anchor": "all-profile canonical deterministic and redaction inspection matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal/tests.rs",
+          "anchor": "exact reviewed registry and profile-preserving removal matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed Full Diff MMIO PCI editor inspect edit and App Sandbox restore"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase/tests.rs",
+          "anchor": "rebase transaction failure race cancellation and durability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/tests.rs",
+          "anchor": "state read edit fault race cancellation cleanup and durability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "independent signed snapshot-tools construction and production supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "complete actual snapshot-editor process contract matrix"
+        }
+      ]
     },
     {
       "id": "corpus:snapshot-network-clones",
@@ -11746,11 +11835,100 @@
     {
       "id": "semantic.snapshot:editor-rebase-and-inspection",
       "family": "snapshots",
-      "summary": "Both Firecracker-shaped rebase entrypoints implement exact native-v2 repeated memory-layer materialization through one stronger staged no-clobber macOS transaction with deterministic syntax, deprecation, signal, failure, uncertainty, redaction, and signed real-chain behavior. Snapshot inspection, VM-state/register editing, and architecture-specific editing remain audit-required under https://github.com/seven332/bangbang/issues/1542.",
+      "summary": "Provide the complete selected snapshot-editor semantics for Bangbang-native artifacts: exact repeated native-v2 memory-layer rebase; deterministic version, vCPU, and VM inspection with explicit portable values plus redaction and equality fingerprints; and finite reviewed aarch64 register removal into a canonical distinct state. Signed Full 2.12 and Diff 2.13 MMIO/PCI evidence proves the edited state retains every other semantic field and loads Paused through the fixed launcher and nested App Sandbox before explicit resume and SYSTEM_OFF.",
       "source_refs": [
         "corpus:snapshot-editor"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection.rs",
+          "anchor": "canonical confidentiality-aware native snapshot inspection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal.rs",
+          "anchor": "finite reviewed Firecracker aarch64 register removal"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase.rs",
+          "anchor": "staged exact native-v2 Diff rebase transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit.rs",
+          "anchor": "descriptor-anchored native state read and edit transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/unix.rs",
+          "anchor": "Unix no-clobber publication and durability implementation"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "complete pinned snapshot-editor command surface"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "shared rebase inspection edit signal and outcome execution"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-diff-rebase-contract.md",
+          "anchor": "checked memory rebase closure ledger"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked twelve-record state inspection and edit closure ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signed real-HVF both-tool rebase load and recapture chain"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection/tests.rs",
+          "anchor": "all-profile canonical deterministic and redaction inspection matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal/tests.rs",
+          "anchor": "exact reviewed registry and profile-preserving removal matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed Full Diff MMIO PCI editor inspect edit and App Sandbox restore"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_rebase/tests.rs",
+          "anchor": "rebase transaction failure race cancellation and durability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/tests.rs",
+          "anchor": "state read edit fault race cancellation cleanup and durability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "independent signed snapshot-tools construction and production supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "complete actual snapshot-editor process contract matrix"
+        }
+      ]
     },
     {
       "id": "semantic.snapshot:full-create-load-and-public-lifecycle",
@@ -13325,56 +13503,365 @@
     {
       "id": "tool-argument:snapshot-editor/edit-vmstate/remove-regs/output-path",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/edit-vmstate/remove-regs/output-path.",
+      "summary": "Require --output-path/-o as an absent distinct child for edited Bangbang-native state; publish one verified canonical owner-only 0600 file without clobber, classify committed uncertainty, and remove private staging while preserving the input.",
       "source_refs": [
         "tool-argument:snapshot-editor/edit-vmstate/remove-regs/output-path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal.rs",
+          "anchor": "typed profile-preserving reviewed register transformation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit.rs",
+          "anchor": "distinct no-clobber state output transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/unix.rs",
+          "anchor": "owner-only staged hard-link publication and durability"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "remove-regs --output-path/-o parser"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "register removal transaction execution and outcome classification"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked output authority publication and signed restore contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal/tests.rs",
+          "anchor": "typed transformation and exact profile preservation tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed distinct canonical edited state and App Sandbox restore"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/tests.rs",
+          "anchor": "output race no-clobber cleanup and uncertainty tests"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "signed snapshot-editor construction verification and product supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual-binary output path alias publication race and redaction tests"
+        }
+      ]
     },
     {
       "id": "tool-argument:snapshot-editor/edit-vmstate/remove-regs/regs",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/edit-vmstate/remove-regs/regs.",
+      "summary": "Require one or more duplicate-free decimal, hexadecimal, or space-delimited u64 register IDs; admit the complete request against the exact finite 67-ID reviewed Firecracker v1.16.0 aarch64 registry before path access and never disclose IDs or values.",
       "source_refs": [
         "tool-argument:snapshot-editor/edit-vmstate/remove-regs/regs"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal.rs",
+          "anchor": "exact 67-ID reviewed request registry and admission"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit.rs",
+          "anchor": "immutable source and verified output edit transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/unix.rs",
+          "anchor": "Unix descriptor-anchored edit publication"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "decimal hexadecimal and space-delimited REGS parser"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "pre-path request admission and value-free summary"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked finite registry and value-free edit contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal/tests.rs",
+          "anchor": "exact registry admission order duplicate and per-vCPU result tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed DBGBVR0 removal over Full Diff MMIO and PCI"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/tests.rs",
+          "anchor": "verified profile-preserving edit transaction matrix"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "signed snapshot-editor construction verification and product supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual-binary decimal hexadecimal delimiter admission and disclosure tests"
+        }
+      ]
     },
     {
       "id": "tool-argument:snapshot-editor/edit-vmstate/remove-regs/vmstate-path",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/edit-vmstate/remove-regs/vmstate-path.",
+      "summary": "Require --vmstate-path/-v as an immutable descriptor-anchored Bangbang-native state input; bound and revalidate its exact bytes, inode, pathname entry, and parent through a reviewed profile-preserving edit without reopening substitutions.",
       "source_refs": [
         "tool-argument:snapshot-editor/edit-vmstate/remove-regs/vmstate-path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal.rs",
+          "anchor": "typed Bangbang-native state decode transform and rebuild"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit.rs",
+          "anchor": "bounded immutable descriptor-anchored state input"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/unix.rs",
+          "anchor": "source entry parent and content identity revalidation"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "remove-regs --vmstate-path/-v parser"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "reviewed register removal input execution"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked immutable descriptor-anchored input contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal/tests.rs",
+          "anchor": "all-profile state transformation and rejection tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed immutable original state facts and edited-state restore"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/tests.rs",
+          "anchor": "source content entry parent race cancellation and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "signed snapshot-editor construction verification and product supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual-binary vmstate path alias immutability race and redaction tests"
+        }
+      ]
     },
     {
       "id": "tool-argument:snapshot-editor/info-vmstate/vcpu-states/vmstate-path",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/info-vmstate/vcpu-states/vmstate-path.",
+      "summary": "Require --vmstate-path/-v for deterministic canonical vCPU inspection of a bounded descriptor-anchored Bangbang-native state document, with explicit portable values and confidential reviewed state represented only by equality fingerprints.",
       "source_refs": [
         "tool-argument:snapshot-editor/info-vmstate/vcpu-states/vmstate-path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection.rs",
+          "anchor": "canonical vcpu-states JSON inspection"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "info-vmstate vcpu-states --vmstate-path/-v parser"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "descriptor-anchored bounded inspection executor"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked vCPU inspection schema redaction and signed contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection/tests.rs",
+          "anchor": "all-profile canonical vCPU JSON and confidentiality tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed deterministic Full Diff MMIO PCI vCPU inspection"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "signed snapshot-editor construction verification and product supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual-binary all-profile vCPU path alias race and redaction tests"
+        }
+      ]
     },
     {
       "id": "tool-argument:snapshot-editor/info-vmstate/version/vmstate-path",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/info-vmstate/version/vmstate-path.",
+      "summary": "Require --vmstate-path/-v for a bounded descriptor-anchored Bangbang-native state document and print its exact native version token deterministically without exposing the path or accepting Firecracker bitcode.",
       "source_refs": [
         "tool-argument:snapshot-editor/info-vmstate/version/vmstate-path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection.rs",
+          "anchor": "exact decoded native document version source"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "info-vmstate version --vmstate-path/-v parser"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "descriptor-anchored version inspection executor"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked exact native version and signed contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection/tests.rs",
+          "anchor": "all-profile exact version inspection tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed deterministic Full 2.12 and Diff 2.13 version inspection"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "signed snapshot-editor construction verification and product supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual-binary all-profile version path alias rejection and redaction tests"
+        }
+      ]
     },
     {
       "id": "tool-argument:snapshot-editor/info-vmstate/vm-state/vmstate-path",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool argument snapshot-editor/info-vmstate/vm-state/vmstate-path.",
+      "summary": "Require --vmstate-path/-v for deterministic canonical full-VM inspection of a bounded descriptor-anchored Bangbang-native state document, retaining exact profile, devices, memory, and Diff relationships while redacting host authority and fingerprinting confidential state.",
       "source_refs": [
         "tool-argument:snapshot-editor/info-vmstate/vm-state/vmstate-path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection.rs",
+          "anchor": "canonical full vm-state JSON inspection"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "info-vmstate vm-state --vmstate-path/-v parser"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "descriptor-anchored bounded inspection executor"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked VM inspection schema redaction Diff and signed contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection/tests.rs",
+          "anchor": "all-profile canonical full-VM JSON and confidentiality tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed deterministic Full Diff MMIO PCI VM inspection"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "signed snapshot-editor construction verification and product supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual-binary all-profile VM path alias race and redaction tests"
+        }
+      ]
     },
     {
       "id": "tool-operation:cpu-template-helper/fingerprint/compare",
@@ -13615,38 +14102,229 @@
     {
       "id": "tool-operation:snapshot-editor/edit-vmstate/remove-regs",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool operation snapshot-editor/edit-vmstate/remove-regs.",
+      "summary": "Provide snapshot-editor edit-vmstate remove-regs for a nonempty duplicate-free request from the exact 67-ID reviewed Firecracker aarch64 registry, resetting present optional values across every vCPU into a distinct canonical owner-only state with immutable input, value-free counts, redacted deterministic outcomes, and signed Full/Diff product restore.",
       "source_refs": [
         "tool-operation:snapshot-editor/edit-vmstate/remove-regs"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal.rs",
+          "anchor": "exact reviewed multi-vCPU register removal and report"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit.rs",
+          "anchor": "immutable source and verified no-clobber edit transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/unix.rs",
+          "anchor": "Unix descriptor identity publication cleanup and durability"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "edit-vmstate remove-regs frontend"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "pre-path admission transformation publication and outcome execution"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked reviewed edit transaction and signed product contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/register_removal/tests.rs",
+          "anchor": "registry request report multi-vCPU and profile preservation tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed reviewed edit plus Full Diff MMIO PCI App Sandbox restore"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_state_edit/tests.rs",
+          "anchor": "complete edit fault race cancellation cleanup and durability matrix"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "signed snapshot-editor construction verification and product supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual-binary register edit syntax profile transaction and signal matrix"
+        }
+      ]
     },
     {
       "id": "tool-operation:snapshot-editor/info-vmstate/vcpu-states",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool operation snapshot-editor/info-vmstate/vcpu-states.",
+      "summary": "Provide snapshot-editor info-vmstate vcpu-states as bounded deterministic bangbang.snapshot-editor.info.v1 JSON for every supported Bangbang-native profile, preserving ordered portable vCPU semantics while exposing confidential pointer-authentication, vector, debug, SME, GIC, and pending state only through reviewed fingerprints or redaction.",
       "source_refs": [
         "tool-operation:snapshot-editor/info-vmstate/vcpu-states"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection.rs",
+          "anchor": "bounded deterministic vCPU inspection DTO and JSON schema"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "info-vmstate vcpu-states frontend"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "descriptor-anchored vCPU inspection execution"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked canonical vCPU view and signed product contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection/tests.rs",
+          "anchor": "deterministic all-profile vCPU semantics and confidentiality tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed repeated vCPU inspection before and after real edit"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "signed snapshot-editor construction verification and product supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual-binary all-profile deterministic vCPU inspection matrix"
+        }
+      ]
     },
     {
       "id": "tool-operation:snapshot-editor/info-vmstate/version",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool operation snapshot-editor/info-vmstate/version.",
+      "summary": "Provide snapshot-editor info-vmstate version for frozen native-v1 and exact native-v2 2.3 through 2.13 state, printing one deterministic v<major>.<minor>.<patch> token and rejecting malformed, future, and Firecracker bitcode documents without disclosure.",
       "source_refs": [
         "tool-operation:snapshot-editor/info-vmstate/version"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection.rs",
+          "anchor": "exact decoded native family profile and version source"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "info-vmstate version frontend"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "descriptor-anchored exact version execution"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked exact native version and signed product contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection/tests.rs",
+          "anchor": "all-profile deterministic version source tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed repeated exact Full 2.12 and Diff 2.13 version inspection"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "signed snapshot-editor construction verification and product supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual-binary all-profile version and rejection matrix"
+        }
+      ]
     },
     {
       "id": "tool-operation:snapshot-editor/info-vmstate/vm-state",
       "family": "snapshots",
-      "summary": "Audit the Firecracker v1.16 public tool operation snapshot-editor/info-vmstate/vm-state.",
+      "summary": "Provide snapshot-editor info-vmstate vm-state as bounded deterministic bangbang.snapshot-editor.info.v1 JSON for every supported Bangbang-native profile, with explicit portable machine, memory, topology, time, device, and Diff semantics plus literal authority redaction and domain-separated confidential-state fingerprints.",
       "source_refs": [
         "tool-operation:snapshot-editor/info-vmstate/vm-state"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection.rs",
+          "anchor": "bounded deterministic full-VM inspection DTO and JSON schema"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/bin/snapshot-editor.rs",
+          "anchor": "info-vmstate vm-state frontend"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "descriptor-anchored full-VM inspection execution"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-editor-contract.md",
+          "anchor": "checked canonical VM view preservation and signed product contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_document/inspection/tests.rs",
+          "anchor": "deterministic all-profile VM semantics redaction and fingerprint tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed repeated Full Diff MMIO PCI VM inspection and edit comparison"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "signed snapshot-editor construction verification and product supply"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "actual-binary all-profile deterministic VM inspection matrix"
+        }
+      ]
     }
   ]
 }
