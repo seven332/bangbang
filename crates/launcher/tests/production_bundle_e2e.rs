@@ -7712,7 +7712,7 @@ fn normalize_snapshot_device_relative_timers(value: &mut serde_json::Value) {
         serde_json::Value::Object(fields) => {
             for (name, value) in fields {
                 if matches!(name.as_str(), "age_nanos" | "remaining_nanos") && value.is_number() {
-                    *value = serde_json::Value::String("<relative-time>".to_owned());
+                    *value = serde_json::Value::from(0_u64);
                 } else {
                     normalize_snapshot_device_relative_timers(value);
                 }
