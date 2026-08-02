@@ -1558,7 +1558,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn memory_binding(memory_mib: u64) -> SnapshotMemoryBinding {
+    pub(crate) fn memory_binding(memory_mib: u64) -> SnapshotMemoryBinding {
         let size = memory_mib * MIB;
         memory_binding_for_ranges(vec![
             GuestMemoryRange::new(GuestAddress::new(aarch64::DRAM_MEM_START), size)

@@ -23,6 +23,7 @@ mod session_vcpu;
 mod sme;
 mod snapshot;
 mod snapshot_bundle;
+mod snapshot_document;
 mod snapshot_restore;
 mod snapshot_v2;
 mod snapshot_v2_balloon_platform;
@@ -133,6 +134,12 @@ pub use snapshot_bundle::{
     HvfSnapshotV1CompatibilityState, HvfSnapshotV1DecodeError, HvfSnapshotV1EncodeError,
     HvfSnapshotV1InterruptState, HvfSnapshotV1State, HvfSnapshotV1VcpuState,
     decode_hvf_snapshot_v1_state, encode_hvf_snapshot_v1_state,
+};
+pub use snapshot_document::{
+    HvfNativeSnapshotDocument, HvfNativeSnapshotDocumentDecodeError,
+    HvfNativeSnapshotDocumentEncodeError, HvfNativeSnapshotDocumentProfile,
+    HvfNativeSnapshotDocumentReplaceError, HvfNativeSnapshotPlatformRef, HvfNativeSnapshotVcpuRef,
+    HvfNativeSnapshotVcpuState, HvfNativeSnapshotVcpus,
 };
 pub use snapshot_restore::{
     HvfSnapshotV1PlatformError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,

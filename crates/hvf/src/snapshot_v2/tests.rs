@@ -67,19 +67,19 @@ pub(crate) const MMIO_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2/fixtures/mmio.hex");
 pub(crate) const PCI_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2/fixtures/pci.hex");
-const MULTI_BLOCK_MMIO_GRAPH_FIXTURE_HEX: &str =
+pub(crate) const MULTI_BLOCK_MMIO_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2_5/fixtures/root-mmio.hex");
 const MULTI_BLOCK_PCI_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2_5/fixtures/rootless-pci.hex");
-const STORAGE_MMIO_GRAPH_FIXTURE_HEX: &str =
+pub(crate) const STORAGE_MMIO_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2_6/fixtures/pmem-root-mmio.hex");
 const STORAGE_PCI_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2_6/fixtures/mixed-pmem-root-pci.hex");
 const SERIAL_DEFAULT_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_serial_v2_7/fixtures/default.hex");
-const SERIAL_CONFIGURED_FIXTURE_HEX: &str =
+pub(crate) const SERIAL_CONFIGURED_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_serial_v2_7/fixtures/configured.hex");
-const ENTROPY_INACTIVE_MMIO_FIXTURE_HEX: &str =
+pub(crate) const ENTROPY_INACTIVE_MMIO_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_entropy_v2_8/fixtures/inactive-mmio.hex");
 const ENTROPY_ACTIVE_PCI_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_entropy_v2_8/fixtures/active-pci.hex");
@@ -474,7 +474,7 @@ pub(crate) fn complete_state_fixture(graph_hex: &str) -> HvfSnapshotV2State {
         .expect("complete minor-four fixture should validate")
 }
 
-fn complete_multi_block_state_fixture(graph_hex: &str) -> HvfSnapshotV2MultiBlockState {
+pub(crate) fn complete_multi_block_state_fixture(graph_hex: &str) -> HvfSnapshotV2MultiBlockState {
     let graph = SnapshotV2MultiBlockDeviceGraph::decode(
         NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         &fixture_bytes(graph_hex),
@@ -484,7 +484,7 @@ fn complete_multi_block_state_fixture(graph_hex: &str) -> HvfSnapshotV2MultiBloc
         .expect("complete minor-five fixture should validate")
 }
 
-fn complete_storage_state_fixture(graph_hex: &str) -> HvfSnapshotV2StorageState {
+pub(crate) fn complete_storage_state_fixture(graph_hex: &str) -> HvfSnapshotV2StorageState {
     let graph = SnapshotV2StorageDeviceGraph::decode(
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         &fixture_bytes(graph_hex),
@@ -494,7 +494,7 @@ fn complete_storage_state_fixture(graph_hex: &str) -> HvfSnapshotV2StorageState 
         .expect("complete minor-six fixture should validate")
 }
 
-fn complete_serial_state_fixture(
+pub(crate) fn complete_serial_state_fixture(
     graph_hex: Option<&str>,
     serial_hex: &str,
 ) -> HvfSnapshotV2SerialState {
@@ -518,7 +518,7 @@ fn complete_serial_state_fixture(
     .expect("complete minor-seven fixture should validate")
 }
 
-fn complete_entropy_state_fixture(
+pub(crate) fn complete_entropy_state_fixture(
     graph_hex: Option<&str>,
     serial_hex: &str,
     entropy_hex: Option<&str>,
@@ -945,7 +945,7 @@ pub(crate) fn product_serial_fixture() -> SnapshotV2SerialState {
     .expect("serial fixture should decode")
 }
 
-fn complete_balloon_state_fixture(
+pub(crate) fn complete_balloon_state_fixture(
     transport: SnapshotV2DeviceTransportKind,
     has_storage: bool,
     has_entropy: bool,
@@ -1068,7 +1068,7 @@ pub(crate) fn try_exact_minor_ten_platform(
     )
 }
 
-fn complete_memory_hotplug_state_fixture(
+pub(crate) fn complete_memory_hotplug_state_fixture(
     transport: SnapshotV2DeviceTransportKind,
     has_storage: bool,
     has_entropy: bool,
@@ -1166,7 +1166,7 @@ pub(crate) fn complete_network_state_fixture(
     })
 }
 
-fn exact_minor_twelve_memory_binding(
+pub(crate) fn exact_minor_twelve_memory_binding(
     state: Option<&SnapshotV2MemoryHotplugState>,
 ) -> SnapshotV2MemoryBinding {
     let mut ranges = aarch64::dram_layout(FIXTURE_MEMORY_MIB * MIB)
@@ -1269,6 +1269,7 @@ fn exact_minor_thirteen_memory_binding(
 fn exact_minor_thirteen_platform_fixture(
     state: Option<SnapshotV2MemoryHotplugState>,
     base: SnapshotV2DiffBase,
+    ranges: &[GuestMemoryRange],
 ) -> HvfSnapshotV2DiffPlatformState {
     let capture = state.map(memory_hotplug_capture_fixture);
     let result = exact_minor_thirteen_memory_binding(
@@ -1276,7 +1277,7 @@ fn exact_minor_thirteen_platform_fixture(
             .as_ref()
             .map(HvfSnapshotV2MemoryHotplugCaptureState::state),
     );
-    let layer = SnapshotV2DiffLayerBinding::try_from_ranges(base, result, &[])
+    let layer = SnapshotV2DiffLayerBinding::try_from_ranges(base, result, ranges)
         .expect("exact-2.13 layer should validate");
     let (_, machine, global, topology, vcpus, time) = deterministic_device_graph_platform_fixture(
         NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
@@ -1288,7 +1289,7 @@ fn exact_minor_thirteen_platform_fixture(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn complete_diff_state_fixture(
+pub(crate) fn complete_diff_state_fixture(
     transport: SnapshotV2DeviceTransportKind,
     has_storage: bool,
     has_entropy: bool,
@@ -1297,6 +1298,7 @@ fn complete_diff_state_fixture(
     has_network: bool,
     has_vsock: bool,
     base: SnapshotV2DiffBase,
+    ranges: &[GuestMemoryRange],
 ) -> HvfSnapshotV2DiffState {
     let memory_hotplug = has_memory_hotplug.then(|| product_memory_hotplug_fixture(transport));
     let graph = has_storage.then(|| product_storage_fixture_with_network(transport, has_network));
@@ -1313,7 +1315,7 @@ fn complete_diff_state_fixture(
     let network = has_network.then(|| product_network_fixture(transport, network_device));
     let vsock = has_vsock.then(|| product_vsock_fixture(transport));
     HvfSnapshotV2DiffState::try_new(
-        exact_minor_thirteen_platform_fixture(memory_hotplug, base),
+        exact_minor_thirteen_platform_fixture(memory_hotplug, base, ranges),
         graph,
         product_serial_fixture(),
         has_entropy.then(|| memory_hotplug_product_entropy_fixture(transport)),
@@ -2699,6 +2701,7 @@ fn exact_minor_thirteen_diff_closes_all_sixty_four_mmio_and_pci_products() {
                 has_network,
                 has_vsock,
                 SnapshotV2DiffBase::Zero,
+                &[],
             );
             let encoded = encode_hvf_snapshot_v2_diff_state(&original)
                 .expect("complete exact-2.13 state should encode");
@@ -2786,6 +2789,7 @@ fn exact_minor_thirteen_diff_accepts_predecessor_and_rejects_detached_layer_subs
         true,
         true,
         SnapshotV2DiffBase::Image(predecessor.clone()),
+        &[],
     );
     let encoded = encode_hvf_snapshot_v2_diff_state(&original)
         .expect("predecessor-root exact-2.13 state should encode");
@@ -2808,6 +2812,7 @@ fn exact_minor_thirteen_diff_accepts_predecessor_and_rejects_detached_layer_subs
         true,
         true,
         SnapshotV2DiffBase::Zero,
+        &[],
     );
     assert!(matches!(
         NativeV2DiffSnapshotCandidateState::from_diff_state_v2_13(
