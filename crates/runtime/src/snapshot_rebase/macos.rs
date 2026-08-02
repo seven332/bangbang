@@ -532,12 +532,25 @@ where
             SnapshotV2DiffRebaseFailure::StagingChanged,
         ));
     }
-    staging.verified_facts = Some(inspect_file_facts(&staging.file).map_err(|source| {
+    let verified_facts = inspect_file_facts(&staging.file).map_err(|source| {
         precommit_error(
             stage,
             SnapshotV2DiffRebaseFailure::StagingValidation { source },
         )
-    })?);
+    })?;
+    if verified_facts.permissions() != 0o600
+        || !verified_facts.is_regular()
+        || !verified_facts.is_read_write()
+        || !verified_facts.is_close_on_exec()
+        || verified_facts.is_append()
+        || verified_facts.length() != binding.file_length()
+    {
+        return Err(precommit_error(
+            stage,
+            SnapshotV2DiffRebaseFailure::StagingChanged,
+        ));
+    }
+    staging.verified_facts = Some(verified_facts);
     Ok(())
 }
 
@@ -829,7 +842,7 @@ fn open_staging(directory: &File, name: &CString) -> Result<File, io::ErrorKind>
             directory.as_raw_fd(),
             name.as_ptr(),
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            libc::c_uint::from(mode),
+            libc::c_int::from(mode),
         )
     };
     if descriptor < 0 {
@@ -899,7 +912,7 @@ fn entry_identity(directory: &File, name: &CString) -> Result<Option<FileIdentit
         // SAFETY: successful `fstatat` initialized the complete structure.
         let stat = unsafe { stat.assume_init() };
         return Ok(Some(FileIdentity {
-            device: u64::from(u32::from_ne_bytes(stat.st_dev.to_ne_bytes())),
+            device: raw_device_identity(stat.st_dev),
             inode: stat.st_ino,
         }));
     }
@@ -909,6 +922,10 @@ fn entry_identity(directory: &File, name: &CString) -> Result<Option<FileIdentit
     } else {
         Err(error.kind())
     }
+}
+
+fn raw_device_identity(device: libc::dev_t) -> u64 {
+    u64::from_ne_bytes(i64::from(device).to_ne_bytes())
 }
 
 fn atomic_exchange(

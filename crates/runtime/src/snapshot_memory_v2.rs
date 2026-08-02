@@ -1036,6 +1036,11 @@ impl FileFacts {
         self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) const fn permissions(self) -> u32 {
+        self.mode & 0o7777
+    }
+
     pub(crate) const fn same_object(self, other: Self) -> bool {
         self.device == other.device && self.inode == other.inode
     }

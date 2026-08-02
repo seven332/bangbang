@@ -362,6 +362,31 @@ mod macos_tests {
     }
 
     #[test]
+    fn result_sync_rejects_staging_permission_drift() {
+        let fixture = RebaseFixture::complete("result-mode-drift");
+        let error = rebase_snapshot_v2_diff_paths_with_cancel(&fixture.paths, |stage| {
+            if stage == SnapshotV2DiffRebaseStage::ResultFileSync {
+                let staging = fixture.directory.staging_entries();
+                assert_eq!(staging.len(), 1);
+                fs::set_permissions(&staging[0], fs::Permissions::from_mode(0o644))
+                    .expect("staging permissions should drift during the callback");
+            }
+            false
+        })
+        .expect_err("result verification should reject permission drift");
+        assert_eq!(error.stage(), SnapshotV2DiffRebaseStage::ResultFileSync);
+        assert!(matches!(
+            error.failure(),
+            SnapshotV2DiffRebaseFailure::StagingChanged
+        ));
+        assert_eq!(
+            error.staging_cleanup(),
+            Some(SnapshotV2DiffRebaseCleanup::Removed)
+        );
+        fixture.assert_uncommitted_and_clean();
+    }
+
+    #[test]
     fn stable_parent_symlink_resolves_to_one_retained_anchor() {
         let fixture = RebaseFixture::complete("parent-symlink");
         let parent_alias = fixture.directory.child("parent-alias");
