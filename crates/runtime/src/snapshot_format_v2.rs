@@ -46,17 +46,18 @@ const REDACTED: &str = "<redacted>";
 pub const NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION: SnapshotFormatVersion =
     SnapshotFormatVersion::new(2, 0, 0);
 
-/// Semantic version emitted by the current native-v2 writer.
-pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 12, 0);
+/// Highest active native-v2 compatibility version used by generic encoding
+/// and version reporting.
+pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 13, 0);
 
-/// Newest compatibility version understood through an explicit internal seam.
+/// Newest compatibility version understood by exact-version catalog seams.
 const NATIVE_V2_LATEST_KNOWN_COMPATIBILITY_VERSION: SnapshotFormatVersion =
     NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION;
 
 /// Exact native-v2 version of the complete legacy device-free platform profile.
 ///
 /// This identity stays separate from [`NATIVE_V2_SNAPSHOT_VERSION`] so advancing
-/// the current writer cannot reinterpret graphless platform state as a newer
+/// the active ceiling cannot reinterpret graphless platform state as a newer
 /// device profile.
 pub const NATIVE_V2_LEGACY_PLATFORM_VERSION: SnapshotFormatVersion =
     SnapshotFormatVersion::new(2, 3, 0);
@@ -68,27 +69,27 @@ const _: () = assert!(
 const _: () = assert!(
     NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.major()
         == NATIVE_V2_SNAPSHOT_VERSION.major()
-        && NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor() + 6
+        && NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor() + 7
             == NATIVE_V2_SNAPSHOT_VERSION.minor()
         && NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.patch() == 0
 );
 const _: () = assert!(
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
-        && NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.minor() + 5
+        && NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.minor() + 6
             == NATIVE_V2_SNAPSHOT_VERSION.minor()
         && NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION.patch()
             == NATIVE_V2_SNAPSHOT_VERSION.patch()
 );
 const _: () = assert!(
     NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
-        && NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION.minor() + 4
+        && NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION.minor() + 5
             == NATIVE_V2_SNAPSHOT_VERSION.minor()
         && NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION.patch()
             == NATIVE_V2_SNAPSHOT_VERSION.patch()
 );
 const _: () = assert!(
     NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
-        && NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION.minor() + 3
+        && NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION.minor() + 4
             == NATIVE_V2_SNAPSHOT_VERSION.minor()
         && NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION.patch()
             == NATIVE_V2_SNAPSHOT_VERSION.patch()
@@ -96,29 +97,28 @@ const _: () = assert!(
 const _: () = assert!(
     NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION.major()
         == NATIVE_V2_SNAPSHOT_VERSION.major()
-        && NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION.minor() + 2
+        && NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION.minor() + 3
             == NATIVE_V2_SNAPSHOT_VERSION.minor()
         && NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION.patch()
             == NATIVE_V2_SNAPSHOT_VERSION.patch()
 );
 const _: () = assert!(
     NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
-        && NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION.minor() + 1
+        && NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION.minor() + 2
             == NATIVE_V2_SNAPSHOT_VERSION.minor()
         && NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION.patch()
             == NATIVE_V2_SNAPSHOT_VERSION.patch()
 );
 const _: () = assert!(
     NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
-        && NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.minor()
+        && NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.minor() + 1
             == NATIVE_V2_SNAPSHOT_VERSION.minor()
         && NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.patch()
             == NATIVE_V2_SNAPSHOT_VERSION.patch()
 );
 const _: () = assert!(
     NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
-        && NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION.minor()
-            == NATIVE_V2_SNAPSHOT_VERSION.minor() + 1
+        && NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION.minor() == NATIVE_V2_SNAPSHOT_VERSION.minor()
         && NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION.patch() == NATIVE_V2_SNAPSHOT_VERSION.patch()
 );
 
@@ -330,9 +330,7 @@ pub const NATIVE_V2_VSOCK_COMPONENT_KEY: SnapshotV2ComponentKey =
 
 /// Canonical identity of the optional singleton native-v2 Diff layer.
 ///
-/// This semantic component is introduced by the dormant exact-2.13
-/// compatibility seam. Public product profiles remain exact 2.12 until the
-/// later activation slice.
+/// This semantic component is introduced by the exact-2.13 Diff profile.
 pub const NATIVE_V2_DIFF_COMPONENT_KEY: SnapshotV2ComponentKey = SnapshotV2ComponentKey::new(14, 0);
 
 impl fmt::Debug for SnapshotV2ComponentKey {

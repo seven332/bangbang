@@ -1,4 +1,4 @@
-//! Dormant exact native-v2 2.13 differential-memory artifact contract.
+//! Active exact native-v2 2.13 differential-memory artifact contract.
 
 use std::collections::TryReserveError;
 use std::fmt;
@@ -29,14 +29,14 @@ pub use materialize::{
 pub use writer::{
     SnapshotV2DiffSelection, SnapshotV2DiffSelectionError, SnapshotV2DiffVerifyError,
     SnapshotV2DiffVerifyStage, SnapshotV2DiffWriteError, SnapshotV2DiffWriteStage,
-    verify_snapshot_v2_diff_layer_output, write_snapshot_v2_diff_layer,
-    write_snapshot_v2_diff_layer_with_cancel,
+    verify_snapshot_v2_diff_layer_output, verify_snapshot_v2_diff_layer_output_with_cancel,
+    write_snapshot_v2_diff_layer, write_snapshot_v2_diff_layer_with_cancel,
 };
 
 #[cfg(test)]
 mod tests;
 
-/// Exact compatibility identity of the dormant Diff layer contract.
+/// Exact compatibility identity of the active Diff layer contract.
 pub const NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION: SnapshotFormatVersion =
     SnapshotFormatVersion::new(2, 13, 0);
 

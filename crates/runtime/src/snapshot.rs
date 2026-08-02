@@ -54,7 +54,7 @@ pub struct SnapshotV2NetworkControllerCommitProductConfigs {
     mmds_state: Option<MmdsStateHandle>,
 }
 
-/// Complete current exact-2.12 controller product, including destination-only
+/// Complete exact-2.12 Full controller product, including destination-only
 /// vsock configuration and every retained exact-2.11 projection.
 #[doc(hidden)]
 pub struct SnapshotV2VsockControllerCommitProductConfigs {
@@ -484,7 +484,7 @@ impl SnapshotV2ControllerCommit {
         }
     }
 
-    /// Retains current exact-2.12 serial, optional prior products, complete
+    /// Retains exact-2.12 Full serial, optional prior products, complete
     /// override-resolved network/MMDS state, and optional destination vsock
     /// configuration as one atomic destination value.
     #[doc(hidden)]
@@ -967,7 +967,6 @@ pub(crate) enum SnapshotV1Rejection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapshotV2CreateRejection {
-    CreateSnapshotType,
     BootSource,
     DriveDevice,
     NetworkDevice,
@@ -1125,10 +1124,9 @@ pub(crate) fn classify_v2_create(
 pub(crate) fn classify_v2_create_request(
     input: &SnapshotCreateInput,
 ) -> Result<(), SnapshotV2CreateRejection> {
-    if input.snapshot_type != SnapshotType::Full {
-        return Err(SnapshotV2CreateRejection::CreateSnapshotType);
+    match input.snapshot_type {
+        SnapshotType::Full | SnapshotType::Diff => Ok(()),
     }
-    Ok(())
 }
 
 pub(crate) fn classify_v2_create_profile(
@@ -1578,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn native_v2_create_policy_accepts_machine_facts_and_rejects_unencoded_resources() {
+    fn native_v2_create_policy_accepts_full_and_diff_and_rejects_unencoded_resources() {
         let full = SnapshotCreateInput::new(SnapshotType::Full, "state", "memory");
         assert_eq!(classify_v2_create(&full, supported_v2_profile()), Ok(()));
         assert_eq!(
@@ -1586,7 +1584,7 @@ mod tests {
                 &SnapshotCreateInput::new(SnapshotType::Diff, "state", "memory"),
                 supported_v2_profile(),
             ),
-            Err(SnapshotV2CreateRejection::CreateSnapshotType)
+            Ok(())
         );
 
         let cases = [

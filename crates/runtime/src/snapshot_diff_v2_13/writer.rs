@@ -790,6 +790,11 @@ impl fmt::Display for SnapshotV2DiffVerifyStage {
 
 /// Failure while verifying a Diff layer against one detached binding.
 pub enum SnapshotV2DiffVerifyError {
+    /// Verification was cancelled at a stable stage.
+    Cancelled {
+        /// The stage observing cancellation.
+        stage: SnapshotV2DiffVerifyStage,
+    },
     /// The detached or decoded binding is invalid.
     Binding {
         /// The redacted binding failure.
@@ -832,6 +837,12 @@ impl fmt::Debug for SnapshotV2DiffVerifyError {
 impl fmt::Display for SnapshotV2DiffVerifyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled { stage } => {
+                write!(
+                    formatter,
+                    "native-v2 Diff verification cancelled at {stage}"
+                )
+            }
             Self::Binding { .. } => formatter.write_str("native-v2 Diff binding is invalid"),
             Self::MetadataAllocationFailed { .. } => {
                 formatter.write_str("native-v2 Diff verification allocation failed")
@@ -866,7 +877,8 @@ impl std::error::Error for SnapshotV2DiffVerifyError {
         match self {
             Self::Binding { source } => Some(source),
             Self::MetadataAllocationFailed { source } => Some(source),
-            Self::Io { .. }
+            Self::Cancelled { .. }
+            | Self::Io { .. }
             | Self::PositionMismatch { .. }
             | Self::FileLengthMismatch
             | Self::BindingMismatch
@@ -880,20 +892,49 @@ pub fn verify_snapshot_v2_diff_layer_output<R: Read + Seek>(
     binding: &SnapshotV2DiffLayerBinding,
     reader: &mut R,
 ) -> Result<(), SnapshotV2DiffVerifyError> {
-    verify_snapshot_v2_diff_layer_output_with_reserve(binding, reader, |buffer, additional| {
-        buffer.try_reserve_exact(additional)
-    })
+    verify_snapshot_v2_diff_layer_output_with_reserve(
+        binding,
+        reader,
+        |buffer, additional| buffer.try_reserve_exact(additional),
+        || false,
+    )
 }
 
-fn verify_snapshot_v2_diff_layer_output_with_reserve<R, A>(
+/// Verifies one detached Diff layer while observing cancellation between
+/// bounded metadata and padding operations.
+pub fn verify_snapshot_v2_diff_layer_output_with_cancel<R, C>(
+    binding: &SnapshotV2DiffLayerBinding,
+    reader: &mut R,
+    is_cancelled: C,
+) -> Result<(), SnapshotV2DiffVerifyError>
+where
+    R: Read + Seek,
+    C: FnMut() -> bool,
+{
+    verify_snapshot_v2_diff_layer_output_with_reserve(
+        binding,
+        reader,
+        |buffer, additional| buffer.try_reserve_exact(additional),
+        is_cancelled,
+    )
+}
+
+fn verify_snapshot_v2_diff_layer_output_with_reserve<R, A, C>(
     binding: &SnapshotV2DiffLayerBinding,
     reader: &mut R,
     mut reserve_metadata: A,
+    mut is_cancelled: C,
 ) -> Result<(), SnapshotV2DiffVerifyError>
 where
     R: Read + Seek,
     A: FnMut(&mut Vec<u8>, usize) -> Result<(), TryReserveError>,
+    C: FnMut() -> bool,
 {
+    if is_cancelled() {
+        return Err(SnapshotV2DiffVerifyError::Cancelled {
+            stage: SnapshotV2DiffVerifyStage::FileLength,
+        });
+    }
     let expected = binding
         .encode()
         .map_err(|source| SnapshotV2DiffVerifyError::Binding { source })?;
@@ -911,6 +952,11 @@ where
     if end != binding.file_length() {
         return Err(SnapshotV2DiffVerifyError::FileLengthMismatch);
     }
+    if is_cancelled() {
+        return Err(SnapshotV2DiffVerifyError::Cancelled {
+            stage: SnapshotV2DiffVerifyStage::Metadata,
+        });
+    }
     seek_read_exact(reader, 0, SnapshotV2DiffVerifyStage::Metadata)?;
 
     let mut metadata = Vec::new();
@@ -918,6 +964,11 @@ where
         .map_err(|source| SnapshotV2DiffVerifyError::MetadataAllocationFailed { source })?;
     metadata.resize(expected.len(), 0);
     read_exact_stage(reader, &mut metadata, SnapshotV2DiffVerifyStage::Metadata)?;
+    if is_cancelled() {
+        return Err(SnapshotV2DiffVerifyError::Cancelled {
+            stage: SnapshotV2DiffVerifyStage::Metadata,
+        });
+    }
     let decoded = SnapshotV2DiffLayerBinding::decode(&metadata)
         .map_err(|source| SnapshotV2DiffVerifyError::Binding { source })?;
     if metadata != expected || decoded != *binding {
@@ -935,6 +986,11 @@ where
     )?;
     let mut buffer = [0_u8; ZERO_CHUNK_BYTES];
     while padding != 0 {
+        if is_cancelled() {
+            return Err(SnapshotV2DiffVerifyError::Cancelled {
+                stage: SnapshotV2DiffVerifyStage::MetadataPadding,
+            });
+        }
         let length = usize::try_from(padding.min(ZERO_CHUNK_BYTES as u64)).map_err(|_| {
             SnapshotV2DiffVerifyError::Binding {
                 source: SnapshotV2DiffLayerBindingError::LengthOverflow,
@@ -958,6 +1014,11 @@ where
                 source: SnapshotV2DiffLayerBindingError::LengthOverflow,
             }
         })?;
+    }
+    if is_cancelled() {
+        return Err(SnapshotV2DiffVerifyError::Cancelled {
+            stage: SnapshotV2DiffVerifyStage::MetadataPadding,
+        });
     }
     Ok(())
 }

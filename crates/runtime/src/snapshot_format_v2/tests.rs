@@ -210,7 +210,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn public_writer_is_vsock_twelve_and_explicit_diff_thirteen_is_dormant() {
+fn public_structural_version_is_diff_thirteen_while_full_stays_vsock_twelve() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -219,7 +219,7 @@ fn public_writer_is_vsock_twelve_and_explicit_diff_thirteen_is_dormant() {
     );
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
-        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
     );
     assert_eq!(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY.kind(), 11);
     assert_eq!(NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY.instance(), 0);
@@ -659,12 +659,12 @@ fn public_writer_is_vsock_twelve_and_explicit_diff_thirteen_is_dormant() {
         &[],
         &[vsock, diff],
     )
-    .expect("explicit exact 2.13 should admit the dormant Diff component");
+    .expect("explicit exact 2.13 should admit the Diff component");
     let decoded_diff = decode_snapshot_v2_state_with_compatibility_version(
         &diff_state,
         NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
     )
-    .expect("explicit exact 2.13 should decode the dormant Diff component");
+    .expect("explicit exact 2.13 should decode the Diff component");
     assert_eq!(
         decoded_diff.metadata().version(),
         NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
@@ -673,12 +673,15 @@ fn public_writer_is_vsock_twelve_and_explicit_diff_thirteen_is_dormant() {
         decoded_diff.component(NATIVE_V2_DIFF_COMPONENT_KEY),
         Some(diff)
     );
+    let public_diff = decode_snapshot_v2_state(&diff_state)
+        .expect("the public structural decoder should admit exact 2.13");
+    assert_eq!(
+        public_diff.component(NATIVE_V2_DIFF_COMPONENT_KEY),
+        Some(diff)
+    );
     assert!(matches!(
-        decode_snapshot_v2_state(&diff_state),
-        Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
-            supported: NATIVE_V2_SNAPSHOT_VERSION,
-        })
+        decode_native_snapshot_state(&diff_state),
+        Ok(NativeSnapshotState::V2(_))
     ));
     let downgraded_diff = with_u16_field_and_checksum(&diff_state, VERSION_MINOR_OFFSET, 12);
     assert_eq!(
@@ -762,11 +765,11 @@ fn version_policy_rejects_major_and_newer_minor_but_accepts_patch() {
         })
     );
 
-    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 13);
+    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 14);
     assert_eq!(
         decode_snapshot_v2_state(&minor),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: SnapshotFormatVersion::new(2, 13, 0),
+            found: SnapshotFormatVersion::new(2, 14, 0),
             supported: NATIVE_V2_SNAPSHOT_VERSION,
         })
     );

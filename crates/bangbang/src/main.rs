@@ -2616,10 +2616,10 @@ mod tests {
         NATIVE_V1_SNAPSHOT_VERSION, NativeSnapshotFormatError, SnapshotFormatError,
         encode_snapshot_envelope,
     };
-    use bangbang_runtime::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
     use bangbang_runtime::snapshot_memory_v2::{
         encode_snapshot_v2_state_with_memory, write_snapshot_v2_memory_image,
     };
+    use bangbang_runtime::snapshot_vsock_v2_12::NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION;
     use bangbang_runtime::startup::Arm64BootResources;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmData};
 
@@ -3381,7 +3381,7 @@ mod tests {
         let version = super::describe_snapshot(snapshot_path.to_str().expect("UTF-8 path"))
             .expect("valid native-v2 snapshot should inspect");
 
-        assert_eq!(version, NATIVE_V2_SNAPSHOT_VERSION);
+        assert_eq!(version, NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION);
         fs::remove_file(snapshot_path).expect("snapshot fixture should clean up");
     }
 

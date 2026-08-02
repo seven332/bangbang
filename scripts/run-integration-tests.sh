@@ -518,6 +518,7 @@ if contains native_v2_process "${selected_tests[@]}"; then
     vmm::tests::signed_exact_minor_twelve_process_mmio_vsock_owner_transaction_is_atomic \
     vmm::tests::signed_exact_minor_twelve_process_pci_vsock_owner_transaction_is_atomic \
     vmm::tests::signed_native_v2_process_publishes_recaptures_and_resumes_private_pair \
+    vmm::tests::signed_native_v2_diff_process_loads_zero_root_and_rebased_products \
     vmm::tests::signed_native_v2_root_process_commits_complete_mmio_and_pci_owners_atomically \
     vmm::tests::signed_native_v2_storage_destination_stays_private_and_paused_through_commit \
     vmm::tests::signed_native_v2_serial_destination_reconciles_and_recaptures_private_owner \

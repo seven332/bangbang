@@ -49,6 +49,157 @@ struct OpenedFinalPath {
     tracker: Option<Arc<dyn SnapshotStagingTracker>>,
 }
 
+struct DiffLoadStaging {
+    directory: File,
+    name: CString,
+    writer: Option<File>,
+    reader: Option<File>,
+    identity: FileIdentity,
+    active: bool,
+}
+
+impl DiffLoadStaging {
+    fn create() -> Result<Self, SnapshotArtifactLoadError> {
+        let mut directories = Vec::with_capacity(2);
+        if let Ok(current) = std::env::current_dir() {
+            directories.push(current);
+        }
+        let temporary = std::env::temp_dir();
+        if !directories.contains(&temporary) {
+            directories.push(temporary);
+        }
+
+        let mut last_error = io::ErrorKind::NotFound;
+        for path in directories {
+            let directory =
+                match open_load_directory(&path, SnapshotArtifactLoadStage::MemoryStaging) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        if let SnapshotArtifactLoadFailure::Io(kind) = error.failure() {
+                            last_error = *kind;
+                        }
+                        continue;
+                    }
+                };
+            for _ in 0..STAGING_CREATE_ATTEMPTS {
+                let name = staging_name(SnapshotArtifactKind::Memory).map_err(|_| {
+                    load_error(
+                        SnapshotArtifactLoadStage::MemoryStaging,
+                        SnapshotArtifactLoadFailure::Io(io::ErrorKind::Other),
+                    )
+                })?;
+                match open_staging(&directory, &name) {
+                    Ok(file) => {
+                        let identity = file_identity(&file).map_err(|kind| {
+                            load_error(
+                                SnapshotArtifactLoadStage::MemoryStaging,
+                                SnapshotArtifactLoadFailure::Io(kind),
+                            )
+                        })?;
+                        let mut staging = Self {
+                            directory,
+                            name,
+                            writer: Some(file),
+                            reader: None,
+                            identity,
+                            active: true,
+                        };
+                        staging
+                            .writer()?
+                            .set_permissions(std::fs::Permissions::from_mode(0o600))
+                            .map_err(|source| {
+                                load_error(
+                                    SnapshotArtifactLoadStage::MemoryStaging,
+                                    SnapshotArtifactLoadFailure::Io(source.kind()),
+                                )
+                            })?;
+                        return staging.open_reader_and_unlink();
+                    }
+                    Err(io::ErrorKind::AlreadyExists) => {}
+                    Err(kind) => {
+                        last_error = kind;
+                        break;
+                    }
+                }
+            }
+        }
+        Err(load_error(
+            SnapshotArtifactLoadStage::MemoryStaging,
+            SnapshotArtifactLoadFailure::Io(last_error),
+        ))
+    }
+
+    fn writer(&mut self) -> Result<&mut File, SnapshotArtifactLoadError> {
+        self.writer.as_mut().ok_or_else(|| {
+            load_error(
+                SnapshotArtifactLoadStage::MemoryStaging,
+                SnapshotArtifactLoadFailure::Io(io::ErrorKind::InvalidInput),
+            )
+        })
+    }
+
+    fn open_reader_and_unlink(mut self) -> Result<Self, SnapshotArtifactLoadError> {
+        let (file, _) = open_regular_final(
+            &self.directory,
+            &self.name,
+            SnapshotArtifactKind::Memory,
+            SnapshotArtifactLoadStage::MemoryStaging,
+            SnapshotArtifactLoadStage::MemoryStaging,
+        )?;
+        let actual = file_identity(&file).map_err(|kind| {
+            load_error(
+                SnapshotArtifactLoadStage::MemoryStaging,
+                SnapshotArtifactLoadFailure::Io(kind),
+            )
+        })?;
+        if actual != self.identity
+            || entry_identity(&self.directory, &self.name).map_err(|kind| {
+                load_error(
+                    SnapshotArtifactLoadStage::MemoryStaging,
+                    SnapshotArtifactLoadFailure::Io(kind),
+                )
+            })? != Some(self.identity)
+        {
+            return Err(load_error(
+                SnapshotArtifactLoadStage::MemoryStaging,
+                SnapshotArtifactLoadFailure::Io(io::ErrorKind::PermissionDenied),
+            ));
+        }
+        self.reader = Some(file);
+        // SAFETY: the retained directory is live, the generated component is
+        // NUL-terminated, and the immediately preceding identity checks prove
+        // that the entry still names both staging descriptors opened above.
+        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) } != 0 {
+            return Err(load_error(
+                SnapshotArtifactLoadStage::MemoryStaging,
+                SnapshotArtifactLoadFailure::Io(io::Error::last_os_error().kind()),
+            ));
+        }
+        self.active = false;
+        Ok(self)
+    }
+
+    fn into_read_only_unlinked(mut self) -> Result<File, SnapshotArtifactLoadError> {
+        drop(self.writer.take());
+        self.reader.take().ok_or_else(|| {
+            load_error(
+                SnapshotArtifactLoadStage::MemoryStaging,
+                SnapshotArtifactLoadFailure::Io(io::ErrorKind::InvalidInput),
+            )
+        })
+    }
+}
+
+impl Drop for DiffLoadStaging {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = clean_staging_entry(&self.directory, &self.name, self.identity);
+        }
+        self.writer.take();
+        self.reader.take();
+    }
+}
+
 struct StagingFile<'directory> {
     destination: &'directory OpenedFinalPath,
     artifact: SnapshotArtifactKind,
@@ -1100,7 +1251,7 @@ pub(super) fn load_native_snapshot_artifacts_macos(
         SnapshotArtifactLoadStage::MemoryOpen,
         SnapshotArtifactLoadStage::MemoryTypeCheck,
     )?;
-    load_prepared_native_snapshot_memory_file_macos(prepared, memory_file)
+    load_prepared_native_snapshot_memory_file_macos(prepared, memory_file, &mut || false)
 }
 
 pub(super) fn load_snapshot_artifacts_macos(
@@ -1351,7 +1502,14 @@ pub(super) fn prepare_snapshot_state_path_macos(
 pub(super) fn load_prepared_native_snapshot_memory_file_macos(
     prepared: PreparedNativeSnapshotState,
     mut memory_file: File,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError> {
+    if is_cancelled() {
+        return Err(load_error(
+            SnapshotArtifactLoadStage::MemoryLoad,
+            SnapshotArtifactLoadFailure::Cancelled,
+        ));
+    }
     let state = prepared.state;
     let memory = match &state.inner {
         NativeSnapshotArtifactStateInner::V1(record) => {
@@ -1423,7 +1581,7 @@ pub(super) fn load_prepared_native_snapshot_memory_file_macos(
                             )?
                         }
                         NativeV2MemoryHotplugSnapshotPreparation::Prepared(prepared) => prepared
-                            .materialize_memory_file(memory_file)
+                            .materialize_memory_file_with_cancel(memory_file, |_| is_cancelled())
                             .map(
                                 MaterializedNativeV2MemoryHotplugSnapshotCandidateState::into_parts,
                             )
@@ -1470,15 +1628,19 @@ pub(super) fn load_prepared_native_snapshot_memory_file_macos(
                                         ),
                                     )
                                 })?;
-                            materialize_snapshot_v2_memory_hotplug_file(&topology, memory_file)
-                                .map_err(|source| {
-                                    load_error(
-                                        SnapshotArtifactLoadStage::MemoryLoad,
-                                        SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(
-                                            source,
-                                        ),
-                                    )
-                                })?
+                            materialize_snapshot_v2_memory_hotplug_file_with_cancel(
+                                &topology,
+                                memory_file,
+                                |_| is_cancelled(),
+                            )
+                            .map_err(|source| {
+                                load_error(
+                                    SnapshotArtifactLoadStage::MemoryLoad,
+                                    SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(
+                                        source,
+                                    ),
+                                )
+                            })?
                         }
                         None => load_snapshot_v2_memory_file(&decoded, memory_file).map_err(
                             |source| {
@@ -1520,17 +1682,128 @@ pub(super) fn load_prepared_native_snapshot_memory_file_macos(
                                         ),
                                     )
                                 })?;
-                            materialize_snapshot_v2_memory_hotplug_file(&topology, memory_file)
-                                .map_err(|source| {
-                                    load_error(
-                                        SnapshotArtifactLoadStage::MemoryLoad,
-                                        SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(
-                                            source,
-                                        ),
-                                    )
-                                })?
+                            materialize_snapshot_v2_memory_hotplug_file_with_cancel(
+                                &topology,
+                                memory_file,
+                                |_| is_cancelled(),
+                            )
+                            .map_err(|source| {
+                                load_error(
+                                    SnapshotArtifactLoadStage::MemoryLoad,
+                                    SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(
+                                        source,
+                                    ),
+                                )
+                            })?
                         }
                         None => load_snapshot_v2_memory_file(&decoded, memory_file).map_err(
+                            |source| {
+                                load_error(
+                                    SnapshotArtifactLoadStage::MemoryLoad,
+                                    SnapshotArtifactLoadFailure::MemoryV2(source),
+                                )
+                            },
+                        )?,
+                    }
+                }
+                NativeV2SnapshotArtifactProfile::DiffStateV2_13 => {
+                    let candidate =
+                        NativeV2DiffSnapshotCandidateState::from_committed_diff_state_v2_13(
+                            bytes.clone(),
+                        )
+                        .map_err(|source| {
+                            load_error(
+                                SnapshotArtifactLoadStage::StateDecode,
+                                SnapshotArtifactLoadFailure::NativeState(
+                                    NativeSnapshotArtifactStateError::DiffV2Profile(source),
+                                ),
+                            )
+                        })?;
+                    let (_, binding, _, _, _, _, memory_hotplug, _, _, layer) =
+                        candidate.into_parts();
+                    let magic = read_memory_artifact_magic(&mut memory_file)?;
+                    let complete_file = if magic == NATIVE_V2_MEMORY_MAGIC {
+                        memory_file
+                    } else if magic == NATIVE_V2_DIFF_MAGIC {
+                        if !matches!(layer.base(), SnapshotV2DiffBase::Zero) {
+                            return Err(load_error(
+                                SnapshotArtifactLoadStage::MemoryClassification,
+                                SnapshotArtifactLoadFailure::DiffBaseUnavailable,
+                            ));
+                        }
+                        verify_snapshot_v2_diff_layer_output_with_cancel(
+                            &layer,
+                            &mut memory_file,
+                            &mut *is_cancelled,
+                        )
+                        .map_err(|source| {
+                            load_error(
+                                SnapshotArtifactLoadStage::MemoryClassification,
+                                SnapshotArtifactLoadFailure::DiffVerification(source),
+                            )
+                        })?;
+                        let mut staging = DiffLoadStaging::create()?;
+                        let result = promote_snapshot_v2_diff_zero_root_file_with_cancel(
+                            memory_file,
+                            staging.writer()?,
+                            |_| is_cancelled(),
+                        )
+                        .map_err(|source| {
+                            load_error(
+                                SnapshotArtifactLoadStage::MemoryMaterialization,
+                                SnapshotArtifactLoadFailure::DiffMaterialization(source),
+                            )
+                        })?;
+                        if result != binding {
+                            return Err(load_error(
+                                SnapshotArtifactLoadStage::MemoryMaterialization,
+                                SnapshotArtifactLoadFailure::DiffVerification(
+                                    SnapshotV2DiffVerifyError::BindingMismatch,
+                                ),
+                            ));
+                        }
+                        staging.into_read_only_unlinked()?
+                    } else {
+                        return Err(load_error(
+                            SnapshotArtifactLoadStage::MemoryClassification,
+                            SnapshotArtifactLoadFailure::MemoryV2(
+                                SnapshotV2MemoryLoadError::MemoryHeaderMismatch,
+                            ),
+                        ));
+                    };
+                    match memory_hotplug {
+                        Some(memory_hotplug) => {
+                            let topology =
+                                PreparedSnapshotV2MemoryHotplugTopology::prepare_for_compatibility_version(
+                                    memory_hotplug,
+                                    binding,
+                                    NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+                                )
+                                .map_err(|source| {
+                                    load_error(
+                                        SnapshotArtifactLoadStage::StateDecode,
+                                        SnapshotArtifactLoadFailure::MemoryHotplugPreparation(
+                                            NativeV2MemoryHotplugSnapshotPreparationError::Topology(
+                                                source,
+                                            ),
+                                        ),
+                                    )
+                                })?;
+                            materialize_snapshot_v2_memory_hotplug_file_with_cancel(
+                                &topology,
+                                complete_file,
+                                |_| is_cancelled(),
+                            )
+                            .map_err(|source| {
+                                load_error(
+                                    SnapshotArtifactLoadStage::MemoryLoad,
+                                    SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(
+                                        source,
+                                    ),
+                                )
+                            })?
+                        }
+                        None => load_snapshot_v2_memory_file(&decoded, complete_file).map_err(
                             |source| {
                                 load_error(
                                     SnapshotArtifactLoadStage::MemoryLoad,
@@ -1549,6 +1822,13 @@ pub(super) fn load_prepared_native_snapshot_memory_file_macos(
             }
         }
     };
+    if is_cancelled() {
+        drop(memory);
+        return Err(load_error(
+            SnapshotArtifactLoadStage::MemoryLoad,
+            SnapshotArtifactLoadFailure::Cancelled,
+        ));
+    }
     Ok(LoadedNativeSnapshotArtifacts { state, memory })
 }
 
@@ -1582,6 +1862,7 @@ pub(super) fn load_prepared_snapshot_memory_file_macos(
 pub(super) fn load_prepared_native_snapshot_memory_path_macos(
     prepared: PreparedNativeSnapshotState,
     path: &Path,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError> {
     let split = split_final_path(path, SnapshotArtifactKind::Memory).map_err(|_| {
         load_error(
@@ -1602,7 +1883,7 @@ pub(super) fn load_prepared_native_snapshot_memory_path_macos(
         SnapshotArtifactLoadStage::MemoryOpen,
         SnapshotArtifactLoadStage::MemoryTypeCheck,
     )?;
-    load_prepared_native_snapshot_memory_file_macos(prepared, file)
+    load_prepared_native_snapshot_memory_file_macos(prepared, file, is_cancelled)
 }
 
 pub(super) fn load_prepared_snapshot_memory_path_macos(
@@ -1629,6 +1910,29 @@ pub(super) fn load_prepared_snapshot_memory_path_macos(
         SnapshotArtifactLoadStage::MemoryTypeCheck,
     )?;
     load_prepared_snapshot_memory_file_macos(prepared, file)
+}
+
+fn read_memory_artifact_magic(file: &mut File) -> Result<[u8; 8], SnapshotArtifactLoadError> {
+    file.seek(SeekFrom::Start(0)).map_err(|source| {
+        load_error(
+            SnapshotArtifactLoadStage::MemoryClassification,
+            SnapshotArtifactLoadFailure::Io(source.kind()),
+        )
+    })?;
+    let mut magic = [0_u8; 8];
+    file.read_exact(&mut magic).map_err(|source| {
+        load_error(
+            SnapshotArtifactLoadStage::MemoryClassification,
+            SnapshotArtifactLoadFailure::Io(source.kind()),
+        )
+    })?;
+    file.seek(SeekFrom::Start(0)).map_err(|source| {
+        load_error(
+            SnapshotArtifactLoadStage::MemoryClassification,
+            SnapshotArtifactLoadFailure::Io(source.kind()),
+        )
+    })?;
+    Ok(magic)
 }
 
 fn supplied_regular_length(

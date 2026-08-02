@@ -17093,7 +17093,7 @@ fn prepares_owned_hvf_arm64_boot_session() {
     assert!(!diff.selection().ranges().is_empty());
     session
         .abort_snapshot_lineage_quiesced(diff.token(), &guard)
-        .expect("dormant Diff preparation should abort unchanged");
+        .expect("Diff preparation should abort unchanged");
     let full = session
         .begin_full_snapshot_lineage_quiesced(&guard)
         .expect("normal boot Full lineage should begin");

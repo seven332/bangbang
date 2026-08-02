@@ -167,7 +167,7 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
         .expect("current v2 state should validate");
 
     assert_eq!(state.family(), NativeSnapshotArtifactFamily::V2);
-    assert_eq!(state.version(), NATIVE_V2_SNAPSHOT_VERSION);
+    assert_eq!(state.version(), NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION);
     assert_eq!(state.v2_bytes(), Some(bytes.as_slice()));
     assert_eq!(state.v2_memory_binding(), Some(&binding));
     assert_eq!(
@@ -224,7 +224,7 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
         &binding_payload,
     );
     let mut legacy = encode_snapshot_v2_state_with_compatibility_version(
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         &[],
         &[memory_component],
     )
@@ -304,7 +304,7 @@ fn current_v2_artifact_boundary_rejects_missing_serial_state() {
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
         &memory,
         &mut image,
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
     )
     .expect("graphless current memory should encode internally");
     let binding_payload = binding
@@ -316,7 +316,7 @@ fn current_v2_artifact_boundary_rejects_missing_serial_state() {
         &binding_payload,
     );
     let bytes = encode_snapshot_v2_state_with_compatibility_version(
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         &[],
         &[memory_component],
     )
@@ -522,11 +522,11 @@ fn exact_minor_twelve_vsock_pair_has_current_artifact_and_family_authority() {
     assert_eq!(
         artifact
             .v2_profile()
-            .expect("current exact-2.12 artifact should classify"),
+            .expect("exact-2.12 Full artifact should classify"),
         NativeV2SnapshotArtifactProfile::VsockStateV2_12
     );
     NativeSnapshotArtifactState::from_compatible_bytes(bytes.clone())
-        .expect("the compatible family decoder should admit current exact-2.12");
+        .expect("the compatible family decoder should admit exact-2.12 Full");
     assert_eq!(
         classify_native_v2_profile(&bytes, &binding)
             .expect("the explicit classifier should recognize exact 2.12"),
@@ -538,10 +538,14 @@ fn exact_minor_twelve_vsock_pair_has_current_artifact_and_family_authority() {
     ));
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
-        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION
     );
     assert_eq!(
         NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION.minor() + 1,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.minor()
+    );
+    assert_eq!(
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION.minor() + 1,
         NATIVE_V2_SNAPSHOT_VERSION.minor()
     );
 
@@ -559,7 +563,7 @@ fn current_v2_artifact_boundary_rejects_duplicate_and_nonsemantic_serial_state()
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
         &memory,
         &mut image,
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
     )
     .expect("current memory should encode internally");
     let binding_payload = binding.encode().expect("current binding should encode");
@@ -588,7 +592,7 @@ fn current_v2_artifact_boundary_rejects_duplicate_and_nonsemantic_serial_state()
         &serial_payload,
     );
     let duplicate = encode_snapshot_v2_state_with_compatibility_version(
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         &[],
         &[memory_component, serial, duplicate_serial],
     )
@@ -606,7 +610,7 @@ fn current_v2_artifact_boundary_rejects_duplicate_and_nonsemantic_serial_state()
         &serial_payload,
     );
     let nonsemantic = encode_snapshot_v2_state_with_compatibility_version(
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         &[],
         &[memory_component, nonsemantic_serial],
     )
@@ -2828,11 +2832,11 @@ fn exact_profile_classifier_retains_minor_three_and_rejects_cross_minor_graphs()
     let current_binding = write_snapshot_v2_memory_image_with_compatibility_version(
         &memory,
         &mut current_image,
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
     )
     .expect("current memory binding should encode");
     let current_with_old_graph = NativeSnapshotArtifactState::from_compatible_bytes(encoded_state(
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         &current_binding,
         Some(&old_graph),
     ))
@@ -3509,7 +3513,7 @@ fn supplied_directory_anchors_publish_into_the_opened_identity() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn dormant_diff_publication_commits_direct_state_and_layer_as_one_closed_pair() {
+fn diff_publication_commits_and_zero_root_loads_as_one_closed_pair() {
     let directory = TestDirectory::new("diff-direct");
     let paths = directory.paths("state.snap", "layer.snap");
     let outcome = publish_native_v2_diff_snapshot_artifacts_with(&paths, produce_test_diff)
@@ -3527,16 +3531,184 @@ fn dormant_diff_publication_commits_direct_state_and_layer_as_one_closed_pair() 
         outcome.result_binding(),
         outcome.state().layer_binding().result()
     );
-    assert!(
-        load_native_snapshot_artifacts(&paths).is_err(),
-        "the public exact-2.12 loader must stay closed to dormant Diff"
+    let loaded = load_native_snapshot_artifacts(&paths)
+        .expect("the exact-2.13 zero-root layer should materialize privately");
+    assert_eq!(
+        loaded
+            .state()
+            .v2_profile()
+            .expect("loaded state should retain its exact profile"),
+        NativeV2SnapshotArtifactProfile::DiffStateV2_13
     );
+    let (candidate, memory) = loaded
+        .into_v2_13_diff_candidate()
+        .expect("loaded result should close into the Diff handoff");
+    assert_eq!(candidate.layer_binding(), outcome.state().layer_binding());
+    let mut actual = vec![0; test_bytes().len()];
+    memory
+        .read_slice(&mut actual, GuestAddress::new(aarch64::DRAM_MEM_START))
+        .expect("materialized result memory should remain readable");
+    assert_eq!(actual, test_bytes());
     assert_no_staging(&directory.path);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn dormant_diff_publication_uses_anchored_authority_and_rejects_extended_layer() {
+fn diff_load_accepts_a_complete_rebased_result_image() {
+    let directory = TestDirectory::new("diff-rebased-complete");
+    let paths = directory.paths("state.snap", "memory.snap");
+    let memory = test_v2_memory();
+    let mut memory_file = File::create(paths.memory()).expect("complete result should create");
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut memory_file,
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("exact-2.13 complete result should write");
+    let selection = SnapshotV2DiffSelection::all_current(&memory)
+        .expect("complete result selection should validate");
+    let layer = SnapshotV2DiffLayerBinding::try_from_ranges(
+        SnapshotV2DiffBase::Zero,
+        binding,
+        selection.ranges(),
+    )
+    .expect("rebased layer commitment should validate");
+    fs::write(
+        paths.state(),
+        diff_v2_13_state(&layer).expect("rebased exact-2.13 state should encode"),
+    )
+    .expect("rebased state should write");
+
+    let loaded = load_native_snapshot_artifacts(&paths)
+        .expect("exact-2.13 state should accept its complete rebased result");
+    let (candidate, loaded_memory) = loaded
+        .into_v2_13_diff_candidate()
+        .expect("rebased result should retain the Diff profile");
+    assert_eq!(candidate.layer_binding(), &layer);
+    let mut actual = vec![0; test_bytes().len()];
+    loaded_memory
+        .read_slice(&mut actual, GuestAddress::new(aarch64::DRAM_MEM_START))
+        .expect("rebased result memory should remain readable");
+    assert_eq!(actual, test_bytes());
+    assert_no_staging(&directory.path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn diff_load_rejects_a_state_layer_pair_mismatch_before_private_staging() {
+    let directory = TestDirectory::new("diff-pair-mismatch");
+    let paths = directory.paths("state.snap", "layer.snap");
+    publish_native_v2_diff_snapshot_artifacts_with(&paths, produce_test_diff)
+        .expect("original exact-2.13 state/layer pair should publish");
+
+    let mut alternate_memory = test_v2_memory();
+    alternate_memory
+        .write_slice(&[0xff], GuestAddress::new(aarch64::DRAM_MEM_START))
+        .expect("alternate result byte should write");
+    let selection = SnapshotV2DiffSelection::all_current(&alternate_memory)
+        .expect("alternate complete selection should validate");
+    let mut alternate_layer = Cursor::new(Vec::new());
+    write_snapshot_v2_diff_layer(
+        &alternate_memory,
+        &mut alternate_layer,
+        SnapshotV2DiffBase::Zero,
+        &selection,
+    )
+    .expect("alternate valid layer should encode");
+    fs::write(paths.memory(), alternate_layer.into_inner())
+        .expect("alternate layer should replace only the memory artifact");
+
+    let error = load_native_snapshot_artifacts(&paths)
+        .expect_err("state and layer from different pairs must not load");
+    assert_eq!(
+        error.stage(),
+        SnapshotArtifactLoadStage::MemoryClassification
+    );
+    assert!(matches!(
+        error.failure(),
+        SnapshotArtifactLoadFailure::DiffVerification(SnapshotV2DiffVerifyError::BindingMismatch)
+    ));
+    assert_no_staging(&directory.path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn diff_load_rejects_an_image_base_before_private_staging() {
+    let directory = TestDirectory::new("diff-image-base");
+    let paths = directory.paths("state.snap", "layer.snap");
+    let memory = test_v2_memory();
+    let mut predecessor = Cursor::new(Vec::new());
+    let predecessor = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut predecessor,
+        NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION,
+    )
+    .expect("predecessor binding should write");
+    publish_native_v2_diff_snapshot_artifacts_with(&paths, |mut writer| {
+        let selection =
+            SnapshotV2DiffSelection::all_current(&memory).map_err(|source| source.to_string())?;
+        let layer = write_snapshot_v2_diff_layer(
+            &memory,
+            &mut writer,
+            SnapshotV2DiffBase::Image(predecessor),
+            &selection,
+        )
+        .map_err(|source| source.to_string())?;
+        let state = diff_v2_13_state(&layer)?;
+        NativeV2DiffSnapshotCandidateState::from_diff_state_v2_13(state, layer)
+            .map(NativeV2DiffSnapshotCandidateState::into_publication_state)
+            .map_err(|source| source.to_string())
+    })
+    .expect("image-based state/layer pair should publish");
+
+    let error = load_native_snapshot_artifacts(&paths)
+        .expect_err("standalone loading cannot resolve an image-based Diff");
+    assert_eq!(
+        error.stage(),
+        SnapshotArtifactLoadStage::MemoryClassification
+    );
+    assert!(matches!(
+        error.failure(),
+        SnapshotArtifactLoadFailure::DiffBaseUnavailable
+    ));
+    assert_no_staging(&directory.path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn diff_zero_root_materialization_cancellation_cleans_up_and_retries() {
+    let directory = TestDirectory::new("diff-load-cancel");
+    let paths = directory.paths("state.snap", "layer.snap");
+    publish_native_v2_diff_snapshot_artifacts_with(&paths, produce_test_diff)
+        .expect("zero-root pair should publish");
+    let prepared = prepare_native_snapshot_state_path(paths.state())
+        .expect("exact-2.13 state should prepare without memory access");
+    let cancellation_polls = AtomicUsize::new(0);
+    let error =
+        load_prepared_native_snapshot_memory_path_with_cancel(prepared, paths.memory(), || {
+            cancellation_polls.fetch_add(1, Ordering::SeqCst) > 12
+        })
+        .expect_err("materialization cancellation should abort the load");
+    assert_eq!(
+        error.stage(),
+        SnapshotArtifactLoadStage::MemoryMaterialization
+    );
+    assert!(matches!(
+        error.failure(),
+        SnapshotArtifactLoadFailure::DiffMaterialization(
+            SnapshotV2DiffMaterializationError::Cancelled { .. }
+        )
+    ));
+    assert_no_staging(&directory.path);
+
+    load_native_snapshot_artifacts(&paths)
+        .expect("a fresh load should succeed after materialization cancellation");
+    assert_no_staging(&directory.path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn diff_publication_uses_anchored_authority_and_rejects_extended_layer() {
     let anchored = TestDirectory::new("diff-anchor");
     let outputs = SnapshotArtifactOutputs::new(
         SnapshotArtifactOutput::anchored(
@@ -5418,7 +5590,7 @@ fn current_v2_state(binding: &SnapshotV2MemoryBinding) -> Result<Vec<u8>, String
         ),
     ];
     encode_snapshot_v2_state_with_compatibility_version(
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
         &[],
         &components,
     )

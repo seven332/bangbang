@@ -284,10 +284,11 @@ block/PMEM/network/entropy-retry/balloon-statistics/virtio-mem-publisher
 quiescence, and every required runner operation domain through non-memory
 encoding, complete memory streaming, artifact verification and synchronization,
 exclusive memory-first/state-last commit, and the successful-publication hook.
-The current public writer is native-v2 2.12 with mandatory complete serial
-state and independently optional entropy, balloon, virtio-mem, network/MMDS,
-vsock, and an exact profile-3 graph of 1–64 ordered regular-file block/pmem
-records.
+The public writers are exact native-v2 2.12 Full and exact native-v2 2.13
+Diff. Both retain mandatory complete serial state and independently optional
+entropy, balloon, virtio-mem, network/MMDS, vsock, and an exact profile-3 graph
+of 1–64 ordered regular-file block/pmem records; Diff additionally binds the
+base, selected dirty pages, layer, and materialized result through kind 14.
 The graph may be rooted or rootless across the storage classes.
 Block records may mix access, engine, cache, partuuid, and limiter
 configuration; pmem records bind access/root/limiter, exact file/mapped
@@ -346,16 +347,18 @@ Exact 2.10 adopts virtio-mem state but creates a fresh unlinked shared
 aperture, clean dirty epoch, block-granular plugged views, and destination-local
 mapping, notifier, interrupt, dispatcher, route, metrics, endpoint, and cleanup
 owners. Kind 11 and the exact kind-1 aperture extents must close as one topology
-before publication. Current 2.11 adopts network/MMDS kind 12 only after an
+before publication. Exact 2.11 and newer profiles adopt network/MMDS kind 12 only after an
 exact unique destination override set is validated, then creates fresh
 providers, packet-I/O owners, callbacks, metrics, schedulers, routes, endpoints,
 and MMDS stacks. The MMDS store starts empty, source connections are lost, and
-source V2 tokens fail against the destination key. Current 2.12 adopts vsock
+source V2 tokens fail against the destination key. Exact 2.12 and current 2.13 adopt vsock
 kind 13 only after the saved or overridden selector and exact socket authority
 validate, then creates fresh listener/device, metrics, dispatcher, interrupt,
 connection, endpoint, and cleanup owners. Source connections are closed and
 restored live work is empty; `TRANSPORT_RESET` acknowledgement gates RX while
-TX remains live. Boot-timer, vhost-user, native-v2 Diff/Uffd, Firecracker
+TX remains live. Current 2.13 additionally closes the exact Diff base,
+selection, and result before reusing the same owner transaction. Boot-timer,
+vhost-user, native-v2 Uffd, Firecracker
 artifact bytes, and broad cross-host portability remain outside the current
 public profile.
 
@@ -407,7 +410,7 @@ For native-v2, state family classification, retained File/COW memory binding,
 the live-FDT identity, versioned UART profile, cache/platform state, topology,
 and every time/identity guest destination validate before HVF construction.
 Legacy 2.3 parses its retained bytes as the exact default process FDT. Exact
-2.4 through current 2.12 require a versioned source-product marker instead,
+2.4 through current 2.13 require a versioned source-product marker instead,
 because a booted guest may have consumed or reclaimed those bytes. Exact 2.4
 validates its singleton root; exact 2.5 validates the complete ordered block
 graph; exact 2.6 validates the complete ordered block/pmem configuration,
@@ -424,17 +427,20 @@ optionally requires exact virtio-mem configuration/features/config-space/
 queue/common-virtio/transport state plus a canonical plugged-block bitmap whose
 coverage exactly matches the kind-1 aperture extents. Exact 2.11 retains those
 rules and optionally requires exact ordered network/MMDS kind 12 state plus one
-complete unique clone-local override set. Current 2.12 retains those rules and
+complete unique clone-local override set. Exact 2.12 retains those rules and
 optionally requires exact vsock kind 13 state plus at most one clone-local
-`vsock_override`. The
+`vsock_override`. Current 2.13 retains that complete result product and
+additionally requires exact kind-14 Diff lineage, selection, layer, and result
+bindings. The
 live bytes still must match the retained address, length, and CRC. The memory descriptor
 must remain read-only and close-on-exec; guest
 mappings are private, so destination writes do not mutate the pair. Recorded
 kernel/initrd paths remain inert metadata and are never reopened. Every graph
 selector is likewise inert until destination policy treats it as a direct path
 or resolves the complete keyed vector through exact destination authority.
-Current 2.12 resolves exact drive, pmem, and configured-serial grants as one
-batch; default serial stdio and entropy source/metrics/scheduler/notifier/
+Exact 2.12 Full and current 2.13 Diff resolve exact drive, pmem, and
+configured-serial grants as one batch; default serial stdio and entropy
+source/metrics/scheduler/notifier/
 route/endpoint owners are destination-local and resource-free. Balloon memory,
 timer, metrics, reclaim, notifier/interrupt/dispatcher, endpoint, and cleanup
 owners are likewise destination-local and require no external grant. The
@@ -1354,7 +1360,8 @@ is resource-specific:
   untrusted, preserve redaction, and prevent one process from cleaning up or
   overwriting another process's resources. In contained mode, state
   preinspection is non-consuming and the eventual native-v2 state/memory claim
-  is atomic; current 2.12 then derives every ordered block/pmem request, any
+  is atomic; exact 2.12 Full and current 2.13 Diff then derive every ordered
+  block/pmem request, any
   configured serial sink, and optional entropy/balloon/virtio-mem/network/vsock
   state from decoded state,
   resolves the entire typed keyed vector through one exact destination
@@ -2111,7 +2118,7 @@ private and volatile. Operators must treat DAX as a guest/filesystem choice and
 profile page faults, page-cache/RSS accounting, huge-page realization,
 eviction, same-backing physical-page sharing, side channels, and throughput on
 the deployed macOS/HVF system. Linux Firecracker measurements are not portable
-security or performance promises. Exact native-v2 2.6 through current 2.12
+security or performance promises. Exact native-v2 2.6 through current 2.13
 profile 3 bind exact file/mapped geometry and direct or contained backing
 authority, then restore the same external prefix through a complete-set
 transaction. Signed direct and
@@ -2191,7 +2198,7 @@ real MMDS exchange without vmnet authority. This evidence does not prove
 interrupt remapping, external vmnet connectivity, or Firecracker's KVM ITS
 behavior. Exact native-v2 2.5 reconstructs the exact GICv2m/MSI-X state for
 every admitted profile-2 PCI block endpoint under the same product capacity.
-Exact native-v2 2.6 through current 2.12 additionally reconstruct every admitted
+Exact native-v2 2.6 through current 2.13 additionally reconstruct every admitted
 profile-3 PCI block and pmem endpoint, including mapping and limiter/retry
 ownership; serial remains a platform MMIO device whose exact 2.7 state is
 composed with that PCI storage graph. Exact 2.8 may also reconstruct an exact
@@ -2200,9 +2207,10 @@ endpoint, and exact 2.10 may reconstruct a one-queue PCI virtio-mem endpoint
 with its fresh shared aperture and exact MSI-X/registry identity. Exact 2.11
 may additionally reconstruct network/MMDS with fresh provider, packet-I/O,
 callback, metric, scheduler, route, endpoint, and MMDS ownership in canonical
-product order under the same capacity. Current 2.12 may additionally reconstruct
-vsock with fresh socket, dispatcher, interrupt, metric, connection, endpoint,
-and cleanup ownership plus the retained clone-local host-port cursor.
+product order under the same capacity. Exact 2.12 and current 2.13 may
+additionally reconstruct vsock with fresh socket, dispatcher, interrupt,
+metric, connection, endpoint, and cleanup ownership plus the retained
+clone-local host-port cursor.
 Mismatched, aliased, reordered, or unmodeled MSI-bearing ownership is rejected
 rather than silently omitted. Exact 2.4 retains only its singleton PCI-root
 profile.
@@ -2943,7 +2951,7 @@ The current scaffold does not implement:
 - general-purpose host resource brokering beyond the fixed granted-vsock
   port-only and contained vhost-user exact-child connection facets
 - broader snapshot profiles or Firecracker artifact compatibility beyond the
-  exact contained native-v2 Full/File state-memory-root boundary, legacy
+  exact contained native-v2 Full/File and Diff/File state-memory-root boundary, legacy
   device-free native-v2 2.3 reader, and frozen native-v1 reader
 - full external-network containment beyond the documented lifecycle-v5
   vmnet authority and MMDS-only fast path. Networkless production rejects
@@ -2953,12 +2961,12 @@ The current scaffold does not implement:
   ownership boundary is summarized in
   [Firecracker Compatibility Scope](firecracker-compatibility.md#aggregate-network-and-mmds-closure).
 - vsock behavior beyond the implemented live MMIO-or-PCI Unix-socket subset and
-  exact native-v2 2.12 snapshot/override/clone contract. Exact 2.12 captures
+  exact native-v2 2.12/2.13 snapshot/override/clone contract. Exact 2.12/2.13 capture
   portable CID, selector, cursor, queue/reset, and placement state, closes
   source streams, and reconstructs fresh direct or contained destination
   owners. Live-peer migration, automatic socket or grant migration,
   PATCH/DELETE/runtime hotplug, broader CID and event behavior, Firecracker
-  artifact bytes, Diff/Uffd, vhost/KVM parity, broad performance parity, and
+  artifact bytes, Uffd, vhost/KVM parity, broad performance parity, and
   unconstrained cross-host portability remain non-goals. The exact snapshot
   boundary is in
   [Snapshot Feasibility](snapshot-feasibility.md#native-v2-212-vsock-activation-and-certification).

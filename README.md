@@ -7,8 +7,10 @@ machines run on Apple's Hypervisor.framework rather than KVM.
 The project targets macOS on Apple Silicon. Compatibility is defined by
 observable API and process behavior for documented subsets; it does not imply
 Firecracker binary, snapshot-file, jailer, seccomp, or KVM compatibility. The
-current bangbang-native snapshot writer emits `v2.12.0`, and the loader retains
-the exact older native profiles documented in the snapshot guide.
+current bangbang-native ceiling is `v2.13.0`: `Full` emits an exact `v2.12.0`
+state plus complete memory image, while `Diff` emits an exact `v2.13.0` state
+plus differential layer. The loader retains the exact older native profiles
+documented in the snapshot guide.
 
 ## Documentation
 

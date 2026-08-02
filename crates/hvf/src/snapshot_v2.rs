@@ -38,7 +38,8 @@ use bangbang_runtime::snapshot_device_v2_6::{
 };
 use bangbang_runtime::snapshot_diff_v2_13::{
     NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION, SnapshotV2DiffLayerBinding,
-    SnapshotV2DiffLayerBindingError,
+    SnapshotV2DiffLayerBindingError, SnapshotV2DiffStateError,
+    decode_snapshot_v2_diff_layer_binding,
 };
 use bangbang_runtime::snapshot_entropy_v2_8::{
     NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, SnapshotV2EntropyState,
@@ -2201,7 +2202,7 @@ impl fmt::Debug for HvfSnapshotV2DiffPlatformState {
     }
 }
 
-/// Complete dormant exact native-v2 2.13 HVF differential composition.
+/// Complete exact native-v2 2.13 HVF differential composition.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HvfSnapshotV2DiffState {
     platform: HvfSnapshotV2PlatformState,
@@ -2215,7 +2216,7 @@ pub struct HvfSnapshotV2DiffState {
     layer: SnapshotV2DiffLayerBinding,
 }
 
-/// Owned components retained by one dormant exact-2.13 HVF composition.
+/// Owned components retained by one exact-2.13 HVF composition.
 pub type HvfSnapshotV2DiffStateParts = (
     HvfSnapshotV2PlatformState,
     Option<SnapshotV2StorageDeviceGraph>,
@@ -3526,6 +3527,8 @@ pub enum HvfSnapshotV2DecodeError {
     NetworkState(SnapshotV2NetworkStateDecodeError),
     /// Exact-2.12 vsock component decoding failed.
     VsockState(SnapshotV2VsockStateDecodeError),
+    /// Exact-2.13 Diff commitment decoding failed.
+    DiffState(SnapshotV2DiffStateError),
     /// Nested mandatory-vCPU decoding failed.
     Mandatory(HvfSnapshotV1DecodeError),
     /// A complete locally valid graph failed cross-validation.
@@ -3566,6 +3569,7 @@ impl fmt::Display for HvfSnapshotV2DecodeError {
             Self::MemoryHotplugState(_) => "native-v2 HVF virtio-mem state is invalid",
             Self::NetworkState(_) => "native-v2 HVF network state is invalid",
             Self::VsockState(_) => "native-v2 HVF vsock state is invalid",
+            Self::DiffState(_) => "native-v2 HVF Diff state is invalid",
             Self::Mandatory(_) => "native-v2 HVF mandatory vCPU state is invalid",
             Self::Build(_) => "native-v2 HVF platform graph is inconsistent",
         };
@@ -3587,6 +3591,7 @@ impl std::error::Error for HvfSnapshotV2DecodeError {
             Self::MemoryHotplugState(source) => Some(source),
             Self::NetworkState(source) => Some(source),
             Self::VsockState(source) => Some(source),
+            Self::DiffState(source) => Some(source),
             Self::Mandatory(source) => Some(source),
             Self::Build(source) => Some(source),
             _ => None,
@@ -3777,7 +3782,7 @@ pub fn encode_hvf_snapshot_v2_vsock_state(
     )
 }
 
-/// Encodes one complete dormant exact native-v2 2.13 differential product.
+/// Encodes one complete exact native-v2 2.13 differential product.
 pub fn encode_hvf_snapshot_v2_diff_state(
     state: &HvfSnapshotV2DiffState,
 ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
@@ -4554,6 +4559,101 @@ pub fn decode_hvf_snapshot_v2_vsock_state(
     .map_err(HvfSnapshotV2DecodeError::Build)
 }
 
+/// Decodes and cross-validates one exact native-v2 2.13 differential product.
+pub fn decode_hvf_snapshot_v2_diff_state(
+    state: &SnapshotV2State<'_>,
+) -> Result<HvfSnapshotV2DiffState, HvfSnapshotV2DecodeError> {
+    if state.metadata().version() != NATIVE_V2_DIFF_STATE_COMPATIBILITY_VERSION {
+        return Err(HvfSnapshotV2DecodeError::UnsupportedProfile);
+    }
+    let (
+        vcpu_count,
+        includes_device_graph,
+        includes_entropy,
+        includes_balloon,
+        includes_memory_hotplug,
+        includes_network,
+        includes_vsock,
+    ) = scan_diff_component_profile(state)?;
+    let platform = decode_hvf_snapshot_v2_platform_components_unvalidated(state, vcpu_count, true)?;
+    let device_graph = includes_device_graph
+        .then(|| {
+            SnapshotV2StorageDeviceGraph::decode(
+                NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                component_payload(state, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)?,
+            )
+            .map_err(HvfSnapshotV2DecodeError::StorageDeviceGraph)
+        })
+        .transpose()?;
+    let serial = SnapshotV2SerialState::decode(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        component_payload(state, NATIVE_V2_SERIAL_COMPONENT_KEY)?,
+    )
+    .map_err(HvfSnapshotV2DecodeError::SerialState)?;
+    let entropy = includes_entropy
+        .then(|| {
+            SnapshotV2EntropyState::decode(
+                NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                component_payload(state, NATIVE_V2_ENTROPY_COMPONENT_KEY)?,
+            )
+            .map_err(HvfSnapshotV2DecodeError::EntropyState)
+        })
+        .transpose()?;
+    let balloon = includes_balloon
+        .then(|| {
+            SnapshotV2BalloonState::decode(
+                NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION,
+                component_payload(state, NATIVE_V2_BALLOON_COMPONENT_KEY)?,
+            )
+            .map_err(HvfSnapshotV2DecodeError::BalloonState)
+        })
+        .transpose()?;
+    let memory_hotplug = includes_memory_hotplug
+        .then(|| {
+            SnapshotV2MemoryHotplugState::decode(
+                NATIVE_V2_MEMORY_HOTPLUG_STATE_COMPATIBILITY_VERSION,
+                component_payload(state, NATIVE_V2_MEMORY_HOTPLUG_COMPONENT_KEY)?,
+            )
+            .map_err(HvfSnapshotV2DecodeError::MemoryHotplugState)
+        })
+        .transpose()?;
+    let network = includes_network
+        .then(|| {
+            SnapshotV2NetworkState::decode(
+                NATIVE_V2_NETWORK_STATE_COMPATIBILITY_VERSION,
+                component_payload(state, NATIVE_V2_NETWORK_COMPONENT_KEY)?,
+            )
+            .map_err(HvfSnapshotV2DecodeError::NetworkState)
+        })
+        .transpose()?;
+    let vsock = includes_vsock
+        .then(|| {
+            SnapshotV2VsockState::decode(
+                NATIVE_V2_VSOCK_STATE_COMPATIBILITY_VERSION,
+                component_payload(state, NATIVE_V2_VSOCK_COMPONENT_KEY)?,
+            )
+            .map_err(HvfSnapshotV2DecodeError::VsockState)
+        })
+        .transpose()?;
+    let layer = decode_snapshot_v2_diff_layer_binding(state)
+        .map_err(HvfSnapshotV2DecodeError::DiffState)?;
+    let platform = HvfSnapshotV2DiffPlatformState {
+        platform,
+        memory_hotplug,
+        layer,
+    };
+    HvfSnapshotV2DiffState::try_new(
+        platform,
+        device_graph,
+        serial,
+        entropy,
+        balloon,
+        network,
+        vsock,
+    )
+    .map_err(HvfSnapshotV2DecodeError::Build)
+}
+
 fn decode_hvf_snapshot_v2_platform_components(
     state: &SnapshotV2State<'_>,
     vcpu_count: usize,
@@ -5078,7 +5178,7 @@ fn scan_network_component_profile(
         includes_memory_hotplug,
         includes_network,
         includes_vsock,
-    ) = scan_network_or_vsock_component_profile(state, false)?;
+    ) = scan_network_or_vsock_component_profile(state, false, false)?;
     debug_assert!(!includes_vsock);
     Ok((
         vcpu_count,
@@ -5095,12 +5195,19 @@ type HvfSnapshotV2NetworkOrVsockComponentProfile = (usize, bool, bool, bool, boo
 fn scan_vsock_component_profile(
     state: &SnapshotV2State<'_>,
 ) -> Result<HvfSnapshotV2NetworkOrVsockComponentProfile, HvfSnapshotV2DecodeError> {
-    scan_network_or_vsock_component_profile(state, true)
+    scan_network_or_vsock_component_profile(state, true, false)
+}
+
+fn scan_diff_component_profile(
+    state: &SnapshotV2State<'_>,
+) -> Result<HvfSnapshotV2NetworkOrVsockComponentProfile, HvfSnapshotV2DecodeError> {
+    scan_network_or_vsock_component_profile(state, true, true)
 }
 
 fn scan_network_or_vsock_component_profile(
     state: &SnapshotV2State<'_>,
     allow_vsock: bool,
+    require_diff: bool,
 ) -> Result<HvfSnapshotV2NetworkOrVsockComponentProfile, HvfSnapshotV2DecodeError> {
     let mut components = state.components().peekable();
     for expected in [
@@ -5228,6 +5335,16 @@ fn scan_network_or_vsock_component_profile(
             }))
     {
         return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+    }
+    if require_diff {
+        let diff = components
+            .next()
+            .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+        if diff.disposition() != SnapshotV2ComponentDisposition::Semantic
+            || diff.key() != NATIVE_V2_DIFF_COMPONENT_KEY
+        {
+            return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+        }
     }
     if components.next().is_some() {
         return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
