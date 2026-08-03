@@ -2452,9 +2452,13 @@ limiter state, counters, or the complete capture-ready UART state.
 
 Default logger-stdout tests use pipes, sockets, and descriptor flag inspection
 to prove a close-on-exec nonblocking internal pipe, ordered logger/status
-forwarding plus bounded convergence drain, write-access rejection, and
-preservation of real stdout flags across logger replacement and serial
-capture/restoration. Contained output
+forwarding plus bounded convergence drain, temporary nonblocking-backpressure
+recovery on the same forwarder, terminal target failure and later closed-pipe
+admission, write-access rejection, and preservation of real stdout flags across
+logger replacement and serial capture/restoration. These tests distinguish
+exact worker-to-pipe admission accounting from the non-durable downstream byte
+hop; convergence never joins a forwarder that can remain blocked until process
+exit. Contained output
 tests separately cover transferred regular
 files: the shared adoption helper rejects non-regular or non-`O_WRONLY`
 descriptors, verifies

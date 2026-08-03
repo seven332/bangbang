@@ -2107,12 +2107,20 @@ is resource-specific:
   the real output's shared status flags, so a blocked stdout stalls only that
   one thread and cannot interfere with default serial capture/restoration. One
   fixed-capacity logger queue and one sink-owning worker remain process-local.
+  Exact logger loss accounting ends at that worker's configured writer; for
+  default stdout, successful receipt means whole-record internal-pipe admission
+  and the later forwarding hop is non-durable byte progress. A downstream
+  failure does not retroactively count already admitted records.
   A path-bearing pre-boot configuration prepares its writer first and commits
   through the stable worker; failed or path-free updates retain the prior
   logger target, while best-effort status output retains the bounded adapter.
   An unavailable, unwritable, or full stdout cannot change readiness or a
   functional result. Normal convergence gives accepted adapter bytes one
   bounded one-second drain opportunity without joining a stalled forwarder.
+  Temporary nonblocking backpressure waits and retries only on that thread;
+  terminal failure closes the reader for future ordinary write-failure
+  accounting, while a permanently blocked forwarder may live until process
+  exit.
   Logger, status, and default serial output share no cross-producer ordering
   guarantee; a consumer requiring a private protocol must select an explicit
   logger or serial destination.

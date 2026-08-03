@@ -12,7 +12,8 @@ use std::time::Duration;
 ///
 /// Writers use one nonblocking internal pipe. A single process-owned forwarder
 /// may block on the real stdout descriptor without changing its shared status
-/// flags or blocking a logger producer.
+/// flags or blocking a logger producer. A successful write confirms pipe
+/// admission; forwarding is a later non-durable process transport.
 #[derive(Clone)]
 pub struct ProcessStdoutLogger {
     output: Arc<File>,
@@ -68,6 +69,9 @@ impl ProcessStdoutLogger {
     }
 
     /// Waits a bounded interval for bytes accepted before this call to reach stdout.
+    ///
+    /// Returns `false` after a downstream failure or timeout. It does not join
+    /// the sole forwarder, which may remain blocked until process exit.
     pub fn flush_forwarded(&self, timeout: Duration) -> bool {
         self.progress.wait_for_forwarded(timeout)
     }
@@ -162,11 +166,54 @@ fn forward_stdout(mut input: File, mut target: File, progress: &ProcessStdoutPro
             progress.record_failure();
             return;
         };
-        if target.write_all(bytes).is_err() {
+        if write_all_to_target(&mut target, bytes).is_err() {
             progress.record_failure();
             return;
         }
         progress.record_forwarded(read);
+    }
+}
+
+fn write_all_to_target(target: &mut File, mut bytes: &[u8]) -> Result<(), io::ErrorKind> {
+    while !bytes.is_empty() {
+        match target.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero),
+            Ok(written) => {
+                let Some(remaining) = bytes.get(written..) else {
+                    return Err(io::ErrorKind::InvalidData);
+                };
+                bytes = remaining;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_descriptor_write(target.as_raw_fd())?;
+            }
+            Err(error) => return Err(error.kind()),
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_descriptor_write(descriptor: RawFd) -> Result<(), io::ErrorKind> {
+    let mut event = libc::pollfd {
+        fd: descriptor,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `event` is one initialized writable poll entry. The sole
+        // forwarder may wait indefinitely without blocking a logger producer.
+        let ready = unsafe { libc::poll(&raw mut event, 1, -1) };
+        if ready > 0 {
+            return Ok(());
+        }
+        if ready == 0 {
+            continue;
+        }
+        let kind = io::Error::last_os_error().kind();
+        if kind != io::ErrorKind::Interrupted {
+            return Err(kind);
+        }
     }
 }
 
@@ -283,6 +330,7 @@ mod tests {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
     use super::{
@@ -295,7 +343,7 @@ mod tests {
         flags & mask
     }
 
-    fn read_exact_with_timeout(reader: &mut File, bytes: &mut [u8]) {
+    fn read_exact_with_timeout(reader: &mut (impl Read + AsRawFd), bytes: &mut [u8]) {
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut offset = 0;
         while offset < bytes.len() {
@@ -317,6 +365,19 @@ mod tests {
                 Ok(read) => offset += read,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => panic!("stdout adapter read failed: {error}"),
+            }
+        }
+    }
+
+    fn fill_nonblocking_socket(writer: &mut UnixStream) -> usize {
+        let bytes = [b'x'; 4096];
+        let mut written = 0;
+        loop {
+            match writer.write(&bytes) {
+                Ok(0) => panic!("stdout fixture made no progress"),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return written,
+                Err(error) => panic!("stdout fixture should fill: {error}"),
             }
         }
     }
@@ -389,6 +450,71 @@ mod tests {
             ),
             mutable_status_flags(original)
         );
+    }
+
+    #[test]
+    fn process_stdout_forwarder_resumes_after_temporary_nonblocking_backpressure() {
+        let (mut reader, mut target) =
+            UnixStream::pair().expect("stdout socket fixture should create");
+        target
+            .set_nonblocking(true)
+            .expect("stdout target should become nonblocking");
+        let descriptor = target.as_raw_fd();
+        let original = descriptor_status_flags(descriptor).expect("stdout flags should inspect");
+        let filled = fill_nonblocking_socket(&mut target);
+        let mut output = ProcessStdoutLogger::prepare_from_descriptor(descriptor)
+            .expect("full writable stdout fixture should prepare");
+        let marker = b"forwarded-after-backpressure\n";
+
+        output
+            .write_all(marker)
+            .expect("adapter should accept the marker while stdout is full");
+        assert!(
+            !output.flush_forwarded(Duration::from_millis(10)),
+            "full stdout must not report the marker as forwarded"
+        );
+
+        let mut received = vec![0_u8; filled + marker.len()];
+        read_exact_with_timeout(&mut reader, &mut received);
+        assert_eq!(&received[..filled], vec![b'x'; filled]);
+        assert_eq!(&received[filled..], marker);
+        assert!(
+            output.flush_forwarded(Duration::from_secs(1)),
+            "the same forwarder should resume after stdout becomes writable"
+        );
+        assert_eq!(
+            mutable_status_flags(
+                descriptor_status_flags(descriptor)
+                    .expect("target flags should remain inspectable")
+            ),
+            mutable_status_flags(original)
+        );
+    }
+
+    #[test]
+    fn process_stdout_target_failure_bounds_progress_and_closes_future_admission() {
+        let (reader, target) = UnixStream::pair().expect("stdout socket fixture should create");
+        let mut output = ProcessStdoutLogger::prepare_from_descriptor(target.as_raw_fd())
+            .expect("writable stdout fixture should prepare");
+        drop(reader);
+
+        output
+            .write_all(b"unforwardable\n")
+            .expect("adapter can admit bytes before the target failure is observed");
+        assert!(
+            !output.flush_forwarded(Duration::from_secs(1)),
+            "target failure must make bounded progress fail"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match output.write(b"later\n") {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
+                Err(error) => panic!("closed adapter returned an unexpected error: {error}"),
+                Ok(_) if Instant::now() < deadline => std::thread::yield_now(),
+                Ok(_) => panic!("closed adapter should reject future admission"),
+            }
+        }
     }
 
     #[test]

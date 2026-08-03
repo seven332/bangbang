@@ -191,7 +191,11 @@ The sole exception is `logger.limiter.recovery`, which must be unrestricted to
 report a prior admitted recovery without recursively limiting itself. Queue,
 receipt, write, flush, and replacement loss never changes the request, VM,
 guest, worker, or process result and increments the exact existing loss counter
-once.
+once. That exact boundary ends at the writer configured in the logger worker.
+For default stdout, the configured writer is the internal nonblocking pipe: a
+successful receipt confirms whole-record pipe admission, not completion of the
+later stdout-forwarder write. Downstream progress is deliberately non-durable
+and does not retroactively assign already admitted bytes to per-record loss.
 
 ## Default output and configuration projection
 
@@ -203,8 +207,13 @@ pipe. One process-owned forwarder drains that pipe to a writable close-on-exec
 stdout duplicate without changing stdout's shared status flags. A blocked real
 stdout can therefore stall only that one forwarder; it cannot block producers,
 alter serial standard-stream ownership, or accumulate forwarding threads.
-Normal convergence waits at most one second for already accepted adapter bytes;
-a stalled output still cannot replace the process result.
+The forwarder waits and retries when the shared target is temporarily
+nonblocking and full, advances progress only after a complete chunk, and exits
+on a terminal target error. Later pipe writes then observe the closed reader;
+already admitted unread bytes remain outside per-record accounting. Normal
+convergence waits at most one second for already accepted adapter bytes. It
+never joins the sole forwarder, which may remain blocked until process exit,
+and a stalled or failed output cannot replace the process result.
 Runtime/library controllers remain silent unless an executable explicitly
 installs an output. An unavailable or unwritable stdout leaves the logger
 unconfigured and cannot change process readiness or results. Version/help/
