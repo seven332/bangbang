@@ -10,22 +10,27 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
 
 use delivery::{
-    LoggerDelivery, LoggerDeliveryConfig, LoggerProducer, PreparedLoggerWriter, ReplaceWriterError,
+    LoggerDelivery, LoggerDeliveryConfig, LoggerEmergencyIngress, LoggerProducer,
+    PanicRecordPrefix, PreparedLoggerWriter, ReplaceWriterError,
 };
 use event::{LogBatch, LogOrigin, LogRecord, LoggerEvent};
 #[cfg(test)]
 use rate_limiter::LogRateLimiterClock;
 use rate_limiter::{LogRateLimitDecision, LoggerRateLimitIdentity, LoggerRateLimiters};
 
-pub use event::{LoggerAction, LoggerApiRoute, LoggerHttpMethod};
+pub use event::{
+    LoggerAction, LoggerApiRoute, LoggerHttpMethod, PanicLogRecords, ProcessTerminalCategory,
+};
 
 const BOOT_TIMER_LOG_MODULE: &str = "bangbang_runtime::boot_timer";
 const API_REQUEST_LOG_MODULE: &str = "bangbang_runtime::api_server";
 const MINIMAL_ACTION_LOG_MODULE: &str = "bangbang_runtime::vmm_action";
+const PROCESS_LOG_MODULE: &str = "bangbang::process";
+const PANIC_LOG_MODULE: &str = "bangbang::panic";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LoggerLevel {
@@ -297,6 +302,112 @@ impl SharedLoggerMetrics {
     }
 }
 
+#[derive(Debug)]
+struct EmergencyLoggerTarget {
+    ingress: Option<Arc<LoggerEmergencyIngress>>,
+    prefix: PanicRecordPrefix,
+    enabled: bool,
+}
+
+impl Default for EmergencyLoggerTarget {
+    fn default() -> Self {
+        Self {
+            ingress: None,
+            prefix: PanicRecordPrefix::Plain,
+            enabled: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EmergencyLoggerInner {
+    target: Mutex<EmergencyLoggerTarget>,
+    enabled: AtomicBool,
+    pending_loss: AtomicBool,
+    metrics: SharedLoggerMetrics,
+}
+
+/// Narrow, cloneable panic-record admission capability for an executable hook.
+#[derive(Clone)]
+pub struct EmergencyLogger {
+    inner: Arc<EmergencyLoggerInner>,
+}
+
+impl fmt::Debug for EmergencyLogger {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EmergencyLogger")
+            .finish_non_exhaustive()
+    }
+}
+
+impl EmergencyLogger {
+    fn new(metrics: SharedLoggerMetrics) -> Self {
+        let target = Mutex::new(EmergencyLoggerTarget::default());
+        // macOS lazily allocates the pthread-backed mutex on its first lock.
+        // Initialize it on this ordinary construction path, never in the hook.
+        drop(
+            target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        Self {
+            inner: Arc::new(EmergencyLoggerInner {
+                target,
+                enabled: AtomicBool::new(false),
+                pending_loss: AtomicBool::new(false),
+                metrics,
+            }),
+        }
+    }
+
+    /// Attempts one preencoded panic-record publication without waiting or retrying.
+    pub fn try_log_panic(&self) -> bool {
+        match self.inner.target.try_lock() {
+            Ok(target) => {
+                if !target.enabled {
+                    return false;
+                }
+                let Some(ingress) = target.ingress.as_deref() else {
+                    return false;
+                };
+                if ingress.publish_once(target.prefix) {
+                    true
+                } else {
+                    self.inner.pending_loss.store(true, Ordering::Release);
+                    false
+                }
+            }
+            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
+                if self.inner.enabled.load(Ordering::Acquire) {
+                    self.inner.pending_loss.store(true, Ordering::Release);
+                }
+                false
+            }
+        }
+    }
+
+    fn update(&self, target: EmergencyLoggerTarget) {
+        let enabled = target.enabled;
+        let mut current = self
+            .inner
+            .target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = target;
+        drop(current);
+        // A contended hook may conservatively linearize before this completed
+        // publication; a successful lock always observes the full snapshot.
+        self.inner.enabled.store(enabled, Ordering::Release);
+    }
+
+    fn settle_pending_loss(&self) {
+        if self.inner.pending_loss.swap(false, Ordering::AcqRel) {
+            self.inner.metrics.record_missed_logs(1);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct BootTimerLogRateLimiter {
     inner: LoggerRateLimiters,
@@ -389,6 +500,8 @@ pub struct LoggerState {
     show_log_origin: bool,
     module: Option<String>,
     metrics: SharedLoggerMetrics,
+    panic_records: Arc<PanicLogRecords>,
+    emergency_logger: EmergencyLogger,
     boot_timer_rate_limiter: BootTimerLogRateLimiter,
     delivery_config: LoggerDeliveryConfig,
 }
@@ -427,24 +540,25 @@ impl fmt::Debug for PreparedLoggerConfig {
 
 impl Default for LoggerState {
     fn default() -> Self {
+        Self::with_shared_metrics(SharedLoggerMetrics::default())
+    }
+}
+
+impl LoggerState {
+    pub(crate) fn with_shared_metrics(metrics: SharedLoggerMetrics) -> Self {
+        let panic_records = Arc::new(PanicLogRecords::new());
+        let emergency_logger = EmergencyLogger::new(metrics.clone());
         Self {
             delivery: None,
             level: LoggerLevel::Info,
             show_level: false,
             show_log_origin: false,
             module: None,
-            metrics: SharedLoggerMetrics::default(),
+            metrics,
+            panic_records,
+            emergency_logger,
             boot_timer_rate_limiter: BootTimerLogRateLimiter::default(),
             delivery_config: LoggerDeliveryConfig::default(),
-        }
-    }
-}
-
-impl LoggerState {
-    pub(crate) fn with_shared_metrics(metrics: SharedLoggerMetrics) -> Self {
-        Self {
-            metrics,
-            ..Self::default()
         }
     }
 
@@ -497,14 +611,19 @@ impl LoggerState {
             self.commit_writer(writer)?;
         }
         self.apply_config(config);
+        self.publish_emergency_target();
         Ok(())
     }
 
     fn commit_writer(&mut self, writer: PreparedLoggerWriter) -> Result<(), LoggerConfigError> {
         let Some(delivery) = &self.delivery else {
-            let delivery =
-                LoggerDelivery::spawn(writer, self.metrics.clone(), self.delivery_config.clone())
-                    .map_err(LoggerConfigError::SpawnWorker)?;
+            let delivery = LoggerDelivery::spawn(
+                writer,
+                self.metrics.clone(),
+                self.panic_records.clone(),
+                self.delivery_config.clone(),
+            )
+            .map_err(LoggerConfigError::SpawnWorker)?;
             self.delivery = Some(delivery);
             return Ok(());
         };
@@ -517,6 +636,7 @@ impl LoggerState {
                 let successor = LoggerDelivery::spawn(
                     writer,
                     self.metrics.clone(),
+                    self.panic_records.clone(),
                     self.delivery_config.clone(),
                 )
                 .map_err(LoggerConfigError::SpawnWorker)?;
@@ -539,6 +659,49 @@ impl LoggerState {
         if let Some(module) = config.module {
             self.module = Some(module);
         }
+    }
+
+    fn publish_emergency_target(&self) {
+        let enabled = self.delivery.is_some()
+            && self.level.allows(LoggerLevel::Error)
+            && module_filter_allows(self.module.as_deref(), PANIC_LOG_MODULE);
+        self.emergency_logger.update(EmergencyLoggerTarget {
+            ingress: self
+                .delivery
+                .as_ref()
+                .map(LoggerDelivery::emergency_ingress),
+            prefix: PanicRecordPrefix::from_flags(self.show_level, self.show_log_origin),
+            enabled,
+        });
+    }
+
+    pub(crate) fn emergency_logger(&self) -> EmergencyLogger {
+        self.emergency_logger.clone()
+    }
+
+    pub(crate) fn settle_emergency_loss(&self) {
+        self.emergency_logger.settle_pending_loss();
+    }
+
+    #[track_caller]
+    pub(crate) fn log_process_terminal(&self, category: ProcessTerminalCategory) -> bool {
+        let level = category.level();
+        if !self.level.allows(level)
+            || !module_filter_allows(self.module.as_deref(), PROCESS_LOG_MODULE)
+        {
+            return false;
+        }
+        let Some(delivery) = &self.delivery else {
+            return false;
+        };
+        let record = LogRecord::encode(
+            self.show_level,
+            self.show_log_origin,
+            LogOrigin::from(Location::caller()),
+            level,
+            LoggerEvent::ProcessExit(category),
+        );
+        delivery.producer().deliver_host(LogBatch::one(record))
     }
 
     #[track_caller]
@@ -628,6 +791,7 @@ impl LoggerState {
     pub(crate) fn configure_test_writer(&mut self, writer: impl Write + Send + 'static) {
         self.commit_writer(PreparedLoggerWriter::new(writer))
             .expect("test logger writer should configure");
+        self.publish_emergency_target();
     }
 
     #[cfg(test)]
@@ -663,7 +827,7 @@ mod tests {
     use super::{
         BootTimerLogRateLimiter, LogRateLimitDecision, LogRateLimiterClock, LoggerAction,
         LoggerApiRoute, LoggerConfigError, LoggerConfigInput, LoggerDeliveryConfig,
-        LoggerHttpMethod, LoggerLevel, LoggerState, SharedLoggerMetrics,
+        LoggerHttpMethod, LoggerLevel, LoggerState, ProcessTerminalCategory, SharedLoggerMetrics,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -975,6 +1139,7 @@ mod tests {
             output: old_output.clone(),
         });
         let stale = state.boot_timer_logger();
+        let emergency = state.emergency_logger();
         assert!(stale.log_boot_time(1_000, 200));
         gate.wait_until_entered();
 
@@ -996,6 +1161,7 @@ mod tests {
 
         gate.release();
         assert!(stale.wait_for_delivery_for_test());
+        assert!(emergency.try_log_panic());
         assert!(state.log_action(LoggerAction::InstanceStart));
         assert_eq!(
             String::from_utf8(
@@ -1005,7 +1171,11 @@ mod tests {
                     .clone()
             )
             .expect("old output should be UTF-8"),
-            "Guest-boot-time =   1000 us 1 ms,    200 CPU us 0 CPU ms\naction=InstanceStart\n"
+            concat!(
+                "Guest-boot-time =   1000 us 1 ms,    200 CPU us 0 CPU ms\n",
+                "event=process-panic\n",
+                "action=InstanceStart\n",
+            )
         );
         assert_eq!(
             fs::metadata(&candidate_path)
@@ -1081,6 +1251,7 @@ mod tests {
         );
         state.configure_test_writer(SharedWriter(Arc::new(Mutex::new(Vec::new()))));
         let stale = state.boot_timer_logger();
+        let emergency = state.emergency_logger();
 
         assert!(state.disconnect_delivery_for_test());
         wait_for(|| observer.active() == 0);
@@ -1090,11 +1261,12 @@ mod tests {
         assert_eq!(observer.started(), 2);
 
         assert!(!stale.log_boot_time(1_000, 200));
+        assert!(emergency.try_log_panic());
         assert!(state.log_action(LoggerAction::FlushMetrics));
         assert_eq!(metrics.missed_log_count(), 1);
         assert_eq!(
             *output.lock().expect("successor output lock should succeed"),
-            b"action=FlushMetrics\n"
+            b"event=process-panic\naction=FlushMetrics\n"
         );
     }
 
@@ -1158,6 +1330,130 @@ mod tests {
             "level=Info action=FlushMetrics\n"
         );
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn process_terminal_records_use_fixed_categories_and_filters() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut state = LoggerState::default();
+        state.configure_test_writer(SharedWriter(output.clone()));
+
+        assert!(state.log_process_terminal(ProcessTerminalCategory::Success));
+        assert!(state.log_process_terminal(ProcessTerminalCategory::ProcessFailure));
+        state
+            .configure(LoggerConfigInput::new().with_module("other"))
+            .expect("module update should succeed");
+        assert!(!state.log_process_terminal(ProcessTerminalCategory::Panic));
+
+        assert_eq!(
+            *output.lock().expect("output lock should succeed"),
+            b"event=process-exit category=success\nevent=process-exit category=process-failure\n"
+        );
+    }
+
+    #[test]
+    fn emergency_logger_observes_late_configuration_and_prefix_update() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut state = LoggerState::default();
+        let emergency = state.emergency_logger();
+        assert!(!emergency.try_log_panic());
+
+        state.configure_test_writer(SharedWriter(output.clone()));
+        state
+            .configure(LoggerConfigInput::new().with_show_level(true))
+            .expect("prefix update should succeed");
+        assert!(emergency.try_log_panic());
+        assert!(state.boot_timer_logger().wait_for_delivery_for_test());
+
+        assert_eq!(
+            *output.lock().expect("output lock should succeed"),
+            b"level=Error event=process-panic\n"
+        );
+    }
+
+    #[test]
+    fn filtered_emergency_logger_does_not_record_a_loss() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(SharedWriter(Arc::new(Mutex::new(Vec::new()))));
+        state
+            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Off))
+            .expect("filter update should succeed");
+
+        assert!(!state.emergency_logger().try_log_panic());
+        state.settle_emergency_loss();
+        assert_eq!(metrics.missed_log_count(), 0);
+    }
+
+    #[test]
+    fn occupied_emergency_ingress_coalesces_one_deferred_loss() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(SharedWriter(Arc::new(Mutex::new(Vec::new()))));
+        let emergency = state.emergency_logger();
+
+        assert!(emergency.try_log_panic());
+        assert!(!emergency.try_log_panic());
+        assert!(!emergency.try_log_panic());
+        state.settle_emergency_loss();
+        state.settle_emergency_loss();
+        assert_eq!(metrics.missed_log_count(), 1);
+    }
+
+    #[test]
+    fn contended_emergency_snapshot_returns_without_locking_and_defers_loss() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(SharedWriter(Arc::new(Mutex::new(Vec::new()))));
+        let emergency = state.emergency_logger();
+        let held = emergency.clone();
+        let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let holder = std::thread::spawn(move || {
+            let _guard = held
+                .inner
+                .target
+                .lock()
+                .expect("target lock should succeed");
+            entered_sender.send(()).expect("holder should signal entry");
+            release_receiver
+                .recv()
+                .expect("holder should receive release");
+        });
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("holder should enter");
+
+        assert!(!emergency.try_log_panic());
+        release_sender
+            .send(())
+            .expect("holder should receive release signal");
+        holder.join().expect("holder should exit");
+        state.settle_emergency_loss();
+        assert_eq!(metrics.missed_log_count(), 1);
+    }
+
+    #[test]
+    fn poisoned_emergency_snapshot_returns_without_locking_and_defers_loss() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(SharedWriter(Arc::new(Mutex::new(Vec::new()))));
+        let emergency = state.emergency_logger();
+        let poisoned = emergency.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _guard = poisoned
+                .inner
+                .target
+                .lock()
+                .expect("target lock should initially succeed");
+            panic!("poison emergency target fixture");
+        });
+        assert!(poisoner.join().is_err());
+
+        assert!(!emergency.try_log_panic());
+        state.settle_emergency_loss();
+        state.settle_emergency_loss();
+        assert_eq!(metrics.missed_log_count(), 1);
     }
 
     #[test]

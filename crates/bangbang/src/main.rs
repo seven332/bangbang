@@ -21,6 +21,7 @@ mod grant_integration_probe;
 #[doc(hidden)]
 #[cfg(target_os = "macos")]
 pub mod host_network;
+mod panic_bridge;
 mod periodic_metrics;
 #[cfg(target_os = "macos")]
 mod snapshot_restore_resources;
@@ -57,7 +58,7 @@ use vmm::{
     ProcessVmnetAuthority, VmmRequestHandler,
 };
 
-use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
+use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel, ProcessTerminalCategory};
 use bangbang_runtime::metrics::{MetricsConfigInput, MetricsDiagnostics, SharedSignalMetrics};
 use bangbang_runtime::mmds::MmdsContentInput;
 use bangbang_runtime::snapshot_format::{
@@ -95,29 +96,65 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         };
     }
-    let mut contained = match ContainedSession::bootstrap() {
+    let bridge = panic_bridge::PanicBridge::install();
+    let mut contained = None;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_process_lifecycle(&bridge, &mut contained)
+    }));
+    match outcome {
+        Ok(exit_code) => {
+            bridge.restore();
+            exit_code
+        }
+        Err(payload) => {
+            bridge.nudge_fallback();
+            panic_bridge::isolate_secondary_panic(|| {
+                if let Some(session) = contained.as_mut() {
+                    let _ = session.finish(
+                        bangbang_session::TerminalCategory::ProcessFailure,
+                        ProcessExitCode::ProcessFailure.value(),
+                    );
+                }
+            });
+            panic_bridge::isolate_secondary_panic(|| drop(contained.take()));
+            bridge.restore();
+            panic_bridge::resume_original(payload)
+        }
+    }
+}
+
+fn run_process_lifecycle(
+    bridge: &panic_bridge::PanicBridge,
+    contained: &mut Option<ContainedSession>,
+) -> ExitCode {
+    *contained = match ContainedSession::bootstrap() {
         Ok(contained) => contained,
         Err(err) => {
             eprintln!("bangbang: {err}");
             return ProcessExitCode::ProcessFailure.into_exit_code();
         }
     };
-    let result = run(&mut contained);
+    let result = run(bridge, contained);
     let (category, exit_code) = terminal_result(&result, contained.as_ref());
     if let Some(session) = contained.as_mut() {
         let _ = session.finish(category, exit_code);
     }
-    match result {
+    let exit_code = match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let exit_code = err.exit_code().into_exit_code();
             eprintln!("bangbang: {err}");
             exit_code
         }
-    }
+    };
+    drop(contained.take());
+    exit_code
 }
 
-fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
+fn run(
+    bridge: &panic_bridge::PanicBridge,
+    contained: &mut Option<ContainedSession>,
+) -> Result<(), ProcessError> {
     let snapshot_cancellation = NativeV1SnapshotCaptureCancellation::default();
     let mut contained_shutdown = if let Some(session) = contained.as_mut() {
         let (reader, writer) = session
@@ -280,117 +317,133 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
                 .with_contained_restore_authority(contained_restore_authority);
             #[cfg(not(target_os = "macos"))]
             let mut vmm = vmm;
-            apply_startup_metrics_config(&mut vmm, metrics_config)?;
-            if contained_shutdown_requested(contained)? {
-                return Ok(());
-            }
-            apply_startup_logger_config(&mut vmm, logger_config)?;
-            if contained_shutdown_requested(contained)? {
-                return Ok(());
-            }
-            apply_startup_metadata_with_authority(
-                &mut vmm,
-                metadata.as_deref(),
-                grant_authority.as_ref(),
-            )?;
-            if contained_shutdown_requested(contained)? {
-                return Ok(());
-            }
-            let _fatal_signal_handlers = FatalSignalHandlers::install()?;
-            let _sigpipe_signal_handler = SigpipeSignalHandler::install(signal_metrics)?;
-            if apply_startup_config_file_with_cancel(
-                &mut vmm,
-                config_file.as_deref(),
-                grant_authority.as_ref(),
-                || contained_shutdown_requested(contained),
-            )? {
-                return finish_process_with_terminal_metrics(&mut vmm, Ok(()));
-            }
-            let result = (|| {
-                let mut shutdown_signal = match contained_shutdown.take() {
-                    Some(signal) => signal,
-                    None => ShutdownSignal::install(snapshot_cancellation.clone())?,
-                };
-                if contained_shutdown_requested(contained)? {
-                    return Ok(());
-                }
-                if no_api {
-                    if let Some(session) = contained.as_mut() {
-                        session
-                            .send_ready(bangbang_session::Readiness::NoApi)
-                            .map_err(|_| ProcessError::ContainedSession)?;
+            let _ = bridge.attach(vmm.emergency_logger());
+            let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = (|| {
+                    apply_startup_metrics_config(&mut vmm, metrics_config)?;
+                    if contained_shutdown_requested(contained)? {
+                        return Ok(());
                     }
-                    println!("status: VM running without API");
-                    let result = wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
-                    return result.and_then(|()| contained_wakeup_result(contained));
-                }
-
-                #[cfg(target_os = "macos")]
-                let (_anchored_api_guard, server) = {
-                    let claim = contained
-                        .as_ref()
-                        .and_then(ContainedSession::directory_grant_authority)
-                        .map(|authority| {
-                            authority.claim_socket_directory(
-                                std::path::Path::new(&api_sock),
-                                ResourceRole::ApiSocketDirectory,
-                            )
-                        })
-                        .transpose()
-                        .map_err(|_| ProcessError::ContainedSession)?
-                        .flatten();
-                    match claim {
-                        Some(claim) => {
-                            let namespace = contained
-                                .as_ref()
-                                .ok_or(ProcessError::ContainedSession)?
-                                .socket_namespace()
-                                .map_err(|_| ProcessError::ContainedSession)?
-                                .ok_or(ProcessError::ContainedSession)?;
-                            let socket = bind_anchored_socket(
-                                namespace,
-                                claim,
-                                ResourceRole::ApiSocketDirectory,
-                                None,
-                            )
-                            .map_err(|error| {
-                                ProcessError::ApiServer(ApiServerError::Anchored(error))
-                            })?;
-                            let (server, guard) =
-                                ApiServer::from_anchored(socket, http_api_max_payload_size);
-                            (Some(guard), server)
+                    apply_startup_logger_config(&mut vmm, logger_config)?;
+                    if contained_shutdown_requested(contained)? {
+                        return Ok(());
+                    }
+                    apply_startup_metadata_with_authority(
+                        &mut vmm,
+                        metadata.as_deref(),
+                        grant_authority.as_ref(),
+                    )?;
+                    if contained_shutdown_requested(contained)? {
+                        return Ok(());
+                    }
+                    let _fatal_signal_handlers = FatalSignalHandlers::install()?;
+                    let _sigpipe_signal_handler = SigpipeSignalHandler::install(signal_metrics)?;
+                    if apply_startup_config_file_with_cancel(
+                        &mut vmm,
+                        config_file.as_deref(),
+                        grant_authority.as_ref(),
+                        || contained_shutdown_requested(contained),
+                    )? {
+                        return Ok(());
+                    }
+                    (|| {
+                        let mut shutdown_signal = match contained_shutdown.take() {
+                            Some(signal) => signal,
+                            None => ShutdownSignal::install(snapshot_cancellation.clone())?,
+                        };
+                        if contained_shutdown_requested(contained)? {
+                            return Ok(());
                         }
-                        None => (
-                            None,
-                            ApiServer::bind_with_max_payload_size(
-                                &api_sock,
-                                http_api_max_payload_size,
-                            )
-                            .map_err(ProcessError::ApiServer)?,
-                        ),
-                    }
-                };
-                #[cfg(not(target_os = "macos"))]
-                let server =
-                    ApiServer::bind_with_max_payload_size(&api_sock, http_api_max_payload_size)
-                        .map_err(ProcessError::ApiServer)?;
-                if contained_shutdown_requested(contained)? {
-                    return Ok(());
-                }
-                if let Some(session) = contained.as_mut() {
-                    session
-                        .send_ready(bangbang_session::Readiness::Api)
-                        .map_err(|_| ProcessError::ContainedSession)?;
-                }
-                println!("status: API server listening");
-                let shutdown_wakeup = shutdown_signal.wakeup_reader();
-                server
-                    .run_until(&mut vmm, shutdown_wakeup)
-                    .map_err(ProcessError::ApiServer)
-                    .and_then(|()| contained_wakeup_result(contained))
-            })();
+                        if no_api {
+                            if let Some(session) = contained.as_mut() {
+                                session
+                                    .send_ready(bangbang_session::Readiness::NoApi)
+                                    .map_err(|_| ProcessError::ContainedSession)?;
+                            }
+                            println!("status: VM running without API");
+                            let result = wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
+                            return result.and_then(|()| contained_wakeup_result(contained));
+                        }
 
-            finish_process_with_terminal_metrics(&mut vmm, result)
+                        #[cfg(target_os = "macos")]
+                        let (_anchored_api_guard, server) = {
+                            let claim = contained
+                                .as_ref()
+                                .and_then(ContainedSession::directory_grant_authority)
+                                .map(|authority| {
+                                    authority.claim_socket_directory(
+                                        std::path::Path::new(&api_sock),
+                                        ResourceRole::ApiSocketDirectory,
+                                    )
+                                })
+                                .transpose()
+                                .map_err(|_| ProcessError::ContainedSession)?
+                                .flatten();
+                            match claim {
+                                Some(claim) => {
+                                    let namespace = contained
+                                        .as_ref()
+                                        .ok_or(ProcessError::ContainedSession)?
+                                        .socket_namespace()
+                                        .map_err(|_| ProcessError::ContainedSession)?
+                                        .ok_or(ProcessError::ContainedSession)?;
+                                    let socket = bind_anchored_socket(
+                                        namespace,
+                                        claim,
+                                        ResourceRole::ApiSocketDirectory,
+                                        None,
+                                    )
+                                    .map_err(|error| {
+                                        ProcessError::ApiServer(ApiServerError::Anchored(error))
+                                    })?;
+                                    let (server, guard) =
+                                        ApiServer::from_anchored(socket, http_api_max_payload_size);
+                                    (Some(guard), server)
+                                }
+                                None => (
+                                    None,
+                                    ApiServer::bind_with_max_payload_size(
+                                        &api_sock,
+                                        http_api_max_payload_size,
+                                    )
+                                    .map_err(ProcessError::ApiServer)?,
+                                ),
+                            }
+                        };
+                        #[cfg(not(target_os = "macos"))]
+                        let server = ApiServer::bind_with_max_payload_size(
+                            &api_sock,
+                            http_api_max_payload_size,
+                        )
+                        .map_err(ProcessError::ApiServer)?;
+                        if contained_shutdown_requested(contained)? {
+                            return Ok(());
+                        }
+                        if let Some(session) = contained.as_mut() {
+                            session
+                                .send_ready(bangbang_session::Readiness::Api)
+                                .map_err(|_| ProcessError::ContainedSession)?;
+                        }
+                        println!("status: API server listening");
+                        let shutdown_wakeup = shutdown_signal.wakeup_reader();
+                        server
+                            .run_until(&mut vmm, shutdown_wakeup)
+                            .map_err(ProcessError::ApiServer)
+                            .and_then(|()| contained_wakeup_result(contained))
+                    })()
+                })();
+                let category = process_terminal_category(&result, contained.as_ref());
+                finish_process_with_terminal_observability(&mut vmm, result, category)
+            }));
+            match execution {
+                Ok(result) => result,
+                Err(payload) => {
+                    panic_bridge::isolate_secondary_panic(|| {
+                        vmm.handle_terminal_observability(ProcessTerminalCategory::Panic);
+                    });
+                    panic_bridge::resume_original(payload)
+                }
+            }
         }
     }
 }
@@ -422,6 +475,27 @@ fn terminal_result(
     }
 }
 
+fn process_terminal_category(
+    result: &Result<(), ProcessError>,
+    contained: Option<&ContainedSession>,
+) -> ProcessTerminalCategory {
+    match result {
+        Ok(()) if contained.is_some_and(ContainedSession::was_cancelled) => {
+            ProcessTerminalCategory::Cancelled
+        }
+        Ok(()) => ProcessTerminalCategory::Success,
+        Err(error)
+            if matches!(
+                error.exit_code(),
+                ProcessExitCode::ArgumentParsing | ProcessExitCode::BadConfiguration
+            ) =>
+        {
+            ProcessTerminalCategory::Configuration
+        }
+        Err(_) => ProcessTerminalCategory::ProcessFailure,
+    }
+}
+
 fn contained_shutdown_requested(
     contained: &Option<ContainedSession>,
 ) -> Result<bool, ProcessError> {
@@ -435,14 +509,15 @@ fn contained_wakeup_result(contained: &Option<ContainedSession>) -> Result<(), P
     contained_shutdown_requested(contained).map(|_| ())
 }
 
-fn finish_process_with_terminal_metrics<S>(
+fn finish_process_with_terminal_observability<S>(
     vmm: &mut ProcessVmm<S>,
     result: Result<(), ProcessError>,
+    category: ProcessTerminalCategory,
 ) -> Result<(), ProcessError>
 where
     S: vmm::InstanceStartExecutor,
 {
-    vmm.handle_terminal_metrics_flush();
+    vmm.handle_terminal_observability(category);
     result
 }
 
@@ -2598,6 +2673,7 @@ mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{
         LoggerApiRoute, LoggerConfigError, LoggerConfigInput, LoggerHttpMethod, LoggerLevel,
+        ProcessTerminalCategory,
     };
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
     use bangbang_runtime::memory::{
@@ -5030,7 +5106,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_metrics_drain_initial_preserve_server_error_and_do_not_duplicate() {
+    fn terminal_observability_drains_initial_preserves_error_and_is_idempotent() {
         let metrics_path = unique_metrics_path("server-error-final");
         let mut vmm = ProcessVmm::with_starter(
             "demo-1",
@@ -5053,7 +5129,11 @@ mod tests {
             ErrorKind::BrokenPipe,
         )));
         assert_eq!(
-            super::finish_process_with_terminal_metrics(&mut vmm, result),
+            super::finish_process_with_terminal_observability(
+                &mut vmm,
+                result,
+                ProcessTerminalCategory::ProcessFailure,
+            ),
             Err(ProcessError::ApiServer(ApiServerError::Accept(
                 ErrorKind::BrokenPipe
             )))
@@ -5066,7 +5146,11 @@ mod tests {
         );
 
         assert_eq!(
-            super::finish_process_with_terminal_metrics(&mut vmm, Ok(())),
+            super::finish_process_with_terminal_observability(
+                &mut vmm,
+                Ok(()),
+                ProcessTerminalCategory::Success,
+            ),
             Ok(())
         );
         assert_eq!(
@@ -5103,7 +5187,11 @@ mod tests {
             ErrorKind::BrokenPipe,
         )));
         assert_eq!(
-            super::finish_process_with_terminal_metrics(&mut vmm, result),
+            super::finish_process_with_terminal_observability(
+                &mut vmm,
+                result,
+                ProcessTerminalCategory::ProcessFailure,
+            ),
             Err(ProcessError::ApiServer(ApiServerError::Accept(
                 ErrorKind::BrokenPipe
             )))
@@ -5111,10 +5199,65 @@ mod tests {
         let _failed_final = metrics_fifo.drain_available();
 
         assert_eq!(
-            super::finish_process_with_terminal_metrics(&mut vmm, Ok(())),
+            super::finish_process_with_terminal_observability(
+                &mut vmm,
+                Ok(()),
+                ProcessTerminalCategory::Success,
+            ),
             Ok(())
         );
         assert_eq!(metrics_fifo.drain_available(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn terminal_logger_failure_is_counted_before_final_metrics_and_preserves_result() {
+        let metrics_path = unique_metrics_path("terminal-logger-failure");
+        let mut logger_fifo = MetricsFifo::create("terminal-logger-failure");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(logger_fifo.path()),
+        ))
+        .expect("logger should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        vmm.handle_initial_metrics_flush();
+        assert_eq!(logger_fifo.drain_available(), b"action=InstanceStart\n");
+        logger_fifo.fill_to_capacity();
+
+        let result = Err(ProcessError::ApiServer(ApiServerError::Accept(
+            ErrorKind::BrokenPipe,
+        )));
+        assert_eq!(
+            super::finish_process_with_terminal_observability(
+                &mut vmm,
+                result,
+                ProcessTerminalCategory::ProcessFailure,
+            ),
+            Err(ProcessError::ApiServer(ApiServerError::Accept(
+                ErrorKind::BrokenPipe
+            )))
+        );
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            concat!(
+                "{\"vmm\":{\"metrics_flush_count\":1}}\n",
+                "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n",
+            )
+        );
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
     #[test]
@@ -5147,7 +5290,11 @@ mod tests {
 
         let result = super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
         assert_eq!(
-            super::finish_process_with_terminal_metrics(&mut vmm, result),
+            super::finish_process_with_terminal_observability(
+                &mut vmm,
+                result,
+                ProcessTerminalCategory::Success,
+            ),
             Ok(())
         );
         assert_eq!(
@@ -5187,7 +5334,11 @@ mod tests {
 
         let result = super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
         assert_eq!(
-            super::finish_process_with_terminal_metrics(&mut vmm, result),
+            super::finish_process_with_terminal_observability(
+                &mut vmm,
+                result,
+                ProcessTerminalCategory::ProcessFailure,
+            ),
             Err(super::ProcessError::ProcessSessionTerminal)
         );
         assert_eq!(

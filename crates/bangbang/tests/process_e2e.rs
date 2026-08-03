@@ -9,6 +9,7 @@
 
 mod support;
 
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, symlink};
 
@@ -179,6 +180,76 @@ fn executable_short_version_alias_exits_before_socket_publication() {
     assert!(
         !socket_path.exists(),
         "short version must not publish the API socket"
+    );
+}
+
+#[test]
+fn executable_logs_success_terminal_record_after_api_shutdown() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("terminal-success.socket");
+    let logger_path = test_dir.path().join("terminal-success.log");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start_with_extra_args(
+        &socket_path,
+        &instance_id,
+        &["--log-path", path_text(&logger_path)],
+    );
+
+    let output = bangbang.terminate();
+    assert_clean_shutdown(output, &socket_path, "API terminal logger");
+    assert_eq!(
+        fs::read_to_string(&logger_path).expect("terminal logger output should be readable"),
+        "event=process-exit category=success\n"
+    );
+}
+
+#[test]
+fn executable_logs_configuration_terminal_record_after_logger_setup() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("terminal-configuration.socket");
+    let logger_path = test_dir.path().join("terminal-configuration.log");
+    let missing_metadata = test_dir.path().join("missing-metadata.json");
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &[
+            "--log-path",
+            path_text(&logger_path),
+            "--metadata",
+            path_text(&missing_metadata),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(BAD_CONFIGURATION_EXIT_CODE));
+    assert_eq!(
+        fs::read_to_string(&logger_path).expect("terminal logger output should be readable"),
+        "event=process-exit category=configuration\n"
+    );
+}
+
+#[test]
+fn executable_logs_process_failure_terminal_record_after_logger_setup() {
+    let test_dir = TestDir::new();
+    let logger_path = test_dir.path().join("terminal-process-failure.log");
+    let unavailable_socket = test_dir.path().join("missing").join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let args = [
+        OsStr::new("--api-sock"),
+        unavailable_socket.as_os_str(),
+        OsStr::new("--id"),
+        OsStr::new(&instance_id),
+        OsStr::new("--log-path"),
+        logger_path.as_os_str(),
+    ];
+
+    let output = BangbangProcess::run_with_args_expect_exit(&args, "API bind failure");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(&logger_path).expect("terminal logger output should be readable"),
+        "event=process-exit category=process-failure\n"
     );
 }
 

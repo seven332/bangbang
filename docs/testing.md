@@ -2350,6 +2350,26 @@ timer MMIO outcomes do not change. API socket tests cover level/origin/module
 filters and verify that request bodies and dynamic selectors never reach logger
 output.
 
+Emergency logger tests separately prove one compare-exchange publication,
+priority before an ordinary wake message, bounded idle polling, independence
+from a full ordinary queue, held and failed writers, disconnect and worker
+unwind closure, failure-atomic replacement, a fresh disconnected successor,
+late prefix/filter publication, and immediate contended or poisoned attachment
+fallback with one deferred loss. Fixed panic and terminal variants are checked
+for exact text, level, UTF-8 validity, and the 512-byte ceiling.
+
+Every test that changes the global panic hook self-spawns the exact unit-test
+child with one case marker and `--test-threads=1`; the parent pipes output,
+enforces a five-second deadline, and kills only a timeout failure. These cases
+cover default and sentinel prior-hook suppression/restoration, string and
+custom payload redaction, resumed payload identity, pre-attachment and filtered
+fallback, an occupied logger ingress, first/second invocation behavior, a
+stalled fallback writer, secondary-payload isolation, and true panic-on-drop
+double panic. Direct ingress tests add unavailable, occupied, claimed, closed,
+and failed fallback outcomes without mutating a hook. The double-panic case
+requires only bounded non-success and absence of both secrets; it deliberately
+makes no persistence claim.
+
 Metrics transaction tests use injected outputs to cover every implemented
 increment family and persistent store, first/no-new/new-event lines, lower/new
 producer generations, keyed disappearance and reappearance, independent
@@ -2364,9 +2384,21 @@ preboot scheduler dormancy, a session-epoch deadline, Running and Paused
 periodic output, due work that is not starved by ready API clients, periodic
 failure/rearm/recovery, explicit failure propagation, initial/final sink
 failure, guest stop, worker terminal error, ordinary server error, exact result
-preservation, idempotent finalization, and independent process ownership. The
+preservation, terminal logger-before-final-metrics ordering, terminal logger
+failure accounting, all fixed categories, idempotent finalization, and
+independent process ownership. Ordinary real-binary tests cover successful API
+shutdown plus configuration and process failures after logger setup. The
 60-second rule is checked with injected `Instant` values and due schedulers;
 tests do not sleep for a production interval.
+
+Run the focused process-observability evidence with:
+
+```sh
+cargo test -p bangbang-runtime logger --all-features --locked
+cargo test -p bangbang --bin bangbang panic_bridge::tests --all-features --locked -- --test-threads=1
+cargo test -p bangbang --bin bangbang terminal_observability --all-features --locked
+cargo test -p bangbang --test process_e2e terminal_record --all-features --locked
+```
 
 Serial unit tests cover nullable output, the bounded 64-KiB internal TX buffer,
 nonblocking file/FIFO behavior, path redaction, exact token-bucket refill/drop
@@ -2399,7 +2431,10 @@ redaction. Direct create/FIFO/open timing remains covered by the original tests.
 Production reachability is intentionally narrower than those normative tests.
 The existing API-driven and config-file-driven signed executable scenarios each
 observe session-initial plus explicit output before shutdown and one additional
-normal-terminal line after exit. The signed boot-timer scenario proves a guest
+normal-terminal metrics line and final fixed success logger record after exit.
+The normal production-bundle output-grant cases check the same terminal logger
+record, while module-filtered concurrent cases prove it is suppressed. The
+signed boot-timer scenario proves a guest
 magic write reaches the configured logger; signed initrd/direct-rootfs serial
 scenarios prove configured public TX output and clear behavior. Dedicated
 signed serial-stdio cases use a raw `/dev/ttyS0` guest protocol and an exact
