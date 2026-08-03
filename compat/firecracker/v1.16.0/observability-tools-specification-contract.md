@@ -1,0 +1,216 @@
+# Firecracker v1.16.0 observability, tools, and specification contract
+
+This is the checked ownership and evidence ledger for Wave 7 parent
+[#1491](https://github.com/seven332/bangbang/issues/1491). It is pinned to
+Firecracker v1.16.0 commit
+`d83d72b710361a10294480131377b1b00b163af8` and Bangbang's supported macOS
+arm64/Hypervisor.framework target.
+
+The starting boundary is exact: 93 records belong to #1491 and nine records
+remain named #1373, #1378, or Wave 8 handoffs. Ownership is stable even as an
+owning child changes its rows from `audit-required` to a supported terminal
+disposition. Producer-only children #1785, #1788, and #1789 intentionally own
+no early disposition; their work feeds #1786, #1790, and #1799 respectively.
+
+## Evidence keys
+
+- **FC-API**: pinned
+  [`firecracker.yaml`](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml)
+  operations and schemas.
+- **FC-ACTIONS**: pinned strict
+  [action parser](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/src/api_server/request/actions.rs)
+  including the aarch64 `SendCtrlAltDel` rejection.
+- **FC-X86**: pinned
+  [x86 custom CPU-template implementation](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs)
+  and Swagger's explicit x86-only CPUID/MSR descriptions.
+- **FC-ARM**: pinned arm64
+  [`CustomCpuTemplate`](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48)
+  accepts only the arm64 fields and denies unknown architecture fields.
+- **APPLE-HVF**: public arm64 HVF exposes typed
+  [general-register](https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29),
+  [system-register](https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29),
+  and
+  [feature-register](https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29)
+  interfaces, not an x86 CPUID leaf/MSR namespace.
+- **LOCAL-API**: strict request/response types and routes in
+  `crates/api/src/{http,route}.rs`.
+- **LOCAL-DISPATCH**: Unix-socket handling and controller dispatch in
+  `crates/bangbang/src/api_server.rs`.
+- **LOCAL-STATE**: process-owned instance/action/configuration behavior in
+  `crates/runtime/src/lib.rs` and `crates/bangbang/src/vmm.rs`.
+- **FOCUSED**: API parser/response and controller tests in
+  `crates/api/src/http.rs` and `crates/bangbang/src/api_server.rs`.
+- **PROCESS**: real executable socket, malformed-route survival,
+  configuration, action, state, and redaction tests in
+  `crates/bangbang/tests/process_e2e.rs`.
+- **SIGNED**: signed real-HVF lifecycle in
+  `crates/bangbang/tests/executable_hvf_e2e.rs`, plus App Sandbox and production
+  API boundaries in the owning signed targets.
+
+## Core API certification
+
+The four operations expose Firecracker-shaped instance, version, optional
+full-configuration, and synchronous-action behavior. Bodyless GETs, exact
+method/path matching, strict action JSON, deterministic 200/204/400/413
+responses, fixed `fault_message` JSON, state admission, failure atomicity, and
+process survival are covered at the appropriate library/process/signed layers.
+The instance states are exactly `Not started`, `Running`, and `Paused`.
+
+`FullVmConfiguration` has no required properties in the pinned schema.
+Bangbang therefore implements deterministic supported-field export and
+optional omission while the separately tracked optional `.logger` and
+`.metrics` properties remain owned by #1786 and #1787. This schema result does
+not close the Wave 8 interaction semantic.
+
+The terminal API specification semantic is similarly bounded. It covers API
+socket availability while the process control loop is alive, strict
+request/response/state behavior, survival of malformed or external failures,
+value-safe failure information, and current signed lifecycle evidence. It does
+not claim comprehensive failure logging (#1786), formal proofs (#1797),
+numeric startup/resource/performance or telemetry outcomes (#1798), or final
+cross-capability interactions (Wave 8).
+
+## X86 CPUID/MSR platform boundary
+
+All 13 CPUID/MSR identities are executable x86_64 contracts. ARM register
+reinterpretation would change their architecture and bitmap semantics; an x86
+emulator or Linux/KVM sidecar would change the native backend and one-process
+boundary; silently accepting them would report success without enforcing the
+requested CPU state. None is an identity-preserving implementation on macOS
+arm64/HVF.
+
+Bangbang retains Firecracker's architecture-strict behavior: complete
+`cpuid_modifiers` or `msr_modifiers` shapes are rejected before conversion,
+runtime mutation, backend construction, or start. The response is the fixed
+malformed-request fault and contains no leaf, subleaf, flags, register,
+address, or bitmap value. The focused tests are
+`rejects_complete_x86_cpu_config_shapes_without_retaining_values` and the x86
+cases in `executable_configures_vm_before_start`.
+
+The current platform decision is the #1784
+[Plan Challenge](https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449).
+The existing arm64 `kvm_capabilities`, `vcpu_features`, and reviewed
+`reg_modifiers` behavior is unchanged; its own exact platform/safety outcomes
+remain in the CPU-template contract.
+
+## Exact #1491-owned ledger
+
+| Identity | Owner | Result after #1784 |
+| --- | --- | --- |
+| `api-operation:GET /` | #1784 | `implemented-and-verified` |
+| `api-operation:GET /version` | #1784 | `implemented-and-verified` |
+| `api-operation:GET /vm/config` | #1784 | `implemented-and-verified` |
+| `api-operation:PUT /actions` | #1784 | `implemented-and-verified` |
+| `api-path:/` | #1784 | `implemented-and-verified` |
+| `api-path:/actions` | #1784 | `implemented-and-verified` |
+| `api-path:/version` | #1784 | `implemented-and-verified` |
+| `api-path:/vm/config` | #1784 | `implemented-and-verified` |
+| `api-property:CpuConfig.cpuid_modifiers` | #1784 | `proven-platform-impossible` |
+| `api-property:CpuConfig.msr_modifiers` | #1784 | `proven-platform-impossible` |
+| `api-property:CpuidLeafModifier.flags` | #1784 | `proven-platform-impossible` |
+| `api-property:CpuidLeafModifier.leaf` | #1784 | `proven-platform-impossible` |
+| `api-property:CpuidLeafModifier.modifiers` | #1784 | `proven-platform-impossible` |
+| `api-property:CpuidLeafModifier.subleaf` | #1784 | `proven-platform-impossible` |
+| `api-property:CpuidRegisterModifier.bitmap` | #1784 | `proven-platform-impossible` |
+| `api-property:CpuidRegisterModifier.register` | #1784 | `proven-platform-impossible` |
+| `api-property:Error.fault_message` | #1784 | `implemented-and-verified` |
+| `api-property:FirecrackerVersion.firecracker_version` | #1784 | `implemented-and-verified` |
+| `api-property:InstanceActionInfo.action_type` | #1784 | `implemented-and-verified` |
+| `api-property:InstanceInfo.app_name` | #1784 | `implemented-and-verified` |
+| `api-property:InstanceInfo.id` | #1784 | `implemented-and-verified` |
+| `api-property:InstanceInfo.state` | #1784 | `implemented-and-verified` |
+| `api-property:InstanceInfo.vmm_version` | #1784 | `implemented-and-verified` |
+| `api-property:MsrModifier.addr` | #1784 | `proven-platform-impossible` |
+| `api-property:MsrModifier.bitmap` | #1784 | `proven-platform-impossible` |
+| `api-schema:CpuidLeafModifier` | #1784 | `proven-platform-impossible` |
+| `api-schema:CpuidRegisterModifier` | #1784 | `proven-platform-impossible` |
+| `api-schema:Error` | #1784 | `implemented-and-verified` |
+| `api-schema:FirecrackerVersion` | #1784 | `implemented-and-verified` |
+| `api-schema:FullVmConfiguration` | #1784 | `implemented-and-verified` |
+| `api-schema:InstanceActionInfo` | #1784 | `implemented-and-verified` |
+| `api-schema:InstanceInfo` | #1784 | `implemented-and-verified` |
+| `api-schema:MsrModifier` | #1784 | `proven-platform-impossible` |
+| `corpus:actions-api` | #1784 | `implemented-and-verified` |
+| `semantic.specification:api-availability-stability-and-failure-information` | #1784 | `implemented-and-verified` |
+| `api-operation:PUT /logger` | #1786 | `audit-required` |
+| `api-path:/logger` | #1786 | `audit-required` |
+| `api-property:FullVmConfiguration.logger` | #1786 | `audit-required` |
+| `api-property:Logger.level` | #1786 | `audit-required` |
+| `api-property:Logger.log_path` | #1786 | `audit-required` |
+| `api-property:Logger.module` | #1786 | `audit-required` |
+| `api-property:Logger.show_level` | #1786 | `audit-required` |
+| `api-property:Logger.show_log_origin` | #1786 | `audit-required` |
+| `api-schema:Logger` | #1786 | `audit-required` |
+| `corpus:logger` | #1786 | `audit-required` |
+| `semantic.observability:logger-delivery-filtering-loss-and-redaction` | #1786 | `audit-required` |
+| `api-operation:PUT /metrics` | #1787 | `audit-required` |
+| `api-path:/metrics` | #1787 | `audit-required` |
+| `api-property:FullVmConfiguration.metrics` | #1787 | `audit-required` |
+| `api-property:Metrics.metrics_path` | #1787 | `audit-required` |
+| `api-property:RateLimiter.bandwidth` | #1787 | `audit-required` |
+| `api-property:RateLimiter.ops` | #1787 | `audit-required` |
+| `api-property:TokenBucket.one_time_burst` | #1787 | `audit-required` |
+| `api-property:TokenBucket.refill_time` | #1787 | `audit-required` |
+| `api-property:TokenBucket.size` | #1787 | `audit-required` |
+| `api-schema:Metrics` | #1787 | `audit-required` |
+| `api-schema:RateLimiter` | #1787 | `audit-required` |
+| `api-schema:TokenBucket` | #1787 | `audit-required` |
+| `corpus:metrics` | #1790 | `audit-required` |
+| `semantic.observability:metrics-schema-producers-flush-and-lifecycle` | #1790 | `audit-required` |
+| `corpus:tracing` | #1791 | `audit-required` |
+| `tool-argument:cpu-template-helper/template/dump/config` | #1792 | `audit-required` |
+| `tool-argument:cpu-template-helper/template/dump/output` | #1792 | `audit-required` |
+| `tool-argument:cpu-template-helper/template/dump/template` | #1792 | `audit-required` |
+| `tool-argument:cpu-template-helper/template/verify/config` | #1792 | `audit-required` |
+| `tool-argument:cpu-template-helper/template/verify/template` | #1792 | `audit-required` |
+| `tool-operation:cpu-template-helper/template/dump` | #1792 | `audit-required` |
+| `tool-operation:cpu-template-helper/template/verify` | #1792 | `audit-required` |
+| `tool-argument:cpu-template-helper/template/strip/paths` | #1793 | `audit-required` |
+| `tool-argument:cpu-template-helper/template/strip/suffix` | #1793 | `audit-required` |
+| `tool-operation:cpu-template-helper/template/strip` | #1793 | `audit-required` |
+| `tool-argument:cpu-template-helper/fingerprint/compare/curr` | #1794 | `audit-required` |
+| `tool-argument:cpu-template-helper/fingerprint/compare/filters` | #1794 | `audit-required` |
+| `tool-argument:cpu-template-helper/fingerprint/compare/prev` | #1794 | `audit-required` |
+| `tool-argument:cpu-template-helper/fingerprint/dump/config` | #1794 | `audit-required` |
+| `tool-argument:cpu-template-helper/fingerprint/dump/output` | #1794 | `audit-required` |
+| `tool-argument:cpu-template-helper/fingerprint/dump/template` | #1794 | `audit-required` |
+| `tool-operation:cpu-template-helper/fingerprint/compare` | #1794 | `audit-required` |
+| `tool-operation:cpu-template-helper/fingerprint/dump` | #1794 | `audit-required` |
+| `corpus:cpu-template-helper` | #1795 | `audit-required` |
+| `corpus:cpu-templates` | #1795 | `audit-required` |
+| `semantic.cpu:configuration-templates-and-feature-state` | #1795 | `audit-required` |
+| `corpus:getting-started` | #1796 | `audit-required` |
+| `corpus:rootfs-and-kernel` | #1796 | `audit-required` |
+| `corpus:formal-verification` | #1797 | `audit-required` |
+| `corpus:network-performance` | #1798 | `audit-required` |
+| `corpus:specification` | #1798 | `audit-required` |
+| `semantic.specification:performance-resource-and-telemetry-outcomes` | #1798 | `audit-required` |
+| `corpus:design` | #1799 | `audit-required` |
+| `corpus:device-api` | #1799 | `audit-required` |
+| `corpus:release-changelog` | #1799 | `audit-required` |
+| `semantic.tools:packaging-help-errors-and-applicable-operations` | #1799 | `audit-required` |
+| `semantic.transport:virtio-mmio-activation` | #1799 | `audit-required` |
+
+## Exact retained handoffs
+
+| Identity | Retained owner | Current disposition |
+| --- | --- | --- |
+| `corpus:jailer` | #1373 | `audit-required` |
+| `corpus:production-host` | #1373 | `audit-required` |
+| `tool-argument:jailer/chroot-base-dir` | #1373 | `audit-required` |
+| `tool-argument:jailer/gid` | #1373 | `audit-required` |
+| `tool-argument:jailer/uid` | #1373 | `audit-required` |
+| `tool-operation:jailer/run` | #1373 | `audit-required` |
+| `corpus:network-setup` | #1378 | `audit-required` |
+| `semantic.network:virtio-net-vmnet-policy-and-connectivity` | #1378 | `audit-required` |
+| `semantic.cross-capability:state-errors-metrics-security-and-snapshots` | Wave 8 | `audit-required` |
+
+## Disposition accounting
+
+#1784 moves 22 rows to `implemented-and-verified` and 13 rows to
+`proven-platform-impossible`. The post-#1784 inventory is therefore exactly
+318 implemented, 67 audit-required, three missing-platform-feasible, and 30
+proven-platform-impossible. If every other #1491-owned row later becomes
+implemented while the nine handoffs remain, the prospective Wave 7 endpoint
+is 376/9/3/30. These are exact consequences of the current row set, not quotas;
+the authoritative current totals remain derived from `capabilities.json`.

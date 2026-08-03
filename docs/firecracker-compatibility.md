@@ -313,6 +313,24 @@ Exact bounds, replacement/GET/snapshot behavior, expert-risk limits, signed
 evidence, and remaining Wave 7 helper/portability ownership are in the checked
 [CPU-template contract](../compat/firecracker/v1.16.0/cpu-template-contract.md).
 
+## X86 CPUID and MSR platform boundary
+
+Firecracker's CPUID leaf/register and MSR modifier schemas are executable
+x86_64 contracts, not architecture-neutral names for ARM state. The pinned
+arm64 implementation rejects those fields, and public Apple Silicon
+Hypervisor.framework has ARM general, system, and feature-register interfaces
+but no identity-preserving x86 CPUID-leaf or model-specific-register namespace.
+
+Complete `cpuid_modifiers` and `msr_modifiers` request shapes therefore receive
+the fixed malformed-request response before conversion, retained configuration,
+backend construction, or start. The response is value-free, the prior
+configuration and `Not started` state are unchanged, and no x86 selector is
+aliased to an ARM register. Silent acceptance would claim CPU state that was
+not enforced; emulation or a Linux/KVM sidecar would change Bangbang's native
+macOS arm64/HVF and one-process boundary. The checked
+[Wave 7 ownership and specification contract](../compat/firecracker/v1.16.0/observability-tools-specification-contract.md)
+records the exact 13 exclusions, evidence, alternatives, and focused tests.
+
 ## Internal Concurrent vCPU Run Coordination
 
 The ordered HVF topology is consumed by an internal concurrent
@@ -725,6 +743,14 @@ subjects; current API/CLI behavior remains here, snapshot format behavior
 remains in [Snapshot Feasibility](snapshot-feasibility.md), security and
 authority remain in [macOS Host Security Model](security.md), and validation
 commands remain in [Testing Guide](testing.md).
+
+The checked
+[Wave 7 ownership and specification contract](../compat/firecracker/v1.16.0/observability-tools-specification-contract.md)
+certifies the core API operation/path/schema set and its bounded API
+availability, stability, state, survival, and value-safe failure semantic. It
+also preserves the independent logger, metrics, tools, corpus, performance,
+formal-verification, and final cross-capability owners rather than promoting
+them through that aggregate result.
 
 Current global disposition totals are derived from `capabilities.json` and
 checked by the capability-audit tests. Human-readable documents deliberately

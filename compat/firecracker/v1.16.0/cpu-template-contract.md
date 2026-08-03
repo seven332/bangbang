@@ -19,9 +19,10 @@ The implementation deliberately separates three outcomes:
 
 The Firecracker-shaped arm64 `CpuConfig` schema, PUT operation/path, startup
 property, and ARM modifier properties now have a complete finite policy. The
-x86 CPUID/MSR leaves, whole CPU-template corpora, heterogeneous-fleet outcomes,
-and public dump/strip/verify/fingerprint helper remain nonterminal Wave 7 work;
-terminal arm64 request handling does not claim those independent contracts.
+x86 CPUID/MSR leaves have a separate terminal platform-exclusion policy. Whole
+CPU-template corpora, heterogeneous-fleet outcomes, and the public
+dump/strip/verify/fingerprint helper remain nonterminal Wave 7 work; neither
+terminal architecture boundary claims those independent contracts.
 
 ## Request model and bounds
 
@@ -52,6 +53,27 @@ All input and executable aggregates have manual value-redacted `Debug`
 implementations. Structurally valid but unavailable KVM-only categories cross
 the runtime action boundary only long enough to return their fixed platform
 classification; they are never installed as effective controller state.
+
+## X86 CPUID and MSR platform boundary
+
+Firecracker's `cpuid_modifiers`, `msr_modifiers`, `CpuidLeafModifier`,
+`CpuidRegisterModifier`, and `MsrModifier` identities describe executable
+x86_64 CPU state. The pinned arm64 model rejects those fields as foreign
+architecture input, while public Apple Silicon Hypervisor.framework exposes
+ARM general, system, and feature registers rather than an identity-preserving
+x86 CPUID-leaf or model-specific-register namespace.
+
+Bangbang therefore rejects every complete x86 CPUID or MSR request shape as a
+fixed malformed request before conversion, controller mutation, backend
+construction, or guest start. The response does not retain or expose a leaf,
+subleaf, flag, register, address, or bitmap value, and a rejected replacement
+leaves the prior CPU and VM configuration unchanged. Mapping x86 selectors to
+ARM registers would change the architecture and bitmap semantics; silently
+accepting them would falsely report enforcement; and an x86 emulator or
+Linux/KVM sidecar would leave the supported native macOS arm64/HVF process
+boundary. The exact 13-record proof, authoritative sources, rejected
+alternatives, and focused tests are checked by the
+[Wave 7 contract](observability-tools-specification-contract.md).
 
 ## Executable custom subset
 

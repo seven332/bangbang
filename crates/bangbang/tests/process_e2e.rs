@@ -2360,6 +2360,50 @@ fn executable_configures_vm_before_start() {
         "GET / after custom PUT /cpu-config",
     );
 
+    let vm_config_before_x86_requests = http_get(&socket_path, "/vm/config");
+    for (request_name, body) in [
+        (
+            "PUT /cpu-config x86 CPUID shape",
+            r#"{"cpuid_modifiers":[{"leaf":"0x4a11cafe","subleaf":"0x1badb002","flags":1432778632,"modifiers":[{"register":"edx","bitmap":"0b10100101101001011010010110100101"}]}]}"#,
+        ),
+        (
+            "PUT /cpu-config x86 MSR shape",
+            r#"{"msr_modifiers":[{"addr":"0x5eedc0de","bitmap":"0b1010010110100101101001011010010110100101101001011010010110100101"}]}"#,
+        ),
+    ] {
+        let response = http_put_json(&socket_path, "/cpu-config", body);
+        assert_bad_request_response(&response, request_name);
+        assert_response_contains(
+            &response,
+            r#"{"fault_message":"Malformed HTTP request."}"#,
+            request_name,
+        );
+        for value in [
+            "4a11cafe",
+            "1badb002",
+            "1432778632",
+            "edx",
+            "5eedc0de",
+            "1010010110100101",
+        ] {
+            assert!(
+                !response.contains(value),
+                "{request_name} response must not retain x86 input values"
+            );
+        }
+        let instance_info = http_get(&socket_path, "/");
+        assert_response_contains(
+            &instance_info,
+            r#""state":"Not started""#,
+            &format!("GET / after {request_name}"),
+        );
+        assert_eq!(
+            http_get(&socket_path, "/vm/config"),
+            vm_config_before_x86_requests,
+            "{request_name} must not mutate the exported VM configuration"
+        );
+    }
+
     let malformed_cpu_config_response = http_put_json(&socket_path, "/cpu-config", "not-json");
     assert_bad_request_response(&malformed_cpu_config_response, "PUT /cpu-config malformed");
     assert_response_contains(
