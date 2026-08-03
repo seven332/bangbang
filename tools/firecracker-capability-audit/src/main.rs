@@ -5,8 +5,11 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use bangbang_firecracker_capability_audit::{
-    AuditError, AuditMode, CAPABILITY_INVENTORY_PATH, SOURCE_MANIFEST_PATH, derive_source_manifest,
-    read_capability_inventory, read_source_manifest, source_manifest_json, validate,
+    AuditError, AuditMode, CAPABILITY_INVENTORY_PATH, LOGGER_PRODUCER_AUDIT_PATH,
+    LOGGER_PRODUCER_MANIFEST_PATH, SOURCE_MANIFEST_PATH, derive_logger_producer_manifest,
+    derive_source_manifest, logger_producer_manifest_json, read_capability_inventory,
+    read_logger_producer_audit, read_logger_producer_manifest, read_source_manifest,
+    source_manifest_json, validate, validate_logger_producers,
 };
 
 fn main() -> ExitCode {
@@ -31,6 +34,7 @@ fn run(args: Vec<String>) -> Result<String, AuditError> {
         "validate" => run_validate(command_args),
         "compare" => run_compare(command_args),
         "regenerate" => run_regenerate(command_args),
+        "regenerate-logger-producers" => run_regenerate_logger_producers(command_args),
         "help" | "--help" | "-h" => Ok(usage().to_string()),
         _ => Err(AuditError::new(format!(
             "unknown command: {command}\n{}",
@@ -54,12 +58,17 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     let inventory = read_capability_inventory(&root.join(CAPABILITY_INVENTORY_PATH))?;
     validate(&manifest, &inventory, &root, mode)
         .map_err(|errors| AuditError::new(format!("inventory validation errors:\n{errors}")))?;
+    let logger_manifest = read_logger_producer_manifest(&root.join(LOGGER_PRODUCER_MANIFEST_PATH))?;
+    let logger_audit = read_logger_producer_audit(&root.join(LOGGER_PRODUCER_AUDIT_PATH))?;
+    validate_logger_producers(&logger_manifest, &logger_audit, &root, mode).map_err(|errors| {
+        AuditError::new(format!("logger producer validation errors:\n{errors}"))
+    })?;
     let mode_name = match mode {
         AuditMode::Delivery => "delivery",
         AuditMode::Final => "final",
     };
     Ok(format!(
-        "Firecracker capability inventory is valid in {mode_name} mode"
+        "Firecracker capability inventory and logger producer audit are valid in {mode_name} mode"
     ))
 }
 
@@ -68,17 +77,41 @@ fn run_compare(args: &[String]) -> Result<String, AuditError> {
     let root = repository_root()?;
     let checked_in = read_source_manifest(&root.join(SOURCE_MANIFEST_PATH))?;
     let derived = derive_source_manifest(Path::new(&firecracker))?;
+    let checked_logger = read_logger_producer_manifest(&root.join(LOGGER_PRODUCER_MANIFEST_PATH))?;
+    let derived_logger = derive_logger_producer_manifest(Path::new(&firecracker))?;
+    let mut differences = Vec::new();
     if checked_in != derived {
         let checked_json = String::from_utf8(source_manifest_json(&checked_in)?)
             .map_err(|_| AuditError::new("checked source manifest JSON is not valid UTF-8"))?;
         let derived_json = String::from_utf8(source_manifest_json(&derived)?)
             .map_err(|_| AuditError::new("derived source manifest JSON is not valid UTF-8"))?;
-        return Err(AuditError::new(format!(
+        differences.push(format!(
             "derived source manifest differs from {SOURCE_MANIFEST_PATH}; run regenerate to an explicit candidate path\n{}",
             canonical_line_diff(&checked_json, &derived_json)
-        )));
+        ));
     }
-    Ok("checked-in source manifest matches the pinned Firecracker checkout".to_string())
+    if checked_logger != derived_logger {
+        let checked_json = String::from_utf8(logger_producer_manifest_json(&checked_logger)?)
+            .map_err(|_| {
+                AuditError::new("checked logger producer manifest JSON is not valid UTF-8")
+            })?;
+        let derived_json = String::from_utf8(logger_producer_manifest_json(&derived_logger)?)
+            .map_err(|_| {
+                AuditError::new("derived logger producer manifest JSON is not valid UTF-8")
+            })?;
+        differences.push(format!(
+            "derived logger producer manifest differs from {LOGGER_PRODUCER_MANIFEST_PATH}; run regenerate-logger-producers to an explicit candidate path\n{}",
+            canonical_line_diff(&checked_json, &derived_json)
+        ));
+    }
+    if differences.is_empty() {
+        Ok(
+            "checked-in source and logger producer manifests match the pinned Firecracker checkout"
+                .to_string(),
+        )
+    } else {
+        Err(AuditError::new(differences.join("\n")))
+    }
 }
 
 fn canonical_line_diff(checked: &str, derived: &str) -> String {
@@ -125,13 +158,48 @@ fn run_regenerate(args: &[String]) -> Result<String, AuditError> {
     ))
 }
 
+fn run_regenerate_logger_producers(args: &[String]) -> Result<String, AuditError> {
+    let options = required_options(args, &["--firecracker", "--output"])?;
+    let firecracker = options
+        .get("--firecracker")
+        .ok_or_else(|| AuditError::new("--firecracker is required"))?;
+    let output = options
+        .get("--output")
+        .ok_or_else(|| AuditError::new("--output is required"))?;
+    let root = repository_root()?;
+    let output_path = candidate_output_path(&root, Path::new(output))?;
+    let derived = derive_logger_producer_manifest(Path::new(firecracker))?;
+    let bytes = logger_producer_manifest_json(&derived)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output_path)
+        .map_err(|error| AuditError::new(format!("failed to create candidate output: {error}")))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| AuditError::new(format!("failed to write candidate output: {error}")))?;
+    Ok(format!(
+        "generated logger producer manifest candidate: {}",
+        output_path.display()
+    ))
+}
+
 fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditError> {
     let output_path = absolute_from(root, output);
     let source_path = root.join(SOURCE_MANIFEST_PATH);
     let inventory_path = root.join(CAPABILITY_INVENTORY_PATH);
+    let logger_manifest_path = root.join(LOGGER_PRODUCER_MANIFEST_PATH);
+    let logger_audit_path = root.join(LOGGER_PRODUCER_AUDIT_PATH);
     let normalized_output = normalize_lexically(&output_path);
-    if normalized_output == normalize_lexically(&source_path)
-        || normalized_output == normalize_lexically(&inventory_path)
+    let checked_paths = [
+        &source_path,
+        &inventory_path,
+        &logger_manifest_path,
+        &logger_audit_path,
+    ];
+    if checked_paths
+        .iter()
+        .any(|path| normalized_output == normalize_lexically(path))
     {
         return Err(AuditError::new(
             "regenerate requires a separate candidate output and never overwrites checked-in inventory files",
@@ -155,7 +223,7 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
         .canonicalize()
         .map_err(|_| AuditError::new("candidate output parent directory is not accessible"))?;
     let effective_output = canonical_parent.join(file_name);
-    for checked_path in [&source_path, &inventory_path] {
+    for checked_path in checked_paths {
         if checked_path
             .canonicalize()
             .is_ok_and(|canonical| canonical == effective_output)
@@ -249,7 +317,7 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bangbang-firecracker-capability-audit validate [--final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH"
+    "Usage:\n  bangbang-firecracker-capability-audit validate [--final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH"
 }
 
 #[cfg(test)]
@@ -295,9 +363,14 @@ mod tests {
     }
 
     #[test]
-    fn regenerate_refuses_both_checked_inventory_files() {
+    fn regeneration_refuses_all_checked_inventory_files() {
         let root = Path::new("/repository");
-        for path in [SOURCE_MANIFEST_PATH, CAPABILITY_INVENTORY_PATH] {
+        for path in [
+            SOURCE_MANIFEST_PATH,
+            CAPABILITY_INVENTORY_PATH,
+            LOGGER_PRODUCER_MANIFEST_PATH,
+            LOGGER_PRODUCER_AUDIT_PATH,
+        ] {
             let error = candidate_output_path(root, Path::new(path))
                 .expect_err("checked inventory path should be refused");
             assert!(error.to_string().contains("never overwrites"));
@@ -305,11 +378,13 @@ mod tests {
     }
 
     #[test]
-    fn regenerate_refuses_lexical_aliases_of_checked_inventory_files() {
+    fn regeneration_refuses_lexical_aliases_of_checked_inventory_files() {
         let root = Path::new("/repository");
         for path in [
             "compat/firecracker/../firecracker/v1.16.0/source-manifest.json",
             "compat/firecracker/v1.16.0/./capabilities.json",
+            "compat/firecracker/v1.16.0/./logger-producer-manifest.json",
+            "compat/firecracker/v1.16.0/../v1.16.0/logger-producer-audit.json",
         ] {
             let error = candidate_output_path(root, Path::new(path))
                 .expect_err("checked inventory alias should be refused");
