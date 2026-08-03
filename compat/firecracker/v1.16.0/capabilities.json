@@ -1245,11 +1245,55 @@
     {
       "id": "api-operation:PUT /logger",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /logger.",
+      "summary": "Accept the strict Firecracker v1.16 logger configuration, apply every supplied field transactionally, preserve the previous target and filtering on failure, and emit one value-redacted request/result pair around every parsed operation.",
       "source_refs": [
         "api-operation:PUT /logger"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict PUT /logger request model and parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "logger dispatch and closed request/result records"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "transactional process-owned logger replacement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "logger configuration, filtering, delivery, and loss accounting"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict logger route and field tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "logger update, redaction, result, and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "process-level default and replacement logger evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "configuration, filtering, delivery, and exact missed-count tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /machine-config",
@@ -2196,11 +2240,55 @@
     {
       "id": "api-path:/logger",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /logger.",
+      "summary": "Expose only Firecracker's PUT /logger route with strict method, path, body, and payload-limit handling; retain the process-owned bounded stdout target for path-free updates and leave stdout flags independent of a successful explicit-path target switch.",
       "source_refs": [
         "api-path:/logger"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact /logger route admission"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "bounded logger endpoint dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "default-target retention and committed path replacement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/process_stdout.rs",
+          "anchor": "nonblocking internal stdout adapter and sole forwarder"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "method, path, body, field, and payload-limit rejection tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "logger endpoint request, result, parse-rejection, and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "stdout retention, path switch, blocked sink, and process isolation tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/process_stdout.rs",
+          "anchor": "internal-pipe flags, target isolation, forwarding, and failure tests"
+        }
+      ]
     },
     {
       "id": "api-path:/machine-config",
@@ -5661,11 +5749,50 @@
     {
       "id": "api-property:FullVmConfiguration.logger",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.logger.",
+      "summary": "Accept a strict logger section during startup configuration with file values overriding earlier CLI logger values, apply it before configured actions, and intentionally omit process-local logger state from GET /vm/config without exposing its path.",
       "source_refs": [
         "api-property:FullVmConfiguration.logger"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "logger request schema and VM configuration omission"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "logger-free public VM configuration projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup logger section ordering and CLI precedence"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "VM configuration logger omission test"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "logger configuration does not add a VM configuration section"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "config-file logger precedence and startup ordering tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "path-free logger update and VM configuration omission evidence"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.machine-config",
@@ -6177,47 +6304,202 @@
     {
       "id": "api-property:Logger.level",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Logger.level.",
+      "summary": "Parse Firecracker's case-insensitive Error, Warning, Info, and Debug values, default to Info when omitted, and apply the selected minimum severity to every closed logger event without changing committed state on invalid input.",
       "source_refs": [
         "api-property:Logger.level"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker logger level parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "default and configured severity filtering"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "logger level spelling, case, null, and rejection tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "API logger level filtering and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "level filtering and exact record-prefix tests"
+        }
+      ]
     },
     {
       "id": "api-property:Logger.log_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Logger.log_path.",
+      "summary": "Use a process-owned bounded stdout adapter as the normal default target, open an explicit append-only path before committing replacement without changing stdout descriptor flags, and redact path values from all faults and semantic records.",
       "source_refs": [
         "api-property:Logger.log_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "normal-run process stdout installation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "failure-atomic logger target replacement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "append-only file target preparation and redacted errors"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/process_stdout.rs",
+          "anchor": "nonblocking internal stdout pipe and flag-isolated forwarder"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "stdout adapter isolation from serial flag lifetime test"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "default stdout, replacement, unavailable, full, and isolation evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "target commit and redacted failure tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/process_stdout.rs",
+          "anchor": "descriptor ownership, bounded forwarding, and target-isolation tests"
+        }
+      ]
     },
     {
       "id": "api-property:Logger.module",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Logger.module.",
+      "summary": "Apply an optional module-prefix filter to stable logger module identities, accept null or omission as no filter, and preserve target and prior filtering when a replacement cannot be prepared.",
       "source_refs": [
         "api-property:Logger.module"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "optional logger module request field"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "module-prefix filtering and transactional configuration"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "logger module type, null, and complete-body tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup module-filter behavior tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "module match, miss, and rollback tests"
+        }
+      ]
     },
     {
       "id": "api-property:Logger.show_level",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Logger.show_level.",
+      "summary": "Default level display to false and, when enabled, prefix each complete logger record with the exact stable uppercase level while preserving one-record framing under concurrent producers.",
       "source_refs": [
         "api-property:Logger.show_level"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "optional show_level request field"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "stable level prefix encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "configured API logger exact level prefixes"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed closed logger level validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "show-level default and exact encoding tests"
+        }
+      ]
     },
     {
       "id": "api-property:Logger.show_log_origin",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Logger.show_log_origin.",
+      "summary": "Default origin display to false and, when enabled, prefix every logger record with its fixed implementation-owned module identity without deriving fields from request, path, or guest-controlled values.",
       "source_refs": [
         "api-property:Logger.show_log_origin"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "optional show_log_origin request field"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "fixed module-origin prefix encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "configured API logger exact origin prefixes"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "origin default, prefix, and field-redaction tests"
+        }
+      ]
     },
     {
       "id": "api-property:MachineConfiguration.cpu_template",
@@ -10252,11 +10534,50 @@
     {
       "id": "api-schema:Logger",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema Logger.",
+      "summary": "Implement the strict Firecracker v1.16 Logger schema with optional log_path, level, module, show_level, and show_log_origin fields, reject unknown or ill-typed input, and apply all supplied fields as one process-local configuration transaction.",
       "source_refs": [
         "api-schema:Logger"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict Logger schema and request conversion"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "Logger schema dispatch conversion"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "transactional Logger configuration model"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "minimal, complete, case, null, unknown-field, and type tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "schema dispatch, update, and failure-atomic tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "public API logger schema process evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "configuration model, filtering, target, and prefix tests"
+        }
+      ]
     },
     {
       "id": "api-schema:MachineConfiguration",

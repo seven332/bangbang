@@ -95,6 +95,93 @@ pub enum LoggerAction {
     FlushMetrics,
 }
 
+/// Fixed API-server control outcomes synchronized with the checked logger audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerApiControlOutcome {
+    ServerRunning,
+    ServerStopped,
+    ConnectionFailed,
+    RequestDeprecated,
+    RequestCompleted,
+    RequestParseBadRequest,
+    RequestParsePayloadTooLarge,
+}
+
+impl LoggerApiControlOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::ServerRunning | Self::ServerStopped => "server",
+            Self::ConnectionFailed => "connection",
+            Self::RequestDeprecated | Self::RequestCompleted => "request",
+            Self::RequestParseBadRequest | Self::RequestParsePayloadTooLarge => "request-parse",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::ServerRunning => "running",
+            Self::ServerStopped => "stopped",
+            Self::ConnectionFailed => "failed",
+            Self::RequestDeprecated => "deprecated",
+            Self::RequestCompleted => "completed",
+            Self::RequestParseBadRequest => "bad-request",
+            Self::RequestParsePayloadTooLarge => "payload-too-large",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::ConnectionFailed
+            | Self::RequestParseBadRequest
+            | Self::RequestParsePayloadTooLarge => LoggerLevel::Error,
+            Self::RequestDeprecated => LoggerLevel::Warn,
+            Self::ServerStopped => LoggerLevel::Debug,
+            Self::ServerRunning | Self::RequestCompleted => LoggerLevel::Info,
+        }
+    }
+}
+
+/// Fixed result class for one successfully parsed and dispatched API request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerApiResultOutcome {
+    Ok,
+    NoContent,
+    BadRequest,
+    PayloadTooLarge,
+}
+
+impl LoggerApiResultOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NoContent => "no-content",
+            Self::BadRequest => "bad-request",
+            Self::PayloadTooLarge => "payload-too-large",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::Ok | Self::NoContent => LoggerLevel::Info,
+            Self::BadRequest | Self::PayloadTooLarge => LoggerLevel::Error,
+        }
+    }
+}
+
+/// Fixed normal process-startup outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessStartupOutcome {
+    Running,
+}
+
+impl ProcessStartupOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+        }
+    }
+}
+
 /// Stable process termination categories emitted by the executable lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessTerminalCategory {
@@ -135,10 +222,12 @@ impl LoggerAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LoggerEvent {
+    ApiControl(LoggerApiControlOutcome),
     ApiRequest {
         method: LoggerHttpMethod,
         route: LoggerApiRoute,
     },
+    ApiResult(LoggerApiResultOutcome),
     Action(LoggerAction),
     BootTime {
         wall_time_us: u64,
@@ -148,6 +237,7 @@ pub(super) enum LoggerEvent {
         suppressed: u64,
     },
     ProcessPanic,
+    ProcessStartup(ProcessStartupOutcome),
     ProcessExit(ProcessTerminalCategory),
 }
 
@@ -212,12 +302,22 @@ impl LogRecord {
         }
 
         match event {
+            LoggerEvent::ApiControl(outcome) => {
+                encoder.push_str("operation=");
+                encoder.push_str(outcome.operation());
+                encoder.push_str(" outcome=");
+                encoder.push_str(outcome.outcome());
+            }
             LoggerEvent::ApiRequest { method, route } => {
                 encoder.push_str("The API server received a ");
                 encoder.push_str(method.as_str());
                 encoder.push_str(" request on \"");
                 encoder.push_str(route.as_str());
                 encoder.push_str("\".");
+            }
+            LoggerEvent::ApiResult(outcome) => {
+                encoder.push_str("action=request outcome=");
+                encoder.push_str(outcome.as_str());
             }
             LoggerEvent::Action(action) => {
                 encoder.push_str("action=");
@@ -242,6 +342,10 @@ impl LogRecord {
                 encoder.push_str(" messages were suppressed due to rate limiting");
             }
             LoggerEvent::ProcessPanic => encoder.push_str("event=process-panic"),
+            LoggerEvent::ProcessStartup(outcome) => {
+                encoder.push_str("operation=process-startup outcome=");
+                encoder.push_str(outcome.as_str());
+            }
             LoggerEvent::ProcessExit(category) => {
                 encoder.push_str("event=process-exit category=");
                 encoder.push_str(category.as_str());
@@ -531,8 +635,9 @@ fn utf8_prefix_len(value: &str, maximum: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        LogOrigin, LogRecord, LoggerAction, LoggerApiRoute, LoggerEvent, LoggerHttpMethod,
-        MAX_LOG_RECORD_BYTES, PanicLogRecords, ProcessTerminalCategory, normalize_origin,
+        LogOrigin, LogRecord, LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome,
+        LoggerApiRoute, LoggerEvent, LoggerHttpMethod, MAX_LOG_RECORD_BYTES, PanicLogRecords,
+        ProcessStartupOutcome, ProcessTerminalCategory, normalize_origin,
     };
     use crate::logger::LoggerLevel;
 
@@ -586,6 +691,109 @@ mod tests {
         assert_eq!(
             recovery.as_str(),
             "3 messages were suppressed due to rate limiting\n"
+        );
+    }
+
+    #[test]
+    fn encodes_closed_api_control_result_and_startup_shapes() {
+        let origin = LogOrigin::new("crates/bangbang/src/api_server.rs", 19);
+        let control_cases = [
+            (
+                LoggerApiControlOutcome::ServerRunning,
+                LoggerLevel::Info,
+                "operation=server outcome=running\n",
+            ),
+            (
+                LoggerApiControlOutcome::ServerStopped,
+                LoggerLevel::Debug,
+                "operation=server outcome=stopped\n",
+            ),
+            (
+                LoggerApiControlOutcome::ConnectionFailed,
+                LoggerLevel::Error,
+                "operation=connection outcome=failed\n",
+            ),
+            (
+                LoggerApiControlOutcome::RequestDeprecated,
+                LoggerLevel::Warn,
+                "operation=request outcome=deprecated\n",
+            ),
+            (
+                LoggerApiControlOutcome::RequestCompleted,
+                LoggerLevel::Info,
+                "operation=request outcome=completed\n",
+            ),
+            (
+                LoggerApiControlOutcome::RequestParseBadRequest,
+                LoggerLevel::Error,
+                "operation=request-parse outcome=bad-request\n",
+            ),
+            (
+                LoggerApiControlOutcome::RequestParsePayloadTooLarge,
+                LoggerLevel::Error,
+                "operation=request-parse outcome=payload-too-large\n",
+            ),
+        ];
+        for (outcome, level, expected) in control_cases {
+            let record = LogRecord::encode(
+                false,
+                false,
+                origin,
+                outcome.level(),
+                LoggerEvent::ApiControl(outcome),
+            );
+            assert_eq!(outcome.level(), level);
+            assert_eq!(record.as_str(), expected);
+            assert!(record.as_bytes().len() <= MAX_LOG_RECORD_BYTES);
+            assert!(std::str::from_utf8(record.as_bytes()).is_ok());
+        }
+
+        let result_cases = [
+            (LoggerApiResultOutcome::Ok, LoggerLevel::Info, "ok"),
+            (
+                LoggerApiResultOutcome::NoContent,
+                LoggerLevel::Info,
+                "no-content",
+            ),
+            (
+                LoggerApiResultOutcome::BadRequest,
+                LoggerLevel::Error,
+                "bad-request",
+            ),
+            (
+                LoggerApiResultOutcome::PayloadTooLarge,
+                LoggerLevel::Error,
+                "payload-too-large",
+            ),
+        ];
+        for (outcome, level, expected) in result_cases {
+            let record = LogRecord::encode(
+                true,
+                false,
+                origin,
+                outcome.level(),
+                LoggerEvent::ApiResult(outcome),
+            );
+            assert_eq!(outcome.level(), level);
+            assert_eq!(
+                record.as_str(),
+                format!(
+                    "level={} action=request outcome={expected}\n",
+                    level.as_str()
+                )
+            );
+        }
+
+        let startup = LogRecord::encode(
+            false,
+            false,
+            origin,
+            LoggerLevel::Info,
+            LoggerEvent::ProcessStartup(ProcessStartupOutcome::Running),
+        );
+        assert_eq!(
+            startup.as_str(),
+            "operation=process-startup outcome=running\n"
         );
     }
 

@@ -10073,6 +10073,16 @@ fn normal_bundle_isolates_concurrent_default_serial_stdio_sessions() {
             "{name} serial session should publish exactly one success marker"
         );
         assert!(!stdout.contains(GUEST_SERIAL_RX_FAILURE_MARKER));
+        for expected in [
+            "operation=server outcome=running\n",
+            "operation=process-startup outcome=running\n",
+            "action=request outcome=no-content\n",
+        ] {
+            assert!(
+                stdout.contains(expected),
+                "{name} production stdout should multiplex {expected:?}: {stdout}"
+            );
+        }
     }
     second.close_stdin();
     thread::sleep(Duration::from_millis(100));
@@ -16285,6 +16295,13 @@ impl OutputGrantFixture {
 
     fn assert_current_outputs(&self) {
         Self::assert_outputs_at(&self.logger, &self.metrics, &self.serial, false, true, true);
+        let logger = fs::read(&self.logger).expect("startup logger output should read");
+        assert!(
+            logger
+                .windows(b"operation=process-startup outcome=running\n".len())
+                .any(|window| window == b"operation=process-startup outcome=running\n"),
+            "startup output grant should receive the no-API process startup record"
+        );
     }
 
     fn assert_outputs_at(

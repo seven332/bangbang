@@ -2,13 +2,13 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::mem::MaybeUninit;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 mod anchored_socket;
@@ -58,7 +58,10 @@ use vmm::{
     ProcessVmnetAuthority, VmmRequestHandler,
 };
 
-use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel, ProcessTerminalCategory};
+use bangbang_runtime::logger::{
+    LoggerApiControlOutcome, LoggerConfigInput, LoggerLevel, ProcessStartupOutcome,
+    ProcessStdoutLogger, ProcessTerminalCategory,
+};
 use bangbang_runtime::metrics::{MetricsConfigInput, MetricsDiagnostics, SharedSignalMetrics};
 use bangbang_runtime::mmds::MmdsContentInput;
 use bangbang_runtime::snapshot_format::{
@@ -85,7 +88,25 @@ const NATIVE_SNAPSHOT_MAX_FILE_BYTES: usize =
 const MIN_INSTANCE_ID_LEN: usize = 1;
 const MAX_INSTANCE_ID_LEN: usize = 64;
 const FIRECRACKER_DEFAULT_NOFILE_LIMIT: RawFd = 2048;
+const PROCESS_STDOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &["no-seccomp", "seccomp-filter"];
+
+fn write_process_stdout_line(
+    arguments: fmt::Arguments<'_>,
+    mut stdout: Option<ProcessStdoutLogger>,
+) {
+    let line = format!("{arguments}\n");
+    if let Some(stdout) = stdout.as_mut() {
+        let _ = stdout.write_all(line.as_bytes());
+        return;
+    }
+
+    let _ = std::thread::Builder::new()
+        .name("bangbang-status-output".to_owned())
+        .spawn(move || {
+            let _ = std::io::stdout().lock().write_all(line.as_bytes());
+        });
+}
 
 fn main() -> ExitCode {
     #[cfg(target_os = "macos")]
@@ -284,12 +305,6 @@ fn run(
                 .metrics_diagnostics()
                 .map_err(ProcessError::StartupTime)?;
 
-            println!("bangbang {}", env!("CARGO_PKG_VERSION"));
-            println!(
-                "hvf target supported: {}",
-                HvfBackend::is_supported_target()
-            );
-
             let signal_metrics = SharedSignalMetrics::default();
             let vmm = ProcessVmm::new(
                 id,
@@ -317,6 +332,20 @@ fn run(
                 .with_contained_restore_authority(contained_restore_authority);
             #[cfg(not(target_os = "macos"))]
             let mut vmm = vmm;
+            if let Ok(output) = ProcessStdoutLogger::prepare() {
+                let _ = vmm.install_process_stdout_logger(output);
+            }
+            write_process_stdout_line(
+                format_args!("bangbang {}", env!("CARGO_PKG_VERSION")),
+                vmm.process_stdout_writer(),
+            );
+            write_process_stdout_line(
+                format_args!(
+                    "hvf target supported: {}",
+                    HvfBackend::is_supported_target()
+                ),
+                vmm.process_stdout_writer(),
+            );
             let _ = bridge.attach(vmm.emergency_logger());
             let mut fatal_signal_handlers = None;
             let mut sigpipe_signal_handler = None;
@@ -357,12 +386,16 @@ fn run(
                             return Ok(());
                         }
                         if no_api {
+                            let _ = vmm.log_process_startup(ProcessStartupOutcome::Running);
                             if let Some(session) = contained.as_mut() {
                                 session
                                     .send_ready(bangbang_session::Readiness::NoApi)
                                     .map_err(|_| ProcessError::ContainedSession)?;
                             }
-                            println!("status: VM running without API");
+                            write_process_stdout_line(
+                                format_args!("status: VM running without API"),
+                                vmm.process_stdout_writer(),
+                            );
                             let result = wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
                             return result.and_then(|()| contained_wakeup_result(contained));
                         }
@@ -421,17 +454,25 @@ fn run(
                         if contained_shutdown_requested(contained)? {
                             return Ok(());
                         }
+                        let _ = vmm.log_api_control(LoggerApiControlOutcome::ServerRunning);
+                        let _ = vmm.log_process_startup(ProcessStartupOutcome::Running);
                         if let Some(session) = contained.as_mut() {
                             session
                                 .send_ready(bangbang_session::Readiness::Api)
                                 .map_err(|_| ProcessError::ContainedSession)?;
                         }
-                        println!("status: API server listening");
+                        write_process_stdout_line(
+                            format_args!("status: API server listening"),
+                            vmm.process_stdout_writer(),
+                        );
                         let shutdown_wakeup = shutdown_signal.wakeup_reader();
-                        server
+                        let result = server
                             .run_until(&mut vmm, shutdown_wakeup)
-                            .map_err(ProcessError::ApiServer)
-                            .and_then(|()| contained_wakeup_result(contained))
+                            .map_err(ProcessError::ApiServer);
+                        if result.is_ok() {
+                            let _ = vmm.log_api_control(LoggerApiControlOutcome::ServerStopped);
+                        }
+                        result.and_then(|()| contained_wakeup_result(contained))
                     })()
                 })();
                 let category = process_terminal_category(&result, contained.as_ref());
@@ -442,6 +483,7 @@ fn run(
                 Err(payload) => {
                     panic_bridge::isolate_secondary_panic(|| {
                         vmm.handle_terminal_observability(ProcessTerminalCategory::Panic);
+                        let _ = vmm.flush_process_stdout(PROCESS_STDOUT_DRAIN_TIMEOUT);
                     });
                     panic_bridge::resume_original(payload)
                 }
@@ -514,6 +556,7 @@ where
     S: vmm::InstanceStartExecutor,
 {
     vmm.handle_terminal_observability(category);
+    let _ = vmm.flush_process_stdout(PROCESS_STDOUT_DRAIN_TIMEOUT);
     result
 }
 
@@ -2668,7 +2711,8 @@ mod tests {
     use bangbang_runtime::block::{DriveConfig, DriveConfigInput};
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{
-        LoggerApiRoute, LoggerConfigError, LoggerConfigInput, LoggerHttpMethod, LoggerLevel,
+        LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute, LoggerConfigError,
+        LoggerConfigInput, LoggerHttpMethod, LoggerLevel, ProcessStartupOutcome,
         ProcessTerminalCategory,
     };
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
@@ -3060,6 +3104,21 @@ mod tests {
         #[track_caller]
         fn log_api_request(&mut self, method: LoggerHttpMethod, route: LoggerApiRoute) -> bool {
             self.inner.log_api_request(method, route)
+        }
+
+        #[track_caller]
+        fn log_api_control(&mut self, outcome: LoggerApiControlOutcome) -> bool {
+            self.inner.log_api_control(outcome)
+        }
+
+        #[track_caller]
+        fn log_api_result(&mut self, outcome: LoggerApiResultOutcome) -> bool {
+            self.inner.log_api_result(outcome)
+        }
+
+        #[track_caller]
+        fn log_process_startup(&mut self, outcome: ProcessStartupOutcome) -> bool {
+            self.inner.log_process_startup(outcome)
         }
 
         fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
@@ -5089,6 +5148,72 @@ mod tests {
         fs::remove_file(config_path).expect("fixture config should clean up");
         fs::remove_file(metrics_path).expect("fixture metrics should clean up");
         fs::remove_file(logger_path).expect("fixture logger should clean up");
+    }
+
+    #[test]
+    fn config_file_logger_fields_and_target_override_cli_logger_fields_and_target() {
+        let config_path = unique_config_path("logger-precedence");
+        let cli_logger_path = unique_logger_path("logger-precedence-cli");
+        let config_logger_path = unique_logger_path("logger-precedence-config");
+        let config_logger_path_json = serde_json::to_string(
+            config_logger_path
+                .to_str()
+                .expect("config logger path should be UTF-8"),
+        )
+        .expect("config logger path should encode");
+        fs::write(
+            &config_path,
+            format!(
+                r#"{{
+                    "boot-source": {{"kernel_image_path": "/tmp/vmlinux"}},
+                    "logger": {{
+                        "log_path": {config_logger_path_json},
+                        "level": "Info",
+                        "module": "bangbang_runtime::vmm_action",
+                        "show_level": true,
+                        "show_log_origin": false
+                    }}
+                }}"#
+            ),
+        )
+        .expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        super::apply_startup_logger_config(
+            &mut vmm,
+            Some(
+                LoggerConfigInput::new()
+                    .with_log_path(&cli_logger_path)
+                    .with_level(LoggerLevel::Error)
+                    .with_module("does-not-match")
+                    .with_show_level(false)
+                    .with_show_log_origin(true),
+            ),
+        )
+        .expect("CLI logger should apply first");
+        super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("config path should be UTF-8")),
+        )
+        .expect("config-file logger should replace CLI logger and start");
+
+        assert_eq!(
+            fs::read_to_string(&cli_logger_path).expect("CLI logger output should read"),
+            ""
+        );
+        assert_eq!(
+            fs::read_to_string(&config_logger_path).expect("config logger output should read"),
+            "level=Info action=InstanceStart\n"
+        );
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+        fs::remove_file(cli_logger_path).expect("CLI logger should clean up");
+        fs::remove_file(config_logger_path).expect("config logger should clean up");
     }
 
     #[test]

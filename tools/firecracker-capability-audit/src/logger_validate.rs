@@ -29,7 +29,7 @@ const EXPECTED_EXAMPLE: usize = 22;
 const EXPECTED_DIRECT: usize = 466;
 const EXPECTED_MACRO_TEMPLATE: usize = 2;
 const LOGGER_EXTRACTOR: &str = "rust-logger-macro-v1";
-const PLANNED_ISSUES: [&str; 3] = ["#1807", "#1808", "#1809"];
+const PLANNED_ISSUES: [&str; 2] = ["#1808", "#1809"];
 
 /// Validate the checked logger source manifest and human classification overlay.
 pub fn validate_logger_producers(
@@ -540,7 +540,7 @@ fn validate_class(
                 .is_some_and(|issue| PLANNED_ISSUES.contains(&issue))
             {
                 errors.push(format!(
-                    "planned logger class must be owned by #1807, #1808, or #1809: {}",
+                    "planned logger class must be owned by #1808 or #1809: {}",
                     class.id
                 ));
             }
@@ -677,13 +677,22 @@ fn validate_context_mapping(
 
 fn validate_compiled_event_set(classes: &[LoggerProducerClass], errors: &mut Vec<String>) {
     let expected = BTreeMap::from([
+        (
+            LoggerCompiledEvent::ApiControl,
+            "logger.api-control.outcome",
+        ),
         (LoggerCompiledEvent::ApiRequest, "logger.api.request"),
+        (LoggerCompiledEvent::ApiResult, "logger.api.result"),
         (LoggerCompiledEvent::InstanceStart, "logger.api.result"),
         (LoggerCompiledEvent::FlushMetrics, "logger.api.result"),
         (LoggerCompiledEvent::BootTime, "logger.boot.time"),
         (
             LoggerCompiledEvent::RateLimitRecovery,
             "logger.limiter.recovery",
+        ),
+        (
+            LoggerCompiledEvent::ProcessStartup,
+            "logger.process-startup.outcome",
         ),
         (LoggerCompiledEvent::ProcessPanic, "logger.process.panic"),
         (LoggerCompiledEvent::ProcessExit, "logger.process.exit"),

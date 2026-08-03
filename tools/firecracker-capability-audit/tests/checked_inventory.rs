@@ -93,7 +93,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
     const EXPECTED_CLASSES: [(&str, LoggerClassDisposition, usize); 31] = [
         (
             "logger.api-control.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             7,
         ),
         (
@@ -102,7 +102,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             5,
         ),
         ("logger.api.request", LoggerClassDisposition::Implemented, 1),
-        ("logger.api.result", LoggerClassDisposition::Planned, 5),
+        ("logger.api.result", LoggerClassDisposition::Implemented, 5),
         (
             "logger.backend.outcome",
             LoggerClassDisposition::Planned,
@@ -188,7 +188,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ),
         (
             "logger.process-startup.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             5,
         ),
         (
@@ -308,7 +308,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             .iter()
             .filter(|class| class.disposition == LoggerClassDisposition::Implemented)
             .count(),
-        5
+        8
     );
     assert_eq!(
         audit
@@ -316,7 +316,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             .iter()
             .filter(|class| class.disposition == LoggerClassDisposition::Planned)
             .count(),
-        19
+        16
     );
     assert_eq!(
         audit
@@ -342,8 +342,8 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
     assert_eq!(
         mapped_dispositions,
         BTreeMap::from([
-            (LoggerClassDisposition::Implemented, 9),
-            (LoggerClassDisposition::Planned, 397),
+            (LoggerClassDisposition::Implemented, 26),
+            (LoggerClassDisposition::Planned, 380),
             (LoggerClassDisposition::NotApplicable, 62),
         ])
     );
@@ -361,7 +361,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         });
     assert_eq!(
         planned_owners,
-        BTreeMap::from([("#1807", 3), ("#1808", 5), ("#1809", 11)])
+        BTreeMap::from([("#1808", 5), ("#1809", 11)])
     );
 
     let compiled_events = audit
@@ -372,11 +372,14 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
     assert_eq!(
         compiled_events,
         BTreeSet::from([
+            LoggerCompiledEvent::ApiControl,
             LoggerCompiledEvent::ApiRequest,
+            LoggerCompiledEvent::ApiResult,
             LoggerCompiledEvent::InstanceStart,
             LoggerCompiledEvent::FlushMetrics,
             LoggerCompiledEvent::BootTime,
             LoggerCompiledEvent::RateLimitRecovery,
+            LoggerCompiledEvent::ProcessStartup,
             LoggerCompiledEvent::ProcessPanic,
             LoggerCompiledEvent::ProcessExit,
         ])
@@ -389,17 +392,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
                 && !class.compiled_events.is_empty()
         })
         .collect::<Vec<_>>();
-    assert_eq!(planned_with_compiled_events.len(), 1);
-    assert_eq!(planned_with_compiled_events[0].id, "logger.api.result");
-    assert_eq!(
-        planned_with_compiled_events[0].compiled_events,
-        [
-            LoggerCompiledEvent::InstanceStart,
-            LoggerCompiledEvent::FlushMetrics,
-        ]
-    );
-    assert!(!planned_with_compiled_events[0].implementation.is_empty());
-    assert!(!planned_with_compiled_events[0].validation.is_empty());
+    assert!(planned_with_compiled_events.is_empty());
 
     let capabilities = inventory
         .capabilities
@@ -407,13 +400,22 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         .map(|capability| (capability.id.as_str(), capability))
         .collect::<BTreeMap<_, _>>();
     for id in LOGGER_CAPABILITIES {
+        let aggregate = matches!(
+            id,
+            "corpus:logger" | "semantic.observability:logger-delivery-filtering-loss-and-redaction"
+        );
+        let expected = if aggregate {
+            Disposition::AuditRequired
+        } else {
+            Disposition::ImplementedAndVerified
+        };
         assert_eq!(
             capabilities
                 .get(id)
                 .unwrap_or_else(|| panic!("logger capability must exist: {id}"))
                 .disposition,
-            Disposition::AuditRequired,
-            "audit-only slice must not promote logger capability: {id}"
+            expected,
+            "#1807 capability disposition drifted: {id}"
         );
     }
 }
@@ -843,6 +845,17 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         "corpus:actions-api",
         "semantic.specification:api-availability-stability-and-failure-information",
     ];
+    const LOGGER_IMPLEMENTED: [&str; 9] = [
+        "api-operation:PUT /logger",
+        "api-path:/logger",
+        "api-property:FullVmConfiguration.logger",
+        "api-property:Logger.level",
+        "api-property:Logger.log_path",
+        "api-property:Logger.module",
+        "api-property:Logger.show_level",
+        "api-property:Logger.show_log_origin",
+        "api-schema:Logger",
+    ];
     const X86_IMPOSSIBLE: [&str; 13] = [
         "api-property:CpuConfig.cpuid_modifiers",
         "api-property:CpuConfig.msr_modifiers",
@@ -884,15 +897,20 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         .map(|(id, _)| *id)
         .collect::<BTreeSet<_>>();
     let implemented = CORE_IMPLEMENTED.into_iter().collect::<BTreeSet<_>>();
+    let logger_implemented = LOGGER_IMPLEMENTED.into_iter().collect::<BTreeSet<_>>();
     let impossible = X86_IMPOSSIBLE.into_iter().collect::<BTreeSet<_>>();
 
     assert_eq!(owned.len(), 93, "Wave 7 owner identities must be unique");
     assert_eq!(handoffs.len(), 9, "retained handoffs must be unique");
     assert!(owned.is_disjoint(&handoffs));
     assert_eq!(implemented.len(), 22);
+    assert_eq!(logger_implemented.len(), 9);
     assert_eq!(impossible.len(), 13);
     assert!(implemented.is_disjoint(&impossible));
+    assert!(logger_implemented.is_disjoint(&implemented));
+    assert!(logger_implemented.is_disjoint(&impossible));
     assert!(implemented.union(&impossible).all(|id| owned.contains(id)));
+    assert!(logger_implemented.iter().all(|id| owned.contains(id)));
 
     for (id, owner) in WAVE_7_OWNED.into_iter().chain(RETAINED_HANDOFFS) {
         assert!(
@@ -920,6 +938,22 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         assert!(
             contract.contains(&format!("| `{id}` | #1784 | `implemented-and-verified` |")),
             "contract must record implemented result: {id}"
+        );
+    }
+
+    for id in &logger_implemented {
+        let capability = by_id.get(id).expect("logger API identity must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "logger API identity must be terminal: {id}"
+        );
+        assert!(!capability.implementation.is_empty());
+        assert!(!capability.validation.is_empty());
+        assert!(capability.exclusion.is_none());
+        assert!(
+            contract.contains(&format!("| `{id}` | #1786 | `implemented-and-verified` |")),
+            "contract must record implemented logger result: {id}"
         );
     }
 
@@ -988,7 +1022,9 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     }
 
     let selected = implemented
-        .union(&impossible)
+        .iter()
+        .chain(logger_implemented.iter())
+        .chain(impossible.iter())
         .copied()
         .collect::<BTreeSet<_>>();
     let expected_audit = owned
@@ -1018,7 +1054,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
             .contains("numeric startup/resource/performance or telemetry outcomes (#1798)")
     );
     assert!(normalized_contract.contains("final cross-capability interactions (Wave 8)"));
-    assert!(normalized_contract.contains("318 implemented, 67 audit-required"));
+    assert!(normalized_contract.contains("327 implemented, 58 audit-required"));
     assert!(normalized_contract.contains("376/9/3/30"));
 }
 
@@ -1483,8 +1519,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 318);
-    assert_eq!(count(Disposition::AuditRequired), 67);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 327);
+    assert_eq!(count(Disposition::AuditRequired), 58);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -2213,8 +2249,8 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 318);
-    assert_eq!(count(Disposition::AuditRequired), 67);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 327);
+    assert_eq!(count(Disposition::AuditRequired), 58);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -2510,8 +2546,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 318);
-    assert_eq!(count(Disposition::AuditRequired), 67);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 327);
+    assert_eq!(count(Disposition::AuditRequired), 58);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -2659,8 +2695,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 318);
-    assert_eq!(count(Disposition::AuditRequired), 67);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 327);
+    assert_eq!(count(Disposition::AuditRequired), 58);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -2929,8 +2965,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 318);
-    assert_eq!(count(Disposition::AuditRequired), 67);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 327);
+    assert_eq!(count(Disposition::AuditRequired), 58);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 

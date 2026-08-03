@@ -32,8 +32,8 @@ use bangbang_api::http::{
     PmemPatchRequest, PmemRateLimiterRequest, RequestError, SerialConfigRequest,
     SnapshotCreateRequest, SnapshotLoadRequest,
     SnapshotMemoryBackendType as ApiSnapshotMemoryBackendType, SnapshotType as ApiSnapshotType,
-    TokenBucketRequest, VmConfigResponse, VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest,
-    VsockConfigResponse, api_request_metric_endpoint, parse_request_with_limit,
+    StatusCode, TokenBucketRequest, VmConfigResponse, VmStateUpdate, VmStateUpdateRequest,
+    VsockConfigRequest, VsockConfigResponse, api_request_metric_endpoint, parse_request_with_limit,
     request_total_len_with_limit,
 };
 use bangbang_runtime::balloon::{
@@ -52,7 +52,10 @@ use bangbang_runtime::cpu::{
 use bangbang_runtime::entropy::{
     EntropyConfigInput, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
 };
-use bangbang_runtime::logger::{LoggerApiRoute, LoggerConfigInput, LoggerHttpMethod, LoggerLevel};
+use bangbang_runtime::logger::{
+    LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute, LoggerConfigInput,
+    LoggerHttpMethod, LoggerLevel,
+};
 use bangbang_runtime::machine::{
     MachineConfig, MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
@@ -303,7 +306,9 @@ impl ApiServer {
             .set_nonblocking(false)
             .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
-        let _ = handle_connection(&mut stream, vmm, self.http_api_max_payload_size);
+        if handle_connection(&mut stream, vmm, self.http_api_max_payload_size).is_err() {
+            let _ = vmm.log_api_control(LoggerApiControlOutcome::ConnectionFailed);
+        }
 
         Ok(())
     }
@@ -641,7 +646,10 @@ fn handle_connection(
             RequestRead::Complete(request) => {
                 handle_request_bytes_with_limit(&request, vmm, http_api_max_payload_size)
             }
-            RequestRead::TooLarge => HttpResponse::payload_too_large_fault(),
+            RequestRead::TooLarge => {
+                let _ = vmm.log_api_control(LoggerApiControlOutcome::RequestParsePayloadTooLarge);
+                HttpResponse::payload_too_large_fault()
+            }
         };
 
     stream
@@ -663,6 +671,7 @@ fn handle_request_bytes_with_limit(
         Ok(request) => {
             log_api_request(&request, vmm);
             let response = handle_api_request(request, vmm);
+            let _ = vmm.log_api_result(api_result_outcome(response.status()));
             vmm.handle_initial_metrics_flush();
             response
         }
@@ -673,11 +682,22 @@ fn handle_request_bytes_with_limit(
                 record_api_request_parse_failure(bytes, vmm);
             }
             if err == RequestError::PayloadTooLarge {
+                let _ = vmm.log_api_control(LoggerApiControlOutcome::RequestParsePayloadTooLarge);
                 HttpResponse::payload_too_large_fault()
             } else {
+                let _ = vmm.log_api_control(LoggerApiControlOutcome::RequestParseBadRequest);
                 HttpResponse::fault(err.fault_message())
             }
         }
+    }
+}
+
+const fn api_result_outcome(status: StatusCode) -> LoggerApiResultOutcome {
+    match status {
+        StatusCode::Ok => LoggerApiResultOutcome::Ok,
+        StatusCode::NoContent => LoggerApiResultOutcome::NoContent,
+        StatusCode::BadRequest => LoggerApiResultOutcome::BadRequest,
+        StatusCode::PayloadTooLarge => LoggerApiResultOutcome::PayloadTooLarge,
     }
 }
 
@@ -1019,6 +1039,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
 fn record_deprecated_api_usage(request: &ApiRequest, vmm: &mut impl VmmRequestHandler) {
     if request_uses_deprecated_api(request) {
         vmm.record_deprecated_api_call();
+        let _ = vmm.log_api_control(LoggerApiControlOutcome::RequestDeprecated);
     }
 }
 
@@ -1089,6 +1110,7 @@ fn record_vm_state_latency(
         VmStateUpdate::Paused => vmm.record_pause_vm_latency_us(duration_us),
         VmStateUpdate::Resumed => vmm.record_resume_vm_latency_us(duration_us),
     }
+    let _ = vmm.log_api_control(LoggerApiControlOutcome::RequestCompleted);
 }
 
 fn snapshot_type_from_request(snapshot_type: ApiSnapshotType) -> RuntimeSnapshotType {
@@ -1166,6 +1188,9 @@ fn handle_snapshot_create_request(
             vmm,
         );
     }
+    if result.is_ok() {
+        let _ = vmm.log_api_control(LoggerApiControlOutcome::RequestCompleted);
+    }
     handle_empty(result)
 }
 
@@ -1182,6 +1207,9 @@ fn handle_snapshot_load_request(
         Ok(_) | Err(VmmActionError::SnapshotUnsupported | VmmActionError::SnapshotLoad(_))
     ) {
         vmm.record_load_snapshot_latency_us(duration_as_micros_u64(started.elapsed()));
+    }
+    if result.is_ok() {
+        let _ = vmm.log_api_control(LoggerApiControlOutcome::RequestCompleted);
     }
     handle_empty(result)
 }
@@ -2338,7 +2366,7 @@ mod tests {
     };
     use bangbang_runtime::block::{DriveLiveUpdateMode, DriveUpdateError};
     use bangbang_runtime::boot::BootSourceConfigInput;
-    use bangbang_runtime::logger::LoggerConfigInput;
+    use bangbang_runtime::logger::{LoggerConfigInput, ProcessStartupOutcome};
     use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
@@ -4461,6 +4489,21 @@ mod tests {
             self.inner.log_api_request(method, route)
         }
 
+        #[track_caller]
+        fn log_api_control(&mut self, outcome: LoggerApiControlOutcome) -> bool {
+            self.inner.log_api_control(outcome)
+        }
+
+        #[track_caller]
+        fn log_api_result(&mut self, outcome: LoggerApiResultOutcome) -> bool {
+            self.inner.log_api_result(outcome)
+        }
+
+        #[track_caller]
+        fn log_process_startup(&mut self, outcome: ProcessStartupOutcome) -> bool {
+            self.inner.log_process_startup(outcome)
+        }
+
         fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
             self.inner.record_pause_vm_latency_us(duration_us);
         }
@@ -6247,6 +6290,159 @@ mod tests {
     }
 
     #[test]
+    fn configured_logger_records_closed_parse_rejections_without_dispatch_results() {
+        let mut vmm = test_controller();
+        let logger_path = unique_socket_path("logger-parse-outcomes").with_extension("log");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new()
+                .with_log_path(&logger_path)
+                .with_show_level(true)
+                .with_module("bangbang_runtime::api_server"),
+        ))
+        .expect("logger should configure");
+
+        let malformed = handle_request_bytes(b"private-malformed-request", &mut vmm);
+        assert_eq!(malformed.status(), StatusCode::BadRequest);
+        let oversized = request_with_body("PUT", "/mmds", r#"{"secret":"private-body"}"#);
+        let oversized = handle_request_bytes_with_limit(oversized.as_bytes(), &mut vmm, 1);
+        assert_eq!(oversized.status(), StatusCode::PayloadTooLarge);
+
+        let output = fs::read_to_string(&logger_path).expect("logger output should be readable");
+        assert_eq!(
+            output,
+            concat!(
+                "level=Error operation=request-parse outcome=bad-request\n",
+                "level=Error operation=request-parse outcome=payload-too-large\n",
+            )
+        );
+        assert!(!output.contains("action=request"));
+        assert!(!output.contains("private-malformed-request"));
+        assert!(!output.contains("private-body"));
+
+        fs::remove_file(logger_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn configured_logger_records_deprecated_and_completed_control_outcomes() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let logger_path = unique_socket_path("logger-control-outcomes").with_extension("log");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new()
+                .with_log_path(&logger_path)
+                .with_level(LoggerLevel::Trace)
+                .with_show_level(true)
+                .with_module("bangbang_runtime::api_server"),
+        ))
+        .expect("logger should configure");
+
+        let deprecated = handle_request_bytes(
+            request_with_body(
+                "PUT",
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":"None"}"#,
+            )
+            .as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(deprecated.status(), StatusCode::NoContent);
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        let paused = handle_request_bytes(
+            request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#).as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(paused.status(), StatusCode::NoContent);
+        let resumed = handle_request_bytes(
+            request_with_body("PATCH", "/vm", r#"{"state":"Resumed"}"#).as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(resumed.status(), StatusCode::NoContent);
+        let private_rejected_path = "/private/logger-must-not-open";
+        let rejected = handle_request_bytes(
+            request_with_body(
+                "PUT",
+                "/logger",
+                &format!(r#"{{"log_path":"{private_rejected_path}"}}"#),
+            )
+            .as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(rejected.status(), StatusCode::BadRequest);
+
+        let output = fs::read_to_string(&logger_path).expect("logger output should be readable");
+        assert_eq!(
+            output,
+            concat!(
+                "level=Info The API server received a Put request on \"/machine-config\".\n",
+                "level=Warn operation=request outcome=deprecated\n",
+                "level=Info action=request outcome=no-content\n",
+                "level=Info The API server received a Patch request on \"/vm\".\n",
+                "level=Info operation=request outcome=completed\n",
+                "level=Info action=request outcome=no-content\n",
+                "level=Info The API server received a Patch request on \"/vm\".\n",
+                "level=Info operation=request outcome=completed\n",
+                "level=Info action=request outcome=no-content\n",
+                "level=Info The API server received a Put request on \"/logger\".\n",
+                "level=Error action=request outcome=bad-request\n",
+            )
+        );
+        assert!(!output.contains(private_rejected_path));
+
+        fs::remove_file(logger_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn maps_every_closed_http_status_to_a_closed_api_result() {
+        assert_eq!(
+            api_result_outcome(StatusCode::Ok),
+            LoggerApiResultOutcome::Ok
+        );
+        assert_eq!(
+            api_result_outcome(StatusCode::NoContent),
+            LoggerApiResultOutcome::NoContent
+        );
+        assert_eq!(
+            api_result_outcome(StatusCode::BadRequest),
+            LoggerApiResultOutcome::BadRequest
+        );
+        assert_eq!(
+            api_result_outcome(StatusCode::PayloadTooLarge),
+            LoggerApiResultOutcome::PayloadTooLarge
+        );
+    }
+
+    #[test]
+    fn discarded_connection_failure_records_one_closed_control_outcome() {
+        let socket_path = unique_socket_path("log-conn");
+        let logger_path = unique_socket_path("log-conn-out").with_extension("log");
+        let server = ApiServer::bind(&socket_path).expect("server should bind");
+        let client = UnixStream::connect(&socket_path).expect("client should connect");
+        let mut vmm = test_controller();
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new()
+                .with_log_path(&logger_path)
+                .with_show_level(true)
+                .with_module("bangbang_runtime::api_server"),
+        ))
+        .expect("logger should configure");
+        drop(client);
+
+        server
+            .serve_next(&mut vmm)
+            .expect("connection failure should not stop the server");
+
+        assert_eq!(
+            fs::read_to_string(&logger_path).expect("logger output should be readable"),
+            "level=Error operation=connection outcome=failed\n"
+        );
+        fs::remove_file(logger_path).expect("fixture should clean up");
+    }
+
+    #[test]
     fn configured_logger_records_actions_over_api_requests() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let logger_path = unique_socket_path("logger-actions").with_extension("log");
@@ -6285,11 +6481,15 @@ mod tests {
 
         let output = fs::read_to_string(&logger_path).expect("logger output should be readable");
         let mut lines = output.lines();
+        assert_api_result_log_with_origin(lines.next(), "no-content");
         assert_api_request_log_with_origin(lines.next(), "Put", "/boot-source");
+        assert_api_result_log_with_origin(lines.next(), "no-content");
         assert_api_request_log_with_origin(lines.next(), "Put", "/actions");
         assert_action_log_with_origin(lines.next(), "InstanceStart");
+        assert_api_result_log_with_origin(lines.next(), "no-content");
         assert_api_request_log_with_origin(lines.next(), "Put", "/actions");
         assert_action_log_with_origin(lines.next(), "FlushMetrics");
+        assert_api_result_log_with_origin(lines.next(), "no-content");
         assert_eq!(lines.next(), None);
 
         fs::remove_file(logger_path).expect("fixture should clean up");
@@ -6332,7 +6532,15 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(&logger_path).expect("logger output should be readable"),
-            "The API server received a Put request on \"/boot-source\".\nThe API server received a Put request on \"/actions\".\nThe API server received a Put request on \"/actions\".\n"
+            concat!(
+                "action=request outcome=no-content\n",
+                "The API server received a Put request on \"/boot-source\".\n",
+                "action=request outcome=no-content\n",
+                "The API server received a Put request on \"/actions\".\n",
+                "action=request outcome=no-content\n",
+                "The API server received a Put request on \"/actions\".\n",
+                "action=request outcome=no-content\n",
+            )
         );
 
         fs::remove_file(logger_path).expect("fixture should clean up");
@@ -6396,7 +6604,17 @@ mod tests {
         let output = fs::read_to_string(&logger_path).expect("logger output should be readable");
         assert_eq!(
             output,
-            "The API server received a Get request on \"/version\".\nThe API server received a Put request on \"/mmds\".\nThe API server received a Patch request on \"/mmds\".\nThe API server received a Put request on \"/drives/{drive_id}\".\n"
+            concat!(
+                "action=request outcome=no-content\n",
+                "The API server received a Get request on \"/version\".\n",
+                "action=request outcome=ok\n",
+                "The API server received a Put request on \"/mmds\".\n",
+                "action=request outcome=no-content\n",
+                "The API server received a Patch request on \"/mmds\".\n",
+                "action=request outcome=no-content\n",
+                "The API server received a Put request on \"/drives/{drive_id}\".\n",
+                "action=request outcome=no-content\n",
+            )
         );
         assert!(
             !output.contains("private-mmds-secret"),
@@ -6464,6 +6682,31 @@ mod tests {
         );
     }
 
+    fn assert_api_result_log_with_origin(line: Option<&str>, outcome: &str) {
+        let line = line.expect("logger output should include API result line");
+        assert!(line.starts_with("level=Info origin="));
+        let suffix = format!(" action=request outcome={outcome}");
+        assert!(line.ends_with(&suffix));
+
+        let origin = line
+            .strip_prefix("level=Info origin=")
+            .expect("logger output should include origin prefix")
+            .strip_suffix(&suffix)
+            .expect("logger output should include API result suffix");
+        let (file, line_number) = origin
+            .rsplit_once(':')
+            .expect("logger origin should include file and line");
+
+        assert!(
+            file.ends_with("api_server.rs"),
+            "unexpected origin file: {file}"
+        );
+        assert!(
+            line_number.parse::<u32>().is_ok(),
+            "unexpected origin line: {line_number}"
+        );
+    }
+
     #[test]
     fn api_logger_update_replaces_startup_logger_before_actions() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
@@ -6511,7 +6754,14 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&api_logger_path).expect("api logger output should be readable"),
-            "The API server received a Put request on \"/boot-source\".\nThe API server received a Put request on \"/actions\".\naction=InstanceStart\n"
+            concat!(
+                "action=request outcome=no-content\n",
+                "The API server received a Put request on \"/boot-source\".\n",
+                "action=request outcome=no-content\n",
+                "The API server received a Put request on \"/actions\".\n",
+                "action=InstanceStart\n",
+                "action=request outcome=no-content\n",
+            )
         );
 
         fs::remove_file(startup_logger_path).expect("startup fixture should clean up");
@@ -12194,6 +12444,44 @@ mod tests {
             )
         );
         assert!(!logger_path.exists());
+    }
+
+    #[test]
+    fn streaming_payload_limit_records_parse_rejection_without_dispatch_result() {
+        let socket_path = unique_socket_path("stream-log");
+        let logger_path = unique_socket_path("stream-log-out").with_extension("log");
+        let server =
+            ApiServer::bind_with_max_payload_size(&socket_path, 1).expect("server should bind");
+        let mut client = UnixStream::connect(&socket_path).expect("client should connect");
+        let request = request_with_body("PUT", "/mmds", "{}");
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new()
+                .with_log_path(&logger_path)
+                .with_show_level(true)
+                .with_module("bangbang_runtime::api_server"),
+        ))
+        .expect("logger should configure");
+
+        server
+            .serve_next(&mut vmm)
+            .expect("server should reject oversized request");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
+        let output = fs::read_to_string(&logger_path).expect("logger output should be readable");
+        assert_eq!(
+            output,
+            "level=Error operation=request-parse outcome=payload-too-large\n"
+        );
+        assert!(!output.contains("action=request"));
+        fs::remove_file(logger_path).expect("fixture should clean up");
     }
 
     #[test]

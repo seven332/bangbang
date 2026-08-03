@@ -129,7 +129,9 @@ use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::entropy::{EntropyConfig, EntropyMmioLayout};
 use bangbang_runtime::lazy_memory::LazyGuestMemoryConsumerProfile;
 use bangbang_runtime::logger::{
-    EmergencyLogger, LoggerApiRoute, LoggerConfigInput, LoggerHttpMethod, ProcessTerminalCategory,
+    EmergencyLogger, LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute,
+    LoggerConfigInput, LoggerHttpMethod, ProcessStartupOutcome, ProcessStdoutLogger,
+    ProcessTerminalCategory,
 };
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
@@ -5322,6 +5324,15 @@ pub(crate) trait VmmRequestHandler {
     #[track_caller]
     fn log_api_request(&mut self, method: LoggerHttpMethod, route: LoggerApiRoute) -> bool;
 
+    #[track_caller]
+    fn log_api_control(&mut self, outcome: LoggerApiControlOutcome) -> bool;
+
+    #[track_caller]
+    fn log_api_result(&mut self, outcome: LoggerApiResultOutcome) -> bool;
+
+    #[track_caller]
+    fn log_process_startup(&mut self, outcome: ProcessStartupOutcome) -> bool;
+
     fn record_pause_vm_latency_us(&mut self, duration_us: u64);
 
     fn record_resume_vm_latency_us(&mut self, duration_us: u64);
@@ -5478,6 +5489,7 @@ where
     terminal_metrics_attempted: bool,
     process_metrics_diagnostics: MetricsDiagnostics,
     process_signal_metrics: Option<SharedSignalMetrics>,
+    process_stdout: Option<ProcessStdoutLogger>,
     snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation,
     terminal_snapshot_load_failure: bool,
     terminal_instance_start_failure: bool,
@@ -5587,6 +5599,7 @@ where
             terminal_metrics_attempted: false,
             process_metrics_diagnostics: MetricsDiagnostics::default(),
             process_signal_metrics: None,
+            process_stdout: None,
             snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation::default(),
             terminal_snapshot_load_failure: false,
             terminal_instance_start_failure: false,
@@ -5627,6 +5640,26 @@ where
     pub(crate) fn with_process_signal_metrics(mut self, metrics: SharedSignalMetrics) -> Self {
         self.process_signal_metrics = Some(metrics);
         self
+    }
+
+    pub(crate) fn install_process_stdout_logger(
+        &mut self,
+        output: ProcessStdoutLogger,
+    ) -> Result<(), VmmActionError> {
+        self.controller
+            .install_process_stdout_logger(output.clone())?;
+        self.process_stdout = Some(output);
+        Ok(())
+    }
+
+    pub(crate) fn process_stdout_writer(&self) -> Option<ProcessStdoutLogger> {
+        self.process_stdout.clone()
+    }
+
+    pub(crate) fn flush_process_stdout(&self, timeout: Duration) -> bool {
+        self.process_stdout
+            .as_ref()
+            .is_none_or(|stdout| stdout.flush_forwarded(timeout))
     }
 
     pub(crate) fn with_snapshot_capture_cancellation(
@@ -5833,6 +5866,21 @@ where
     #[track_caller]
     fn log_api_request(&mut self, method: LoggerHttpMethod, route: LoggerApiRoute) -> bool {
         self.controller.log_api_request(method, route)
+    }
+
+    #[track_caller]
+    fn log_api_control(&mut self, outcome: LoggerApiControlOutcome) -> bool {
+        self.controller.log_api_control(outcome)
+    }
+
+    #[track_caller]
+    fn log_api_result(&mut self, outcome: LoggerApiResultOutcome) -> bool {
+        self.controller.log_api_result(outcome)
+    }
+
+    #[track_caller]
+    fn log_process_startup(&mut self, outcome: ProcessStartupOutcome) -> bool {
+        self.controller.log_process_startup(outcome)
     }
 
     fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
@@ -10226,6 +10274,21 @@ where
     #[track_caller]
     fn log_api_request(&mut self, method: LoggerHttpMethod, route: LoggerApiRoute) -> bool {
         ProcessVmm::log_api_request(self, method, route)
+    }
+
+    #[track_caller]
+    fn log_api_control(&mut self, outcome: LoggerApiControlOutcome) -> bool {
+        ProcessVmm::log_api_control(self, outcome)
+    }
+
+    #[track_caller]
+    fn log_api_result(&mut self, outcome: LoggerApiResultOutcome) -> bool {
+        ProcessVmm::log_api_result(self, outcome)
+    }
+
+    #[track_caller]
+    fn log_process_startup(&mut self, outcome: ProcessStartupOutcome) -> bool {
+        ProcessVmm::log_process_startup(self, outcome)
     }
 
     fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
@@ -35659,15 +35722,14 @@ mod tests {
     use std::collections::VecDeque;
     use std::fmt;
     use std::fs::{self, File, OpenOptions, remove_file};
-    use std::io::{Cursor, Seek, SeekFrom, Write};
+    use std::io::{Cursor, Read, Seek, SeekFrom, Write};
     use std::net::Ipv4Addr;
     use std::num::NonZeroUsize;
-    #[cfg(target_os = "macos")]
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt as _;
-    use std::os::unix::net::UnixListener;
     #[cfg(target_os = "macos")]
-    use std::os::unix::net::{UnixDatagram, UnixStream};
+    use std::os::unix::net::UnixDatagram;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::process::Command;
@@ -35698,7 +35760,9 @@ mod tests {
     use bangbang_runtime::entropy::{EntropyConfig, EntropyConfigInput};
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
-    use bangbang_runtime::logger::{LoggerConfigInput, ProcessTerminalCategory};
+    use bangbang_runtime::logger::{
+        LoggerConfigInput, ProcessStdoutLogger, ProcessTerminalCategory,
+    };
     use bangbang_runtime::machine::{MachineConfig, MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
@@ -35738,7 +35802,7 @@ mod tests {
     use bangbang_runtime::serial::{
         CaptureReadySerialState, SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialConfigInput,
         SerialMmioDevice, SerialOutput, SerialOutputFile, SerialOutputMetrics,
-        SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
+        SerialRateLimiterConfig, SerialStdio, SharedSerialOutput, SharedSerialOutputBuffer,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::serial::{
@@ -63772,6 +63836,85 @@ mod tests {
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
             "{\"uart\":{\"error_count\":0,\"flush_count\":0,\"input_count\":0,\"interrupt_count\":0,\"missed_read_count\":0,\"missed_write_count\":0,\"overrun_count\":0,\"rate_limiter_dropped_bytes\":2,\"read_count\":0,\"write_count\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
         );
+    }
+
+    #[test]
+    fn logger_stdout_adapter_isolates_target_flags_from_serial_lifetime() {
+        let (mut reader, stdout) = UnixStream::pair().expect("stdout fixture should create");
+        let descriptor = stdout.as_raw_fd();
+        // SAFETY: `F_GETFL` only inspects the live fixture descriptor.
+        let original_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        assert!(original_flags >= 0, "stdout flags should inspect");
+        let status_mask =
+            libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK | libc::O_ASYNC | libc::O_SYNC;
+        let output = ProcessStdoutLogger::prepare_from_descriptor(descriptor)
+            .expect("writable stdout fixture should prepare");
+        let mut vmm =
+            ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", FakeStarter::success(18));
+
+        vmm.install_process_stdout_logger(output)
+            .expect("fresh VMM should install process stdout");
+        // SAFETY: `F_GETFL` only inspects the live fixture descriptor.
+        let configured_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        assert_eq!(configured_flags & status_mask, original_flags & status_mask);
+
+        let mut status = vmm
+            .process_stdout_writer()
+            .expect("installed stdout adapter should be shared");
+        status
+            .write_all(b"status-before\n")
+            .expect("status should enter the bounded adapter");
+
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_show_level(true),
+        ))
+        .expect("path-free update should retain stdout");
+        // SAFETY: `F_GETFL` only inspects the live fixture descriptor.
+        let retained_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        assert_eq!(retained_flags & status_mask, original_flags & status_mask);
+
+        let missing_parent = TempFilePath::absent("logger-missing-parent");
+        assert!(
+            vmm.handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(missing_parent.path().join("logger")),
+            ))
+            .is_err(),
+            "failed replacement should preserve stdout"
+        );
+        // SAFETY: `F_GETFL` only inspects the live fixture descriptor.
+        let failed_replacement_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        assert_eq!(
+            failed_replacement_flags & status_mask,
+            original_flags & status_mask
+        );
+
+        let logger = TempFilePath::create("stdout-replacement-logger");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(logger.path()),
+        ))
+        .expect("path replacement should commit");
+        // SAFETY: `F_GETFL` only inspects the live fixture descriptor.
+        let replaced_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        assert_eq!(replaced_flags & status_mask, original_flags & status_mask);
+
+        status
+            .write_all(b"status-after\n")
+            .expect("status should retain its bounded stdout adapter");
+        let mut forwarded = [0_u8; 27];
+        reader
+            .read_exact(&mut forwarded)
+            .expect("status bytes should be forwarded in order");
+        assert_eq!(&forwarded, b"status-before\nstatus-after\n");
+
+        let serial = SerialStdio::output_from_descriptor(descriptor)
+            .expect("serial should capture the unchanged target descriptor");
+        // SAFETY: `F_GETFL` only inspects the live fixture descriptor.
+        let serial_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        assert_ne!(serial_flags & libc::O_NONBLOCK, 0);
+        drop(serial);
+        // SAFETY: `F_GETFL` only inspects the live fixture descriptor.
+        let final_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        assert_eq!(final_flags & status_mask, original_flags & status_mask);
     }
 
     #[test]

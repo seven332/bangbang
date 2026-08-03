@@ -485,23 +485,33 @@ representation.
 
 ### Logger records and delivery
 
-Logger output is silent by default because no sink is configured. `PUT /logger`
-and the matching CLI flags can open one process-local file or FIFO with
-append/create and `O_NONBLOCK` semantics. Open errors and later diagnostics do
-not echo the configured path. Level, optional level/origin prefixes, and module
-prefix matching filter records before encoding or delivery. Every implemented
-record is valid UTF-8, includes its newline inside a 512-byte limit, and is
-encoded from fixed event types rather than arbitrary formatting values.
-`show_log_origin` retains ordinary repository-relative callsites but removes an
-absolute or parent-traversing build-host prefix.
+Normal executable runs install a process-owned bounded stdout adapter before
+logger-capable startup. Its nonblocking internal pipe feeds one forwarding
+thread without changing real stdout flags. Library/runtime controllers remain
+silent until their owner explicitly installs a target. `PUT /logger`, startup configuration, and
+the matching CLI flags can replace stdout with one process-local file or FIFO
+opened with append/create and `O_NONBLOCK` semantics. Open errors and later
+diagnostics do not echo the configured path. Level, optional level/origin
+prefixes, and module-prefix matching filter records before encoding or
+delivery. Every implemented record is valid UTF-8, includes its newline inside
+a 512-byte limit, and is encoded from fixed event types rather than arbitrary
+formatting values. `show_log_origin` retains ordinary repository-relative
+callsites but removes an absolute or parent-traversing build-host prefix.
 
-Successfully parsed API requests and successful `InstanceStart` and explicit
-`FlushMetrics` actions are unrestricted host records: they do not consume the
-guest-triggered limiter. Request records contain only a fixed method and route
-template, never a resource selector or request body. In particular, drive,
-network-interface, and pmem routes use `{drive_id}`, `{iface_id}`, and
-`{pmem_id}` placeholders. The boot timer is the one bounded guest-triggered
-logger callsite. Its per-controller/per-identity atomic GCRA admits an initial
+API receipt, control, dispatch result, process startup, and successful
+`InstanceStart`/explicit `FlushMetrics` action records are unrestricted host
+records: they do not consume the guest-triggered limiter. Receipt records
+contain only a fixed method and route template, never a resource selector or
+request body. In particular, drive, network-interface, and pmem routes use
+`{drive_id}`, `{iface_id}`, and `{pmem_id}` placeholders. Every successfully
+parsed dispatch emits one `action=request outcome=<closed-outcome>` result.
+Parser rejections instead emit one fixed `request-parse` control outcome and no
+result. Fixed control events additionally cover server start/stop, discarded
+connection failure, deprecated requests, and successful pause/resume or
+snapshot completion. Normal readiness has one
+`operation=process-startup outcome=running` record. The boot timer is the one
+bounded guest-triggered logger callsite. Its per-controller/per-identity atomic
+GCRA admits an initial
 burst of ten records, refills the five-second budget at one token per 500 ms,
 uses at most 16 compare/exchange attempts, increments
 `logger.rate_limited_log_count` for every denied record, and emits one
@@ -519,19 +529,36 @@ one `write` and, after a complete write, one `flush` per record. Queue full or
 disconnect, receipt timeout, zero/short/error writes, and flush failure
 increment the saturating `logger.missed_log_count` exactly once per affected
 record; suffixes are not retried and output durability is not claimed. A
-rate-limited record is counted as rate-limited rather than missed.
+rate-limited record is counted as rate-limited rather than missed. Exact loss
+accounting ends at the worker's configured writer. For default stdout that
+writer is the internal pipe, so receipt confirms whole-record pipe admission;
+the later stdout-forwarder hop is non-durable byte progress and does not
+retroactively count an already admitted record after a downstream failure.
 
-The first path-bearing configuration starts the sole worker off-side. Later
-preboot replacements prepare a writer and send it to that worker through a
-pending/committed/cancelled transaction. Queue pressure or a stalled writer
-leaves the old sink and façade fields authoritative and cannot create detached
-worker generations. Only a proven disconnected receiver licenses one successor
+The executable starts the sole worker off-side with a close-on-exec,
+nonblocking internal pipe. One process-owned thread forwards logger and status
+bytes to a writable close-on-exec stdout duplicate without changing its shared
+status flags. Temporary `WouldBlock` waits and retries only on that forwarder;
+progress advances after a complete chunk, while a terminal target error closes
+the pipe reader so future worker writes use ordinary loss accounting. The
+forwarder is never joined and may remain blocked until process exit. Later
+preboot path replacements prepare a writer and send it to the logger worker
+through a pending/committed/cancelled transaction. Default serial can therefore
+capture and restore stdout independently. Queue pressure, a stalled writer, or
+a target-open failure leaves
+the old sink and façade fields authoritative and cannot create detached worker
+generations. Only a proven disconnected receiver licenses one successor
 worker; old clones remain attached to the disconnected generation. Path-free
-updates retain the active delivery object.
+updates retain the active delivery object and bounded stdout adapter.
+Unavailable or unwritable stdout disables only default logger delivery; a full
+or blocking stdout cannot hold API/no-API readiness or the
+functional process result. Normal convergence waits at most one second for
+accepted adapter bytes to reach writable stdout; timeout or downstream failure
+does not create a durability claim or replace the result.
 
 ### Terminal and panic process records
 
-A configured logger can append one fixed terminal record at process
+An active logger target can append one fixed terminal record at process
 convergence. The exact bodies are `event=process-exit category=success`,
 `configuration`, `process-failure`, `cancelled`, or `panic`, followed by one
 newline. Success and cancellation use `Info`; the other categories use `Error`.
@@ -1042,16 +1069,16 @@ management remains deferred.
 | `--start-time-cpu-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, session-initial, explicit runtime, 60-second periodic, and normal-terminal metrics output includes `api_server.process_startup_time_cpu_us` as the sampled process CPU clock minus this value, saturating at zero for future timestamps before adding optional parent CPU time. |
 | `--parent-cpu-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When `--start-time-cpu-us` is also provided, every emitted store value adds this value into `api_server.process_startup_time_cpu_us`; it is not serialized separately. |
 | `--metrics-path <PATH>` | configures metrics output before API serving | Uses the same per-process metrics sink and redacted host-path error policy as `PUT /metrics`. A later duplicate `PUT /metrics` request fails without replacing this sink. |
-| `--log-path <PATH>` | configures logger output before API serving | Uses the same per-process logger sink and redacted host-path error policy as `PUT /logger`. |
-| `--level <LEVEL>` | configures logger level before API serving | Accepts the existing logger levels `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error`; invalid levels fail before readiness with the bad-configuration exit status. Minimal API request, action, and boot-timer logs are emitted only when the configured level allows `Info`. |
-| `--module <MODULE>` | filters implemented logger events | Matches the stored `PUT /logger` field and filters current logger events with Firecracker-style module-path prefix matching. API request method/route-template lines use `bangbang_runtime::api_server`, action logs use `bangbang_runtime::vmm_action`, and boot-timer logs use `bangbang_runtime::boot_timer`. |
-| `--show-level` | enables level prefix for minimal logger events | Writes `level=Info` before minimal API request, action, and boot-timer log lines. |
-| `--show-log-origin` | enables origin field for implemented logger events | Writes normalized non-absolute `origin=<file>:<line>` before API request, action, and boot-timer log messages. |
+| `--log-path <PATH>` | replaces default logger stdout before API serving | Uses the same failure-atomic per-process target and redacted host-path error policy as `PUT /logger`; the bounded stdout adapter never changes the real descriptor's shared status flags, so replacement needs no stdout restoration handshake. |
+| `--level <LEVEL>` | configures logger level before API serving | Accepts `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error`; invalid levels fail before readiness with the bad-configuration exit status. Each fixed event is emitted only when its closed level passes the configured filter. |
+| `--module <MODULE>` | filters implemented logger events | Matches the stored `PUT /logger` field and applies Firecracker-style module-path prefix matching to every fixed logger event. |
+| `--show-level` | enables level prefixes | Writes the exact closed `level=Error`, `Warn`, `Info`, or `Debug` before each admitted record. |
+| `--show-log-origin` | enables origin fields | Writes a normalized implementation-owned `origin=<file>:<line>` before each admitted record. |
 | `--boot-timer` | enables guest boot-time logging | Registers the Firecracker aarch64 pseudo-MMIO boot timer at `0x4000_0000`; a guest write of byte value `123` at offset `0` logs elapsed wall and process CPU time through the configured logger sink when level and module filters allow `Info` for `bangbang_runtime::boot_timer`. This is process observability state and is not exposed in `GET /vm/config`. |
 | `--enable-pci` | selects all-virtio PCI startup on supported macOS arm64/HVF hosts | Exact flag syntax is immutable for the process. Required target and GIC/MSI symbols are checked before API/no-api readiness; one shared 31-endpoint slot/BAR/dispatcher budget plus exact fixed and worst-case runtime vector demand is checked before `Running`. Balloon, block, network, pmem, vsock, entropy, and virtio-mem use deterministic modern PCI functions while serial, RTC, boot timer, GIC, VMGenID, and VMClock remain platform MMIO devices. PCI mode omits the VMM-supplied `pci=off` and publishes only the PCI/GICv2m transport FDT; default startup remains all-virtio-MMIO. Exact native-v2 2.12 Full and current native-v2 2.13 Diff create/load support required platform-MMIO serial plus independently optional rooted/rootless profile-3 regular-file block/pmem storage, entropy, balloon, virtio-mem, network/MMDS, and vsock in all 64 products up to the same endpoint/vector budget; exact 2.3–2.11 retain their original profiles. Kind 13 restores exact PCI placement and reconstructs a fresh socket/device/metric/dispatcher/connection/cleanup owner from the saved or overridden selector, with empty live work and the saved clone-local cursor. Running/Paused non-root block, pmem, and network PUT/DELETE share type-scoped identity and one owner-thread inventory with manual guest coordination; runtime vsock hotplug remains unsupported. |
 | `--mmds-size-limit <BYTES>` | configures the maximum serialized MMDS data-store size | When omitted, follows the effective HTTP API payload limit like Firecracker; with default HTTP settings this is `51200` bytes. The complete non-negative `usize` domain is accepted. A zero limit permits startup and rejects every serialized JSON object through the MMDS data-store-limit response. Malformed, overflowing, and duplicate values fail during argument parsing. |
 | `--metadata <PATH>` | initializes MMDS data before API serving or no-api readiness | Reads a readable regular UTF-8 JSON metadata file up to 1 MiB and applies it through the same runtime validation and serialized data-store limit as `PUT /mmds`. Malformed files, non-object data, oversized files, duplicate object keys, empty paths, control-character paths, and missing-value inputs fail before readiness. |
-| `--config-file <PATH>` | startup implemented for supported subset | Reads a Firecracker-shaped JSON configuration from a readable regular file up to 1 MiB, applies supported sections through the same validation path as matching API requests, and starts the VM with `InstanceStart`. In API-enabled mode, the API socket is published only after successful startup. Malformed files, oversized files, duplicate object keys, unknown sections, unsupported sections, or invalid sections fail before socket publication or no-api readiness. |
+| `--config-file <PATH>` | startup implemented for supported subset | Reads a Firecracker-shaped JSON configuration from a readable regular file up to 1 MiB, applies supported sections through the same validation path as matching API requests, and starts the VM with `InstanceStart`. Its logger section applies after CLI logger configuration, so each provided value overrides the matching CLI field or target before actions while omissions retain prior/default values. In API-enabled mode, the API socket is published only after successful startup. Malformed files, oversized files, duplicate object keys, unknown sections, unsupported sections, or invalid sections fail before socket publication or no-api readiness. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
 | `--snapshot-version` | implemented native-envelope inspection | Prints the current supported ceiling `v2.13.0` and exits successfully before fd-table setup, API socket publication, signal setup, or HVF startup. Full output remains exact 2.12 and Diff output is exact 2.13. This names bangbang's native data format and does not claim Firecracker v10 artifact compatibility. |
@@ -1383,7 +1410,7 @@ compatibility targets.
 | `PUT` | `/metrics` | implemented supported sparse subset | Opens one process-local file/FIFO sink before boot with nonblocking output and path-redacted errors; duplicate initialization fails without replacing it, and observability state is omitted from `GET /vm/config`. Configuration alone writes nothing. A retained session causes one best-effort initial line; 60-second output continues in Running and Paused; explicit runtime `FlushMetrics` is fallible; and normal process convergence makes one best-effort final attempt. Lines use the interval/store, successful-baseline, reset-aware, sparse-schema, and at-least-once retry contract above for all implemented API, logger, signal, UART, and device producers. |
 | `PUT` | `/actions` | supported target; internal startup execution and explicit metrics flush implemented | Parses `InstanceStart` and `FlushMetrics` and routes them through the process VMM owner. Parsed request and successful action logger records are best effort and never gate the functional result. `InstanceStart` validates boot source and state, prepares an owned HVF session with configured serial output or default process stdout/terminal-or-FIFO stdin, starts the worker, and commits `Running` after the worker handle is retained. `FlushMetrics` is rejected before startup; after startup it returns `204` for an unconfigured/successful sink or a metrics fault for a failed configured write, and it retains its API/action/logger effects. Automatic initial, periodic, and terminal writes do not route through `/actions` and create no action log. The aarch64 `SendCtrlAltDel` parser path contributes to `put_api_requests.actions_count` but not `actions_fails`, matching Firecracker's parser-entry placement. |
 | `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. The unsupported request is counted under `put_api_requests.actions_count` without incrementing `actions_fails`. |
-| `PUT` | `/logger` | implemented supported process-local subset | Stores pre-boot configuration, opens an optional nonblocking sink, applies level/show/module filters, and omits observability state from `GET /vm/config`. Parsed API method/fixed-route-template and successful `InstanceStart`/explicit `FlushMetrics` actions are unrestricted host records with no selectors or bodies. Boot-timer records use the bounded atomic callsite and recovery contract above. One fixed queue and sink-owning worker isolate caller paths; queue/receipt/write/flush failure increments `missed_log_count` exactly once and never changes the request, action, or guest result. Reconfiguration is bounded and failure-atomic on the stable worker. No sink is configured by default. |
+| `PUT` | `/logger` | implemented and verified process-local contract | Normal execution starts with a process-owned bounded stdout adapter whose nonblocking internal pipe leaves real stdout flags unchanged; a path-bearing pre-boot update failure-atomically replaces the logger target, while a path-free update retains it. Level/show/module filtering applies to fixed API receipt, control, result, action, startup, timer, panic, and terminal records; observability state is omitted from `GET /vm/config`. Parse rejections have a closed control record and no result; every parsed dispatch has one closed result. One fixed sink-owning worker isolates callers, and queue/receipt/write/flush failure increments `missed_log_count` exactly once without changing the request, action, guest, readiness, or process result. Paths, selectors, bodies, faults, and dynamic values are excluded. |
 | `PUT` | `/serial` | implemented output/limiter, portable RX/state core, and exact 2.7 restore | Stores an optional pre-boot public path and byte token bucket; `{}` or `"serial_out_path": null` clears the public path. Startup opens a configured file/FIFO nonblocking and disables stdin, or duplicates nonblocking process stdout plus supported terminal/FIFO/pipe stdin. A contained selector adopts one exact write-only regular-file grant without reopening it. Exhausted TX bytes are dropped without blocking, sleeping, or failing the guest write. The backend-neutral UART has a bounded 64-byte RX FIFO, DR/OE/RDA/FCR behavior, typed delivery/drain intents, complete register/status state, GIC receive-interrupt delivery, and shared RX/TX metrics. Exact native-v2 2.7 retains endpoint intent, limiter configuration, registers, RX, status, and pending work while each destination prepares fresh endpoints, limiter budget, and metrics. Public host-driven streaming remains absent. |
 | `PUT` | `/cpu-config` | supported finite arm64 custom profile; all other categories terminally classified | Parses bounded ordered Firecracker aarch64 custom templates with a 256-entry limit per array, exact 32/64/128-bit ARM identities/bitmaps, fixed seven-word vCPU-feature indexes, stronger duplicate-identity checks, and value-redacted diagnostics. A successful custom PUT replaces static/custom state; empty input clears it. Exact `(baseline & !filter) | value` execution covers eleven U64 ID registers, ACTLR.EnTSO, U64 X0/X4-X30 and reviewed SP/PC/PSTATE fields, U128 Q0-Q31 with explicit little-endian transport, and U32 FPCR/FPSR with fail-closed scalar conversion. ZFR0/SMFR0 require a public macOS 15.2 pre-VM gate; ACTLR filters are limited to bit 1. Every requested typed baseline is read on every owner before any write, targets are common, and each write is immediately reread; boot setup then overrides X0/PC/PSTATE. Any failure destroys the unpublished VM. X1-X3, banked state, all named unsafe/dependency/time/ownership/EL2 public-HVF families, aliases, unnamed encodings, and invalid KVM fields receive stable value-free policy faults; KVM capability, vCPU-feature, demux, firmware, firmware-feature, SVE, and unknown classes have distinct platform faults. Custom contents are omitted from GET and excluded from native-v1 snapshots. See the checked CPU-template contract. |
 | `PUT` | `/network-interfaces/{iface_id}` | pre-boot storage, PCI-only Running/Paused insertion, capture-ready handoff, and exact native-v2 2.11 restore implemented | Stores up to 16 initial virtio-net configurations before boot without opening host networking resources, including Firecracker-shaped RX/TX bandwidth and ops limiters. Startup preparation attaches configured interfaces over the selected virtio-MMIO/FDT or modern PCI transport. In a live PCI session, a new validated ID/MAC prepares one independent packet-I/O entry using the immutable startup/MMDS policy, checks actual contained vmnet authority, publishes metrics and PCI ownership on the owner thread, and commits live configuration last. Existing entries keep their queues and resources. Duplicate ID/MAC, invalid host config, capacity, authority, command, and publication failures preserve prior state; uncertain cleanup is terminal. Default MMIO rejects runtime insertion. Internal notification dispatch and runtime PATCH retain the same limiter/retry behavior and detailed per-interface/aggregate metrics. Exact 2.11 kind 12 joins deterministic configuration order to queue/feature/limiter/retry/MMIO-or-PCI placement and MMDS protocol configuration while excluding host providers, packet-I/O owners, handles, callbacks, peer/cached packets, live TCP/ARP state, MMDS data, token material, metrics, and clocks. Every load requires a complete clone-local override set and reconstructs fresh owners. Signed direct and contained V1/V2 guests prove empty/reseeded data, source connection/token loss, fresh sessions, redaction, retry, and cleanup. External direct-vmnet connectivity remains deferred. |
@@ -1510,11 +1537,11 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /vsock` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /metrics` | `metrics_path` | required | Host path to the metrics output file or FIFO. The runtime opens it as per-process observability state and redacts path details from API-facing open errors. |
 | `PUT /metrics` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /logger` | `log_path` | optional | Host path to the logger output file or FIFO. When present, the runtime opens it as per-process observability state and redacts path details from API-facing open errors. When omitted, the existing sink is left unchanged. |
+| `PUT /logger` | `log_path` | optional | Host path to the logger output file or FIFO. Normal execution initially targets a process-owned bounded stdout adapter that never changes real stdout flags. A present path is prepared before commit and replaces the active logger target failure-atomically; omission retains the active target. API-facing errors and records redact the path. |
 | `PUT /logger` | `level` | optional | Case-insensitive values `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error` are accepted. `Warning` is normalized to `Warn`. |
-| `PUT /logger` | `show_level` | optional | When true, implemented API request, action, and boot-timer log lines include a `level=Info` prefix. |
-| `PUT /logger` | `show_log_origin` | optional | When true, implemented API request, action, and boot-timer log lines include an `origin=<file>:<line>` field for the callsite after absolute/parent-traversing build prefixes are removed. |
-| `PUT /logger` | `module` | optional | Filters implemented logger events with Firecracker-style module-path prefix matching. API request method/route-template lines use `bangbang_runtime::api_server`, action logs use `bangbang_runtime::vmm_action`, and boot-timer logs use `bangbang_runtime::boot_timer`; non-matching filters suppress those lines without failing the action. |
+| `PUT /logger` | `show_level` | optional | Defaults false. When true, every admitted fixed logger record receives its exact stable `level=Error`, `Warn`, `Info`, or `Debug` prefix. |
+| `PUT /logger` | `show_log_origin` | optional | Defaults false. When true, every admitted record includes an implementation-owned `origin=<file>:<line>` field after absolute/parent-traversing build prefixes are removed; request values never become origins. |
+| `PUT /logger` | `module` | optional | Filters fixed logger events with Firecracker-style module-path prefix matching. API receipt/control/result, action, startup, process, and boot-timer records use closed Bangbang module identities; nonmatching filters suppress records without failing functional work. |
 | `PUT /logger` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /serial` | `serial_out_path` | optional | Host path to the serial output file or FIFO. The runtime stores it before boot, startup opens it as per-process observability output, disables stdin, and redacts path details from API-facing open errors. Omit the field or set it to `null` to select nonblocking process stdout plus supported terminal/FIFO stdin at startup. A contained path reference instead moves one exact granted write-only regular-file output and likewise disables stdin. |
 | `PUT /serial` | `rate_limiter` | optional token bucket | Missing or `null` values are accepted. Firecracker-shaped token buckets with `size`, optional `one_time_burst`, and `refill_time` are stored before boot. At startup, `size=0`, `refill_time=0`, or overflowing millisecond-to-nanosecond refill intervals disable the limiter; otherwise the limiter starts full, applies the optional one-time burst, refills over time, and drops exhausted output bytes without blocking. |
@@ -1800,29 +1827,32 @@ rules are defined in the observability contract above. API request fields that
 Firecracker does not define, absent device producers, and empty optional
 families remain absent rather than being fabricated for shape completeness.
 The process startup path and API/VMM state path implement the logger field
-policy above as pre-boot-only per-process observability configuration. Startup
-CLI flags can configure the initial logger before the API socket is served.
-Repeated pre-boot `PUT /logger` requests update only the fields they provide,
-including after startup CLI configuration. Runtime requests fail without opening
-a new output path. The configured logger sink records the method and path for
-successfully parsed API requests before dispatch, using fixed templates rather
-than resource selectors and without logging request bodies. It also records
-minimal successful `InstanceStart` and `FlushMetrics`
-action lines when the logger level allows `Info`. When `--boot-timer` is
-enabled, the same sink records the Firecracker-shaped `Guest-boot-time` line
-after the guest writes the boot timer magic byte. `show_level` adds
-`level=Info`, and `show_log_origin` adds a normalized non-absolute API server,
-runtime action, or boot timer callsite as `origin=<file>:<line>`. `module`
-filters API request logs
-against `bangbang_runtime::api_server`, action logs against
-`bangbang_runtime::vmm_action`, and boot timer logs against
-`bangbang_runtime::boot_timer`. Request and action records are unrestricted;
-boot-timer records use the ten-per-five-second limiter and recovery warning.
-Queue pressure, receipt timeout, disconnect, or sink failure increments
-`missed_log_count` exactly once per affected record and never changes the
-functional outcome. The fixed process terminal and catchable-main panic
-boundary is defined above; no general global process logging, durable
-panic/fatal writer, rotation, or external telemetry backend is claimed.
+policy above as pre-boot-only per-process observability configuration. Normal
+execution installs the bounded stdout adapter first. Startup CLI fields apply next; a
+config-file logger section applies later and overrides its provided matching
+CLI fields and target before configured actions. Repeated pre-boot `PUT /logger` requests update only
+the fields they provide. Runtime requests fail without opening a new output
+path. A path-free update retains stdout or the current explicit target; a
+successful path switch leaves the independently owned stdout/serial flags
+unchanged.
+
+The active logger records the method and fixed route template for every parsed
+request before dispatch, without selectors or bodies. Every parsed dispatch
+then emits one closed HTTP result. Parser `400`/`413` rejections emit one fixed
+control outcome and no result. Additional fixed control events cover server
+start/stop, a discarded connection fault, deprecation, and successful
+pause/resume or snapshot work; successful readiness emits the fixed process
+startup record. Existing successful `InstanceStart` and `FlushMetrics` action
+lines remain. When `--boot-timer` is enabled, the same target records the
+Firecracker-shaped `Guest-boot-time` line after the guest writes the timer magic
+byte. `show_level`, `show_log_origin`, and `module` apply uniformly to these
+closed events. Host records are unrestricted; boot-timer records use the
+ten-per-five-second limiter and recovery warning. Queue pressure, receipt
+timeout, disconnect, or sink failure increments `missed_log_count` exactly once
+per affected record and never changes the functional outcome. The fixed
+process terminal and catchable-main panic boundary is defined above; no general
+global process logging, durable panic/fatal writer, rotation, or external
+telemetry backend is claimed.
 The API and VMM state path implement the `PUT /vsock` field policy above as a
 pre-boot-only guest configuration section. Valid requests replace the stored
 vsock config and return `204 No Content`; invalid requests fail without
@@ -3895,7 +3925,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PATCH /mmds` | implemented after data initialization; `204` empty response | implemented after data initialization; `204` empty response | Applies RFC 7396 merge-patch semantics to the stored JSON object using the effective MMDS data-store limit. Pre-start requests that parse successfully and reach the VMM action create the MMDS store before applying the patch, but patching still requires initialized data. Runtime requests return the same MMDS not-initialized fault when the store is absent or the store exists without initialized data. Oversized patched results are rejected without mutating the previous value. |
 | `PUT /mmds/config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Stores control-plane MMDS config before startup after runtime validation rejects empty interface lists and validates that each listed interface ID already exists in the configured network interface set. A successful config request creates the process-local MMDS store even when no data has been initialized. At startup, selected interfaces enable the complete implemented bounded guest-visible MMDS packet path over MMIO or PCI; runtime config mutation remains intentionally pre-boot-only. |
 | `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Process observability state, omitted from `GET /vm/config`. Duplicate initialization and identifiable malformed requests are counted without replacing the sink; duplicate state is rejected before a contained grant claim. Configuration writes nothing. In contained mode an exact metrics-sink reference claims one `WriteOnly` regular-file descriptor, normalizes append/nonblocking status without reopening it, and retains it for the same initial, 60-second Running/Paused periodic, explicit fallible `FlushMetrics`, and best-effort terminal transaction/schema behavior. Direct paths retain current create/FIFO behavior. |
-| `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Process observability state, omitted from `GET /vm/config`. Repeated pre-boot requests update provided fields. A contained path-bearing request claims an exact singleton `WriteOnly` logger-sink descriptor and failure-atomically sends the adopted append/nonblocking sink to the stable writer worker; a path-free request retains delivery and claims nothing. Direct paths retain current create/FIFO behavior. Closed records are at most 512 bytes; unrestricted API method/template and action records omit selectors/bodies, while receipt-free boot-timer records use atomic suppression recovery. Queue, timeout, write, and flush misses never change functional results. A stalled connected worker rejects replacement without spawning another generation. No sink is configured by default. |
+| `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Process observability state, omitted from `GET /vm/config`. Normal execution targets a process-owned bounded stdout adapter whose nonblocking internal pipe leaves stdout flags unchanged. Worker receipt and exact loss accounting end at pipe admission; the sole stdout forwarder retries temporary backpressure but is non-durable and never joined. Repeated pre-boot requests update provided fields; path-free requests retain delivery, while direct or contained path-bearing requests prepare an append/nonblocking writer and failure-atomically send it to the stable worker. Serial capture/restoration stays independent of target commit or failure. Closed records are at most 512 bytes. API receipt/control/result, startup, action, panic, and terminal records omit selectors, bodies, paths, and faults; receipt-free boot-timer records use atomic suppression recovery. Queue, timeout, configured-writer write, and flush misses never change functional results. A stalled connected worker rejects replacement without spawning another generation. |
 | `PUT /serial` | implemented; `204` empty response on successful pre-boot output configuration, rate-limiter configuration, or clear request | unsupported after start; `400` `fault_message` | Serial output is process observability state, not guest configuration. Direct valid `serial_out_path` values and token-bucket `rate_limiter` values are stored without opening host resources during the request; startup opens the path, disables stdin, wraps output in the limiter when enabled, and routes guest TX bytes to it. A contained exact serial-sink reference instead adopts and retains one `WriteOnly` append/nonblocking regular-file descriptor; clear/replacement drops it, and startup moves it once without reopening the reference. With no path/grant, startup duplicates nonblocking stdout and attaches supported terminal/FIFO stdin for bounded owner-run-loop RX. A later startup failure leaves a consumed grant unavailable until validated serial reconfiguration. Malformed parser/input/grant failures preserve previous public and private state. |
 | `PUT /entropy` | implemented and verified; `204` empty response on successful configuration | unsupported after start; `400` `fault_message` | Stores the strict virtio-rng configuration before startup, including valid `bandwidth` and `ops` buckets. `GET /vm/config` returns `{}` for an unconfigured limiter or its exact configured object. `InstanceStart` attaches the host-OS-backed endpoint over selected MMIO or product PCI. Queue dispatch caps requests at 64 KiB, retains and schedules exactly one throttled descriptor, restores exact limiter state when publication cannot complete, and emits seven entropy metrics. Exact native-v2 2.8 serializes detached queue/limiter/pending/retry/transport state without random bytes, source identity, metrics, or host time and restores fresh destination owners. Signed Linux guests prove live and restored marker-gated reads, throttling, retry without another guest kick, explicit/automatic resume, recapture, immutable clones, containment, and cleanup over both transports. |
 | `PUT /balloon` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Stores the complete Firecracker-shaped balloon configuration before startup, rejects targets larger than configured guest memory without mutating previous machine/balloon state, exposes exact committed state through `GET /balloon` and `GET /vm/config`, and attaches the endpoint over the selected startup transport. Runtime target and nonzero polling updates, required and optional statistics, hint start/automatic acknowledgement/explicit stop, reporting, and metrics are implemented. Inflate/deflate prepare compact paired 4-KiB PFN accounting before used publication and commit by move afterward. Exact native-v2 2.9 kind 10 serializes bounded validated configuration/features, variable queues, latest/pending statistics, DONE-normalized hint history, accounting, common virtio state, and MMIO/PCI placement; every destination constructs fresh timer/metrics/reclaim/notifier/interrupt/dispatcher/endpoint/cleanup owners. Signed direct and normal-production/App-Sandbox MMIO/PCI Linux evidence covers explicit/automatic resume, a full destination-local interval, new hinting, reporting, inflate/deflate/API continuity, recapture, immutable clones, failures, containment, and cleanup. The component is capped at 262,144 ranges and 4 MiB inside the 16-MiB state cap. Darwin host-page alignment/reclaim remains best effort and does not promise synchronous RSS reduction. |

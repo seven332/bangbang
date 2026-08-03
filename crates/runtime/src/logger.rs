@@ -1,5 +1,6 @@
 mod delivery;
 mod event;
+mod process_stdout;
 mod rate_limiter;
 
 use std::fmt;
@@ -23,8 +24,10 @@ use rate_limiter::LogRateLimiterClock;
 use rate_limiter::{LogRateLimitDecision, LoggerRateLimitIdentity, LoggerRateLimiters};
 
 pub use event::{
-    LoggerAction, LoggerApiRoute, LoggerHttpMethod, PanicLogRecords, ProcessTerminalCategory,
+    LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute,
+    LoggerHttpMethod, PanicLogRecords, ProcessStartupOutcome, ProcessTerminalCategory,
 };
+pub use process_stdout::{ProcessStdoutLogger, ProcessStdoutLoggerError};
 
 const BOOT_TIMER_LOG_MODULE: &str = "bangbang_runtime::boot_timer";
 const API_REQUEST_LOG_MODULE: &str = "bangbang_runtime::api_server";
@@ -220,6 +223,7 @@ pub enum LoggerConfigError {
     EmptyPath,
     OpenFile(std::io::ErrorKind),
     SpawnWorker(std::io::ErrorKind),
+    OutputAlreadyInitialized,
     DeliveryQueueFull,
     ReplacementTimedOut,
 }
@@ -239,6 +243,9 @@ impl fmt::Display for LoggerConfigError {
                     formatter,
                     "logger worker could not be initialized: {kind:?}"
                 )
+            }
+            Self::OutputAlreadyInitialized => {
+                formatter.write_str("logger output is already initialized")
             }
             Self::DeliveryQueueFull => {
                 formatter.write_str("logger output replacement queue is full")
@@ -568,6 +575,18 @@ impl LoggerState {
         self.commit_config(prepared)
     }
 
+    pub(crate) fn install_process_stdout(
+        &mut self,
+        output: ProcessStdoutLogger,
+    ) -> Result<(), LoggerConfigError> {
+        if self.delivery.is_some() {
+            return Err(LoggerConfigError::OutputAlreadyInitialized);
+        }
+        self.commit_writer(PreparedLoggerWriter::new(output))?;
+        self.publish_emergency_target();
+        Ok(())
+    }
+
     /// Opens or adopts an optional replacement writer without mutating active state.
     pub fn prepare_config(
         config: LoggerConfig,
@@ -727,6 +746,27 @@ impl LoggerState {
     }
 
     #[track_caller]
+    pub fn log_api_control(&self, outcome: LoggerApiControlOutcome) -> bool {
+        let level = outcome.level();
+        if !self.level.allows(level)
+            || !module_filter_allows(self.module.as_deref(), API_REQUEST_LOG_MODULE)
+        {
+            return false;
+        }
+        let Some(delivery) = &self.delivery else {
+            return false;
+        };
+        let record = LogRecord::encode(
+            self.show_level,
+            self.show_log_origin,
+            LogOrigin::from(Location::caller()),
+            level,
+            LoggerEvent::ApiControl(outcome),
+        );
+        delivery.producer().deliver_host(LogBatch::one(record))
+    }
+
+    #[track_caller]
     pub fn log_api_request(&self, method: LoggerHttpMethod, route: LoggerApiRoute) -> bool {
         const API_REQUEST_LEVEL: LoggerLevel = LoggerLevel::Info;
 
@@ -744,6 +784,49 @@ impl LoggerState {
             LogOrigin::from(Location::caller()),
             API_REQUEST_LEVEL,
             LoggerEvent::ApiRequest { method, route },
+        );
+        delivery.producer().deliver_host(LogBatch::one(record))
+    }
+
+    #[track_caller]
+    pub fn log_api_result(&self, outcome: LoggerApiResultOutcome) -> bool {
+        let level = outcome.level();
+        if !self.level.allows(level)
+            || !module_filter_allows(self.module.as_deref(), API_REQUEST_LOG_MODULE)
+        {
+            return false;
+        }
+        let Some(delivery) = &self.delivery else {
+            return false;
+        };
+        let record = LogRecord::encode(
+            self.show_level,
+            self.show_log_origin,
+            LogOrigin::from(Location::caller()),
+            level,
+            LoggerEvent::ApiResult(outcome),
+        );
+        delivery.producer().deliver_host(LogBatch::one(record))
+    }
+
+    #[track_caller]
+    pub fn log_process_startup(&self, outcome: ProcessStartupOutcome) -> bool {
+        const PROCESS_STARTUP_LEVEL: LoggerLevel = LoggerLevel::Info;
+
+        if !self.level.allows(PROCESS_STARTUP_LEVEL)
+            || !module_filter_allows(self.module.as_deref(), PROCESS_LOG_MODULE)
+        {
+            return false;
+        }
+        let Some(delivery) = &self.delivery else {
+            return false;
+        };
+        let record = LogRecord::encode(
+            self.show_level,
+            self.show_log_origin,
+            LogOrigin::from(Location::caller()),
+            PROCESS_STARTUP_LEVEL,
+            LoggerEvent::ProcessStartup(outcome),
         );
         delivery.producer().deliver_host(LogBatch::one(record))
     }
@@ -826,8 +909,9 @@ mod tests {
     use super::delivery::WorkerObserver;
     use super::{
         BootTimerLogRateLimiter, LogRateLimitDecision, LogRateLimiterClock, LoggerAction,
-        LoggerApiRoute, LoggerConfigError, LoggerConfigInput, LoggerDeliveryConfig,
-        LoggerHttpMethod, LoggerLevel, LoggerState, ProcessTerminalCategory, SharedLoggerMetrics,
+        LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute, LoggerConfigError,
+        LoggerConfigInput, LoggerDeliveryConfig, LoggerHttpMethod, LoggerLevel, LoggerState,
+        ProcessStartupOutcome, ProcessTerminalCategory, SharedLoggerMetrics,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -1050,6 +1134,59 @@ mod tests {
                 .expect("logger output should be UTF-8"),
             "The API server received a Put request on \"/drives/{drive_id}\".\naction=InstanceStart\n"
         );
+    }
+
+    #[test]
+    fn closed_api_control_result_and_startup_producers_apply_levels_and_modules() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut state = LoggerState::default();
+        state.configure_test_writer(SharedWriter(output.clone()));
+
+        assert!(state.log_api_control(LoggerApiControlOutcome::ServerRunning));
+        assert!(!state.log_api_control(LoggerApiControlOutcome::ServerStopped));
+        assert!(state.log_api_control(LoggerApiControlOutcome::ConnectionFailed));
+        assert!(state.log_api_control(LoggerApiControlOutcome::RequestDeprecated));
+        assert!(state.log_api_result(LoggerApiResultOutcome::NoContent));
+        assert!(state.log_api_result(LoggerApiResultOutcome::BadRequest));
+        assert!(state.log_process_startup(ProcessStartupOutcome::Running));
+
+        assert_eq!(
+            String::from_utf8(output.lock().expect("output lock should succeed").clone())
+                .expect("logger output should be UTF-8"),
+            concat!(
+                "operation=server outcome=running\n",
+                "operation=connection outcome=failed\n",
+                "operation=request outcome=deprecated\n",
+                "action=request outcome=no-content\n",
+                "action=request outcome=bad-request\n",
+                "operation=process-startup outcome=running\n",
+            )
+        );
+
+        state
+            .configure(LoggerConfigInput::new().with_module("bangbang_runtime::api_server"))
+            .expect("API module filter should apply");
+        assert!(state.log_api_control(LoggerApiControlOutcome::RequestCompleted));
+        assert!(state.log_api_result(LoggerApiResultOutcome::Ok));
+        assert!(!state.log_process_startup(ProcessStartupOutcome::Running));
+
+        state
+            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Off))
+            .expect("off level should apply");
+        assert!(!state.log_api_control(LoggerApiControlOutcome::ConnectionFailed));
+        assert!(!state.log_api_result(LoggerApiResultOutcome::PayloadTooLarge));
+    }
+
+    #[test]
+    fn closed_host_event_delivery_failures_are_counted_without_changing_callers() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(FailingWriter);
+
+        assert!(!state.log_api_control(LoggerApiControlOutcome::ConnectionFailed));
+        assert!(!state.log_api_result(LoggerApiResultOutcome::BadRequest));
+        assert!(!state.log_process_startup(ProcessStartupOutcome::Running));
+        assert_eq!(metrics.missed_log_count(), 3);
     }
 
     #[test]

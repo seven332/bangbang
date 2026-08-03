@@ -260,11 +260,14 @@ pub enum LoggerNonApplicableReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LoggerCompiledEvent {
+    ApiControl,
     ApiRequest,
+    ApiResult,
     InstanceStart,
     FlushMetrics,
     BootTime,
     RateLimitRecovery,
+    ProcessStartup,
     ProcessPanic,
     ProcessExit,
 }
