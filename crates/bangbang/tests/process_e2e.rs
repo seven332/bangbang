@@ -484,6 +484,8 @@ fn executable_logs_success_terminal_record_after_api_shutdown() {
         concat!(
             "operation=server outcome=running\n",
             "operation=process-startup outcome=running\n",
+            "operation=host-signal outcome=received\n",
+            "operation=shutdown outcome=orderly\n",
             "event=process-exit category=success\n",
         )
     );
@@ -511,7 +513,10 @@ fn executable_logs_configuration_terminal_record_after_logger_setup() {
     assert_eq!(output.status.code(), Some(BAD_CONFIGURATION_EXIT_CODE));
     assert_eq!(
         fs::read_to_string(&logger_path).expect("terminal logger output should be readable"),
-        "event=process-exit category=configuration\n"
+        concat!(
+            "operation=shutdown outcome=abnormal\n",
+            "event=process-exit category=configuration\n",
+        )
     );
 }
 
@@ -535,7 +540,10 @@ fn executable_logs_process_failure_terminal_record_after_logger_setup() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         fs::read_to_string(&logger_path).expect("terminal logger output should be readable"),
-        "event=process-exit category=process-failure\n"
+        concat!(
+            "operation=shutdown outcome=abnormal\n",
+            "event=process-exit category=process-failure\n",
+        )
     );
 }
 
@@ -1195,8 +1203,13 @@ fn executable_rejects_empty_mutating_api_requests_without_stopping() {
 fn executable_handles_sigint_shutdown_cleanly() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
+    let logger_path = test_dir.path().join("sigint.log");
     let instance_id = test_dir.instance_id();
-    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+    let bangbang = BangbangProcess::start_with_extra_args(
+        &socket_path,
+        &instance_id,
+        &["--log-path", path_text(&logger_path)],
+    );
 
     assert!(
         socket_path.exists(),
@@ -1204,6 +1217,16 @@ fn executable_handles_sigint_shutdown_cleanly() {
     );
 
     assert_clean_shutdown(bangbang.interrupt(), &socket_path, "bangbang SIGINT");
+    assert_eq!(
+        fs::read_to_string(&logger_path).expect("SIGINT logger output should be readable"),
+        concat!(
+            "operation=server outcome=running\n",
+            "operation=process-startup outcome=running\n",
+            "operation=host-signal outcome=received\n",
+            "operation=shutdown outcome=orderly\n",
+            "event=process-exit category=success\n",
+        )
+    );
 }
 
 #[test]

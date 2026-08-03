@@ -286,7 +286,7 @@ impl fmt::Debug for LoggerProducer {
 }
 
 impl LoggerProducer {
-    pub(super) fn deliver_guest(&self, batch: LogBatch) -> bool {
+    pub(super) fn deliver_nonblocking(&self, batch: LogBatch) -> bool {
         let record_count = batch.len();
         match self.sender.try_send(WorkerMessage::batch(batch, None)) {
             Ok(()) => true,
@@ -1198,10 +1198,10 @@ mod tests {
         let producer = delivery.producer();
         let emergency = delivery.emergency_ingress();
 
-        assert!(producer.deliver_guest(LogBatch::one(record(LoggerAction::InstanceStart))));
+        assert!(producer.deliver_nonblocking(LogBatch::one(record(LoggerAction::InstanceStart))));
         gate.wait_until_entered();
-        assert!(producer.deliver_guest(LogBatch::one(record(LoggerAction::FlushMetrics))));
-        assert!(!producer.deliver_guest(LogBatch::one(record(LoggerAction::InstanceStart))));
+        assert!(producer.deliver_nonblocking(LogBatch::one(record(LoggerAction::FlushMetrics))));
+        assert!(!producer.deliver_nonblocking(LogBatch::one(record(LoggerAction::InstanceStart))));
         assert!(emergency.publish_once(super::PanicRecordPrefix::Plain));
         assert_eq!(metrics.missed_log_count(), 1);
 
@@ -1310,7 +1310,7 @@ mod tests {
         .expect("worker should spawn");
         let producer = delivery.producer();
 
-        assert!(producer.deliver_guest(LogBatch::one(record(LoggerAction::InstanceStart))));
+        assert!(producer.deliver_nonblocking(LogBatch::one(record(LoggerAction::InstanceStart))));
         gate.wait_until_entered();
         assert!(!producer.deliver_host(LogBatch::one(record(LoggerAction::FlushMetrics))));
         assert_eq!(metrics.missed_log_count(), 1);
@@ -1358,10 +1358,10 @@ mod tests {
         .expect("worker should spawn");
         let producer = delivery.producer();
 
-        assert!(producer.deliver_guest(LogBatch::one(record(LoggerAction::InstanceStart))));
+        assert!(producer.deliver_nonblocking(LogBatch::one(record(LoggerAction::InstanceStart))));
         gate.wait_until_entered();
-        assert!(producer.deliver_guest(LogBatch::one(record(LoggerAction::FlushMetrics))));
-        assert!(!producer.deliver_guest(LogBatch::two(
+        assert!(producer.deliver_nonblocking(LogBatch::one(record(LoggerAction::FlushMetrics))));
+        assert!(!producer.deliver_nonblocking(LogBatch::two(
             record(LoggerAction::InstanceStart),
             record(LoggerAction::FlushMetrics),
         )));
@@ -1386,7 +1386,7 @@ mod tests {
         let producer = delivery.producer();
 
         assert!(delivery.disconnect_for_test());
-        assert!(!producer.deliver_guest(LogBatch::two(
+        assert!(!producer.deliver_nonblocking(LogBatch::two(
             record(LoggerAction::InstanceStart),
             record(LoggerAction::FlushMetrics),
         )));

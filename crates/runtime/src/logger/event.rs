@@ -182,6 +182,299 @@ impl ProcessStartupOutcome {
     }
 }
 
+/// Fixed public device kinds admitted by host lifecycle records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerDeviceKind {
+    Block,
+    Network,
+    Pmem,
+}
+
+impl LoggerDeviceKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Network => "network",
+            Self::Pmem => "pmem",
+        }
+    }
+}
+
+/// Fixed VM lifecycle and host-control outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerLifecycleOutcome {
+    BackendStartupSucceeded,
+    BackendStartupFailed,
+    VmStartSucceeded,
+    VmStartRejected,
+    VmStartFailed,
+    VmPauseSucceeded,
+    VmPauseUnchanged,
+    VmPauseRejected,
+    VmPauseFailed,
+    VmResumeSucceeded,
+    VmResumeUnchanged,
+    VmResumeRejected,
+    VmResumeFailed,
+    VmStopSucceeded,
+    VmStopFailed,
+    DeviceAttachSucceeded(LoggerDeviceKind),
+    DeviceAttachRejected(LoggerDeviceKind),
+    DeviceAttachFailed(LoggerDeviceKind),
+    DeviceUpdateSucceeded(LoggerDeviceKind),
+    DeviceUpdateRejected(LoggerDeviceKind),
+    DeviceUpdateFailed(LoggerDeviceKind),
+    DeviceDetachSucceeded(LoggerDeviceKind),
+    DeviceDetachRejected(LoggerDeviceKind),
+    DeviceDetachFailed(LoggerDeviceKind),
+}
+
+impl LoggerLifecycleOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::BackendStartupSucceeded | Self::BackendStartupFailed => "backend-startup",
+            Self::VmStartSucceeded | Self::VmStartRejected | Self::VmStartFailed => "vm-start",
+            Self::VmPauseSucceeded
+            | Self::VmPauseUnchanged
+            | Self::VmPauseRejected
+            | Self::VmPauseFailed => "vm-pause",
+            Self::VmResumeSucceeded
+            | Self::VmResumeUnchanged
+            | Self::VmResumeRejected
+            | Self::VmResumeFailed => "vm-resume",
+            Self::VmStopSucceeded | Self::VmStopFailed => "vm-stop",
+            Self::DeviceAttachSucceeded(_)
+            | Self::DeviceAttachRejected(_)
+            | Self::DeviceAttachFailed(_) => "device-attach",
+            Self::DeviceUpdateSucceeded(_)
+            | Self::DeviceUpdateRejected(_)
+            | Self::DeviceUpdateFailed(_) => "device-update",
+            Self::DeviceDetachSucceeded(_)
+            | Self::DeviceDetachRejected(_)
+            | Self::DeviceDetachFailed(_) => "device-detach",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::BackendStartupSucceeded
+            | Self::VmStartSucceeded
+            | Self::VmPauseSucceeded
+            | Self::VmResumeSucceeded
+            | Self::VmStopSucceeded
+            | Self::DeviceAttachSucceeded(_)
+            | Self::DeviceUpdateSucceeded(_)
+            | Self::DeviceDetachSucceeded(_) => "succeeded",
+            Self::VmPauseUnchanged | Self::VmResumeUnchanged => "unchanged",
+            Self::VmStartRejected
+            | Self::VmPauseRejected
+            | Self::VmResumeRejected
+            | Self::DeviceAttachRejected(_)
+            | Self::DeviceUpdateRejected(_)
+            | Self::DeviceDetachRejected(_) => "rejected",
+            Self::BackendStartupFailed
+            | Self::VmStartFailed
+            | Self::VmPauseFailed
+            | Self::VmResumeFailed
+            | Self::VmStopFailed
+            | Self::DeviceAttachFailed(_)
+            | Self::DeviceUpdateFailed(_)
+            | Self::DeviceDetachFailed(_) => "failed",
+        }
+    }
+
+    pub const fn device_kind(self) -> Option<LoggerDeviceKind> {
+        match self {
+            Self::DeviceAttachSucceeded(kind)
+            | Self::DeviceAttachRejected(kind)
+            | Self::DeviceAttachFailed(kind)
+            | Self::DeviceUpdateSucceeded(kind)
+            | Self::DeviceUpdateRejected(kind)
+            | Self::DeviceUpdateFailed(kind)
+            | Self::DeviceDetachSucceeded(kind)
+            | Self::DeviceDetachRejected(kind)
+            | Self::DeviceDetachFailed(kind) => Some(kind),
+            _ => None,
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::VmPauseUnchanged | Self::VmResumeUnchanged => LoggerLevel::Debug,
+            Self::BackendStartupFailed
+            | Self::VmStartRejected
+            | Self::VmStartFailed
+            | Self::VmPauseRejected
+            | Self::VmPauseFailed
+            | Self::VmResumeRejected
+            | Self::VmResumeFailed
+            | Self::VmStopFailed
+            | Self::DeviceAttachRejected(_)
+            | Self::DeviceAttachFailed(_)
+            | Self::DeviceUpdateRejected(_)
+            | Self::DeviceUpdateFailed(_)
+            | Self::DeviceDetachRejected(_)
+            | Self::DeviceDetachFailed(_) => LoggerLevel::Error,
+            Self::BackendStartupSucceeded
+            | Self::VmStartSucceeded
+            | Self::VmPauseSucceeded
+            | Self::VmResumeSucceeded
+            | Self::VmStopSucceeded
+            | Self::DeviceAttachSucceeded(_)
+            | Self::DeviceUpdateSucceeded(_)
+            | Self::DeviceDetachSucceeded(_) => LoggerLevel::Info,
+        }
+    }
+}
+
+/// Fixed snapshot request outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerSnapshotOutcome {
+    CreateSucceeded,
+    CreateRejected,
+    CreateFailed,
+    CreateCancelled,
+    LoadSucceeded,
+    LoadRejected,
+    LoadFailed,
+    LoadCancelled,
+}
+
+impl LoggerSnapshotOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::CreateSucceeded
+            | Self::CreateRejected
+            | Self::CreateFailed
+            | Self::CreateCancelled => "snapshot-create",
+            Self::LoadSucceeded | Self::LoadRejected | Self::LoadFailed | Self::LoadCancelled => {
+                "snapshot-load"
+            }
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::CreateSucceeded | Self::LoadSucceeded => "succeeded",
+            Self::CreateRejected | Self::LoadRejected => "rejected",
+            Self::CreateFailed | Self::LoadFailed => "failed",
+            Self::CreateCancelled | Self::LoadCancelled => "cancelled",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::CreateSucceeded | Self::LoadSucceeded => LoggerLevel::Info,
+            Self::CreateCancelled | Self::LoadCancelled => LoggerLevel::Warn,
+            Self::CreateRejected | Self::CreateFailed | Self::LoadRejected | Self::LoadFailed => {
+                LoggerLevel::Error
+            }
+        }
+    }
+}
+
+/// Fixed process-observed boot-worker outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerApiWorkerOutcome {
+    Running,
+    Exited,
+    Stopped,
+    Failed,
+}
+
+impl LoggerApiWorkerOutcome {
+    pub const fn operation(self) -> &'static str {
+        "boot-worker"
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Exited => "exited",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::Running | Self::Exited => LoggerLevel::Info,
+            Self::Stopped => LoggerLevel::Debug,
+            Self::Failed => LoggerLevel::Error,
+        }
+    }
+}
+
+/// Fixed process-observed metrics-worker outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerObservabilityOutcome {
+    MetricsWorkerFailed,
+}
+
+impl LoggerObservabilityOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::MetricsWorkerFailed => "metrics-worker",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::MetricsWorkerFailed => "failed",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::MetricsWorkerFailed => LoggerLevel::Error,
+        }
+    }
+}
+
+/// Fixed deferred signal and process-shutdown convergence outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerProcessSignalOutcome {
+    HostSignalReceived,
+    CancellationRequested,
+    GuestPoweroff,
+    GuestReset,
+    ShutdownOrderly,
+    ShutdownAbnormal,
+}
+
+impl LoggerProcessSignalOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::HostSignalReceived => "host-signal",
+            Self::CancellationRequested => "cancellation",
+            Self::GuestPoweroff | Self::GuestReset => "guest-power",
+            Self::ShutdownOrderly | Self::ShutdownAbnormal => "shutdown",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::HostSignalReceived => "received",
+            Self::CancellationRequested => "requested",
+            Self::GuestPoweroff => "poweroff",
+            Self::GuestReset => "reset",
+            Self::ShutdownOrderly => "orderly",
+            Self::ShutdownAbnormal => "abnormal",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::ShutdownAbnormal => LoggerLevel::Error,
+            Self::HostSignalReceived
+            | Self::CancellationRequested
+            | Self::GuestPoweroff
+            | Self::GuestReset
+            | Self::ShutdownOrderly => LoggerLevel::Info,
+        }
+    }
+}
+
 /// Stable process termination categories emitted by the executable lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessTerminalCategory {
@@ -223,6 +516,7 @@ impl LoggerAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LoggerEvent {
     ApiControl(LoggerApiControlOutcome),
+    ApiWorker(LoggerApiWorkerOutcome),
     ApiRequest {
         method: LoggerHttpMethod,
         route: LoggerApiRoute,
@@ -233,12 +527,16 @@ pub(super) enum LoggerEvent {
         wall_time_us: u64,
         cpu_time_us: u64,
     },
+    Lifecycle(LoggerLifecycleOutcome),
+    Observability(LoggerObservabilityOutcome),
     RateLimitRecovery {
         suppressed: u64,
     },
     ProcessPanic,
+    ProcessSignal(LoggerProcessSignalOutcome),
     ProcessStartup(ProcessStartupOutcome),
     ProcessExit(ProcessTerminalCategory),
+    Snapshot(LoggerSnapshotOutcome),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -308,6 +606,12 @@ impl LogRecord {
                 encoder.push_str(" outcome=");
                 encoder.push_str(outcome.outcome());
             }
+            LoggerEvent::ApiWorker(outcome) => {
+                encoder.push_str("operation=");
+                encoder.push_str(outcome.operation());
+                encoder.push_str(" outcome=");
+                encoder.push_str(outcome.outcome());
+            }
             LoggerEvent::ApiRequest { method, route } => {
                 encoder.push_str("The API server received a ");
                 encoder.push_str(method.as_str());
@@ -337,11 +641,34 @@ impl LogRecord {
                 encoder.push_u64(cpu_time_us / 1_000);
                 encoder.push_str(" CPU ms");
             }
+            LoggerEvent::Lifecycle(outcome) => {
+                if let Some(kind) = outcome.device_kind() {
+                    encoder.push_str("device-kind=");
+                    encoder.push_str(kind.as_str());
+                    encoder.push_byte(b' ');
+                }
+                encoder.push_str("operation=");
+                encoder.push_str(outcome.operation());
+                encoder.push_str(" outcome=");
+                encoder.push_str(outcome.outcome());
+            }
+            LoggerEvent::Observability(outcome) => {
+                encoder.push_str("operation=");
+                encoder.push_str(outcome.operation());
+                encoder.push_str(" outcome=");
+                encoder.push_str(outcome.outcome());
+            }
             LoggerEvent::RateLimitRecovery { suppressed } => {
                 encoder.push_u64(suppressed);
                 encoder.push_str(" messages were suppressed due to rate limiting");
             }
             LoggerEvent::ProcessPanic => encoder.push_str("event=process-panic"),
+            LoggerEvent::ProcessSignal(outcome) => {
+                encoder.push_str("operation=");
+                encoder.push_str(outcome.operation());
+                encoder.push_str(" outcome=");
+                encoder.push_str(outcome.outcome());
+            }
             LoggerEvent::ProcessStartup(outcome) => {
                 encoder.push_str("operation=process-startup outcome=");
                 encoder.push_str(outcome.as_str());
@@ -349,6 +676,12 @@ impl LogRecord {
             LoggerEvent::ProcessExit(category) => {
                 encoder.push_str("event=process-exit category=");
                 encoder.push_str(category.as_str());
+            }
+            LoggerEvent::Snapshot(outcome) => {
+                encoder.push_str("operation=");
+                encoder.push_str(outcome.operation());
+                encoder.push_str(" outcome=");
+                encoder.push_str(outcome.outcome());
             }
         }
 
@@ -636,8 +969,10 @@ fn utf8_prefix_len(value: &str, maximum: usize) -> usize {
 mod tests {
     use super::{
         LogOrigin, LogRecord, LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome,
-        LoggerApiRoute, LoggerEvent, LoggerHttpMethod, MAX_LOG_RECORD_BYTES, PanicLogRecords,
-        ProcessStartupOutcome, ProcessTerminalCategory, normalize_origin,
+        LoggerApiRoute, LoggerApiWorkerOutcome, LoggerDeviceKind, LoggerEvent, LoggerHttpMethod,
+        LoggerLifecycleOutcome, LoggerObservabilityOutcome, LoggerProcessSignalOutcome,
+        LoggerSnapshotOutcome, MAX_LOG_RECORD_BYTES, PanicLogRecords, ProcessStartupOutcome,
+        ProcessTerminalCategory, normalize_origin,
     };
     use crate::logger::LoggerLevel;
 
@@ -795,6 +1130,303 @@ mod tests {
             startup.as_str(),
             "operation=process-startup outcome=running\n"
         );
+    }
+
+    fn assert_closed_event(event: LoggerEvent, level: LoggerLevel, body: &str) {
+        let origin = LogOrigin::new("crates/runtime/src/logger/event.rs", 77);
+        for (show_level, show_origin) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let record = LogRecord::encode(show_level, show_origin, origin, level, event);
+            let mut expected = String::new();
+            if show_level {
+                expected.push_str("level=");
+                expected.push_str(level.as_str());
+                expected.push(' ');
+            }
+            if show_origin {
+                expected.push_str("origin=crates/runtime/src/logger/event.rs:77 ");
+            }
+            expected.push_str(body);
+            expected.push('\n');
+
+            assert_eq!(record.as_str(), expected);
+            assert!(record.as_bytes().len() <= MAX_LOG_RECORD_BYTES);
+            assert!(std::str::from_utf8(record.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn encodes_every_closed_host_worker_snapshot_and_signal_outcome() {
+        let lifecycle_cases = [
+            (
+                LoggerLifecycleOutcome::BackendStartupSucceeded,
+                LoggerLevel::Info,
+                "operation=backend-startup outcome=succeeded",
+            ),
+            (
+                LoggerLifecycleOutcome::BackendStartupFailed,
+                LoggerLevel::Error,
+                "operation=backend-startup outcome=failed",
+            ),
+            (
+                LoggerLifecycleOutcome::VmStartSucceeded,
+                LoggerLevel::Info,
+                "operation=vm-start outcome=succeeded",
+            ),
+            (
+                LoggerLifecycleOutcome::VmStartRejected,
+                LoggerLevel::Error,
+                "operation=vm-start outcome=rejected",
+            ),
+            (
+                LoggerLifecycleOutcome::VmStartFailed,
+                LoggerLevel::Error,
+                "operation=vm-start outcome=failed",
+            ),
+            (
+                LoggerLifecycleOutcome::VmPauseSucceeded,
+                LoggerLevel::Info,
+                "operation=vm-pause outcome=succeeded",
+            ),
+            (
+                LoggerLifecycleOutcome::VmPauseUnchanged,
+                LoggerLevel::Debug,
+                "operation=vm-pause outcome=unchanged",
+            ),
+            (
+                LoggerLifecycleOutcome::VmPauseRejected,
+                LoggerLevel::Error,
+                "operation=vm-pause outcome=rejected",
+            ),
+            (
+                LoggerLifecycleOutcome::VmPauseFailed,
+                LoggerLevel::Error,
+                "operation=vm-pause outcome=failed",
+            ),
+            (
+                LoggerLifecycleOutcome::VmResumeSucceeded,
+                LoggerLevel::Info,
+                "operation=vm-resume outcome=succeeded",
+            ),
+            (
+                LoggerLifecycleOutcome::VmResumeUnchanged,
+                LoggerLevel::Debug,
+                "operation=vm-resume outcome=unchanged",
+            ),
+            (
+                LoggerLifecycleOutcome::VmResumeRejected,
+                LoggerLevel::Error,
+                "operation=vm-resume outcome=rejected",
+            ),
+            (
+                LoggerLifecycleOutcome::VmResumeFailed,
+                LoggerLevel::Error,
+                "operation=vm-resume outcome=failed",
+            ),
+            (
+                LoggerLifecycleOutcome::VmStopSucceeded,
+                LoggerLevel::Info,
+                "operation=vm-stop outcome=succeeded",
+            ),
+            (
+                LoggerLifecycleOutcome::VmStopFailed,
+                LoggerLevel::Error,
+                "operation=vm-stop outcome=failed",
+            ),
+        ];
+        for (outcome, level, expected) in lifecycle_cases {
+            assert_eq!(outcome.level(), level);
+            assert_closed_event(LoggerEvent::Lifecycle(outcome), level, expected);
+        }
+
+        for (kind, kind_text) in [
+            (LoggerDeviceKind::Block, "block"),
+            (LoggerDeviceKind::Network, "network"),
+            (LoggerDeviceKind::Pmem, "pmem"),
+        ] {
+            for (outcome, operation, outcome_text, level) in [
+                (
+                    LoggerLifecycleOutcome::DeviceAttachSucceeded(kind),
+                    "device-attach",
+                    "succeeded",
+                    LoggerLevel::Info,
+                ),
+                (
+                    LoggerLifecycleOutcome::DeviceAttachRejected(kind),
+                    "device-attach",
+                    "rejected",
+                    LoggerLevel::Error,
+                ),
+                (
+                    LoggerLifecycleOutcome::DeviceAttachFailed(kind),
+                    "device-attach",
+                    "failed",
+                    LoggerLevel::Error,
+                ),
+                (
+                    LoggerLifecycleOutcome::DeviceUpdateSucceeded(kind),
+                    "device-update",
+                    "succeeded",
+                    LoggerLevel::Info,
+                ),
+                (
+                    LoggerLifecycleOutcome::DeviceUpdateRejected(kind),
+                    "device-update",
+                    "rejected",
+                    LoggerLevel::Error,
+                ),
+                (
+                    LoggerLifecycleOutcome::DeviceUpdateFailed(kind),
+                    "device-update",
+                    "failed",
+                    LoggerLevel::Error,
+                ),
+                (
+                    LoggerLifecycleOutcome::DeviceDetachSucceeded(kind),
+                    "device-detach",
+                    "succeeded",
+                    LoggerLevel::Info,
+                ),
+                (
+                    LoggerLifecycleOutcome::DeviceDetachRejected(kind),
+                    "device-detach",
+                    "rejected",
+                    LoggerLevel::Error,
+                ),
+                (
+                    LoggerLifecycleOutcome::DeviceDetachFailed(kind),
+                    "device-detach",
+                    "failed",
+                    LoggerLevel::Error,
+                ),
+            ] {
+                assert_eq!(outcome.level(), level);
+                assert_closed_event(
+                    LoggerEvent::Lifecycle(outcome),
+                    level,
+                    &format!(
+                        "device-kind={kind_text} operation={operation} outcome={outcome_text}"
+                    ),
+                );
+            }
+        }
+
+        for (outcome, level, expected) in [
+            (
+                LoggerSnapshotOutcome::CreateSucceeded,
+                LoggerLevel::Info,
+                "operation=snapshot-create outcome=succeeded",
+            ),
+            (
+                LoggerSnapshotOutcome::CreateRejected,
+                LoggerLevel::Error,
+                "operation=snapshot-create outcome=rejected",
+            ),
+            (
+                LoggerSnapshotOutcome::CreateFailed,
+                LoggerLevel::Error,
+                "operation=snapshot-create outcome=failed",
+            ),
+            (
+                LoggerSnapshotOutcome::CreateCancelled,
+                LoggerLevel::Warn,
+                "operation=snapshot-create outcome=cancelled",
+            ),
+            (
+                LoggerSnapshotOutcome::LoadSucceeded,
+                LoggerLevel::Info,
+                "operation=snapshot-load outcome=succeeded",
+            ),
+            (
+                LoggerSnapshotOutcome::LoadRejected,
+                LoggerLevel::Error,
+                "operation=snapshot-load outcome=rejected",
+            ),
+            (
+                LoggerSnapshotOutcome::LoadFailed,
+                LoggerLevel::Error,
+                "operation=snapshot-load outcome=failed",
+            ),
+            (
+                LoggerSnapshotOutcome::LoadCancelled,
+                LoggerLevel::Warn,
+                "operation=snapshot-load outcome=cancelled",
+            ),
+        ] {
+            assert_eq!(outcome.level(), level);
+            assert_closed_event(LoggerEvent::Snapshot(outcome), level, expected);
+        }
+
+        for (outcome, level, expected) in [
+            (
+                LoggerApiWorkerOutcome::Running,
+                LoggerLevel::Info,
+                "operation=boot-worker outcome=running",
+            ),
+            (
+                LoggerApiWorkerOutcome::Exited,
+                LoggerLevel::Info,
+                "operation=boot-worker outcome=exited",
+            ),
+            (
+                LoggerApiWorkerOutcome::Stopped,
+                LoggerLevel::Debug,
+                "operation=boot-worker outcome=stopped",
+            ),
+            (
+                LoggerApiWorkerOutcome::Failed,
+                LoggerLevel::Error,
+                "operation=boot-worker outcome=failed",
+            ),
+        ] {
+            assert_eq!(outcome.level(), level);
+            assert_closed_event(LoggerEvent::ApiWorker(outcome), level, expected);
+        }
+
+        let observability = LoggerObservabilityOutcome::MetricsWorkerFailed;
+        assert_eq!(observability.level(), LoggerLevel::Error);
+        assert_closed_event(
+            LoggerEvent::Observability(observability),
+            LoggerLevel::Error,
+            "operation=metrics-worker outcome=failed",
+        );
+
+        for (outcome, level, expected) in [
+            (
+                LoggerProcessSignalOutcome::HostSignalReceived,
+                LoggerLevel::Info,
+                "operation=host-signal outcome=received",
+            ),
+            (
+                LoggerProcessSignalOutcome::CancellationRequested,
+                LoggerLevel::Info,
+                "operation=cancellation outcome=requested",
+            ),
+            (
+                LoggerProcessSignalOutcome::GuestPoweroff,
+                LoggerLevel::Info,
+                "operation=guest-power outcome=poweroff",
+            ),
+            (
+                LoggerProcessSignalOutcome::GuestReset,
+                LoggerLevel::Info,
+                "operation=guest-power outcome=reset",
+            ),
+            (
+                LoggerProcessSignalOutcome::ShutdownOrderly,
+                LoggerLevel::Info,
+                "operation=shutdown outcome=orderly",
+            ),
+            (
+                LoggerProcessSignalOutcome::ShutdownAbnormal,
+                LoggerLevel::Error,
+                "operation=shutdown outcome=abnormal",
+            ),
+        ] {
+            assert_eq!(outcome.level(), level);
+            assert_closed_event(LoggerEvent::ProcessSignal(outcome), level, expected);
+        }
     }
 
     #[test]

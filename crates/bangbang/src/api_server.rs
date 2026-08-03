@@ -273,6 +273,7 @@ impl ApiServer {
                 ApiServerWaitResult::TimedOut => {}
             }
             if drain_shutdown_wakeup(shutdown_wakeup)? {
+                vmm.record_shutdown_wakeup();
                 return Ok(());
             }
             vmm.drain_process_exit_wakeup()
@@ -6485,7 +6486,12 @@ mod tests {
         assert_api_request_log_with_origin(lines.next(), "Put", "/boot-source");
         assert_api_result_log_with_origin(lines.next(), "no-content");
         assert_api_request_log_with_origin(lines.next(), "Put", "/actions");
+        assert_lifecycle_log_with_origin(
+            lines.next(),
+            "operation=backend-startup outcome=succeeded",
+        );
         assert_action_log_with_origin(lines.next(), "InstanceStart");
+        assert_lifecycle_log_with_origin(lines.next(), "operation=vm-start outcome=succeeded");
         assert_api_result_log_with_origin(lines.next(), "no-content");
         assert_api_request_log_with_origin(lines.next(), "Put", "/actions");
         assert_action_log_with_origin(lines.next(), "FlushMetrics");
@@ -6682,6 +6688,27 @@ mod tests {
         );
     }
 
+    fn assert_lifecycle_log_with_origin(line: Option<&str>, event: &str) {
+        let line = line.expect("logger output should include lifecycle line");
+        assert!(line.starts_with("level=Info origin="));
+        let suffix = format!(" {event}");
+        assert!(line.ends_with(&suffix));
+
+        let origin = line
+            .strip_prefix("level=Info origin=")
+            .expect("logger output should include origin prefix")
+            .strip_suffix(&suffix)
+            .expect("logger output should include lifecycle suffix");
+        let (file, line_number) = origin
+            .rsplit_once(':')
+            .expect("logger origin should include file and line");
+        assert!(file.ends_with("vmm.rs"), "unexpected origin file: {file}");
+        assert!(
+            line_number.parse::<u32>().is_ok(),
+            "unexpected origin line: {line_number}"
+        );
+    }
+
     fn assert_api_result_log_with_origin(line: Option<&str>, outcome: &str) {
         let line = line.expect("logger output should include API result line");
         assert!(line.starts_with("level=Info origin="));
@@ -6759,7 +6786,10 @@ mod tests {
                 "The API server received a Put request on \"/boot-source\".\n",
                 "action=request outcome=no-content\n",
                 "The API server received a Put request on \"/actions\".\n",
+                "operation=backend-startup outcome=succeeded\n",
                 "action=InstanceStart\n",
+                "operation=boot-worker outcome=running\n",
+                "operation=vm-start outcome=succeeded\n",
                 "action=request outcome=no-content\n",
             )
         );
@@ -13078,7 +13108,7 @@ mod tests {
         .expect("boot source should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("instance should start");
-        process_exit_trigger.trigger(ProcessSessionExitStatus::GuestRequestedStop);
+        process_exit_trigger.trigger(ProcessSessionExitStatus::GuestPoweroff);
 
         assert_eq!(server.run_until(&mut vmm, &mut shutdown_reader), Ok(()));
         drop(server);

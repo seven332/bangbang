@@ -609,6 +609,7 @@ fn wait_for_no_api_shutdown_with_periodic_schedulers(
             ProcessWaitResult::TimedOut => {}
         }
         if shutdown_signal.drain_wakeup()? {
+            vmm.record_shutdown_wakeup();
             return Ok(());
         }
         vmm.drain_process_exit_wakeup()
@@ -3154,7 +3155,7 @@ mod tests {
         fn handle_periodic_metrics_flush(&mut self) {
             self.inner.handle_periodic_metrics_flush();
             self.process_exit_trigger
-                .trigger(ProcessSessionExitStatus::GuestRequestedStop);
+                .trigger(ProcessSessionExitStatus::GuestPoweroff);
         }
 
         fn balloon_statistics_update_interval(&self) -> Option<Duration> {
@@ -3164,7 +3165,7 @@ mod tests {
         fn handle_periodic_balloon_statistics_update(&mut self) -> Result<bool, VmmActionError> {
             let result = self.inner.handle_periodic_balloon_statistics_update();
             self.process_exit_trigger
-                .trigger(ProcessSessionExitStatus::GuestRequestedStop);
+                .trigger(ProcessSessionExitStatus::GuestPoweroff);
             result
         }
 
@@ -5142,7 +5143,13 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&logger_path).expect("logger output should be readable"),
-            "level=Info action=InstanceStart\nlevel=Info action=FlushMetrics\n"
+            concat!(
+                "level=Info operation=backend-startup outcome=succeeded\n",
+                "level=Info action=InstanceStart\n",
+                "level=Info operation=boot-worker outcome=running\n",
+                "level=Info operation=vm-start outcome=succeeded\n",
+                "level=Info action=FlushMetrics\n",
+            )
         );
 
         fs::remove_file(config_path).expect("fixture config should clean up");
@@ -5355,7 +5362,16 @@ mod tests {
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("instance should start");
         vmm.handle_initial_metrics_flush();
-        assert_eq!(logger_fifo.drain_available(), b"action=InstanceStart\n");
+        assert_eq!(
+            logger_fifo.drain_available(),
+            concat!(
+                "operation=backend-startup outcome=succeeded\n",
+                "action=InstanceStart\n",
+                "operation=boot-worker outcome=running\n",
+                "operation=vm-start outcome=succeeded\n",
+            )
+            .as_bytes()
+        );
         logger_fifo.fill_to_capacity();
 
         let result = Err(ProcessError::ApiServer(ApiServerError::Accept(
@@ -5375,7 +5391,7 @@ mod tests {
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
             concat!(
                 "{\"vmm\":{\"metrics_flush_count\":1}}\n",
-                "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n",
+                "{\"logger\":{\"missed_log_count\":3},\"vmm\":{\"metrics_flush_count\":1}}\n",
             )
         );
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -5407,7 +5423,7 @@ mod tests {
         vmm.handle_initial_metrics_flush();
         let mut shutdown_signal = test_shutdown_signal();
 
-        process_exit_trigger.trigger(ProcessSessionExitStatus::GuestRequestedStop);
+        process_exit_trigger.trigger(ProcessSessionExitStatus::GuestPoweroff);
 
         let result = super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
         assert_eq!(
@@ -5517,6 +5533,7 @@ mod tests {
     #[test]
     fn no_api_periodic_metrics_failure_reschedules_and_retries_delta() {
         let mut metrics_fifo = MetricsFifo::create("periodic-retry");
+        let logger_path = unique_logger_path("periodic-retry");
         let signal_metrics = SharedSignalMetrics::default();
         let mut vmm = ProcessVmm::with_starter(
             "demo-1",
@@ -5529,6 +5546,10 @@ mod tests {
             metrics_fifo.path(),
         )))
         .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(&logger_path),
+        ))
+        .expect("logger should configure");
         vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
             "/tmp/vmlinux",
         )))
@@ -5588,6 +5609,16 @@ mod tests {
             VmmActionError::MetricsFlush(MetricsFlushError::Write(ErrorKind::WouldBlock))
         ));
         let _explicit_attempt = metrics_fifo.drain_available();
+
+        let output = fs::read_to_string(&logger_path).expect("logger output should be readable");
+        assert_eq!(
+            output
+                .matches("operation=metrics-worker outcome=failed\n")
+                .count(),
+            1
+        );
+        assert!(!output.contains("WouldBlock"));
+        fs::remove_file(logger_path).expect("logger fixture should clean up");
     }
 
     #[test]
@@ -6867,7 +6898,13 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(&path).expect("logger output should be readable"),
-            "level=Info action=InstanceStart\nlevel=Info action=FlushMetrics\n"
+            concat!(
+                "level=Info operation=backend-startup outcome=succeeded\n",
+                "level=Info action=InstanceStart\n",
+                "level=Info operation=boot-worker outcome=running\n",
+                "level=Info operation=vm-start outcome=succeeded\n",
+                "level=Info action=FlushMetrics\n",
+            )
         );
 
         fs::remove_file(path).expect("fixture should clean up");
@@ -6907,7 +6944,12 @@ mod tests {
             .expect("flush metrics should succeed");
         assert_eq!(
             fs::read_to_string(&matching_path).expect("matching logger output should be readable"),
-            "action=InstanceStart\naction=FlushMetrics\n"
+            concat!(
+                "operation=backend-startup outcome=succeeded\n",
+                "action=InstanceStart\n",
+                "operation=vm-start outcome=succeeded\n",
+                "action=FlushMetrics\n",
+            )
         );
 
         let filtered_path = unique_logger_path("module-filter-miss");

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, TryReserveError};
 use std::ffi::OsString;
 use std::fmt;
@@ -16,8 +17,6 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use bangbang_hvf::HvfArm64BootVsockCaptureErrorKind;
 use bangbang_hvf::{
     HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonCaptureState,
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyCaptureError,
@@ -38,9 +37,10 @@ use bangbang_hvf::{
     HvfArm64BootStorageCaptureError, HvfArm64BootStorageCaptureErrorKind,
     HvfArm64BootStorageCaptureStage, HvfArm64BootTimerDeviceConfig, HvfArm64BootVcpuError,
     HvfArm64BootVsockCaptureDisposition, HvfArm64BootVsockCaptureError,
-    HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState, HvfBackend, HvfSnapshotV1Bundle,
-    HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
-    HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfSnapshotV2BalloonMmioPlatformPlan,
+    HvfArm64BootVsockCaptureErrorKind, HvfArm64BootVsockCaptureStage,
+    HvfArm64BootVsockCaptureState, HvfBackend, HvfSnapshotV1Bundle, HvfSnapshotV1BundleError,
+    HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition, HvfSnapshotV1RestoreError,
+    HvfSnapshotV1State, HvfSnapshotV2BalloonMmioPlatformPlan,
     HvfSnapshotV2BalloonMmioProcessConfig, HvfSnapshotV2BalloonMmioRestoreError,
     HvfSnapshotV2BalloonPciPlatformPlan, HvfSnapshotV2BalloonPciRestoreError,
     HvfSnapshotV2BalloonPreparedProduct, HvfSnapshotV2BalloonState, HvfSnapshotV2BootState,
@@ -130,8 +130,9 @@ use bangbang_runtime::entropy::{EntropyConfig, EntropyMmioLayout};
 use bangbang_runtime::lazy_memory::LazyGuestMemoryConsumerProfile;
 use bangbang_runtime::logger::{
     EmergencyLogger, LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute,
-    LoggerConfigInput, LoggerHttpMethod, ProcessStartupOutcome, ProcessStdoutLogger,
-    ProcessTerminalCategory,
+    LoggerApiWorkerOutcome, LoggerConfigInput, LoggerDeviceKind, LoggerHttpMethod,
+    LoggerLifecycleOutcome, LoggerObservabilityOutcome, LoggerProcessSignalOutcome,
+    LoggerSnapshotOutcome, ProcessStartupOutcome, ProcessStdoutLogger, ProcessTerminalCategory,
 };
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
@@ -2449,6 +2450,21 @@ pub(crate) enum SnapshotCaptureReadyPreflightError {
 }
 
 impl SnapshotCaptureReadyPreflightError {
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Storage(source) => {
+                source.kind() == HvfArm64BootStorageCaptureErrorKind::Cancelled
+            }
+            Self::Vsock(source) => source.kind() == HvfArm64BootVsockCaptureErrorKind::Cancelled,
+            Self::Balloon(_)
+            | Self::MemoryHotplug(_)
+            | Self::Entropy(_)
+            | Self::Serial(_)
+            | Self::Network(_)
+            | Self::SessionUnavailable => false,
+        }
+    }
+
     fn into_native_v1(self) -> NativeV1SnapshotPublicationError {
         match self {
             Self::Storage(source) => NativeV1SnapshotPublicationError::StoragePreflight(source),
@@ -2597,6 +2613,39 @@ fn native_v2_snapshot_publication_action_error(
         NativeV2SnapshotPublicationError::Preflight(source) => source,
         NativeV2SnapshotPublicationError::Profile(_) => VmmActionError::SnapshotUnsupported,
         error => VmmActionError::SnapshotCreate(BackendError::Hypervisor(error.to_string())),
+    }
+}
+
+fn native_v2_snapshot_publication_logger_outcome(
+    error: &NativeV2SnapshotPublicationError,
+) -> LoggerSnapshotOutcome {
+    match error {
+        NativeV2SnapshotPublicationError::CaptureReadyPreflight(source)
+            if source.is_cancelled() =>
+        {
+            LoggerSnapshotOutcome::CreateCancelled
+        }
+        NativeV2SnapshotPublicationError::Transaction(transaction)
+            if transaction.producer().is_some_and(|producer| {
+                matches!(
+                    producer.source(),
+                    NativeV2SnapshotPublicationProducerError::Capture(
+                        NativeV2SnapshotCaptureError::Cancelled { .. }
+                    )
+                )
+            }) =>
+        {
+            LoggerSnapshotOutcome::CreateCancelled
+        }
+        NativeV2SnapshotPublicationError::Preflight(_)
+        | NativeV2SnapshotPublicationError::CaptureReadyPreflight(_)
+        | NativeV2SnapshotPublicationError::Profile(_)
+        | NativeV2SnapshotPublicationError::Resource(_)
+        | NativeV2SnapshotPublicationError::SessionUnavailable
+        | NativeV2SnapshotPublicationError::ConfigurationUnavailable => {
+            LoggerSnapshotOutcome::CreateRejected
+        }
+        NativeV2SnapshotPublicationError::Transaction(_) => LoggerSnapshotOutcome::CreateFailed,
     }
 }
 
@@ -4276,6 +4325,40 @@ enum NativeSnapshotLoadError {
     NativeV2(NativeV2SnapshotLoadError),
 }
 
+fn native_v2_snapshot_load_is_cancelled(error: &NativeV2SnapshotLoadError) -> bool {
+    match error {
+        NativeV2SnapshotLoadError::Cancelled => true,
+        NativeV2SnapshotLoadError::AfterResourceAdoption { source } => {
+            native_v2_snapshot_load_is_cancelled(source)
+        }
+        _ => false,
+    }
+}
+
+fn native_snapshot_load_logger_outcome(error: &NativeSnapshotLoadError) -> LoggerSnapshotOutcome {
+    match error {
+        NativeSnapshotLoadError::NativeV2(source)
+            if native_v2_snapshot_load_is_cancelled(source) =>
+        {
+            LoggerSnapshotOutcome::LoadCancelled
+        }
+        NativeSnapshotLoadError::Preflight(_)
+        | NativeSnapshotLoadError::ProcessTerminal
+        | NativeSnapshotLoadError::Resource(_)
+        | NativeSnapshotLoadError::NativeV1(NativeV1SnapshotLoadError::Preflight(_))
+        | NativeSnapshotLoadError::NativeV1(NativeV1SnapshotLoadError::ProcessTerminal)
+        | NativeSnapshotLoadError::NativeV1(NativeV1SnapshotLoadError::Resource(_))
+        | NativeSnapshotLoadError::NativeV2(NativeV2SnapshotLoadError::Preflight(_))
+        | NativeSnapshotLoadError::NativeV2(NativeV2SnapshotLoadError::ProcessTerminal)
+        | NativeSnapshotLoadError::NativeV2(NativeV2SnapshotLoadError::Resource(_)) => {
+            LoggerSnapshotOutcome::LoadRejected
+        }
+        NativeSnapshotLoadError::Artifact(_)
+        | NativeSnapshotLoadError::NativeV1(_)
+        | NativeSnapshotLoadError::NativeV2(_) => LoggerSnapshotOutcome::LoadFailed,
+    }
+}
+
 impl fmt::Display for NativeSnapshotLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -4375,6 +4458,12 @@ impl fmt::Debug for BlockBackingUpdate {
             Self::Provided(_) => formatter.write_str("Provided(<owned>)"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessSessionShutdownStatus {
+    Succeeded,
+    Failed,
 }
 
 pub(crate) trait ProcessSessionDiagnostics {
@@ -4535,6 +4624,10 @@ pub(crate) trait ProcessSessionDiagnostics {
 
     fn process_exit_status(&self) -> ProcessSessionExitStatus {
         ProcessSessionExitStatus::Running
+    }
+
+    fn shutdown(&mut self) -> ProcessSessionShutdownStatus {
+        ProcessSessionShutdownStatus::Succeeded
     }
 }
 
@@ -4850,7 +4943,10 @@ impl BootRunLoopPmemDeviceUpdater {
 pub(crate) enum ProcessSessionExitStatus {
     #[default]
     Running,
-    GuestRequestedStop,
+    GuestPoweroff,
+    GuestReset,
+    WorkerExited,
+    WorkerFailed,
     Terminal,
 }
 
@@ -4865,8 +4961,10 @@ impl ProcessSessionExitStatus {
     pub(crate) const fn decision(self) -> ProcessSessionExitDecision {
         match self {
             Self::Running => ProcessSessionExitDecision::Continue,
-            Self::GuestRequestedStop => ProcessSessionExitDecision::ExitSuccessfully,
-            Self::Terminal => ProcessSessionExitDecision::ExitWithFailure,
+            Self::GuestPoweroff | Self::GuestReset => ProcessSessionExitDecision::ExitSuccessfully,
+            Self::WorkerExited | Self::WorkerFailed | Self::Terminal => {
+                ProcessSessionExitDecision::ExitWithFailure
+            }
         }
     }
 }
@@ -5370,6 +5468,8 @@ pub(crate) trait VmmRequestHandler {
     fn process_exit_status(&self) -> ProcessSessionExitStatus {
         ProcessSessionExitStatus::Running
     }
+
+    fn record_shutdown_wakeup(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -5475,6 +5575,63 @@ impl fmt::Debug for ProcessVmnetAuthority {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveDeviceLifecycleOperation {
+    Attach,
+    Update,
+    Detach,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveDeviceLifecycleAction {
+    kind: LoggerDeviceKind,
+    operation: LiveDeviceLifecycleOperation,
+}
+
+impl LiveDeviceLifecycleAction {
+    const fn succeeded(self) -> LoggerLifecycleOutcome {
+        match self.operation {
+            LiveDeviceLifecycleOperation::Attach => {
+                LoggerLifecycleOutcome::DeviceAttachSucceeded(self.kind)
+            }
+            LiveDeviceLifecycleOperation::Update => {
+                LoggerLifecycleOutcome::DeviceUpdateSucceeded(self.kind)
+            }
+            LiveDeviceLifecycleOperation::Detach => {
+                LoggerLifecycleOutcome::DeviceDetachSucceeded(self.kind)
+            }
+        }
+    }
+
+    const fn rejected(self) -> LoggerLifecycleOutcome {
+        match self.operation {
+            LiveDeviceLifecycleOperation::Attach => {
+                LoggerLifecycleOutcome::DeviceAttachRejected(self.kind)
+            }
+            LiveDeviceLifecycleOperation::Update => {
+                LoggerLifecycleOutcome::DeviceUpdateRejected(self.kind)
+            }
+            LiveDeviceLifecycleOperation::Detach => {
+                LoggerLifecycleOutcome::DeviceDetachRejected(self.kind)
+            }
+        }
+    }
+
+    const fn failed(self) -> LoggerLifecycleOutcome {
+        match self.operation {
+            LiveDeviceLifecycleOperation::Attach => {
+                LoggerLifecycleOutcome::DeviceAttachFailed(self.kind)
+            }
+            LiveDeviceLifecycleOperation::Update => {
+                LoggerLifecycleOutcome::DeviceUpdateFailed(self.kind)
+            }
+            LiveDeviceLifecycleOperation::Detach => {
+                LoggerLifecycleOutcome::DeviceDetachFailed(self.kind)
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ProcessVmm<S>
 where
@@ -5485,6 +5642,7 @@ where
     started_session: Option<S::Session>,
     metrics_session_epoch: Option<Instant>,
     initial_metrics_attempted: bool,
+    terminal_convergence_attempted: bool,
     terminal_logger_attempted: bool,
     terminal_metrics_attempted: bool,
     process_metrics_diagnostics: MetricsDiagnostics,
@@ -5493,6 +5651,11 @@ where
     snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation,
     terminal_snapshot_load_failure: bool,
     terminal_instance_start_failure: bool,
+    instance_start_backend_attempted: bool,
+    live_device_backend_attempted: bool,
+    observed_process_exit_status: Cell<Option<ProcessSessionExitStatus>>,
+    shutdown_wakeup_observed: bool,
+    terminal_session_metrics: Option<MetricsDiagnostics>,
     pci_enabled: bool,
     vmnet_authority: ProcessVmnetAuthority,
     grant_authority: Option<GrantAuthority>,
@@ -5595,6 +5758,7 @@ where
             started_session: None,
             metrics_session_epoch: None,
             initial_metrics_attempted: false,
+            terminal_convergence_attempted: false,
             terminal_logger_attempted: false,
             terminal_metrics_attempted: false,
             process_metrics_diagnostics: MetricsDiagnostics::default(),
@@ -5603,6 +5767,11 @@ where
             snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation::default(),
             terminal_snapshot_load_failure: false,
             terminal_instance_start_failure: false,
+            instance_start_backend_attempted: false,
+            live_device_backend_attempted: false,
+            observed_process_exit_status: Cell::new(None),
+            shutdown_wakeup_observed: false,
+            terminal_session_metrics: None,
             pci_enabled: false,
             vmnet_authority: ProcessVmnetAuthority::Direct,
             grant_authority: None,
@@ -5761,8 +5930,82 @@ where
         self.controller.serial_config()
     }
 
+    fn live_device_lifecycle_action(
+        &self,
+        action: &VmmAction,
+    ) -> Option<LiveDeviceLifecycleAction> {
+        if self.controller.instance_info().state == bangbang_runtime::InstanceState::NotStarted {
+            return None;
+        }
+
+        match action {
+            VmmAction::PutDrive(input) => Some(LiveDeviceLifecycleAction {
+                kind: LoggerDeviceKind::Block,
+                operation: if self
+                    .controller
+                    .drive_configs()
+                    .iter()
+                    .any(|config| config.drive_id() == input.path_drive_id())
+                {
+                    LiveDeviceLifecycleOperation::Update
+                } else {
+                    LiveDeviceLifecycleOperation::Attach
+                },
+            }),
+            VmmAction::UpdateBlockDevice(_) => Some(LiveDeviceLifecycleAction {
+                kind: LoggerDeviceKind::Block,
+                operation: LiveDeviceLifecycleOperation::Update,
+            }),
+            VmmAction::PutNetworkInterface(input) => Some(LiveDeviceLifecycleAction {
+                kind: LoggerDeviceKind::Network,
+                operation: if self
+                    .controller
+                    .network_interface_configs()
+                    .iter()
+                    .any(|config| config.iface_id() == input.path_iface_id())
+                {
+                    LiveDeviceLifecycleOperation::Update
+                } else {
+                    LiveDeviceLifecycleOperation::Attach
+                },
+            }),
+            VmmAction::UpdateNetworkInterface(_) => Some(LiveDeviceLifecycleAction {
+                kind: LoggerDeviceKind::Network,
+                operation: LiveDeviceLifecycleOperation::Update,
+            }),
+            VmmAction::PutPmem(input) => Some(LiveDeviceLifecycleAction {
+                kind: LoggerDeviceKind::Pmem,
+                operation: if self
+                    .controller
+                    .pmem_configs()
+                    .iter()
+                    .any(|config| config.id() == input.id())
+                {
+                    LiveDeviceLifecycleOperation::Update
+                } else {
+                    LiveDeviceLifecycleOperation::Attach
+                },
+            }),
+            VmmAction::PatchPmem(_) => Some(LiveDeviceLifecycleAction {
+                kind: LoggerDeviceKind::Pmem,
+                operation: LiveDeviceLifecycleOperation::Update,
+            }),
+            VmmAction::HotUnplugDevice(input) => Some(LiveDeviceLifecycleAction {
+                kind: match input.kind() {
+                    HotUnplugDeviceKind::Drive => LoggerDeviceKind::Block,
+                    HotUnplugDeviceKind::NetworkInterface => LoggerDeviceKind::Network,
+                    HotUnplugDeviceKind::Pmem => LoggerDeviceKind::Pmem,
+                },
+                operation: LiveDeviceLifecycleOperation::Detach,
+            }),
+            _ => None,
+        }
+    }
+
     pub(crate) fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         let had_started_session = self.has_started_session();
+        let live_device_lifecycle = self.live_device_lifecycle_action(&action);
+        self.live_device_backend_attempted = false;
         let result = match action {
             VmmAction::InstanceStart => self.start_instance(),
             VmmAction::PutBootSource(input) => self.put_boot_source(input),
@@ -5803,6 +6046,17 @@ where
             VmmAction::FlushMetrics => self.flush_metrics(),
             action => self.controller.handle_action(action),
         };
+
+        if let Some(action) = live_device_lifecycle {
+            let outcome = if result.is_ok() {
+                action.succeeded()
+            } else if self.live_device_backend_attempted {
+                action.failed()
+            } else {
+                action.rejected()
+            };
+            let _ = self.controller.log_lifecycle(outcome);
+        }
 
         if !had_started_session && self.has_started_session() {
             debug_assert!(self.metrics_session_epoch.is_none());
@@ -6042,6 +6296,24 @@ where
     }
 
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
+        self.instance_start_backend_attempted = false;
+        let result = self.start_instance_inner();
+        let outcome = if result.is_ok() {
+            let _ = self
+                .controller
+                .async_logger()
+                .log_api_worker(LoggerApiWorkerOutcome::Running);
+            LoggerLifecycleOutcome::VmStartSucceeded
+        } else if self.instance_start_backend_attempted {
+            LoggerLifecycleOutcome::VmStartFailed
+        } else {
+            LoggerLifecycleOutcome::VmStartRejected
+        };
+        let _ = self.controller.log_lifecycle(outcome);
+        result
+    }
+
+    fn start_instance_inner(&mut self) -> Result<VmmData, VmmActionError> {
         if self.terminal_snapshot_load_failure || self.terminal_instance_start_failure {
             return Err(VmmActionError::InstanceStart(BackendError::InvalidState(
                 "process cannot construct another VM after a terminal construction failure",
@@ -6215,6 +6487,7 @@ where
         let mut started_session = None;
         let mut terminal_start_failure = false;
 
+        self.instance_start_backend_attempted = true;
         let result = controller.start_instance_with(|controller| {
             match starter.start_with_startup_resources(
                 controller,
@@ -6222,10 +6495,13 @@ where
                 startup_resources,
             ) {
                 Ok(session) => {
+                    let _ =
+                        controller.log_lifecycle(LoggerLifecycleOutcome::BackendStartupSucceeded);
                     started_session = Some(session);
                     Ok(())
                 }
                 Err(source) => {
+                    let _ = controller.log_lifecycle(LoggerLifecycleOutcome::BackendStartupFailed);
                     terminal_start_failure =
                         source.disposition() == InstanceStartDisposition::Terminal;
                     Err(source.into_source())
@@ -6404,11 +6680,14 @@ where
             ),
             None => BlockBackingUpdate::ConfiguredPath,
         };
-        self.started_session
+        let session = self
+            .started_session
             .as_mut()
             .ok_or(VmmActionError::DriveUpdate(
                 DriveUpdateError::ActiveSessionUnavailable,
-            ))?
+            ))?;
+        self.live_device_backend_attempted = true;
+        session
             .update_block_device(
                 &config,
                 backing_update,
@@ -6512,11 +6791,14 @@ where
                 })?;
                 #[cfg(target_os = "macos")]
                 let drive_id = config.drive_id().to_string();
-                self.started_session
-                    .as_mut()
-                    .ok_or(VmmActionError::DriveRuntimeMutation(
-                        DriveRuntimeMutationError::ActiveSessionUnavailable,
-                    ))?
+                let session =
+                    self.started_session
+                        .as_mut()
+                        .ok_or(VmmActionError::DriveRuntimeMutation(
+                            DriveRuntimeMutationError::ActiveSessionUnavailable,
+                        ))?;
+                self.live_device_backend_attempted = true;
+                session
                     .insert_runtime_block_device(RuntimeBlockDeviceResource::vhost_user(
                         config, frontend,
                     ))
@@ -6568,6 +6850,7 @@ where
                         DriveRuntimeMutationError::ActiveSessionUnavailable,
                     )
                 })?;
+                self.live_device_backend_attempted = true;
                 session
                     .insert_runtime_block_device(RuntimeBlockDeviceResource::prepared(
                         prepared_device,
@@ -6601,6 +6884,7 @@ where
                 DriveRuntimeMutationError::ActiveSessionUnavailable,
             )
         })?;
+        self.live_device_backend_attempted = true;
         session
             .remove_runtime_block_device(prepared.drive_id())
             .map_err(VmmActionError::DriveRuntimeMutation)?;
@@ -6634,6 +6918,7 @@ where
                 NetworkRuntimeMutationError::ActiveSessionUnavailable,
             )
         })?;
+        self.live_device_backend_attempted = true;
         session
             .insert_runtime_network_device(config, self.vmnet_authority)
             .map_err(VmmActionError::NetworkRuntimeMutation)?;
@@ -6663,6 +6948,7 @@ where
                 NetworkRuntimeMutationError::ActiveSessionUnavailable,
             )
         })?;
+        self.live_device_backend_attempted = true;
         session
             .remove_runtime_network_device(prepared.iface_id())
             .map_err(VmmActionError::NetworkRuntimeMutation)?;
@@ -6796,6 +7082,7 @@ where
         let session = self.started_session.as_mut().ok_or({
             VmmActionError::PmemRuntimeMutation(PmemRuntimeMutationError::ActiveSessionUnavailable)
         })?;
+        self.live_device_backend_attempted = true;
         session
             .insert_runtime_pmem_device(config, backing)
             .map_err(VmmActionError::PmemRuntimeMutation)?;
@@ -6823,6 +7110,7 @@ where
         let session = self.started_session.as_mut().ok_or({
             VmmActionError::PmemRuntimeMutation(PmemRuntimeMutationError::ActiveSessionUnavailable)
         })?;
+        self.live_device_backend_attempted = true;
         session
             .remove_runtime_pmem_device(prepared.pmem_id())
             .map_err(VmmActionError::PmemRuntimeMutation)?;
@@ -6881,52 +7169,141 @@ where
     }
 
     fn pause_instance(&mut self) -> Result<VmmData, VmmActionError> {
-        let transition = self.controller.preflight_pause_instance()?;
+        let transition = match self.controller.preflight_pause_instance() {
+            Ok(transition) => transition,
+            Err(error) => {
+                let _ = self
+                    .controller
+                    .log_lifecycle(LoggerLifecycleOutcome::VmPauseRejected);
+                return Err(error);
+            }
+        };
         let Some(session) = self.started_session.as_mut() else {
+            let _ = self
+                .controller
+                .log_lifecycle(LoggerLifecycleOutcome::VmPauseFailed);
             return Err(VmmActionError::Lifecycle(BackendError::InvalidState(
                 "active session unavailable",
             )));
         };
 
         if transition == VmStateTransition::AlreadyInTargetState {
+            let _ = self
+                .controller
+                .log_lifecycle(LoggerLifecycleOutcome::VmPauseUnchanged);
             return Ok(VmmData::Empty);
         }
-        session.pause().map_err(VmmActionError::Lifecycle)?;
-        self.controller.pause_instance()
+        if let Err(error) = session.pause() {
+            let _ = self
+                .controller
+                .log_lifecycle(LoggerLifecycleOutcome::VmPauseFailed);
+            return Err(VmmActionError::Lifecycle(error));
+        }
+        let result = self.controller.pause_instance();
+        let outcome = if result.is_ok() {
+            LoggerLifecycleOutcome::VmPauseSucceeded
+        } else {
+            LoggerLifecycleOutcome::VmPauseFailed
+        };
+        let _ = self.controller.log_lifecycle(outcome);
+        result
     }
 
     fn resume_instance(&mut self) -> Result<VmmData, VmmActionError> {
-        let transition = self.controller.preflight_resume_instance()?;
+        self.resume_instance_with_lifecycle_log(true)
+    }
+
+    fn resume_instance_with_lifecycle_log(
+        &mut self,
+        log_lifecycle: bool,
+    ) -> Result<VmmData, VmmActionError> {
+        let transition = match self.controller.preflight_resume_instance() {
+            Ok(transition) => transition,
+            Err(error) => {
+                if log_lifecycle {
+                    let _ = self
+                        .controller
+                        .log_lifecycle(LoggerLifecycleOutcome::VmResumeRejected);
+                }
+                return Err(error);
+            }
+        };
         let Some(session) = self.started_session.as_mut() else {
+            if log_lifecycle {
+                let _ = self
+                    .controller
+                    .log_lifecycle(LoggerLifecycleOutcome::VmResumeFailed);
+            }
             return Err(VmmActionError::Lifecycle(BackendError::InvalidState(
                 "active session unavailable",
             )));
         };
 
         if transition == VmStateTransition::AlreadyInTargetState {
+            if log_lifecycle {
+                let _ = self
+                    .controller
+                    .log_lifecycle(LoggerLifecycleOutcome::VmResumeUnchanged);
+            }
             return Ok(VmmData::Empty);
         }
-        session.resume().map_err(VmmActionError::Lifecycle)?;
-        self.controller.resume_instance()
+        if let Err(error) = session.resume() {
+            if log_lifecycle {
+                let _ = self
+                    .controller
+                    .log_lifecycle(LoggerLifecycleOutcome::VmResumeFailed);
+            }
+            return Err(VmmActionError::Lifecycle(error));
+        }
+        let result = self.controller.resume_instance();
+        if log_lifecycle {
+            let outcome = if result.is_ok() {
+                LoggerLifecycleOutcome::VmResumeSucceeded
+            } else {
+                LoggerLifecycleOutcome::VmResumeFailed
+            };
+            let _ = self.controller.log_lifecycle(outcome);
+        }
+        result
     }
 
     fn create_snapshot(&mut self, input: SnapshotCreateInput) -> Result<VmmData, VmmActionError> {
-        match input.snapshot_type() {
+        let publication = match input.snapshot_type() {
             SnapshotType::Full => self.publish_native_v2_snapshot(&input),
             SnapshotType::Diff => self.publish_native_v2_diff_snapshot(&input),
-        }
-        .map_err(native_v2_snapshot_publication_action_error)?;
-        Ok(VmmData::Empty)
+        };
+        let outcome = publication
+            .as_ref()
+            .map_or_else(native_v2_snapshot_publication_logger_outcome, |_| {
+                LoggerSnapshotOutcome::CreateSucceeded
+            });
+        let result = publication
+            .map_err(native_v2_snapshot_publication_action_error)
+            .map(|_| VmmData::Empty);
+        let _ = self.controller.log_snapshot(outcome);
+        result
     }
 
     fn load_snapshot(&mut self, input: SnapshotLoadInput) -> Result<VmmData, VmmActionError> {
-        let resume_requested = self
-            .restore_native_snapshot(&input)
-            .map_err(native_snapshot_load_action_error)?;
-        if resume_requested {
-            self.resume_instance()
-                .map_err(native_v1_snapshot_resume_action_error)?;
+        let resume_requested = match self.restore_native_snapshot(&input) {
+            Ok(resume_requested) => resume_requested,
+            Err(error) => {
+                let outcome = native_snapshot_load_logger_outcome(&error);
+                let error = native_snapshot_load_action_error(error);
+                let _ = self.controller.log_snapshot(outcome);
+                return Err(error);
+            }
+        };
+        if resume_requested && let Err(error) = self.resume_instance_with_lifecycle_log(false) {
+            let error = native_v1_snapshot_resume_action_error(error);
+            let _ = self
+                .controller
+                .log_snapshot(LoggerSnapshotOutcome::LoadFailed);
+            return Err(error);
         }
+        let _ = self
+            .controller
+            .log_snapshot(LoggerSnapshotOutcome::LoadSucceeded);
         Ok(VmmData::Empty)
     }
 
@@ -6952,6 +7329,7 @@ where
                     .ok_or(VmmActionError::DriveUpdate(
                         DriveUpdateError::ActiveSessionUnavailable,
                     ))?;
+                self.live_device_backend_attempted = true;
                 session
                     .update_block_device(
                         &updated_config,
@@ -6995,6 +7373,7 @@ where
                 } else {
                     BlockBackingUpdate::Unchanged
                 };
+                self.live_device_backend_attempted = true;
                 session
                     .update_block_device(
                         &updated_config,
@@ -7033,6 +7412,7 @@ where
                 ));
             };
 
+            self.live_device_backend_attempted = true;
             session
                 .update_network_interface(update)
                 .map_err(VmmActionError::NetworkInterfaceUpdate)?;
@@ -7059,6 +7439,7 @@ where
                 ));
             };
 
+            self.live_device_backend_attempted = true;
             session
                 .update_pmem(update)
                 .map_err(VmmActionError::PmemUpdate)?;
@@ -7265,7 +7646,12 @@ where
         }
 
         self.initial_metrics_attempted = true;
-        let _ = self.flush_automatic_metrics();
+        if self.flush_automatic_metrics().is_err() {
+            let _ = self
+                .controller
+                .async_logger()
+                .log_observability(LoggerObservabilityOutcome::MetricsWorkerFailed);
+        }
     }
 
     pub(crate) fn emergency_logger(&self) -> EmergencyLogger {
@@ -7274,6 +7660,48 @@ where
 
     pub(crate) fn handle_terminal_observability(&mut self, category: ProcessTerminalCategory) {
         self.handle_initial_metrics_flush();
+        if !self.terminal_convergence_attempted {
+            self.terminal_convergence_attempted = true;
+            let logger = self.controller.async_logger();
+            if category == ProcessTerminalCategory::Cancelled {
+                let _ =
+                    logger.log_process_signal(LoggerProcessSignalOutcome::CancellationRequested);
+            } else if self.shutdown_wakeup_observed {
+                let _ = logger.log_process_signal(LoggerProcessSignalOutcome::HostSignalReceived);
+            }
+
+            let _ = self.process_exit_status();
+            let worker_outcome_observed = self.observed_process_exit_status.get().is_some();
+            let session_shutdown = self.started_session.take().map(|mut session| {
+                self.terminal_session_metrics = Some(session.metrics_diagnostics());
+                session.shutdown()
+            });
+            if let Some(status) = session_shutdown {
+                if !worker_outcome_observed {
+                    let _ = logger.log_api_worker(LoggerApiWorkerOutcome::Stopped);
+                }
+                let outcome = match status {
+                    ProcessSessionShutdownStatus::Succeeded => {
+                        LoggerLifecycleOutcome::VmStopSucceeded
+                    }
+                    ProcessSessionShutdownStatus::Failed => LoggerLifecycleOutcome::VmStopFailed,
+                };
+                let _ = self.controller.log_lifecycle(outcome);
+            }
+
+            let orderly =
+                matches!(
+                    category,
+                    ProcessTerminalCategory::Success | ProcessTerminalCategory::Cancelled
+                ) && !matches!(session_shutdown, Some(ProcessSessionShutdownStatus::Failed));
+            let shutdown_outcome = if orderly {
+                LoggerProcessSignalOutcome::ShutdownOrderly
+            } else {
+                LoggerProcessSignalOutcome::ShutdownAbnormal
+            };
+            let _ = logger.log_process_signal(shutdown_outcome);
+        }
+
         self.controller.settle_emergency_logger_loss();
         if !self.terminal_logger_attempted {
             self.terminal_logger_attempted = true;
@@ -7283,12 +7711,19 @@ where
     }
 
     fn handle_periodic_metrics_flush(&mut self) {
-        let _ = self.flush_automatic_metrics();
+        if self.flush_automatic_metrics().is_err() {
+            let _ = self
+                .controller
+                .async_logger()
+                .log_observability(LoggerObservabilityOutcome::MetricsWorkerFailed);
+        }
     }
 
     pub(crate) fn handle_terminal_metrics_flush(&mut self) {
         self.handle_initial_metrics_flush();
-        if !self.has_started_session() || self.terminal_metrics_attempted {
+        if (self.started_session.is_none() && self.terminal_session_metrics.is_none())
+            || self.terminal_metrics_attempted
+        {
             return;
         }
 
@@ -7332,6 +7767,7 @@ where
             .started_session
             .as_ref()
             .map(ProcessSessionDiagnostics::metrics_diagnostics)
+            .or_else(|| self.terminal_session_metrics.clone())
             .unwrap_or_default();
         let signal_diagnostics = self
             .process_signal_metrics
@@ -7359,14 +7795,46 @@ where
         Ok(())
     }
 
+    pub(crate) fn record_shutdown_wakeup(&mut self) {
+        self.shutdown_wakeup_observed = true;
+    }
+
     pub(crate) fn process_exit_status(&self) -> ProcessSessionExitStatus {
-        if self.terminal_snapshot_load_failure || self.terminal_instance_start_failure {
-            return ProcessSessionExitStatus::Terminal;
+        let status = if self.terminal_snapshot_load_failure || self.terminal_instance_start_failure
+        {
+            ProcessSessionExitStatus::Terminal
+        } else {
+            self.started_session
+                .as_ref()
+                .map(ProcessSessionDiagnostics::process_exit_status)
+                .unwrap_or_default()
+        };
+        if !matches!(
+            status,
+            ProcessSessionExitStatus::Running | ProcessSessionExitStatus::Terminal
+        ) && self.observed_process_exit_status.get().is_none()
+        {
+            self.observed_process_exit_status.set(Some(status));
+            let logger = self.controller.async_logger();
+            match status {
+                ProcessSessionExitStatus::GuestPoweroff => {
+                    let _ = logger.log_api_worker(LoggerApiWorkerOutcome::Exited);
+                    let _ = logger.log_process_signal(LoggerProcessSignalOutcome::GuestPoweroff);
+                }
+                ProcessSessionExitStatus::GuestReset => {
+                    let _ = logger.log_api_worker(LoggerApiWorkerOutcome::Exited);
+                    let _ = logger.log_process_signal(LoggerProcessSignalOutcome::GuestReset);
+                }
+                ProcessSessionExitStatus::WorkerExited => {
+                    let _ = logger.log_api_worker(LoggerApiWorkerOutcome::Exited);
+                }
+                ProcessSessionExitStatus::WorkerFailed => {
+                    let _ = logger.log_api_worker(LoggerApiWorkerOutcome::Failed);
+                }
+                ProcessSessionExitStatus::Running | ProcessSessionExitStatus::Terminal => {}
+            }
         }
-        self.started_session
-            .as_ref()
-            .map(ProcessSessionDiagnostics::process_exit_status)
-            .unwrap_or_default()
+        status
     }
 
     fn resume_native_v2_snapshot_if_requested(
@@ -7376,15 +7844,16 @@ where
         if !resume_requested {
             return Ok(false);
         }
-        self.resume_instance().map_err(|error| {
-            let source = match error {
-                VmmActionError::Lifecycle(source) => source,
-                _ => BackendError::InvalidState(
-                    "restored native-v2 resume failed before running-state commit",
-                ),
-            };
-            NativeV2SnapshotLoadError::Resume(source)
-        })?;
+        self.resume_instance_with_lifecycle_log(false)
+            .map_err(|error| {
+                let source = match error {
+                    VmmActionError::Lifecycle(source) => source,
+                    _ => BackendError::InvalidState(
+                        "restored native-v2 resume failed before running-state commit",
+                    ),
+                };
+                NativeV2SnapshotLoadError::Resume(source)
+            })?;
         Ok(true)
     }
 
@@ -10321,6 +10790,10 @@ where
 
     fn process_exit_status(&self) -> ProcessSessionExitStatus {
         ProcessVmm::process_exit_status(self)
+    }
+
+    fn record_shutdown_wakeup(&mut self) {
+        ProcessVmm::record_shutdown_wakeup(self);
     }
 }
 
@@ -30335,10 +30808,9 @@ impl BootRunLoopProcessExit for HvfArm64BootRunLoopOutcome {
             Self::StepLimitReached { .. } | Self::Wakeup { .. } => {
                 ProcessSessionExitStatus::Running
             }
-            Self::GuestShutdown { .. } | Self::GuestReset { .. } => {
-                ProcessSessionExitStatus::GuestRequestedStop
-            }
-            _ => ProcessSessionExitStatus::Terminal,
+            Self::GuestShutdown { .. } => ProcessSessionExitStatus::GuestPoweroff,
+            Self::GuestReset { .. } => ProcessSessionExitStatus::GuestReset,
+            _ => ProcessSessionExitStatus::WorkerExited,
         }
     }
 }
@@ -31838,9 +32310,9 @@ where
         let _ = self.control.request_stop();
     }
 
-    fn stop_and_join(&mut self) {
+    fn stop_and_join(&mut self) -> ProcessSessionShutdownStatus {
         let Some(worker) = self.worker.take() else {
-            return;
+            return ProcessSessionShutdownStatus::Succeeded;
         };
 
         // Snapshot memory I/O is cooperative. Signal it before shutdown can
@@ -31855,7 +32327,13 @@ where
         // A stop error can mean an in-flight vCPU run was not canceled; avoid
         // turning cleanup into an unbounded join in that error path.
         if stop_requested || was_paused || worker.is_finished() {
-            let _ = worker.join();
+            if worker.join().is_ok() {
+                ProcessSessionShutdownStatus::Succeeded
+            } else {
+                ProcessSessionShutdownStatus::Failed
+            }
+        } else {
+            ProcessSessionShutdownStatus::Failed
         }
     }
 }
@@ -35186,6 +35664,21 @@ impl ProcessSessionDiagnostics for HvfProcessSession {
     fn process_exit_status(&self) -> ProcessSessionExitStatus {
         self.diagnostics().process_exit_status()
     }
+
+    fn shutdown(&mut self) -> ProcessSessionShutdownStatus {
+        match self {
+            Self::Boot(session) => session.stop_and_join(),
+            Self::SnapshotV2(session) => session.stop_and_join(),
+            #[cfg(target_os = "macos")]
+            Self::SerialSnapshotV2(destination) => {
+                if destination.cleanup().is_ok() {
+                    ProcessSessionShutdownStatus::Succeeded
+                } else {
+                    ProcessSessionShutdownStatus::Failed
+                }
+            }
+        }
+    }
 }
 
 impl<S> ProcessSessionDiagnostics for BootRunLoopSupervisor<S>
@@ -35661,8 +36154,12 @@ where
             BootRunLoopWorkerStatus::Running => ProcessSessionExitStatus::Running,
             BootRunLoopWorkerStatus::Paused => ProcessSessionExitStatus::Running,
             BootRunLoopWorkerStatus::Exited(outcome) => outcome.process_exit_status(),
-            BootRunLoopWorkerStatus::Failed(_) => ProcessSessionExitStatus::Terminal,
+            BootRunLoopWorkerStatus::Failed(_) => ProcessSessionExitStatus::WorkerFailed,
         }
+    }
+
+    fn shutdown(&mut self) -> ProcessSessionShutdownStatus {
+        self.stop_and_join()
     }
 }
 
@@ -35671,7 +36168,7 @@ where
     S: BootRunLoopSession,
 {
     fn drop(&mut self) {
-        self.stop_and_join();
+        let _ = self.stop_and_join();
     }
 }
 
@@ -35761,7 +36258,8 @@ mod tests {
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::logger::{
-        LoggerConfigInput, ProcessStdoutLogger, ProcessTerminalCategory,
+        LoggerConfigInput, LoggerLevel, LoggerLifecycleOutcome, ProcessStdoutLogger,
+        ProcessTerminalCategory,
     };
     use bangbang_runtime::machine::{MachineConfig, MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::memory::{
@@ -35990,18 +36488,19 @@ mod tests {
         ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
         ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
         ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessSnapshotV2BalloonLoadRequest,
-        ProcessSnapshotV2DiffLoadRequest, ProcessSnapshotV2EntropyLoadRequest,
-        ProcessSnapshotV2MemoryHotplugLoadRequest, ProcessSnapshotV2MultiBlockLoadRequest,
-        ProcessSnapshotV2MultiBlockLoadSuccess, ProcessSnapshotV2NetworkLoadRequest,
-        ProcessSnapshotV2NetworkRestorePlanError, ProcessSnapshotV2RootLoadCompletion,
-        ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess,
-        ProcessSnapshotV2SerialLoadRequest, ProcessSnapshotV2StorageLoadRequest,
-        ProcessSnapshotV2StorageLoadSuccess, ProcessSnapshotV2VsockLoadRequest, ProcessVmm,
-        ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
-        SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
-        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
-        native_v2_platform_capture_is_terminal, prepare_process_snapshot_v2_network_restore_plan,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessSessionShutdownStatus,
+        ProcessSnapshotV2BalloonLoadRequest, ProcessSnapshotV2DiffLoadRequest,
+        ProcessSnapshotV2EntropyLoadRequest, ProcessSnapshotV2MemoryHotplugLoadRequest,
+        ProcessSnapshotV2MultiBlockLoadRequest, ProcessSnapshotV2MultiBlockLoadSuccess,
+        ProcessSnapshotV2NetworkLoadRequest, ProcessSnapshotV2NetworkRestorePlanError,
+        ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
+        ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2SerialLoadRequest,
+        ProcessSnapshotV2StorageLoadRequest, ProcessSnapshotV2StorageLoadSuccess,
+        ProcessSnapshotV2VsockLoadRequest, ProcessVmm, ProcessVmnetAuthority,
+        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
+        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
+        prepare_process_snapshot_v2_network_restore_plan,
         prepare_process_snapshot_v2_vsock_candidate, require_native_v1_composite_record,
         snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
@@ -36590,6 +37089,8 @@ mod tests {
         memory_hotplug_status_count: usize,
         last_memory_hotplug_status_requested_size_mib: Option<u64>,
         memory_hotplug_status_result: Option<Result<MemoryHotplugStatus, MemoryHotplugStatusError>>,
+        process_exit_status: ProcessSessionExitStatus,
+        shutdown_status: ProcessSessionShutdownStatus,
     }
 
     impl FakeSession {
@@ -36666,7 +37167,21 @@ mod tests {
                 memory_hotplug_status_count: 0,
                 last_memory_hotplug_status_requested_size_mib: None,
                 memory_hotplug_status_result: None,
+                process_exit_status: ProcessSessionExitStatus::Running,
+                shutdown_status: ProcessSessionShutdownStatus::Succeeded,
             }
+        }
+
+        fn with_process_exit_status(id: u64, status: ProcessSessionExitStatus) -> Self {
+            let mut session = Self::new(id);
+            session.process_exit_status = status;
+            session
+        }
+
+        fn with_shutdown_status(id: u64, status: ProcessSessionShutdownStatus) -> Self {
+            let mut session = Self::new(id);
+            session.shutdown_status = status;
+            session
         }
 
         fn with_block_update_result(id: u64, result: DriveUpdateError) -> Self {
@@ -37104,6 +37619,14 @@ mod tests {
                 None => Ok(MemoryHotplugStatus::new(config, 0, requested_size_mib)),
             }
         }
+
+        fn process_exit_status(&self) -> ProcessSessionExitStatus {
+            self.process_exit_status
+        }
+
+        fn shutdown(&mut self) -> ProcessSessionShutdownStatus {
+            self.shutdown_status
+        }
     }
 
     impl SnapshotCreateSession for FakeSession {
@@ -37157,9 +37680,10 @@ mod tests {
             storage_configs,
             network_configs,
             mmds_config,
+            mmds_state: _,
             vsock_config,
             expected_transport: transport,
-            ..
+            cancellation,
         } = request;
         let has_block = !storage_configs.drives().is_empty();
         let has_pmem = !storage_configs.pmem().is_empty();
@@ -37178,17 +37702,24 @@ mod tests {
         destination
             .publish(|mut writer| {
                 session.native_snapshot_producer_count += 1;
+                if cancellation.is_cancelled() {
+                    return Err(NativeV2SnapshotPublicationProducerError::Capture(
+                        NativeV2SnapshotCaptureError::Cancelled {
+                            stage: NativeV2SnapshotCaptureStage::Source,
+                        },
+                    ));
+                }
                 let binding =
-                    write_snapshot_v2_memory_image_with_cancel(&memory, &mut writer, |_| false)
-                        .map_err(|source| {
-                            NativeV2SnapshotPublicationProducerError::Capture(
-                                NativeV2SnapshotCaptureError::Platform {
-                                    source: HvfArm64BootSnapshotV2CaptureError::MemoryImage {
-                                        source,
-                                    },
-                                },
-                            )
-                        })?;
+                    write_snapshot_v2_memory_image_with_cancel(&memory, &mut writer, |_| {
+                        cancellation.is_cancelled()
+                    })
+                    .map_err(|source| {
+                        NativeV2SnapshotPublicationProducerError::Capture(
+                            NativeV2SnapshotCaptureError::Platform {
+                                source: HvfArm64BootSnapshotV2CaptureError::MemoryImage { source },
+                            },
+                        )
+                    })?;
                 let memory = binding.encode().map_err(|source| {
                     NativeV2SnapshotPublicationProducerError::Capture(
                         NativeV2SnapshotCaptureError::Encode {
@@ -39399,7 +39930,7 @@ mod tests {
         fn process_exit_status(&self) -> super::ProcessSessionExitStatus {
             match self {
                 Self::StepLimitReached | Self::Wakeup => super::ProcessSessionExitStatus::Running,
-                Self::Terminal => super::ProcessSessionExitStatus::GuestRequestedStop,
+                Self::Terminal => super::ProcessSessionExitStatus::GuestPoweroff,
             }
         }
     }
@@ -39411,7 +39942,11 @@ mod tests {
             super::ProcessSessionExitDecision::Continue
         );
         assert_eq!(
-            super::ProcessSessionExitStatus::GuestRequestedStop.decision(),
+            super::ProcessSessionExitStatus::GuestPoweroff.decision(),
+            super::ProcessSessionExitDecision::ExitSuccessfully
+        );
+        assert_eq!(
+            super::ProcessSessionExitStatus::GuestReset.decision(),
             super::ProcessSessionExitDecision::ExitSuccessfully
         );
         assert_eq!(
@@ -39426,13 +39961,13 @@ mod tests {
             super::BootRunLoopProcessExit::process_exit_status(
                 &super::HvfArm64BootRunLoopOutcome::GuestShutdown { steps: 1 },
             ),
-            super::ProcessSessionExitStatus::GuestRequestedStop
+            super::ProcessSessionExitStatus::GuestPoweroff
         );
         assert_eq!(
             super::BootRunLoopProcessExit::process_exit_status(
                 &super::HvfArm64BootRunLoopOutcome::GuestReset { steps: 1 },
             ),
-            super::ProcessSessionExitStatus::GuestRequestedStop
+            super::ProcessSessionExitStatus::GuestReset
         );
         assert_eq!(
             super::BootRunLoopProcessExit::process_exit_status(
@@ -39441,7 +39976,7 @@ mod tests {
                     reason: 1,
                 },
             ),
-            super::ProcessSessionExitStatus::Terminal
+            super::ProcessSessionExitStatus::WorkerExited
         );
     }
 
@@ -45697,6 +46232,113 @@ mod tests {
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
             "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn snapshot_load_logger_closes_success_rejection_failure_and_cancellation() {
+        let (success_snapshot, success_input) =
+            native_v2_snapshot_load_fixture("snapshot-load-log-success", false);
+        let success_log = TempFilePath::create("private-snapshot-load-success-log");
+        let mut success = ProcessVmm::with_starter(
+            "snapshot-load-success",
+            "0.1.0",
+            "bangbang",
+            FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success),
+        );
+        success
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(success_log.path()),
+            ))
+            .expect("success logger should configure");
+        success
+            .handle_action(VmmAction::LoadSnapshot(success_input))
+            .expect("snapshot load should succeed");
+        assert_eq!(
+            fs::read_to_string(success_log.path()).expect("success log should read"),
+            "operation=snapshot-load outcome=succeeded\n"
+        );
+        success_snapshot.assert_no_staging();
+
+        let rejected_log = TempFilePath::create("private-snapshot-load-rejected-log");
+        let mut rejected = ProcessVmm::with_starter(
+            "snapshot-load-rejected",
+            "0.1.0",
+            "bangbang",
+            FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success),
+        );
+        rejected
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(rejected_log.path()),
+            ))
+            .expect("rejection logger should configure");
+        rejected
+            .handle_action(VmmAction::PutSerial(
+                SerialConfigInput::new().with_serial_out_path("/private/rejected-serial"),
+            ))
+            .expect("serial configuration should make the destination non-fresh");
+        assert!(
+            rejected
+                .handle_action(VmmAction::LoadSnapshot(snapshot_load_input(false)))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(rejected_log.path()).expect("rejection log should read"),
+            "operation=snapshot-load outcome=rejected\n"
+        );
+
+        let (failed_snapshot, failed_input) =
+            native_v2_snapshot_load_fixture("snapshot-load-log-failed", true);
+        let failed_log = TempFilePath::create("private-snapshot-load-failed-log");
+        let mut failed = ProcessVmm::with_starter(
+            "snapshot-load-failed",
+            "0.1.0",
+            "bangbang",
+            FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::ResumeFailure),
+        );
+        failed
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(failed_log.path()),
+            ))
+            .expect("failure logger should configure");
+        assert!(
+            failed
+                .handle_action(VmmAction::LoadSnapshot(failed_input))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(failed_log.path()).expect("failure log should read"),
+            "operation=snapshot-load outcome=failed\n"
+        );
+        failed_snapshot.assert_no_staging();
+
+        let (cancelled_snapshot, cancelled_input) =
+            native_v2_snapshot_load_fixture("snapshot-load-log-cancelled", false);
+        let cancellation = NativeV2SnapshotCaptureCancellation::default();
+        let cancelled_log = TempFilePath::create("private-snapshot-load-cancelled-log");
+        let mut cancelled = ProcessVmm::with_starter(
+            "snapshot-load-cancelled",
+            "0.1.0",
+            "bangbang",
+            FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success),
+        )
+        .with_snapshot_capture_cancellation(cancellation.clone());
+        cancelled
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(cancelled_log.path()),
+            ))
+            .expect("cancellation logger should configure");
+        cancellation.cancel();
+        assert!(
+            cancelled
+                .handle_action(VmmAction::LoadSnapshot(cancelled_input))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(cancelled_log.path()).expect("cancellation log should read"),
+            "operation=snapshot-load outcome=cancelled\n"
+        );
+        cancelled_snapshot.assert_no_staging();
     }
 
     #[cfg(target_os = "macos")]
@@ -53837,7 +54479,7 @@ mod tests {
         );
         assert_eq!(
             supervisor.process_exit_status(),
-            super::ProcessSessionExitStatus::GuestRequestedStop
+            super::ProcessSessionExitStatus::GuestPoweroff
         );
         assert!(supervisor.process_exit_wakeup_fd().is_some());
         supervisor
@@ -55619,7 +56261,7 @@ mod tests {
         );
         assert_eq!(
             supervisor.process_exit_status(),
-            super::ProcessSessionExitStatus::Terminal
+            super::ProcessSessionExitStatus::WorkerFailed
         );
         supervisor
             .drain_process_exit_wakeup()
@@ -55982,6 +56624,71 @@ mod tests {
             .expect("started session should remain available");
         assert_eq!(session.pause_count, 1);
         assert_eq!(session.resume_count, 0);
+    }
+
+    #[test]
+    fn lifecycle_logger_distinguishes_pause_resume_results_without_error_payloads() {
+        let output = TempFilePath::create("pause-resume-lifecycle");
+        let mut vmm = configured_vmm(FakeStarter::success(121));
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new()
+                .with_log_path(output.path())
+                .with_level(LoggerLevel::Debug),
+        ))
+        .expect("logger should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("pause should succeed");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("duplicate pause should succeed");
+        vmm.handle_action(VmmAction::Resume)
+            .expect("resume should succeed");
+        vmm.handle_action(VmmAction::Resume)
+            .expect("duplicate resume should succeed");
+
+        let output = fs::read_to_string(output.path()).expect("logger output should read");
+        for expected in [
+            "operation=vm-pause outcome=succeeded\n",
+            "operation=vm-pause outcome=unchanged\n",
+            "operation=vm-resume outcome=succeeded\n",
+            "operation=vm-resume outcome=unchanged\n",
+        ] {
+            assert_eq!(output.matches(expected).count(), 1);
+        }
+
+        let failed_output = TempFilePath::create("pause-lifecycle-failed");
+        let mut failed = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_pause_result(
+                122,
+                BackendError::Hypervisor("private-pause-error".to_owned()),
+            ),
+        ));
+        failed
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(failed_output.path()),
+            ))
+            .expect("logger should configure");
+        failed
+            .handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        assert!(failed.handle_action(VmmAction::Pause).is_err());
+        let output = fs::read_to_string(failed_output.path()).expect("logger output should read");
+        assert!(output.contains("operation=vm-pause outcome=failed\n"));
+        assert!(!output.contains("private-pause-error"));
+
+        let rejected_output = TempFilePath::create("pause-lifecycle-rejected");
+        let mut rejected = configured_vmm(FakeStarter::success(123));
+        rejected
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(rejected_output.path()),
+            ))
+            .expect("logger should configure");
+        assert!(rejected.handle_action(VmmAction::Pause).is_err());
+        assert_eq!(
+            fs::read_to_string(rejected_output.path()).expect("logger output should read"),
+            "operation=vm-pause outcome=rejected\n"
+        );
     }
 
     #[test]
@@ -56886,6 +57593,208 @@ mod tests {
             .expect("started session should remain available");
         assert_eq!(session.snapshot_create_barrier_count, 0);
         assert_eq!(session.native_snapshot_publication_count, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn snapshot_create_logger_closes_success_rejection_failure_and_cancellation() {
+        let success_directory = TempSnapshotDirectory::new("snapshot-log-success");
+        let success_paths = success_directory.paths();
+        let success_log = TempFilePath::create("private-snapshot-success-log");
+        let mut success = snapshot_profile_vmm(FakeStarter::success(127));
+        success
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(success_log.path()),
+            ))
+            .expect("success logger should configure");
+        success
+            .handle_action(VmmAction::InstanceStart)
+            .expect("success source should start");
+        success
+            .handle_action(VmmAction::Pause)
+            .expect("success source should pause");
+        success
+            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                success_paths.state(),
+                success_paths.memory(),
+            )))
+            .expect("snapshot should succeed");
+        let output = fs::read_to_string(success_log.path()).expect("success log should read");
+        assert!(output.contains("operation=snapshot-create outcome=succeeded\n"));
+        assert!(
+            !output.contains(
+                success_paths
+                    .state()
+                    .to_str()
+                    .expect("success state path should be UTF-8")
+            )
+        );
+        assert!(
+            !output.contains(
+                success_paths
+                    .memory()
+                    .to_str()
+                    .expect("success memory path should be UTF-8")
+            )
+        );
+
+        let rejected_log = TempFilePath::create("private-snapshot-rejected-log");
+        let mut rejected = configured_vmm(FakeStarter::success(128));
+        rejected
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(rejected_log.path()),
+            ))
+            .expect("rejection logger should configure");
+        assert!(
+            rejected
+                .handle_action(snapshot_create_action(SnapshotType::Full))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(rejected_log.path()).expect("rejection log should read"),
+            "operation=snapshot-create outcome=rejected\n"
+        );
+
+        let failed_directory = TempSnapshotDirectory::new("snapshot-log-failed");
+        let failed_paths = failed_directory.paths();
+        fs::write(failed_paths.state(), b"private-existing-snapshot-state")
+            .expect("existing snapshot state should create a publication collision");
+        let failed_log = TempFilePath::create("private-snapshot-failed-log");
+        let mut failed = snapshot_profile_vmm(FakeStarter::success(129));
+        failed
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(failed_log.path()),
+            ))
+            .expect("failure logger should configure");
+        failed
+            .handle_action(VmmAction::InstanceStart)
+            .expect("failure source should start");
+        failed
+            .handle_action(VmmAction::Pause)
+            .expect("failure source should pause");
+        assert!(
+            failed
+                .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                    SnapshotType::Full,
+                    failed_paths.state(),
+                    failed_paths.memory(),
+                )))
+                .is_err()
+        );
+        let output = fs::read_to_string(failed_log.path()).expect("failure log should read");
+        assert!(output.contains("operation=snapshot-create outcome=failed\n"));
+        assert!(
+            !output.contains(
+                failed_paths
+                    .state()
+                    .to_str()
+                    .expect("failed state path should be UTF-8")
+            )
+        );
+        assert!(
+            !output.contains(
+                failed_paths
+                    .memory()
+                    .to_str()
+                    .expect("failed memory path should be UTF-8")
+            )
+        );
+
+        let cancellation = NativeV2SnapshotCaptureCancellation::default();
+        let cancelled_directory = TempSnapshotDirectory::new("snapshot-log-cancelled");
+        let cancelled_paths = cancelled_directory.paths();
+        let cancelled_log = TempFilePath::create("private-snapshot-cancelled-log");
+        let mut cancelled = snapshot_profile_vmm(FakeStarter::success(130))
+            .with_snapshot_capture_cancellation(cancellation.clone());
+        cancelled
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(cancelled_log.path()),
+            ))
+            .expect("cancellation logger should configure");
+        cancelled
+            .handle_action(VmmAction::InstanceStart)
+            .expect("cancelled source should start");
+        cancelled
+            .handle_action(VmmAction::Pause)
+            .expect("cancelled source should pause");
+        cancellation.cancel();
+        assert!(
+            cancelled
+                .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                    SnapshotType::Full,
+                    cancelled_paths.state(),
+                    cancelled_paths.memory(),
+                )))
+                .is_err()
+        );
+        let output = fs::read_to_string(cancelled_log.path()).expect("cancelled log should read");
+        assert!(output.contains("operation=snapshot-create outcome=cancelled\n"));
+        assert!(
+            !output.contains(
+                cancelled_paths
+                    .state()
+                    .to_str()
+                    .expect("cancelled state path should be UTF-8")
+            )
+        );
+        assert!(
+            !output.contains(
+                cancelled_paths
+                    .memory()
+                    .to_str()
+                    .expect("cancelled memory path should be UTF-8")
+            )
+        );
+
+        let preflight_directory = TempSnapshotDirectory::new("snapshot-log-preflight-cancelled");
+        let preflight_paths = preflight_directory.paths();
+        let preflight_log = TempFilePath::create("private-snapshot-preflight-cancelled-log");
+        let mut preflight_cancelled = snapshot_profile_vmm(
+            FakeStarter::success(131).with_snapshot_storage_preflight_failure(
+                HvfArm64BootStorageCaptureError::cancelled(),
+            ),
+        );
+        preflight_cancelled
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(preflight_log.path()),
+            ))
+            .expect("preflight cancellation logger should configure");
+        preflight_cancelled
+            .handle_action(VmmAction::InstanceStart)
+            .expect("preflight cancellation source should start");
+        preflight_cancelled
+            .handle_action(VmmAction::Pause)
+            .expect("preflight cancellation source should pause");
+        assert!(
+            preflight_cancelled
+                .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                    SnapshotType::Full,
+                    preflight_paths.state(),
+                    preflight_paths.memory(),
+                )))
+                .is_err()
+        );
+        let output = fs::read_to_string(preflight_log.path())
+            .expect("preflight cancellation log should read");
+        assert!(output.contains("operation=snapshot-create outcome=cancelled\n"));
+        assert!(!output.contains("operation=snapshot-create outcome=rejected\n"));
+        assert!(
+            !output.contains(
+                preflight_paths
+                    .state()
+                    .to_str()
+                    .expect("preflight cancellation state path should be UTF-8")
+            )
+        );
+        assert!(
+            !output.contains(
+                preflight_paths
+                    .memory()
+                    .to_str()
+                    .expect("preflight cancellation memory path should be UTF-8")
+            )
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -62895,8 +63804,13 @@ mod tests {
         let block = TempFilePath::create("mixed-runtime-block");
         let second_block = TempFilePath::create("mixed-runtime-second-block");
         let pmem = TempFilePath::create_with_bytes("mixed-runtime-pmem", b"pmem");
+        let logger = TempFilePath::create("mixed-runtime-logger");
         let mut vmm = configured_vmm(FakeStarter::success(88));
         vmm.pci_enabled = true;
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(logger.path()),
+        ))
+        .expect("logger should configure before startup");
         vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
             "rootfs",
             "rootfs",
@@ -63062,6 +63976,164 @@ mod tests {
                 "block:remove:shared",
             ]
         );
+
+        let output = fs::read_to_string(logger.path()).expect("logger output should read");
+        for (kind, attach_count, update_count, detach_count) in
+            [("block", 2, 1, 2), ("network", 2, 0, 2), ("pmem", 2, 0, 2)]
+        {
+            assert_eq!(
+                output
+                    .matches(&format!(
+                        "device-kind={kind} operation=device-attach outcome=succeeded\n"
+                    ))
+                    .count(),
+                attach_count
+            );
+            assert_eq!(
+                output
+                    .matches(&format!(
+                        "device-kind={kind} operation=device-update outcome=succeeded\n"
+                    ))
+                    .count(),
+                update_count
+            );
+            assert_eq!(
+                output
+                    .matches(&format!(
+                        "device-kind={kind} operation=device-detach outcome=succeeded\n"
+                    ))
+                    .count(),
+                detach_count
+            );
+        }
+        assert_eq!(
+            output
+                .matches("device-kind=pmem operation=device-update outcome=rejected\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            output
+                .matches("device-kind=network operation=device-update outcome=rejected\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            output
+                .matches("device-kind=network operation=device-attach outcome=rejected\n")
+                .count(),
+            1
+        );
+        for forbidden in [
+            SHARED_ID,
+            SHARED_MAC,
+            "vmnet:shared",
+            root.path().to_str().expect("root path should be UTF-8"),
+            block.path().to_str().expect("block path should be UTF-8"),
+            pmem.path().to_str().expect("pmem path should be UTF-8"),
+        ] {
+            assert!(!output.contains(forbidden), "logger leaked {forbidden:?}");
+        }
+    }
+
+    #[test]
+    fn live_device_backend_failures_use_closed_kind_and_operation_only() {
+        let block_backing = TempFilePath::create("private-block-backing");
+        let block_log = TempFilePath::create("private-block-log");
+        let mut block = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_block_insert_result(
+                124,
+                DriveRuntimeMutationError::PublishDevice {
+                    message: "private-block-backend-error".to_owned(),
+                },
+            ),
+        ));
+        block.pci_enabled = true;
+        block
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(block_log.path()),
+            ))
+            .expect("block logger should configure");
+        block
+            .handle_action(VmmAction::InstanceStart)
+            .expect("block VM should start");
+        assert!(
+            block
+                .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+                    "private_block_id",
+                    "private_block_id",
+                    block_backing.path(),
+                    false,
+                )))
+                .is_err()
+        );
+        let output = fs::read_to_string(block_log.path()).expect("block logger should read");
+        assert!(output.contains("device-kind=block operation=device-attach outcome=failed\n"));
+        assert!(!output.contains("private_block_id"));
+        assert!(!output.contains("private-block-backend-error"));
+
+        let network_log = TempFilePath::create("private-network-log");
+        let mut network = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_network_insert_result(
+                125,
+                NetworkRuntimeMutationError::PublishDevice {
+                    message: "private-network-backend-error".to_owned(),
+                },
+            ),
+        ));
+        network.pci_enabled = true;
+        network
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(network_log.path()),
+            ))
+            .expect("network logger should configure");
+        network
+            .handle_action(VmmAction::InstanceStart)
+            .expect("network VM should start");
+        assert!(
+            network
+                .handle_action(VmmAction::PutNetworkInterface(
+                    NetworkInterfaceConfigInput::new(
+                        "private_network_id",
+                        "private_network_id",
+                        "vmnet:private-network-host",
+                    ),
+                ))
+                .is_err()
+        );
+        let output = fs::read_to_string(network_log.path()).expect("network logger should read");
+        assert!(output.contains("device-kind=network operation=device-attach outcome=failed\n"));
+        assert!(!output.contains("private_network_id"));
+        assert!(!output.contains("private-network-backend-error"));
+
+        let pmem_backing = TempFilePath::create_with_bytes("private-pmem-backing", b"pmem");
+        let pmem_log = TempFilePath::create("private-pmem-log");
+        let mut pmem = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_pmem_insert_result(
+                126,
+                PmemRuntimeMutationError::PublishDevice {
+                    message: "private-pmem-backend-error".to_owned(),
+                },
+            ),
+        ));
+        pmem.pci_enabled = true;
+        pmem.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(pmem_log.path()),
+        ))
+        .expect("pmem logger should configure");
+        pmem.handle_action(VmmAction::InstanceStart)
+            .expect("pmem VM should start");
+        assert!(
+            pmem.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+                "private_pmem_id",
+                pmem_backing.path().display().to_string(),
+            )))
+            .is_err()
+        );
+        let output = fs::read_to_string(pmem_log.path()).expect("pmem logger should read");
+        assert!(output.contains("device-kind=pmem operation=device-attach outcome=failed\n"));
+        assert!(!output.contains("private_pmem_id"));
+        assert!(!output.contains("private-pmem-backend-error"));
     }
 
     #[test]
@@ -63955,7 +65027,12 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(logger.path()).expect("logger output should read"),
-            "action=InstanceStart\n"
+            concat!(
+                "operation=backend-startup outcome=succeeded\n",
+                "action=InstanceStart\n",
+                "operation=boot-worker outcome=running\n",
+                "operation=vm-start outcome=succeeded\n",
+            )
         );
     }
 
@@ -63998,7 +65075,12 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(logger.path()).expect("logger output should read"),
-            "action=InstanceStart\n"
+            concat!(
+                "operation=backend-startup outcome=succeeded\n",
+                "action=InstanceStart\n",
+                "operation=boot-worker outcome=running\n",
+                "operation=vm-start outcome=succeeded\n",
+            )
         );
     }
 
@@ -64028,12 +65110,202 @@ mod tests {
         assert_eq!(
             fs::read_to_string(output.path()).expect("combined output should read"),
             concat!(
+                "operation=backend-startup outcome=succeeded\n",
                 "action=InstanceStart\n",
+                "operation=boot-worker outcome=running\n",
+                "operation=vm-start outcome=succeeded\n",
                 "{\"vmm\":{\"metrics_flush_count\":1}}\n",
+                "operation=vm-stop outcome=succeeded\n",
+                "operation=shutdown outcome=orderly\n",
                 "event=process-exit category=success\n",
                 "{\"vmm\":{\"metrics_flush_count\":1}}\n",
             )
         );
+    }
+
+    #[test]
+    fn terminal_convergence_orders_signal_worker_stop_vm_stop_and_final_record_once() {
+        let output = TempFilePath::create("terminal-convergence-signal");
+        let mut vmm =
+            ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", FakeStarter::success(19));
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new()
+                .with_log_path(output.path())
+                .with_level(LoggerLevel::Debug),
+        ))
+        .expect("logger should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/private/terminal-kernel",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        vmm.record_shutdown_wakeup();
+        vmm.handle_terminal_observability(ProcessTerminalCategory::Success);
+        vmm.handle_terminal_observability(ProcessTerminalCategory::Panic);
+
+        let output = fs::read_to_string(output.path()).expect("logger output should read");
+        assert_eq!(
+            output,
+            concat!(
+                "operation=backend-startup outcome=succeeded\n",
+                "action=InstanceStart\n",
+                "operation=boot-worker outcome=running\n",
+                "operation=vm-start outcome=succeeded\n",
+                "operation=host-signal outcome=received\n",
+                "operation=boot-worker outcome=stopped\n",
+                "operation=vm-stop outcome=succeeded\n",
+                "operation=shutdown outcome=orderly\n",
+                "event=process-exit category=success\n",
+            )
+        );
+        assert!(!output.contains("terminal-kernel"));
+    }
+
+    #[test]
+    fn terminal_cleanup_failure_is_logged_without_replacing_terminal_category() {
+        let output = TempFilePath::create("terminal-convergence-failure");
+        let session = FakeSession::with_shutdown_status(20, ProcessSessionShutdownStatus::Failed);
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            FakeStarter::success_with_session(session),
+        );
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new()
+                .with_log_path(output.path())
+                .with_level(LoggerLevel::Debug),
+        ))
+        .expect("logger should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/private/failing-cleanup-kernel",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        vmm.handle_terminal_observability(ProcessTerminalCategory::Success);
+
+        let output = fs::read_to_string(output.path()).expect("logger output should read");
+        assert!(output.contains("operation=boot-worker outcome=stopped\n"));
+        assert!(output.contains("operation=vm-stop outcome=failed\n"));
+        assert!(output.contains("operation=shutdown outcome=abnormal\n"));
+        assert!(output.ends_with("event=process-exit category=success\n"));
+        assert!(!output.contains("failing-cleanup-kernel"));
+    }
+
+    #[test]
+    fn process_exit_observation_distinguishes_guest_and_worker_outcomes_once() {
+        for (status, decision, expected_worker, expected_power) in [
+            (
+                ProcessSessionExitStatus::GuestPoweroff,
+                super::ProcessSessionExitDecision::ExitSuccessfully,
+                "operation=boot-worker outcome=exited\n",
+                Some("operation=guest-power outcome=poweroff\n"),
+            ),
+            (
+                ProcessSessionExitStatus::GuestReset,
+                super::ProcessSessionExitDecision::ExitSuccessfully,
+                "operation=boot-worker outcome=exited\n",
+                Some("operation=guest-power outcome=reset\n"),
+            ),
+            (
+                ProcessSessionExitStatus::WorkerExited,
+                super::ProcessSessionExitDecision::ExitWithFailure,
+                "operation=boot-worker outcome=exited\n",
+                None,
+            ),
+            (
+                ProcessSessionExitStatus::WorkerFailed,
+                super::ProcessSessionExitDecision::ExitWithFailure,
+                "operation=boot-worker outcome=failed\n",
+                None,
+            ),
+        ] {
+            let output = TempFilePath::create("process-exit-observation");
+            let session = FakeSession::with_process_exit_status(21, status);
+            let mut vmm = ProcessVmm::with_starter(
+                "demo-1",
+                "0.1.0",
+                "bangbang",
+                FakeStarter::success_with_session(session),
+            );
+            vmm.handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(output.path()),
+            ))
+            .expect("logger should configure");
+            vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                "/private/guest-kernel",
+            )))
+            .expect("boot source should configure");
+            vmm.handle_action(VmmAction::InstanceStart)
+                .expect("startup should succeed");
+
+            assert_eq!(vmm.process_exit_status(), status);
+            assert_eq!(vmm.process_exit_status().decision(), decision);
+            let _ = vmm
+                .controller
+                .log_lifecycle(LoggerLifecycleOutcome::VmStopSucceeded);
+
+            let output = fs::read_to_string(output.path()).expect("logger output should read");
+            assert_eq!(output.matches(expected_worker).count(), 1);
+            if let Some(expected_power) = expected_power {
+                assert_eq!(output.matches(expected_power).count(), 1);
+            } else {
+                assert!(!output.contains("operation=guest-power"));
+            }
+            assert!(!output.contains("guest-kernel"));
+        }
+    }
+
+    #[test]
+    fn start_rejection_and_backend_failure_are_closed_and_redacted() {
+        let rejected_output = TempFilePath::create("start-rejected");
+        let mut rejected =
+            ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", FakeStarter::success(22));
+        rejected
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(rejected_output.path()),
+            ))
+            .expect("logger should configure");
+        assert!(rejected.handle_action(VmmAction::InstanceStart).is_err());
+        assert_eq!(
+            fs::read_to_string(rejected_output.path()).expect("rejected logger should read"),
+            "operation=vm-start outcome=rejected\n"
+        );
+
+        let failed_output = TempFilePath::create("start-failed");
+        let mut failed = ProcessVmm::with_starter(
+            "demo-2",
+            "0.1.0",
+            "bangbang",
+            FakeStarter::failure(BackendError::Hypervisor(
+                "private-backend-start-sentinel".to_owned(),
+            )),
+        );
+        failed
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(failed_output.path()),
+            ))
+            .expect("logger should configure");
+        failed
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                "/private/failing-kernel",
+            )))
+            .expect("boot source should configure");
+        assert!(failed.handle_action(VmmAction::InstanceStart).is_err());
+        let output = fs::read_to_string(failed_output.path()).expect("failed logger should read");
+        assert_eq!(
+            output,
+            concat!(
+                "operation=backend-startup outcome=failed\n",
+                "operation=vm-start outcome=failed\n",
+            )
+        );
+        assert!(!output.contains("private-backend-start-sentinel"));
+        assert!(!output.contains("failing-kernel"));
     }
 
     #[test]
@@ -64054,7 +65326,10 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(output.path()).expect("combined output should read"),
-            "event=process-exit category=configuration\n"
+            concat!(
+                "operation=shutdown outcome=abnormal\n",
+                "event=process-exit category=configuration\n",
+            )
         );
     }
 
@@ -64087,8 +65362,13 @@ mod tests {
         assert_eq!(
             fs::read_to_string(logger.path()).expect("logger output should read"),
             concat!(
+                "operation=backend-startup outcome=succeeded\n",
                 "action=InstanceStart\n",
+                "operation=boot-worker outcome=running\n",
+                "operation=vm-start outcome=succeeded\n",
                 "event=process-panic\n",
+                "operation=vm-stop outcome=succeeded\n",
+                "operation=shutdown outcome=abnormal\n",
                 "event=process-exit category=panic\n",
             )
         );

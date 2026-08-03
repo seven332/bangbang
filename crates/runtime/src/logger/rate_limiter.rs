@@ -39,6 +39,7 @@ impl LogRateLimiterClock for SystemLogRateLimiterClock {
 pub(super) enum LoggerRateLimitIdentity {
     BootTimer,
     ApiRequest,
+    ObservabilityWorker,
 }
 
 impl LoggerRateLimitIdentity {
@@ -46,11 +47,17 @@ impl LoggerRateLimitIdentity {
         match self {
             Self::BootTimer => 0,
             Self::ApiRequest => 1,
+            Self::ObservabilityWorker => 2,
         }
     }
 }
 
-const LOGGER_RATE_LIMIT_IDENTITY_COUNT: usize = LoggerRateLimitIdentity::ApiRequest.index() + 1;
+const LOGGER_RATE_LIMIT_IDENTITIES: [LoggerRateLimitIdentity; 3] = [
+    LoggerRateLimitIdentity::BootTimer,
+    LoggerRateLimitIdentity::ApiRequest,
+    LoggerRateLimitIdentity::ObservabilityWorker,
+];
+const LOGGER_RATE_LIMIT_IDENTITY_COUNT: usize = LOGGER_RATE_LIMIT_IDENTITIES.len();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LogRateLimitDecision {

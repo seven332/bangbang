@@ -98,7 +98,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ),
         (
             "logger.api-worker.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             5,
         ),
         ("logger.api.request", LoggerClassDisposition::Implemented, 1),
@@ -122,7 +122,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ),
         (
             "logger.lifecycle.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             24,
         ),
         (
@@ -177,13 +177,13 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ),
         (
             "logger.observability.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             4,
         ),
         ("logger.pmem.outcome", LoggerClassDisposition::Planned, 18),
         (
             "logger.process-signal.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             5,
         ),
         (
@@ -204,7 +204,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ("logger.serial.outcome", LoggerClassDisposition::Planned, 12),
         (
             "logger.snapshot.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             18,
         ),
         (
@@ -308,7 +308,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             .iter()
             .filter(|class| class.disposition == LoggerClassDisposition::Implemented)
             .count(),
-        8
+        13
     );
     assert_eq!(
         audit
@@ -316,7 +316,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             .iter()
             .filter(|class| class.disposition == LoggerClassDisposition::Planned)
             .count(),
-        16
+        11
     );
     assert_eq!(
         audit
@@ -342,8 +342,8 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
     assert_eq!(
         mapped_dispositions,
         BTreeMap::from([
-            (LoggerClassDisposition::Implemented, 26),
-            (LoggerClassDisposition::Planned, 380),
+            (LoggerClassDisposition::Implemented, 82),
+            (LoggerClassDisposition::Planned, 324),
             (LoggerClassDisposition::NotApplicable, 62),
         ])
     );
@@ -359,10 +359,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             *counts.entry(issue).or_insert(0_usize) += 1;
             counts
         });
-    assert_eq!(
-        planned_owners,
-        BTreeMap::from([("#1808", 5), ("#1809", 11)])
-    );
+    assert_eq!(planned_owners, BTreeMap::from([("#1809", 11)]));
 
     let compiled_events = audit
         .classes
@@ -373,15 +370,20 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         compiled_events,
         BTreeSet::from([
             LoggerCompiledEvent::ApiControl,
+            LoggerCompiledEvent::ApiWorker,
             LoggerCompiledEvent::ApiRequest,
             LoggerCompiledEvent::ApiResult,
             LoggerCompiledEvent::InstanceStart,
             LoggerCompiledEvent::FlushMetrics,
             LoggerCompiledEvent::BootTime,
+            LoggerCompiledEvent::Lifecycle,
+            LoggerCompiledEvent::Observability,
             LoggerCompiledEvent::RateLimitRecovery,
             LoggerCompiledEvent::ProcessStartup,
             LoggerCompiledEvent::ProcessPanic,
             LoggerCompiledEvent::ProcessExit,
+            LoggerCompiledEvent::ProcessSignal,
+            LoggerCompiledEvent::Snapshot,
         ])
     );
     let planned_with_compiled_events = audit

@@ -68,15 +68,12 @@ source calls only when subsystem, observable outcome, target fields, delivery,
 module/origin behavior, limiter policy, disposition, and delivery owner agree.
 There are no path selectors and no `other`, `unknown`, or catch-all class.
 
-The 31 classes contain 8 implemented classes, 16 planned classes, and 7 exact
-not-applicable classes. Across source mappings this is 26 implemented, 380
+The 31 classes contain 13 implemented classes, 11 planned classes, and 7 exact
+not-applicable classes. Across source mappings this is 82 implemented, 324
 planned, and 62 not-applicable invocations.
 
-`planned` is an explicit intermediate delivery state. The two remaining owners
-are:
+`planned` is an explicit intermediate delivery state. The remaining owner is:
 
-- #1808: host lifecycle, API/VMM worker, snapshot, signal, and observability
-  outcomes; and
 - #1809: backend, vCPU, transport, and device outcomes.
 
 Delivery validation accepts those named planned classes. Final validation
@@ -90,6 +87,12 @@ one control record and no result. Process startup has one fixed `running`
 outcome after the no-API owner is ready or the API socket is bound and before
 readiness is announced.
 
+Issue #1808 closes the host lifecycle and live-device controls, API/VMM worker
+status, snapshot create/load results, metrics-worker failures, host signals,
+guest power convergence, cancellation, and orderly/abnormal shutdown. These
+records use typed fixed vocabularies, discard payloads before encoding, and
+preserve the functional result when logger delivery fails.
+
 ## Closed class ledger
 
 `Mappings` is the exact number of source identities assigned to the class.
@@ -98,7 +101,7 @@ Owners apply only to planned work.
 | Class | Disposition | Owner/reason | Mappings |
 | --- | --- | --- | ---: |
 | `logger.api-control.outcome` | `implemented` | fixed server/connection/request outcomes | 7 |
-| `logger.api-worker.outcome` | `planned` | #1808 | 5 |
+| `logger.api-worker.outcome` | `implemented` | fixed worker lifecycle | 5 |
 | `logger.api.request` | `implemented` | parsed method/template receipt | 1 |
 | `logger.api.result` | `implemented` | closed HTTP result plus retained actions | 5 |
 | `logger.backend.outcome` | `planned` | #1809 | 26 |
@@ -106,7 +109,7 @@ Owners apply only to planned work.
 | `logger.block.outcome` | `planned` | #1809 | 34 |
 | `logger.boot.time` | `implemented` | bounded boot timing | 1 |
 | `logger.entropy.outcome` | `planned` | #1809 | 16 |
-| `logger.lifecycle.outcome` | `planned` | #1808 | 24 |
+| `logger.lifecycle.outcome` | `implemented` | fixed VM and live-device lifecycle | 24 |
 | `logger.limiter.recovery` | `implemented` | bounded suppressed count | 1 |
 | `logger.memory-hotplug.outcome` | `planned` | #1809 | 22 |
 | `logger.network.outcome` | `planned` | #1809 | 26 |
@@ -117,14 +120,14 @@ Owners apply only to planned work.
 | `logger.nonapp.tool` | `not-applicable` | `separate-tool-owner` | 1 |
 | `logger.nonapp.tracing` | `not-applicable` | `tracing-owned` | 2 |
 | `logger.nonapp.x86` | `not-applicable` | `x86-only` | 15 |
-| `logger.observability.outcome` | `planned` | #1808 | 4 |
+| `logger.observability.outcome` | `implemented` | rate-limited metrics-worker failure | 4 |
 | `logger.pmem.outcome` | `planned` | #1809 | 18 |
-| `logger.process-signal.outcome` | `planned` | #1808 | 5 |
+| `logger.process-signal.outcome` | `implemented` | fixed signal and shutdown convergence | 5 |
 | `logger.process-startup.outcome` | `implemented` | fixed normal startup outcome | 5 |
 | `logger.process.exit` | `implemented` | fixed terminal category | 3 |
 | `logger.process.panic` | `implemented` | fixed emergency record | 3 |
 | `logger.serial.outcome` | `planned` | #1809 | 12 |
-| `logger.snapshot.outcome` | `planned` | #1808 | 18 |
+| `logger.snapshot.outcome` | `implemented` | fixed create/load result | 18 |
 | `logger.time-identity.outcome` | `planned` | #1809 | 16 |
 | `logger.transport.outcome` | `planned` | #1809 | 74 |
 | `logger.vsock.outcome` | `planned` | #1809 | 52 |
@@ -135,19 +138,32 @@ the closed outcome selects level. Adding a new operation/outcome requires
 deliberate class metadata and compiled-event review, never inheritance from a
 source-path selector.
 
-The newly closed records have exact fixed shapes:
+The implemented host-owned records have exact fixed shapes:
 
 - API control: `operation=<server|connection|request|request-parse>
   outcome=<closed-outcome>`;
 - parsed dispatch result: `action=request
-  outcome=<ok|no-content|bad-request|payload-too-large>`; and
-- normal startup: `operation=process-startup outcome=running`.
+  outcome=<ok|no-content|bad-request|payload-too-large>`;
+- normal startup: `operation=process-startup outcome=running`;
+- VM lifecycle: `operation=<backend-startup|vm-start|vm-pause|vm-resume|vm-stop>
+  outcome=<closed-outcome>`;
+- live device control: `device-kind=<block|network|pmem>
+  operation=<device-attach|device-update|device-detach>
+  outcome=<succeeded|rejected|failed>`;
+- snapshots: `operation=<snapshot-create|snapshot-load>
+  outcome=<succeeded|rejected|failed|cancelled>`;
+- worker and observability status:
+  `operation=<boot-worker|metrics-worker> outcome=<closed-outcome>`; and
+- process convergence:
+  `operation=<host-signal|cancellation|guest-power|shutdown>
+  outcome=<closed-outcome>`.
 
-Control/result levels are selected from the closed outcome: normal operation is
-`Info`, server stop is `Debug`, deprecation is `Warn`, and connection, parse,
-or error response outcomes are `Error`. These records use fixed modules and do
-not carry a URI, request/response body, fault text, status integer, path, or
-selector.
+Levels are selected from the closed outcome: normal operation is `Info`,
+unchanged VM state and an orderly stopped worker are `Debug`, snapshot
+cancellation and deprecation are `Warn`, and rejection, failure, or abnormal shutdown are
+`Error`. These records use fixed modules and do not carry a URI,
+request/response body, fault text, status integer, path, selector, device ID,
+MAC address, or guest value.
 
 ## Allowed fields and redaction
 
@@ -186,9 +202,11 @@ A guest-capable class applies the guest-safe policy to every mapped producer,
 including a host-only member of the same semantic class. This is deliberately
 conservative: it cannot grant a producer a blocking or unrestricted path.
 
-Every guest-capable class is rate-limited under its own fixed class identity.
-The sole exception is `logger.limiter.recovery`, which must be unrestricted to
-report a prior admitted recovery without recursively limiting itself. Queue,
+Every guest-capable class is rate-limited under its own fixed class identity,
+and the repeating asynchronous metrics-worker class independently uses
+`logger-rate.observability-worker`. The sole exception is
+`logger.limiter.recovery`, which must be unrestricted to report a prior
+admitted recovery without recursively limiting itself. Queue,
 receipt, write, flush, and replacement loss never changes the request, VM,
 guest, worker, or process result and increments the exact existing loss counter
 once. That exact boundary ends at the writer configured in the logger worker.
@@ -270,5 +288,5 @@ Issue #1807 promotes the nine concrete `/logger` operation, path, schema,
 property, and full-configuration records in `capabilities.json`. The two
 aggregate `corpus:logger` and
 `semantic.observability:logger-delivery-filtering-loss-and-redaction` records
-remain `audit-required` until #1808, #1809, and final certification close every
-planned producer class.
+remain `audit-required` until #1809 and final certification close every planned
+producer class and verify the aggregate claim.
