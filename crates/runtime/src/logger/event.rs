@@ -478,13 +478,48 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_routes_are_fixed_templates() {
-        assert_eq!(LoggerApiRoute::Drive.as_str(), "/drives/{drive_id}");
-        assert_eq!(
-            LoggerApiRoute::NetworkInterface.as_str(),
-            "/network-interfaces/{iface_id}"
-        );
-        assert_eq!(LoggerApiRoute::Pmem.as_str(), "/pmem/{pmem_id}");
+    fn every_route_has_its_reviewed_fixed_template() {
+        let cases = [
+            (LoggerApiRoute::Root, "/"),
+            (LoggerApiRoute::Actions, "/actions"),
+            (LoggerApiRoute::Balloon, "/balloon"),
+            (
+                LoggerApiRoute::BalloonHintingStart,
+                "/balloon/hinting/start",
+            ),
+            (
+                LoggerApiRoute::BalloonHintingStatus,
+                "/balloon/hinting/status",
+            ),
+            (LoggerApiRoute::BalloonHintingStop, "/balloon/hinting/stop"),
+            (LoggerApiRoute::BalloonStatistics, "/balloon/statistics"),
+            (LoggerApiRoute::BootSource, "/boot-source"),
+            (LoggerApiRoute::CpuConfig, "/cpu-config"),
+            (LoggerApiRoute::Drive, "/drives/{drive_id}"),
+            (LoggerApiRoute::Entropy, "/entropy"),
+            (LoggerApiRoute::Logger, "/logger"),
+            (LoggerApiRoute::MachineConfig, "/machine-config"),
+            (LoggerApiRoute::MemoryHotplug, "/hotplug/memory"),
+            (LoggerApiRoute::Metrics, "/metrics"),
+            (LoggerApiRoute::Mmds, "/mmds"),
+            (LoggerApiRoute::MmdsConfig, "/mmds/config"),
+            (
+                LoggerApiRoute::NetworkInterface,
+                "/network-interfaces/{iface_id}",
+            ),
+            (LoggerApiRoute::Pmem, "/pmem/{pmem_id}"),
+            (LoggerApiRoute::Serial, "/serial"),
+            (LoggerApiRoute::SnapshotCreate, "/snapshot/create"),
+            (LoggerApiRoute::SnapshotLoad, "/snapshot/load"),
+            (LoggerApiRoute::Version, "/version"),
+            (LoggerApiRoute::Vm, "/vm"),
+            (LoggerApiRoute::VmConfig, "/vm/config"),
+            (LoggerApiRoute::Vsock, "/vsock"),
+        ];
+
+        for (route, expected) in cases {
+            assert_eq!(route.as_str(), expected);
+        }
     }
 
     #[test]

@@ -649,11 +649,15 @@ impl ReplacementWaiter {
 #[cfg(test)]
 mod tests {
     use std::io::{Error, ErrorKind, Write};
+    use std::sync::mpsc;
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::Duration;
 
-    use super::{LoggerDelivery, LoggerDeliveryConfig, PreparedLoggerWriter};
+    use super::{
+        DeliveryReceipt, LoggerDelivery, LoggerDeliveryConfig, PreparedLoggerWriter,
+        ReplaceWriterError, ReplacementToken,
+    };
     use crate::logger::LoggerLevel;
     use crate::logger::SharedLoggerMetrics;
     use crate::logger::event::{LogBatch, LogOrigin, LogRecord, LoggerAction, LoggerEvent};
@@ -789,6 +793,94 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[derive(Debug)]
+    struct DropSignalWriter(Option<mpsc::SyncSender<()>>);
+
+    impl Write for DropSignalWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for DropSignalWriter {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.try_send(());
+            }
+        }
+    }
+
+    #[test]
+    fn receipt_timeout_wins_before_dequeue_and_accounts_once() {
+        let metrics = SharedLoggerMetrics::default();
+        let (receipt, waiter) = DeliveryReceipt::new();
+
+        assert!(!waiter.finish_timeout(2, &metrics));
+        assert!(receipt.has_timed_out());
+        assert!(!receipt.begin());
+        assert!(!receipt.complete(0));
+        assert_eq!(metrics.missed_log_count(), 2);
+    }
+
+    #[test]
+    fn receipt_completion_and_timeout_orders_have_one_accounting_owner() {
+        let timeout_metrics = SharedLoggerMetrics::default();
+        let (timed_out_receipt, timed_out_waiter) = DeliveryReceipt::new();
+        assert!(timed_out_receipt.begin());
+        assert!(!timed_out_waiter.finish_timeout(2, &timeout_metrics));
+        assert!(!timed_out_receipt.complete(0));
+        assert_eq!(timeout_metrics.missed_log_count(), 2);
+
+        let success_metrics = SharedLoggerMetrics::default();
+        let (successful_receipt, successful_waiter) = DeliveryReceipt::new();
+        assert!(successful_receipt.begin());
+        assert!(successful_receipt.complete(0));
+        assert!(successful_waiter.wait(Duration::ZERO, 1, &success_metrics));
+        assert_eq!(success_metrics.missed_log_count(), 0);
+
+        let failure_metrics = SharedLoggerMetrics::default();
+        let (failed_receipt, failed_waiter) = DeliveryReceipt::new();
+        assert!(failed_receipt.begin());
+        assert!(failed_receipt.complete(1));
+        failure_metrics.record_missed_logs(1);
+        assert!(!failed_waiter.wait(Duration::ZERO, 1, &failure_metrics));
+        assert_eq!(failure_metrics.missed_log_count(), 1);
+    }
+
+    #[test]
+    fn replacement_commit_and_cancel_orders_are_linearized() {
+        let (cancelled_token, cancelled_waiter) = ReplacementToken::new();
+        assert!(matches!(
+            cancelled_waiter.cancel_or_observe_commit(),
+            Err(ReplaceWriterError::TimedOut)
+        ));
+        assert!(!cancelled_token.commit());
+
+        let (committed_token, committed_waiter) = ReplacementToken::new();
+        assert!(committed_token.commit());
+        assert!(committed_waiter.wait(Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn dropping_all_senders_stops_the_worker_and_drops_its_writer() {
+        let (drop_sender, drop_receiver) = mpsc::sync_channel(1);
+        let delivery = LoggerDelivery::spawn(
+            PreparedLoggerWriter::new(DropSignalWriter(Some(drop_sender))),
+            SharedLoggerMetrics::default(),
+            LoggerDeliveryConfig::for_test(1, Duration::from_millis(100)),
+        )
+        .expect("worker should spawn");
+
+        drop(delivery);
+        drop_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker should exit and drop its writer");
     }
 
     #[test]
