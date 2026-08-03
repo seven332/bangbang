@@ -715,7 +715,7 @@ fn ensure_checkout_at(path: &Path, expected_commit: &str) -> Result<PathBuf, Aud
     Ok(canonical)
 }
 
-fn git_output(checkout: &Path, args: &[&str]) -> Result<String, AuditError> {
+pub(crate) fn git_output(checkout: &Path, args: &[&str]) -> Result<String, AuditError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(checkout)
@@ -732,7 +732,7 @@ fn git_output(checkout: &Path, args: &[&str]) -> Result<String, AuditError> {
         .map_err(|_| AuditError::new("Git returned non-UTF-8 output"))
 }
 
-fn ensure_regular_input(checkout: &Path, relative: &str) -> Result<PathBuf, AuditError> {
+pub(crate) fn ensure_regular_input(checkout: &Path, relative: &str) -> Result<PathBuf, AuditError> {
     let joined = checkout.join(relative);
     let metadata = std::fs::symlink_metadata(&joined)
         .map_err(|_| AuditError::new(format!("pinned input is missing: {relative}")))?;
@@ -752,7 +752,7 @@ fn ensure_regular_input(checkout: &Path, relative: &str) -> Result<PathBuf, Audi
     Ok(canonical)
 }
 
-fn read_input(checkout: &Path, relative: &str) -> Result<String, AuditError> {
+pub(crate) fn read_input(checkout: &Path, relative: &str) -> Result<String, AuditError> {
     let path = ensure_regular_input(checkout, relative)?;
     std::fs::read_to_string(path)
         .map_err(|error| AuditError::new(format!("failed to read {relative}: {error}")))

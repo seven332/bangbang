@@ -41,6 +41,12 @@ const EXTRACTORS: &[&str] = &[
 pub struct ValidationErrors(Vec<String>);
 
 impl ValidationErrors {
+    pub(crate) fn from_messages(mut messages: Vec<String>) -> Self {
+        messages.sort();
+        messages.dedup();
+        Self(messages)
+    }
+
     /// Individual validation failures in deterministic order.
     pub fn messages(&self) -> &[String] {
         &self.0
@@ -613,7 +619,7 @@ fn validate_exclusion(
     }
 }
 
-fn validate_reference(
+pub(crate) fn validate_reference(
     reference: &Reference,
     repository_root: &Path,
     tracked_files: &BTreeSet<PathBuf>,
@@ -698,6 +704,13 @@ fn tracked_files_for_inventory(
     if !inventory_has_local_references(inventory) {
         return BTreeSet::new();
     }
+    tracked_repository_files(repository_root, errors)
+}
+
+pub(crate) fn tracked_repository_files(
+    repository_root: &Path,
+    errors: &mut Vec<String>,
+) -> BTreeSet<PathBuf> {
     let output = match Command::new("git")
         .arg("-C")
         .arg(repository_root)

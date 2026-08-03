@@ -1395,9 +1395,10 @@ cargo test -p bangbang-firecracker-capability-audit --all-targets --locked
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 ```
 
-The workspace suite also validates both checked JSON files. Ordinary validation
-uses only the pinned checked-in inventory and does not discover or require a
-sibling Firecracker checkout.
+The workspace suite also validates all four checked JSON files: the general
+source manifest and capability overlay plus the logger producer manifest and
+human audit. Ordinary validation uses only the pinned checked-in inventory and
+does not discover or require a sibling Firecracker checkout.
 
 ### Evidence Responsibilities
 
@@ -1507,6 +1508,27 @@ Review exact identity changes before updating `source-manifest.json`. Never
 use regeneration to alter `capabilities.json`; missing and stale overlays
 must be resolved deliberately.
 
+The checked logger producer audit uses the same authority split. The pinned
+machine manifest contains exactly 429 ordinary and 39 unrestricted public
+logger calls across 81 matching files: 446 production, zero test-only, 22
+example, 466 direct, and two nonlogger macro-template invocations. Compare both
+machine manifests with the command above, or create a logger-only candidate:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- \
+  regenerate-logger-producers \
+  --firecracker /path/to/firecracker \
+  --output codex-work/tmp/logger-producer-manifest.candidate.json
+```
+
+The destination must not exist and cannot alias any checked JSON artifact.
+Review every identity, syntax/source context, input, count, and fingerprint
+change before deliberately updating `logger-producer-manifest.json`. The
+command never creates, carries forward, or rewrites semantic classes in
+`logger-producer-audit.json`; missing or stale mappings require human review.
+The class policy and safe-field boundary are documented in the
+[logger producer contract](../compat/firecracker/v1.16.0/logger-contract.md).
+
 The final parent gate is:
 
 ```sh
@@ -1514,9 +1536,9 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --final
 ```
 
 Final mode fails while any `audit-required` or
-`missing-platform-feasible` record remains. An inventory-only change does not
-promote a capability without record-specific implementation and validation
-evidence.
+`missing-platform-feasible` capability record or any planned logger class
+remains. An inventory-only change does not promote a capability without
+record-specific implementation and validation evidence.
 
 ## Running Tests
 

@@ -1,0 +1,2651 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "classes": [
+    {
+      "id": "logger.api-control.outcome",
+      "subsystem": "api",
+      "summary": "Fixed redacted API server transport and recognized result.",
+      "guest_triggerable": false,
+      "delivery": "bounded-host",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::api_server",
+      "origin": "configurable",
+      "limiter": "unrestricted",
+      "allowed_fields": [
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic API server transport and recognized result; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1807"
+    },
+    {
+      "id": "logger.api-worker.outcome",
+      "subsystem": "api",
+      "summary": "Fixed redacted API/VMM worker lifecycle.",
+      "guest_triggerable": false,
+      "delivery": "nonblocking-async",
+      "level": "outcome-derived",
+      "module": "bangbang::worker",
+      "origin": "configurable",
+      "limiter": "unrestricted",
+      "allowed_fields": [
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic API/VMM worker lifecycle; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1808"
+    },
+    {
+      "id": "logger.api.request",
+      "subsystem": "api",
+      "summary": "Parsed API method and fixed route-template receipt without body or selector values.",
+      "guest_triggerable": false,
+      "delivery": "unrestricted-host",
+      "level": "info",
+      "module": "bangbang_runtime::api_server",
+      "origin": "configurable",
+      "limiter": "unrestricted",
+      "allowed_fields": [
+        "method",
+        "route"
+      ],
+      "disposition": "implemented",
+      "rationale": "The pinned receipt producer maps to Bangbang's closed method and route-template event; dynamic descriptions are replaced before record construction.",
+      "compiled_events": [
+        "api-request"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parsed request logger dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "typed logger producers and delivery policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed logger event encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "API request logger tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "method, route, body, selector, and redaction logger evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "API request encoding, filtering, and delivery tests"
+        }
+      ]
+    },
+    {
+      "id": "logger.api.result",
+      "subsystem": "api",
+      "summary": "Recognized API result category, including the already implemented minimal successful actions.",
+      "guest_triggerable": false,
+      "delivery": "bounded-host",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::api_server",
+      "origin": "configurable",
+      "limiter": "unrestricted",
+      "allowed_fields": [
+        "action",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "Firecracker shares these producer sites across many responses; Bangbang already emits fixed InstanceStart and FlushMetrics success actions, while closed general success/rejection/result coverage remains owned by #1807.",
+      "delivery_issue": "#1807",
+      "compiled_events": [
+        "instance-start",
+        "flush-metrics"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "successful InstanceStart and FlushMetrics action logging"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "typed logger producers and delivery policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed logger event encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "successful action logger tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "successful action process logger evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "fixed action encoding and delivery tests"
+        }
+      ]
+    },
+    {
+      "id": "logger.backend.outcome",
+      "subsystem": "cpu-and-machine",
+      "summary": "Fixed redacted backend, memory, interrupt, or vCPU outcome.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "outcome-derived",
+      "module": "bangbang_hvf::backend",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.backend.outcome",
+      "allowed_fields": [
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic backend, memory, interrupt, or vCPU outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1809"
+    },
+    {
+      "id": "logger.balloon.outcome",
+      "subsystem": "memory-devices",
+      "summary": "Fixed redacted balloon device outcome.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::device",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.balloon.outcome",
+      "allowed_fields": [
+        "device-kind",
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic balloon device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1809"
+    },
+    {
+      "id": "logger.block.outcome",
+      "subsystem": "storage",
+      "summary": "Fixed redacted block device outcome.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::device",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.block.outcome",
+      "allowed_fields": [
+        "device-kind",
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic block device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1809"
+    },
+    {
+      "id": "logger.boot.time",
+      "subsystem": "vm-lifecycle",
+      "summary": "Guest boot wall and process CPU timing admitted through one bounded atomic call site.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "info",
+      "module": "bangbang_runtime::boot_timer",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.boot-time",
+      "allowed_fields": [
+        "cpu-time-us",
+        "wall-time-us"
+      ],
+      "disposition": "implemented",
+      "rationale": "The pinned boot-timer producer maps to Bangbang's fixed numeric boot event without guest bytes, addresses, or device identity.",
+      "compiled_events": [
+        "boot-time"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot_timer.rs",
+          "anchor": "boot timer logger admission"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "typed logger producers and delivery policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed logger event encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed guest boot-timer logger evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot_timer.rs",
+          "anchor": "boot timer MMIO and logger tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "boot timing limiter, filtering, and recovery tests"
+        }
+      ]
+    },
+    {
+      "id": "logger.entropy.outcome",
+      "subsystem": "remaining-devices",
+      "summary": "Fixed redacted entropy device outcome.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::device",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.entropy.outcome",
+      "allowed_fields": [
+        "device-kind",
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic entropy device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1809"
+    },
+    {
+      "id": "logger.lifecycle.outcome",
+      "subsystem": "vm-lifecycle",
+      "summary": "Fixed redacted VM lifecycle and control outcome.",
+      "guest_triggerable": false,
+      "delivery": "bounded-host",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::lifecycle",
+      "origin": "configurable",
+      "limiter": "unrestricted",
+      "allowed_fields": [
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic VM lifecycle and control outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1808"
+    },
+    {
+      "id": "logger.limiter.recovery",
+      "subsystem": "observability",
+      "summary": "Fixed rate-limit recovery summary containing only a bounded suppressed count.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "warn",
+      "module": "bangbang_runtime::boot_timer",
+      "origin": "configurable",
+      "limiter": "unrestricted",
+      "allowed_fields": [
+        "suppressed-count"
+      ],
+      "disposition": "implemented",
+      "rationale": "The recovery record is emitted only after an admitted bounded producer call and cannot recurse through its own limiter.",
+      "compiled_events": [
+        "rate-limit-recovery"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "typed logger producers and delivery policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed logger event encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "rate-limit denial and recovery tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "atomic limiter identity and suppression tests"
+        }
+      ]
+    },
+    {
+      "id": "logger.memory-hotplug.outcome",
+      "subsystem": "memory-devices",
+      "summary": "Fixed redacted virtio-mem outcome.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::device",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.memory-hotplug.outcome",
+      "allowed_fields": [
+        "device-kind",
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic virtio-mem outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1809"
+    },
+    {
+      "id": "logger.network.outcome",
+      "subsystem": "network-and-mmds",
+      "summary": "Fixed redacted network or MMDS outcome.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::device",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.network.outcome",
+      "allowed_fields": [
+        "device-kind",
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic network or MMDS outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1809"
+    },
+    {
+      "id": "logger.nonapp.example",
+      "subsystem": "developer-tooling",
+      "summary": "Log-instrument example-binary output.",
+      "guest_triggerable": false,
+      "delivery": "not-applicable",
+      "level": "not-applicable",
+      "module": "not-applicable",
+      "origin": "not-applicable",
+      "limiter": "not-applicable",
+      "allowed_fields": [],
+      "disposition": "not-applicable",
+      "non_applicable_reason": "example-only",
+      "rationale": "These calls exist only in upstream example programs and are not Firecracker VMM process producers."
+    },
+    {
+      "id": "logger.nonapp.fuzzing",
+      "subsystem": "developer-tooling",
+      "summary": "Fuzzing-build warning.",
+      "guest_triggerable": false,
+      "delivery": "not-applicable",
+      "level": "not-applicable",
+      "module": "not-applicable",
+      "origin": "not-applicable",
+      "limiter": "not-applicable",
+      "allowed_fields": [],
+      "disposition": "not-applicable",
+      "non_applicable_reason": "developer-instrumentation",
+      "rationale": "The producer exists only in an explicitly insecure developer fuzzing build and is not a production VMM outcome."
+    },
+    {
+      "id": "logger.nonapp.gdb",
+      "subsystem": "developer-tooling",
+      "summary": "Optional GDB remote-debugging protocol diagnostics.",
+      "guest_triggerable": false,
+      "delivery": "not-applicable",
+      "level": "not-applicable",
+      "module": "not-applicable",
+      "origin": "not-applicable",
+      "limiter": "not-applicable",
+      "allowed_fields": [],
+      "disposition": "not-applicable",
+      "non_applicable_reason": "developer-instrumentation",
+      "rationale": "These calls serve Firecracker's optional developer GDB server rather than the production VMM logger contract selected for Bangbang."
+    },
+    {
+      "id": "logger.nonapp.linux-hardening",
+      "subsystem": "process",
+      "summary": "Linux prctl speculation-mitigation failure.",
+      "guest_triggerable": false,
+      "delivery": "not-applicable",
+      "level": "not-applicable",
+      "module": "not-applicable",
+      "origin": "not-applicable",
+      "limiter": "not-applicable",
+      "allowed_fields": [],
+      "disposition": "not-applicable",
+      "non_applicable_reason": "linux-kvm-only",
+      "rationale": "The producer reports a Linux prctl mechanism that has no identity-preserving macOS/HVF operation; Bangbang documents its platform security boundary separately."
+    },
+    {
+      "id": "logger.nonapp.tool",
+      "subsystem": "developer-tooling",
+      "summary": "CPU-template helper command warning.",
+      "guest_triggerable": false,
+      "delivery": "not-applicable",
+      "level": "not-applicable",
+      "module": "not-applicable",
+      "origin": "not-applicable",
+      "limiter": "not-applicable",
+      "allowed_fields": [],
+      "disposition": "not-applicable",
+      "non_applicable_reason": "separate-tool-owner",
+      "rationale": "This producer belongs to the separately delivered CPU-template-helper command rather than the Bangbang VMM process logger."
+    },
+    {
+      "id": "logger.nonapp.tracing",
+      "subsystem": "observability",
+      "summary": "Developer tracing span entry and exit output.",
+      "guest_triggerable": false,
+      "delivery": "not-applicable",
+      "level": "not-applicable",
+      "module": "not-applicable",
+      "origin": "not-applicable",
+      "limiter": "not-applicable",
+      "allowed_fields": [],
+      "disposition": "not-applicable",
+      "non_applicable_reason": "tracing-owned",
+      "rationale": "The log-instrument crate implements developer tracing owned by #1791, not the Firecracker VMM logger compatibility surface."
+    },
+    {
+      "id": "logger.nonapp.x86",
+      "subsystem": "cpu-and-machine",
+      "summary": "X86 KVM, CPUID, xstate, interrupt, or debug-register producer.",
+      "guest_triggerable": false,
+      "delivery": "not-applicable",
+      "level": "not-applicable",
+      "module": "not-applicable",
+      "origin": "not-applicable",
+      "limiter": "not-applicable",
+      "allowed_fields": [],
+      "disposition": "not-applicable",
+      "non_applicable_reason": "x86-only",
+      "rationale": "The containing code is compiled only for Firecracker's x86_64 backend and has no identity-preserving macOS arm64/HVF execution path."
+    },
+    {
+      "id": "logger.observability.outcome",
+      "subsystem": "observability",
+      "summary": "Fixed redacted logger or metrics worker outcome.",
+      "guest_triggerable": false,
+      "delivery": "nonblocking-async",
+      "level": "outcome-derived",
+      "module": "bangbang::worker",
+      "origin": "configurable",
+      "limiter": "unrestricted",
+      "allowed_fields": [
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic logger or metrics worker outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1808"
+    },
+    {
+      "id": "logger.pmem.outcome",
+      "subsystem": "storage",
+      "summary": "Fixed redacted pmem device outcome.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::device",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.pmem.outcome",
+      "allowed_fields": [
+        "device-kind",
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic pmem device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1809"
+    },
+    {
+      "id": "logger.process-signal.outcome",
+      "subsystem": "process",
+      "summary": "Fixed redacted host signal and shutdown convergence.",
+      "guest_triggerable": false,
+      "delivery": "nonblocking-async",
+      "level": "outcome-derived",
+      "module": "bangbang::worker",
+      "origin": "configurable",
+      "limiter": "unrestricted",
+      "allowed_fields": [
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic host signal and shutdown convergence; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1808"
+    },
+    {
+      "id": "logger.process-startup.outcome",
+      "subsystem": "process",
+      "summary": "Fixed redacted process startup and readiness.",
+      "guest_triggerable": false,
+      "delivery": "bounded-host",
+      "level": "outcome-derived",
+      "module": "bangbang::process",
+      "origin": "configurable",
+      "limiter": "unrestricted",
+      "allowed_fields": [
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic process startup and readiness; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1807"
+    },
+    {
+      "id": "logger.process.exit",
+      "subsystem": "process",
+      "summary": "One fixed process-exit category emitted during terminal convergence.",
+      "guest_triggerable": false,
+      "delivery": "unrestricted-host",
+      "level": "category-derived",
+      "module": "bangbang::process",
+      "origin": "configurable",
+      "limiter": "unrestricted",
+      "allowed_fields": [
+        "category"
+      ],
+      "disposition": "implemented",
+      "rationale": "Firecracker's success, error-detail, and exit-code lines converge to one value-free Bangbang category; error payload and numeric exit-code text are not retained.",
+      "compiled_events": [
+        "process-exit"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "terminal observability convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "typed logger producers and delivery policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed logger event encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "terminal observability unit tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "success, configuration, failure, cancellation, and panic terminal evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "process category encoding and delivery tests"
+        }
+      ]
+    },
+    {
+      "id": "logger.process.panic",
+      "subsystem": "process",
+      "summary": "One pre-encoded fixed process-panic event with emergency admission.",
+      "guest_triggerable": false,
+      "delivery": "unrestricted-host",
+      "level": "error",
+      "module": "bangbang::panic",
+      "origin": "prepared-emergency",
+      "limiter": "unrestricted",
+      "allowed_fields": [],
+      "disposition": "implemented",
+      "rationale": "Firecracker's panic payload and secondary cleanup/metrics errors collapse into one fixed record so panic data and nested failure text never reach the sink.",
+      "compiled_events": [
+        "process-panic"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/panic_bridge.rs",
+          "anchor": "fixed panic bridge publication and admission"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "typed logger producers and delivery policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed logger event encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "panic and terminal observability tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/panic_bridge.rs",
+          "anchor": "panic bridge concurrency and fallback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "panic redaction and terminal-order evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "emergency logger delivery and loss tests"
+        }
+      ]
+    },
+    {
+      "id": "logger.serial.outcome",
+      "subsystem": "remaining-devices",
+      "summary": "Fixed redacted serial device outcome.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::device",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.serial.outcome",
+      "allowed_fields": [
+        "device-kind",
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic serial device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1809"
+    },
+    {
+      "id": "logger.snapshot.outcome",
+      "subsystem": "snapshot",
+      "summary": "Fixed redacted snapshot create, load, or restore outcome.",
+      "guest_triggerable": false,
+      "delivery": "bounded-host",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::snapshot",
+      "origin": "configurable",
+      "limiter": "unrestricted",
+      "allowed_fields": [
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic snapshot create, load, or restore outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1808"
+    },
+    {
+      "id": "logger.time-identity.outcome",
+      "subsystem": "remaining-devices",
+      "summary": "Fixed redacted time, identity, or legacy platform-device outcome.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::device",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.time-identity.outcome",
+      "allowed_fields": [
+        "device-kind",
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic time, identity, or legacy platform-device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1809"
+    },
+    {
+      "id": "logger.transport.outcome",
+      "subsystem": "device-transport",
+      "summary": "Fixed redacted device transport, PCI, queue, or notification outcome.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::device",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.transport.outcome",
+      "allowed_fields": [
+        "device-kind",
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic device transport, PCI, queue, or notification outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1809"
+    },
+    {
+      "id": "logger.vsock.outcome",
+      "subsystem": "vsock",
+      "summary": "Fixed redacted vsock transport or connection outcome.",
+      "guest_triggerable": true,
+      "delivery": "nonblocking-guest",
+      "level": "outcome-derived",
+      "module": "bangbang_runtime::device",
+      "origin": "configurable",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.vsock.outcome",
+      "allowed_fields": [
+        "device-kind",
+        "operation",
+        "outcome"
+      ],
+      "disposition": "planned",
+      "rationale": "All mapped upstream calls report the same semantic vsock transport or connection outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "delivery_issue": "#1809"
+    }
+  ],
+  "mappings": [
+    {
+      "invocation_id": "logger-invocation:src/cpu-template-helper/src/template/dump/aarch64.rs:20:17",
+      "class_id": "logger.nonapp.tool"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/mod.rs:102:21",
+      "class_id": "logger.api-control.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/mod.rs:112:21",
+      "class_id": "logger.api-control.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/mod.rs:116:17",
+      "class_id": "logger.api-control.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/mod.rs:135:21",
+      "class_id": "logger.api-control.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/mod.rs:141:17",
+      "class_id": "logger.api-control.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/mod.rs:183:13",
+      "class_id": "logger.api-control.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/mod.rs:85:9",
+      "class_id": "logger.api-control.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/mod.rs:97:21",
+      "class_id": "logger.api-worker.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:169:9",
+      "class_id": "logger.api.result"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:176:9",
+      "class_id": "logger.api.result"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:192:21",
+      "class_id": "logger.api.result"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:218:25",
+      "class_id": "logger.api.result"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:225:25",
+      "class_id": "logger.api.result"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:76:9",
+      "class_id": "logger.api.request"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server_adapter.rs:130:21",
+      "class_id": "logger.api-worker.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server_adapter.rs:137:13",
+      "class_id": "logger.api-worker.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server_adapter.rs:143:13",
+      "class_id": "logger.api-worker.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/api_server_adapter.rs:189:5",
+      "class_id": "logger.api-worker.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:110:9",
+      "class_id": "logger.process.exit"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:113:9",
+      "class_id": "logger.process.exit"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:116:9",
+      "class_id": "logger.process.exit"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:139:9",
+      "class_id": "logger.process.panic"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:141:13",
+      "class_id": "logger.process.panic"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:151:13",
+      "class_id": "logger.process.panic"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:333:5",
+      "class_id": "logger.process-startup.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:336:5",
+      "class_id": "logger.nonapp.fuzzing"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:351:17",
+      "class_id": "logger.process-startup.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:541:9",
+      "class_id": "logger.nonapp.linux-hardening"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:546:13",
+      "class_id": "logger.nonapp.linux-hardening"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/main.rs:608:5",
+      "class_id": "logger.process-startup.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/metrics.rs:47:13",
+      "class_id": "logger.observability.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/metrics.rs:65:13",
+      "class_id": "logger.observability.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/metrics.rs:77:13",
+      "class_id": "logger.observability.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/firecracker/src/metrics.rs:83:13",
+      "class_id": "logger.observability.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/five.rs:13:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/five.rs:15:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/five.rs:25:17",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/five.rs:26:17",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/four.rs:11:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/four.rs:13:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/four.rs:22:17",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/one.rs:10:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/one.rs:11:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/one.rs:12:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/one.rs:17:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/six.rs:10:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/six.rs:11:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/six.rs:12:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/six.rs:17:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/six.rs:26:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/three.rs:10:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/three.rs:11:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/three.rs:20:13",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/two.rs:10:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/two.rs:11:5",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/examples/two.rs:20:13",
+      "class_id": "logger.nonapp.example"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/src/lib.rs:37:9",
+      "class_id": "logger.nonapp.tracing"
+    },
+    {
+      "invocation_id": "logger-invocation:src/log-instrument/src/lib.rs:54:9",
+      "class_id": "logger.nonapp.tracing"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/acpi/mod.rs:181:32",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/acpi/mod.rs:183:9",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/acpi/mod.rs:70:32",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/acpi/mod.rs:72:9",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/aarch64/cache_info.rs:307:21",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/aarch64/mod.rs:180:9",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/aarch64/mod.rs:195:9",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/aarch64/mod.rs:208:17",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/aarch64/mod.rs:70:9",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/aarch64/vcpu.rs:504:9",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/mod.rs:70:13",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/mod.rs:120:9",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/mod.rs:458:5",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/mptable.rs:131:5",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:283:13",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:405:21",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:432:29",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:588:13",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:728:25",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:738:25",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:746:17",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/xstate.rs:120:13",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/arch/x86_64/xstate.rs:79:13",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/builder.rs:304:9",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/builder.rs:354:9",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/builder.rs:386:5",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/builder.rs:388:5",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/builder.rs:390:5",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/builder.rs:392:5",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/builder.rs:449:5",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/builder.rs:553:5",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/cpu_config/x86_64/cpuid/normalize.rs:382:25",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs:48:33",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/device_manager/mmio.rs:85:5",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/device_manager/mod.rs:135:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/device_manager/mod.rs:141:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/device_manager/mod.rs:375:9",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/device_manager/mod.rs:619:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/device_manager/pci_mngr.rs:151:9",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/device_manager/pci_mngr.rs:325:25",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/device_manager/pci_mngr.rs:95:9",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/acpi/vmclock.rs:151:9",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/acpi/vmgenid.rs:110:9",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/acpi/vmgenid.rs:116:9",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/acpi/vmgenid.rs:61:9",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:152:13",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:236:21",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:263:21",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:325:21",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/rtc_pl031.rs:114:13",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/rtc_pl031.rs:38:9",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/rtc_pl031.rs:44:9",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/rtc_pl031.rs:99:13",
+      "class_id": "logger.time-identity.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:120:25",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:202:13",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:208:17",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:305:27",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:312:13",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:320:21",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:341:21",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:353:25",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:361:25",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:384:17",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:387:17",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:427:17",
+      "class_id": "logger.serial.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/mod.rs:34:5",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/pci/pci_segment.rs:131:9",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/pci/pci_segment.rs:153:9",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/pseudo/boot_timer.rs:31:13",
+      "class_id": "logger.boot.time"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:239:17",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:406:25",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:457:21",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:498:17",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:510:17",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:573:25",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:586:21",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:591:21",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:598:21",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:640:21",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:711:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:935:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:947:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:985:17",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:109:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:138:21",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:142:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:27:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:34:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:42:17",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:49:17",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:60:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:70:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:83:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:89:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:97:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/mod.rs:121:5",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/balloon/util.rs:39:13",
+      "class_id": "logger.balloon.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/device.rs:336:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:19:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:25:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:32:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:45:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:56:17",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:59:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:72:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:148:17",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:275:17",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:363:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:417:25",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:438:29",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:460:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:480:21",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:501:29",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:525:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:567:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:628:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:641:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:684:21",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:82:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:23:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:30:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:39:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:49:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:55:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:63:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:78:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:91:22",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:94:13",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/request.rs:116:17",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/request.rs:124:17",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/request.rs:136:17",
+      "class_id": "logger.block.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/device.rs:137:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/device.rs:149:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/device.rs:158:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/device.rs:197:9",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/device.rs:200:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:278:9",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:356:17",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:390:17",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:417:17",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:439:17",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:453:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:476:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:482:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:550:21",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:581:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:588:9",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:644:17",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:652:9",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:665:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:691:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:22:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:32:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:38:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:50:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:73:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:78:13",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:87:17",
+      "class_id": "logger.memory-hotplug.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:1029:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:1045:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:498:21",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:503:17",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:560:17",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:566:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:609:17",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:698:29",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:709:21",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:759:17",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:888:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:925:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:949:17",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:966:17",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:108:21",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:113:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:26:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:33:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:40:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:47:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:54:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:64:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:70:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:78:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:92:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:386:21",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:392:17",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:404:21",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:463:21",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:482:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:493:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:501:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:507:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:562:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:593:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:21:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:28:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:38:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:44:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:56:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:75:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:80:13",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:89:17",
+      "class_id": "logger.pmem.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/queue.rs:567:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:152:21",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:161:25",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:168:25",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:174:21",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:186:21",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:200:17",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:210:13",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:228:17",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:22:13",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:29:13",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:39:13",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:45:13",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:57:13",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:80:13",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:85:13",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:94:17",
+      "class_id": "logger.entropy.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:137:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:146:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:225:25",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:230:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:285:25",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:293:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:325:29",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:348:25",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:359:21",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:363:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:473:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:115:18",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:128:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:138:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:195:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:202:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:231:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:249:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:296:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:359:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:390:21",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:415:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:91:18",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:565:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:592:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:836:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:851:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:896:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:910:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:941:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:952:21",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:982:21",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:252:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:262:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:308:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:319:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:391:17",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:460:17",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:468:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:189:33",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:206:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:213:17",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:236:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:239:25",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:252:17",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:274:35",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:277:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:352:17",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:363:9",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:418:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:432:17",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:104:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:116:29",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:147:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:154:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:161:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:168:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:178:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:184:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:192:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:216:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:223:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:52:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:58:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:72:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:78:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:98:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:183:17",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:205:9",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:221:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:301:17",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:344:9",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:368:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:389:25",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:415:29",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:421:17",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:493:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:583:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:672:25",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:676:25",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:706:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:722:29",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:741:21",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:787:13",
+      "class_id": "logger.vsock.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/arch/x86.rs:129:9",
+      "class_id": "logger.nonapp.x86"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:135:17",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:138:17",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:141:17",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:143:39",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:147:17",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:149:17",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:151:17",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:67:21",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:84:25",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:88:21",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/mod.rs:57:5",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/target.rs:209:13",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/target.rs:282:13",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/target.rs:311:13",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/target.rs:324:13",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/target.rs:428:17",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/target.rs:443:21",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/target.rs:468:17",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/gdb/target.rs:483:21",
+      "class_id": "logger.nonapp.gdb"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/lib.rs:690:9",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/lib.rs:765:13",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/lib.rs:770:13",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/lib.rs:775:13",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/lib.rs:781:13",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/lib.rs:821:21",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/lib.rs:831:21",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/logger/mod.rs:44:13",
+      "class_id": "logger.process-startup.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/logger/mod.rs:47:13",
+      "class_id": "logger.process-startup.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/logger/rate_limited.rs:175:21",
+      "class_id": "logger.limiter.recovery"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/mmds/token.rs:211:13",
+      "class_id": "logger.network.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/configuration.rs:283:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/configuration.rs:293:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/configuration.rs:305:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/configuration.rs:329:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:175:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:185:25",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:189:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:191:21",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:233:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:246:25",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:264:25",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:272:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:286:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:303:28",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:317:28",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:320:20",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:346:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:379:13",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:390:25",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:401:25",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:409:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:417:9",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:458:22",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/pci/msix.rs:459:23",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:228:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:229:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:231:17",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:235:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:236:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:239:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:240:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:243:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:244:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:264:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:265:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:267:17",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:271:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:272:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:275:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:276:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:279:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/persist.rs:280:13",
+      "class_id": "logger.snapshot.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/rate_limiter/mod.rs:199:17",
+      "class_id": "logger.transport.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/resources.rs:218:13",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/rpc_interface.rs:390:13",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/rpc_interface.rs:457:17",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/rpc_interface.rs:651:13",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/rpc_interface.rs:680:9",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/rpc_interface.rs:877:9",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/rpc_interface.rs:890:9",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/rpc_interface.rs:940:17",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/rpc_interface.rs:950:17",
+      "class_id": "logger.lifecycle.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/signal_handler.rs:144:9",
+      "class_id": "logger.process-signal.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/signal_handler.rs:150:5",
+      "class_id": "logger.process-signal.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/signal_handler.rs:25:9",
+      "class_id": "logger.process-signal.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/signal_handler.rs:45:13",
+      "class_id": "logger.process-signal.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/signal_handler.rs:70:5",
+      "class_id": "logger.process-signal.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/interrupts.rs:184:21",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/memory.rs:429:21",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/memory.rs:447:21",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:302:21",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:368:13",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:388:13",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:426:25",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:436:25",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:447:17",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:459:17",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:467:21",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:475:21",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:496:17",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:504:17",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vm.rs:167:21",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vm.rs:250:13",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vm.rs:253:13",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vm.rs:397:17",
+      "class_id": "logger.backend.outcome"
+    },
+    {
+      "invocation_id": "logger-invocation:src/vmm/src/vstate/vm.rs:701:9",
+      "class_id": "logger.backend.outcome"
+    }
+  ]
+}

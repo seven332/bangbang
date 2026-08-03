@@ -1,0 +1,5117 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "generator_version": 1,
+  "inputs": [
+    {
+      "path": "src/cpu-template-helper/src/template/dump/aarch64.rs",
+      "git_blob": "3456298f5212b306c2b983dcedb8d7073d0dba48",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/firecracker/src/api_server/mod.rs",
+      "git_blob": "ecc6a7217c94475385dd2038d9e3787c10633167",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/firecracker/src/api_server/parsed_request.rs",
+      "git_blob": "2946b19706718653d9a0728c32571e39f7ce40d5",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/firecracker/src/api_server_adapter.rs",
+      "git_blob": "cd6a444c675ef3a9ef493b018189d4c8e9b03402",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/firecracker/src/main.rs",
+      "git_blob": "39c989c87f622472e104a66ac864440c1c9b7b7a",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/firecracker/src/metrics.rs",
+      "git_blob": "7914dece48f434a4de105995ae837f89d9f226e3",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/log-instrument/examples/five.rs",
+      "git_blob": "07aa0951935249fbe5bf8dde8aaafaec2143bd31",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/log-instrument/examples/four.rs",
+      "git_blob": "803cb6d8e9f5cc0a6dd99013c925db70279ea6e0",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/log-instrument/examples/one.rs",
+      "git_blob": "57836a0330d5130c43bd4bb036c4542d86a5a84c",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/log-instrument/examples/six.rs",
+      "git_blob": "443b36adea3eab0eb884850aa13d9e905169f084",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/log-instrument/examples/three.rs",
+      "git_blob": "13f8e0049cee90197843508f67c25f9f2518d3da",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/log-instrument/examples/two.rs",
+      "git_blob": "3c13ae9e78281df23ad50e4db9b2e6991d3c7de4",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/log-instrument/src/lib.rs",
+      "git_blob": "3939dc6df769f854d406d9a8e502d886815d7934",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/acpi/mod.rs",
+      "git_blob": "1dce12246781087e07c4619e86130c9ed05f4f1e",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/arch/aarch64/cache_info.rs",
+      "git_blob": "4c934626f1b548a848341c1690f7e10369699431",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/arch/aarch64/mod.rs",
+      "git_blob": "007ef1bf4bdf91027650d3545642609b535a501f",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/arch/aarch64/vcpu.rs",
+      "git_blob": "989aa78a2fb5140baedd416e8d5f894141eac1a3",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/arch/mod.rs",
+      "git_blob": "a35c61d311757c1bab2bd804c8f0a15159157a6e",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/arch/x86_64/mod.rs",
+      "git_blob": "cf7efe66dbc83d4243effd3403a6d3a210f04742",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/arch/x86_64/mptable.rs",
+      "git_blob": "6b6bde062df9c47fb75fe02dc06d63d201568b9b",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/arch/x86_64/vcpu.rs",
+      "git_blob": "98563aab2e357a0873e543acae4427f866dac6e3",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/arch/x86_64/xstate.rs",
+      "git_blob": "836c77b96bcd3e30c595c97f6a4841a5ab070825",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/builder.rs",
+      "git_blob": "45dd3865155541b9bdfbe459289d5909481fd3e6",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/cpu_config/x86_64/cpuid/normalize.rs",
+      "git_blob": "7accc3ecd714c7ca7c7f7dad8fbdea213a6a8d58",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs",
+      "git_blob": "1e790f1a9517ac450254de312a6a131923b7176c",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/device_manager/mmio.rs",
+      "git_blob": "e84784a3d5ff0919900f5443f1281816894c2e60",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/device_manager/mod.rs",
+      "git_blob": "202c457b6487989c8cf656600da7c3e5f76059f6",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/device_manager/pci_mngr.rs",
+      "git_blob": "8a625037c4d815991a7ed99eb4423e99f962c089",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/acpi/vmclock.rs",
+      "git_blob": "dbd42add87ebb5cac5d754e482dea5c7846782b9",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/acpi/vmgenid.rs",
+      "git_blob": "443faadde897bc711f863a3165daa95c65c7c6b5",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/legacy/i8042.rs",
+      "git_blob": "2f1b6b95c1d553ff4f56fb3aea48a03d38a22255",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/legacy/rtc_pl031.rs",
+      "git_blob": "96b1134eb1c6d39128cdcc037582cb775d2f3a5d",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "git_blob": "e38480179de107a3d6c27066fd9e93b8c3b2b043",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/mod.rs",
+      "git_blob": "7bff1948d0a5394540463965a20faf532fd56c6e",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/pci/pci_segment.rs",
+      "git_blob": "1761b8c22611d67ec9f1c62bb607d8aa0edbcb37",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/pseudo/boot_timer.rs",
+      "git_blob": "81f9abb34f3d3298f17182ba099ae86a9f1bbad1",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "git_blob": "1e962e828d77481115ef2cbfadfcd20845a322fb",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "git_blob": "a89cfe8477d9680cef80d94a727c6e49fec49b13",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/balloon/mod.rs",
+      "git_blob": "96005a36a8a9f3d1267029f9c1f5123b0e8fa529",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/balloon/util.rs",
+      "git_blob": "1d00891783e98f33224f1dc3e84d5fdf39d003f1",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/block/vhost_user/device.rs",
+      "git_blob": "7df600722ab95ea85360712e5737b54f870f1fc5",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs",
+      "git_blob": "4f143995630a148787349969e2992906ff32516b",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "git_blob": "ec7ec468505f5f9291d37d337a95cb9421cb8c6f",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/block/virtio/event_handler.rs",
+      "git_blob": "9f02862f81494073f5733cc0b8a37a767ed36e80",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/block/virtio/request.rs",
+      "git_blob": "feaa811e221e6f603b77f59084c0a0253019c3a5",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/device.rs",
+      "git_blob": "1cb591d7a3a6cdbe24071eb2c4b8b4f6ecaff078",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "git_blob": "c6c0ea443e42876d528b40e55398732d0397e66b",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/mem/event_handler.rs",
+      "git_blob": "ae81ef12a64f78c3a48dd8089f1f72372bcc9b7a",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "git_blob": "22b223b383b460cc5ba6edc4ea4c3a0a5eb2ddab",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "git_blob": "9d8c09a45f228d64c05d515dc05ef285af6197bb",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/pmem/device.rs",
+      "git_blob": "4d4da40a8e97a2a4c3291e51fcdd375e0a47f273",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/pmem/event_handler.rs",
+      "git_blob": "2324c509a6950ebdc82789132c6dac795f306bed",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/queue.rs",
+      "git_blob": "b4ff6514ed3018c11decd7ddf46ea1d41d322e7a",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/rng/device.rs",
+      "git_blob": "a6fee70262880a9b9ee6301c98757f3e2282f5a9",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/rng/event_handler.rs",
+      "git_blob": "dffda5d88451d9271520c18c93619925f787f32b",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "git_blob": "9c519604a9683720ee04dc3cb60cc709310ce36c",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "git_blob": "09d11a79f2068c295865a9c72d9e80b681c00c93",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/transport/pci/device.rs",
+      "git_blob": "40e8c2fc1390c01e0157cbbc99824eedc0ad4e4a",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/vsock/csm/connection.rs",
+      "git_blob": "eee415ef65f5e69ab099c44e1626cf6805b6ab53",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "git_blob": "16ee25a5a0af9976c44cdb1da2fd78b79b8c4d13",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "git_blob": "a680fda338ef025e15ea48f3716127530ae50527",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "git_blob": "e2c28033ec73b785f8c7220d079cc0039fa76a2c",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/gdb/arch/x86.rs",
+      "git_blob": "f8df58bedef307d49450ca3afeccbc858de76324",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/gdb/event_loop.rs",
+      "git_blob": "13d1f438a47824eedb90715a7af2ccdae25dcb8b",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/gdb/mod.rs",
+      "git_blob": "4656093ed77241021a0336c0a94876c1c83fc71a",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/gdb/target.rs",
+      "git_blob": "442d06c1c133510646ae66afc3a0cddf5b820b02",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/lib.rs",
+      "git_blob": "98884fdb7fc4c5fa6fc0961206fe5ea0f1d3e114",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/logger/mod.rs",
+      "git_blob": "df71f408db809edae5ee1d58c822386d2e37fb5c",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/logger/rate_limited.rs",
+      "git_blob": "e840e501c9cebd1ed6659bcc543b5561adb7238b",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/mmds/token.rs",
+      "git_blob": "f397c7a48557e911f472506b3d7e1b7269ad7c5d",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/pci/configuration.rs",
+      "git_blob": "b838262a0a4553b12a4956dca90debe4e5cdf55f",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/pci/msix.rs",
+      "git_blob": "0d7c3e75fe146772580cbdec531f1d4bb887c9fe",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/persist.rs",
+      "git_blob": "feb53c0e19e63aa11fcf863be1367596cf4f4fa0",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/rate_limiter/mod.rs",
+      "git_blob": "58a63194a1c2195fa20e376d360da1f199e95be6",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/resources.rs",
+      "git_blob": "64254170e7650c75ec4f71c39da122992ba4c2db",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/rpc_interface.rs",
+      "git_blob": "7693b305f650268e40ce5a54219138f081a0c240",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/signal_handler.rs",
+      "git_blob": "772d724d2fdc78524af52a837aaa3b112185ea09",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/vstate/interrupts.rs",
+      "git_blob": "1b8e40bf72a2faeb5d1db1353a9c04ce6a7ef466",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/vstate/memory.rs",
+      "git_blob": "7bff6ad070df2b5dd80fe4b941a1dcd7f451e6fb",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "git_blob": "4b99ac386b3b296a5da82a638e0441790aed33a3",
+      "extractor": "rust-logger-macro-v1"
+    },
+    {
+      "path": "src/vmm/src/vstate/vm.rs",
+      "git_blob": "4ba4bdc9c827e5d4c8ed60cf8bf796ace8b3ff1e",
+      "extractor": "rust-logger-macro-v1"
+    }
+  ],
+  "counts": {
+    "scanned_rust_files": 362,
+    "matching_input_files": 81,
+    "ordinary": 429,
+    "unrestricted": 39,
+    "error": 180,
+    "warn": 138,
+    "info": 54,
+    "debug": 47,
+    "trace": 10,
+    "error_unrestricted": 22,
+    "warn_unrestricted": 7,
+    "info_unrestricted": 10,
+    "production": 446,
+    "test": 0,
+    "example": 22,
+    "direct": 466,
+    "macro_template": 2
+  },
+  "invocations": [
+    {
+      "id": "logger-invocation:src/cpu-template-helper/src/template/dump/aarch64.rs:20:17",
+      "path": "src/cpu-template-helper/src/template/dump/aarch64.rs",
+      "line": 20,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:bd0177b927f0e7542190658af0f58e4161214341539036f080b7eb6ffdcc328e"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/mod.rs:102:21",
+      "path": "src/firecracker/src/api_server/mod.rs",
+      "line": 102,
+      "column": 21,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:efdc2f50dfb399876a08e5c57363f30930129592767b782f11ca92bc4df18dcc"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/mod.rs:112:21",
+      "path": "src/firecracker/src/api_server/mod.rs",
+      "line": 112,
+      "column": 21,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:46005169bddccedbeb7b9df168c656c8609f13eb580ba244070ff0fd4fbe791c"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/mod.rs:116:17",
+      "path": "src/firecracker/src/api_server/mod.rs",
+      "line": 116,
+      "column": 17,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c529c5afa589334d7b61c710af3e8b659638236e20de09b6fb57ebd9f12a20a4"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/mod.rs:135:21",
+      "path": "src/firecracker/src/api_server/mod.rs",
+      "line": 135,
+      "column": 21,
+      "macro_name": "warn_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5a18f84545ac5fd54ca16b68d277bd50c2ec1313e84047663561e7f6f9b46507"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/mod.rs:141:17",
+      "path": "src/firecracker/src/api_server/mod.rs",
+      "line": 141,
+      "column": 17,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:94122f3c538872c279d98bb78a17ed5a6dacb4c6a252e34d0114c14ff7f97fb5"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/mod.rs:183:13",
+      "path": "src/firecracker/src/api_server/mod.rs",
+      "line": 183,
+      "column": 13,
+      "macro_name": "info_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:8e6ae572becf4d8c26a7580b8d93d2af16c3d5d5dd245fc6e680aae0ac37649d"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/mod.rs:85:9",
+      "path": "src/firecracker/src/api_server/mod.rs",
+      "line": 85,
+      "column": 9,
+      "macro_name": "info_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0463d0125fa0c1a33f36f81b5851d92099bfac6c560f619aebc609b94317cc83"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/mod.rs:97:21",
+      "path": "src/firecracker/src/api_server/mod.rs",
+      "line": 97,
+      "column": 21,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:590e792e9d950fc4f7124174cdc235767b1bb1062e55f3106e2728a4d6021bd7"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:169:9",
+      "path": "src/firecracker/src/api_server/parsed_request.rs",
+      "line": 169,
+      "column": 9,
+      "macro_name": "info_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a19ba04e2e866588f6529385498e96709862a8462b3aa473a7853945a8865611"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:176:9",
+      "path": "src/firecracker/src/api_server/parsed_request.rs",
+      "line": 176,
+      "column": 9,
+      "macro_name": "info_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a19ba04e2e866588f6529385498e96709862a8462b3aa473a7853945a8865611"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:192:21",
+      "path": "src/firecracker/src/api_server/parsed_request.rs",
+      "line": 192,
+      "column": 21,
+      "macro_name": "info_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:41501ae031ad9ad39e11348344d096ffd98b8117134791af3a18a1e0e6c6017c"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:218:25",
+      "path": "src/firecracker/src/api_server/parsed_request.rs",
+      "line": 218,
+      "column": 25,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:b9c0c42e82fd203e1ef16d9f0ea3011ace8dd1f9a8e298fd11abfc0c9c39ed8f"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:225:25",
+      "path": "src/firecracker/src/api_server/parsed_request.rs",
+      "line": 225,
+      "column": 25,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cea92526ccdf22bd5828c4ae801cab56c8b0508b21f736f683314770319b519f"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server/parsed_request.rs:76:9",
+      "path": "src/firecracker/src/api_server/parsed_request.rs",
+      "line": 76,
+      "column": 9,
+      "macro_name": "info_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c5060c7c13576cf237d8b06168a7f7fa9c83855f63a5e85df49d950cee8db985"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server_adapter.rs:130:21",
+      "path": "src/firecracker/src/api_server_adapter.rs",
+      "line": 130,
+      "column": 21,
+      "macro_name": "warn_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a68267648f6ea9ca9916e9ed3f9fc2fe930363e3aa91622b044c314ae706eb08"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server_adapter.rs:137:13",
+      "path": "src/firecracker/src/api_server_adapter.rs",
+      "line": 137,
+      "column": 13,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a1bd47f04428438839c20e2b6f82e5d62cb858c8da43166ded0962a4a30f7e0d"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server_adapter.rs:143:13",
+      "path": "src/firecracker/src/api_server_adapter.rs",
+      "line": 143,
+      "column": 13,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:742ea6e2b3874a7993ce0cb4e929fb293740e1f7780ebd3b940f0b48545bdfce"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/api_server_adapter.rs:189:5",
+      "path": "src/firecracker/src/api_server_adapter.rs",
+      "line": 189,
+      "column": 5,
+      "macro_name": "info_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4c7c2f4f84766926792373731b32f2b7ebcb688408507f732114e82a014e0713"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:110:9",
+      "path": "src/firecracker/src/main.rs",
+      "line": 110,
+      "column": 9,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2863c6368cf2c0edb327406daf110deed200ad9086b586b6ff12e7ebc3fe15ef"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:113:9",
+      "path": "src/firecracker/src/main.rs",
+      "line": 113,
+      "column": 9,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:8f687ffeb6649e942d34e46c248376fdc376ec950a2e3ac3397a297d3fea0f94"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:116:9",
+      "path": "src/firecracker/src/main.rs",
+      "line": 116,
+      "column": 9,
+      "macro_name": "info_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2a1c6371cf6736fd6febf5585b45d8f41ef336895a28fecf1bd78021e77839f3"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:139:9",
+      "path": "src/firecracker/src/main.rs",
+      "line": 139,
+      "column": 9,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:18b2c3010adb391a005ee91a9e49d062fb3f7852e57afcaa9a059514811e086b"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:141:13",
+      "path": "src/firecracker/src/main.rs",
+      "line": 141,
+      "column": 13,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2ee174b8bcc4d4b51860a89e3744d5f41b7f93d60c8e68fd5dadf93e588a0b65"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:151:13",
+      "path": "src/firecracker/src/main.rs",
+      "line": 151,
+      "column": 13,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:260aba0a8e4a1fe12c923dd68b8efe1d5d6c3be5832d7fb9836cb0ef7f431706"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:333:5",
+      "path": "src/firecracker/src/main.rs",
+      "line": 333,
+      "column": 5,
+      "macro_name": "info_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a1bef615002d9a832acf556dc7ef00a36dab380220056f3d14ec677945cf1b48"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:336:5",
+      "path": "src/firecracker/src/main.rs",
+      "line": 336,
+      "column": 5,
+      "macro_name": "warn_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a1ea55faf4ca04a16d323ff2d612c43a8572bfdcb23539226ceab86a8cb93c5b"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:351:17",
+      "path": "src/firecracker/src/main.rs",
+      "line": 351,
+      "column": 17,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:8b8398aa287a31fe4852e39d1d52abd73d940dcefd01ae4849bb76190effd778"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:541:9",
+      "path": "src/firecracker/src/main.rs",
+      "line": 541,
+      "column": 9,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:3a3ac8ae494b2f075ff547a46178bbbd0f2ac938f0dec0cb80117f7a587d59ec"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:546:13",
+      "path": "src/firecracker/src/main.rs",
+      "line": 546,
+      "column": 13,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d85a9e8421dcf37e3444f03d675358b18768d605a2a365344806a7924ed76f55"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/main.rs:608:5",
+      "path": "src/firecracker/src/main.rs",
+      "line": 608,
+      "column": 5,
+      "macro_name": "info_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:9451e314cf071963e3219e13ebea7133db0fbc06c4b523c089298592e2f85c25"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/metrics.rs:47:13",
+      "path": "src/firecracker/src/metrics.rs",
+      "line": 47,
+      "column": 13,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:96f534dd0dd35b91f1626230e092abb3a7b0878223459a85b72ace5a7ae34a34"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/metrics.rs:65:13",
+      "path": "src/firecracker/src/metrics.rs",
+      "line": 65,
+      "column": 13,
+      "macro_name": "warn_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d59f5c76c36f6d8b98d95affc0fa4b97c1a46b82a26b57ad01d89ff956b42d6e"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/metrics.rs:77:13",
+      "path": "src/firecracker/src/metrics.rs",
+      "line": 77,
+      "column": 13,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:326e1eaabf2fe7d020656e9b262ea54f25d775358260dd8030df5a0d525ba388"
+    },
+    {
+      "id": "logger-invocation:src/firecracker/src/metrics.rs:83:13",
+      "path": "src/firecracker/src/metrics.rs",
+      "line": 83,
+      "column": 13,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:8213d21e290526f445fdbcb9e37f1a6c04bec5116798dcce71b37703a959a367"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/five.rs:13:5",
+      "path": "src/log-instrument/examples/five.rs",
+      "line": 13,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:66707bc12e9125c141b9c18baf3a6f53f2d6a2be29996a6e444d6dc314cb9654"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/five.rs:15:5",
+      "path": "src/log-instrument/examples/five.rs",
+      "line": 15,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:66707bc12e9125c141b9c18baf3a6f53f2d6a2be29996a6e444d6dc314cb9654"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/five.rs:25:17",
+      "path": "src/log-instrument/examples/five.rs",
+      "line": 25,
+      "column": 17,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:6796d722fd35faa9d14b028184d66d69b8cc581781e9f0b63db3846f389f7470"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/five.rs:26:17",
+      "path": "src/log-instrument/examples/five.rs",
+      "line": 26,
+      "column": 17,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:828ba34fca714600b99d081a68fa3f2108d30914837926ce7a133ec087eb8aee"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/four.rs:11:5",
+      "path": "src/log-instrument/examples/four.rs",
+      "line": 11,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:66707bc12e9125c141b9c18baf3a6f53f2d6a2be29996a6e444d6dc314cb9654"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/four.rs:13:5",
+      "path": "src/log-instrument/examples/four.rs",
+      "line": 13,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:66707bc12e9125c141b9c18baf3a6f53f2d6a2be29996a6e444d6dc314cb9654"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/four.rs:22:17",
+      "path": "src/log-instrument/examples/four.rs",
+      "line": 22,
+      "column": 17,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:6796d722fd35faa9d14b028184d66d69b8cc581781e9f0b63db3846f389f7470"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/one.rs:10:5",
+      "path": "src/log-instrument/examples/one.rs",
+      "line": 10,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:da81106049a2e179a1ac1dc4aa3e9e30c0ed19f52f7fbafb83a047ff85de16c9"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/one.rs:11:5",
+      "path": "src/log-instrument/examples/one.rs",
+      "line": 11,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:da272edcdc91b15501a07b0409ba852ed9aac46c6616d02eea72706a0c81a1ec"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/one.rs:12:5",
+      "path": "src/log-instrument/examples/one.rs",
+      "line": 12,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:d1afc836c684dd7ac0ee931481c978ccee65ca093d50dfcfabfbd18ad4236045"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/one.rs:17:5",
+      "path": "src/log-instrument/examples/one.rs",
+      "line": 17,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:918561356dac0005c9462d5ac9c2e10865780df1277549eca0054a430e2aa29c"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/six.rs:10:5",
+      "path": "src/log-instrument/examples/six.rs",
+      "line": 10,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:da81106049a2e179a1ac1dc4aa3e9e30c0ed19f52f7fbafb83a047ff85de16c9"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/six.rs:11:5",
+      "path": "src/log-instrument/examples/six.rs",
+      "line": 11,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:da272edcdc91b15501a07b0409ba852ed9aac46c6616d02eea72706a0c81a1ec"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/six.rs:12:5",
+      "path": "src/log-instrument/examples/six.rs",
+      "line": 12,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:d1afc836c684dd7ac0ee931481c978ccee65ca093d50dfcfabfbd18ad4236045"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/six.rs:17:5",
+      "path": "src/log-instrument/examples/six.rs",
+      "line": 17,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:918561356dac0005c9462d5ac9c2e10865780df1277549eca0054a430e2aa29c"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/six.rs:26:5",
+      "path": "src/log-instrument/examples/six.rs",
+      "line": 26,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:900e1f2912754cb36dec158fca0add4330960ee2e7e9ba39b221d31f3ee808a4"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/three.rs:10:5",
+      "path": "src/log-instrument/examples/three.rs",
+      "line": 10,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:53cc57a731aec1f6df8edace3cb853c04f6422b7166ca7ed6a58c834e846629c"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/three.rs:11:5",
+      "path": "src/log-instrument/examples/three.rs",
+      "line": 11,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:027968dcef836c1be2825024a131e89afce2c1e86d2f3ef15b782148a2e51e79"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/three.rs:20:13",
+      "path": "src/log-instrument/examples/three.rs",
+      "line": 20,
+      "column": 13,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:6796d722fd35faa9d14b028184d66d69b8cc581781e9f0b63db3846f389f7470"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/two.rs:10:5",
+      "path": "src/log-instrument/examples/two.rs",
+      "line": 10,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:9ca20ec7f16d2ca625df027a1d8459b1f846b5734f224012e8bd777a47b333fa"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/two.rs:11:5",
+      "path": "src/log-instrument/examples/two.rs",
+      "line": 11,
+      "column": 5,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:fcb582e6b7dd93f07d2d5520bb7045e4f596f3a333895e273b5d31a5ff5c8d2a"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/examples/two.rs:20:13",
+      "path": "src/log-instrument/examples/two.rs",
+      "line": 20,
+      "column": 13,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "example",
+      "fingerprint": "sha256:6796d722fd35faa9d14b028184d66d69b8cc581781e9f0b63db3846f389f7470"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/src/lib.rs:37:9",
+      "path": "src/log-instrument/src/lib.rs",
+      "line": 37,
+      "column": 9,
+      "macro_name": "trace",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:88a289651aa3ca77a81341f1c48b4c6ee4ad41fd1cf34d628341713d2c87b951"
+    },
+    {
+      "id": "logger-invocation:src/log-instrument/src/lib.rs:54:9",
+      "path": "src/log-instrument/src/lib.rs",
+      "line": 54,
+      "column": 9,
+      "macro_name": "trace",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6e9367de9582c1ab2433cb56705ec1ac8b6bb4d0d19d527b82355f85a6edbcb1"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/acpi/mod.rs:181:32",
+      "path": "src/vmm/src/acpi/mod.rs",
+      "line": 181,
+      "column": 32,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:bda88c9bea15a17befbd3dc30f3d8275aa983f04ed9a4ffaf4ddd4e84073b407"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/acpi/mod.rs:183:9",
+      "path": "src/vmm/src/acpi/mod.rs",
+      "line": 183,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:bee844270c94ce2f35f37a96f16c066176c6b28e7f64df914c427a571db86fe9"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/acpi/mod.rs:70:32",
+      "path": "src/vmm/src/acpi/mod.rs",
+      "line": 70,
+      "column": 32,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a4a7e76d9aaac99e1eb3a8495803bf395890dd51bfe4a22182270321b7831b09"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/acpi/mod.rs:72:9",
+      "path": "src/vmm/src/acpi/mod.rs",
+      "line": 72,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e13bab07d7d43db60b5817fde9bf2c37dfa50e40de08ba005825318c4ba0cb0e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/aarch64/cache_info.rs:307:21",
+      "path": "src/vmm/src/arch/aarch64/cache_info.rs",
+      "line": 307,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:55290b859b13df3ecc1b44c4cf9227c46946fc6b6ed808656e0c4b812d9707be"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/aarch64/mod.rs:180:9",
+      "path": "src/vmm/src/arch/aarch64/mod.rs",
+      "line": 180,
+      "column": 9,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:69aad1df4cf1aeafd48d151839a06fe282f99965fc806bca16dd0cae0d4b0b2c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/aarch64/mod.rs:195:9",
+      "path": "src/vmm/src/arch/aarch64/mod.rs",
+      "line": 195,
+      "column": 9,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:147303e2343960457dcc1720da9d7c8737d85ee54ca93be27146bb5c654ca412"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/aarch64/mod.rs:208:17",
+      "path": "src/vmm/src/arch/aarch64/mod.rs",
+      "line": 208,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:90ab72f44ddc2819f8a3ab12187c823ec5c9cf7dfd9ffd34a4f01139a5a84910"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/aarch64/mod.rs:70:9",
+      "path": "src/vmm/src/arch/aarch64/mod.rs",
+      "line": 70,
+      "column": 9,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cc045c418a94852053bc4df1ba08ed4bc2978fac2a458d425bd2e8b1a3b26506"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/aarch64/vcpu.rs:504:9",
+      "path": "src/vmm/src/arch/aarch64/vcpu.rs",
+      "line": 504,
+      "column": 9,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:14df607128278f141c6936560280d57a2b40f1690aa2d12581e79cf87402e2ee"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/mod.rs:70:13",
+      "path": "src/vmm/src/arch/mod.rs",
+      "line": 70,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0cfd5cd5d68e19191d00164cae67a0e0db536e0e4e92353d9e1fda54d5010347"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/mod.rs:120:9",
+      "path": "src/vmm/src/arch/x86_64/mod.rs",
+      "line": 120,
+      "column": 9,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cc045c418a94852053bc4df1ba08ed4bc2978fac2a458d425bd2e8b1a3b26506"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/mod.rs:458:5",
+      "path": "src/vmm/src/arch/x86_64/mod.rs",
+      "line": 458,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:7055e4b087f1fde0bbff3ed7a39763862c4d491a0a0ce178f2869723624b2a00"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/mptable.rs:131:5",
+      "path": "src/vmm/src/arch/x86_64/mptable.rs",
+      "line": 131,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6121ed0d4ae94d6631ace050522bf97e5f25f57aa021877f94940241e554a597"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:283:13",
+      "path": "src/vmm/src/arch/x86_64/vcpu.rs",
+      "line": 283,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:aef4feb5c76df939879fbd37655e6125e48e164101df389726117b04af97003b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:405:21",
+      "path": "src/vmm/src/arch/x86_64/vcpu.rs",
+      "line": 405,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:52f9edb34266e9e06d7f391dc221cdad48711c813adb1d455a0d94a572a2fecb"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:432:29",
+      "path": "src/vmm/src/arch/x86_64/vcpu.rs",
+      "line": 432,
+      "column": 29,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:88762a289a595ef670b1d952ed38d23dd9678d64ac9e93ca493a53f0722ccd29"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:588:13",
+      "path": "src/vmm/src/arch/x86_64/vcpu.rs",
+      "line": 588,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cf1c9f731865f0f02d082f939b72bf00003ab038f61d84ba51826236eb4a9296"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:728:25",
+      "path": "src/vmm/src/arch/x86_64/vcpu.rs",
+      "line": 728,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:46ccb8a82817766b1b2e4ad01481c6e53ad689849e9517617ef9d297acf35f28"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:738:25",
+      "path": "src/vmm/src/arch/x86_64/vcpu.rs",
+      "line": 738,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:7383f73b99abcca7efef6bcfe54e949110bfa5373733e448201269fcdcc84a40"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/vcpu.rs:746:17",
+      "path": "src/vmm/src/arch/x86_64/vcpu.rs",
+      "line": 746,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d451db0981d47bb914085b79fa96692d6204e523acd09dec401c5f858e8ca256"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/xstate.rs:120:13",
+      "path": "src/vmm/src/arch/x86_64/xstate.rs",
+      "line": 120,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:003ca18206765416e8d6d397ddb89b490c2d337556e7f6e32a810bf591f12fff"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/arch/x86_64/xstate.rs:79:13",
+      "path": "src/vmm/src/arch/x86_64/xstate.rs",
+      "line": 79,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ebaa1b2272c95103a344d6ae4b06eb3308247af3615c538cb8825e9530b04576"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/builder.rs:304:9",
+      "path": "src/vmm/src/builder.rs",
+      "line": 304,
+      "column": 9,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:92a31fd370ae004a4e876421e12d06215c491b326994ad0082095c2f4a8193b4"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/builder.rs:354:9",
+      "path": "src/vmm/src/builder.rs",
+      "line": 354,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c95384fa1c5bd9ecef6e279edb7c0c6bdd8621b9e2d1865f9698936bb967e2a0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/builder.rs:386:5",
+      "path": "src/vmm/src/builder.rs",
+      "line": 386,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c4bb438b8ac15da96983b298d3381868d940c3edaf05b59094a9a0b9567e5898"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/builder.rs:388:5",
+      "path": "src/vmm/src/builder.rs",
+      "line": 388,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f730ff3c36914e0dee43af934b8f1b7058dba9e56e003b2e59f913bc400a3e50"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/builder.rs:390:5",
+      "path": "src/vmm/src/builder.rs",
+      "line": 390,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f8bcc6e4e66376cdded96c78c50abf8fe59084c27bf6c18194abe4487454895e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/builder.rs:392:5",
+      "path": "src/vmm/src/builder.rs",
+      "line": 392,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4b8ba93121abd7e30a33dcf08b5d4ee7c2112db765de524b79f1c0b654db8eae"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/builder.rs:449:5",
+      "path": "src/vmm/src/builder.rs",
+      "line": 449,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e2968a55827f958119551cffacddac981eaa13e6705ab461468dd6c034044679"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/builder.rs:553:5",
+      "path": "src/vmm/src/builder.rs",
+      "line": 553,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6acaa9db94f0e91ca51ecea2eec95e3aa3ab5b2c5a978c1c9e2ea3fe595cae1a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/cpu_config/x86_64/cpuid/normalize.rs:382:25",
+      "path": "src/vmm/src/cpu_config/x86_64/cpuid/normalize.rs",
+      "line": 382,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:eda573a1fbe2a7e525e071e4ec8d3d0d6bb3afad1ecc9a76fca89f6247eb9f99"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs:48:33",
+      "path": "src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs",
+      "line": 48,
+      "column": 33,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:004d5527822f888fbcba66a9c63d7caa4f386750e70c39e3f08afdf900ebe711"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/device_manager/mmio.rs:85:5",
+      "path": "src/vmm/src/device_manager/mmio.rs",
+      "line": 85,
+      "column": 5,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:df1e04446050965c80737d1ccae89fb291ad6ff388dd592dc6e94a4ba109db84"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/device_manager/mod.rs:135:13",
+      "path": "src/vmm/src/device_manager/mod.rs",
+      "line": 135,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ce0cdecf60f5714e84a779d3f919248e1d68004d8c278d609086ceedf00d5d6a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/device_manager/mod.rs:141:13",
+      "path": "src/vmm/src/device_manager/mod.rs",
+      "line": 141,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:eac95b763f1b82ad5cfb5c5bf6213d1257904a5d674b0244a9d880e96d0a2bc7"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/device_manager/mod.rs:375:9",
+      "path": "src/vmm/src/device_manager/mod.rs",
+      "line": 375,
+      "column": 9,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:73240e64f238225780cfb85105892f3c8b680bd7baacd1d30647f2c5d0c04676"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/device_manager/mod.rs:619:13",
+      "path": "src/vmm/src/device_manager/mod.rs",
+      "line": 619,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4925d6971b882c161ed26c0d39c58009a8d297fe2dbf339e11b66dfd95836042"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/device_manager/pci_mngr.rs:151:9",
+      "path": "src/vmm/src/device_manager/pci_mngr.rs",
+      "line": 151,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e269ede522569122579533fded85fe006a4a9e8be575768b5a252383db5ebe87"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/device_manager/pci_mngr.rs:325:25",
+      "path": "src/vmm/src/device_manager/pci_mngr.rs",
+      "line": 325,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:9a22b49e8e628af0adc6fe58f987b3eba777405b573579a119157546896f4aa6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/device_manager/pci_mngr.rs:95:9",
+      "path": "src/vmm/src/device_manager/pci_mngr.rs",
+      "line": 95,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:bbe29c9564285059e2b41be8c75f24a420a4c4be5b34fecb7b413e4fe66aa47a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/acpi/vmclock.rs:151:9",
+      "path": "src/vmm/src/devices/acpi/vmclock.rs",
+      "line": 151,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:55d798d975e63d4fcbe1a1aa38529be64e9090a1a47c4624482f80e717483b1a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/acpi/vmgenid.rs:110:9",
+      "path": "src/vmm/src/devices/acpi/vmgenid.rs",
+      "line": 110,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:97dca02a1ecd40467e6f3c198aa7a5f66585bb2c1d8c106419f929b241a3914f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/acpi/vmgenid.rs:116:9",
+      "path": "src/vmm/src/devices/acpi/vmgenid.rs",
+      "line": 116,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:7f74eb4cdee20dbe0474833e7e3c65e2c65ff956eff10fc4c9ed9910081bef9e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/acpi/vmgenid.rs:61:9",
+      "path": "src/vmm/src/devices/acpi/vmgenid.rs",
+      "line": 61,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:9daa946970f77e42aedafda4eb500ff108576ecd0d4c717818c6425903ae7caf"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:152:13",
+      "path": "src/vmm/src/devices/legacy/i8042.rs",
+      "line": 152,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5b3e9c07bfa0f0674270f725da83eee3f72592eb77cec2539db679a639762fbc"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:236:21",
+      "path": "src/vmm/src/devices/legacy/i8042.rs",
+      "line": 236,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4e88da8cc3c96f87212b0d08c7d1edd366aad12c76274e8d502613eb747121af"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:263:21",
+      "path": "src/vmm/src/devices/legacy/i8042.rs",
+      "line": 263,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:aeb3061b5d2530a3b443f666f967e60c179596406bbc3a8884b9f933d7538864"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:325:21",
+      "path": "src/vmm/src/devices/legacy/i8042.rs",
+      "line": 325,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4e88da8cc3c96f87212b0d08c7d1edd366aad12c76274e8d502613eb747121af"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/rtc_pl031.rs:114:13",
+      "path": "src/vmm/src/devices/legacy/rtc_pl031.rs",
+      "line": 114,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1dd9044b859b66efab8f8cde881e292904892c805332b1afed934de15c85fa52"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/rtc_pl031.rs:38:9",
+      "path": "src/vmm/src/devices/legacy/rtc_pl031.rs",
+      "line": 38,
+      "column": 9,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1e7a60b09eb269807c3d39100d38baf9e3dcefb74f77acab5120abab04bdf18d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/rtc_pl031.rs:44:9",
+      "path": "src/vmm/src/devices/legacy/rtc_pl031.rs",
+      "line": 44,
+      "column": 9,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cb50fedbc0c0f038371d23030b920275ab75166c0e1d2f99b18810e4f90d244b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/rtc_pl031.rs:99:13",
+      "path": "src/vmm/src/devices/legacy/rtc_pl031.rs",
+      "line": 99,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f100e67ecf00ed502a42b0c7856f7efbe47f274a34d14081ad07deb2298a9b21"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:120:25",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 120,
+      "column": 25,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:92096eb50df2374dd5f63a37a3ac36928c6067fb82a3d841545459e1f3d3a8bf"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:202:13",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 202,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4a47f09c8305d62365f8c4a8cc5e9354755389057915fb93cc24debfa2bc6bba"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:208:17",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 208,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:70234e8c3f74efeceeab935330f1b38d1999b4e5e74ef7a0ff6aca96174ece05"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:305:27",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 305,
+      "column": 27,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0bf2a456f921f22455ef19947a33455186afd683b509af2970b50fddbb94eb6f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:312:13",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 312,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4a47f09c8305d62365f8c4a8cc5e9354755389057915fb93cc24debfa2bc6bba"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:320:21",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 320,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:b03705d070b763a42987120bdc3d9ea6a5d413bd9e061faf68ea0ac5a4619335"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:341:21",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 341,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5540edc3198558d1f6384efca7cb54535ef06d7566ea0f0d8d759b708bf3ae3c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:353:25",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 353,
+      "column": 25,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2e1bbf74ef9c599ff8e4232f2c55b1e94008ee3430c88cce1e7807ca4d3a6bab"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:361:25",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 361,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5540edc3198558d1f6384efca7cb54535ef06d7566ea0f0d8d759b708bf3ae3c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:384:17",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 384,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:628e50fc2731cccb87202d6fd680225b7d0231c0dcf84fc40bffff2870b6c23a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:387:17",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 387,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:69215730aafb394dd88be8d0e7714ff9d292a128a3f2d708cf599df0be52be64"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/legacy/serial.rs:427:17",
+      "path": "src/vmm/src/devices/legacy/serial.rs",
+      "line": 427,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ad3a41b4ecb4161df97eba2fad614509af5f1012aad0e84c10424da3e6684820"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/mod.rs:34:5",
+      "path": "src/vmm/src/devices/mod.rs",
+      "line": 34,
+      "column": 5,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:da3bdb7e383d9cc58637bfd4fde5b2666c264b7b1158b82ea3c7c926812cb2a6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/pci/pci_segment.rs:131:9",
+      "path": "src/vmm/src/devices/pci/pci_segment.rs",
+      "line": 131,
+      "column": 9,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1934a80a3fae5a210b2b798fd538c951d523c965423e087c142cd17a4e8d56bd"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/pci/pci_segment.rs:153:9",
+      "path": "src/vmm/src/devices/pci/pci_segment.rs",
+      "line": 153,
+      "column": 9,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c375f659f033248ca67c123989909fe54860fa79c3a4c694a7b84637ec3fb242"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/pseudo/boot_timer.rs:31:13",
+      "path": "src/vmm/src/devices/pseudo/boot_timer.rs",
+      "line": 31,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:3afb5c3c3fcd38874a6f796fc0f40c16390f717c43aa081a6519a54b6babf570"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:239:17",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 239,
+      "column": 17,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2dee9ac974d5ddd6681cddaded16fc4d54752efd024501b4f2d834d2a8079df3"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:406:25",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 406,
+      "column": 25,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f9ee05c8604d4f0b0e62adbde2ebd48efd23fbeb697f160b7c9154bafc276d7a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:457:21",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 457,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:8b675237911764aa1216277e4497759c76ed014e6a617085d317dde89c5ceda9"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:498:17",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 498,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1c6e49a4173241c1b469b4884aec79a1291b5c57d31b6f4084e6b39203eef4b2"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:510:17",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 510,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1944f212a4f0a663435f26cb02e176e09fadfdc65bc97f2c8520296a353248aa"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:573:25",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 573,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:628ee3af511977b30b19a8e08819c68cb166b5712f110b3f7f778a0ead812b82"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:586:21",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 586,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1acb2e41dfd7d50b92a108b05eb9e43257a4b6cca8e861622c1fd3c283686d0b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:591:21",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 591,
+      "column": 21,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cfcddd41a6d1b304db23f63788467c24062c00d7eee2ebfb532215fdb56f9f23"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:598:21",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 598,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:875a4485c7238931d882942c578dc7529dc5129f018544b0f92f8d1aca925185"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:640:21",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 640,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:66aed05520bc8e6c1610d101fd527136486f5888bc51941c364295330cfb96f6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:711:13",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 711,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c0b5360f694217d38a64c73bedc11170f9bbb027573cff43019c8eaeb501fd3d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:935:13",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 935,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ecaa3654de91bd5887ad2e13e9b54b42105b1ea78d46889337114f7cc84d01b0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:947:13",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 947,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fb3e06b163a50af6324285f395bee2b6c629b3e1848767a21c0550b8df6d08b9"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/device.rs:985:17",
+      "path": "src/vmm/src/devices/virtio/balloon/device.rs",
+      "line": 985,
+      "column": 17,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:35bbd72a084bee8d354c863b9d68b09b9b6109222b792dc29e675ad42f2568a3"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:109:13",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 109,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f0c943edeca79067c7d33bf36e9e33411fddb0885ee9cacfeea751f16aa44d54"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:138:21",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 138,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2313f418b4662051556ce6a1472a320dd6d731ef64a4d763c846cfddb80bae92"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:142:13",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 142,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:9ef4bb4433a6e7906a8813721f5e6d97d05fa0c01d229b8e00e38ee6a669d0e5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:27:13",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 27,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fadbbd3873b904cb672b044e78962d26449a38496bddf84cae9d45742b26b167"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:34:13",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 34,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5210cf6102a923cf54368f0fe22dda7569f5404b3ba16a4d3634f04d49ae734f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:42:17",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 42,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:8b86d97b2c4c663543ef3d5706bd3121f4c136010f76a17a3ac55785ecfdc5cd"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:49:17",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 49,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0872ccc59080d9c68a7102f991364f2c6d183409ff3133ede8b0a9a75a23c0d7"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:60:13",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 60,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:617656a99e23d734fa361063b76dbf2d369a733099c400b9f771a9b418f8e61d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:70:13",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 70,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:db021f6e4cac00944c74ae1c0707668723e7aaba011af78e2fdd99e338002295"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:83:13",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 83,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fb6727cbf72d9a49a1f105aa78425f205ea86e8b77839101d9bd4afcf80a9f4d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:89:13",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 89,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a08d2d0dcc30745604b516041b9aa079421ec71a0ad208d6ed5fd84c82769c6c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/event_handler.rs:97:13",
+      "path": "src/vmm/src/devices/virtio/balloon/event_handler.rs",
+      "line": 97,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:39e030d758589ff924b9292b1672a678971e61ec59cf7401d9e75242b4875d54"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/mod.rs:121:5",
+      "path": "src/vmm/src/devices/virtio/balloon/mod.rs",
+      "line": 121,
+      "column": 5,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:da3bdb7e383d9cc58637bfd4fde5b2666c264b7b1158b82ea3c7c926812cb2a6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/balloon/util.rs:39:13",
+      "path": "src/vmm/src/devices/virtio/balloon/util.rs",
+      "line": 39,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:aaa54f7eaf5853f5581e1c6eca102d843edfffc95d38f372efbb1d293caaa134"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/device.rs:336:13",
+      "path": "src/vmm/src/devices/virtio/block/vhost_user/device.rs",
+      "line": 336,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ecaa3654de91bd5887ad2e13e9b54b42105b1ea78d46889337114f7cc84d01b0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:19:13",
+      "path": "src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs",
+      "line": 19,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fb6727cbf72d9a49a1f105aa78425f205ea86e8b77839101d9bd4afcf80a9f4d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:25:13",
+      "path": "src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs",
+      "line": 25,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:3cfccbc985eb7e76fb2cdb55ff963e4ff4d8a5e3be8afb95e9674a7bdcc4e108"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:32:13",
+      "path": "src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs",
+      "line": 32,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:39e030d758589ff924b9292b1672a678971e61ec59cf7401d9e75242b4875d54"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:45:13",
+      "path": "src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs",
+      "line": 45,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f0c943edeca79067c7d33bf36e9e33411fddb0885ee9cacfeea751f16aa44d54"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:56:17",
+      "path": "src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs",
+      "line": 56,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ed7b53897d8217612c433aad847b074064a2121786600ac454cb6f7f7c016563"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:59:13",
+      "path": "src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs",
+      "line": 59,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5887f6ab860fcce4e51dc261fe90662e9d349916a3c50e557310e6316a0ededa"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs:72:13",
+      "path": "src/vmm/src/devices/virtio/block/vhost_user/event_handler.rs",
+      "line": 72,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4081cab8087989c959256915ecfda06fe27cfef1cdf9da8c0ed30271975ea717"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:148:17",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 148,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0c068283c221ce2ce9e5d3906d40a4a5d652609e182de51d83290b820ff25439"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:275:17",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 275,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "macro-template",
+      "source_context": "production",
+      "fingerprint": "sha256:7c5bed2f3228062fa1ac822331479055bca42ef2f370a5301721ee815b55aa8c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:363:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 363,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0f0682b02f8765298b14237fc6e1d0d3c861db76c348249a7d782f453b333cef"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:417:25",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 417,
+      "column": 25,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:b1574ec9c4c776d7e4a6608eb92a7acc6ab449b09de11dbddd8b82c3fe4eb2a3"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:438:29",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 438,
+      "column": 29,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:83686cc8762464920482bb3f2a2cb1daa28dad906e87120abece184e9722e9ca"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:460:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 460,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6ecb32b896dd734fb3c3e733d350a9dfb09d312abdaff5d6461a5c819ece8c79"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:480:21",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 480,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:49f3bd8ddfe46f965a88e261cea844d65f9a046af1e40ef80861fc5eaed0b367"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:501:29",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 501,
+      "column": 29,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:28613decbf8b4adf1af56a5e91f2953d16d0a2a0ba0d6f117723d7b87265d714"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:525:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 525,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:59addf0b96ff81dd4df2a8533540ad6d9f64f702c3b6b779c403a9ced5279183"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:567:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 567,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6a54b0d71677fbcf1ba5a243252f29c1e7f8a3d552faa7ceeaacad79616880bf"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:628:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 628,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ecaa3654de91bd5887ad2e13e9b54b42105b1ea78d46889337114f7cc84d01b0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:641:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 641,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fb3e06b163a50af6324285f395bee2b6c629b3e1848767a21c0550b8df6d08b9"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:684:21",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 684,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:52399d3c47bb5f207f08b087994fcca78bf21cbb0e72d17b557d2b296f059cc8"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/device.rs:82:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/device.rs",
+      "line": 82,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cb55e78babb37b4b9be7d204d95da04e4053011cf9afb95108537048a1288da1"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:23:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/event_handler.rs",
+      "line": 23,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:246fba342f062d564d51e765ef739d25e0dcb73d37fdbab7c529bbdf136b4fdc"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:30:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/event_handler.rs",
+      "line": 30,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:312df1e0603e03e5d4c8112bf211f5d1ae1d020392e6f258a712533211fb66ec"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:39:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/event_handler.rs",
+      "line": 39,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fa0b753e3d3645dc57c7e5cb55838f41119069cf1edde2d38d2d32e147436b74"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:49:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/event_handler.rs",
+      "line": 49,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fb6727cbf72d9a49a1f105aa78425f205ea86e8b77839101d9bd4afcf80a9f4d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:55:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/event_handler.rs",
+      "line": 55,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:3cfccbc985eb7e76fb2cdb55ff963e4ff4d8a5e3be8afb95e9674a7bdcc4e108"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:63:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/event_handler.rs",
+      "line": 63,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:39e030d758589ff924b9292b1672a678971e61ec59cf7401d9e75242b4875d54"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:78:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/event_handler.rs",
+      "line": 78,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:345df4e8106b9956dab8238b8cb7805208b6f191bbdc6a98c514c4930cf7b389"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:91:22",
+      "path": "src/vmm/src/devices/virtio/block/virtio/event_handler.rs",
+      "line": 91,
+      "column": 22,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2d2758adefb4f1621074c7d4cd87863e9f3e1e1d1fa1609ec86d6f28abefdc7e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/event_handler.rs:94:13",
+      "path": "src/vmm/src/devices/virtio/block/virtio/event_handler.rs",
+      "line": 94,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:30515bc25a28981df67bba100915c802c656b469e36ad34ef8fe17d0cffd0abb"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/request.rs:116:17",
+      "path": "src/vmm/src/devices/virtio/block/virtio/request.rs",
+      "line": 116,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2d4719147936e1a06b2f2b3438b88f2108389369c2bb4e5949130d8cabdc527b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/request.rs:124:17",
+      "path": "src/vmm/src/devices/virtio/block/virtio/request.rs",
+      "line": 124,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:569f36b23a0453f129e22b81663f2f835b14197b9a6158dfd97236685a6c1af1"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/block/virtio/request.rs:136:17",
+      "path": "src/vmm/src/devices/virtio/block/virtio/request.rs",
+      "line": 136,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c61616158f278233f4e7c6465e2a94ec9caf9efc0d768e7226c954a76f8e6c41"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/device.rs:137:17",
+      "path": "src/vmm/src/devices/virtio/device.rs",
+      "line": 137,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a0287b76ad3c4d898bf5373eea6ae405bc6dc0a4a5a2d1f0e9ba590f352607e5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/device.rs:149:17",
+      "path": "src/vmm/src/devices/virtio/device.rs",
+      "line": 149,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:eebb807e94fbbc803b03eaa492a25d6c64e3e082228cdbb184f8f79dc8bda71b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/device.rs:158:13",
+      "path": "src/vmm/src/devices/virtio/device.rs",
+      "line": 158,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:615892f7256079a5aa19516c0d47f4de1b4e8046266d6c238d48aed4ecdebbca"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/device.rs:197:9",
+      "path": "src/vmm/src/devices/virtio/device.rs",
+      "line": 197,
+      "column": 9,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1ae35738ecc68ed8fc0b77b34b856a1ce8db8290ffa40976bec1c5b9b69d727d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/device.rs:200:17",
+      "path": "src/vmm/src/devices/virtio/device.rs",
+      "line": 200,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:b6f503283e0f764ca253de56adfb7be233bf654181af7950a2343f0102f73c95"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:278:9",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 278,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:070be605993b27e3893b4c3ce359adb85e649a9e642b5a3fd9c0bec3dff65cf1"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:356:17",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 356,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f3121341a067fad5859ffe21bbb06b7816b79f6b596150abf0fb86b542f10fcc"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:390:17",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 390,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a90f00f72544b682bac2a777eac2895c109f0aa6c4da09edb3b8109c4ab29428"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:417:17",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 417,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:50d3b21d548cfda30c44047e045d4120fb0e3c3151ac14206d303e4f39b7c78e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:439:17",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 439,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:145b889c34adba2016efb2aa0ca63335be02d60f145d4b9f483e3f6676a56ff3"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:453:13",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 453,
+      "column": 13,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:953403d654de20475eaa925289e5bd6430451004761e36455441985498d530f4"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:476:13",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 476,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:aca73f998ca8e9bfb366de10b6df871f85bf041af70ca2dae74e29125c2e2caf"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:482:13",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 482,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0669aaef6a308be42a410ea864ded63f6f62bc2d0cc43ac7af22135b7b30aa36"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:550:21",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 550,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2eb106d95090462dac23873a5fece15b6d0ebafa8c85d12c3be729f420839be1"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:581:13",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 581,
+      "column": 13,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:62425afa6a831d55dab29733bd8e3ded9f6523bad781f78a3fc7123767e41097"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:588:9",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 588,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:281fbbbcbeb8760226f4ddb1a15e5b5b9ae7323c75fbbbce4780affcce0409ab"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:644:17",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 644,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:654beb38939187031763fe1711459d74d552d9ffc9389fceb7919374b1540ecd"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:652:9",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 652,
+      "column": 9,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f09628aa4b7443fd4d7d47ab3b00e7d7e0ff3207466116c00973b98993d64e4b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:665:13",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 665,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:650504fe7ec936e94816e68163be1a710b9d5d1776492b6f851e1ff69e978787"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/device.rs:691:13",
+      "path": "src/vmm/src/devices/virtio/mem/device.rs",
+      "line": 691,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:bb7b4406dcf3de69b2d2124e14feae4be9b20eafeeac8f97fe9249fd3d18ff61"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:22:13",
+      "path": "src/vmm/src/devices/virtio/mem/event_handler.rs",
+      "line": 22,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e247cadfe60e6a2a964d731fc229d4a588899cbac25e47191d201a1d2cdd2139"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:32:13",
+      "path": "src/vmm/src/devices/virtio/mem/event_handler.rs",
+      "line": 32,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:16d5901f6d29163e68daa372727da2e646847c14ad40f194adb965b62f3dbf16"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:38:13",
+      "path": "src/vmm/src/devices/virtio/mem/event_handler.rs",
+      "line": 38,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:22692059252743c6da6a0cd41a333dc2832b85cd47de2818a21bd93c2c2e0c9f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:50:13",
+      "path": "src/vmm/src/devices/virtio/mem/event_handler.rs",
+      "line": 50,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:77e676eb61e72bb180e2e7dc883461abd6b816b9851244f371e48f52a99b5621"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:73:13",
+      "path": "src/vmm/src/devices/virtio/mem/event_handler.rs",
+      "line": 73,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4a4b1fc9a6d4634a79214687198007cad5885f9e75531d70a37af1a5249d1fbc"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:78:13",
+      "path": "src/vmm/src/devices/virtio/mem/event_handler.rs",
+      "line": 78,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:dc2e84f180302ebaba73f9542c50266990b9820842dfb32406145e113e6302f4"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/mem/event_handler.rs:87:17",
+      "path": "src/vmm/src/devices/virtio/mem/event_handler.rs",
+      "line": 87,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:70db8655907c5a9c3615972cb10b7d2f0364df69d80b75b2695996bce04467cd"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:1029:13",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 1029,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ecaa3654de91bd5887ad2e13e9b54b42105b1ea78d46889337114f7cc84d01b0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:1045:13",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 1045,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fb3e06b163a50af6324285f395bee2b6c629b3e1848767a21c0550b8df6d08b9"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:498:21",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 498,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:3c38242c71e7e67e402e6db7d0312de9561d1910cadfbe46778db0c2b4349b63"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:503:17",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 503,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6cd5c729784557d0199420920fddb4aca21ed8542b0ca4b43d63a171b31dcd96"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:560:17",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 560,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:48340b19ca1e03c12356db15040c2d70e53e83e80e2e6da7597af12181a66fb4"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:566:13",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 566,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6c61e5971acb76d5738eb58af0cb4184377aee52564f7da6860cd92ca6520f99"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:609:17",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 609,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6614ab1c453f6f0104022d5272a273d04a07a3be390f9a13ca284c5d06198768"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:698:29",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 698,
+      "column": 29,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c35c6ddd4d6b8366181b44b2250ebe5eeab32c91a78788e91055f7c599e45c80"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:709:21",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 709,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:538fd62aba50d2f3861e34310a0870a6e1d24632d31f8dd51b19cf6b53ac83eb"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:759:17",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 759,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cadcefc83f4c992ef5c5d0b65e4d9b7b53a3b50aeba315be4e5f260b82198887"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:888:13",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 888,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:85c94644d8bd18aefe9cda95a206bfde4774aa5bdf53ea6910212384b727063a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:925:13",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 925,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:b32a780540c36ea2a155452fc541e4dd589443e64c152e306addc3b5cd02ec08"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:949:17",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 949,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:b2f62df8cf63fc1ec3034d9653fa1ebc96a99bd343e70a41418edd0c3e4baf62"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/device.rs:966:17",
+      "path": "src/vmm/src/devices/virtio/net/device.rs",
+      "line": 966,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:00576e85afb214e3a493d1d488dac45f3af89a95f28a56ab40d794c920826c8e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:108:21",
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "line": 108,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:3a92e40ebefb8fce9512d008f3331187e1e9647643a5d4219a4a6c0068d545af"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:113:13",
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "line": 113,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0deac52e91846f1a28fe562bb1239cdd5ed0df2c71e057a4c2a067963fef7051"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:26:13",
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "line": 26,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5ed6402ec867a4975768d228290922a6abc1a7db08bd443ffcddc95fa765a9b7"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:33:13",
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "line": 33,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:746ac12e9a550989f9ce1bb16fee0775a4b368723aab9c9a0c4988cf4b1be3d4"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:40:13",
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "line": 40,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5ed6402ec867a4975768d228290922a6abc1a7db08bd443ffcddc95fa765a9b7"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:47:13",
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "line": 47,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:746ac12e9a550989f9ce1bb16fee0775a4b368723aab9c9a0c4988cf4b1be3d4"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:54:13",
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "line": 54,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:11e022264a4e7b26611550f075762d4afe1a78d99a0b51fadec6e480f90255ba"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:64:13",
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "line": 64,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fb6727cbf72d9a49a1f105aa78425f205ea86e8b77839101d9bd4afcf80a9f4d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:70:13",
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "line": 70,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a3124fca727c4194fc1aa28b07432f524f7f38c3df155be7b8ac3ab94cddbfa5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:78:13",
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "line": 78,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:39e030d758589ff924b9292b1672a678971e61ec59cf7401d9e75242b4875d54"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/net/event_handler.rs:92:13",
+      "path": "src/vmm/src/devices/virtio/net/event_handler.rs",
+      "line": 92,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f0c943edeca79067c7d33bf36e9e33411fddb0885ee9cacfeea751f16aa44d54"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:386:21",
+      "path": "src/vmm/src/devices/virtio/pmem/device.rs",
+      "line": 386,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:678d7bf0f86365074c9a49d1e34910bc407f0feee8d4c2d5a8eaf17adcefaffe"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:392:17",
+      "path": "src/vmm/src/devices/virtio/pmem/device.rs",
+      "line": 392,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:678d7bf0f86365074c9a49d1e34910bc407f0feee8d4c2d5a8eaf17adcefaffe"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:404:21",
+      "path": "src/vmm/src/devices/virtio/pmem/device.rs",
+      "line": 404,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:678d7bf0f86365074c9a49d1e34910bc407f0feee8d4c2d5a8eaf17adcefaffe"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:463:21",
+      "path": "src/vmm/src/devices/virtio/pmem/device.rs",
+      "line": 463,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6c3e06d68548aa82b0c46c2243c594abbfee7cca135ec724361c937a5337434a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:482:13",
+      "path": "src/vmm/src/devices/virtio/pmem/device.rs",
+      "line": 482,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:64667d7f70e50852268c27f6cd8db8a05cce8fa3c1e6de8f34250dbd6f383979"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:493:13",
+      "path": "src/vmm/src/devices/virtio/pmem/device.rs",
+      "line": 493,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:b92a7ed163b8d00d0b0b5fca9713b945da78e3eac3d214be12b1f48f8945c896"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:501:13",
+      "path": "src/vmm/src/devices/virtio/pmem/device.rs",
+      "line": 501,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d88fbb880e5005b2e509311916702f9075e4e499b43aaa4e4b4e8517dc196e05"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:507:13",
+      "path": "src/vmm/src/devices/virtio/pmem/device.rs",
+      "line": 507,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:b92a7ed163b8d00d0b0b5fca9713b945da78e3eac3d214be12b1f48f8945c896"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:562:13",
+      "path": "src/vmm/src/devices/virtio/pmem/device.rs",
+      "line": 562,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ecaa3654de91bd5887ad2e13e9b54b42105b1ea78d46889337114f7cc84d01b0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/device.rs:593:13",
+      "path": "src/vmm/src/devices/virtio/pmem/device.rs",
+      "line": 593,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:651503be4c26b3337aafdf6df9955011079254d2e8ecc2e2459712977b9acf3c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:21:13",
+      "path": "src/vmm/src/devices/virtio/pmem/event_handler.rs",
+      "line": 21,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2f972600123dec11f12c794debd9372b9f487ae3d58aac34f87f8ed5d839c591"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:28:13",
+      "path": "src/vmm/src/devices/virtio/pmem/event_handler.rs",
+      "line": 28,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ea03e89b86cb3a00a984933c78dafc2994d0f6745117711f29d9f2a451203799"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:38:13",
+      "path": "src/vmm/src/devices/virtio/pmem/event_handler.rs",
+      "line": 38,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4b051c726fcf67dc41aaa97090bcc883972cdff3f2e4291f11c65b26f45130c4"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:44:13",
+      "path": "src/vmm/src/devices/virtio/pmem/event_handler.rs",
+      "line": 44,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d7c4edea59b9646fd860fcc78c742d054f739e213e357fbf05146e83631bfe6d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:56:13",
+      "path": "src/vmm/src/devices/virtio/pmem/event_handler.rs",
+      "line": 56,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6c4665460c615de98576da226733be3feca0522dd0c20c9312332436943869a0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:75:13",
+      "path": "src/vmm/src/devices/virtio/pmem/event_handler.rs",
+      "line": 75,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:653f562159f2ae70fe0f82b69dae56f287fb4fea6742e2574833e7607b690e24"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:80:13",
+      "path": "src/vmm/src/devices/virtio/pmem/event_handler.rs",
+      "line": 80,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ecc255f0b11389a5fb3f8beab6867ca4cb8d4b03066174bf2c4b09543ace5453"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/pmem/event_handler.rs:89:17",
+      "path": "src/vmm/src/devices/virtio/pmem/event_handler.rs",
+      "line": 89,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5ecdf9706e45f50cade4d833d192037ba237c2c65d8a245bc1ad820fe2f72204"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/queue.rs:567:13",
+      "path": "src/vmm/src/devices/virtio/queue.rs",
+      "line": 567,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0bbee47b0e10fc0751284fa6efbba8afb1eb35c6f090bee605ce8a6b0be4eab0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:152:21",
+      "path": "src/vmm/src/devices/virtio/rng/device.rs",
+      "line": 152,
+      "column": 21,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:01470b7b57274889c2a3fd9e4732418b6ccb0b6c171bac04166e746c39e4fd2c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:161:25",
+      "path": "src/vmm/src/devices/virtio/rng/device.rs",
+      "line": 161,
+      "column": 25,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ebf0d91955344928427f569bc932a3033c98115d933166b8a71ce6348b635baf"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:168:25",
+      "path": "src/vmm/src/devices/virtio/rng/device.rs",
+      "line": 168,
+      "column": 25,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:875febd62f361e36ff33e9337fb60211edcf0ba2a03d4313d393356913e9d7fa"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:174:21",
+      "path": "src/vmm/src/devices/virtio/rng/device.rs",
+      "line": 174,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:24df24c32588b8c4e7d2b9f4bccd0c0aff4f37e8ae926a2d5cae0ed1ea75d535"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:186:21",
+      "path": "src/vmm/src/devices/virtio/rng/device.rs",
+      "line": 186,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e3813b06e875d87e9f16f4d8e00261d067398a43208623da0f16b97ca26b6116"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:200:17",
+      "path": "src/vmm/src/devices/virtio/rng/device.rs",
+      "line": 200,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a24d8bf06596ff386a9474110b9f7df9e7eec1102180c1c6775ef51d37e0e256"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:210:13",
+      "path": "src/vmm/src/devices/virtio/rng/device.rs",
+      "line": 210,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1dd4ae5b896f9811d067945e21abf461733e2555ac33cd5c18548fde6c6825b5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/device.rs:228:17",
+      "path": "src/vmm/src/devices/virtio/rng/device.rs",
+      "line": 228,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f2251ba8c6ee9a72f2d991411ac749319dd5695aff7c635bc3c59b6e9f33bf31"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:22:13",
+      "path": "src/vmm/src/devices/virtio/rng/event_handler.rs",
+      "line": 22,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:19a84e69fcc8b0d3f901a61598e9634396c2849ff718c75d9ef2e763da6d1487"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:29:13",
+      "path": "src/vmm/src/devices/virtio/rng/event_handler.rs",
+      "line": 29,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:649e9a8f141ee2042a57eb31fc60a516929f3d023a6ab125adfde51251d4bc22"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:39:13",
+      "path": "src/vmm/src/devices/virtio/rng/event_handler.rs",
+      "line": 39,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:aaf78b6cf7f97d99886316ca894402ea53144d172df07b82fa5037e034ac8f97"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:45:13",
+      "path": "src/vmm/src/devices/virtio/rng/event_handler.rs",
+      "line": 45,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:56b4c21cf0b586344024b9cae5539fc5169bd615eb100c8c8b8e18f26cdc7d28"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:57:13",
+      "path": "src/vmm/src/devices/virtio/rng/event_handler.rs",
+      "line": 57,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:54fd669d5261ab301a4f825944fcf17bd4ec3bc622f8dc0e2769df970ce698ae"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:80:13",
+      "path": "src/vmm/src/devices/virtio/rng/event_handler.rs",
+      "line": 80,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:153f74bc1952e6b92fc7355f31c7920265fbbfbc4b08472926bc0cd6c84d36bf"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:85:13",
+      "path": "src/vmm/src/devices/virtio/rng/event_handler.rs",
+      "line": 85,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4d2fc786f065cf8f18564eb2b302b698cab3c0216306fabd873f5e2dae2739ed"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/rng/event_handler.rs:94:17",
+      "path": "src/vmm/src/devices/virtio/rng/event_handler.rs",
+      "line": 94,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cb9c1e9eb0e71bc830376d6146a1362425e39b25a77dce4c160b5158426d6e0f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:137:13",
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "line": 137,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:36f285ba76496178cd70ee1397249bedb9bd46b3ade70b70a65afdc40a81801e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:146:13",
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "line": 146,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:acb3fb2cbf612c583f3b17a29d3313c28a79172afe229e958e66733efa518e69"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:225:25",
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "line": 225,
+      "column": 25,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5c7c3752306313d930173b752d23f6201abf02c25b75a112ffc967d93595fc24"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:230:13",
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "line": 230,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:760137752ab839046103936455a41ae28a9ce6a2292d0f1a7e7e971a8124563a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:285:25",
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "line": 285,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:492bdeeb75fe38045998cce5c613edb807f982845ec25f7a9ea7a13acb3d2905"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:293:17",
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "line": 293,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c790ee96409c4732485efb82bfe431e2251f020e2df4feaa8ecd3f87f9df8e0c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:325:29",
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "line": 325,
+      "column": 29,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:8d3c50c0c6575de5e3102f48b9493fab793a541a4842faf95e01324cfb2b1f67"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:348:25",
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "line": 348,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:12bab3dac49fd72333112698d7285836bda989fd3b21aa62452164bbb6db0bc6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:359:21",
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "line": 359,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:8c2d730e665f32b5cff5e77905430ed69c9ec830f64bd3cabd06030db727b4c8"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:363:17",
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "line": 363,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5027349d0b8535b760c2f49a52f9dbe8304b0a3c23d11126aace6a31715684a4"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/mmio.rs:473:13",
+      "path": "src/vmm/src/devices/virtio/transport/mmio.rs",
+      "line": 473,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:08e3b71d3765864aaa344fa281fc27e2bf1a899b9c8a759cb9e2cf57aaf026fe"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:115:18",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 115,
+      "column": 18,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1ed5bffa320e3f04d5f721bc5bacf5303daf909afb3553dde1069242a9ecb200"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:128:17",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 128,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f33fd81e4f3398e9731116ec4d7ace2b131c06475434b848c92312760efddeb6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:138:17",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 138,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:64675520fbd7f107542b0b6e6ff6be3c26a8d927326e66dd817b9929c4cd2b0e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:195:17",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 195,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:9a33898c5c120177cb06e22afb0e9cc9006ebd0d5eb1190b62f21b98cf3a4c49"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:202:13",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 202,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ec80fe8cd3eb837d149dd6bd21d7264b08bb3944e25bbec3f893fda987ff8fcd"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:231:17",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 231,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e0e57764d0413fa84083d7260c1bf61f8fccb6807cfc76852d59e82a8e021448"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:249:13",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 249,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d32e295b35e328c9def5c878bf6da8f839910e247b535edcc7f12a1d0d1a0677"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:296:17",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 296,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c2293d6c540ea12a18f697c51c216c1a36a86e937e2cfc5441086e58d1a9632f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:359:17",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 359,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0474c830dc9b15980903214cee2d1fc8863d87471aad8344f7f29b567b121c2a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:390:21",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 390,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0e5acbdc7ff1b2721c3e86601e84aedfa89fdedc093cbce7c201c4443e59d5ac"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:415:17",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 415,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:81710f941da45be638c2d1a08345b5baf3fe7c79b2b80bcb943398b04a4141c3"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/common_config.rs:91:18",
+      "path": "src/vmm/src/devices/virtio/transport/pci/common_config.rs",
+      "line": 91,
+      "column": 18,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1d225fedc1a0cb126acf8924ce04482bb697d212f2fa1d9f339e576b5506c9be"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:565:13",
+      "path": "src/vmm/src/devices/virtio/transport/pci/device.rs",
+      "line": 565,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5c59e8893f3a47c331d11b0fec092c373f57cdaa04f925f60cf0a90cbc1d5087"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:592:13",
+      "path": "src/vmm/src/devices/virtio/transport/pci/device.rs",
+      "line": 592,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1a40a7ddd518fb8c957797b0771fdb716c4a2675a1066122917ede65a3bdb99c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:836:17",
+      "path": "src/vmm/src/devices/virtio/transport/pci/device.rs",
+      "line": 836,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:8cb666bbffdc7bc6138eed3fa2d5cd43fa89b133db18659d244f44f1f5879198"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:851:17",
+      "path": "src/vmm/src/devices/virtio/transport/pci/device.rs",
+      "line": 851,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d10f3bb27e452eff0b1e8626b9c7832da7987f06aeddb394b13abaa184037977"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:896:17",
+      "path": "src/vmm/src/devices/virtio/transport/pci/device.rs",
+      "line": 896,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:7bda7ca1cd6052bf2e6cec81d55c64a435d918269c290a908e02d3df12a01b79"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:910:17",
+      "path": "src/vmm/src/devices/virtio/transport/pci/device.rs",
+      "line": 910,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d3cd01550e66f188e78589bd07c88aaa56481513e8dfd03e07522899dbd9c5df"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:941:13",
+      "path": "src/vmm/src/devices/virtio/transport/pci/device.rs",
+      "line": 941,
+      "column": 13,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:26c641a5c18dace909c000f36d258b69bdffb01b21e4a8bfa5ef53fe64f0a649"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:952:21",
+      "path": "src/vmm/src/devices/virtio/transport/pci/device.rs",
+      "line": 952,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:dbaa68c180a9350de909f1a4ef95aae769c918c80151115c978b9c5b70c6c27e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/transport/pci/device.rs:982:21",
+      "path": "src/vmm/src/devices/virtio/transport/pci/device.rs",
+      "line": 982,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6a7d71429c915122aefb8e6ee4a7ddc8a0e49518cea038854daf3ab2435b60b5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:252:21",
+      "path": "src/vmm/src/devices/virtio/vsock/csm/connection.rs",
+      "line": 252,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e016f2d1f28f908a5588328b9cea06ea4a09364976165b391545dd1403e03bc1"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:262:21",
+      "path": "src/vmm/src/devices/virtio/vsock/csm/connection.rs",
+      "line": 262,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:679c8f1a24bd93cfda06113e739c1e5aea9543b3e5db2f16e514942d34ee6ca1"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:308:21",
+      "path": "src/vmm/src/devices/virtio/vsock/csm/connection.rs",
+      "line": 308,
+      "column": 21,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d4a67012b531c4a4245300679429f2b216b2ccbc91b2720fd357e9782db20d62"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:319:21",
+      "path": "src/vmm/src/devices/virtio/vsock/csm/connection.rs",
+      "line": 319,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:bcdbfd10ee063f231640f4c2787f470b6d030773d493f60c46fc3d2777331f23"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:391:17",
+      "path": "src/vmm/src/devices/virtio/vsock/csm/connection.rs",
+      "line": 391,
+      "column": 17,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e3766c7d9c43d6e2b288c059cb86f7a3b4b9347ef53b8b7835137a4e7f1b05e2"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:460:17",
+      "path": "src/vmm/src/devices/virtio/vsock/csm/connection.rs",
+      "line": 460,
+      "column": 17,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:55b1f4ca600956483f9e889983a4bd090ec8295956698caa1204d2f791110295"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/csm/connection.rs:468:21",
+      "path": "src/vmm/src/devices/virtio/vsock/csm/connection.rs",
+      "line": 468,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:3256d0db018ce2029deb122d3f7b783c9c53b7af20bbbdfc8be1a63e0e374a4d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:189:33",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 189,
+      "column": 33,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:266f7d4de967ea065a3c9d82b2e9c81db71d901f03ff69f1777295b3ec97b96e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:206:21",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 206,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fe5e558dfb7410d17d5948dda97a112e46796c0c531f9a660388b1efa1189123"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:213:17",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 213,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:955a7fb314bdab6066d07046cd310c80413ebd1286b8f8802411cc1abbdfd807"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:236:21",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 236,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:9d58a404adc46eca0ea147feb6ef20d5899f826ea9be560d6a4cfe8a1e3be4c5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:239:25",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 239,
+      "column": 25,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:955a7fb314bdab6066d07046cd310c80413ebd1286b8f8802411cc1abbdfd807"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:252:17",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 252,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:955a7fb314bdab6066d07046cd310c80413ebd1286b8f8802411cc1abbdfd807"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:274:35",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 274,
+      "column": 35,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:37f470266f70fda83eaf7acdf0c8036fc04896fae6f882652d7331cc0ba37b5f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:277:13",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 277,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d18defb56044b883393271baa5d5c7ecec72f67c64518650df404f3b1797b9c8"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:352:17",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 352,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6f371b6ba6539667b126a7055bb91f8fea9315ca770d201e04722d74888d02b4"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:363:9",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 363,
+      "column": 9,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:858e7830c9de948e6c82d7e2db533b15e97d1dafaaa204004541dba66cf8b1ac"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:418:13",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 418,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:383471643474724b226873fc6ccf827923c12d45200c8d0067f52a7220407091"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/device.rs:432:17",
+      "path": "src/vmm/src/devices/virtio/vsock/device.rs",
+      "line": 432,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f69bb5f417c3c2f40ba854115ac36722dc59f72966249d3f8a9e7f30e83c978b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:104:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 104,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5d8be579532e14e22acd0a5232c84e850ad9d0c903e2709b8d772378edd60db5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:116:29",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 116,
+      "column": 29,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5e643ceb476d14b5da06f984a7d8f3011fc45fa7837126230f6cf0023edd5f86"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:147:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 147,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5ed6402ec867a4975768d228290922a6abc1a7db08bd443ffcddc95fa765a9b7"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:154:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 154,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:746ac12e9a550989f9ce1bb16fee0775a4b368723aab9c9a0c4988cf4b1be3d4"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:161:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 161,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:091146563696bc6a7082bb3779b816e6f78f1b369b2cd9b7e7856ce0e691de22"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:168:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 168,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2c58065639a13a822b6716ab49148276acbe13cc2043e8faee565b9ad25d0b74"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:178:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 178,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fb6727cbf72d9a49a1f105aa78425f205ea86e8b77839101d9bd4afcf80a9f4d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:184:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 184,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a3124fca727c4194fc1aa28b07432f524f7f38c3df155be7b8ac3ab94cddbfa5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:192:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 192,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:39e030d758589ff924b9292b1672a678971e61ec59cf7401d9e75242b4875d54"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:216:21",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 216,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2c900a21156a897a0342f500ab5f1b2622e60647da0cccecf46ad79544f385ab"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:223:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 223,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:7c348abe157dacc628acd337fc13d4a93c1c51b2d18ab33b588f11ee24a394a1"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:52:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 52,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:7bc7ff58670eab73ef17c11893693251932c9c3ab5ac39551056decf41a0f61e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:58:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 58,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:89c9bf12f9a01be02e8107c51613cf06cbf0591c2570b2429b9af8ef793aeccd"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:72:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 72,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4480e3e9e5278b6573c48af15f7b81c5785320a85ca5d82a3a519be420619301"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:78:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 78,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c38d8f939341b694b7bb7381bdddf6e87059861ae436bdff19f26dc2ca5dec0c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/event_handler.rs:98:13",
+      "path": "src/vmm/src/devices/virtio/vsock/event_handler.rs",
+      "line": 98,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d952d73f2519b26125bc5b4c2b76d1022fa07cf31f134e4b4027dd3ee25ff5d2"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:183:17",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 183,
+      "column": 17,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:810907857b021791b99e34726f227d469884cd2bc19c2cba513161f7133ec4e2"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:205:9",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 205,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2e865e765482ef191977708c27456d6d58576ce157758cce4f06347facb12bed"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:221:13",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 221,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:7ed605376caff86066f65fc92ce5df803a57261df219b2d7326a53dbdad776f5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:301:17",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 301,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d574b8b99bec929ab2cc3853d7fc327dd93778657f4a916b1a1623bdbcdbee14"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:344:9",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 344,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:7efa1c3985d66c0c3409c5086b309dbffaf8f63bc5cbe097dd9d6b4ee053f34b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:368:21",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 368,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:bc2a58e30012a5464e5e8c5b826a7267f095f144dddee72e4d1be1dfefc6cd42"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:389:25",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 389,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:547988e17d8e96fdfa07dc78758cc988acc50be48709bf61303be7438663c0a2"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:415:29",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 415,
+      "column": 29,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d5739036c79031054ba8f3db8f122dd563ad441328c1e4e4c90aef5e68ce04e8"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:421:17",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 421,
+      "column": 17,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:61c0a70b2a19ba7b31b3a55d99a086433d15d1929517efa318dce9a53bc28495"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:493:13",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 493,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ef35680d597002d2e2b95c853af2f97c844f1279eb5b77be83c31b5400247f9f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:583:21",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 583,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:985c0fbbdfcfd9b1700b02d8b3b8848eea7ebd4024105f4773c921ff9094adfe"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:672:25",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 672,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e0b4610c3202e3e1d497dc96a1437fc7febe5e966c8143fa0e901f7e6b74f98e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:676:25",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 676,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:db3c0b19e4a1b1cec9c3e629485b7529944dcedc8db6c69420e962f16fd94c03"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:706:21",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 706,
+      "column": 21,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:360c8427c1b2c8ce259a20d88c739fa4fb58e0cad8391249cf11db5d33f0fbe8"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:722:29",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 722,
+      "column": 29,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:9e04bee1a279963fcaa9b1e3ca259fb29c90460630c2d38b15c891a1ab61bf7b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:741:21",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 741,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:9e04bee1a279963fcaa9b1e3ca259fb29c90460630c2d38b15c891a1ab61bf7b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/devices/virtio/vsock/unix/muxer.rs:787:13",
+      "path": "src/vmm/src/devices/virtio/vsock/unix/muxer.rs",
+      "line": 787,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ca7a6e8837ec7432fbb3742cfa1e01d7d8a1ca187ba100a8c9e3c56fba30a496"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/arch/x86.rs:129:9",
+      "path": "src/vmm/src/gdb/arch/x86.rs",
+      "line": 129,
+      "column": 9,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:929d824ec1ce7fdda5cbc07bf9cbed255b4e3cdab9c13015e52db15f22e30e2e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:135:17",
+      "path": "src/vmm/src/gdb/event_loop.rs",
+      "line": 135,
+      "column": 17,
+      "macro_name": "trace",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:827ebc04f6e2ffe0fbdebcc632d32f3bf0e0bf914f2334d6c266dee62ee17d80"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:138:17",
+      "path": "src/vmm/src/gdb/event_loop.rs",
+      "line": 138,
+      "column": 17,
+      "macro_name": "trace",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1edc5226f3924d0d8ef345b6d43ea0cb902112579df8ec55d4074a97e6609126"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:141:17",
+      "path": "src/vmm/src/gdb/event_loop.rs",
+      "line": 141,
+      "column": 17,
+      "macro_name": "trace",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2710dc6cab5fddbfbab6a43a5df5736fc1a4b3428e1af767b94b43a6fe4c8ba0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:143:39",
+      "path": "src/vmm/src/gdb/event_loop.rs",
+      "line": 143,
+      "column": 39,
+      "macro_name": "trace",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:009e37fe71837e4655e6911c3e99d26532c8f702bea5c7884ecc6b0a9a275db2"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:147:17",
+      "path": "src/vmm/src/gdb/event_loop.rs",
+      "line": 147,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1b7132230da8c3176a4c1ec0aae182fbdc226e974ff7b0d9bde06cae1d8b0599"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:149:17",
+      "path": "src/vmm/src/gdb/event_loop.rs",
+      "line": 149,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d68b6ef08d92f45a38e61b7cab3d9b97dfaa9ed1bcffeac975a0d8f2e8dfb35e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:151:17",
+      "path": "src/vmm/src/gdb/event_loop.rs",
+      "line": 151,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cc9c8855e3166a1914d39a8f2e2fcbf365a85916f9f4a95d5cbd9575ac64b67b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:67:21",
+      "path": "src/vmm/src/gdb/event_loop.rs",
+      "line": 67,
+      "column": 21,
+      "macro_name": "trace",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:5dac8d5e619520f65e00294901170b6d4c6912b7a75ba23cb4376759169d3d47"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:84:25",
+      "path": "src/vmm/src/gdb/event_loop.rs",
+      "line": 84,
+      "column": 25,
+      "macro_name": "trace",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:293ee95c93e73462163f4fab1504658a3be9cdb91f6cf94a55a27968711fda17"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/event_loop.rs:88:21",
+      "path": "src/vmm/src/gdb/event_loop.rs",
+      "line": 88,
+      "column": 21,
+      "macro_name": "trace",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e789aa2bce849807253f4e39be565fc404acfc28e76134dd088fb64dd930a1c5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/mod.rs:57:5",
+      "path": "src/vmm/src/gdb/mod.rs",
+      "line": 57,
+      "column": 5,
+      "macro_name": "trace",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fcc34737082eb222a25476aef4cb054a07d187b2944cca572601542a13f1ba9f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/target.rs:209:13",
+      "path": "src/vmm/src/gdb/target.rs",
+      "line": 209,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c92c4562e295967df1af1d5a176340b861a8b6450ef1ea37cf8a0e3539cd8237"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/target.rs:282:13",
+      "path": "src/vmm/src/gdb/target.rs",
+      "line": 282,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4dd5bca827028ea80fdbf59f90e7fcfb32e7df00800206c7637bb6c23c57d16f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/target.rs:311:13",
+      "path": "src/vmm/src/gdb/target.rs",
+      "line": 311,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:6ec702e7b25e27a9349fd87985cce1546d4670d8bc89d6121a85d491991ee279"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/target.rs:324:13",
+      "path": "src/vmm/src/gdb/target.rs",
+      "line": 324,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fd2ca0f934391d4bb49e274120ee171c4abbe71daabf4df2edbf95112c1271d4"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/target.rs:428:17",
+      "path": "src/vmm/src/gdb/target.rs",
+      "line": 428,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d141bbc5373a95fc79df71e65fbfeac652384a8e6d03cbb54584908fe4f1691f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/target.rs:443:21",
+      "path": "src/vmm/src/gdb/target.rs",
+      "line": 443,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:60d0ef00138691d12a5bf7ba0c2a46df9c474a96600727786ab5b7c82d17f8c7"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/target.rs:468:17",
+      "path": "src/vmm/src/gdb/target.rs",
+      "line": 468,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d141bbc5373a95fc79df71e65fbfeac652384a8e6d03cbb54584908fe4f1691f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/gdb/target.rs:483:21",
+      "path": "src/vmm/src/gdb/target.rs",
+      "line": 483,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:976038bcd7b6479a6ca4a87d186c75c1e7c549857d915626c0e50879844a91b7"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/lib.rs:690:9",
+      "path": "src/vmm/src/lib.rs",
+      "line": 690,
+      "column": 9,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4529fb3ef603031e3c208e7053cc285ce8014dd59b3cac6c10f9055a3ca47628"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/lib.rs:765:13",
+      "path": "src/vmm/src/lib.rs",
+      "line": 765,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:514c3244aa51411225f5fda339cfccf7940388763dbe863e33f3bc3d266214be"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/lib.rs:770:13",
+      "path": "src/vmm/src/lib.rs",
+      "line": 770,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a5d3a923b5da4e04e6ed1c2dc6b7862ee34e483baa9069808a01f9b3de39f1dc"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/lib.rs:775:13",
+      "path": "src/vmm/src/lib.rs",
+      "line": 775,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4832b683bbc9d2170fcddc7a5a1559fdcab41fa0651e48ca494269ff9fb62908"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/lib.rs:781:13",
+      "path": "src/vmm/src/lib.rs",
+      "line": 781,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4a5d651639ff7c1725147311387065975d96c31e74b69a10499d404cd40634ec"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/lib.rs:821:21",
+      "path": "src/vmm/src/lib.rs",
+      "line": 821,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:950dca6db97235bd6f9e8dec7795c6bed5bbbf1dfcbead9a33a96e5e709bcf24"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/lib.rs:831:21",
+      "path": "src/vmm/src/lib.rs",
+      "line": 831,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:97e0aa2d1e4b0a67484deb6281db55fdbbc560dded54ab99d338c5ae69e7dae9"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/logger/mod.rs:44:13",
+      "path": "src/vmm/src/logger/mod.rs",
+      "line": 44,
+      "column": 13,
+      "macro_name": "warn_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a90f816affef974edbc89dd231bb4dae7bb792b7eac75dbd096b3764f06648d8"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/logger/mod.rs:47:13",
+      "path": "src/vmm/src/logger/mod.rs",
+      "line": 47,
+      "column": 13,
+      "macro_name": "warn_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0985179602d56d65c742c5ff973a9fbf5653f0995a09e4144c469178baea1288"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/logger/rate_limited.rs:175:21",
+      "path": "src/vmm/src/logger/rate_limited.rs",
+      "line": 175,
+      "column": 21,
+      "macro_name": "warn_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:70d168afd8bd2f81237a8681ff8f92d644401fd1cded0cf1561818ef0b70e81f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/mmds/token.rs:211:13",
+      "path": "src/vmm/src/mmds/token.rs",
+      "line": 211,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a425e4a75c1dc50e6e4fb52bfe8a715fd9a65dc4a9283c6a9efcafb28cd00098"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/configuration.rs:283:13",
+      "path": "src/vmm/src/pci/configuration.rs",
+      "line": 283,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:38540781996fc3591038a2f1cfb6fef449cb3bb6684b1d261efea5288149391c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/configuration.rs:293:17",
+      "path": "src/vmm/src/pci/configuration.rs",
+      "line": 293,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cadbcabaa8f6d323f1a4be4c03ec71d001c1d8ad715cae0853f6689f9c79948c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/configuration.rs:305:13",
+      "path": "src/vmm/src/pci/configuration.rs",
+      "line": 305,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cadbcabaa8f6d323f1a4be4c03ec71d001c1d8ad715cae0853f6689f9c79948c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/configuration.rs:329:13",
+      "path": "src/vmm/src/pci/configuration.rs",
+      "line": 329,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cadbcabaa8f6d323f1a4be4c03ec71d001c1d8ad715cae0853f6689f9c79948c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:175:17",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 175,
+      "column": 17,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a64c3eb444951c7ba4f9c16067308dc32b59de416f42026f8d75056a03601c54"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:185:25",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 185,
+      "column": 25,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:7f72fb8225bea2a65bea494ee588724c8149154900225017abab652fc51219e6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:189:17",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 189,
+      "column": 17,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:cc135a0a8af3031fab287288afd16a311fd7b52b78051aeda5b04edc39acfa70"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:191:21",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 191,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:179eb90a96869cbe58340d0dbb84a2f620360ffb5363e7c268ca1c2dd0add63e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:233:13",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 233,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:447bbb88561b42d29af05e927085e524fd1b638a31ba82deec4194ca824a36c6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:246:25",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 246,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:faac1a6d6027d15944afb214ba0559f4e9be12eb041d9711d0012b0ba3f3247d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:264:25",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 264,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:faac1a6d6027d15944afb214ba0559f4e9be12eb041d9711d0012b0ba3f3247d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:272:17",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 272,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:24417f0e9a9b09e10e9f1fc91ea54cfed0ccf9b062b784dff130083318b67cb0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:286:13",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 286,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:49d24171112508ead0a43a106cfcfe270fd0c54c4666824c659746e8a2074fb2"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:303:28",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 303,
+      "column": 28,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e258e941ea3daa861e6a8cf0600998b12b9189092d9d5ee868fc1da15899adbd"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:317:28",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 317,
+      "column": 28,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:e258e941ea3daa861e6a8cf0600998b12b9189092d9d5ee868fc1da15899adbd"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:320:20",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 320,
+      "column": 20,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:91b79bbbaec7150bec8e36796d4ce185155e313de4bf743e5e1ebc45191b4ef8"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:346:17",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 346,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:7f72fb8225bea2a65bea494ee588724c8149154900225017abab652fc51219e6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:379:13",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 379,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:3977d188a8f83ab3c91f9d46cd6f3f8d8673db659ec11f7725b93a888ad35a7d"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:390:25",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 390,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:887847c1c41ff5f1aedda2b4d9f4b248fe68e776f207b048fbfe6260f2b45279"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:401:25",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 401,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:887847c1c41ff5f1aedda2b4d9f4b248fe68e776f207b048fbfe6260f2b45279"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:409:17",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 409,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:24417f0e9a9b09e10e9f1fc91ea54cfed0ccf9b062b784dff130083318b67cb0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:417:9",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 417,
+      "column": 9,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:08c584d0e445e2ba28c6e6afb90e31e01c14bb6e78b665f9a935e5a935355121"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:458:22",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 458,
+      "column": 22,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a131894c7b117b22970475d747db6ba62ac6798db08ec1667305cdee420cae82"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/pci/msix.rs:459:23",
+      "path": "src/vmm/src/pci/msix.rs",
+      "line": 459,
+      "column": 23,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ea8c94f26a84c20a7c6882a2ffa38916269e68f0b329d41b3ebad179547b9814"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:228:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 228,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:893c7c74a305b3e6590a684b4ad6c90f747044e7c1bd69a1714cbde7ae5a503e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:229:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 229,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:aeb9334e1baf772568569a02fe2b4215dd992130ae85f21bbc9be76f09883b1c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:231:17",
+      "path": "src/vmm/src/persist.rs",
+      "line": 231,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:90b92014572b0cf343bf69b5cbcd27d9adc2abc45894c7031210a14fce0c8bb9"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:235:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 235,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:893c7c74a305b3e6590a684b4ad6c90f747044e7c1bd69a1714cbde7ae5a503e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:236:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 236,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fc12596144b489880ed1b0e455db6776327f8ecbbcbe8d311d0a4bb732ce73a6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:239:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 239,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:8176593b0e42c45a5df25a51f210120702d593a5ace9dea5311704ca0c914ca0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:240:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 240,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:aeb9334e1baf772568569a02fe2b4215dd992130ae85f21bbc9be76f09883b1c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:243:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 243,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:8176593b0e42c45a5df25a51f210120702d593a5ace9dea5311704ca0c914ca0"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:244:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 244,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:fc12596144b489880ed1b0e455db6776327f8ecbbcbe8d311d0a4bb732ce73a6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:264:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 264,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:30a440f388e5c03d71d01187d051fc2c68c044b8ae3b9a54d7aed8b95c539712"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:265:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 265,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:da685946fe992dd91a599a88087b5767698d7b2ce999bdbb427e71f96b2b1ae8"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:267:17",
+      "path": "src/vmm/src/persist.rs",
+      "line": 267,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:24ae3eb26c917becb28f5f023194035f2f7052d4e7dd1481fd8d6ce4674224a5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:271:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 271,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:30a440f388e5c03d71d01187d051fc2c68c044b8ae3b9a54d7aed8b95c539712"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:272:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 272,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2a3030d651d31ca0c23a4814a1ee2d13df36faedaf5261a97ee164a503f2dcab"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:275:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 275,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:370acc5f2aeef6c1767d2ea6153c39760b4ea9da3845023b852cc28302ba00ee"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:276:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 276,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:da685946fe992dd91a599a88087b5767698d7b2ce999bdbb427e71f96b2b1ae8"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:279:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 279,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:370acc5f2aeef6c1767d2ea6153c39760b4ea9da3845023b852cc28302ba00ee"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/persist.rs:280:13",
+      "path": "src/vmm/src/persist.rs",
+      "line": 280,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2a3030d651d31ca0c23a4814a1ee2d13df36faedaf5261a97ee164a503f2dcab"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/rate_limiter/mod.rs:199:17",
+      "path": "src/vmm/src/rate_limiter/mod.rs",
+      "line": 199,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:855376208ed75d3439facc91cdf587e9fb6618a5f02910c0b90eca408aea5b2e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/resources.rs:218:13",
+      "path": "src/vmm/src/resources.rs",
+      "line": 218,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1b4cfd932bbf44fc9422542dd8511f40bff8e92b49af1d2343f61ba99c6502a5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/rpc_interface.rs:390:13",
+      "path": "src/vmm/src/rpc_interface.rs",
+      "line": 390,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1b4cfd932bbf44fc9422542dd8511f40bff8e92b49af1d2343f61ba99c6502a5"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/rpc_interface.rs:457:17",
+      "path": "src/vmm/src/rpc_interface.rs",
+      "line": 457,
+      "column": 17,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:b6af5031b55d7847c8e02a252332e3b6e7f77ce6b235f5ba0f0425b47ae9f2f3"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/rpc_interface.rs:651:13",
+      "path": "src/vmm/src/rpc_interface.rs",
+      "line": 651,
+      "column": 13,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:51ba9f308828769d1bd1e5db175b299435bcff796c33b5e9e200ae62a360c4fd"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/rpc_interface.rs:680:9",
+      "path": "src/vmm/src/rpc_interface.rs",
+      "line": 680,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:1d521f50fff7feeacb493a7071ab0c873096479d087adb3cd96e945c10359fa6"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/rpc_interface.rs:877:9",
+      "path": "src/vmm/src/rpc_interface.rs",
+      "line": 877,
+      "column": 9,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:bed4aaf8b1268a4f5d3f676cd9dfb4f12a86c36f14c28d36317478b08e330228"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/rpc_interface.rs:890:9",
+      "path": "src/vmm/src/rpc_interface.rs",
+      "line": 890,
+      "column": 9,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0fa07d6b2fab727e3b6409195e81c3c01945c9a6a2a48e5ca6c9146848d29f07"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/rpc_interface.rs:940:17",
+      "path": "src/vmm/src/rpc_interface.rs",
+      "line": 940,
+      "column": 17,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:9916117db3c73e59d8382a6b0a988179d3301742a9d8f80535036f0283bc0e45"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/rpc_interface.rs:950:17",
+      "path": "src/vmm/src/rpc_interface.rs",
+      "line": 950,
+      "column": 17,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:4d04d804f0e0acbec1a502a7698f4184932b953a980b9fcaec7cdb97cdae6080"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/signal_handler.rs:144:9",
+      "path": "src/vmm/src/signal_handler.rs",
+      "line": 144,
+      "column": 9,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:018f6dc04574e4f5edecbf46f14756ca31b664c950bce0ffd542ea88da840022"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/signal_handler.rs:150:5",
+      "path": "src/vmm/src/signal_handler.rs",
+      "line": 150,
+      "column": 5,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:f64365dbbc6ffaaee633ff551e67ad5e8f3445549869e16a9aff0f0e5d36699a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/signal_handler.rs:25:9",
+      "path": "src/vmm/src/signal_handler.rs",
+      "line": 25,
+      "column": 9,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2d4c54e89a6e738629ffd0d64896d31ba8e328f979b0f5cce3b3a433b16224af"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/signal_handler.rs:45:13",
+      "path": "src/vmm/src/signal_handler.rs",
+      "line": 45,
+      "column": 13,
+      "macro_name": "error_unrestricted",
+      "syntax": "macro-template",
+      "source_context": "production",
+      "fingerprint": "sha256:a36ddfd9a632b54f8cefd16b8775c0b8fac50e1e0c50b88eca7d20bb8b2ae562"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/signal_handler.rs:70:5",
+      "path": "src/vmm/src/signal_handler.rs",
+      "line": 70,
+      "column": 5,
+      "macro_name": "error_unrestricted",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:aa5d3c8d0cf0be8633945b6d7c35ce454d897e9c66e382692aa6e17558d35f40"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/interrupts.rs:184:21",
+      "path": "src/vmm/src/vstate/interrupts.rs",
+      "line": 184,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a0ddb32a5e680fe38e8876b238b4a741d88cfa56623d20f89d2329fe75afb05e"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/memory.rs:429:21",
+      "path": "src/vmm/src/vstate/memory.rs",
+      "line": 429,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:2cc6919fb0f2b12a70446ec3b1f5bd1dd32a17666017bddc647f50c1abf5877b"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/memory.rs:447:21",
+      "path": "src/vmm/src/vstate/memory.rs",
+      "line": 447,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:53781238b2faeb7705512f4190164f4449eb8ce4696822c8e331f0f32dfcaa95"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:302:21",
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "line": 302,
+      "column": 21,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0be0652ed92d08aa80004d8c512c38816a63134ccaf85cd98fe31f7bc67ee12f"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:368:13",
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "line": 368,
+      "column": 13,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a9e5692d463de739da1670aa96073b3942d18dfbbb45980e123f9d1af5ecd5fc"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:388:13",
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "line": 388,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d6f935686c2ef581a3e698cf48839d193936a94d88648c5e6d5bef86dca8e13a"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:426:25",
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "line": 426,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:3d435a04cc1f4cf6cf9ebbeaf75a024e36b1f8488c90fbfef2dd19d3017387bd"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:436:25",
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "line": 436,
+      "column": 25,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:3d435a04cc1f4cf6cf9ebbeaf75a024e36b1f8488c90fbfef2dd19d3017387bd"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:447:17",
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "line": 447,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:a8b85b2fba7690018e40d230153dde64ce5cfc9eb994b7bd83c219920ea3481c"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:459:17",
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "line": 459,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:c6b73229075e8e56e4a34f999c1b4970cffbaf4e5f66e2834f6a06a702b8d121"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:467:21",
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "line": 467,
+      "column": 21,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:ee4bbabe8505dc93986bda0f52870f641bf52db0705942c4e0eff1a49532aaa8"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:475:21",
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "line": 475,
+      "column": 21,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0a2ea996885651573964a3fc665321628174bc71c86405b4a3c53f6b30212057"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:496:17",
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "line": 496,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:33f7995871909a45135f0fcbd343b7c3b2edae20beb9e2255735fb2e8bde0a47"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vcpu.rs:504:17",
+      "path": "src/vmm/src/vstate/vcpu.rs",
+      "line": 504,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:d3df90935775cf9460133f47756edc019ee6f3c97380cf953167447567b52418"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vm.rs:167:21",
+      "path": "src/vmm/src/vstate/vm.rs",
+      "line": 167,
+      "column": 21,
+      "macro_name": "info",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:0af20a950f890a2779ba4b985122d1360a324079fca2b5d0a4ad942091e37b93"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vm.rs:250:13",
+      "path": "src/vmm/src/vstate/vm.rs",
+      "line": 250,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:9047eca7d5e2100ce572adec3c3166afa1d0df81919fc1e8c30e3d35db2da216"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vm.rs:253:13",
+      "path": "src/vmm/src/vstate/vm.rs",
+      "line": 253,
+      "column": 13,
+      "macro_name": "warn",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:388bddced83e99963f0721866273f552371ec2a45012fe4ac8d076178e090c91"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vm.rs:397:17",
+      "path": "src/vmm/src/vstate/vm.rs",
+      "line": 397,
+      "column": 17,
+      "macro_name": "error",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:541c3625bbb770d7afc922f86bc79771de738a9c6dcba560096afad9a868f1ee"
+    },
+    {
+      "id": "logger-invocation:src/vmm/src/vstate/vm.rs:701:9",
+      "path": "src/vmm/src/vstate/vm.rs",
+      "line": 701,
+      "column": 9,
+      "macro_name": "debug",
+      "syntax": "direct",
+      "source_context": "production",
+      "fingerprint": "sha256:aa2a8fb0bf27d1210f4426b575a3bf0fcdba36aca5ec82ea68f6895dde6c66c1"
+    }
+  ]
+}

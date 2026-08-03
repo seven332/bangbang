@@ -20,6 +20,12 @@ For commands and test-layer selection, see the
 - [`capabilities.json`](capabilities.json) is human-owned. It assigns exactly
   one disposition to every generated identity and adds reviewed semantic
   records for cross-leaf behavior.
+- [`logger-producer-manifest.json`](logger-producer-manifest.json) is
+  machine-owned. It records every pinned public logger invocation identity,
+  syntax/source context, input Git blob, and value-redacted fingerprint.
+- [`logger-producer-audit.json`](logger-producer-audit.json) is human-owned. It
+  maps every logger invocation explicitly to one closed semantic class and its
+  reviewed delivery, limiter, disposition, owner, and evidence policy.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
@@ -58,6 +64,7 @@ reviewed delta.
 | [Snapshot editor state](snapshot-editor-contract.md) | Native-state version/vCPU/VM inspection, finite reviewed-register editing, no-clobber publication, signed Full/Diff product restore, and the exact twelve-row closure |
 | [Snapshot Wave 6](snapshot-wave6-contract.md) | Exact 70-row load, artifact, version, device, tool, time/identity, portability, and downstream-owner certification |
 | [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
+| [Logger producers](logger-contract.md) | Exact 468-invocation source closure, closed semantic classes, safe fields, delivery/limiter policy, and #1807/#1808/#1809 ownership |
 
 ## Dispositions
 
@@ -107,5 +114,6 @@ full evidence and Challenge gate.
 Validate the checked inventory, compare or regenerate candidates, and run the
 normal repository checks using
 [Testing Guide](../../../docs/testing.md#firecracker-capability-inventory).
-Review candidate identity changes before updating `source-manifest.json`;
-never use regeneration to alter `capabilities.json`.
+Review candidate identity changes before updating either machine-owned
+manifest. Never use regeneration to alter `capabilities.json` or
+`logger-producer-audit.json`.

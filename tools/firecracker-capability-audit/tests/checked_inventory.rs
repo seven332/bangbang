@@ -2,8 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
-    AuditMode, CAPABILITY_INVENTORY_PATH, Disposition, Reference, SOURCE_MANIFEST_PATH,
-    read_capability_inventory, read_source_manifest, source_manifest_json, validate,
+    AuditMode, CAPABILITY_INVENTORY_PATH, Disposition, LOGGER_PRODUCER_AUDIT_PATH,
+    LOGGER_PRODUCER_MANIFEST_PATH, LoggerClassDisposition, LoggerCompiledEvent,
+    LoggerDeliveryPolicy, Reference, SOURCE_MANIFEST_PATH, logger_producer_audit_json,
+    logger_producer_manifest_json, read_capability_inventory, read_logger_producer_audit,
+    read_logger_producer_manifest, read_source_manifest, source_manifest_json, validate,
+    validate_logger_producers,
 };
 
 #[test]
@@ -43,6 +47,579 @@ fn checked_source_manifest_is_canonical_and_deterministic() {
         first, checked_bytes,
         "checked source manifest must use canonical serialization"
     );
+}
+
+#[test]
+fn checked_logger_artifacts_are_canonical_and_valid_for_delivery() {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let manifest_path = repository_root.join(LOGGER_PRODUCER_MANIFEST_PATH);
+    let audit_path = repository_root.join(LOGGER_PRODUCER_AUDIT_PATH);
+    let manifest = read_logger_producer_manifest(&manifest_path)
+        .expect("checked logger producer manifest must parse");
+    let audit =
+        read_logger_producer_audit(&audit_path).expect("checked logger producer audit must parse");
+
+    validate_logger_producers(&manifest, &audit, &repository_root, AuditMode::Delivery)
+        .expect("checked logger artifacts must satisfy delivery-time invariants");
+
+    let first_manifest =
+        logger_producer_manifest_json(&manifest).expect("logger producer manifest must serialize");
+    let second_manifest = logger_producer_manifest_json(&manifest)
+        .expect("logger producer manifest must serialize again");
+    assert_eq!(first_manifest, second_manifest);
+    assert_eq!(
+        first_manifest,
+        std::fs::read(manifest_path).expect("checked logger producer manifest must be readable")
+    );
+
+    let first_audit =
+        logger_producer_audit_json(&audit).expect("logger producer audit must serialize");
+    let second_audit =
+        logger_producer_audit_json(&audit).expect("logger producer audit must serialize again");
+    assert_eq!(first_audit, second_audit);
+    assert_eq!(
+        first_audit,
+        std::fs::read(audit_path).expect("checked logger producer audit must be readable")
+    );
+}
+
+#[test]
+fn checked_logger_producer_audit_is_complete_and_stable() {
+    const CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/logger-contract.md";
+    const EXPECTED_CLASSES: [(&str, LoggerClassDisposition, usize); 31] = [
+        (
+            "logger.api-control.outcome",
+            LoggerClassDisposition::Planned,
+            7,
+        ),
+        (
+            "logger.api-worker.outcome",
+            LoggerClassDisposition::Planned,
+            5,
+        ),
+        ("logger.api.request", LoggerClassDisposition::Implemented, 1),
+        ("logger.api.result", LoggerClassDisposition::Planned, 5),
+        (
+            "logger.backend.outcome",
+            LoggerClassDisposition::Planned,
+            26,
+        ),
+        (
+            "logger.balloon.outcome",
+            LoggerClassDisposition::Planned,
+            28,
+        ),
+        ("logger.block.outcome", LoggerClassDisposition::Planned, 34),
+        ("logger.boot.time", LoggerClassDisposition::Implemented, 1),
+        (
+            "logger.entropy.outcome",
+            LoggerClassDisposition::Planned,
+            16,
+        ),
+        (
+            "logger.lifecycle.outcome",
+            LoggerClassDisposition::Planned,
+            24,
+        ),
+        (
+            "logger.limiter.recovery",
+            LoggerClassDisposition::Implemented,
+            1,
+        ),
+        (
+            "logger.memory-hotplug.outcome",
+            LoggerClassDisposition::Planned,
+            22,
+        ),
+        (
+            "logger.network.outcome",
+            LoggerClassDisposition::Planned,
+            26,
+        ),
+        (
+            "logger.nonapp.example",
+            LoggerClassDisposition::NotApplicable,
+            22,
+        ),
+        (
+            "logger.nonapp.fuzzing",
+            LoggerClassDisposition::NotApplicable,
+            1,
+        ),
+        (
+            "logger.nonapp.gdb",
+            LoggerClassDisposition::NotApplicable,
+            19,
+        ),
+        (
+            "logger.nonapp.linux-hardening",
+            LoggerClassDisposition::NotApplicable,
+            2,
+        ),
+        (
+            "logger.nonapp.tool",
+            LoggerClassDisposition::NotApplicable,
+            1,
+        ),
+        (
+            "logger.nonapp.tracing",
+            LoggerClassDisposition::NotApplicable,
+            2,
+        ),
+        (
+            "logger.nonapp.x86",
+            LoggerClassDisposition::NotApplicable,
+            15,
+        ),
+        (
+            "logger.observability.outcome",
+            LoggerClassDisposition::Planned,
+            4,
+        ),
+        ("logger.pmem.outcome", LoggerClassDisposition::Planned, 18),
+        (
+            "logger.process-signal.outcome",
+            LoggerClassDisposition::Planned,
+            5,
+        ),
+        (
+            "logger.process-startup.outcome",
+            LoggerClassDisposition::Planned,
+            5,
+        ),
+        (
+            "logger.process.exit",
+            LoggerClassDisposition::Implemented,
+            3,
+        ),
+        (
+            "logger.process.panic",
+            LoggerClassDisposition::Implemented,
+            3,
+        ),
+        ("logger.serial.outcome", LoggerClassDisposition::Planned, 12),
+        (
+            "logger.snapshot.outcome",
+            LoggerClassDisposition::Planned,
+            18,
+        ),
+        (
+            "logger.time-identity.outcome",
+            LoggerClassDisposition::Planned,
+            16,
+        ),
+        (
+            "logger.transport.outcome",
+            LoggerClassDisposition::Planned,
+            74,
+        ),
+        ("logger.vsock.outcome", LoggerClassDisposition::Planned, 52),
+    ];
+    const LOGGER_CAPABILITIES: [&str; 11] = [
+        "api-operation:PUT /logger",
+        "api-path:/logger",
+        "api-property:FullVmConfiguration.logger",
+        "api-property:Logger.level",
+        "api-property:Logger.log_path",
+        "api-property:Logger.module",
+        "api-property:Logger.show_level",
+        "api-property:Logger.show_log_origin",
+        "api-schema:Logger",
+        "corpus:logger",
+        "semantic.observability:logger-delivery-filtering-loss-and-redaction",
+    ];
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let manifest =
+        read_logger_producer_manifest(&repository_root.join(LOGGER_PRODUCER_MANIFEST_PATH))
+            .expect("checked logger producer manifest must parse");
+    let audit = read_logger_producer_audit(&repository_root.join(LOGGER_PRODUCER_AUDIT_PATH))
+        .expect("checked logger producer audit must parse");
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+
+    assert_eq!(manifest.invocations.len(), 468);
+    assert_eq!(manifest.inputs.len(), 81);
+    assert_eq!(manifest.counts.scanned_rust_files, 362);
+    assert_eq!(manifest.counts.ordinary, 429);
+    assert_eq!(manifest.counts.unrestricted, 39);
+    assert_eq!(manifest.counts.production, 446);
+    assert_eq!(manifest.counts.test, 0);
+    assert_eq!(manifest.counts.example, 22);
+    assert_eq!(manifest.counts.direct, 466);
+    assert_eq!(manifest.counts.macro_template, 2);
+    assert_eq!(audit.classes.len(), 31);
+    assert_eq!(audit.mappings.len(), 468);
+
+    let classes = audit
+        .classes
+        .iter()
+        .map(|class| (class.id.as_str(), class))
+        .collect::<BTreeMap<_, _>>();
+    let mapping_counts =
+        audit
+            .mappings
+            .iter()
+            .fold(BTreeMap::<&str, usize>::new(), |mut counts, mapping| {
+                *counts.entry(mapping.class_id.as_str()).or_default() += 1;
+                counts
+            });
+    let contract = std::fs::read_to_string(repository_root.join(CONTRACT_PATH))
+        .expect("logger producer contract must be readable");
+    let contract_rows = contract
+        .lines()
+        .filter(|line| line.starts_with("| `logger."))
+        .collect::<Vec<_>>();
+    assert_eq!(contract_rows.len(), EXPECTED_CLASSES.len());
+
+    for (id, disposition, expected_mappings) in EXPECTED_CLASSES {
+        let class = classes
+            .get(id)
+            .unwrap_or_else(|| panic!("logger class must exist: {id}"));
+        assert_eq!(class.disposition, disposition, "disposition drifted: {id}");
+        assert_eq!(mapping_counts.get(id), Some(&expected_mappings));
+        let disposition = match disposition {
+            LoggerClassDisposition::Implemented => "implemented",
+            LoggerClassDisposition::Planned => "planned",
+            LoggerClassDisposition::NotApplicable => "not-applicable",
+        };
+        let prefix = format!("| `{id}` | `{disposition}` |");
+        let row = contract_rows
+            .iter()
+            .find(|row| row.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("contract class row must exist: {id}"));
+        assert!(
+            row.ends_with(&format!("| {expected_mappings} |")),
+            "contract mapping count drifted: {id}"
+        );
+    }
+
+    assert_eq!(
+        audit
+            .classes
+            .iter()
+            .filter(|class| class.disposition == LoggerClassDisposition::Implemented)
+            .count(),
+        5
+    );
+    assert_eq!(
+        audit
+            .classes
+            .iter()
+            .filter(|class| class.disposition == LoggerClassDisposition::Planned)
+            .count(),
+        19
+    );
+    assert_eq!(
+        audit
+            .classes
+            .iter()
+            .filter(|class| class.disposition == LoggerClassDisposition::NotApplicable)
+            .count(),
+        7
+    );
+    let mapped_dispositions = audit
+        .mappings
+        .iter()
+        .map(|mapping| {
+            classes
+                .get(mapping.class_id.as_str())
+                .expect("mapped class must exist")
+                .disposition
+        })
+        .fold(BTreeMap::new(), |mut counts, disposition| {
+            *counts.entry(disposition).or_insert(0_usize) += 1;
+            counts
+        });
+    assert_eq!(
+        mapped_dispositions,
+        BTreeMap::from([
+            (LoggerClassDisposition::Implemented, 9),
+            (LoggerClassDisposition::Planned, 397),
+            (LoggerClassDisposition::NotApplicable, 62),
+        ])
+    );
+    let planned_owners = audit
+        .classes
+        .iter()
+        .filter(|class| class.disposition == LoggerClassDisposition::Planned)
+        .fold(BTreeMap::new(), |mut counts, class| {
+            let issue = class
+                .delivery_issue
+                .as_deref()
+                .expect("planned class must name its owner");
+            *counts.entry(issue).or_insert(0_usize) += 1;
+            counts
+        });
+    assert_eq!(
+        planned_owners,
+        BTreeMap::from([("#1807", 3), ("#1808", 5), ("#1809", 11)])
+    );
+
+    let compiled_events = audit
+        .classes
+        .iter()
+        .flat_map(|class| class.compiled_events.iter().copied())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        compiled_events,
+        BTreeSet::from([
+            LoggerCompiledEvent::ApiRequest,
+            LoggerCompiledEvent::InstanceStart,
+            LoggerCompiledEvent::FlushMetrics,
+            LoggerCompiledEvent::BootTime,
+            LoggerCompiledEvent::RateLimitRecovery,
+            LoggerCompiledEvent::ProcessPanic,
+            LoggerCompiledEvent::ProcessExit,
+        ])
+    );
+    let planned_with_compiled_events = audit
+        .classes
+        .iter()
+        .filter(|class| {
+            class.disposition == LoggerClassDisposition::Planned
+                && !class.compiled_events.is_empty()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(planned_with_compiled_events.len(), 1);
+    assert_eq!(planned_with_compiled_events[0].id, "logger.api.result");
+    assert_eq!(
+        planned_with_compiled_events[0].compiled_events,
+        [
+            LoggerCompiledEvent::InstanceStart,
+            LoggerCompiledEvent::FlushMetrics,
+        ]
+    );
+    assert!(!planned_with_compiled_events[0].implementation.is_empty());
+    assert!(!planned_with_compiled_events[0].validation.is_empty());
+
+    let capabilities = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+    for id in LOGGER_CAPABILITIES {
+        assert_eq!(
+            capabilities
+                .get(id)
+                .unwrap_or_else(|| panic!("logger capability must exist: {id}"))
+                .disposition,
+            Disposition::AuditRequired,
+            "audit-only slice must not promote logger capability: {id}"
+        );
+    }
+}
+
+#[test]
+fn logger_audit_mutations_fail_closed() {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let manifest =
+        read_logger_producer_manifest(&repository_root.join(LOGGER_PRODUCER_MANIFEST_PATH))
+            .expect("checked logger producer manifest must parse");
+    let audit = read_logger_producer_audit(&repository_root.join(LOGGER_PRODUCER_AUDIT_PATH))
+        .expect("checked logger producer audit must parse");
+
+    let final_error =
+        validate_logger_producers(&manifest, &audit, &repository_root, AuditMode::Final)
+            .expect_err("final mode must reject planned classes")
+            .to_string();
+    assert!(final_error.contains("final logger validation forbids planned class"));
+
+    let mut missing = audit.clone();
+    missing.mappings.pop();
+    let error =
+        validate_logger_producers(&manifest, &missing, &repository_root, AuditMode::Delivery)
+            .expect_err("missing mapping must fail")
+            .to_string();
+    assert!(error.contains("logger invocation has no audit mapping"));
+
+    let mut duplicate = audit.clone();
+    duplicate.mappings.push(
+        duplicate
+            .mappings
+            .last()
+            .expect("mapping must exist")
+            .clone(),
+    );
+    let error =
+        validate_logger_producers(&manifest, &duplicate, &repository_root, AuditMode::Delivery)
+            .expect_err("duplicate mapping must fail")
+            .to_string();
+    assert!(error.contains("logger mapping invocation id entries must be sorted and unique"));
+
+    let mut stale = audit.clone();
+    let mut stale_mapping = stale.mappings.last().expect("mapping must exist").clone();
+    stale_mapping.invocation_id = "logger-invocation:zzz/stale.rs:1:1".to_string();
+    stale.mappings.push(stale_mapping);
+    let error = validate_logger_producers(&manifest, &stale, &repository_root, AuditMode::Delivery)
+        .expect_err("stale mapping must fail")
+        .to_string();
+    assert!(error.contains("logger audit mapping is stale"));
+
+    let mut malformed_manifest = manifest.clone();
+    malformed_manifest.invocations[0].fingerprint = "sha256:NOT-A-DIGEST".to_string();
+    let error = validate_logger_producers(
+        &malformed_manifest,
+        &audit,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("malformed fingerprint must fail")
+    .to_string();
+    assert!(error.contains("fingerprint is not lowercase SHA-256"));
+
+    let mut overflowing_counts = manifest.clone();
+    overflowing_counts.counts.production = usize::MAX;
+    let error = validate_logger_producers(
+        &overflowing_counts,
+        &audit,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("overflowing declared counts must fail without panicking")
+    .to_string();
+    assert!(error.contains("logger source-context counts must cover every invocation"));
+
+    let mut malformed_blob = manifest.clone();
+    malformed_blob.inputs[0].git_blob = "A".repeat(40);
+    let error = validate_logger_producers(
+        &malformed_blob,
+        &audit,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("noncanonical Git blob ID must fail")
+    .to_string();
+    assert!(error.contains("logger input git_blob is not a Git object id"));
+
+    let mut catch_all = audit.clone();
+    let class = catch_all
+        .classes
+        .iter_mut()
+        .find(|class| class.id == "logger.api-control.outcome")
+        .expect("planned class must exist");
+    class.id = "logger.api.catch-all".to_string();
+    let error =
+        validate_logger_producers(&manifest, &catch_all, &repository_root, AuditMode::Delivery)
+            .expect_err("catch-all class must fail")
+            .to_string();
+    assert!(error.contains("logger class id uses a catch-all term"));
+
+    let mut mismatched_not_applicable = audit.clone();
+    let class = mismatched_not_applicable
+        .classes
+        .iter_mut()
+        .find(|class| class.id == "logger.nonapp.example")
+        .expect("example class must exist");
+    class.guest_triggerable = true;
+    let error = validate_logger_producers(
+        &manifest,
+        &mismatched_not_applicable,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("not-applicable policy mismatch must fail")
+    .to_string();
+    assert!(error.contains("must use only not-applicable policy"));
+
+    let mut blocking_guest = audit.clone();
+    let class = blocking_guest
+        .classes
+        .iter_mut()
+        .find(|class| class.id == "logger.block.outcome")
+        .expect("block class must exist");
+    class.delivery = LoggerDeliveryPolicy::BoundedHost;
+    let error = validate_logger_producers(
+        &manifest,
+        &blocking_guest,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("guest-triggerable blocking delivery must fail")
+    .to_string();
+    assert!(error.contains("requires exact nonblocking-guest delivery"));
+
+    let mut evidence_mismatch = audit.clone();
+    let class = evidence_mismatch
+        .classes
+        .iter_mut()
+        .find(|class| class.id == "logger.api.result")
+        .expect("API result class must exist");
+    class.validation.clear();
+    let error = validate_logger_producers(
+        &manifest,
+        &evidence_mismatch,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("compiled event without complete evidence must fail")
+    .to_string();
+    assert!(error.contains("compiled-event metadata and exact evidence must appear together"));
+
+    let mut wrong_compiled_owner = audit.clone();
+    let boot_class = wrong_compiled_owner
+        .classes
+        .iter()
+        .find(|class| class.id == "logger.boot.time")
+        .expect("boot class must exist")
+        .clone();
+    let class = wrong_compiled_owner
+        .classes
+        .iter_mut()
+        .find(|class| class.id == "logger.boot.time")
+        .expect("boot class must exist");
+    class.compiled_events.clear();
+    class.implementation.clear();
+    class.validation.clear();
+    let class = wrong_compiled_owner
+        .classes
+        .iter_mut()
+        .find(|class| class.id == "logger.api-control.outcome")
+        .expect("API control class must exist");
+    class.compiled_events = vec![LoggerCompiledEvent::BootTime];
+    class.implementation = boot_class.implementation;
+    class.validation = boot_class.validation;
+    let error = validate_logger_producers(
+        &manifest,
+        &wrong_compiled_owner,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("compiled event on the wrong class must fail")
+    .to_string();
+    assert!(error.contains("logger compiled event must have its exact class"));
+
+    let mut unresolved_evidence = audit;
+    let class = unresolved_evidence
+        .classes
+        .iter_mut()
+        .find(|class| class.id == "logger.api.request")
+        .expect("API request class must exist");
+    class.implementation[0] = Reference::Local {
+        path: "crates/runtime/src/missing-logger-evidence.rs".to_string(),
+        anchor: None,
+    };
+    let error = validate_logger_producers(
+        &manifest,
+        &unresolved_evidence,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("unresolved local evidence must fail")
+    .to_string();
+    assert!(error.contains("local reference path does not exist"));
 }
 
 fn local_reference_paths(references: &[Reference]) -> Option<BTreeSet<&str>> {
