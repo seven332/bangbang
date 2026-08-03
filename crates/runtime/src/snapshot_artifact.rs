@@ -1700,6 +1700,13 @@ pub enum NativeV2NetworkSnapshotPreparationError {
     Topology(SnapshotV2NetworkRestorePreparationError),
 }
 
+impl NativeV2NetworkSnapshotPreparationError {
+    /// Returns whether preparation stopped at an explicit cancellation checkpoint.
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Topology(source) if source.is_cancelled())
+    }
+}
+
 impl fmt::Debug for NativeV2NetworkSnapshotPreparationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)
@@ -2063,6 +2070,19 @@ pub enum NativeV2VsockSnapshotPreparationError {
     Manifest(SnapshotRestoreManifestError),
     /// Owner-free network topology preparation failed.
     Network(SnapshotV2NetworkRestorePreparationError),
+}
+
+impl NativeV2VsockSnapshotPreparationError {
+    /// Returns whether preparation stopped at an explicit cancellation checkpoint.
+    pub const fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Vsock(source) => source.is_cancelled(),
+            Self::Network(source) => source.is_cancelled(),
+            Self::NetworkOverridesWithoutDevice
+            | Self::DestinationTransport
+            | Self::Manifest(_) => false,
+        }
+    }
 }
 
 impl fmt::Debug for NativeV2VsockSnapshotPreparationError {
@@ -4751,6 +4771,23 @@ impl SnapshotArtifactLoadError {
     /// Returns the redacted failure reason.
     pub const fn failure(&self) -> &SnapshotArtifactLoadFailure {
         &self.failure
+    }
+
+    /// Returns whether cooperative cancellation caused the load failure.
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(
+            &self.failure,
+            SnapshotArtifactLoadFailure::Cancelled
+                | SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(
+                    SnapshotV2MemoryHotplugMaterializationError::Cancelled { .. }
+                )
+                | SnapshotArtifactLoadFailure::DiffVerification(
+                    SnapshotV2DiffVerifyError::Cancelled { .. }
+                )
+                | SnapshotArtifactLoadFailure::DiffMaterialization(
+                    SnapshotV2DiffMaterializationError::Cancelled { .. }
+                )
+        )
     }
 }
 

@@ -261,15 +261,20 @@ pub enum LoggerNonApplicableReason {
 #[serde(rename_all = "kebab-case")]
 pub enum LoggerCompiledEvent {
     ApiControl,
+    ApiWorker,
     ApiRequest,
     ApiResult,
     InstanceStart,
     FlushMetrics,
     BootTime,
+    Lifecycle,
+    Observability,
     RateLimitRecovery,
     ProcessStartup,
     ProcessPanic,
     ProcessExit,
+    ProcessSignal,
+    Snapshot,
 }
 
 /// Human-owned policy and evidence for one coherent semantic producer class.

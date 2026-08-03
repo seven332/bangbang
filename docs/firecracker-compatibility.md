@@ -509,23 +509,40 @@ Parser rejections instead emit one fixed `request-parse` control outcome and no
 result. Fixed control events additionally cover server start/stop, discarded
 connection failure, deprecated requests, and successful pause/resume or
 snapshot completion. Normal readiness has one
-`operation=process-startup outcome=running` record. The boot timer is the one
-bounded guest-triggered logger callsite. Its per-controller/per-identity atomic
-GCRA admits an initial
+`operation=process-startup outcome=running` record.
+
+Typed host outcome records additionally cover backend startup; VM
+start/pause/resume/stop; block, network, and pmem live attach/update/detach;
+snapshot create/load success, rejection, failure, and cancellation; boot-worker
+running/exited/stopped/failed status; metrics-worker failure; host signal and
+cancellation receipt; guest poweroff/reset convergence; and orderly or abnormal
+shutdown. Only fixed operation, outcome, and optional device-kind values reach
+encoding. IDs, paths, MAC addresses, descriptors, guest values, and raw errors
+are discarded first. Lifecycle and snapshot calls use bounded host receipts;
+worker, signal, and observability calls make one nonblocking queue attempt.
+Snapshot-internal resume does not duplicate an ordinary VM-resume record, and
+terminal convergence records observed worker/power status before cleanup,
+VM-stop, shutdown, and the final process category.
+
+The boot timer is the bounded guest-triggered timing callsite. Its
+per-controller/per-identity atomic GCRA admits an initial
 burst of ten records, refills the five-second budget at one token per 500 ms,
 uses at most 16 compare/exchange attempts, increments
 `logger.rate_limited_log_count` for every denied record, and emits one
 unrestricted `Warn` recovery record before the next admitted boot-time record.
+Repeated asynchronous metrics-worker failures use a separate
+`logger-rate.observability-worker` identity, so they cannot consume or recover
+the boot-timer budget.
 Unconfigured or filtered records do not consume the limiter and are not missed
 deliveries.
 
 Each controller has one fixed 256-message queue and one worker that exclusively
-owns the sink. A boot-timer/vCPU caller encodes and attempts `try_send` once; it
-does no sink I/O and waits for neither capacity nor completion. API/action
-callers may wait at most one second for a receipt to preserve the ordinary
-output-before-return case, but timeout is only a conservatively counted
-unconfirmed record and never changes the functional result. The worker makes
-one `write` and, after a complete write, one `flush` per record. Queue full or
+owns the sink. A guest or asynchronous caller encodes and attempts `try_send`
+once; it does no sink I/O and waits for neither capacity nor completion.
+Bounded host callers may wait at most one second for a receipt to preserve the
+ordinary output-before-return case, but timeout is only a conservatively
+counted unconfirmed record and never changes the functional result. The worker
+makes one `write` and, after a complete write, one `flush` per record. Queue full or
 disconnect, receipt timeout, zero/short/error writes, and flush failure
 increment the saturating `logger.missed_log_count` exactly once per affected
 record; suffixes are not retried and output durability is not claimed. A

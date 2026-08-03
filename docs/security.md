@@ -2129,14 +2129,17 @@ is resource-specific:
 - Successfully parsed API requests encode closed method/route-template lines
   before dispatch and exactly one closed HTTP result afterward. Parser
   rejections encode a fixed control outcome and no result. Other closed host
-  events cover server/connection/request control, normal startup, successful
-  actions, panic, and convergence. They intentionally omit resource selectors,
-  request/response bodies, fault strings, paths, and guest values; optional
-  origins are implementation-owned and cannot expose absolute build-host paths.
-  Every record is valid UTF-8 and at most 512 bytes including newline. These
-  host records are unrestricted and use at most a one-second receipt; guest
-  boot-timer records use immediate admission, a bounded atomic
-  ten-per-five-second limiter, and one ordered recovery warning. Queue,
+  events cover server/connection/request control, normal startup, backend and
+  VM lifecycle, live device controls, snapshots, workers, signals, guest power,
+  shutdown, panic, and convergence. They intentionally omit resource
+  selectors, request/response bodies, fault strings, paths, and guest values;
+  optional origins are implementation-owned and cannot expose absolute
+  build-host paths. Every record is valid UTF-8 and at most 512 bytes including
+  newline. Ordinary host lifecycle and snapshot records use at most a
+  one-second receipt; callbacks and workers use immediate admission. Guest
+  boot-timer records use a bounded atomic ten-per-five-second limiter and one
+  ordered recovery warning, while repeated metrics-worker failures use a
+  separate limiter identity. Queue,
   timeout, zero/short/error write, or flush failure increments exact
   missed-delivery accounting but cannot change the API, action, startup, or
   guest-MMIO result. A stalled sink preserves old state without accumulating
@@ -2889,22 +2892,34 @@ receipt, closed control/result, process startup, and action events are
 unrestricted host VMM records; they can expose only fixed method/route,
 operation, outcome, and action vocabulary, not runtime selectors,
 request/response bodies, faults, host paths, or guest serial output. The
-guest-triggerable boot-timer callsite alone uses a bounded limiter and emits one
-unrestricted warning when delivery recovers. Logger filtering, queue pressure,
-timeout ambiguity, and sink failures never change the API, action, readiness,
-or guest outcome; rate-limited records and exact per-record delivery failures
-are observable only through process-local counters.
+guest-triggerable boot-timer callsite uses a bounded limiter and emits one
+unrestricted warning when delivery recovers; repeated metrics-worker failures
+use an independent `logger-rate.observability-worker` identity. Logger
+filtering, queue pressure, timeout ambiguity, and sink failures never change
+the API, action, readiness, VM lifecycle, snapshot, or guest outcome;
+rate-limited records and exact per-record delivery failures are observable only
+through process-local counters.
+
+Host lifecycle records use only fixed backend/VM operation and outcome values.
+Live block, network, and pmem controls add a fixed device kind, never the
+device ID, backing path, MAC address, provider name, or backend error. Snapshot
+records distinguish create/load success, rejection, failure, and cancellation
+without state or memory paths. Boot-worker and metrics-worker callbacks use a
+narrow cloned logger facade with no configuration or sink authority and never
+wait for completion.
 
 Process convergence adds only fixed, non-user-derived logger records. Normal
-records are `event=process-exit category=<fixed-category>` under the
-`bangbang::process` filter; a catchable main-runtime panic can first emit
+records first distinguish a host signal or cancellation request, observed
+boot-worker and guest poweroff/reset status, VM-stop cleanup, and orderly or
+abnormal shutdown before `event=process-exit category=<fixed-category>` under
+the `bangbang::process` filter. A catchable main-runtime panic can first emit
 `event=process-panic` under `bangbang::panic` and then the fixed `panic`
-terminal category. The five terminal categories, levels, optional
-level/origin prefixes, 512-byte ceiling, and callsites are compiled in. These
-records never incorporate `PanicHookInfo`, panic payloads, error strings,
-paths, selectors, descriptors, credentials, guest/register data, or API
-bodies. A filtered or unconfigured panic path uses only the plain fixed record
-through a precreated stderr worker.
+terminal category. The closed operations/outcomes, five terminal categories,
+levels, optional level/origin prefixes, 512-byte ceiling, and callsites are
+compiled in. These records never incorporate `PanicHookInfo`, panic payloads,
+error strings, paths, selectors, descriptors, credentials, guest/register
+data, or API bodies. A filtered or unconfigured panic path uses only the plain
+fixed record through a precreated stderr worker.
 
 The ordinary executable exclusively owns the process-global Rust panic hook
 after private binder dispatch and before contained bootstrap. It retains the

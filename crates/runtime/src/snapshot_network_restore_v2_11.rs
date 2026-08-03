@@ -931,6 +931,13 @@ pub enum SnapshotV2NetworkRestorePreparationError {
     },
 }
 
+impl SnapshotV2NetworkRestorePreparationError {
+    /// Returns whether preparation stopped at an explicit cancellation checkpoint.
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled { .. })
+    }
+}
+
 impl fmt::Debug for SnapshotV2NetworkRestorePreparationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -2073,6 +2080,7 @@ mod tests {
                 |stage| stage == target,
             )
             .expect_err("targeted cancellation should fail");
+            assert!(error.is_cancelled());
             assert!(matches!(
                 error,
                 SnapshotV2NetworkRestorePreparationError::Cancelled { stage } if stage == target

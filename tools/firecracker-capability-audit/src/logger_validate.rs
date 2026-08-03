@@ -29,7 +29,7 @@ const EXPECTED_EXAMPLE: usize = 22;
 const EXPECTED_DIRECT: usize = 466;
 const EXPECTED_MACRO_TEMPLATE: usize = 2;
 const LOGGER_EXTRACTOR: &str = "rust-logger-macro-v1";
-const PLANNED_ISSUES: [&str; 2] = ["#1808", "#1809"];
+const PLANNED_ISSUES: [&str; 1] = ["#1809"];
 
 /// Validate the checked logger source manifest and human classification overlay.
 pub fn validate_logger_producers(
@@ -540,7 +540,7 @@ fn validate_class(
                 .is_some_and(|issue| PLANNED_ISSUES.contains(&issue))
             {
                 errors.push(format!(
-                    "planned logger class must be owned by #1808 or #1809: {}",
+                    "planned logger class must be owned by #1809: {}",
                     class.id
                 ));
             }
@@ -681,11 +681,17 @@ fn validate_compiled_event_set(classes: &[LoggerProducerClass], errors: &mut Vec
             LoggerCompiledEvent::ApiControl,
             "logger.api-control.outcome",
         ),
+        (LoggerCompiledEvent::ApiWorker, "logger.api-worker.outcome"),
         (LoggerCompiledEvent::ApiRequest, "logger.api.request"),
         (LoggerCompiledEvent::ApiResult, "logger.api.result"),
         (LoggerCompiledEvent::InstanceStart, "logger.api.result"),
         (LoggerCompiledEvent::FlushMetrics, "logger.api.result"),
         (LoggerCompiledEvent::BootTime, "logger.boot.time"),
+        (LoggerCompiledEvent::Lifecycle, "logger.lifecycle.outcome"),
+        (
+            LoggerCompiledEvent::Observability,
+            "logger.observability.outcome",
+        ),
         (
             LoggerCompiledEvent::RateLimitRecovery,
             "logger.limiter.recovery",
@@ -696,6 +702,11 @@ fn validate_compiled_event_set(classes: &[LoggerProducerClass], errors: &mut Vec
         ),
         (LoggerCompiledEvent::ProcessPanic, "logger.process.panic"),
         (LoggerCompiledEvent::ProcessExit, "logger.process.exit"),
+        (
+            LoggerCompiledEvent::ProcessSignal,
+            "logger.process-signal.outcome",
+        ),
+        (LoggerCompiledEvent::Snapshot, "logger.snapshot.outcome"),
     ]);
     let actual = classes
         .iter()

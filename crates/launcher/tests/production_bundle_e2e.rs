@@ -16335,6 +16335,28 @@ impl OutputGrantFixture {
             has_terminal, terminal,
             "terminal logger output should follow the configured module filter"
         );
+        if terminal {
+            let logger = std::str::from_utf8(&logger)
+                .expect("granted logger output should remain valid UTF-8");
+            let mut previous = 0usize;
+            for expected in [
+                "operation=boot-worker outcome=exited\n",
+                "operation=guest-power outcome=poweroff\n",
+                "operation=vm-stop outcome=succeeded\n",
+                "operation=shutdown outcome=orderly\n",
+                "event=process-exit category=success\n",
+            ] {
+                let offset = logger[previous..]
+                    .find(expected)
+                    .map(|offset| previous + offset)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "terminal production logger should contain {expected:?} in order: {logger}"
+                        )
+                    });
+                previous = offset + expected.len();
+            }
+        }
 
         let metrics = fs::read_to_string(metrics_path).expect("granted metrics output should read");
         let seed = std::str::from_utf8(OUTPUT_METRICS_SEED).expect("metrics seed should be UTF-8");

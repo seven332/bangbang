@@ -607,6 +607,13 @@ pub enum SnapshotV2VsockRestorePreparationError {
     },
 }
 
+impl SnapshotV2VsockRestorePreparationError {
+    /// Returns whether preparation stopped at an explicit cancellation checkpoint.
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled { .. })
+    }
+}
+
 impl fmt::Debug for SnapshotV2VsockRestorePreparationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)

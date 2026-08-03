@@ -25,7 +25,9 @@ use rate_limiter::{LogRateLimitDecision, LoggerRateLimitIdentity, LoggerRateLimi
 
 pub use event::{
     LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute,
-    LoggerHttpMethod, PanicLogRecords, ProcessStartupOutcome, ProcessTerminalCategory,
+    LoggerApiWorkerOutcome, LoggerDeviceKind, LoggerHttpMethod, LoggerLifecycleOutcome,
+    LoggerObservabilityOutcome, LoggerProcessSignalOutcome, LoggerSnapshotOutcome, PanicLogRecords,
+    ProcessStartupOutcome, ProcessTerminalCategory,
 };
 pub use process_stdout::{ProcessStdoutLogger, ProcessStdoutLoggerError};
 
@@ -34,6 +36,9 @@ const API_REQUEST_LOG_MODULE: &str = "bangbang_runtime::api_server";
 const MINIMAL_ACTION_LOG_MODULE: &str = "bangbang_runtime::vmm_action";
 const PROCESS_LOG_MODULE: &str = "bangbang::process";
 const PANIC_LOG_MODULE: &str = "bangbang::panic";
+const LIFECYCLE_LOG_MODULE: &str = "bangbang_runtime::lifecycle";
+const SNAPSHOT_LOG_MODULE: &str = "bangbang_runtime::snapshot";
+const WORKER_LOG_MODULE: &str = "bangbang::worker";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LoggerLevel {
@@ -433,6 +438,25 @@ impl BootTimerLogRateLimiter {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct ObservabilityWorkerLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl ObservabilityWorkerLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner
+            .check(LoggerRateLimitIdentity::ObservabilityWorker)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BootTimerLogger {
     producer: Option<LoggerProducer>,
@@ -489,7 +513,99 @@ impl BootTimerLogger {
             LogBatch::two(recovery, boot)
         };
 
-        producer.deliver_guest(batch)
+        producer.deliver_nonblocking(batch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_delivery_for_test(&self) -> bool {
+        self.producer
+            .as_ref()
+            .is_none_or(LoggerProducer::wait_for_idle_for_test)
+    }
+}
+
+/// Narrow, cloneable admission capability for process-owned asynchronous events.
+#[derive(Debug, Clone)]
+pub struct AsyncLogger {
+    producer: Option<LoggerProducer>,
+    level: LoggerLevel,
+    show_level: bool,
+    show_log_origin: bool,
+    module: Option<String>,
+    metrics: SharedLoggerMetrics,
+    observability_rate_limiter: ObservabilityWorkerLogRateLimiter,
+}
+
+impl AsyncLogger {
+    #[track_caller]
+    pub fn log_api_worker(&self, outcome: LoggerApiWorkerOutcome) -> bool {
+        self.log_unrestricted(outcome.level(), LoggerEvent::ApiWorker(outcome))
+    }
+
+    #[track_caller]
+    pub fn log_process_signal(&self, outcome: LoggerProcessSignalOutcome) -> bool {
+        self.log_unrestricted(outcome.level(), LoggerEvent::ProcessSignal(outcome))
+    }
+
+    #[track_caller]
+    pub fn log_observability(&self, outcome: LoggerObservabilityOutcome) -> bool {
+        let level = outcome.level();
+        if !self.level.allows(level)
+            || !module_filter_allows(self.module.as_deref(), WORKER_LOG_MODULE)
+        {
+            return false;
+        }
+        let Some(producer) = &self.producer else {
+            return false;
+        };
+        let suppressed = match self.observability_rate_limiter.check() {
+            LogRateLimitDecision::Admitted { suppressed } => suppressed,
+            LogRateLimitDecision::Denied => {
+                self.metrics.record_rate_limited_log();
+                return false;
+            }
+        };
+        let origin = LogOrigin::from(Location::caller());
+        let outcome = LogRecord::encode(
+            self.show_level,
+            self.show_log_origin,
+            origin,
+            level,
+            LoggerEvent::Observability(outcome),
+        );
+        let batch = if suppressed == 0 {
+            LogBatch::one(outcome)
+        } else {
+            let recovery = LogRecord::encode(
+                self.show_level,
+                self.show_log_origin,
+                origin,
+                LoggerLevel::Warn,
+                LoggerEvent::RateLimitRecovery { suppressed },
+            );
+            LogBatch::two(recovery, outcome)
+        };
+        producer.deliver_nonblocking(batch)
+    }
+
+    #[track_caller]
+    fn log_unrestricted(&self, level: LoggerLevel, event: LoggerEvent) -> bool {
+        if !self.level.allows(level)
+            || !module_filter_allows(self.module.as_deref(), WORKER_LOG_MODULE)
+        {
+            return false;
+        }
+        let Some(producer) = &self.producer else {
+            return false;
+        };
+        let record = LogRecord::encode(
+            self.show_level,
+            self.show_log_origin,
+            LogOrigin::from(Location::caller()),
+            level,
+            event,
+        );
+        producer.deliver_nonblocking(LogBatch::one(record))
     }
 
     #[cfg(test)]
@@ -510,6 +626,7 @@ pub struct LoggerState {
     panic_records: Arc<PanicLogRecords>,
     emergency_logger: EmergencyLogger,
     boot_timer_rate_limiter: BootTimerLogRateLimiter,
+    observability_rate_limiter: ObservabilityWorkerLogRateLimiter,
     delivery_config: LoggerDeliveryConfig,
 }
 
@@ -524,6 +641,10 @@ impl fmt::Debug for LoggerState {
             .field("module", &self.module.as_ref().map(|_| "<redacted>"))
             .field("metrics", &self.metrics)
             .field("boot_timer_rate_limiter", &self.boot_timer_rate_limiter)
+            .field(
+                "observability_rate_limiter",
+                &self.observability_rate_limiter,
+            )
             .field("delivery_config", &self.delivery_config)
             .finish()
     }
@@ -565,6 +686,7 @@ impl LoggerState {
             panic_records,
             emergency_logger,
             boot_timer_rate_limiter: BootTimerLogRateLimiter::default(),
+            observability_rate_limiter: ObservabilityWorkerLogRateLimiter::default(),
             delivery_config: LoggerDeliveryConfig::default(),
         }
     }
@@ -843,6 +965,60 @@ impl LoggerState {
         }
     }
 
+    pub fn async_logger(&self) -> AsyncLogger {
+        AsyncLogger {
+            producer: self.delivery.as_ref().map(LoggerDelivery::producer),
+            level: self.level,
+            show_level: self.show_level,
+            show_log_origin: self.show_log_origin,
+            module: self.module.clone(),
+            metrics: self.metrics.clone(),
+            observability_rate_limiter: self.observability_rate_limiter.clone(),
+        }
+    }
+
+    #[track_caller]
+    pub fn log_lifecycle(&self, outcome: LoggerLifecycleOutcome) -> bool {
+        let level = outcome.level();
+        if !self.level.allows(level)
+            || !module_filter_allows(self.module.as_deref(), LIFECYCLE_LOG_MODULE)
+        {
+            return false;
+        }
+        let Some(delivery) = &self.delivery else {
+            return false;
+        };
+        let record = LogRecord::encode(
+            self.show_level,
+            self.show_log_origin,
+            LogOrigin::from(Location::caller()),
+            level,
+            LoggerEvent::Lifecycle(outcome),
+        );
+        delivery.producer().deliver_host(LogBatch::one(record))
+    }
+
+    #[track_caller]
+    pub fn log_snapshot(&self, outcome: LoggerSnapshotOutcome) -> bool {
+        let level = outcome.level();
+        if !self.level.allows(level)
+            || !module_filter_allows(self.module.as_deref(), SNAPSHOT_LOG_MODULE)
+        {
+            return false;
+        }
+        let Some(delivery) = &self.delivery else {
+            return false;
+        };
+        let record = LogRecord::encode(
+            self.show_level,
+            self.show_log_origin,
+            LogOrigin::from(Location::caller()),
+            level,
+            LoggerEvent::Snapshot(outcome),
+        );
+        delivery.producer().deliver_host(LogBatch::one(record))
+    }
+
     #[track_caller]
     pub fn log_boot_timer(&self, wall_time_us: u64, cpu_time_us: u64) -> bool {
         self.boot_timer_logger()
@@ -909,9 +1085,12 @@ mod tests {
     use super::delivery::WorkerObserver;
     use super::{
         BootTimerLogRateLimiter, LogRateLimitDecision, LogRateLimiterClock, LoggerAction,
-        LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute, LoggerConfigError,
-        LoggerConfigInput, LoggerDeliveryConfig, LoggerHttpMethod, LoggerLevel, LoggerState,
-        ProcessStartupOutcome, ProcessTerminalCategory, SharedLoggerMetrics,
+        LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute, LoggerApiWorkerOutcome,
+        LoggerConfigError, LoggerConfigInput, LoggerDeliveryConfig, LoggerDeviceKind,
+        LoggerHttpMethod, LoggerLevel, LoggerLifecycleOutcome, LoggerObservabilityOutcome,
+        LoggerProcessSignalOutcome, LoggerSnapshotOutcome, LoggerState,
+        ObservabilityWorkerLogRateLimiter, ProcessStartupOutcome, ProcessTerminalCategory,
+        SharedLoggerMetrics,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -1187,6 +1366,83 @@ mod tests {
         assert!(!state.log_api_result(LoggerApiResultOutcome::BadRequest));
         assert!(!state.log_process_startup(ProcessStartupOutcome::Running));
         assert_eq!(metrics.missed_log_count(), 3);
+    }
+
+    #[test]
+    fn closed_lifecycle_snapshot_and_async_events_use_fixed_shapes() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut state = LoggerState::default();
+        state.configure_test_writer(SharedWriter(output.clone()));
+
+        assert!(state.log_lifecycle(LoggerLifecycleOutcome::BackendStartupSucceeded));
+        assert!(
+            state.log_lifecycle(LoggerLifecycleOutcome::DeviceAttachSucceeded(
+                LoggerDeviceKind::Block,
+            ))
+        );
+        assert!(state.log_snapshot(LoggerSnapshotOutcome::LoadCancelled));
+        let logger = state.async_logger();
+        assert!(logger.log_api_worker(LoggerApiWorkerOutcome::Running));
+        assert!(logger.log_process_signal(LoggerProcessSignalOutcome::GuestReset));
+        assert!(logger.log_observability(LoggerObservabilityOutcome::MetricsWorkerFailed));
+        assert!(logger.wait_for_delivery_for_test());
+
+        assert_eq!(
+            String::from_utf8(output.lock().expect("output lock should succeed").clone())
+                .expect("logger output should be UTF-8"),
+            concat!(
+                "operation=backend-startup outcome=succeeded\n",
+                "device-kind=block operation=device-attach outcome=succeeded\n",
+                "operation=snapshot-load outcome=cancelled\n",
+                "operation=boot-worker outcome=running\n",
+                "operation=guest-power outcome=reset\n",
+                "operation=metrics-worker outcome=failed\n",
+            )
+        );
+    }
+
+    #[test]
+    fn observability_worker_has_an_independent_nonblocking_limiter() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let metrics = SharedLoggerMetrics::default();
+        let clock = Arc::new(TestClock::default());
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.observability_rate_limiter =
+            ObservabilityWorkerLogRateLimiter::with_clock(clock.clone());
+        state.configure_test_writer(SharedWriter(output.clone()));
+        let logger = state.async_logger();
+
+        for _ in 0..10 {
+            assert!(logger.log_observability(LoggerObservabilityOutcome::MetricsWorkerFailed));
+        }
+        assert!(!logger.log_observability(LoggerObservabilityOutcome::MetricsWorkerFailed));
+        assert_eq!(metrics.rate_limited_log_count(), 1);
+
+        clock.set(500);
+        assert!(logger.log_observability(LoggerObservabilityOutcome::MetricsWorkerFailed));
+        assert!(logger.wait_for_delivery_for_test());
+        let output = String::from_utf8(output.lock().expect("output lock should succeed").clone())
+            .expect("logger output should be UTF-8");
+        assert_eq!(
+            output
+                .matches("operation=metrics-worker outcome=failed\n")
+                .count(),
+            11
+        );
+        assert!(output.contains("1 messages were suppressed due to rate limiting\n"));
+    }
+
+    #[test]
+    fn disconnected_async_logger_counts_exact_loss_without_waiting() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(FailingWriter);
+        let logger = state.async_logger();
+        assert!(state.disconnect_delivery_for_test());
+
+        assert!(!logger.log_api_worker(LoggerApiWorkerOutcome::Failed));
+        assert!(!logger.log_process_signal(LoggerProcessSignalOutcome::ShutdownAbnormal));
+        assert_eq!(metrics.missed_log_count(), 2);
     }
 
     #[test]

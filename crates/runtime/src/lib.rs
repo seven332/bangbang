@@ -725,6 +725,11 @@ impl VmmController {
         self.logger_state.boot_timer_logger()
     }
 
+    /// Returns the narrow process-owned asynchronous logger capability.
+    pub fn async_logger(&self) -> logger::AsyncLogger {
+        self.logger_state.async_logger()
+    }
+
     /// Returns the narrow panic-record admission handle for this controller.
     pub fn emergency_logger(&self) -> logger::EmergencyLogger {
         self.logger_state.emergency_logger()
@@ -1631,6 +1636,16 @@ impl VmmController {
     #[track_caller]
     fn log_action(&self, action: logger::LoggerAction) -> bool {
         self.logger_state.log_action(action)
+    }
+
+    #[track_caller]
+    pub fn log_lifecycle(&self, outcome: logger::LoggerLifecycleOutcome) -> bool {
+        self.logger_state.log_lifecycle(outcome)
+    }
+
+    #[track_caller]
+    pub fn log_snapshot(&self, outcome: logger::LoggerSnapshotOutcome) -> bool {
+        self.logger_state.log_snapshot(outcome)
     }
 
     #[track_caller]

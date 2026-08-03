@@ -473,6 +473,10 @@ impl SnapshotV2SerialStorageAdoptionError {
             SnapshotRestoreResourceDisposition::Terminal
         )
     }
+
+    pub(crate) const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Bundle(source) if source.is_cancelled() && !source.cleanup_failed())
+    }
 }
 
 impl fmt::Debug for SnapshotV2SerialStorageAdoptionError {
@@ -989,6 +993,20 @@ impl SnapshotV2SerialRestoreBundleError {
             Self::Stdio { .. } | Self::Cancelled { .. } => {
                 SnapshotRestoreResourceDisposition::Terminal
             }
+        }
+    }
+
+    pub(crate) const fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Resources(source) => source.is_cancelled(),
+            Self::Cancelled {
+                owners_cleanup: None,
+                completion_abort: None,
+            } => true,
+            Self::Stdio { .. }
+            | Self::SerialConfig { .. }
+            | Self::InvalidResourceSet { .. }
+            | Self::Cancelled { .. } => false,
         }
     }
 }
@@ -1887,6 +1905,7 @@ mod tests {
             error.disposition(),
             SnapshotRestoreResourceDisposition::Retryable
         );
+        assert!(!error.is_cancelled());
 
         let resources = batch(None, &state);
         let (input_reader, _input_writer) = pipe_files();
@@ -1912,6 +1931,7 @@ mod tests {
             error.disposition(),
             SnapshotRestoreResourceDisposition::Retryable
         );
+        assert!(error.is_cancelled());
         assert_eq!(
             status_flags(input_reader.as_raw_fd()) & (libc::O_ACCMODE | libc::O_NONBLOCK),
             original_input_flags & (libc::O_ACCMODE | libc::O_NONBLOCK)

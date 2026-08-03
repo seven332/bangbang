@@ -1528,6 +1528,21 @@ command never creates, carries forward, or rewrites semantic classes in
 `logger-producer-audit.json`; missing or stale mappings require human review.
 The class policy and safe-field boundary are documented in the
 [logger producer contract](../compat/firecracker/v1.16.0/logger-contract.md).
+The current overlay has exactly 13 implemented, 11 planned, and seven
+not-applicable classes, representing 82 implemented, 324 planned, and 62
+not-applicable source mappings. The remaining planned classes are all owned by
+#1809.
+
+Host lifecycle logger coverage exercises backend and VM transitions, all three
+live device kinds, boot-worker observation, automatic metrics failures,
+snapshot create/load success/rejection/failure/cancellation, host signals,
+guest power convergence, cancellation, cleanup failure, and terminal ordering.
+Tests assert the exact closed vocabulary and verify that paths, identifiers,
+MAC addresses, descriptors, guest values, and raw errors never reach a record.
+Runtime logger tests separately prove bounded host receipts, nonblocking async
+delivery, the independent observability limiter, filtering, and exact loss
+accounting. Process and signed integration targets verify the executable
+ordering boundary.
 
 The final parent gate is:
 

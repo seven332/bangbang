@@ -74,9 +74,45 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
+      "disposition": "implemented",
       "rationale": "All mapped upstream calls report the same semantic API/VMM worker lifecycle; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1808"
+      "compiled_events": [
+        "api-worker"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "boot worker observation and shutdown convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "typed asynchronous API worker producer and delivery"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed API worker outcome encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "worker outcome, redaction, and terminal-order tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "process worker lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "asynchronous worker delivery and loss tests"
+        }
+      ]
     },
     {
       "id": "logger.api.request",
@@ -338,12 +374,54 @@
       "origin": "configurable",
       "limiter": "unrestricted",
       "allowed_fields": [
+        "device-kind",
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
+      "disposition": "implemented",
       "rationale": "All mapped upstream calls report the same semantic VM lifecycle and control outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1808"
+      "compiled_events": [
+        "lifecycle"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "backend, VM, and live device lifecycle convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "typed bounded lifecycle producer and delivery"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed lifecycle outcome encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "API lifecycle ordering and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "VM state, backend, live device, and shutdown outcome tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "process lifecycle and shutdown evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "bounded lifecycle delivery and filtering tests"
+        }
+      ]
     },
     {
       "id": "logger.limiter.recovery",
@@ -536,20 +614,57 @@
     {
       "id": "logger.observability.outcome",
       "subsystem": "observability",
-      "summary": "Fixed redacted logger or metrics worker outcome.",
+      "summary": "Fixed redacted metrics worker outcome.",
       "guest_triggerable": false,
       "delivery": "nonblocking-async",
       "level": "outcome-derived",
       "module": "bangbang::worker",
       "origin": "configurable",
-      "limiter": "unrestricted",
+      "limiter": "rate-limited",
+      "limiter_identity": "logger-rate.observability-worker",
       "allowed_fields": [
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic logger or metrics worker outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1808"
+      "disposition": "implemented",
+      "rationale": "All mapped upstream calls report the same semantic metrics worker outcome; the closed outcome selects level while Bangbang rate-limits repeated failures independently and discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
+      "compiled_events": [
+        "observability"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "automatic metrics worker failure convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "typed rate-limited observability worker producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed observability outcome encoding"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent observability worker limiter identity"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "periodic metrics failure and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "observability limiter independence and asynchronous loss tests"
+        }
+      ]
     },
     {
       "id": "logger.pmem.outcome",
@@ -585,9 +700,55 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
+      "disposition": "implemented",
       "rationale": "All mapped upstream calls report the same semantic host signal and shutdown convergence; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1808"
+      "compiled_events": [
+        "process-signal"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "API shutdown wakeup observation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "no-API shutdown wakeup observation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signal, guest power, cancellation, and shutdown convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "typed asynchronous process signal producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed process signal outcome encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "terminal convergence and failure-preservation tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "guest power, signal, cancellation, and shutdown ordering tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "signal and terminal-order process evidence"
+        }
+      ]
     },
     {
       "id": "logger.process-startup.outcome",
@@ -796,9 +957,45 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
+      "disposition": "implemented",
       "rationale": "All mapped upstream calls report the same semantic snapshot create, load, or restore outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1808"
+      "compiled_events": [
+        "snapshot"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "public snapshot create and load outcome convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "typed bounded snapshot producer and delivery"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed snapshot outcome encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "snapshot API outcome and latency tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "snapshot success, rejection, failure, cancellation, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "bounded snapshot delivery and filtering tests"
+        }
+      ]
     },
     {
       "id": "logger.time-identity.outcome",

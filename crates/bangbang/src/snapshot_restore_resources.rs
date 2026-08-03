@@ -264,6 +264,10 @@ impl SnapshotRestoreResourceError {
     pub(crate) const fn cleanup_failed(&self) -> bool {
         self.cleanup_failed
     }
+
+    pub(crate) const fn is_cancelled(&self) -> bool {
+        matches!(&self.kind, SnapshotRestoreResourceErrorKind::Cancelled) && !self.cleanup_failed
+    }
 }
 
 impl fmt::Debug for SnapshotRestoreResourceError {
@@ -4924,6 +4928,17 @@ impl SnapshotV2StorageRestoreBundleError {
             Self::Bundle { .. } => SnapshotRestoreResourceDisposition::Terminal,
         }
     }
+
+    pub(crate) const fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Resources(source) => source.is_cancelled(),
+            Self::Bundle {
+                source,
+                completion_abort: None,
+            } => source.is_cancelled() && !source.cleanup_failed(),
+            Self::Plan(_) | Self::Bundle { .. } => false,
+        }
+    }
 }
 
 impl fmt::Debug for SnapshotV2StorageRestoreBundleError {
@@ -4997,6 +5012,10 @@ impl SnapshotV2MultiBlockRestoreBundleError {
             } => SnapshotRestoreResourceDisposition::Retryable,
             Self::Bundle { .. } => SnapshotRestoreResourceDisposition::Terminal,
         }
+    }
+
+    pub(crate) const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Resources(source) if source.is_cancelled())
     }
 }
 
@@ -7044,6 +7063,7 @@ mod tests {
             SnapshotRestoreResourceDisposition::Retryable
         );
         assert!(!error.cleanup_failed);
+        assert!(error.is_cancelled());
         fixture.assert_authorities_available(true);
     }
 
@@ -7073,6 +7093,7 @@ mod tests {
             SnapshotRestoreResourceDisposition::Terminal
         );
         assert!(error.cleanup_failed);
+        assert!(!error.is_cancelled());
         assert_coherent_root_claim_restored(&fixture);
         let directory = fixture
             .directories()
@@ -7113,6 +7134,7 @@ mod tests {
             SnapshotRestoreResourceDisposition::Terminal
         );
         assert!(error.cleanup_failed);
+        assert!(!error.is_cancelled());
         assert_coherent_root_claim_restored(&fixture);
         let directory = fixture
             .directories()
@@ -10159,6 +10181,7 @@ mod tests {
             !error.cleanup_failed,
             "ordinary cleanup success must remain distinct from retry safety"
         );
+        assert!(error.is_cancelled());
     }
 
     #[test]
@@ -10280,6 +10303,7 @@ mod tests {
             SnapshotRestoreResourceDisposition::Retryable
         );
         assert!(!error.cleanup_failed);
+        assert!(error.is_cancelled());
 
         let root = TempRoot::new("cancel-after-prepare", b"root");
         let authority = root_file_grant_authority_for_test(root.path());
@@ -10304,6 +10328,7 @@ mod tests {
             SnapshotRestoreResourceDisposition::Retryable
         );
         assert!(!error.cleanup_failed);
+        assert!(error.is_cancelled());
         assert_root_claim_restored(&authority);
 
         let poisoned_root = TempRoot::new("cancel-cleanup-failure", b"root");
@@ -10329,6 +10354,7 @@ mod tests {
             SnapshotRestoreResourceDisposition::Terminal
         );
         assert!(error.cleanup_failed);
+        assert!(!error.is_cancelled());
     }
 
     #[test]

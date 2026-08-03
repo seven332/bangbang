@@ -18205,6 +18205,9 @@ mod macos_arm64 {
             if record == "event=process-panic" || is_closed_control_logger_line(record) {
                 continue;
             }
+            if is_closed_host_outcome_logger_line(record) {
+                continue;
+            }
 
             assert!(
                 is_api_request_logger_line(record),
@@ -18285,6 +18288,9 @@ mod macos_arm64 {
     }
 
     fn expected_logger_record_level(record: &str) -> Option<&'static str> {
+        if let Some(level) = closed_host_outcome_logger_level(record) {
+            return Some(level);
+        }
         match record {
             "operation=server outcome=stopped" => Some("Debug"),
             "operation=connection outcome=failed"
@@ -18335,6 +18341,72 @@ mod macos_arm64 {
         )
     }
 
+    fn is_closed_host_outcome_logger_line(line: &str) -> bool {
+        closed_host_outcome_logger_level(line).is_some()
+    }
+
+    fn closed_host_outcome_logger_level(line: &str) -> Option<&'static str> {
+        let level = match line {
+            "operation=vm-pause outcome=unchanged"
+            | "operation=vm-resume outcome=unchanged"
+            | "operation=boot-worker outcome=stopped" => "Debug",
+            "operation=snapshot-create outcome=cancelled"
+            | "operation=snapshot-load outcome=cancelled" => "Warn",
+            "operation=backend-startup outcome=failed"
+            | "operation=vm-start outcome=rejected"
+            | "operation=vm-start outcome=failed"
+            | "operation=vm-pause outcome=rejected"
+            | "operation=vm-pause outcome=failed"
+            | "operation=vm-resume outcome=rejected"
+            | "operation=vm-resume outcome=failed"
+            | "operation=vm-stop outcome=failed"
+            | "operation=boot-worker outcome=failed"
+            | "operation=metrics-worker outcome=failed"
+            | "operation=snapshot-create outcome=rejected"
+            | "operation=snapshot-create outcome=failed"
+            | "operation=snapshot-load outcome=rejected"
+            | "operation=snapshot-load outcome=failed"
+            | "operation=shutdown outcome=abnormal" => "Error",
+            "operation=backend-startup outcome=succeeded"
+            | "operation=vm-start outcome=succeeded"
+            | "operation=vm-pause outcome=succeeded"
+            | "operation=vm-resume outcome=succeeded"
+            | "operation=vm-stop outcome=succeeded"
+            | "operation=boot-worker outcome=running"
+            | "operation=boot-worker outcome=exited"
+            | "operation=host-signal outcome=received"
+            | "operation=cancellation outcome=requested"
+            | "operation=guest-power outcome=poweroff"
+            | "operation=guest-power outcome=reset"
+            | "operation=shutdown outcome=orderly"
+            | "operation=snapshot-create outcome=succeeded"
+            | "operation=snapshot-load outcome=succeeded" => "Info",
+            _ => return closed_live_device_outcome_logger_level(line),
+        };
+        Some(level)
+    }
+
+    fn closed_live_device_outcome_logger_level(line: &str) -> Option<&'static str> {
+        let mut fields = line.split(' ');
+        let kind = fields.next()?.strip_prefix("device-kind=")?;
+        let operation = fields.next()?.strip_prefix("operation=")?;
+        let outcome = fields.next()?.strip_prefix("outcome=")?;
+        if fields.next().is_some()
+            || !matches!(kind, "block" | "network" | "pmem")
+            || !matches!(
+                operation,
+                "device-attach" | "device-update" | "device-detach"
+            )
+        {
+            return None;
+        }
+        match outcome {
+            "succeeded" => Some("Info"),
+            "rejected" | "failed" => Some("Error"),
+            _ => None,
+        }
+    }
+
     fn is_api_request_logger_line(line: &str) -> bool {
         let Some(rest) = line.strip_prefix("The API server received a ") else {
             return false;
@@ -18355,8 +18427,15 @@ mod macos_arm64 {
         });
 
         assert_eq!(
-            output, "action=InstanceStart\noperation=process-startup outcome=running\n",
-            "no-api logger output should include only action and process startup records"
+            output,
+            concat!(
+                "operation=backend-startup outcome=succeeded\n",
+                "action=InstanceStart\n",
+                "operation=boot-worker outcome=running\n",
+                "operation=vm-start outcome=succeeded\n",
+                "operation=process-startup outcome=running\n",
+            ),
+            "no-api logger output should include the closed startup lifecycle"
         );
     }
 
@@ -18400,6 +18479,31 @@ mod macos_arm64 {
              level=Info origin=crates/runtime/src/logger.rs:7 action=request outcome=no-content\n",
             LoggerPrefixExpectation::LevelOrigin,
         );
+    }
+
+    #[test]
+    fn logger_output_accepts_only_closed_host_outcomes_with_exact_levels() {
+        for (record, level) in [
+            ("operation=backend-startup outcome=succeeded", "Info"),
+            ("operation=vm-pause outcome=unchanged", "Debug"),
+            ("operation=boot-worker outcome=failed", "Error"),
+            ("operation=snapshot-load outcome=cancelled", "Warn"),
+            ("operation=guest-power outcome=reset", "Info"),
+            ("operation=shutdown outcome=abnormal", "Error"),
+            (
+                "device-kind=network operation=device-update outcome=rejected",
+                "Error",
+            ),
+        ] {
+            assert_eq!(closed_host_outcome_logger_level(record), Some(level));
+        }
+        for malformed in [
+            "operation=vm-start outcome=private-error",
+            "device-kind=private operation=device-update outcome=failed",
+            "device-kind=block operation=device-update outcome=failed id=secret",
+        ] {
+            assert_eq!(closed_host_outcome_logger_level(malformed), None);
+        }
     }
 
     #[test]
