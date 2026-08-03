@@ -481,20 +481,14 @@ fn process_terminal_category(
     result: &Result<(), ProcessError>,
     contained: Option<&ContainedSession>,
 ) -> ProcessTerminalCategory {
-    match result {
-        Ok(()) if contained.is_some_and(ContainedSession::was_cancelled) => {
-            ProcessTerminalCategory::Cancelled
+    match terminal_result(result, contained).0 {
+        bangbang_session::TerminalCategory::Success => ProcessTerminalCategory::Success,
+        bangbang_session::TerminalCategory::Configuration => ProcessTerminalCategory::Configuration,
+        bangbang_session::TerminalCategory::ProcessFailure
+        | bangbang_session::TerminalCategory::Unstructured => {
+            ProcessTerminalCategory::ProcessFailure
         }
-        Ok(()) => ProcessTerminalCategory::Success,
-        Err(error)
-            if matches!(
-                error.exit_code(),
-                ProcessExitCode::ArgumentParsing | ProcessExitCode::BadConfiguration
-            ) =>
-        {
-            ProcessTerminalCategory::Configuration
-        }
-        Err(_) => ProcessTerminalCategory::ProcessFailure,
+        bangbang_session::TerminalCategory::Cancelled => ProcessTerminalCategory::Cancelled,
     }
 }
 
