@@ -1253,6 +1253,89 @@ fn snapshot_wave6_terminal_policy_is_stable() {
 }
 
 #[test]
+fn native_v2_full_and_diff_summary_policy_is_stable() {
+    const RECONCILED: [&str; 8] = [
+        "api-path:/pmem/{id}",
+        "api-schema:Pmem",
+        "corpus:device-hotplug",
+        "corpus:memory-hotplug",
+        "corpus:pmem",
+        "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
+        "semantic.storage:pmem-root-mapping-flush-and-state",
+        "semantic.transport:pci-msi-and-coexistence",
+    ];
+    const SNAPSHOT_AGGREGATE: &str = "semantic.snapshot:multi-vcpu-drives-devices-and-mmds";
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let by_id = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+
+    assert_eq!(RECONCILED.into_iter().collect::<BTreeSet<_>>().len(), 8);
+    for id in RECONCILED {
+        let capability = by_id
+            .get(id)
+            .unwrap_or_else(|| panic!("reconciled native-v2 summary must exist: {id}"));
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "reconciled native-v2 summary must remain terminal: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "reconciled native-v2 summary must retain concrete evidence: {id}"
+        );
+        assert!(
+            capability.summary.contains("Full 2.12") && capability.summary.contains("Diff 2.13"),
+            "reconciled summary must distinguish Full 2.12 from Diff 2.13: {id}"
+        );
+        let summary = capability.summary.to_ascii_lowercase();
+        assert!(
+            !summary.contains("current native-v2 2.11")
+                && !summary.contains("current native-v2 2.12")
+                && !summary.contains("current 2.12")
+                && !summary.contains("vsock snapshot persistence remains outside")
+                && !summary.contains("diff, native-v2 uffd"),
+            "reconciled summary retains stale native-v2 wording: {id}"
+        );
+    }
+
+    let transport = by_id
+        .get("semantic.transport:pci-msi-and-coexistence")
+        .expect("terminal PCI transport aggregate must exist");
+    assert!(
+        transport.summary.contains("exact native-v2 2.11")
+            && transport.summary.contains("vsock")
+            && transport.summary.contains("mandatory Diff state"),
+        "PCI transport summary must retain the exact 2.11/Full 2.12/Diff 2.13 ladder"
+    );
+
+    let snapshot = by_id
+        .get(SNAPSHOT_AGGREGATE)
+        .expect("terminal snapshot aggregate must exist");
+    assert_eq!(
+        snapshot.disposition,
+        Disposition::ImplementedAndVerified,
+        "already-current snapshot aggregate must remain terminal"
+    );
+    assert!(
+        snapshot.summary.contains("Full 2.12 and Diff 2.13")
+            && snapshot
+                .summary
+                .contains("all 64 optional-component products"),
+        "snapshot aggregate must retain its already-current Full/Diff product claim"
+    );
+}
+
+#[test]
 fn network_mmds_closure_policy_is_stable() {
     const TERMINAL: [&str; 33] = [
         "api-operation:GET /mmds",
