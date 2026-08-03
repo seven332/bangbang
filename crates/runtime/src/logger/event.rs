@@ -95,6 +95,35 @@ pub enum LoggerAction {
     FlushMetrics,
 }
 
+/// Stable process termination categories emitted by the executable lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessTerminalCategory {
+    Success,
+    Configuration,
+    ProcessFailure,
+    Cancelled,
+    Panic,
+}
+
+impl ProcessTerminalCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Configuration => "configuration",
+            Self::ProcessFailure => "process-failure",
+            Self::Cancelled => "cancelled",
+            Self::Panic => "panic",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::Success | Self::Cancelled => LoggerLevel::Info,
+            Self::Configuration | Self::ProcessFailure | Self::Panic => LoggerLevel::Error,
+        }
+    }
+}
+
 impl LoggerAction {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -118,6 +147,8 @@ pub(super) enum LoggerEvent {
     RateLimitRecovery {
         suppressed: u64,
     },
+    ProcessPanic,
+    ProcessExit(ProcessTerminalCategory),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -210,6 +241,11 @@ impl LogRecord {
                 encoder.push_u64(suppressed);
                 encoder.push_str(" messages were suppressed due to rate limiting");
             }
+            LoggerEvent::ProcessPanic => encoder.push_str("event=process-panic"),
+            LoggerEvent::ProcessExit(category) => {
+                encoder.push_str("event=process-exit category=");
+                encoder.push_str(category.as_str());
+            }
         }
 
         encoder.finish()
@@ -225,6 +261,82 @@ impl LogRecord {
     #[cfg(test)]
     pub(super) fn as_str(&self) -> &str {
         std::str::from_utf8(self.as_bytes()).unwrap_or("")
+    }
+}
+
+/// Opaque, fixed panic records prepared before a panic hook can use them.
+#[derive(Clone)]
+pub struct PanicLogRecords {
+    plain: LogRecord,
+    level: LogRecord,
+    origin: LogRecord,
+    level_and_origin: LogRecord,
+}
+
+impl fmt::Debug for PanicLogRecords {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PanicLogRecords")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for PanicLogRecords {
+    #[track_caller]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PanicLogRecords {
+    /// Preencodes every permitted prefix form using only caller metadata.
+    #[track_caller]
+    pub fn new() -> Self {
+        let origin = LogOrigin::from(Location::caller());
+        Self {
+            plain: LogRecord::encode(
+                false,
+                false,
+                origin,
+                LoggerLevel::Error,
+                LoggerEvent::ProcessPanic,
+            ),
+            level: LogRecord::encode(
+                true,
+                false,
+                origin,
+                LoggerLevel::Error,
+                LoggerEvent::ProcessPanic,
+            ),
+            origin: LogRecord::encode(
+                false,
+                true,
+                origin,
+                LoggerLevel::Error,
+                LoggerEvent::ProcessPanic,
+            ),
+            level_and_origin: LogRecord::encode(
+                true,
+                true,
+                origin,
+                LoggerLevel::Error,
+                LoggerEvent::ProcessPanic,
+            ),
+        }
+    }
+
+    /// Returns the fixed unprefixed fallback record.
+    pub fn plain_bytes(&self) -> &[u8] {
+        self.plain.as_bytes()
+    }
+
+    pub(super) const fn select(&self, show_level: bool, show_log_origin: bool) -> &LogRecord {
+        match (show_level, show_log_origin) {
+            (false, false) => &self.plain,
+            (true, false) => &self.level,
+            (false, true) => &self.origin,
+            (true, true) => &self.level_and_origin,
+        }
     }
 }
 
@@ -420,7 +532,7 @@ fn utf8_prefix_len(value: &str, maximum: usize) -> usize {
 mod tests {
     use super::{
         LogOrigin, LogRecord, LoggerAction, LoggerApiRoute, LoggerEvent, LoggerHttpMethod,
-        MAX_LOG_RECORD_BYTES, normalize_origin,
+        MAX_LOG_RECORD_BYTES, PanicLogRecords, ProcessTerminalCategory, normalize_origin,
     };
     use crate::logger::LoggerLevel;
 
@@ -475,6 +587,83 @@ mod tests {
             recovery.as_str(),
             "3 messages were suppressed due to rate limiting\n"
         );
+    }
+
+    #[test]
+    fn encodes_fixed_process_records_and_levels() {
+        let origin = LogOrigin::new("crates/bangbang/src/process.rs", 17);
+        let cases = [
+            (
+                ProcessTerminalCategory::Success,
+                LoggerLevel::Info,
+                "success",
+            ),
+            (
+                ProcessTerminalCategory::Configuration,
+                LoggerLevel::Error,
+                "configuration",
+            ),
+            (
+                ProcessTerminalCategory::ProcessFailure,
+                LoggerLevel::Error,
+                "process-failure",
+            ),
+            (
+                ProcessTerminalCategory::Cancelled,
+                LoggerLevel::Info,
+                "cancelled",
+            ),
+            (ProcessTerminalCategory::Panic, LoggerLevel::Error, "panic"),
+        ];
+
+        for (category, level, text) in cases {
+            let record = LogRecord::encode(
+                true,
+                false,
+                origin,
+                category.level(),
+                LoggerEvent::ProcessExit(category),
+            );
+            assert_eq!(category.level(), level);
+            assert_eq!(
+                record.as_str(),
+                format!(
+                    "level={} event=process-exit category={text}\n",
+                    level.as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn panic_record_set_preencodes_every_prefix_without_payload_input() {
+        let records = PanicLogRecords::new();
+        assert_eq!(records.plain.as_str(), "event=process-panic\n");
+        assert_eq!(records.level.as_str(), "level=Error event=process-panic\n");
+        assert!(records.origin.as_str().starts_with("origin="));
+        assert!(records.origin.as_str().ends_with(" event=process-panic\n"));
+        assert!(
+            records
+                .level_and_origin
+                .as_str()
+                .starts_with("level=Error origin=")
+        );
+        assert!(
+            records
+                .level_and_origin
+                .as_str()
+                .ends_with(" event=process-panic\n")
+        );
+        assert_eq!(records.plain_bytes(), b"event=process-panic\n");
+        for record in [
+            &records.plain,
+            &records.level,
+            &records.origin,
+            &records.level_and_origin,
+        ] {
+            assert!(record.as_bytes().len() <= MAX_LOG_RECORD_BYTES);
+            assert!(std::str::from_utf8(record.as_bytes()).is_ok());
+        }
     }
 
     #[test]

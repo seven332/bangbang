@@ -1318,6 +1318,11 @@ mod macos_arm64 {
 
         let output = bangbang.terminate();
         assert_clean_shutdown(output, &socket_path, "bangbang");
+        assert_terminal_logger_output(
+            &logger_path,
+            LoggerPrefixExpectation::LevelOrigin,
+            "success",
+        );
         assert_normal_terminal_metrics_output(&metrics_path);
         assert!(
             !uds_path.exists(),
@@ -1724,6 +1729,7 @@ mod macos_arm64 {
 
         let output = bangbang.terminate();
         assert_clean_shutdown(output, &socket_path, "bangbang config file");
+        assert_terminal_logger_output(&logger_path, LoggerPrefixExpectation::None, "success");
         assert_normal_terminal_metrics_output(&metrics_path);
         assert!(
             !uds_path.exists(),
@@ -1819,6 +1825,7 @@ mod macos_arm64 {
             &socket_path,
             "bangbang no-api config file",
         );
+        assert_terminal_logger_output(&logger_path, LoggerPrefixExpectation::None, "success");
         assert!(
             !uds_path.exists(),
             "bangbang no-api config-file shutdown should remove its owned vsock listener path"
@@ -18147,19 +18154,35 @@ mod macos_arm64 {
     fn assert_logger_output_lines(output: &str, prefix: LoggerPrefixExpectation) {
         let mut action_lines = Vec::new();
         let mut saw_api_request_line = false;
+        let mut terminal_lines = 0usize;
         for line in output.lines() {
             let record = logger_record_without_prefix(line, prefix, output);
             if record.starts_with("action=") {
                 action_lines.push(record);
                 continue;
             }
+            if let Some(category) = record.strip_prefix("event=process-exit category=") {
+                assert!(
+                    matches!(
+                        category,
+                        "success" | "configuration" | "process-failure" | "cancelled" | "panic"
+                    ),
+                    "terminal logger category should be fixed; output:\n{output}\nline: {line}"
+                );
+                terminal_lines += 1;
+                continue;
+            }
 
             assert!(
                 is_api_request_logger_line(record),
-                "logger output line should be an action record or API request record; output:\n{output}\nline: {line}"
+                "logger output line should be an action, API request, or terminal record; output:\n{output}\nline: {line}"
             );
             saw_api_request_line = true;
         }
+        assert!(
+            terminal_lines <= 1,
+            "logger output should include at most one terminal record; output:\n{output}"
+        );
 
         const EXPECTED_ACTION_LINES: &[&str] = &["action=InstanceStart", "action=FlushMetrics"];
         assert_eq!(
@@ -18234,6 +18257,21 @@ mod macos_arm64 {
         );
     }
 
+    fn assert_terminal_logger_output(path: &Path, prefix: LoggerPrefixExpectation, category: &str) {
+        let output = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!("logger output {} should be readable: {err}", path.display())
+        });
+        let line = output
+            .lines()
+            .next_back()
+            .expect("post-exit logger output should not be empty");
+        assert_eq!(
+            logger_record_without_prefix(line, prefix, &output),
+            format!("event=process-exit category={category}"),
+            "the terminal logger record should be the last completed record"
+        );
+    }
+
     #[test]
     fn logger_output_accepts_action_records_with_api_request_lines() {
         assert_logger_output_lines(
@@ -18257,7 +18295,9 @@ mod macos_arm64 {
     }
 
     #[test]
-    #[should_panic(expected = "logger output line should be an action record")]
+    #[should_panic(
+        expected = "logger output line should be an action, API request, or terminal record"
+    )]
     fn logger_output_rejects_unexpected_non_action_line() {
         assert_logger_output_lines(
             "action=InstanceStart\nunexpected\n",

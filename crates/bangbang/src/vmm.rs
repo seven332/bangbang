@@ -128,7 +128,9 @@ use bangbang_runtime::boot_timer::BootTimerMmioLayout;
 use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::entropy::{EntropyConfig, EntropyMmioLayout};
 use bangbang_runtime::lazy_memory::LazyGuestMemoryConsumerProfile;
-use bangbang_runtime::logger::{LoggerApiRoute, LoggerConfigInput, LoggerHttpMethod};
+use bangbang_runtime::logger::{
+    EmergencyLogger, LoggerApiRoute, LoggerConfigInput, LoggerHttpMethod, ProcessTerminalCategory,
+};
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
 use bangbang_runtime::memory_hotplug::{
@@ -5472,6 +5474,7 @@ where
     started_session: Option<S::Session>,
     metrics_session_epoch: Option<Instant>,
     initial_metrics_attempted: bool,
+    terminal_logger_attempted: bool,
     terminal_metrics_attempted: bool,
     process_metrics_diagnostics: MetricsDiagnostics,
     process_signal_metrics: Option<SharedSignalMetrics>,
@@ -5580,6 +5583,7 @@ where
             started_session: None,
             metrics_session_epoch: None,
             initial_metrics_attempted: false,
+            terminal_logger_attempted: false,
             terminal_metrics_attempted: false,
             process_metrics_diagnostics: MetricsDiagnostics::default(),
             process_signal_metrics: None,
@@ -7214,6 +7218,20 @@ where
 
         self.initial_metrics_attempted = true;
         let _ = self.flush_automatic_metrics();
+    }
+
+    pub(crate) fn emergency_logger(&self) -> EmergencyLogger {
+        self.controller.emergency_logger()
+    }
+
+    pub(crate) fn handle_terminal_observability(&mut self, category: ProcessTerminalCategory) {
+        self.handle_initial_metrics_flush();
+        self.controller.settle_emergency_logger_loss();
+        if !self.terminal_logger_attempted {
+            self.terminal_logger_attempted = true;
+            let _ = self.controller.log_process_terminal(category);
+        }
+        self.handle_terminal_metrics_flush();
     }
 
     fn handle_periodic_metrics_flush(&mut self) {
@@ -35680,7 +35698,7 @@ mod tests {
     use bangbang_runtime::entropy::{EntropyConfig, EntropyConfigInput};
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
-    use bangbang_runtime::logger::LoggerConfigInput;
+    use bangbang_runtime::logger::{LoggerConfigInput, ProcessTerminalCategory};
     use bangbang_runtime::machine::{MachineConfig, MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
@@ -63838,6 +63856,105 @@ mod tests {
         assert_eq!(
             fs::read_to_string(logger.path()).expect("logger output should read"),
             "action=InstanceStart\n"
+        );
+    }
+
+    #[test]
+    fn terminal_observability_logs_once_between_initial_and_final_metrics() {
+        let output = TempFilePath::create("terminal-observability-order");
+        let mut vmm =
+            ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", FakeStarter::success(18));
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            output.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(output.path()),
+        ))
+        .expect("logger should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        vmm.handle_terminal_observability(ProcessTerminalCategory::Success);
+        vmm.handle_terminal_observability(ProcessTerminalCategory::Panic);
+
+        assert_eq!(
+            fs::read_to_string(output.path()).expect("combined output should read"),
+            concat!(
+                "action=InstanceStart\n",
+                "{\"vmm\":{\"metrics_flush_count\":1}}\n",
+                "event=process-exit category=success\n",
+                "{\"vmm\":{\"metrics_flush_count\":1}}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn terminal_observability_logs_pre_session_without_flushing_metrics() {
+        let output = TempFilePath::create("terminal-observability-pre-session");
+        let mut vmm =
+            ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", FakeStarter::success(18));
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            output.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(output.path()),
+        ))
+        .expect("logger should configure");
+
+        vmm.handle_terminal_observability(ProcessTerminalCategory::Configuration);
+
+        assert_eq!(
+            fs::read_to_string(output.path()).expect("combined output should read"),
+            "event=process-exit category=configuration\n"
+        );
+    }
+
+    #[test]
+    fn terminal_observability_settles_emergency_loss_before_metrics_snapshot() {
+        let metrics = TempFilePath::create("terminal-emergency-loss-metrics");
+        let logger = TempFilePath::create("terminal-emergency-loss-logger");
+        let mut vmm =
+            ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", FakeStarter::success(18));
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(logger.path()),
+        ))
+        .expect("logger should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        let emergency = vmm.emergency_logger();
+        assert!(emergency.try_log_panic());
+        assert!(!emergency.try_log_panic());
+
+        vmm.handle_terminal_observability(ProcessTerminalCategory::Panic);
+
+        assert_eq!(
+            fs::read_to_string(logger.path()).expect("logger output should read"),
+            concat!(
+                "action=InstanceStart\n",
+                "event=process-panic\n",
+                "event=process-exit category=panic\n",
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            concat!(
+                "{\"vmm\":{\"metrics_flush_count\":1}}\n",
+                "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n",
+            )
         );
     }
 

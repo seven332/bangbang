@@ -725,6 +725,22 @@ impl VmmController {
         self.logger_state.boot_timer_logger()
     }
 
+    /// Returns the narrow panic-record admission handle for this controller.
+    pub fn emergency_logger(&self) -> logger::EmergencyLogger {
+        self.logger_state.emergency_logger()
+    }
+
+    /// Settles the single possible deferred hook-side logger admission loss.
+    pub fn settle_emergency_logger_loss(&self) {
+        self.logger_state.settle_emergency_loss();
+    }
+
+    /// Emits one fixed process terminal record through the configured logger.
+    #[track_caller]
+    pub fn log_process_terminal(&self, category: logger::ProcessTerminalCategory) -> bool {
+        self.logger_state.log_process_terminal(category)
+    }
+
     pub fn vm_config(&self) -> Result<VmConfiguration, mmds::MmdsStateLockError> {
         Ok(VmConfiguration::new(
             self.machine_config,

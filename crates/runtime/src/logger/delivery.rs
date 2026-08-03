@@ -11,10 +11,19 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::SharedLoggerMetrics;
-use super::event::LogBatch;
+use super::event::{LogBatch, LogRecord, PanicLogRecords};
 
 const LOGGER_DELIVERY_QUEUE_CAPACITY: usize = 256;
 const LOGGER_DELIVERY_TIMEOUT: Duration = Duration::from_secs(1);
+const LOGGER_EMERGENCY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+const EMERGENCY_ARMED: u8 = 0;
+const EMERGENCY_PLAIN_PENDING: u8 = 1;
+const EMERGENCY_LEVEL_PENDING: u8 = 2;
+const EMERGENCY_ORIGIN_PENDING: u8 = 3;
+const EMERGENCY_LEVEL_ORIGIN_PENDING: u8 = 4;
+const EMERGENCY_CLAIMED: u8 = 5;
+const EMERGENCY_CLOSED: u8 = 6;
 
 const RECEIPT_PENDING: u8 = 0;
 const RECEIPT_WRITING: u8 = 1;
@@ -26,6 +35,128 @@ const REPLACEMENT_COMMITTED: u8 = 1;
 const REPLACEMENT_CANCELLED: u8 = 2;
 
 pub(super) struct PreparedLoggerWriter(Box<dyn Write + Send>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PanicRecordPrefix {
+    Plain,
+    Level,
+    Origin,
+    LevelAndOrigin,
+}
+
+impl PanicRecordPrefix {
+    pub(super) const fn from_flags(show_level: bool, show_log_origin: bool) -> Self {
+        match (show_level, show_log_origin) {
+            (false, false) => Self::Plain,
+            (true, false) => Self::Level,
+            (false, true) => Self::Origin,
+            (true, true) => Self::LevelAndOrigin,
+        }
+    }
+
+    const fn state(self) -> u8 {
+        match self {
+            Self::Plain => EMERGENCY_PLAIN_PENDING,
+            Self::Level => EMERGENCY_LEVEL_PENDING,
+            Self::Origin => EMERGENCY_ORIGIN_PENDING,
+            Self::LevelAndOrigin => EMERGENCY_LEVEL_ORIGIN_PENDING,
+        }
+    }
+
+    const fn from_state(state: u8) -> Option<Self> {
+        match state {
+            EMERGENCY_PLAIN_PENDING => Some(Self::Plain),
+            EMERGENCY_LEVEL_PENDING => Some(Self::Level),
+            EMERGENCY_ORIGIN_PENDING => Some(Self::Origin),
+            EMERGENCY_LEVEL_ORIGIN_PENDING => Some(Self::LevelAndOrigin),
+            _ => None,
+        }
+    }
+}
+
+pub(super) struct LoggerEmergencyIngress {
+    state: AtomicU8,
+    records: Arc<PanicLogRecords>,
+}
+
+impl fmt::Debug for LoggerEmergencyIngress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoggerEmergencyIngress")
+            .field("state", &self.state.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl LoggerEmergencyIngress {
+    pub(super) const fn new(records: Arc<PanicLogRecords>) -> Self {
+        Self {
+            state: AtomicU8::new(EMERGENCY_ARMED),
+            records,
+        }
+    }
+
+    /// Makes exactly one compare-exchange attempt and never retries.
+    pub(super) fn publish_once(&self, prefix: PanicRecordPrefix) -> bool {
+        self.state
+            .compare_exchange(
+                EMERGENCY_ARMED,
+                prefix.state(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    fn claim(&self) -> Option<&LogRecord> {
+        let state = self.state.load(Ordering::Acquire);
+        let prefix = PanicRecordPrefix::from_state(state)?;
+        self.state
+            .compare_exchange(
+                state,
+                EMERGENCY_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        Some(match prefix {
+            PanicRecordPrefix::Plain => self.records.select(false, false),
+            PanicRecordPrefix::Level => self.records.select(true, false),
+            PanicRecordPrefix::Origin => self.records.select(false, true),
+            PanicRecordPrefix::LevelAndOrigin => self.records.select(true, true),
+        })
+    }
+
+    fn close_if_idle(&self) -> bool {
+        match self.state.compare_exchange(
+            EMERGENCY_ARMED,
+            EMERGENCY_CLOSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(EMERGENCY_CLAIMED | EMERGENCY_CLOSED) => true,
+            Err(_) => false,
+        }
+    }
+
+    fn force_close(&self) {
+        self.state.store(EMERGENCY_CLOSED, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn state_for_test(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+}
+
+struct EmergencyWorkerGuard(Arc<LoggerEmergencyIngress>);
+
+impl Drop for EmergencyWorkerGuard {
+    fn drop(&mut self) {
+        self.0.force_close();
+    }
+}
 
 impl fmt::Debug for PreparedLoggerWriter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -53,6 +184,7 @@ pub(super) struct LoggerDeliveryConfig {
     queue_capacity: usize,
     receipt_timeout: Duration,
     replacement_timeout: Duration,
+    emergency_poll_interval: Duration,
     #[cfg(test)]
     fail_spawn: bool,
     #[cfg(test)]
@@ -65,6 +197,7 @@ impl Default for LoggerDeliveryConfig {
             queue_capacity: LOGGER_DELIVERY_QUEUE_CAPACITY,
             receipt_timeout: LOGGER_DELIVERY_TIMEOUT,
             replacement_timeout: LOGGER_DELIVERY_TIMEOUT,
+            emergency_poll_interval: LOGGER_EMERGENCY_POLL_INTERVAL,
             #[cfg(test)]
             fail_spawn: false,
             #[cfg(test)]
@@ -80,6 +213,7 @@ impl LoggerDeliveryConfig {
             queue_capacity,
             receipt_timeout: timeout,
             replacement_timeout: timeout,
+            emergency_poll_interval: timeout,
             fail_spawn: false,
             worker_observer: None,
         }
@@ -202,6 +336,7 @@ impl LoggerProducer {
 
 pub(super) struct LoggerDelivery {
     producer: LoggerProducer,
+    emergency: Arc<LoggerEmergencyIngress>,
     replacement_timeout: Duration,
 }
 
@@ -210,6 +345,7 @@ impl fmt::Debug for LoggerDelivery {
         formatter
             .debug_struct("LoggerDelivery")
             .field("producer", &self.producer)
+            .field("emergency", &self.emergency)
             .field("replacement_timeout", &self.replacement_timeout)
             .finish_non_exhaustive()
     }
@@ -219,6 +355,7 @@ impl LoggerDelivery {
     pub(super) fn spawn(
         writer: PreparedLoggerWriter,
         metrics: SharedLoggerMetrics,
+        panic_records: Arc<PanicLogRecords>,
         config: LoggerDeliveryConfig,
     ) -> Result<Self, std::io::ErrorKind> {
         #[cfg(test)]
@@ -228,6 +365,9 @@ impl LoggerDelivery {
 
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
         let worker_metrics = metrics.clone();
+        let emergency = Arc::new(LoggerEmergencyIngress::new(panic_records));
+        let worker_emergency = emergency.clone();
+        let emergency_poll_interval = config.emergency_poll_interval;
         #[cfg(test)]
         let worker_observer = config.worker_observer.clone();
         thread::Builder::new()
@@ -235,7 +375,13 @@ impl LoggerDelivery {
             .spawn(move || {
                 #[cfg(test)]
                 let _worker_guard = worker_observer.map(WorkerGuard::start);
-                run_worker(receiver, writer, worker_metrics);
+                run_worker(
+                    receiver,
+                    writer,
+                    worker_metrics,
+                    worker_emergency,
+                    emergency_poll_interval,
+                );
             })
             .map_err(|error| error.kind())?;
 
@@ -245,12 +391,17 @@ impl LoggerDelivery {
                 metrics,
                 receipt_timeout: config.receipt_timeout,
             },
+            emergency,
             replacement_timeout: config.replacement_timeout,
         })
     }
 
     pub(super) fn producer(&self) -> LoggerProducer {
         self.producer.clone()
+    }
+
+    pub(super) fn emergency_ingress(&self) -> Arc<LoggerEmergencyIngress> {
+        self.emergency.clone()
     }
 
     pub(super) fn replace_writer(
@@ -398,38 +549,87 @@ fn run_worker(
     receiver: Receiver<WorkerMessage>,
     mut writer: PreparedLoggerWriter,
     metrics: SharedLoggerMetrics,
+    emergency: Arc<LoggerEmergencyIngress>,
+    emergency_poll_interval: Duration,
 ) {
-    while let Ok(mut message) = receiver.recv() {
-        match message.kind {
-            WorkerMessageKind::Batch => {
-                if let Some(batch) = message.batch.take() {
-                    deliver_batch(&mut writer, &batch, message.receipt.take(), &metrics);
+    let _emergency_guard = EmergencyWorkerGuard(emergency.clone());
+    loop {
+        deliver_emergency(&mut writer, &emergency, &metrics);
+        match receiver.recv_timeout(emergency_poll_interval) {
+            Ok(mut message) => {
+                deliver_emergency(&mut writer, &emergency, &metrics);
+                if !handle_worker_message(&mut writer, &metrics, &mut message) {
+                    close_emergency(&mut writer, &emergency, &metrics);
+                    return;
                 }
             }
-            WorkerMessageKind::Replace => {
-                if let (Some(replacement), Some(token)) =
-                    (message.writer.take(), message.replacement.take())
-                    && token.commit()
-                {
-                    let previous = std::mem::replace(&mut writer, replacement);
-                    token.notify();
-                    drop(previous);
-                }
-            }
-            #[cfg(test)]
-            WorkerMessageKind::Barrier => {
-                if let Some(sender) = message.signal.take() {
-                    let _ = sender.try_send(());
-                }
-            }
-            #[cfg(test)]
-            WorkerMessageKind::Disconnect => {
-                if let Some(sender) = message.signal.take() {
-                    let _ = sender.try_send(());
-                }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                close_emergency(&mut writer, &emergency, &metrics);
                 return;
             }
         }
+    }
+}
+
+fn handle_worker_message(
+    writer: &mut PreparedLoggerWriter,
+    metrics: &SharedLoggerMetrics,
+    message: &mut WorkerMessage,
+) -> bool {
+    match message.kind {
+        WorkerMessageKind::Batch => {
+            if let Some(batch) = message.batch.take() {
+                deliver_batch(writer, &batch, message.receipt.take(), metrics);
+            }
+        }
+        WorkerMessageKind::Replace => {
+            if let (Some(replacement), Some(token)) =
+                (message.writer.take(), message.replacement.take())
+                && token.commit()
+            {
+                let previous = std::mem::replace(writer, replacement);
+                token.notify();
+                drop(previous);
+            }
+        }
+        #[cfg(test)]
+        WorkerMessageKind::Barrier => {
+            if let Some(sender) = message.signal.take() {
+                let _ = sender.try_send(());
+            }
+        }
+        #[cfg(test)]
+        WorkerMessageKind::Disconnect => {
+            if let Some(sender) = message.signal.take() {
+                let _ = sender.try_send(());
+            }
+            return false;
+        }
+    }
+    true
+}
+
+fn deliver_emergency(
+    writer: &mut PreparedLoggerWriter,
+    emergency: &LoggerEmergencyIngress,
+    metrics: &SharedLoggerMetrics,
+) {
+    if let Some(record) = emergency.claim()
+        && !writer.write(record.as_bytes())
+    {
+        metrics.record_missed_logs(1);
+    }
+}
+
+fn close_emergency(
+    writer: &mut PreparedLoggerWriter,
+    emergency: &LoggerEmergencyIngress,
+    metrics: &SharedLoggerMetrics,
+) {
+    while !emergency.close_if_idle() {
+        deliver_emergency(writer, emergency, metrics);
+        thread::yield_now();
     }
 }
 
@@ -660,7 +860,13 @@ mod tests {
     };
     use crate::logger::LoggerLevel;
     use crate::logger::SharedLoggerMetrics;
-    use crate::logger::event::{LogBatch, LogOrigin, LogRecord, LoggerAction, LoggerEvent};
+    use crate::logger::event::{
+        LogBatch, LogOrigin, LogRecord, LoggerAction, LoggerEvent, PanicLogRecords,
+    };
+
+    fn panic_records() -> Arc<PanicLogRecords> {
+        Arc::new(PanicLogRecords::new())
+    }
 
     fn record(action: LoggerAction) -> LogRecord {
         LogRecord::encode(
@@ -738,6 +944,19 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicWriter;
+
+    impl Write for PanicWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            panic!("panic writer fixture");
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("panic writer must not flush");
         }
     }
 
@@ -873,6 +1092,7 @@ mod tests {
         let delivery = LoggerDelivery::spawn(
             PreparedLoggerWriter::new(DropSignalWriter(Some(drop_sender))),
             SharedLoggerMetrics::default(),
+            panic_records(),
             LoggerDeliveryConfig::for_test(1, Duration::from_millis(100)),
         )
         .expect("worker should spawn");
@@ -890,6 +1110,7 @@ mod tests {
         let delivery = LoggerDelivery::spawn(
             PreparedLoggerWriter::new(SharedWriter(output.clone())),
             metrics.clone(),
+            panic_records(),
             LoggerDeliveryConfig::for_test(2, Duration::from_millis(100)),
         )
         .expect("worker should spawn");
@@ -907,6 +1128,151 @@ mod tests {
     }
 
     #[test]
+    fn emergency_ingress_publishes_once_before_waking_host_message() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let delivery = LoggerDelivery::spawn(
+            PreparedLoggerWriter::new(SharedWriter(output.clone())),
+            SharedLoggerMetrics::default(),
+            panic_records(),
+            LoggerDeliveryConfig::for_test(2, Duration::from_millis(100)),
+        )
+        .expect("worker should spawn");
+        let emergency = delivery.emergency_ingress();
+
+        assert!(emergency.publish_once(super::PanicRecordPrefix::Plain));
+        assert!(!emergency.publish_once(super::PanicRecordPrefix::Level));
+        assert!(
+            delivery
+                .producer()
+                .deliver_host(LogBatch::one(record(LoggerAction::InstanceStart)))
+        );
+
+        assert_eq!(emergency.state_for_test(), super::EMERGENCY_CLAIMED);
+        assert_eq!(
+            *output.lock().expect("output lock should succeed"),
+            b"event=process-panic\naction=InstanceStart\n"
+        );
+    }
+
+    #[test]
+    fn emergency_ingress_is_polled_without_an_ordinary_message() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let delivery = LoggerDelivery::spawn(
+            PreparedLoggerWriter::new(SharedWriter(output.clone())),
+            SharedLoggerMetrics::default(),
+            panic_records(),
+            LoggerDeliveryConfig::for_test(2, Duration::from_millis(5)),
+        )
+        .expect("worker should spawn");
+        let emergency = delivery.emergency_ingress();
+
+        assert!(emergency.publish_once(super::PanicRecordPrefix::Level));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while output
+            .lock()
+            .expect("output lock should succeed")
+            .is_empty()
+            && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+
+        assert_eq!(emergency.state_for_test(), super::EMERGENCY_CLAIMED);
+        assert_eq!(
+            *output.lock().expect("output lock should succeed"),
+            b"level=Error event=process-panic\n"
+        );
+    }
+
+    #[test]
+    fn emergency_ingress_is_independent_of_a_full_ordinary_queue() {
+        let gate = Arc::new(WriterGate::default());
+        let metrics = SharedLoggerMetrics::default();
+        let delivery = LoggerDelivery::spawn(
+            PreparedLoggerWriter::new(HeldWriter { gate: gate.clone() }),
+            metrics.clone(),
+            panic_records(),
+            LoggerDeliveryConfig::for_test(1, Duration::from_millis(10)),
+        )
+        .expect("worker should spawn");
+        let producer = delivery.producer();
+        let emergency = delivery.emergency_ingress();
+
+        assert!(producer.deliver_guest(LogBatch::one(record(LoggerAction::InstanceStart))));
+        gate.wait_until_entered();
+        assert!(producer.deliver_guest(LogBatch::one(record(LoggerAction::FlushMetrics))));
+        assert!(!producer.deliver_guest(LogBatch::one(record(LoggerAction::InstanceStart))));
+        assert!(emergency.publish_once(super::PanicRecordPrefix::Plain));
+        assert_eq!(metrics.missed_log_count(), 1);
+
+        gate.release();
+        assert!(producer.wait_for_idle_for_test());
+        assert_eq!(emergency.state_for_test(), super::EMERGENCY_CLAIMED);
+        assert_eq!(metrics.missed_log_count(), 1);
+    }
+
+    #[test]
+    fn emergency_write_failure_is_accounted_by_the_worker() {
+        let metrics = SharedLoggerMetrics::default();
+        let delivery = LoggerDelivery::spawn(
+            PreparedLoggerWriter::new(FailingWriter),
+            metrics.clone(),
+            panic_records(),
+            LoggerDeliveryConfig::for_test(1, Duration::from_millis(5)),
+        )
+        .expect("worker should spawn");
+        let emergency = delivery.emergency_ingress();
+
+        assert!(emergency.publish_once(super::PanicRecordPrefix::Plain));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while metrics.missed_log_count() == 0 && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+
+        assert_eq!(emergency.state_for_test(), super::EMERGENCY_CLAIMED);
+        assert_eq!(metrics.missed_log_count(), 1);
+    }
+
+    #[test]
+    fn worker_unwind_closes_the_emergency_ingress() {
+        let delivery = LoggerDelivery::spawn(
+            PreparedLoggerWriter::new(PanicWriter),
+            SharedLoggerMetrics::default(),
+            panic_records(),
+            LoggerDeliveryConfig::for_test(1, Duration::from_millis(5)),
+        )
+        .expect("worker should spawn");
+        let emergency = delivery.emergency_ingress();
+
+        assert!(emergency.publish_once(super::PanicRecordPrefix::Plain));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while emergency.state_for_test() != super::EMERGENCY_CLOSED
+            && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+
+        assert_eq!(emergency.state_for_test(), super::EMERGENCY_CLOSED);
+        assert!(!emergency.publish_once(super::PanicRecordPrefix::Plain));
+    }
+
+    #[test]
+    fn disconnected_worker_closes_emergency_ingress() {
+        let delivery = LoggerDelivery::spawn(
+            PreparedLoggerWriter::new(SharedWriter(Arc::new(Mutex::new(Vec::new())))),
+            SharedLoggerMetrics::default(),
+            panic_records(),
+            LoggerDeliveryConfig::for_test(2, Duration::from_millis(10)),
+        )
+        .expect("worker should spawn");
+        let emergency = delivery.emergency_ingress();
+
+        assert!(delivery.disconnect_for_test());
+        assert_eq!(emergency.state_for_test(), super::EMERGENCY_CLOSED);
+        assert!(!emergency.publish_once(super::PanicRecordPrefix::Plain));
+    }
+
+    #[test]
     fn zero_short_error_and_flush_failures_are_single_accounted() {
         for writer in [
             PreparedLoggerWriter::new(ZeroWriter),
@@ -918,6 +1284,7 @@ mod tests {
             let delivery = LoggerDelivery::spawn(
                 writer,
                 metrics.clone(),
+                panic_records(),
                 LoggerDeliveryConfig::for_test(2, Duration::from_millis(100)),
             )
             .expect("worker should spawn");
@@ -937,6 +1304,7 @@ mod tests {
         let delivery = LoggerDelivery::spawn(
             PreparedLoggerWriter::new(HeldWriter { gate: gate.clone() }),
             metrics.clone(),
+            panic_records(),
             LoggerDeliveryConfig::for_test(2, Duration::from_millis(10)),
         )
         .expect("worker should spawn");
@@ -959,6 +1327,7 @@ mod tests {
         let delivery = LoggerDelivery::spawn(
             PreparedLoggerWriter::new(HeldWriter { gate: gate.clone() }),
             metrics.clone(),
+            panic_records(),
             LoggerDeliveryConfig::for_test(2, Duration::from_millis(10)),
         )
         .expect("worker should spawn");
@@ -983,6 +1352,7 @@ mod tests {
         let delivery = LoggerDelivery::spawn(
             PreparedLoggerWriter::new(HeldWriter { gate: gate.clone() }),
             metrics.clone(),
+            panic_records(),
             LoggerDeliveryConfig::for_test(1, Duration::from_millis(10)),
         )
         .expect("worker should spawn");
@@ -1009,6 +1379,7 @@ mod tests {
         let delivery = LoggerDelivery::spawn(
             PreparedLoggerWriter::new(SharedWriter(output)),
             metrics.clone(),
+            panic_records(),
             LoggerDeliveryConfig::for_test(2, Duration::from_millis(10)),
         )
         .expect("worker should spawn");

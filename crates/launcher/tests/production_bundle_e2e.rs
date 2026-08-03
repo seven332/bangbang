@@ -16262,7 +16262,14 @@ impl OutputGrantFixture {
     }
 
     fn assert_original_outputs(&self) {
-        self.assert_original_outputs_with_logger_expectations(true, true);
+        Self::assert_outputs_at(
+            &self.opened_logger,
+            &self.opened_metrics,
+            &self.opened_serial,
+            true,
+            true,
+            true,
+        );
     }
 
     fn assert_original_outputs_with_logger_expectations(&self, api: bool, action: bool) {
@@ -16272,11 +16279,12 @@ impl OutputGrantFixture {
             &self.opened_serial,
             api,
             action,
+            false,
         );
     }
 
     fn assert_current_outputs(&self) {
-        Self::assert_outputs_at(&self.logger, &self.metrics, &self.serial, false, true);
+        Self::assert_outputs_at(&self.logger, &self.metrics, &self.serial, false, true, true);
     }
 
     fn assert_outputs_at(
@@ -16285,6 +16293,7 @@ impl OutputGrantFixture {
         serial_path: &Path,
         api: bool,
         action: bool,
+        terminal: bool,
     ) {
         let logger = fs::read(logger_path).expect("granted logger output should read");
         assert!(logger.starts_with(OUTPUT_LOGGER_SEED));
@@ -16302,6 +16311,13 @@ impl OutputGrantFixture {
                     .any(|window| window == b"action=InstanceStart\n")
             );
         }
+        let has_terminal = logger
+            .windows(b"event=process-exit category=success\n".len())
+            .any(|window| window == b"event=process-exit category=success\n");
+        assert_eq!(
+            has_terminal, terminal,
+            "terminal logger output should follow the configured module filter"
+        );
 
         let metrics = fs::read_to_string(metrics_path).expect("granted metrics output should read");
         let seed = std::str::from_utf8(OUTPUT_METRICS_SEED).expect("metrics seed should be UTF-8");

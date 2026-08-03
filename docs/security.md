@@ -2869,6 +2869,43 @@ delivery recovers. Logger filtering, queue pressure, timeout ambiguity, and
 sink failures never change the API, action, or guest outcome; rate-limited
 records and exact per-record delivery failures are observable only through
 process-local counters.
+
+Process convergence adds only fixed, non-user-derived logger records. Normal
+records are `event=process-exit category=<fixed-category>` under the
+`bangbang::process` filter; a catchable main-runtime panic can first emit
+`event=process-panic` under `bangbang::panic` and then the fixed `panic`
+terminal category. The five terminal categories, levels, optional
+level/origin prefixes, 512-byte ceiling, and callsites are compiled in. These
+records never incorporate `PanicHookInfo`, panic payloads, error strings,
+paths, selectors, descriptors, credentials, guest/register data, or API
+bodies. A filtered or unconfigured panic path uses only the plain fixed record
+through a precreated stderr worker.
+
+The ordinary executable exclusively owns the process-global Rust panic hook
+after private binder dispatch and before contained bootstrap. It retains the
+exact prior hook, suppresses it throughout that interval, restores it only
+after owned VMM/contained teardown, and then resumes the original payload. This
+prevents the default hook or a caller-supplied prior hook from rendering secret
+payload data while Bangbang owns the process. Runtime logger/metrics state
+remains per-controller and does not install a hook or expose mutable global
+state.
+
+The first hook invocation performs only a preinitialized attachment
+`try_lock`, fixed atomics, and at most one compare-exchange per destination. It
+does no allocation, formatting, channel operation, wake, I/O, wait, receipt,
+retry, or counter update; a second invocation performs no logger work. Logger
+and stderr workers own all writes and poll their one-shot slots every 100 ms.
+Configured-sink contention/poison/occupied loss is latched once and settled by
+the protected main finalizer before final metrics sampling. Normal terminal
+delivery uses the bounded host receipt before final metrics, so its confirmed
+failure or timeout is included without replacing the original process result.
+
+This boundary protects confidentiality and bounds work on a catchable main
+panic; it is not a durability mechanism. Admission can race process exit, and
+a worker can stall or fail after admission. Worker-only panic, panic during
+unwind, abort, fatal `_exit`, and uncatchable signals have no final metrics or
+record-persistence guarantee. Operators must not treat the presence or absence
+of these best-effort records as an audit log or security decision input.
 Current session-initial, periodic, explicit, and normal-terminal metrics lines
 can expose selected API request counters, startup timing fields, logger and
 serial counters, a terse boot run-loop status summary, and minimal device
@@ -3040,8 +3077,9 @@ The current scaffold does not implement:
   unconstrained cross-host portability remain non-goals. The exact snapshot
   boundary is in
   [Snapshot Feasibility](snapshot-feasibility.md#native-v2-212-vsock-activation-and-certification).
-- log rotation, syslog, journald, tracing, remote telemetry, or process-global
-  panic/fatal observability durability
+- log rotation, syslog, journald, tracing, remote telemetry, or durable
+  catch-all worker/double-panic/abort/fatal observability beyond the fixed
+  catchable-main boundary above
 - a public serial streaming API or serial behavior beyond the implemented
   exact native-v2 2.7–2.13 destination-authorized endpoint reconstruction
 

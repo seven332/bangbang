@@ -81,8 +81,8 @@ general HVF runner-loop notification scheduling, public host-driven serial
 injection/streaming beyond process stdin,
 broader device-backed feature negotiation,
 device-backed runner-loop MMIO scheduling, complete device emulation,
-production log rotation/syslog/journald/tracing/remote telemetry, process-global
-panic/fatal observability durability,
+production log rotation/syslog/journald/tracing/remote telemetry, durable
+catch-all panic/fatal observability,
 non-timer CPU-suspend wake and broader PSCI power management, or successful actions beyond owned `InstanceStart`
 startup with an internal boot run loop across bounded step windows and runtime
 `FlushMetrics` yet. The implemented logger, interval metrics, serial, and
@@ -529,6 +529,52 @@ worker generations. Only a proven disconnected receiver licenses one successor
 worker; old clones remain attached to the disconnected generation. Path-free
 updates retain the active delivery object.
 
+### Terminal and panic process records
+
+A configured logger can append one fixed terminal record at process
+convergence. The exact bodies are `event=process-exit category=success`,
+`configuration`, `process-failure`, `cancelled`, or `panic`, followed by one
+newline. Success and cancellation use `Info`; the other categories use `Error`.
+These records use the stable `bangbang::process` module and retain the active
+level, module, `show_level`, and `show_log_origin` policy. They contain no error
+text, path, selector, descriptor, credential, guest/register value, or request
+data. The record is attempted once with the existing bounded host receipt
+before the final metrics snapshot; a confirmed failure or timeout is therefore
+reflected in that snapshot when a session owns one. Filtering or an
+unconfigured sink remains a no-op. The original process result and exit code
+always win.
+
+The executable also owns one redacting panic-hook interval after private binder
+dispatch and before contained bootstrap. Runtime installs no hook and exposes
+only a cloneable per-controller emergency producer. The executable retains the
+exact prior hook, never calls it while Bangbang owns the process, ignores
+`PanicHookInfo`, and restores the retained box directly after normal or caught
+teardown. The first hook invocation may publish only the preencoded
+`event=process-panic` record. An enabled `bangbang::panic` logger receives its
+configured prefix variant through a destination-owned one-shot atomic ingress;
+otherwise a prestarted worker owns the same plain fixed record for stderr.
+Both workers poll their slots at a bounded 100-ms interval. An ordinary logger
+message wakes the logger worker, and caught main-thread teardown nudges the
+fallback outside the hook.
+
+The hook itself performs no encoding, allocation, channel send, worker wake,
+sink/stderr I/O, wait, receipt, retry, or shared-counter update. Its attachment
+mutex is initialized before installation and only `try_lock` is used; each
+destination publication is one compare-exchange attempt. Enabled attachment
+contention, poison, or an occupied/closed logger ingress latches one deferred
+miss which the minimal finalizer settles outside the hook. A catchable
+main-runtime panic then attempts the panic terminal record and final metrics
+under a second catch, isolates contained cleanup, restores the prior hook, and
+resumes the original payload. All fixed panic and terminal variants are valid
+UTF-8 and at most 512 bytes.
+
+This is best-effort observability, not persistence. A logger or fallback worker
+can be stalled or lose a write after admission, and process exit can race its
+poll. A worker-thread-only panic has at most the fixed hook attempt and no main
+finalizer. A second hook invocation is silent; double panic, `panic=abort`, an
+explicit abort, fatal `_exit`, and uncatchable signals have no terminal metrics
+or delivery guarantee.
+
 ### Metrics field and transaction model
 
 Every implemented event total is an interval increment: deprecated, GET, PUT,
@@ -582,8 +628,9 @@ failure to its caller. While the process still owns the retained session and
 live diagnostics, every normal API or no-api convergence path makes one
 best-effort terminal attempt and then returns the original success or error.
 This includes handled shutdown, guest terminal outcomes, worker terminal
-errors, and ordinary bind/wait/server errors; it does not add process-global
-panic-hook or fatal-signal durability.
+errors, and ordinary bind/wait/server errors; it adds no fatal-signal
+durability. A catchable main-runtime panic uses only the protected
+minimal convergence described above and does not continue VMM/API execution.
 
 ### Serial output, input, and native snapshots
 
@@ -639,10 +686,11 @@ broad cross-host portability.
 
 The ordinary CLI has no production rotation, syslog, journald, tracing, remote
 telemetry, or resource-broker policy. Logger and metrics state remains
-process-owned rather than global, so there is no panic/fatal-signal durability
-claim. These named product and architecture boundaries, the sparse metrics
-schema, and the exact native-v1 plus 2.7-or-newer serial limits replace an
-open-ended “full logging and metrics” placeholder.
+per-controller; only the executable's bounded ownership interval uses the
+process-global panic hook. It carries no worker/double-panic/abort/fatal-signal
+durability claim. These named product and architecture boundaries, the sparse
+metrics schema, and the exact native-v1 plus 2.7-or-newer serial limits replace
+an open-ended “full logging and metrics” placeholder.
 
 The ordinary `bangbang` CLI remains the direct, uncontained process entry point.
 The separate production `Bangbang.app` entry point has a fixed unsandboxed
@@ -1772,8 +1820,9 @@ against `bangbang_runtime::api_server`, action logs against
 boot-timer records use the ten-per-five-second limiter and recovery warning.
 Queue pressure, receipt timeout, disconnect, or sink failure increments
 `missed_log_count` exactly once per affected record and never changes the
-functional outcome. No global process logging, panic/fatal writer, rotation, or
-external telemetry backend is claimed.
+functional outcome. The fixed process terminal and catchable-main panic
+boundary is defined above; no general global process logging, durable
+panic/fatal writer, rotation, or external telemetry backend is claimed.
 The API and VMM state path implement the `PUT /vsock` field policy above as a
 pre-boot-only guest configuration section. Valid requests replace the stored
 vsock config and return `204 No Content`; invalid requests fail without
@@ -4203,7 +4252,7 @@ Their eventual support level should follow the endpoint matrix:
   retains only its legacy six UART bytes, rejects nonrepresentable RX state,
   and excludes host endpoints, the output buffer, path, limiter state, and
   counters
-- process-global panic/fatal observability durability and production rotation,
+- durable catch-all worker/double-panic/abort/fatal observability and production rotation,
   syslog, journald, tracing, or remote telemetry; the implemented logger and
   sparse interval metrics schema do not fabricate absent records or devices
 - memory hotplug beyond the implemented block-granular selected MMIO-or-PCI
