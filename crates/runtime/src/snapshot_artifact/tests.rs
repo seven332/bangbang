@@ -1307,11 +1307,47 @@ fn exact_minor_eleven_candidate_propagates_stable_network_cancellation() {
         })
         .expect_err("completion cancellation must prevent publication");
 
+    assert!(error.is_cancelled());
     assert!(matches!(
         error,
         NativeV2NetworkSnapshotPreparationError::Topology(
             SnapshotV2NetworkRestorePreparationError::Cancelled {
                 stage: SnapshotV2NetworkRestorePreparationStage::Completion,
+            }
+        )
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_twelve_candidate_reports_vsock_topology_cancellation() {
+    let vsock_payload = fixture_bytes(include_str!(
+        "../snapshot_vsock_v2_12/fixtures/inactive-mmio.hex"
+    ));
+    let (candidate, memory) = exact_minor_twelve_candidate(None, Some(&vsock_payload));
+    let error = candidate
+        .prepare_with_cancel(
+            &memory,
+            SnapshotV2DeviceTransportKind::Mmio,
+            &[],
+            None,
+            |stage| {
+                matches!(
+                    stage,
+                    NativeV2VsockSnapshotPreparationStage::Vsock(
+                        SnapshotV2VsockRestorePreparationStage::Completion
+                    )
+                )
+            },
+        )
+        .expect_err("vsock completion cancellation must prevent publication");
+
+    assert!(error.is_cancelled());
+    assert!(matches!(
+        error,
+        NativeV2VsockSnapshotPreparationError::Vsock(
+            SnapshotV2VsockRestorePreparationError::Cancelled {
+                stage: SnapshotV2VsockRestorePreparationStage::Completion,
             }
         )
     ));

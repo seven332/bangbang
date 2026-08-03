@@ -3057,6 +3057,7 @@ fn native_v2_error_after_process_root_completion_abort(
 pub(crate) struct NativeV2MultiBlockDestinationLoadError {
     transport: SnapshotV2DeviceTransportKind,
     terminal: bool,
+    cancelled: bool,
     detail: Option<String>,
 }
 
@@ -3066,6 +3067,7 @@ impl NativeV2MultiBlockDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled: false,
             detail: None,
         }
     }
@@ -3073,6 +3075,7 @@ impl NativeV2MultiBlockDestinationLoadError {
     fn with_source(
         transport: SnapshotV2DeviceTransportKind,
         terminal: bool,
+        cancelled: bool,
         source: &(dyn std::error::Error + 'static),
     ) -> Self {
         let mut leaf = source;
@@ -3082,12 +3085,17 @@ impl NativeV2MultiBlockDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled,
             detail: Some(leaf.to_string()),
         }
     }
 
     const fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -3098,6 +3106,7 @@ impl fmt::Debug for NativeV2MultiBlockDestinationLoadError {
             .debug_struct("NativeV2MultiBlockDestinationLoadError")
             .field("transport", &self.transport)
             .field("terminal", &self.terminal)
+            .field("cancelled", &self.cancelled)
             .field("has_detail", &self.detail.is_some())
             .field("state", &"<redacted>")
             .finish()
@@ -3131,6 +3140,7 @@ impl std::error::Error for NativeV2MultiBlockDestinationLoadError {}
 pub(crate) struct NativeV2StorageDestinationLoadError {
     transport: SnapshotV2DeviceTransportKind,
     terminal: bool,
+    cancelled: bool,
     detail: Option<String>,
 }
 
@@ -3140,6 +3150,7 @@ impl NativeV2StorageDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled: false,
             detail: None,
         }
     }
@@ -3147,6 +3158,7 @@ impl NativeV2StorageDestinationLoadError {
     fn with_source(
         transport: SnapshotV2DeviceTransportKind,
         terminal: bool,
+        cancelled: bool,
         source: &(dyn std::error::Error + 'static),
     ) -> Self {
         let mut leaf = source;
@@ -3156,12 +3168,17 @@ impl NativeV2StorageDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled,
             detail: Some(leaf.to_string()),
         }
     }
 
     const fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -3172,6 +3189,7 @@ impl fmt::Debug for NativeV2StorageDestinationLoadError {
             .debug_struct("NativeV2StorageDestinationLoadError")
             .field("transport", &self.transport)
             .field("terminal", &self.terminal)
+            .field("cancelled", &self.cancelled)
             .field("has_detail", &self.detail.is_some())
             .field("state", &"<redacted>")
             .finish()
@@ -3204,6 +3222,7 @@ impl std::error::Error for NativeV2StorageDestinationLoadError {}
 #[cfg(target_os = "macos")]
 pub(crate) struct NativeV2SerialDestinationLoadError {
     terminal: bool,
+    cancelled: bool,
     detail: Option<String>,
 }
 
@@ -3212,23 +3231,33 @@ impl NativeV2SerialDestinationLoadError {
     const fn new(terminal: bool) -> Self {
         Self {
             terminal,
+            cancelled: false,
             detail: None,
         }
     }
 
-    fn with_source(terminal: bool, source: &(dyn std::error::Error + 'static)) -> Self {
+    fn with_source(
+        terminal: bool,
+        cancelled: bool,
+        source: &(dyn std::error::Error + 'static),
+    ) -> Self {
         let mut leaf = source;
         while let Some(next) = leaf.source() {
             leaf = next;
         }
         Self {
             terminal,
+            cancelled,
             detail: Some(leaf.to_string()),
         }
     }
 
     const fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -3238,6 +3267,7 @@ impl fmt::Debug for NativeV2SerialDestinationLoadError {
         formatter
             .debug_struct("NativeV2SerialDestinationLoadError")
             .field("terminal", &self.terminal)
+            .field("cancelled", &self.cancelled)
             .field("has_detail", &self.detail.is_some())
             .field("state", &"<redacted>")
             .finish()
@@ -3270,6 +3300,7 @@ impl std::error::Error for NativeV2SerialDestinationLoadError {}
 pub(crate) struct NativeV2EntropyDestinationLoadError {
     transport: SnapshotV2DeviceTransportKind,
     terminal: bool,
+    cancelled: bool,
     detail: Option<String>,
 }
 
@@ -3279,6 +3310,7 @@ impl NativeV2EntropyDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled: false,
             detail: None,
         }
     }
@@ -3286,6 +3318,7 @@ impl NativeV2EntropyDestinationLoadError {
     fn with_source(
         transport: SnapshotV2DeviceTransportKind,
         terminal: bool,
+        cancelled: bool,
         source: &(dyn std::error::Error + 'static),
     ) -> Self {
         let mut leaf = source;
@@ -3295,12 +3328,17 @@ impl NativeV2EntropyDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled,
             detail: Some(leaf.to_string()),
         }
     }
 
     const fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -3311,6 +3349,7 @@ impl fmt::Debug for NativeV2EntropyDestinationLoadError {
             .debug_struct("NativeV2EntropyDestinationLoadError")
             .field("transport", &self.transport)
             .field("terminal", &self.terminal)
+            .field("cancelled", &self.cancelled)
             .field("has_detail", &self.detail.is_some())
             .field("state", &"<redacted>")
             .finish()
@@ -3344,6 +3383,7 @@ impl std::error::Error for NativeV2EntropyDestinationLoadError {}
 pub(crate) struct NativeV2BalloonDestinationLoadError {
     transport: SnapshotV2DeviceTransportKind,
     terminal: bool,
+    cancelled: bool,
     detail: Option<String>,
 }
 
@@ -3353,6 +3393,7 @@ impl NativeV2BalloonDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled: false,
             detail: None,
         }
     }
@@ -3360,6 +3401,7 @@ impl NativeV2BalloonDestinationLoadError {
     fn with_source(
         transport: SnapshotV2DeviceTransportKind,
         terminal: bool,
+        cancelled: bool,
         source: &(dyn std::error::Error + 'static),
     ) -> Self {
         let mut leaf = source;
@@ -3369,12 +3411,17 @@ impl NativeV2BalloonDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled,
             detail: Some(leaf.to_string()),
         }
     }
 
     const fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -3385,6 +3432,7 @@ impl fmt::Debug for NativeV2BalloonDestinationLoadError {
             .debug_struct("NativeV2BalloonDestinationLoadError")
             .field("transport", &self.transport)
             .field("terminal", &self.terminal)
+            .field("cancelled", &self.cancelled)
             .field("has_detail", &self.detail.is_some())
             .field("state", &"<redacted>")
             .finish()
@@ -3418,6 +3466,7 @@ impl std::error::Error for NativeV2BalloonDestinationLoadError {}
 pub(crate) struct NativeV2MemoryHotplugDestinationLoadError {
     transport: SnapshotV2DeviceTransportKind,
     terminal: bool,
+    cancelled: bool,
     detail: Option<String>,
 }
 
@@ -3427,6 +3476,7 @@ impl NativeV2MemoryHotplugDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled: false,
             detail: None,
         }
     }
@@ -3434,6 +3484,7 @@ impl NativeV2MemoryHotplugDestinationLoadError {
     fn with_source(
         transport: SnapshotV2DeviceTransportKind,
         terminal: bool,
+        cancelled: bool,
         source: &(dyn std::error::Error + 'static),
     ) -> Self {
         let mut leaf = source;
@@ -3443,12 +3494,17 @@ impl NativeV2MemoryHotplugDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled,
             detail: Some(leaf.to_string()),
         }
     }
 
     const fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -3459,6 +3515,7 @@ impl fmt::Debug for NativeV2MemoryHotplugDestinationLoadError {
             .debug_struct("NativeV2MemoryHotplugDestinationLoadError")
             .field("transport", &self.transport)
             .field("terminal", &self.terminal)
+            .field("cancelled", &self.cancelled)
             .field("has_detail", &self.detail.is_some())
             .field("state", &"<redacted>")
             .finish()
@@ -3492,6 +3549,7 @@ impl std::error::Error for NativeV2MemoryHotplugDestinationLoadError {}
 pub(crate) struct NativeV2NetworkDestinationLoadError {
     transport: SnapshotV2DeviceTransportKind,
     terminal: bool,
+    cancelled: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -3500,19 +3558,29 @@ impl NativeV2NetworkDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled: false,
         }
     }
 
     fn with_source(
         transport: SnapshotV2DeviceTransportKind,
         terminal: bool,
+        cancelled: bool,
         _source: &(dyn std::error::Error + 'static),
     ) -> Self {
-        Self::new(transport, terminal)
+        Self {
+            transport,
+            terminal,
+            cancelled,
+        }
     }
 
     const fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -3523,6 +3591,7 @@ impl fmt::Debug for NativeV2NetworkDestinationLoadError {
             .debug_struct("NativeV2NetworkDestinationLoadError")
             .field("transport", &self.transport)
             .field("terminal", &self.terminal)
+            .field("cancelled", &self.cancelled)
             .field("state", &"<redacted>")
             .finish()
     }
@@ -3551,6 +3620,7 @@ impl std::error::Error for NativeV2NetworkDestinationLoadError {}
 pub(crate) struct NativeV2VsockDestinationLoadError {
     transport: SnapshotV2DeviceTransportKind,
     terminal: bool,
+    cancelled: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -3559,19 +3629,37 @@ impl NativeV2VsockDestinationLoadError {
         Self {
             transport,
             terminal,
+            cancelled: false,
+        }
+    }
+
+    const fn cancelled(transport: SnapshotV2DeviceTransportKind, terminal: bool) -> Self {
+        Self {
+            transport,
+            terminal,
+            cancelled: true,
         }
     }
 
     fn with_source(
         transport: SnapshotV2DeviceTransportKind,
         terminal: bool,
+        cancelled: bool,
         _source: &(dyn std::error::Error + 'static),
     ) -> Self {
-        Self::new(transport, terminal)
+        Self {
+            transport,
+            terminal,
+            cancelled,
+        }
     }
 
     const fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -3582,6 +3670,7 @@ impl fmt::Debug for NativeV2VsockDestinationLoadError {
             .debug_struct("NativeV2VsockDestinationLoadError")
             .field("transport", &self.transport)
             .field("terminal", &self.terminal)
+            .field("cancelled", &self.cancelled)
             .field("state", &"<redacted>")
             .finish()
     }
@@ -4329,6 +4418,38 @@ fn native_v2_snapshot_load_is_cancelled(error: &NativeV2SnapshotLoadError) -> bo
     match error {
         NativeV2SnapshotLoadError::Cancelled => true,
         NativeV2SnapshotLoadError::Artifact(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::RestoreResources(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::MultiBlockBundle(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::MultiBlockDestination(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::StorageBundle(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::StorageDestination(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::SerialBundle(source)
+        | NativeV2SnapshotLoadError::EntropyBundle(source)
+        | NativeV2SnapshotLoadError::BalloonBundle(source)
+        | NativeV2SnapshotLoadError::MemoryHotplugBundle(source)
+        | NativeV2SnapshotLoadError::NetworkBundle(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::SerialDestination(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::EntropyDestination(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::BalloonDestination(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::MemoryHotplugDestination(source) => source.is_cancelled(),
+        NativeV2SnapshotLoadError::NetworkPreparation(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::NetworkDestination(source) => source.is_cancelled(),
+        NativeV2SnapshotLoadError::VsockPreparation(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::VsockRestoreResources(source) => source.is_cancelled(),
+        #[cfg(target_os = "macos")]
+        NativeV2SnapshotLoadError::VsockDestination(source) => source.is_cancelled(),
         NativeV2SnapshotLoadError::AfterResourceAdoption { source } => {
             native_v2_snapshot_load_is_cancelled(source)
         }
@@ -11208,6 +11329,10 @@ impl std::error::Error for PreparedHvfSnapshotV2MultiBlockControllerError {}
 #[cfg(target_os = "macos")]
 trait HvfSnapshotV2RestoreDisposition {
     fn is_terminal(&self) -> bool;
+
+    fn is_cancelled(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -11274,6 +11399,10 @@ where
                 true
             }
         }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Restore(source) if source.is_cancelled())
     }
 }
 
@@ -11371,6 +11500,28 @@ where
                     )
             }
             Self::Commit(source) => source.is_terminal(),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Construction(
+                PreparedSnapshotV2MultiBlockDestinationConstructionError::Construction {
+                    source,
+                    completion_abort: None,
+                },
+            ) => source.is_cancelled(),
+            Self::Commit(PreparedSnapshotV2MultiBlockDestinationCommitError::Controller {
+                source: PreparedHvfSnapshotV2MultiBlockControllerError::Cancelled,
+                destination_cleanup: None,
+                completion_abort: None,
+            }) => true,
+            Self::Construction(_)
+            | Self::Commit(
+                PreparedSnapshotV2MultiBlockDestinationCommitError::InvalidState
+                | PreparedSnapshotV2MultiBlockDestinationCommitError::Controller { .. }
+                | PreparedSnapshotV2MultiBlockDestinationCommitError::Completion { .. },
+            ) => false,
         }
     }
 }
@@ -11666,6 +11817,28 @@ where
                     )
             }
             Self::Commit(source) => source.is_terminal(),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Construction(
+                PreparedSnapshotV2StorageDestinationConstructionError::Construction {
+                    source,
+                    completion_abort: None,
+                },
+            ) => source.is_cancelled(),
+            Self::Commit(PreparedSnapshotV2StorageDestinationCommitError::Controller {
+                source: PreparedHvfSnapshotV2StorageControllerError::Cancelled,
+                destination_cleanup: None,
+                completion_abort: None,
+            }) => true,
+            Self::Construction(_)
+            | Self::Commit(
+                PreparedSnapshotV2StorageDestinationCommitError::InvalidState
+                | PreparedSnapshotV2StorageDestinationCommitError::Controller { .. }
+                | PreparedSnapshotV2StorageDestinationCommitError::Completion { .. },
+            ) => false,
         }
     }
 }
@@ -12123,6 +12296,23 @@ impl HvfSnapshotV2SerialConstructionError {
             | Self::BalloonPlan(_)
             | Self::MemoryHotplugPlan(_)
             | Self::InvalidOwners { .. } => true,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::StorageAdoption(source) => source.is_cancelled(),
+            Self::NetworkMmio(source) => source.is_cancelled(),
+            Self::NetworkPci(source) => source.is_cancelled(),
+            Self::Process(source) => source.is_cancelled(),
+            Self::TransportPolicy { .. }
+            | Self::StorageMmioPlan { .. }
+            | Self::StoragePciPlan { .. }
+            | Self::EntropyPciPlan { .. }
+            | Self::BalloonPlan(_)
+            | Self::MemoryHotplugPlan(_)
+            | Self::NetworkPlan(_)
+            | Self::InvalidOwners { .. } => false,
         }
     }
 }
@@ -12689,6 +12879,29 @@ impl PrepareHvfSnapshotV2SerialDestinationError {
                         } if source.is_terminal()
                     )
             }
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Construction(
+                PreparedSnapshotV2SerialDestinationConstructionError::Construction {
+                    source,
+                    owners_cleanup: None,
+                    completion_abort: None,
+                },
+            ) => source.is_cancelled(),
+            Self::Commit(PreparedSnapshotV2SerialDestinationCommitError::Controller {
+                source: PreparedHvfSnapshotV2SerialControllerError::Cancelled,
+                destination_cleanup: None,
+                completion_abort: None,
+            }) => true,
+            Self::Construction(_)
+            | Self::Commit(
+                PreparedSnapshotV2SerialDestinationCommitError::InvalidState
+                | PreparedSnapshotV2SerialDestinationCommitError::Controller { .. }
+                | PreparedSnapshotV2SerialDestinationCommitError::Completion { .. },
+            ) => false,
         }
     }
 }
@@ -14810,11 +15023,12 @@ fn prepare_hvf_native_v2_vsock_destination(
         unavailable_diagnostics: (),
     };
     if !cancellation.try_seal_commit() {
-        let _ = destination.shutdown();
-        return Err(NativeV2VsockDestinationLoadError::new(
-            expected_transport,
-            true,
-        ));
+        let cleanup_failed = destination.shutdown().is_err();
+        return Err(if cleanup_failed {
+            NativeV2VsockDestinationLoadError::new(expected_transport, true)
+        } else {
+            NativeV2VsockDestinationLoadError::cancelled(expected_transport, true)
+        });
     }
     match destination.prepare_controller(machine, boot, resume_requested) {
         Ok(committed) => Ok(committed),
@@ -15869,10 +16083,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 )
                 .map_err(|source| {
                     let terminal = source.is_terminal();
+                    let cancelled = source.is_cancelled();
                     NativeV2SnapshotLoadError::MultiBlockDestination(
                         NativeV2MultiBlockDestinationLoadError::with_source(
                             SnapshotV2DeviceTransportKind::Mmio,
                             terminal,
+                            cancelled,
                             &source,
                         ),
                     )
@@ -15898,10 +16114,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 )
                 .map_err(|source| {
                     let terminal = source.is_terminal();
+                    let cancelled = source.is_cancelled();
                     NativeV2SnapshotLoadError::MultiBlockDestination(
                         NativeV2MultiBlockDestinationLoadError::with_source(
                             SnapshotV2DeviceTransportKind::Pci,
                             terminal,
+                            cancelled,
                             &source,
                         ),
                     )
@@ -16075,10 +16293,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             )
             .map_err(|source| {
                 let terminal = source.is_terminal();
+                let cancelled = source.is_cancelled();
                 NativeV2SnapshotLoadError::StorageDestination(
                     NativeV2StorageDestinationLoadError::with_source(
                         SnapshotV2DeviceTransportKind::Mmio,
                         terminal,
+                        cancelled,
                         &source,
                     ),
                 )
@@ -16102,10 +16322,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             )
             .map_err(|source| {
                 let terminal = source.is_terminal();
+                let cancelled = source.is_cancelled();
                 NativeV2SnapshotLoadError::StorageDestination(
                     NativeV2StorageDestinationLoadError::with_source(
                         SnapshotV2DeviceTransportKind::Pci,
                         terminal,
+                        cancelled,
                         &source,
                     ),
                 )
@@ -16216,8 +16438,9 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             })
             .map_err(|source| {
                 let terminal = source.is_terminal();
+                let cancelled = source.is_cancelled();
                 NativeV2SnapshotLoadError::SerialDestination(
-                    NativeV2SerialDestinationLoadError::with_source(terminal, &source),
+                    NativeV2SerialDestinationLoadError::with_source(terminal, cancelled, &source),
                 )
             })?;
         let serial_output = destination.serial_output_clone().ok_or_else(|| {
@@ -16398,10 +16621,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 };
                 result.map_err(|source| {
                     let terminal = source.is_terminal();
+                    let cancelled = source.is_cancelled();
                     NativeV2SnapshotLoadError::MemoryHotplugDestination(
                         NativeV2MemoryHotplugDestinationLoadError::with_source(
                             expected_transport,
                             terminal,
+                            cancelled,
                             &source,
                         ),
                     )
@@ -16525,10 +16750,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 )
                 .map_err(|source| {
                     let terminal = source.is_terminal();
+                    let cancelled = source.is_cancelled();
                     NativeV2SnapshotLoadError::MemoryHotplugDestination(
                         NativeV2MemoryHotplugDestinationLoadError::with_source(
                             expected_transport,
                             terminal,
+                            cancelled,
                             &source,
                         ),
                     )
@@ -16724,10 +16951,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         )
         .map_err(|source| {
             let terminal = source.is_terminal();
+            let cancelled = source.is_cancelled();
             NativeV2SnapshotLoadError::NetworkDestination(
                 NativeV2NetworkDestinationLoadError::with_source(
                     expected_transport,
                     terminal,
+                    cancelled,
                     &source,
                 ),
             )
@@ -17008,6 +17237,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                     NativeV2VsockDestinationLoadError::with_source(
                         expected_transport,
                         source.is_terminal(),
+                        source.is_cancelled(),
                         &source,
                     ),
                 )
@@ -17029,6 +17259,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                     NativeV2VsockDestinationLoadError::with_source(
                         expected_transport,
                         source.is_terminal(),
+                        source.is_cancelled(),
                         &source,
                     ),
                 )
@@ -17169,10 +17400,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         )
         .map_err(|source| {
             let terminal = source.is_terminal();
+            let cancelled = source.is_cancelled();
             NativeV2SnapshotLoadError::EntropyDestination(
                 NativeV2EntropyDestinationLoadError::with_source(
                     expected_transport,
                     terminal,
+                    cancelled,
                     &source,
                 ),
             )
@@ -17338,10 +17571,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         };
         let (destination, controller_commit) = result.map_err(|source| {
             let terminal = source.is_terminal();
+            let cancelled = source.is_cancelled();
             NativeV2SnapshotLoadError::BalloonDestination(
                 NativeV2BalloonDestinationLoadError::with_source(
                     expected_transport,
                     terminal,
+                    cancelled,
                     &source,
                 ),
             )
@@ -22277,6 +22512,27 @@ impl ProcessSnapshotV2VsockRestoreResourceError {
     pub(crate) const fn cleanup_uncertain(&self) -> bool {
         self.cleanup_uncertain
     }
+
+    pub(crate) const fn is_cancelled(&self) -> bool {
+        if self.cleanup_uncertain {
+            return false;
+        }
+        match &self.kind {
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::Cancelled => true,
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::Files(source) => source.is_cancelled(),
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::Network(source) => {
+                source.is_cancelled()
+            }
+            ProcessSnapshotV2VsockRestoreResourceErrorKind::CandidateMismatch
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::Allocation
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::FileCompletion(_)
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::NetworkPlan(_)
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::BindingAllocation(_)
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::Binding(_)
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::Take(_)
+            | ProcessSnapshotV2VsockRestoreResourceErrorKind::Unconsumed { .. } => false,
+        }
+    }
 }
 
 impl fmt::Debug for ProcessSnapshotV2VsockRestoreResourceError {
@@ -22847,6 +23103,13 @@ impl ProcessSnapshotV2NetworkRestoreResourceError {
 
     pub(crate) const fn disposition(&self) -> ProcessSnapshotV2NetworkRestoreResourceDisposition {
         self.disposition
+    }
+
+    pub(crate) const fn is_cancelled(&self) -> bool {
+        matches!(
+            self.kind,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::Cancelled
+        ) && !self.cleanup_uncertain
     }
 }
 
@@ -25136,6 +25399,7 @@ enum ProcessSnapshotV2VsockMmioRestoreDisposition {
 struct ProcessSnapshotV2VsockMmioRestoreError {
     stage: ProcessSnapshotV2VsockMmioRestoreStage,
     disposition: ProcessSnapshotV2VsockMmioRestoreDisposition,
+    cancelled: bool,
 }
 
 impl ProcessSnapshotV2VsockMmioRestoreError {
@@ -25143,6 +25407,25 @@ impl ProcessSnapshotV2VsockMmioRestoreError {
         Self {
             stage,
             disposition: ProcessSnapshotV2VsockMmioRestoreDisposition::Retryable,
+            cancelled: false,
+        }
+    }
+
+    const fn cancelled(
+        stage: ProcessSnapshotV2VsockMmioRestoreStage,
+        terminal: bool,
+        cleanup_uncertain: bool,
+    ) -> Self {
+        Self {
+            stage,
+            disposition: if cleanup_uncertain {
+                ProcessSnapshotV2VsockMmioRestoreDisposition::TerminalCleanup
+            } else if terminal {
+                ProcessSnapshotV2VsockMmioRestoreDisposition::Terminal
+            } else {
+                ProcessSnapshotV2VsockMmioRestoreDisposition::Retryable
+            },
+            cancelled: !cleanup_uncertain,
         }
     }
 
@@ -25157,6 +25440,7 @@ impl ProcessSnapshotV2VsockMmioRestoreError {
             } else {
                 ProcessSnapshotV2VsockMmioRestoreDisposition::Terminal
             },
+            cancelled: false,
         }
     }
 
@@ -25167,6 +25451,16 @@ impl ProcessSnapshotV2VsockMmioRestoreError {
         if source.cleanup_uncertain() {
             return Self::terminal(stage, true);
         }
+        if source.is_cancelled() {
+            return Self::cancelled(
+                stage,
+                matches!(
+                    source.disposition(),
+                    ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+                ),
+                false,
+            );
+        }
         match source.disposition() {
             ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable => Self::retryable(stage),
             ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal => {
@@ -25175,10 +25469,17 @@ impl ProcessSnapshotV2VsockMmioRestoreError {
         }
     }
 
-    fn from_hvf(source: &HvfSnapshotV2VsockMmioRestoreError, cleanup_uncertain: bool) -> Self {
+    fn from_hvf(
+        source: &HvfSnapshotV2VsockMmioRestoreError,
+        cleanup_uncertain: bool,
+        cancelled: bool,
+    ) -> Self {
         let stage = ProcessSnapshotV2VsockMmioRestoreStage::Hvf(source.stage());
         if source.has_incomplete_cleanup() || cleanup_uncertain {
             return Self::terminal(stage, true);
+        }
+        if cancelled {
+            return Self::cancelled(stage, source.is_terminal(), false);
         }
         match source.disposition() {
             HvfSnapshotV2NetworkMmioRestoreDisposition::Retryable => Self::retryable(stage),
@@ -25192,6 +25493,7 @@ impl ProcessSnapshotV2VsockMmioRestoreError {
     fn from_adoption(
         source: &ProcessSnapshotV2VsockAdoptionError<HvfSnapshotV2VsockMmioRestoreError>,
         cleanup_uncertain: bool,
+        cancelled: bool,
     ) -> Self {
         match source {
             ProcessSnapshotV2VsockAdoptionError::Resources(source) => {
@@ -25211,14 +25513,18 @@ impl ProcessSnapshotV2VsockMmioRestoreError {
                     disposition,
                 },
             ) => {
-                let mapped = Self::from_hvf(source, cleanup_uncertain);
+                let mapped = Self::from_hvf(source, cleanup_uncertain, cancelled);
                 if matches!(disposition, VsockRestoreDisposition::Terminal)
                     && matches!(
                         mapped.disposition,
                         ProcessSnapshotV2VsockMmioRestoreDisposition::Retryable
                     )
                 {
-                    Self::terminal(mapped.stage, cleanup_uncertain)
+                    if mapped.is_cancelled() {
+                        Self::cancelled(mapped.stage, true, cleanup_uncertain)
+                    } else {
+                        Self::terminal(mapped.stage, cleanup_uncertain)
+                    }
                 } else {
                     mapped
                 }
@@ -25247,6 +25553,10 @@ impl ProcessSnapshotV2VsockMmioRestoreError {
             ProcessSnapshotV2VsockMmioRestoreDisposition::Retryable
         )
     }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
 }
 
 impl fmt::Debug for ProcessSnapshotV2VsockMmioRestoreError {
@@ -25255,6 +25565,7 @@ impl fmt::Debug for ProcessSnapshotV2VsockMmioRestoreError {
             .debug_struct("ProcessSnapshotV2VsockMmioRestoreError")
             .field("stage", &self.stage)
             .field("disposition", &self.disposition)
+            .field("cancelled", &self.cancelled)
             .field("state", &"<redacted>")
             .finish()
     }
@@ -25558,6 +25869,7 @@ enum ProcessSnapshotV2VsockPciRestoreDisposition {
 struct ProcessSnapshotV2VsockPciRestoreError {
     stage: ProcessSnapshotV2VsockPciRestoreStage,
     disposition: ProcessSnapshotV2VsockPciRestoreDisposition,
+    cancelled: bool,
 }
 
 impl ProcessSnapshotV2VsockPciRestoreError {
@@ -25565,6 +25877,25 @@ impl ProcessSnapshotV2VsockPciRestoreError {
         Self {
             stage,
             disposition: ProcessSnapshotV2VsockPciRestoreDisposition::Retryable,
+            cancelled: false,
+        }
+    }
+
+    const fn cancelled(
+        stage: ProcessSnapshotV2VsockPciRestoreStage,
+        terminal: bool,
+        cleanup_uncertain: bool,
+    ) -> Self {
+        Self {
+            stage,
+            disposition: if cleanup_uncertain {
+                ProcessSnapshotV2VsockPciRestoreDisposition::TerminalCleanup
+            } else if terminal {
+                ProcessSnapshotV2VsockPciRestoreDisposition::Terminal
+            } else {
+                ProcessSnapshotV2VsockPciRestoreDisposition::Retryable
+            },
+            cancelled: !cleanup_uncertain,
         }
     }
 
@@ -25579,6 +25910,7 @@ impl ProcessSnapshotV2VsockPciRestoreError {
             } else {
                 ProcessSnapshotV2VsockPciRestoreDisposition::Terminal
             },
+            cancelled: false,
         }
     }
 
@@ -25589,6 +25921,16 @@ impl ProcessSnapshotV2VsockPciRestoreError {
         if source.cleanup_uncertain() {
             return Self::terminal(stage, true);
         }
+        if source.is_cancelled() {
+            return Self::cancelled(
+                stage,
+                matches!(
+                    source.disposition(),
+                    ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+                ),
+                false,
+            );
+        }
         match source.disposition() {
             ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable => Self::retryable(stage),
             ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal => {
@@ -25597,10 +25939,17 @@ impl ProcessSnapshotV2VsockPciRestoreError {
         }
     }
 
-    fn from_hvf(source: &HvfSnapshotV2VsockPciRestoreError, cleanup_uncertain: bool) -> Self {
+    fn from_hvf(
+        source: &HvfSnapshotV2VsockPciRestoreError,
+        cleanup_uncertain: bool,
+        cancelled: bool,
+    ) -> Self {
         let stage = ProcessSnapshotV2VsockPciRestoreStage::Hvf(source.stage());
         if source.has_incomplete_cleanup() || cleanup_uncertain {
             return Self::terminal(stage, true);
+        }
+        if cancelled {
+            return Self::cancelled(stage, source.is_terminal(), false);
         }
         match source.disposition() {
             HvfSnapshotV2NetworkPciRestoreDisposition::Retryable => Self::retryable(stage),
@@ -25614,6 +25963,7 @@ impl ProcessSnapshotV2VsockPciRestoreError {
     fn from_adoption(
         source: &ProcessSnapshotV2VsockAdoptionError<HvfSnapshotV2VsockPciRestoreError>,
         cleanup_uncertain: bool,
+        cancelled: bool,
     ) -> Self {
         match source {
             ProcessSnapshotV2VsockAdoptionError::Resources(source) => {
@@ -25633,14 +25983,18 @@ impl ProcessSnapshotV2VsockPciRestoreError {
                     disposition,
                 },
             ) => {
-                let mapped = Self::from_hvf(source, cleanup_uncertain);
+                let mapped = Self::from_hvf(source, cleanup_uncertain, cancelled);
                 if matches!(disposition, VsockRestoreDisposition::Terminal)
                     && matches!(
                         mapped.disposition,
                         ProcessSnapshotV2VsockPciRestoreDisposition::Retryable
                     )
                 {
-                    Self::terminal(mapped.stage, cleanup_uncertain)
+                    if mapped.is_cancelled() {
+                        Self::cancelled(mapped.stage, true, cleanup_uncertain)
+                    } else {
+                        Self::terminal(mapped.stage, cleanup_uncertain)
+                    }
                 } else {
                     mapped
                 }
@@ -25668,6 +26022,10 @@ impl ProcessSnapshotV2VsockPciRestoreError {
             ProcessSnapshotV2VsockPciRestoreDisposition::Retryable
         )
     }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
 }
 
 impl fmt::Debug for ProcessSnapshotV2VsockPciRestoreError {
@@ -25676,6 +26034,7 @@ impl fmt::Debug for ProcessSnapshotV2VsockPciRestoreError {
             .debug_struct("ProcessSnapshotV2VsockPciRestoreError")
             .field("stage", &self.stage)
             .field("disposition", &self.disposition)
+            .field("cancelled", &self.cancelled)
             .field("state", &"<redacted>")
             .finish()
     }
@@ -26089,6 +26448,7 @@ enum ProcessSnapshotV2NetworkMmioRestoreDisposition {
 struct ProcessSnapshotV2NetworkMmioRestoreError {
     stage: ProcessSnapshotV2NetworkMmioRestoreStage,
     disposition: ProcessSnapshotV2NetworkMmioRestoreDisposition,
+    cancelled: bool,
 }
 
 impl ProcessSnapshotV2NetworkMmioRestoreError {
@@ -26103,6 +26463,25 @@ impl ProcessSnapshotV2NetworkMmioRestoreError {
         Self {
             stage,
             disposition: ProcessSnapshotV2NetworkMmioRestoreDisposition::Retryable,
+            cancelled: false,
+        }
+    }
+
+    const fn cancelled(
+        stage: ProcessSnapshotV2NetworkMmioRestoreStage,
+        terminal: bool,
+        cleanup_uncertain: bool,
+    ) -> Self {
+        Self {
+            stage,
+            disposition: if cleanup_uncertain {
+                ProcessSnapshotV2NetworkMmioRestoreDisposition::TerminalCleanup
+            } else if terminal {
+                ProcessSnapshotV2NetworkMmioRestoreDisposition::Terminal
+            } else {
+                ProcessSnapshotV2NetworkMmioRestoreDisposition::Retryable
+            },
+            cancelled: !cleanup_uncertain,
         }
     }
 
@@ -26117,6 +26496,7 @@ impl ProcessSnapshotV2NetworkMmioRestoreError {
             } else {
                 ProcessSnapshotV2NetworkMmioRestoreDisposition::Terminal
             },
+            cancelled: false,
         }
     }
 
@@ -26126,6 +26506,16 @@ impl ProcessSnapshotV2NetworkMmioRestoreError {
     ) -> Self {
         if source.cleanup_uncertain {
             return Self::terminal(stage, true);
+        }
+        if source.is_cancelled() {
+            return Self::cancelled(
+                stage,
+                matches!(
+                    source.disposition(),
+                    ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+                ),
+                false,
+            );
         }
         match source.disposition() {
             ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable => Self::retryable(stage),
@@ -26156,6 +26546,10 @@ impl ProcessSnapshotV2NetworkMmioRestoreError {
             ),
         }
     }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
 }
 
 impl fmt::Debug for ProcessSnapshotV2NetworkMmioRestoreError {
@@ -26164,6 +26558,7 @@ impl fmt::Debug for ProcessSnapshotV2NetworkMmioRestoreError {
             .debug_struct("ProcessSnapshotV2NetworkMmioRestoreError")
             .field("stage", &self.stage)
             .field("disposition", &self.disposition)
+            .field("cancelled", &self.cancelled)
             .field("state", &"<redacted>")
             .finish()
     }
@@ -26695,8 +27090,10 @@ where
     C: Fn(ProcessSnapshotV2VsockMmioRestoreStage) -> bool,
 {
     if cancelled(ProcessSnapshotV2VsockMmioRestoreStage::ResourcePreparation) {
-        return Err(ProcessSnapshotV2VsockMmioRestoreError::retryable(
+        return Err(ProcessSnapshotV2VsockMmioRestoreError::cancelled(
             ProcessSnapshotV2VsockMmioRestoreStage::ResourcePreparation,
+            false,
+            false,
         ));
     }
     let batch = {
@@ -26721,16 +27118,11 @@ where
 
     if cancelled(ProcessSnapshotV2VsockMmioRestoreStage::ProductPreparation) {
         let evidence = staged.shutdown_evidence();
-        return Err(if evidence.terminal {
-            ProcessSnapshotV2VsockMmioRestoreError::terminal(
-                ProcessSnapshotV2VsockMmioRestoreStage::ProductPreparation,
-                evidence.cleanup_uncertain,
-            )
-        } else {
-            ProcessSnapshotV2VsockMmioRestoreError::retryable(
-                ProcessSnapshotV2VsockMmioRestoreStage::ProductPreparation,
-            )
-        });
+        return Err(ProcessSnapshotV2VsockMmioRestoreError::cancelled(
+            ProcessSnapshotV2VsockMmioRestoreStage::ProductPreparation,
+            evidence.terminal,
+            evidence.cleanup_uncertain,
+        ));
     }
 
     let (
@@ -26896,11 +27288,11 @@ where
                 .as_ref()
                 .is_some_and(|batch| batch.taken_count != 0);
             let evidence = staged.shutdown_evidence();
-            return Err(if already_consumed || evidence.terminal {
-                ProcessSnapshotV2VsockMmioRestoreError::terminal(stage, evidence.cleanup_uncertain)
-            } else {
-                ProcessSnapshotV2VsockMmioRestoreError::retryable(stage)
-            });
+            return Err(ProcessSnapshotV2VsockMmioRestoreError::cancelled(
+                stage,
+                already_consumed || evidence.terminal,
+                evidence.cleanup_uncertain,
+            ));
         }
         let Some(batch) = staged.batch.as_mut() else {
             drop((block_backings, pmem_backings, serial_output));
@@ -27072,16 +27464,11 @@ where
             .as_ref()
             .is_some_and(|batch| batch.taken_count != 0);
         let evidence = staged.shutdown_evidence();
-        return Err(if already_consumed || evidence.terminal {
-            ProcessSnapshotV2VsockMmioRestoreError::terminal(
-                ProcessSnapshotV2VsockMmioRestoreStage::HvfConstruction,
-                evidence.cleanup_uncertain,
-            )
-        } else {
-            ProcessSnapshotV2VsockMmioRestoreError::retryable(
-                ProcessSnapshotV2VsockMmioRestoreStage::HvfConstruction,
-            )
-        });
+        return Err(ProcessSnapshotV2VsockMmioRestoreError::cancelled(
+            ProcessSnapshotV2VsockMmioRestoreStage::HvfConstruction,
+            already_consumed || evidence.terminal,
+            evidence.cleanup_uncertain,
+        ));
     }
     let Some(endpoint) = staged.serial_endpoint.take() else {
         drop(platform_plan);
@@ -27131,6 +27518,7 @@ where
         .unwrap_or(HvfSnapshotV2NetworkMmioMemoryInput::ProductOwned);
     let vsock_metrics = SharedVsockDeviceMetrics::default();
 
+    let hvf_cancellation_observed = Cell::new(false);
     let restored = match vsock_key {
         Some(key) => {
             let Some(batch) = staged.batch.as_mut() else {
@@ -27152,7 +27540,13 @@ where
                     Some(resource),
                     vsock_metrics,
                     now,
-                    |stage| cancelled(ProcessSnapshotV2VsockMmioRestoreStage::Hvf(stage)),
+                    |stage| {
+                        let is_cancelled =
+                            cancelled(ProcessSnapshotV2VsockMmioRestoreStage::Hvf(stage));
+                        hvf_cancellation_observed
+                            .set(hvf_cancellation_observed.get() || is_cancelled);
+                        is_cancelled
+                    },
                 )
             }) {
                 Ok((hvf, guard)) => {
@@ -27164,6 +27558,7 @@ where
                     return Err(ProcessSnapshotV2VsockMmioRestoreError::from_adoption(
                         &source,
                         cleanup_uncertain,
+                        hvf_cancellation_observed.get(),
                     ));
                 }
             }
@@ -27180,7 +27575,12 @@ where
                 None,
                 vsock_metrics,
                 now,
-                |stage| cancelled(ProcessSnapshotV2VsockMmioRestoreStage::Hvf(stage)),
+                |stage| {
+                    let is_cancelled =
+                        cancelled(ProcessSnapshotV2VsockMmioRestoreStage::Hvf(stage));
+                    hvf_cancellation_observed.set(hvf_cancellation_observed.get() || is_cancelled);
+                    is_cancelled
+                },
             ) {
                 Ok(hvf) => hvf,
                 Err(source) => {
@@ -27188,6 +27588,7 @@ where
                     return Err(ProcessSnapshotV2VsockMmioRestoreError::from_hvf(
                         &source,
                         cleanup_uncertain,
+                        hvf_cancellation_observed.get(),
                     ));
                 }
             }
@@ -27197,8 +27598,9 @@ where
 
     if cancelled(ProcessSnapshotV2VsockMmioRestoreStage::BatchFinish) {
         let cleanup_uncertain = staged.shutdown();
-        return Err(ProcessSnapshotV2VsockMmioRestoreError::terminal(
+        return Err(ProcessSnapshotV2VsockMmioRestoreError::cancelled(
             ProcessSnapshotV2VsockMmioRestoreStage::BatchFinish,
+            true,
             cleanup_uncertain,
         ));
     }
@@ -27231,7 +27633,15 @@ where
         .is_ok(),
         _ => false,
     };
-    if cancelled(ProcessSnapshotV2VsockMmioRestoreStage::CompleteRecapture) || !equivalent {
+    if cancelled(ProcessSnapshotV2VsockMmioRestoreStage::CompleteRecapture) {
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockMmioRestoreError::cancelled(
+            ProcessSnapshotV2VsockMmioRestoreStage::CompleteRecapture,
+            true,
+            cleanup_uncertain,
+        ));
+    }
+    if !equivalent {
         let cleanup_uncertain = staged.shutdown();
         return Err(ProcessSnapshotV2VsockMmioRestoreError::terminal(
             ProcessSnapshotV2VsockMmioRestoreStage::CompleteRecapture,
@@ -27241,8 +27651,9 @@ where
 
     if cancelled(ProcessSnapshotV2VsockMmioRestoreStage::Assembly) {
         let cleanup_uncertain = staged.shutdown();
-        return Err(ProcessSnapshotV2VsockMmioRestoreError::terminal(
+        return Err(ProcessSnapshotV2VsockMmioRestoreError::cancelled(
             ProcessSnapshotV2VsockMmioRestoreStage::Assembly,
+            true,
             cleanup_uncertain,
         ));
     }
@@ -27268,8 +27679,9 @@ where
 
     if cancelled(ProcessSnapshotV2VsockMmioRestoreStage::GateCommit) {
         let cleanup_uncertain = staged.shutdown();
-        return Err(ProcessSnapshotV2VsockMmioRestoreError::terminal(
+        return Err(ProcessSnapshotV2VsockMmioRestoreError::cancelled(
             ProcessSnapshotV2VsockMmioRestoreStage::GateCommit,
+            true,
             cleanup_uncertain,
         ));
     }
@@ -27533,8 +27945,10 @@ where
     C: Fn(ProcessSnapshotV2VsockPciRestoreStage) -> bool,
 {
     if cancelled(ProcessSnapshotV2VsockPciRestoreStage::ResourcePreparation) {
-        return Err(ProcessSnapshotV2VsockPciRestoreError::retryable(
+        return Err(ProcessSnapshotV2VsockPciRestoreError::cancelled(
             ProcessSnapshotV2VsockPciRestoreStage::ResourcePreparation,
+            false,
+            false,
         ));
     }
     let batch = {
@@ -27559,16 +27973,11 @@ where
 
     if cancelled(ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation) {
         let evidence = staged.shutdown_evidence();
-        return Err(if evidence.terminal {
-            ProcessSnapshotV2VsockPciRestoreError::terminal(
-                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
-                evidence.cleanup_uncertain,
-            )
-        } else {
-            ProcessSnapshotV2VsockPciRestoreError::retryable(
-                ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
-            )
-        });
+        return Err(ProcessSnapshotV2VsockPciRestoreError::cancelled(
+            ProcessSnapshotV2VsockPciRestoreStage::ProductPreparation,
+            evidence.terminal,
+            evidence.cleanup_uncertain,
+        ));
     }
 
     let (
@@ -27734,11 +28143,11 @@ where
                 .as_ref()
                 .is_some_and(|batch| batch.taken_count != 0);
             let evidence = staged.shutdown_evidence();
-            return Err(if already_consumed || evidence.terminal {
-                ProcessSnapshotV2VsockPciRestoreError::terminal(stage, evidence.cleanup_uncertain)
-            } else {
-                ProcessSnapshotV2VsockPciRestoreError::retryable(stage)
-            });
+            return Err(ProcessSnapshotV2VsockPciRestoreError::cancelled(
+                stage,
+                already_consumed || evidence.terminal,
+                evidence.cleanup_uncertain,
+            ));
         }
         let Some(batch) = staged.batch.as_mut() else {
             drop((block_backings, pmem_backings, serial_output));
@@ -27895,16 +28304,11 @@ where
             .as_ref()
             .is_some_and(|batch| batch.taken_count != 0);
         let evidence = staged.shutdown_evidence();
-        return Err(if already_consumed || evidence.terminal {
-            ProcessSnapshotV2VsockPciRestoreError::terminal(
-                ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction,
-                evidence.cleanup_uncertain,
-            )
-        } else {
-            ProcessSnapshotV2VsockPciRestoreError::retryable(
-                ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction,
-            )
-        });
+        return Err(ProcessSnapshotV2VsockPciRestoreError::cancelled(
+            ProcessSnapshotV2VsockPciRestoreStage::HvfConstruction,
+            already_consumed || evidence.terminal,
+            evidence.cleanup_uncertain,
+        ));
     }
     let Some(endpoint) = staged.serial_endpoint.take() else {
         drop(platform_plan);
@@ -27954,6 +28358,7 @@ where
         .unwrap_or(HvfSnapshotV2NetworkPciMemoryInput::ProductOwned);
     let vsock_metrics = SharedVsockDeviceMetrics::default();
 
+    let hvf_cancellation_observed = Cell::new(false);
     let restored = match vsock_key {
         Some(key) => {
             let Some(batch) = staged.batch.as_mut() else {
@@ -27975,7 +28380,13 @@ where
                     Some(resource),
                     vsock_metrics,
                     now,
-                    |stage| cancelled(ProcessSnapshotV2VsockPciRestoreStage::Hvf(stage)),
+                    |stage| {
+                        let is_cancelled =
+                            cancelled(ProcessSnapshotV2VsockPciRestoreStage::Hvf(stage));
+                        hvf_cancellation_observed
+                            .set(hvf_cancellation_observed.get() || is_cancelled);
+                        is_cancelled
+                    },
                 )
             }) {
                 Ok((hvf, guard)) => {
@@ -27987,6 +28398,7 @@ where
                     return Err(ProcessSnapshotV2VsockPciRestoreError::from_adoption(
                         &source,
                         cleanup_uncertain,
+                        hvf_cancellation_observed.get(),
                     ));
                 }
             }
@@ -28003,7 +28415,11 @@ where
                 None,
                 vsock_metrics,
                 now,
-                |stage| cancelled(ProcessSnapshotV2VsockPciRestoreStage::Hvf(stage)),
+                |stage| {
+                    let is_cancelled = cancelled(ProcessSnapshotV2VsockPciRestoreStage::Hvf(stage));
+                    hvf_cancellation_observed.set(hvf_cancellation_observed.get() || is_cancelled);
+                    is_cancelled
+                },
             ) {
                 Ok(hvf) => hvf,
                 Err(source) => {
@@ -28011,6 +28427,7 @@ where
                     return Err(ProcessSnapshotV2VsockPciRestoreError::from_hvf(
                         &source,
                         cleanup_uncertain,
+                        hvf_cancellation_observed.get(),
                     ));
                 }
             }
@@ -28020,8 +28437,9 @@ where
 
     if cancelled(ProcessSnapshotV2VsockPciRestoreStage::BatchFinish) {
         let cleanup_uncertain = staged.shutdown();
-        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+        return Err(ProcessSnapshotV2VsockPciRestoreError::cancelled(
             ProcessSnapshotV2VsockPciRestoreStage::BatchFinish,
+            true,
             cleanup_uncertain,
         ));
     }
@@ -28054,7 +28472,15 @@ where
         .is_ok(),
         _ => false,
     };
-    if cancelled(ProcessSnapshotV2VsockPciRestoreStage::CompleteRecapture) || !equivalent {
+    if cancelled(ProcessSnapshotV2VsockPciRestoreStage::CompleteRecapture) {
+        let cleanup_uncertain = staged.shutdown();
+        return Err(ProcessSnapshotV2VsockPciRestoreError::cancelled(
+            ProcessSnapshotV2VsockPciRestoreStage::CompleteRecapture,
+            true,
+            cleanup_uncertain,
+        ));
+    }
+    if !equivalent {
         let cleanup_uncertain = staged.shutdown();
         return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
             ProcessSnapshotV2VsockPciRestoreStage::CompleteRecapture,
@@ -28064,8 +28490,9 @@ where
 
     if cancelled(ProcessSnapshotV2VsockPciRestoreStage::Assembly) {
         let cleanup_uncertain = staged.shutdown();
-        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+        return Err(ProcessSnapshotV2VsockPciRestoreError::cancelled(
             ProcessSnapshotV2VsockPciRestoreStage::Assembly,
+            true,
             cleanup_uncertain,
         ));
     }
@@ -28091,8 +28518,9 @@ where
 
     if cancelled(ProcessSnapshotV2VsockPciRestoreStage::GateCommit) {
         let cleanup_uncertain = staged.shutdown();
-        return Err(ProcessSnapshotV2VsockPciRestoreError::terminal(
+        return Err(ProcessSnapshotV2VsockPciRestoreError::cancelled(
             ProcessSnapshotV2VsockPciRestoreStage::GateCommit,
+            true,
             cleanup_uncertain,
         ));
     }
@@ -28360,6 +28788,7 @@ enum ProcessSnapshotV2NetworkPciRestoreDisposition {
 struct ProcessSnapshotV2NetworkPciRestoreError {
     stage: ProcessSnapshotV2NetworkPciRestoreStage,
     disposition: ProcessSnapshotV2NetworkPciRestoreDisposition,
+    cancelled: bool,
 }
 
 impl ProcessSnapshotV2NetworkPciRestoreError {
@@ -28374,6 +28803,25 @@ impl ProcessSnapshotV2NetworkPciRestoreError {
         Self {
             stage,
             disposition: ProcessSnapshotV2NetworkPciRestoreDisposition::Retryable,
+            cancelled: false,
+        }
+    }
+
+    const fn cancelled(
+        stage: ProcessSnapshotV2NetworkPciRestoreStage,
+        terminal: bool,
+        cleanup_uncertain: bool,
+    ) -> Self {
+        Self {
+            stage,
+            disposition: if cleanup_uncertain {
+                ProcessSnapshotV2NetworkPciRestoreDisposition::TerminalCleanup
+            } else if terminal {
+                ProcessSnapshotV2NetworkPciRestoreDisposition::Terminal
+            } else {
+                ProcessSnapshotV2NetworkPciRestoreDisposition::Retryable
+            },
+            cancelled: !cleanup_uncertain,
         }
     }
 
@@ -28388,6 +28836,7 @@ impl ProcessSnapshotV2NetworkPciRestoreError {
             } else {
                 ProcessSnapshotV2NetworkPciRestoreDisposition::Terminal
             },
+            cancelled: false,
         }
     }
 
@@ -28397,6 +28846,16 @@ impl ProcessSnapshotV2NetworkPciRestoreError {
     ) -> Self {
         if source.cleanup_uncertain {
             return Self::terminal(stage, true);
+        }
+        if source.is_cancelled() {
+            return Self::cancelled(
+                stage,
+                matches!(
+                    source.disposition(),
+                    ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+                ),
+                false,
+            );
         }
         match source.disposition() {
             ProcessSnapshotV2NetworkRestoreResourceDisposition::Retryable => Self::retryable(stage),
@@ -28427,6 +28886,10 @@ impl ProcessSnapshotV2NetworkPciRestoreError {
             ),
         }
     }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
 }
 
 impl fmt::Debug for ProcessSnapshotV2NetworkPciRestoreError {
@@ -28435,6 +28898,7 @@ impl fmt::Debug for ProcessSnapshotV2NetworkPciRestoreError {
             .debug_struct("ProcessSnapshotV2NetworkPciRestoreError")
             .field("stage", &self.stage)
             .field("disposition", &self.disposition)
+            .field("cancelled", &self.cancelled)
             .field("state", &"<redacted>")
             .finish()
     }
@@ -28619,9 +29083,14 @@ where
     F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
     C: FnMut(ProcessSnapshotV2NetworkMmioRestoreStage) -> bool,
 {
-    if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation)
-        || !resource_plan.matches_mmio_platform_plan(&platform_plan)
-    {
+    if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation) {
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::cancelled(
+            ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation,
+            false,
+            false,
+        ));
+    }
+    if !resource_plan.matches_mmio_platform_plan(&platform_plan) {
         return Err(ProcessSnapshotV2NetworkMmioRestoreError::retryable(
             ProcessSnapshotV2NetworkMmioRestoreStage::ResourcePreparation,
         ));
@@ -28698,11 +29167,11 @@ where
         if cancelled(stage) {
             let cleanup_uncertain =
                 abort_unfinished_process_snapshot_v2_network_resources(batch, resources);
-            return Err(if cleanup_uncertain {
-                ProcessSnapshotV2NetworkMmioRestoreError::terminal(stage, true)
-            } else {
-                ProcessSnapshotV2NetworkMmioRestoreError::retryable(stage)
-            });
+            return Err(ProcessSnapshotV2NetworkMmioRestoreError::cancelled(
+                stage,
+                false,
+                cleanup_uncertain,
+            ));
         }
         let Some(endpoint) = platform_plan.network().get(index) else {
             let cleanup_uncertain =
@@ -28740,16 +29209,11 @@ where
     if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::ProviderFinish) {
         let cleanup_uncertain =
             abort_unfinished_process_snapshot_v2_network_resources(batch, resources);
-        return Err(if cleanup_uncertain {
-            ProcessSnapshotV2NetworkMmioRestoreError::terminal(
-                ProcessSnapshotV2NetworkMmioRestoreStage::ProviderFinish,
-                true,
-            )
-        } else {
-            ProcessSnapshotV2NetworkMmioRestoreError::retryable(
-                ProcessSnapshotV2NetworkMmioRestoreStage::ProviderFinish,
-            )
-        });
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::cancelled(
+            ProcessSnapshotV2NetworkMmioRestoreStage::ProviderFinish,
+            false,
+            cleanup_uncertain,
+        ));
     }
     let completion = match batch.finish() {
         Ok(completion) => completion,
@@ -28778,16 +29242,11 @@ where
     if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::HvfConstruction) {
         let cleanup_uncertain =
             abort_completed_process_snapshot_v2_network_resources(completion, resources);
-        return Err(if cleanup_uncertain {
-            ProcessSnapshotV2NetworkMmioRestoreError::terminal(
-                ProcessSnapshotV2NetworkMmioRestoreStage::HvfConstruction,
-                true,
-            )
-        } else {
-            ProcessSnapshotV2NetworkMmioRestoreError::retryable(
-                ProcessSnapshotV2NetworkMmioRestoreStage::HvfConstruction,
-            )
-        });
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::cancelled(
+            ProcessSnapshotV2NetworkMmioRestoreStage::HvfConstruction,
+            false,
+            cleanup_uncertain,
+        ));
     }
 
     let staged_hvf = match OwnedHvfArm64BootSession::restore_snapshot_v2_network_mmio(
@@ -28811,13 +29270,16 @@ where
         }
     };
 
-    if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::CompleteRecapture)
-        || restored_process_snapshot_v2_network_is_equivalent(
-            &staged_hvf,
-            &completion,
-            &resources,
-            now,
-        )
+    if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::CompleteRecapture) {
+        let cleanup_uncertain =
+            abort_staged_process_snapshot_v2_network_mmio(staged_hvf, completion, resources);
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::cancelled(
+            ProcessSnapshotV2NetworkMmioRestoreStage::CompleteRecapture,
+            true,
+            cleanup_uncertain,
+        ));
+    }
+    if restored_process_snapshot_v2_network_is_equivalent(&staged_hvf, &completion, &resources, now)
         .is_err()
     {
         let cleanup_uncertain =
@@ -28831,8 +29293,9 @@ where
     if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::Assembly) {
         let cleanup_uncertain =
             abort_staged_process_snapshot_v2_network_mmio(staged_hvf, completion, resources);
-        return Err(ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::cancelled(
             ProcessSnapshotV2NetworkMmioRestoreStage::Assembly,
+            true,
             cleanup_uncertain,
         ));
     }
@@ -28858,8 +29321,9 @@ where
 
     if cancelled(ProcessSnapshotV2NetworkMmioRestoreStage::GateCommit) {
         let cleanup_uncertain = owners.shutdown().is_err();
-        return Err(ProcessSnapshotV2NetworkMmioRestoreError::terminal(
+        return Err(ProcessSnapshotV2NetworkMmioRestoreError::cancelled(
             ProcessSnapshotV2NetworkMmioRestoreStage::GateCommit,
+            true,
             cleanup_uncertain,
         ));
     }
@@ -29007,9 +29471,14 @@ where
     F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
     C: FnMut(ProcessSnapshotV2NetworkPciRestoreStage) -> bool,
 {
-    if cancelled(ProcessSnapshotV2NetworkPciRestoreStage::ResourcePreparation)
-        || !resource_plan.matches_pci_platform_plan(&platform_plan)
-    {
+    if cancelled(ProcessSnapshotV2NetworkPciRestoreStage::ResourcePreparation) {
+        return Err(ProcessSnapshotV2NetworkPciRestoreError::cancelled(
+            ProcessSnapshotV2NetworkPciRestoreStage::ResourcePreparation,
+            false,
+            false,
+        ));
+    }
+    if !resource_plan.matches_pci_platform_plan(&platform_plan) {
         return Err(ProcessSnapshotV2NetworkPciRestoreError::retryable(
             ProcessSnapshotV2NetworkPciRestoreStage::ResourcePreparation,
         ));
@@ -29086,11 +29555,11 @@ where
         if cancelled(stage) {
             let cleanup_uncertain =
                 abort_unfinished_process_snapshot_v2_network_resources(batch, resources);
-            return Err(if cleanup_uncertain {
-                ProcessSnapshotV2NetworkPciRestoreError::terminal(stage, true)
-            } else {
-                ProcessSnapshotV2NetworkPciRestoreError::retryable(stage)
-            });
+            return Err(ProcessSnapshotV2NetworkPciRestoreError::cancelled(
+                stage,
+                false,
+                cleanup_uncertain,
+            ));
         }
         let Some(endpoint) = platform_plan.network().get(index) else {
             let cleanup_uncertain =
@@ -29128,16 +29597,11 @@ where
     if cancelled(ProcessSnapshotV2NetworkPciRestoreStage::ProviderFinish) {
         let cleanup_uncertain =
             abort_unfinished_process_snapshot_v2_network_resources(batch, resources);
-        return Err(if cleanup_uncertain {
-            ProcessSnapshotV2NetworkPciRestoreError::terminal(
-                ProcessSnapshotV2NetworkPciRestoreStage::ProviderFinish,
-                true,
-            )
-        } else {
-            ProcessSnapshotV2NetworkPciRestoreError::retryable(
-                ProcessSnapshotV2NetworkPciRestoreStage::ProviderFinish,
-            )
-        });
+        return Err(ProcessSnapshotV2NetworkPciRestoreError::cancelled(
+            ProcessSnapshotV2NetworkPciRestoreStage::ProviderFinish,
+            false,
+            cleanup_uncertain,
+        ));
     }
     let completion = match batch.finish() {
         Ok(completion) => completion,
@@ -29166,16 +29630,11 @@ where
     if cancelled(ProcessSnapshotV2NetworkPciRestoreStage::HvfConstruction) {
         let cleanup_uncertain =
             abort_completed_process_snapshot_v2_network_resources(completion, resources);
-        return Err(if cleanup_uncertain {
-            ProcessSnapshotV2NetworkPciRestoreError::terminal(
-                ProcessSnapshotV2NetworkPciRestoreStage::HvfConstruction,
-                true,
-            )
-        } else {
-            ProcessSnapshotV2NetworkPciRestoreError::retryable(
-                ProcessSnapshotV2NetworkPciRestoreStage::HvfConstruction,
-            )
-        });
+        return Err(ProcessSnapshotV2NetworkPciRestoreError::cancelled(
+            ProcessSnapshotV2NetworkPciRestoreStage::HvfConstruction,
+            false,
+            cleanup_uncertain,
+        ));
     }
 
     let staged_hvf = match OwnedHvfArm64BootSession::restore_snapshot_v2_network_pci(
@@ -29199,14 +29658,22 @@ where
         }
     };
 
-    if cancelled(ProcessSnapshotV2NetworkPciRestoreStage::CompleteRecapture)
-        || restored_process_snapshot_v2_network_pci_is_equivalent(
-            &staged_hvf,
-            &completion,
-            &resources,
-            now,
-        )
-        .is_err()
+    if cancelled(ProcessSnapshotV2NetworkPciRestoreStage::CompleteRecapture) {
+        let cleanup_uncertain =
+            abort_staged_process_snapshot_v2_network_pci(staged_hvf, completion, resources);
+        return Err(ProcessSnapshotV2NetworkPciRestoreError::cancelled(
+            ProcessSnapshotV2NetworkPciRestoreStage::CompleteRecapture,
+            true,
+            cleanup_uncertain,
+        ));
+    }
+    if restored_process_snapshot_v2_network_pci_is_equivalent(
+        &staged_hvf,
+        &completion,
+        &resources,
+        now,
+    )
+    .is_err()
     {
         let cleanup_uncertain =
             abort_staged_process_snapshot_v2_network_pci(staged_hvf, completion, resources);
@@ -29219,8 +29686,9 @@ where
     if cancelled(ProcessSnapshotV2NetworkPciRestoreStage::Assembly) {
         let cleanup_uncertain =
             abort_staged_process_snapshot_v2_network_pci(staged_hvf, completion, resources);
-        return Err(ProcessSnapshotV2NetworkPciRestoreError::terminal(
+        return Err(ProcessSnapshotV2NetworkPciRestoreError::cancelled(
             ProcessSnapshotV2NetworkPciRestoreStage::Assembly,
+            true,
             cleanup_uncertain,
         ));
     }
@@ -29246,8 +29714,9 @@ where
 
     if cancelled(ProcessSnapshotV2NetworkPciRestoreStage::GateCommit) {
         let cleanup_uncertain = owners.shutdown().is_err();
-        return Err(ProcessSnapshotV2NetworkPciRestoreError::terminal(
+        return Err(ProcessSnapshotV2NetworkPciRestoreError::cancelled(
             ProcessSnapshotV2NetworkPciRestoreStage::GateCommit,
+            true,
             cleanup_uncertain,
         ));
     }
@@ -46370,6 +46839,108 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn snapshot_load_logger_outcome_recognizes_all_destination_cancellations() {
+        let source = std::io::Error::other("private destination detail");
+        let transport = SnapshotV2DeviceTransportKind::Mmio;
+        let errors = [
+            NativeV2SnapshotLoadError::MultiBlockDestination(
+                super::NativeV2MultiBlockDestinationLoadError::with_source(
+                    transport, false, true, &source,
+                ),
+            ),
+            NativeV2SnapshotLoadError::StorageDestination(
+                super::NativeV2StorageDestinationLoadError::with_source(
+                    transport, true, true, &source,
+                ),
+            ),
+            NativeV2SnapshotLoadError::SerialDestination(
+                super::NativeV2SerialDestinationLoadError::with_source(true, true, &source),
+            ),
+            NativeV2SnapshotLoadError::EntropyDestination(
+                super::NativeV2EntropyDestinationLoadError::with_source(
+                    transport, true, true, &source,
+                ),
+            ),
+            NativeV2SnapshotLoadError::BalloonDestination(
+                super::NativeV2BalloonDestinationLoadError::with_source(
+                    transport, true, true, &source,
+                ),
+            ),
+            NativeV2SnapshotLoadError::MemoryHotplugDestination(
+                super::NativeV2MemoryHotplugDestinationLoadError::with_source(
+                    transport, true, true, &source,
+                ),
+            ),
+            NativeV2SnapshotLoadError::NetworkDestination(
+                super::NativeV2NetworkDestinationLoadError::with_source(
+                    transport, true, true, &source,
+                ),
+            ),
+            NativeV2SnapshotLoadError::VsockDestination(
+                super::NativeV2VsockDestinationLoadError::with_source(
+                    transport, true, true, &source,
+                ),
+            ),
+        ];
+
+        for error in errors {
+            assert_eq!(
+                native_snapshot_load_logger_outcome(&NativeSnapshotLoadError::NativeV2(error)),
+                LoggerSnapshotOutcome::LoadCancelled
+            );
+        }
+
+        let failed =
+            NativeSnapshotLoadError::NativeV2(NativeV2SnapshotLoadError::VsockDestination(
+                super::NativeV2VsockDestinationLoadError::with_source(
+                    transport, true, false, &source,
+                ),
+            ));
+        assert_eq!(
+            native_snapshot_load_logger_outcome(&failed),
+            LoggerSnapshotOutcome::LoadFailed
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn process_snapshot_load_cancellation_fails_closed_on_cleanup_uncertainty() {
+        assert!(
+            !super::ProcessSnapshotV2NetworkMmioRestoreError::cancelled(
+                super::ProcessSnapshotV2NetworkMmioRestoreStage::GateCommit,
+                true,
+                true,
+            )
+            .is_cancelled()
+        );
+        assert!(
+            !super::ProcessSnapshotV2NetworkPciRestoreError::cancelled(
+                super::ProcessSnapshotV2NetworkPciRestoreStage::GateCommit,
+                true,
+                true,
+            )
+            .is_cancelled()
+        );
+        assert!(
+            !super::ProcessSnapshotV2VsockMmioRestoreError::cancelled(
+                super::ProcessSnapshotV2VsockMmioRestoreStage::GateCommit,
+                true,
+                true,
+            )
+            .is_cancelled()
+        );
+        assert!(
+            !super::ProcessSnapshotV2VsockPciRestoreError::cancelled(
+                super::ProcessSnapshotV2VsockPciRestoreStage::GateCommit,
+                true,
+                true,
+            )
+            .is_cancelled()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn public_native_v2_diff_load_materializes_zero_root_and_dispatches_paused_session() {
         let (snapshot, load) =
             native_v2_diff_snapshot_load_fixture("public-diff-load-paused", false);
@@ -58770,6 +59341,7 @@ mod tests {
                 .expect_err("injected PCI process owner cancellation should reject");
                 assert_eq!(error.stage, cancel_stage);
                 assert_eq!(error.disposition, expected_disposition);
+                assert!(error.is_cancelled());
                 let diagnostics = format!("{error:?} {error}");
                 assert!(diagnostics.contains("<redacted>"));
                 assert!(!diagnostics.contains("eth0"));
@@ -58972,6 +59544,7 @@ mod tests {
             .expect_err("injected process owner cancellation should reject");
             assert_eq!(error.stage, cancel_stage);
             assert_eq!(error.disposition, expected_disposition);
+            assert!(error.is_cancelled());
             let diagnostics = format!("{error:?} {error}");
             assert!(diagnostics.contains("<redacted>"));
             assert!(!diagnostics.contains("eth0"));
@@ -59318,6 +59891,7 @@ mod tests {
                 .expect_err("injected exact-2.12 PCI owner cancellation should reject");
                 assert_eq!(error.stage, cancel_stage);
                 assert_eq!(error.disposition, expected_disposition);
+                assert!(error.is_cancelled());
                 let diagnostics = format!("{error:?} {error}");
                 assert!(diagnostics.contains("<redacted>"));
                 assert!(
@@ -59479,6 +60053,7 @@ mod tests {
             .expect_err("injected exact-2.12 owner cancellation should reject");
             assert_eq!(error.stage, cancel_stage);
             assert_eq!(error.disposition, expected_disposition);
+            assert!(error.is_cancelled());
             let diagnostics = format!("{error:?} {error}");
             assert!(diagnostics.contains("<redacted>"));
             assert!(!diagnostics.contains(destination_socket.path().to_string_lossy().as_ref()));

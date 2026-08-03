@@ -5610,7 +5610,17 @@ mod tests {
         ));
         let _explicit_attempt = metrics_fifo.drain_available();
 
-        let output = fs::read_to_string(&logger_path).expect("logger output should be readable");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let output = loop {
+            let output =
+                fs::read_to_string(&logger_path).expect("logger output should be readable");
+            if output.contains("operation=metrics-worker outcome=failed\n")
+                || Instant::now() >= deadline
+            {
+                break output;
+            }
+            std::thread::yield_now();
+        };
         assert_eq!(
             output
                 .matches("operation=metrics-worker outcome=failed\n")

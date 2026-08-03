@@ -532,6 +532,7 @@ fn cancellation_and_allocation_checkpoints_are_deterministic() {
             },
         )
         .expect_err("selected cancellation stage should stop preparation");
+        assert!(error.is_cancelled());
         assert!(matches!(
             error,
             SnapshotV2VsockRestorePreparationError::Cancelled { stage } if stage == target
