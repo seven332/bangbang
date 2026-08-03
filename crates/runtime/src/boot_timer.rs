@@ -386,7 +386,7 @@ mod tests {
     use std::io::{Error, ErrorKind, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
         BOOT_TIMER_MAGIC_VALUE, BOOT_TIMER_MMIO_DEVICE_WINDOW_SIZE, BOOT_TIMER_REGISTER_SPACE_SIZE,
@@ -462,6 +462,14 @@ mod tests {
         MmioAccessBytes::new(data).expect("test bytes should be valid")
     }
 
+    fn wait_for(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !condition() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(condition(), "asynchronous logger outcome should arrive");
+    }
+
     fn dispatcher_with_device<C: BootTimerClock + 'static>(
         device: BootTimerMmioDevice<C>,
     ) -> MmioDispatcher {
@@ -505,6 +513,7 @@ mod tests {
             MmioDispatchOutcome::Write
         );
 
+        wait_for(|| fs::metadata(&path).is_ok_and(|metadata| metadata.len() != 0));
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(
             output,
@@ -539,7 +548,7 @@ mod tests {
                 .expect("logger failure should not fail MMIO write"),
             MmioDispatchOutcome::Write
         );
-        assert_eq!(metrics.missed_log_count(), 1);
+        wait_for(|| metrics.missed_log_count() == 1);
     }
 
     #[test]

@@ -2102,17 +2102,23 @@ is resource-specific:
   attempt without replacing the process result. Ordinary handle drop closes
   the sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
-  present and keeps a per-process logger sink. Successfully parsed API requests
-  can append method/path lines before dispatch, and successful `InstanceStart`
-  and explicit `FlushMetrics` can append action-event lines when the configured
-  level allows `Info` and the optional module prefix matches the event module.
-  API request log lines intentionally omit request bodies, including MMDS
-  payloads. These host records are unrestricted; guest boot-timer records use a
-  ten-per-five-second limiter and one unrestricted recovery warning. Sink lock,
-  write, or flush failure increments missed-delivery accounting but cannot
-  change the API, action, startup, or guest-MMIO result. Logger startup CLI
-  flags use the same sink and host-path error redaction rules before the API
-  socket is served.
+  present and keeps one fixed-capacity queue plus one sink-owning worker per
+  process. Successfully parsed API requests encode closed method/route-template
+  lines before dispatch, and successful `InstanceStart` and explicit
+  `FlushMetrics` encode closed action-event lines when the configured level
+  allows `Info` and the optional module prefix matches the event module. API
+  records intentionally omit resource selectors and request bodies, including
+  MMDS payloads; optional origin prefixes cannot expose absolute build-host
+  paths. Every record is valid UTF-8 and at most 512 bytes including newline.
+  These host records are unrestricted and use at most a one-second receipt;
+  guest boot-timer records use immediate admission, a bounded atomic
+  ten-per-five-second limiter, and one ordered recovery warning. Queue,
+  timeout, zero/short/error write, or flush failure increments exact
+  missed-delivery accounting but cannot change the API, action, startup, or
+  guest-MMIO result. Preboot sink replacement reuses the worker through a
+  cancellable transaction, so a stalled sink preserves old state without
+  accumulating threads. Logger startup CLI flags use the same sink and
+  host-path error redaction rules before the API socket is served.
 - `scripts/run-integration-tests.sh` creates temporary files for signed
   integration tests and removes them when the wrapper exits normally. Its
   generated guest initrd is cached under `.tmp/guest-artifacts` by default.
@@ -2856,11 +2862,13 @@ busy-wait.
 Metrics and logger outputs are host observability state, not guest
 configuration, and are intentionally omitted from `GET /vm/config`. Current
 logger API request and action events are unrestricted host VMM records; they can
-expose API method/path metadata but not request bodies or guest serial output.
-The guest-triggerable boot-timer callsite alone uses a bounded limiter and emits
-one unrestricted warning when delivery recovers. Logger filtering and sink
-failures never change the API, action, or guest outcome; rate-limited records
-and delivery failures are observable only through process-local counters.
+expose API method/fixed-route metadata but not runtime selectors, request
+bodies, host paths, or guest serial output. The guest-triggerable boot-timer
+callsite alone uses a bounded limiter and emits one unrestricted warning when
+delivery recovers. Logger filtering, queue pressure, timeout ambiguity, and
+sink failures never change the API, action, or guest outcome; rate-limited
+records and exact per-record delivery failures are observable only through
+process-local counters.
 Current session-initial, periodic, explicit, and normal-terminal metrics lines
 can expose selected API request counters, startup timing fields, logger and
 serial counters, a terse boot run-loop status summary, and minimal device

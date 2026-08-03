@@ -128,7 +128,7 @@ use bangbang_runtime::boot_timer::BootTimerMmioLayout;
 use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::entropy::{EntropyConfig, EntropyMmioLayout};
 use bangbang_runtime::lazy_memory::LazyGuestMemoryConsumerProfile;
-use bangbang_runtime::logger::LoggerConfigInput;
+use bangbang_runtime::logger::{LoggerApiRoute, LoggerConfigInput, LoggerHttpMethod};
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
 use bangbang_runtime::memory_hotplug::{
@@ -5318,7 +5318,7 @@ pub(crate) trait VmmRequestHandler {
     fn record_deprecated_api_call(&mut self);
 
     #[track_caller]
-    fn log_api_request(&mut self, method: &str, path: impl fmt::Display) -> bool;
+    fn log_api_request(&mut self, method: LoggerHttpMethod, route: LoggerApiRoute) -> bool;
 
     fn record_pause_vm_latency_us(&mut self, duration_us: u64);
 
@@ -5827,8 +5827,8 @@ where
     }
 
     #[track_caller]
-    fn log_api_request(&mut self, method: &str, path: impl fmt::Display) -> bool {
-        self.controller.log_api_request(method, path)
+    fn log_api_request(&mut self, method: LoggerHttpMethod, route: LoggerApiRoute) -> bool {
+        self.controller.log_api_request(method, route)
     }
 
     fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
@@ -6636,7 +6636,7 @@ where
                 error => error,
             })?;
 
-        self.controller.commit_logger_config(prepared);
+        self.controller.commit_logger_config(prepared)?;
         Ok(VmmData::Empty)
     }
 
@@ -10206,8 +10206,8 @@ where
     }
 
     #[track_caller]
-    fn log_api_request(&mut self, method: &str, path: impl fmt::Display) -> bool {
-        ProcessVmm::log_api_request(self, method, path)
+    fn log_api_request(&mut self, method: LoggerHttpMethod, route: LoggerApiRoute) -> bool {
+        ProcessVmm::log_api_request(self, method, route)
     }
 
     fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
