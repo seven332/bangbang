@@ -57,6 +57,7 @@ reviewed delta.
 | [Snapshot Diff and rebase](snapshot-diff-rebase-contract.md) | Native-v2 2.13 differential create/load, public rebase commands, stronger no-clobber transaction, and terminal Wave 6 composition |
 | [Snapshot editor state](snapshot-editor-contract.md) | Native-state version/vCPU/VM inspection, finite reviewed-register editing, no-clobber publication, signed Full/Diff product restore, and the exact twelve-row closure |
 | [Snapshot Wave 6](snapshot-wave6-contract.md) | Exact 70-row load, artifact, version, device, tool, time/identity, portability, and downstream-owner certification |
+| [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
 
 ## Dispositions
 

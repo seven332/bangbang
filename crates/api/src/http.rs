@@ -7476,6 +7476,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_complete_x86_cpu_config_shapes_without_retaining_values() {
+        const CPUID: &str = r#"{"cpuid_modifiers":[{"leaf":"0x4a11cafe","subleaf":"0x1badb002","flags":1432778632,"modifiers":[{"register":"edx","bitmap":"0b10100101101001011010010110100101"}]}]}"#;
+        const MSR: &str = r#"{"msr_modifiers":[{"addr":"0x5eedc0de","bitmap":"0b1010010110100101101001011010010110100101101001011010010110100101"}]}"#;
+        const COMBINED: &str = r#"{"cpuid_modifiers":[{"leaf":"0x4a11cafe","subleaf":"0x1badb002","flags":1432778632,"modifiers":[{"register":"edx","bitmap":"0b10100101101001011010010110100101"}]}],"msr_modifiers":[{"addr":"0x5eedc0de","bitmap":"0b1010010110100101101001011010010110100101101001011010010110100101"}]}"#;
+
+        for body in [CPUID, MSR, COMBINED] {
+            let result = parse_request(&request_with_body("PUT", "/cpu-config", body));
+
+            assert_eq!(result, Err(RequestError::MalformedRequest));
+            let diagnostic = format!("{:?}", result.expect_err("x86 shape must fail"));
+            for value in [
+                "4a11cafe",
+                "1badb002",
+                "1432778632",
+                "edx",
+                "5eedc0de",
+                "1010010110100101",
+            ] {
+                assert!(
+                    !diagnostic.contains(value),
+                    "fixed parser error must not retain x86 input values"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rejects_duplicate_cpu_config_fields() {
         for body in [
             r#"{"kvm_capabilities":[],"kvm_capabilities":[]}"#,

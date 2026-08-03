@@ -2127,6 +2127,24 @@ Error messages for host file open failures should not echo configured host
 paths. Tests already cover this for several path surfaces, and new host path
 features should add resource-specific redaction and file-type tests.
 
+## X86 CPUID and MSR request values
+
+CPUID leaves, subleaves, flags, register names, MSR addresses, and modifier
+bitmaps are untrusted CPU-control values. On the supported macOS arm64/HVF
+target they have no identity-preserving execution namespace. Complete x86_64
+request shapes are rejected as malformed before conversion, retained
+configuration, backend construction, or start; the prior CPU configuration and
+VM state remain unchanged.
+
+The fixed failure response, product diagnostics, logs, metrics, and serial
+output must not include any submitted selector, address, or bitmap value.
+Mapping these values to ARM registers would create different architecture and
+bitmap semantics, silently ignoring them would falsely report enforcement, and
+delegating them to an emulator or Linux/KVM sidecar would cross the native
+backend and one-process trust boundary. The exact exclusion evidence and tests
+are recorded in the checked
+[Wave 7 contract](../compat/firecracker/v1.16.0/observability-tools-specification-contract.md).
+
 ## Aggregate Storage Trust and Capacity Boundary
 
 The #1471 direct and normal-production signed profiles compose Sync, portable

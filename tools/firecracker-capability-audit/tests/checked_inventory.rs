@@ -56,6 +56,396 @@ fn local_reference_paths(references: &[Reference]) -> Option<BTreeSet<&str>> {
 }
 
 #[test]
+fn wave_7_ownership_and_core_api_policy_is_stable() {
+    const CONTRACT_PATH: &str =
+        "compat/firecracker/v1.16.0/observability-tools-specification-contract.md";
+    const CHALLENGE_URL: &str =
+        "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449";
+    const WAVE_7_OWNED: [(&str, &str); 93] = [
+        ("api-operation:GET /", "#1784"),
+        ("api-operation:GET /version", "#1784"),
+        ("api-operation:GET /vm/config", "#1784"),
+        ("api-operation:PUT /actions", "#1784"),
+        ("api-path:/", "#1784"),
+        ("api-path:/actions", "#1784"),
+        ("api-path:/version", "#1784"),
+        ("api-path:/vm/config", "#1784"),
+        ("api-property:CpuConfig.cpuid_modifiers", "#1784"),
+        ("api-property:CpuConfig.msr_modifiers", "#1784"),
+        ("api-property:CpuidLeafModifier.flags", "#1784"),
+        ("api-property:CpuidLeafModifier.leaf", "#1784"),
+        ("api-property:CpuidLeafModifier.modifiers", "#1784"),
+        ("api-property:CpuidLeafModifier.subleaf", "#1784"),
+        ("api-property:CpuidRegisterModifier.bitmap", "#1784"),
+        ("api-property:CpuidRegisterModifier.register", "#1784"),
+        ("api-property:Error.fault_message", "#1784"),
+        (
+            "api-property:FirecrackerVersion.firecracker_version",
+            "#1784",
+        ),
+        ("api-property:InstanceActionInfo.action_type", "#1784"),
+        ("api-property:InstanceInfo.app_name", "#1784"),
+        ("api-property:InstanceInfo.id", "#1784"),
+        ("api-property:InstanceInfo.state", "#1784"),
+        ("api-property:InstanceInfo.vmm_version", "#1784"),
+        ("api-property:MsrModifier.addr", "#1784"),
+        ("api-property:MsrModifier.bitmap", "#1784"),
+        ("api-schema:CpuidLeafModifier", "#1784"),
+        ("api-schema:CpuidRegisterModifier", "#1784"),
+        ("api-schema:Error", "#1784"),
+        ("api-schema:FirecrackerVersion", "#1784"),
+        ("api-schema:FullVmConfiguration", "#1784"),
+        ("api-schema:InstanceActionInfo", "#1784"),
+        ("api-schema:InstanceInfo", "#1784"),
+        ("api-schema:MsrModifier", "#1784"),
+        ("corpus:actions-api", "#1784"),
+        (
+            "semantic.specification:api-availability-stability-and-failure-information",
+            "#1784",
+        ),
+        ("api-operation:PUT /logger", "#1786"),
+        ("api-path:/logger", "#1786"),
+        ("api-property:FullVmConfiguration.logger", "#1786"),
+        ("api-property:Logger.level", "#1786"),
+        ("api-property:Logger.log_path", "#1786"),
+        ("api-property:Logger.module", "#1786"),
+        ("api-property:Logger.show_level", "#1786"),
+        ("api-property:Logger.show_log_origin", "#1786"),
+        ("api-schema:Logger", "#1786"),
+        ("corpus:logger", "#1786"),
+        (
+            "semantic.observability:logger-delivery-filtering-loss-and-redaction",
+            "#1786",
+        ),
+        ("api-operation:PUT /metrics", "#1787"),
+        ("api-path:/metrics", "#1787"),
+        ("api-property:FullVmConfiguration.metrics", "#1787"),
+        ("api-property:Metrics.metrics_path", "#1787"),
+        ("api-property:RateLimiter.bandwidth", "#1787"),
+        ("api-property:RateLimiter.ops", "#1787"),
+        ("api-property:TokenBucket.one_time_burst", "#1787"),
+        ("api-property:TokenBucket.refill_time", "#1787"),
+        ("api-property:TokenBucket.size", "#1787"),
+        ("api-schema:Metrics", "#1787"),
+        ("api-schema:RateLimiter", "#1787"),
+        ("api-schema:TokenBucket", "#1787"),
+        ("corpus:metrics", "#1790"),
+        (
+            "semantic.observability:metrics-schema-producers-flush-and-lifecycle",
+            "#1790",
+        ),
+        ("corpus:tracing", "#1791"),
+        (
+            "tool-argument:cpu-template-helper/template/dump/config",
+            "#1792",
+        ),
+        (
+            "tool-argument:cpu-template-helper/template/dump/output",
+            "#1792",
+        ),
+        (
+            "tool-argument:cpu-template-helper/template/dump/template",
+            "#1792",
+        ),
+        (
+            "tool-argument:cpu-template-helper/template/verify/config",
+            "#1792",
+        ),
+        (
+            "tool-argument:cpu-template-helper/template/verify/template",
+            "#1792",
+        ),
+        ("tool-operation:cpu-template-helper/template/dump", "#1792"),
+        (
+            "tool-operation:cpu-template-helper/template/verify",
+            "#1792",
+        ),
+        (
+            "tool-argument:cpu-template-helper/template/strip/paths",
+            "#1793",
+        ),
+        (
+            "tool-argument:cpu-template-helper/template/strip/suffix",
+            "#1793",
+        ),
+        ("tool-operation:cpu-template-helper/template/strip", "#1793"),
+        (
+            "tool-argument:cpu-template-helper/fingerprint/compare/curr",
+            "#1794",
+        ),
+        (
+            "tool-argument:cpu-template-helper/fingerprint/compare/filters",
+            "#1794",
+        ),
+        (
+            "tool-argument:cpu-template-helper/fingerprint/compare/prev",
+            "#1794",
+        ),
+        (
+            "tool-argument:cpu-template-helper/fingerprint/dump/config",
+            "#1794",
+        ),
+        (
+            "tool-argument:cpu-template-helper/fingerprint/dump/output",
+            "#1794",
+        ),
+        (
+            "tool-argument:cpu-template-helper/fingerprint/dump/template",
+            "#1794",
+        ),
+        (
+            "tool-operation:cpu-template-helper/fingerprint/compare",
+            "#1794",
+        ),
+        (
+            "tool-operation:cpu-template-helper/fingerprint/dump",
+            "#1794",
+        ),
+        ("corpus:cpu-template-helper", "#1795"),
+        ("corpus:cpu-templates", "#1795"),
+        (
+            "semantic.cpu:configuration-templates-and-feature-state",
+            "#1795",
+        ),
+        ("corpus:getting-started", "#1796"),
+        ("corpus:rootfs-and-kernel", "#1796"),
+        ("corpus:formal-verification", "#1797"),
+        ("corpus:network-performance", "#1798"),
+        ("corpus:specification", "#1798"),
+        (
+            "semantic.specification:performance-resource-and-telemetry-outcomes",
+            "#1798",
+        ),
+        ("corpus:design", "#1799"),
+        ("corpus:device-api", "#1799"),
+        ("corpus:release-changelog", "#1799"),
+        (
+            "semantic.tools:packaging-help-errors-and-applicable-operations",
+            "#1799",
+        ),
+        ("semantic.transport:virtio-mmio-activation", "#1799"),
+    ];
+    const RETAINED_HANDOFFS: [(&str, &str); 9] = [
+        ("corpus:jailer", "#1373"),
+        ("corpus:production-host", "#1373"),
+        ("tool-argument:jailer/chroot-base-dir", "#1373"),
+        ("tool-argument:jailer/gid", "#1373"),
+        ("tool-argument:jailer/uid", "#1373"),
+        ("tool-operation:jailer/run", "#1373"),
+        ("corpus:network-setup", "#1378"),
+        (
+            "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+            "#1378",
+        ),
+        (
+            "semantic.cross-capability:state-errors-metrics-security-and-snapshots",
+            "Wave 8",
+        ),
+    ];
+    const CORE_IMPLEMENTED: [&str; 22] = [
+        "api-operation:GET /",
+        "api-operation:GET /version",
+        "api-operation:GET /vm/config",
+        "api-operation:PUT /actions",
+        "api-path:/",
+        "api-path:/actions",
+        "api-path:/version",
+        "api-path:/vm/config",
+        "api-property:Error.fault_message",
+        "api-property:FirecrackerVersion.firecracker_version",
+        "api-property:InstanceActionInfo.action_type",
+        "api-property:InstanceInfo.app_name",
+        "api-property:InstanceInfo.id",
+        "api-property:InstanceInfo.state",
+        "api-property:InstanceInfo.vmm_version",
+        "api-schema:Error",
+        "api-schema:FirecrackerVersion",
+        "api-schema:FullVmConfiguration",
+        "api-schema:InstanceActionInfo",
+        "api-schema:InstanceInfo",
+        "corpus:actions-api",
+        "semantic.specification:api-availability-stability-and-failure-information",
+    ];
+    const X86_IMPOSSIBLE: [&str; 13] = [
+        "api-property:CpuConfig.cpuid_modifiers",
+        "api-property:CpuConfig.msr_modifiers",
+        "api-property:CpuidLeafModifier.flags",
+        "api-property:CpuidLeafModifier.leaf",
+        "api-property:CpuidLeafModifier.modifiers",
+        "api-property:CpuidLeafModifier.subleaf",
+        "api-property:CpuidRegisterModifier.bitmap",
+        "api-property:CpuidRegisterModifier.register",
+        "api-property:MsrModifier.addr",
+        "api-property:MsrModifier.bitmap",
+        "api-schema:CpuidLeafModifier",
+        "api-schema:CpuidRegisterModifier",
+        "api-schema:MsrModifier",
+    ];
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let by_id = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+    let contract = std::fs::read_to_string(repository_root.join(CONTRACT_PATH))
+        .expect("Wave 7 contract must be readable");
+    let normalized_contract = contract.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let owned = WAVE_7_OWNED
+        .iter()
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
+    let handoffs = RETAINED_HANDOFFS
+        .iter()
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
+    let implemented = CORE_IMPLEMENTED.into_iter().collect::<BTreeSet<_>>();
+    let impossible = X86_IMPOSSIBLE.into_iter().collect::<BTreeSet<_>>();
+
+    assert_eq!(owned.len(), 93, "Wave 7 owner identities must be unique");
+    assert_eq!(handoffs.len(), 9, "retained handoffs must be unique");
+    assert!(owned.is_disjoint(&handoffs));
+    assert_eq!(implemented.len(), 22);
+    assert_eq!(impossible.len(), 13);
+    assert!(implemented.is_disjoint(&impossible));
+    assert!(implemented.union(&impossible).all(|id| owned.contains(id)));
+
+    for (id, owner) in WAVE_7_OWNED.into_iter().chain(RETAINED_HANDOFFS) {
+        assert!(
+            by_id.contains_key(id),
+            "Wave 7 ledger identity must exist: {id}"
+        );
+        let prefix = format!("| `{id}` | {owner} |");
+        assert_eq!(
+            contract.matches(&prefix).count(),
+            1,
+            "Wave 7 contract must contain one exact owner row: {id}"
+        );
+    }
+
+    for id in &implemented {
+        let capability = by_id.get(id).expect("core API identity must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "core API identity must be terminal: {id}"
+        );
+        assert!(!capability.implementation.is_empty());
+        assert!(!capability.validation.is_empty());
+        assert!(capability.exclusion.is_none());
+        assert!(
+            contract.contains(&format!("| `{id}` | #1784 | `implemented-and-verified` |")),
+            "contract must record implemented result: {id}"
+        );
+    }
+
+    for id in &impossible {
+        let capability = by_id.get(id).expect("x86 identity must exist");
+        assert_eq!(capability.source_refs, [*id]);
+        assert_eq!(
+            capability.disposition,
+            Disposition::ProvenPlatformImpossible,
+            "x86 identity must retain terminal platform evidence: {id}"
+        );
+        let exclusion = capability
+            .exclusion
+            .as_ref()
+            .expect("x86 identity must retain exclusion evidence");
+        assert!(exclusion.upstream_contract.iter().any(|reference| matches!(
+            reference,
+            Reference::Authoritative { url } if url.contains("firecracker.yaml#L")
+        )));
+        assert!(exclusion.upstream_contract.iter().any(|reference| matches!(
+            reference,
+            Reference::Authoritative { url }
+                if url.contains("cpu_config/x86_64/custom_cpu_template.rs#L")
+        )));
+        assert!(
+            exclusion.platform_evidence.iter().all(|reference| matches!(
+                reference,
+                Reference::Authoritative { url } if url.starts_with("https://developer.apple.com/documentation/hypervisor/")
+            ))
+        );
+        assert!(exclusion.alternatives.len() >= 3);
+        assert_eq!(
+            local_reference_paths(&exclusion.stable_behavior),
+            Some(BTreeSet::from(["crates/api/src/http.rs"]))
+        );
+        assert_eq!(
+            local_reference_paths(&exclusion.focused_tests),
+            Some(BTreeSet::from([
+                "crates/api/src/http.rs",
+                "crates/bangbang/tests/process_e2e.rs",
+            ]))
+        );
+        assert!(
+            local_reference_paths(&exclusion.compatibility_docs)
+                .expect("x86 compatibility evidence must be local")
+                .contains(CONTRACT_PATH)
+        );
+        assert_eq!(
+            local_reference_paths(&exclusion.security_docs),
+            Some(BTreeSet::from(["docs/security.md"]))
+        );
+        assert_eq!(
+            exclusion.challenge,
+            Reference::Github {
+                url: CHALLENGE_URL.to_string()
+            }
+        );
+        assert!(capability.summary.contains("x86_64"));
+        assert!(capability.summary.contains("malformed"));
+        assert!(
+            contract.contains(&format!(
+                "| `{id}` | #1784 | `proven-platform-impossible` |"
+            )),
+            "contract must record platform result: {id}"
+        );
+    }
+
+    let selected = implemented
+        .union(&impossible)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let expected_audit = owned
+        .difference(&selected)
+        .copied()
+        .chain(handoffs.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let actual_audit = inventory
+        .capabilities
+        .iter()
+        .filter(|capability| capability.disposition == Disposition::AuditRequired)
+        .map(|capability| capability.id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual_audit, expected_audit);
+    for id in &handoffs {
+        assert_eq!(
+            by_id.get(id).expect("handoff must exist").disposition,
+            Disposition::AuditRequired,
+            "external or Wave 8 handoff must not move: {id}"
+        );
+    }
+
+    assert!(normalized_contract.contains("Producer-only children #1785, #1788, and #1789"));
+    assert!(normalized_contract.contains("does not claim comprehensive failure logging (#1786)"));
+    assert!(
+        normalized_contract
+            .contains("numeric startup/resource/performance or telemetry outcomes (#1798)")
+    );
+    assert!(normalized_contract.contains("final cross-capability interactions (Wave 8)"));
+    assert!(normalized_contract.contains("318 implemented, 67 audit-required"));
+    assert!(normalized_contract.contains("376/9/3/30"));
+}
+
+#[test]
 fn snapshot_paging_terminal_policy_is_stable() {
     const CAPABILITY_ID: &str = "corpus:snapshot-page-faults";
 
@@ -516,10 +906,10 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 296);
-    assert_eq!(count(Disposition::AuditRequired), 102);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 318);
+    assert_eq!(count(Disposition::AuditRequired), 67);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
 
 #[test]
@@ -1246,10 +1636,10 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 296);
-    assert_eq!(count(Disposition::AuditRequired), 102);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 318);
+    assert_eq!(count(Disposition::AuditRequired), 67);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
 
 #[test]
@@ -1543,10 +1933,10 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 296);
-    assert_eq!(count(Disposition::AuditRequired), 102);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 318);
+    assert_eq!(count(Disposition::AuditRequired), 67);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
 
 #[test]
@@ -1692,10 +2082,10 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 296);
-    assert_eq!(count(Disposition::AuditRequired), 102);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 318);
+    assert_eq!(count(Disposition::AuditRequired), 67);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
 
 #[test]
@@ -1962,10 +2352,10 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 296);
-    assert_eq!(count(Disposition::AuditRequired), 102);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 318);
+    assert_eq!(count(Disposition::AuditRequired), 67);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 
     for id in IMPLEMENTED_ORIGINAL {
         assert_eq!(

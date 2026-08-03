@@ -62,7 +62,7 @@ validation. They move from `audit-required` to
 | --- | --- | --- |
 | Boot source (7) | `api-operation:PUT /boot-source`; `api-path:/boot-source`; `api-schema:BootSource`; `api-property:BootSource.boot_args`; `api-property:BootSource.initrd_path`; `api-property:BootSource.kernel_image_path`; `api-property:FullVmConfiguration.boot-source` | Strict API/config parsing, transactional retained authority, value-redacted faults, kernel/initrd/rootfs/argument loading, FDT publication, GET serialization, and signed public startup. |
 | Machine configuration (6) | `api-operation:GET /machine-config`; `api-operation:PUT /machine-config`; `api-operation:PATCH /machine-config`; `api-path:/machine-config`; `api-schema:MachineConfiguration`; `api-property:FullVmConfiguration.machine-config` | Defaults, replacement/partial update, target vCPU and configured-equals-realized memory bounds, SMT/static-template/dirty/exact-2M policy, state admission, serialization, and failure-atomic balloon compatibility. |
-| CPU configuration (2) | `api-operation:PUT /cpu-config`; `api-path:/cpu-config` | The already-terminal `CpuConfig` arm64 schema, finite reviewed modifier execution on every vCPU, transactional replacement, value redaction, and stable outcomes for KVM/static/non-executable categories. X86 CPUID/MSR leaves remain separate Wave 7 audit work. |
+| CPU configuration (2) | `api-operation:PUT /cpu-config`; `api-path:/cpu-config` | The already-terminal `CpuConfig` arm64 schema, finite reviewed modifier execution on every vCPU, transactional replacement, value redaction, and stable outcomes for KVM/static/non-executable categories. The 13 x86 CPUID/MSR identities now have separate checked platform exclusions. |
 | VM state (3) | `api-path:/vm`; `api-schema:Vm`; `api-property:Vm.state` | The already-terminal PATCH operation is the path's only operation; Paused/Resumed parsing, idempotent process-owned topology-wide transitions, errors, latency, and signed SMP isolation are covered. |
 
 The public boot-source configuration is not an internal placeholder: the same
@@ -77,7 +77,7 @@ The directly reviewed identities and their current downstream boundaries are:
 
 | Boundary | Exact identities | Final disposition or owner |
 | --- | --- | --- |
-| Exported configuration | `api-operation:GET /vm/config`; `api-path:/vm/config`; `api-schema:FullVmConfiguration` | `audit-required`; Wave 8 owns final cross-capability certification after every exported device field has a terminal result. |
+| Exported configuration | `api-operation:GET /vm/config`; `api-path:/vm/config`; `api-schema:FullVmConfiguration` | `implemented-and-verified`; strict bodyless routing and deterministic serialization of the supported optional configuration are terminal under the [Wave 7 contract](observability-tools-specification-contract.md). The optional `.logger` and `.metrics` properties retain their #1786/#1787 owners, and Wave 8 retains only the final cross-capability interaction semantic. |
 | Snapshot create API leaves | `api-operation:PUT /snapshot/create`; `api-path:/snapshot/create`; `api-schema:SnapshotCreateParams`; `api-property:SnapshotCreateParams.snapshot_type`; `api-property:SnapshotCreateParams.snapshot_path`; `api-property:SnapshotCreateParams.mem_file_path` | `implemented-and-verified`; strict paused-only Full/Diff parsing and the two-output public transaction have portable, signed real-HVF, ordinary-production, and App Sandbox evidence. |
 | Snapshot load aggregates | `api-operation:PUT /snapshot/load`; `api-path:/snapshot/load`; `api-schema:SnapshotLoadParams` | `implemented-and-verified`; the strict schema, frozen native-v1 File/Uffd and native-v2 2.3–2.13 File/COW dispatch, Paused-first lifecycle, authority, failure, and mechanism boundaries are closed by the [Wave 6 snapshot contract](snapshot-wave6-contract.md). |
 | Snapshot semantics | `semantic.snapshot:full-create-load-and-public-lifecycle` | `implemented-and-verified`; the public lineage advances from device-free native-v2 2.3 through exact 2.12 Full with all 64 optional-device products, while exact 2.13 Diff adds mandatory base/selection/result kind 14 and retains all earlier readers. Zero-root and matching rebased results load through direct, contained, ordinary-production, and App Sandbox boundaries. |
@@ -87,7 +87,8 @@ The directly reviewed identities and their current downstream boundaries are:
 | Mixed snapshot aggregates | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `corpus:snapshot-versioning` | `implemented-and-verified`; the exact Diff/rebase, frozen external-pager, version ladder, mechanism exclusions, and bounded portability evidence compose in the Wave 6 ledger. |
 | Snapshot composition | `semantic.snapshot:multi-vcpu-drives-devices-and-mmds` | `implemented-and-verified`; Full 2.12 and Diff 2.13 close all 64 optional-device MMIO/PCI products, exact complete-set external drive restoration, tools, recapture, and direct/contained production evidence. Firecracker v1.16 has no per-drive load-override field. |
 | Snapshot tracking leaves | `api-property:SnapshotLoadParams.enable_diff_snapshots`; `api-property:SnapshotLoadParams.track_dirty_pages` | Already `implemented-and-verified`; they select complete destination dirty tracking and compose with the separately certified exact-2.13 create/rebase boundary. |
-| Broad specifications | `corpus:specification`; `semantic.specification:api-availability-stability-and-failure-information`; `semantic.specification:performance-resource-and-telemetry-outcomes` | `audit-required`; applicable repository-wide outcomes remain Wave 7 work after their producers stabilize. |
+| Core API specification | `semantic.specification:api-availability-stability-and-failure-information` | `implemented-and-verified`; socket/control-loop availability, strict request/response/state behavior, process survival, value-safe failures, and the signed lifecycle are terminal under the [Wave 7 contract](observability-tools-specification-contract.md). Comprehensive failure logging, formal proof, numeric performance/telemetry outcomes, and final cross-capability interactions remain explicitly separate. |
+| Broad specifications | `corpus:specification`; `semantic.specification:performance-resource-and-telemetry-outcomes` | `audit-required`; #1798 owns the applicable numeric startup, resource, performance, and telemetry outcomes after their producers stabilize. |
 | Cross-capability certification | `semantic.cross-capability:state-errors-metrics-security-and-snapshots` | `audit-required`; Wave 8 owns the final interaction audit after the individual lifecycle, error, telemetry, security, device, network, and snapshot producers stabilize. |
 | External isolation gates | `semantic.isolation:host-resource-authority-and-brokerage`; `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`; `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity` | Unchanged `missing-platform-feasible`; #1351 retains its independent external root, vmnet, credential, and deployment evidence gates. |
 
@@ -103,13 +104,15 @@ Those exact identities establish the following non-overlapping handoffs:
   distinct-host success pair remain explicit nonclaims rather than pending
   implementations; #1491 owns explicit future CPU/host/fleet pairs.
 - Wave 7 owns `cpu-template-helper`, host-side kernel/rootfs construction,
-  heterogeneous-fleet CPU-template outcomes, and applicable repository-wide
-  specification outcomes after producers stabilize.
-- Wave 8 owns final cross-capability certification of `GET /vm/config`,
-  `api-path:/vm/config`, and `api-schema:FullVmConfiguration`. Their terminal
-  boot, machine, and CPU properties do not certify unrelated device fields;
-  `semantic.cross-capability:state-errors-metrics-security-and-snapshots`
-  remains part of the same final interaction gate.
+  heterogeneous-fleet CPU-template outcomes, and the remaining applicable
+  repository-wide performance, resource, telemetry, and corpus outcomes after
+  producers stabilize. The core API and architecture-specific x86 boundary
+  are closed by the checked Wave 7 contract.
+- Wave 8 owns only
+  `semantic.cross-capability:state-errors-metrics-security-and-snapshots`, the
+  final interaction audit. Terminal `GET /vm/config`, path, and schema claims
+  remain bounded to deterministic export of supported optional fields and do
+  not certify unrelated logger, metrics, device, or cross-capability behavior.
 - #1351 retains only its independent external root/vmnet evidence gates. This
   audit does not change those records or their public behavior.
 

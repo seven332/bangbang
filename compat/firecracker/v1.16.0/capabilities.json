@@ -30,11 +30,55 @@
     {
       "id": "api-operation:GET /",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation GET /.",
+      "summary": "Return deterministic Firecracker-shaped instance information with the process-owned id, exact Not started/Running/Paused state, immutable VMM version, and application name over the owner-only Unix API socket.",
       "source_refs": [
         "api-operation:GET /"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-operation:GET /balloon",
@@ -267,20 +311,108 @@
     {
       "id": "api-operation:GET /version",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation GET /version.",
+      "summary": "Return the running Bangbang build version in FirecrackerVersion JSON through the exact bodyless GET operation without mutating VM state.",
       "source_refs": [
         "api-operation:GET /version"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-operation:GET /vm/config",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation GET /vm/config.",
+      "summary": "Return deterministic supported VM configuration state through the optional Firecracker FullVmConfiguration schema; separately owned logger and metrics properties remain omitted and nonterminal.",
       "source_refs": [
         "api-operation:GET /vm/config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PATCH /balloon",
@@ -747,11 +879,55 @@
     {
       "id": "api-operation:PUT /actions",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /actions.",
+      "summary": "Execute strict synchronous InstanceStart and FlushMetrics actions with state-aware failure atomicity, while rejecting SendCtrlAltDel on aarch64 before VMM mutation.",
       "source_refs": [
         "api-operation:PUT /actions"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /balloon",
@@ -1524,20 +1700,108 @@
     {
       "id": "api-path:/",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /.",
+      "summary": "Expose only bodyless GET at the exact instance-information path and reject every other method, body, or nonexact route with a stable value-free fault.",
       "source_refs": [
         "api-path:/"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-path:/actions",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /actions.",
+      "summary": "Expose only strict body-bearing PUT at the exact synchronous-action path with fixed empty, malformed, unsupported-action, and state faults.",
       "source_refs": [
         "api-path:/actions"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-path:/balloon",
@@ -2304,11 +2568,55 @@
     {
       "id": "api-path:/version",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /version.",
+      "summary": "Expose only bodyless GET at the exact version path and reject every other method, body, or nonexact route without stopping the API process.",
       "source_refs": [
         "api-path:/version"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-path:/vm",
@@ -2371,11 +2679,55 @@
     {
       "id": "api-path:/vm/config",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /vm/config.",
+      "summary": "Expose only bodyless GET at the exact full-configuration path with deterministic supported-field serialization and stable invalid-route handling.",
       "source_refs": [
         "api-path:/vm/config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-path:/vsock",
@@ -3658,11 +4010,93 @@
     {
       "id": "api-property:CpuConfig.cpuid_modifiers",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property CpuConfig.cpuid_modifiers.",
+      "summary": "Reject the x86_64-only cpuid_modifiers collection as a fixed value-free malformed arm64 request because public Apple Silicon HVF has no identity-preserving CPUID leaf namespace.",
       "source_refs": [
         "api-property:CpuConfig.cpuid_modifiers"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1092-L1113"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-property:CpuConfig.kvm_capabilities",
@@ -3754,11 +4188,93 @@
     {
       "id": "api-property:CpuConfig.msr_modifiers",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property CpuConfig.msr_modifiers.",
+      "summary": "Reject the x86_64-only msr_modifiers collection as a fixed value-free malformed arm64 request because public Apple Silicon HVF has no identity-preserving model-specific-register namespace.",
       "source_refs": [
         "api-property:CpuConfig.msr_modifiers"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1092-L1113"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-property:CpuConfig.reg_modifiers",
@@ -3908,56 +4424,548 @@
     {
       "id": "api-property:CpuidLeafModifier.flags",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property CpuidLeafModifier.flags.",
+      "summary": "Reject the x86_64-only KVM CPUID leaf flags field inside a fixed value-free malformed arm64 request; HVF has no equivalent CPUID leaf/subleaf flag identity.",
       "source_refs": [
         "api-property:CpuidLeafModifier.flags"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1125-L1148"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-property:CpuidLeafModifier.leaf",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property CpuidLeafModifier.leaf.",
+      "summary": "Reject the x86_64-only CPUID leaf index inside a fixed value-free malformed arm64 request; ARM system-register identifiers cannot preserve its meaning.",
       "source_refs": [
         "api-property:CpuidLeafModifier.leaf"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1125-L1148"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-property:CpuidLeafModifier.modifiers",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property CpuidLeafModifier.modifiers.",
+      "summary": "Reject the x86_64-only CPUID register-modifier collection inside a fixed value-free malformed arm64 request; HVF exposes no CPUID table to modify.",
       "source_refs": [
         "api-property:CpuidLeafModifier.modifiers"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1125-L1148"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-property:CpuidLeafModifier.subleaf",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property CpuidLeafModifier.subleaf.",
+      "summary": "Reject the x86_64-only CPUID subleaf index inside a fixed value-free malformed arm64 request; ARM register selection cannot preserve its meaning.",
       "source_refs": [
         "api-property:CpuidLeafModifier.subleaf"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1125-L1148"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-property:CpuidRegisterModifier.bitmap",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property CpuidRegisterModifier.bitmap.",
+      "summary": "Reject the x86_64-only 32-bit CPUID register bitmap inside a fixed value-free malformed arm64 request rather than reinterpret it as an ARM register mask.",
       "source_refs": [
         "api-property:CpuidRegisterModifier.bitmap"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1150-L1167"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-property:CpuidRegisterModifier.register",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property CpuidRegisterModifier.register.",
+      "summary": "Reject the x86_64-only eax/ebx/ecx/edx CPUID register selector inside a fixed value-free malformed arm64 request because no identity-preserving HVF target exists.",
       "source_refs": [
         "api-property:CpuidRegisterModifier.register"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1150-L1167"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-property:Drive.cache_type",
@@ -4347,20 +5355,108 @@
     {
       "id": "api-property:Error.fault_message",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Error.fault_message.",
+      "summary": "Serialize every public API failure as one fixed or value-redacted fault_message string without echoing untrusted request, resource, CPU, or host values.",
       "source_refs": [
         "api-property:Error.fault_message"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-property:FirecrackerVersion.firecracker_version",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FirecrackerVersion.firecracker_version.",
+      "summary": "Serialize the immutable running Bangbang package version under the exact required firecracker_version field.",
       "source_refs": [
         "api-property:FirecrackerVersion.firecracker_version"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.balloon",
@@ -4816,47 +5912,267 @@
     {
       "id": "api-property:InstanceActionInfo.action_type",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property InstanceActionInfo.action_type.",
+      "summary": "Require exactly one action_type and accept Firecracker's InstanceStart and FlushMetrics values while returning the pinned aarch64 rejection for SendCtrlAltDel.",
       "source_refs": [
         "api-property:InstanceActionInfo.action_type"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-property:InstanceInfo.app_name",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property InstanceInfo.app_name.",
+      "summary": "Serialize the immutable process application name under the exact required app_name field.",
       "source_refs": [
         "api-property:InstanceInfo.app_name"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-property:InstanceInfo.id",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property InstanceInfo.id.",
+      "summary": "Serialize the validated process-owned microVM identity under the exact required id field without altering its Unicode byte-bound contract.",
       "source_refs": [
         "api-property:InstanceInfo.id"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-property:InstanceInfo.state",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property InstanceInfo.state.",
+      "summary": "Serialize exactly Not started, Running, or Paused from committed process-owned VM state, preserving the prior state after rejected or failed actions.",
       "source_refs": [
         "api-property:InstanceInfo.state"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-property:InstanceInfo.vmm_version",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property InstanceInfo.vmm_version.",
+      "summary": "Serialize the immutable running Bangbang package version under the exact required vmm_version field.",
       "source_refs": [
         "api-property:InstanceInfo.vmm_version"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-property:Logger.level",
@@ -5892,20 +7208,184 @@
     {
       "id": "api-property:MsrModifier.addr",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MsrModifier.addr.",
+      "summary": "Reject the x86_64-only 32-bit model-specific-register address inside a fixed value-free malformed arm64 request rather than alias it to an ARM system-register identifier.",
       "source_refs": [
         "api-property:MsrModifier.addr"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1169-L1185"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-property:MsrModifier.bitmap",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MsrModifier.bitmap.",
+      "summary": "Reject the x86_64-only 64-bit model-specific-register bitmap inside a fixed value-free malformed arm64 request because public HVF has no corresponding MSR target.",
       "source_refs": [
         "api-property:MsrModifier.bitmap"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1169-L1185"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-property:NetworkInterface.guest_mac",
@@ -8254,20 +9734,184 @@
     {
       "id": "api-schema:CpuidLeafModifier",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema CpuidLeafModifier.",
+      "summary": "Reject the complete x86_64-only CPUID leaf/subleaf/flags/modifiers schema as a fixed value-free malformed arm64 request before runtime state or backend construction.",
       "source_refs": [
         "api-schema:CpuidLeafModifier"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1125-L1148"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-schema:CpuidRegisterModifier",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema CpuidRegisterModifier.",
+      "summary": "Reject the complete x86_64-only CPUID register/bitmap schema as a fixed value-free malformed arm64 request before runtime state or backend construction.",
       "source_refs": [
         "api-schema:CpuidRegisterModifier"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1150-L1167"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-schema:Drive",
@@ -8343,47 +9987,267 @@
     {
       "id": "api-schema:Error",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema Error.",
+      "summary": "Emit deterministic JSON error objects containing the Firecracker-shaped fault_message property for parser, route, state, resource, backend, and payload-limit failures.",
       "source_refs": [
         "api-schema:Error"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-schema:FirecrackerVersion",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema FirecrackerVersion.",
+      "summary": "Emit the exact required firecracker_version JSON object for the running Bangbang build.",
       "source_refs": [
         "api-schema:FirecrackerVersion"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-schema:FullVmConfiguration",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema FullVmConfiguration.",
+      "summary": "Emit deterministic supported optional sections of Firecracker's no-required-property FullVmConfiguration schema; logger and metrics properties retain their separate Wave 7 owners.",
       "source_refs": [
         "api-schema:FullVmConfiguration"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-schema:InstanceActionInfo",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema InstanceActionInfo.",
+      "summary": "Parse a strict deny-unknown-fields object containing the required Firecracker action_type and preserve action/state failure atomicity.",
       "source_refs": [
         "api-schema:InstanceActionInfo"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-schema:InstanceInfo",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema InstanceInfo.",
+      "summary": "Emit all four required Firecracker instance-information fields from immutable identity/version inputs and committed process-owned state.",
       "source_refs": [
         "api-schema:InstanceInfo"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-schema:Logger",
@@ -8697,11 +10561,93 @@
     {
       "id": "api-schema:MsrModifier",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema MsrModifier.",
+      "summary": "Reject the complete x86_64-only model-specific-register address/bitmap schema as a fixed value-free malformed arm64 request before runtime state or backend construction.",
       "source_refs": [
         "api-schema:MsrModifier"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1169-L1185"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L29-L48"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+        ],
+        "platform_evidence": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+        ],
+        "alternatives": [
+          "Accepting and silently ignoring CPUID or MSR input would report success without enforcing the requested guest CPU contract.",
+          "Mapping x86 CPUID leaves or model-specific registers into ARM system registers would change architecture, selector, width, and bitmap semantics.",
+          "Running an x86 emulator, Linux KVM sidecar, or different host backend would leave Bangbang's native macOS arm64/HVF target and one-process VM boundary."
+        ],
+        "stable_behavior": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "validate_cpu_config_json_shape and RequestError::MalformedRequest"
+        }
+        ],
+        "focused_tests": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_complete_x86_cpu_config_shapes_without_retaining_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_configures_vm_before_start x86 shape cases"
+        }
+        ],
+        "compatibility_docs": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "X86 CPUID/MSR platform boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "X86 CPUID and MSR platform boundary"
+        }
+        ],
+        "security_docs": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "X86 CPUID and MSR request values"
+        }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+        }
+      }
     },
     {
       "id": "api-schema:NetworkInterface",
@@ -9352,11 +11298,55 @@
     {
       "id": "corpus:actions-api",
       "family": "api-contract",
-      "summary": "Audit all applicable capability claims owned by the pinned actions-api source corpus.",
+      "summary": "Implement and verify the applicable pinned actions API: strict action schema, synchronous InstanceStart and FlushMetrics, aarch64 SendCtrlAltDel rejection, state admission, fixed faults, and failure atomicity.",
       "source_refs": [
         "corpus:actions-api"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "corpus:ballooning",
@@ -13016,12 +15006,56 @@
     {
       "id": "semantic.specification:api-availability-stability-and-failure-information",
       "family": "specifications",
-      "summary": "Audit applicable API availability, stability, request/failure information, startup, and operational specification outcomes.",
+      "summary": "Keep the owner-only API socket available while the control loop lives; provide strict request, response, state, survival, and value-safe failure behavior with signed lifecycle evidence, while logger, formal, performance, telemetry, and Wave 8 interaction claims retain their exact downstream owners.",
       "source_refs": [
         "corpus:formal-verification",
         "corpus:specification"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core Firecracker API request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API dispatch and state-aware response handling"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "InstanceInfo, VmmAction, and full configuration state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+          "anchor": "Core API certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "core instance, version, configuration, action, route, and fault tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "core API controller and Unix socket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_and_pauses_two_isolated_public_smp_guests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable API success, malformed input, method/path, state, and redaction tests"
+        }
+      ]
     },
     {
       "id": "semantic.specification:performance-resource-and-telemetry-outcomes",

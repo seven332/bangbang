@@ -1428,6 +1428,28 @@ documents may retain selected-family counts only when a focused test uses them
 as a closure invariant; do not copy global totals or delivery chronology into
 prose.
 
+### Wave 7 core API and ownership evidence
+
+The checked
+[Wave 7 ownership and specification contract](../compat/firecracker/v1.16.0/observability-tools-specification-contract.md)
+pins the exact #1491-owned set, retained handoffs, core API terminal set, and
+x86 CPUID/MSR exclusions. Changes to that boundary must run the focused ledger,
+strict full-shape request, and real-process nonmutation tests:
+
+```sh
+cargo test -p bangbang-firecracker-capability-audit --test checked_inventory wave_7_ownership_and_core_api_policy_is_stable --locked
+cargo test -p bangbang-api rejects_complete_x86_cpu_config_shapes_without_retaining_values --locked
+cargo test -p bangbang --test process_e2e executable_configures_vm_before_start --locked
+```
+
+The API test submits complete CPUID-only, MSR-only, and combined x86 shapes and
+requires one fixed value-free malformed result. The process case sends the same
+classes through the real Unix socket and proves the process survives, the
+instance remains `Not started`, and `GET /vm/config` is unchanged. The ledger
+test mechanically prevents dropped or double-owned rows and prevents the core
+API schema from absorbing the independently owned logger, metrics, performance,
+formal-verification, or Wave 8 interaction results.
+
 ### Snapshot Paging Evidence
 
 Changes to the frozen native-v1 Uffd reader, pager protocol, lazy-memory
