@@ -70,6 +70,13 @@ not claim comprehensive failure logging (#1786), formal proofs (#1797),
 numeric startup/resource/performance or telemetry outcomes (#1798), or final
 cross-capability interactions (Wave 8).
 
+The merged #1785 delivery foundation may strengthen logger internals without
+changing this ledger: closed 512-byte records, selector templates, bounded
+atomic boot admission, one fixed queue/sink owner, exact loss accounting, and
+failure-atomic stable-worker replacement are prerequisites for the separately
+owned #1786 logger audit. They do not by themselves promote any logger row,
+change an evidence owner, or claim comprehensive producer/failure coverage.
+
 ## X86 CPUID/MSR platform boundary
 
 All 13 CPUID/MSR identities are executable x86_64 contracts. ARM register

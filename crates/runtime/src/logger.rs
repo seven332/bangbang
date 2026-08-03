@@ -1,21 +1,31 @@
+mod delivery;
+mod event;
+mod rate_limiter;
+
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{LineWriter, Write};
+#[cfg(test)]
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
-use std::time::Instant;
+
+use delivery::{
+    LoggerDelivery, LoggerDeliveryConfig, LoggerProducer, PreparedLoggerWriter, ReplaceWriterError,
+};
+use event::{LogBatch, LogOrigin, LogRecord, LoggerEvent};
+#[cfg(test)]
+use rate_limiter::LogRateLimiterClock;
+use rate_limiter::{LogRateLimitDecision, LoggerRateLimitIdentity, LoggerRateLimiters};
+
+pub use event::{LoggerAction, LoggerApiRoute, LoggerHttpMethod};
 
 const BOOT_TIMER_LOG_MODULE: &str = "bangbang_runtime::boot_timer";
 const API_REQUEST_LOG_MODULE: &str = "bangbang_runtime::api_server";
 const MINIMAL_ACTION_LOG_MODULE: &str = "bangbang_runtime::vmm_action";
-const DEFAULT_LOG_RATE_LIMIT_BURST: u64 = 10;
-const DEFAULT_LOG_RATE_LIMIT_REFILL_MS: u64 = 5_000;
-const DEFAULT_LOG_RATE_LIMIT_PERIOD_MS: u64 =
-    DEFAULT_LOG_RATE_LIMIT_REFILL_MS / DEFAULT_LOG_RATE_LIMIT_BURST;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LoggerLevel {
@@ -53,8 +63,8 @@ impl LoggerLevel {
 }
 
 impl fmt::Display for LoggerLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -78,8 +88,8 @@ impl FromStr for LoggerLevel {
 pub struct LoggerLevelParseError;
 
 impl fmt::Display for LoggerLevelParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("logger level is invalid")
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("logger level is invalid")
     }
 }
 
@@ -204,25 +214,36 @@ impl LoggerConfig {
 pub enum LoggerConfigError {
     EmptyPath,
     OpenFile(std::io::ErrorKind),
+    SpawnWorker(std::io::ErrorKind),
+    DeliveryQueueFull,
+    ReplacementTimedOut,
 }
 
 impl fmt::Display for LoggerConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyPath => f.write_str("logger path must not be empty"),
-            Self::OpenFile(kind) => write!(f, "logger output could not be initialized: {kind:?}"),
+            Self::EmptyPath => formatter.write_str("logger path must not be empty"),
+            Self::OpenFile(kind) => {
+                write!(
+                    formatter,
+                    "logger output could not be initialized: {kind:?}"
+                )
+            }
+            Self::SpawnWorker(kind) => {
+                write!(
+                    formatter,
+                    "logger worker could not be initialized: {kind:?}"
+                )
+            }
+            Self::DeliveryQueueFull => {
+                formatter.write_str("logger output replacement queue is full")
+            }
+            Self::ReplacementTimedOut => formatter.write_str("logger output replacement timed out"),
         }
     }
 }
 
 impl std::error::Error for LoggerConfigError {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoggerDeliveryError {
-    LockContended,
-    LockPoisoned,
-    Write,
-}
 
 #[derive(Debug, Default)]
 struct SharedLoggerMetricsInner {
@@ -236,24 +257,35 @@ pub(crate) struct SharedLoggerMetrics {
 }
 
 impl SharedLoggerMetrics {
-    fn record_saturating(counter: &AtomicU64) {
+    fn record_saturating_by(counter: &AtomicU64, amount: usize) {
+        let amount = u64::try_from(amount).unwrap_or(u64::MAX);
         let mut current = counter.load(Ordering::Relaxed);
         while current != u64::MAX {
-            let next = current.saturating_add(1);
-            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-            {
+            match counter.compare_exchange_weak(
+                current,
+                current.saturating_add(amount),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return,
                 Err(actual) => current = actual,
             }
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn record_missed_log(&self) {
-        Self::record_saturating(&self.inner.missed_log_count);
+        self.record_missed_logs(1);
+    }
+
+    pub(crate) fn record_missed_logs(&self, count: usize) {
+        if count != 0 {
+            Self::record_saturating_by(&self.inner.missed_log_count, count);
+        }
     }
 
     pub(crate) fn record_rate_limited_log(&self) {
-        Self::record_saturating(&self.inner.rate_limited_log_count);
+        Self::record_saturating_by(&self.inner.rate_limited_log_count, 1);
     }
 
     pub(crate) fn missed_log_count(&self) -> u64 {
@@ -265,101 +297,27 @@ impl SharedLoggerMetrics {
     }
 }
 
-trait LogRateLimiterClock: fmt::Debug + Send + Sync {
-    fn now_ms(&self) -> u64;
-}
-
-#[derive(Debug)]
-struct SystemLogRateLimiterClock {
-    epoch: Instant,
-}
-
-impl Default for SystemLogRateLimiterClock {
-    fn default() -> Self {
-        Self {
-            epoch: Instant::now(),
-        }
-    }
-}
-
-impl LogRateLimiterClock for SystemLogRateLimiterClock {
-    fn now_ms(&self) -> u64 {
-        let elapsed = self.epoch.elapsed();
-        elapsed
-            .as_secs()
-            .saturating_mul(1_000)
-            .saturating_add(u64::from(elapsed.subsec_millis()))
-    }
-}
-
-#[derive(Debug, Default)]
-struct LogRateLimiterState {
-    theoretical_arrival_time_ms: u64,
-    suppressed: u64,
-}
-
-#[derive(Debug)]
-struct LogRateLimiterInner {
-    clock: Arc<dyn LogRateLimiterClock>,
-    state: Mutex<LogRateLimiterState>,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct BootTimerLogRateLimiter {
-    inner: Arc<LogRateLimiterInner>,
-}
-
-impl Default for BootTimerLogRateLimiter {
-    fn default() -> Self {
-        Self::with_clock(Arc::new(SystemLogRateLimiterClock::default()))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogRateLimitDecision {
-    Admitted { suppressed: u64 },
-    Denied,
+    inner: LoggerRateLimiters,
 }
 
 impl BootTimerLogRateLimiter {
+    #[cfg(test)]
     fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
         Self {
-            inner: Arc::new(LogRateLimiterInner {
-                clock,
-                state: Mutex::new(LogRateLimiterState::default()),
-            }),
+            inner: LoggerRateLimiters::with_clock(clock),
         }
     }
 
     fn check(&self) -> LogRateLimitDecision {
-        let now_ms = self.inner.clock.now_ms();
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let next_theoretical_arrival_time_ms = state
-            .theoretical_arrival_time_ms
-            .max(now_ms)
-            .saturating_add(DEFAULT_LOG_RATE_LIMIT_PERIOD_MS);
-
-        if next_theoretical_arrival_time_ms.saturating_sub(now_ms)
-            > DEFAULT_LOG_RATE_LIMIT_REFILL_MS
-        {
-            state.suppressed = state.suppressed.saturating_add(1);
-            return LogRateLimitDecision::Denied;
-        }
-
-        state.theoretical_arrival_time_ms = next_theoretical_arrival_time_ms;
-        let suppressed = state.suppressed;
-        state.suppressed = 0;
-        LogRateLimitDecision::Admitted { suppressed }
+        self.inner.check(LoggerRateLimitIdentity::BootTimer)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct BootTimerLogger {
-    sink: Option<LoggerSink>,
+    producer: Option<LoggerProducer>,
     level: LoggerLevel,
     show_level: bool,
     show_log_origin: bool,
@@ -369,30 +327,19 @@ pub struct BootTimerLogger {
 }
 
 impl BootTimerLogger {
-    fn record_delivery(&self, result: Result<(), LoggerDeliveryError>) -> bool {
-        if result.is_err() {
-            self.metrics.record_missed_log();
-            return false;
-        }
-        true
-    }
-
     #[track_caller]
     pub fn log_boot_time(&self, wall_time_us: u64, cpu_time_us: u64) -> bool {
         const BOOT_TIMER_LEVEL: LoggerLevel = LoggerLevel::Info;
 
-        if !self.level.allows(BOOT_TIMER_LEVEL) {
+        if !self.level.allows(BOOT_TIMER_LEVEL)
+            || !module_filter_allows(self.module.as_deref(), BOOT_TIMER_LOG_MODULE)
+        {
             return false;
         }
 
-        if !module_filter_allows(self.module.as_deref(), BOOT_TIMER_LOG_MODULE) {
-            return false;
-        }
-
-        let Some(sink) = &self.sink else {
+        let Some(producer) = &self.producer else {
             return false;
         };
-
         let suppressed = match self.rate_limiter.check() {
             LogRateLimitDecision::Admitted { suppressed } => suppressed,
             LogRateLimitDecision::Denied => {
@@ -400,58 +347,72 @@ impl BootTimerLogger {
                 return false;
             }
         };
-        let origin = Location::caller();
-
-        if suppressed != 0 {
-            self.record_delivery(sink.write_rate_limit_recovery(
-                self.show_level,
-                self.show_log_origin,
-                origin,
-                LoggerLevel::Warn,
-                suppressed,
-            ));
-        }
-
-        self.record_delivery(sink.write_boot_timer(
+        let origin = LogOrigin::from(Location::caller());
+        let boot = LogRecord::encode(
             self.show_level,
             self.show_log_origin,
             origin,
             BOOT_TIMER_LEVEL,
-            wall_time_us,
-            cpu_time_us,
-        ))
+            LoggerEvent::BootTime {
+                wall_time_us,
+                cpu_time_us,
+            },
+        );
+        let batch = if suppressed == 0 {
+            LogBatch::one(boot)
+        } else {
+            let recovery = LogRecord::encode(
+                self.show_level,
+                self.show_log_origin,
+                origin,
+                LoggerLevel::Warn,
+                LoggerEvent::RateLimitRecovery { suppressed },
+            );
+            LogBatch::two(recovery, boot)
+        };
+
+        producer.deliver_guest(batch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_delivery_for_test(&self) -> bool {
+        self.producer
+            .as_ref()
+            .is_none_or(LoggerProducer::wait_for_idle_for_test)
     }
 }
 
 pub struct LoggerState {
-    sink: Option<LoggerSink>,
+    delivery: Option<LoggerDelivery>,
     level: LoggerLevel,
     show_level: bool,
     show_log_origin: bool,
     module: Option<String>,
     metrics: SharedLoggerMetrics,
     boot_timer_rate_limiter: BootTimerLogRateLimiter,
+    delivery_config: LoggerDeliveryConfig,
 }
 
 impl fmt::Debug for LoggerState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LoggerState")
-            .field("sink", &self.sink.as_ref().map(|_| "<owned>"))
+            .field("delivery", &self.delivery.as_ref().map(|_| "<owned>"))
             .field("level", &self.level)
             .field("show_level", &self.show_level)
             .field("show_log_origin", &self.show_log_origin)
             .field("module", &self.module.as_ref().map(|_| "<redacted>"))
             .field("metrics", &self.metrics)
             .field("boot_timer_rate_limiter", &self.boot_timer_rate_limiter)
+            .field("delivery_config", &self.delivery_config)
             .finish()
     }
 }
 
-/// A fully validated logger update whose optional replacement sink is ready.
+/// A fully validated logger update whose optional replacement writer is ready.
 pub struct PreparedLoggerConfig {
     config: LoggerConfig,
-    sink: Option<LoggerSink>,
+    writer: Option<PreparedLoggerWriter>,
 }
 
 impl fmt::Debug for PreparedLoggerConfig {
@@ -459,7 +420,7 @@ impl fmt::Debug for PreparedLoggerConfig {
         formatter
             .debug_struct("PreparedLoggerConfig")
             .field("config", &self.config)
-            .field("sink", &self.sink.as_ref().map(|_| "<owned>"))
+            .field("writer", &self.writer.as_ref().map(|_| "<owned>"))
             .finish()
     }
 }
@@ -467,13 +428,14 @@ impl fmt::Debug for PreparedLoggerConfig {
 impl Default for LoggerState {
     fn default() -> Self {
         Self {
-            sink: None,
+            delivery: None,
             level: LoggerLevel::Info,
             show_level: false,
             show_log_origin: false,
             module: None,
             metrics: SharedLoggerMetrics::default(),
             boot_timer_rate_limiter: BootTimerLogRateLimiter::default(),
+            delivery_config: LoggerDeliveryConfig::default(),
         }
     }
 }
@@ -486,30 +448,33 @@ impl LoggerState {
         }
     }
 
-    fn record_delivery(&self, result: Result<(), LoggerDeliveryError>) -> bool {
-        if result.is_err() {
-            self.metrics.record_missed_log();
-            return false;
-        }
-        true
-    }
-
     pub fn configure(&mut self, input: LoggerConfigInput) -> Result<(), LoggerConfigError> {
         let config = input.validate()?;
         let prepared = Self::prepare_config(config, None)?;
-        self.commit_config(prepared);
-
-        Ok(())
+        self.commit_config(prepared)
     }
 
-    /// Prepares an update without mutating the active logger state.
+    /// Opens or adopts an optional replacement writer without mutating active state.
     pub fn prepare_config(
         config: LoggerConfig,
         provided_file: Option<File>,
     ) -> Result<PreparedLoggerConfig, LoggerConfigError> {
-        let sink = match (config.log_path(), provided_file) {
-            (Some(_), Some(file)) => Some(LoggerSink::from_file(file)?),
-            (Some(path), None) => Some(LoggerSink::open(path)?),
+        let writer = match (config.log_path(), provided_file) {
+            (Some(_), Some(file)) => {
+                let file = crate::output_file::adopt_write_only_file(file)
+                    .map_err(LoggerConfigError::OpenFile)?;
+                Some(PreparedLoggerWriter::new(file))
+            }
+            (Some(path), None) => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .create(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path)
+                    .map_err(|error| LoggerConfigError::OpenFile(error.kind()))?;
+                Some(PreparedLoggerWriter::new(file))
+            }
             (None, None) => None,
             (None, Some(_)) => {
                 return Err(LoggerConfigError::OpenFile(
@@ -518,16 +483,50 @@ impl LoggerState {
             }
         };
 
-        Ok(PreparedLoggerConfig { config, sink })
+        Ok(PreparedLoggerConfig { config, writer })
     }
 
-    /// Commits a previously prepared update without further fallible work.
-    pub fn commit_config(&mut self, prepared: PreparedLoggerConfig) {
-        let PreparedLoggerConfig { config, sink } = prepared;
+    /// Commits a prepared update after any writer transaction succeeds.
+    pub fn commit_config(
+        &mut self,
+        prepared: PreparedLoggerConfig,
+    ) -> Result<(), LoggerConfigError> {
+        let PreparedLoggerConfig { config, writer } = prepared;
 
-        if let Some(sink) = sink {
-            self.sink = Some(sink);
+        if let Some(writer) = writer {
+            self.commit_writer(writer)?;
         }
+        self.apply_config(config);
+        Ok(())
+    }
+
+    fn commit_writer(&mut self, writer: PreparedLoggerWriter) -> Result<(), LoggerConfigError> {
+        let Some(delivery) = &self.delivery else {
+            let delivery =
+                LoggerDelivery::spawn(writer, self.metrics.clone(), self.delivery_config.clone())
+                    .map_err(LoggerConfigError::SpawnWorker)?;
+            self.delivery = Some(delivery);
+            return Ok(());
+        };
+
+        match delivery.replace_writer(writer) {
+            Ok(()) => Ok(()),
+            Err(ReplaceWriterError::Full(_writer)) => Err(LoggerConfigError::DeliveryQueueFull),
+            Err(ReplaceWriterError::TimedOut) => Err(LoggerConfigError::ReplacementTimedOut),
+            Err(ReplaceWriterError::Disconnected(writer)) => {
+                let successor = LoggerDelivery::spawn(
+                    writer,
+                    self.metrics.clone(),
+                    self.delivery_config.clone(),
+                )
+                .map_err(LoggerConfigError::SpawnWorker)?;
+                self.delivery = Some(successor);
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_config(&mut self, config: LoggerConfig) {
         if let Some(level) = config.level() {
             self.level = level;
         }
@@ -543,59 +542,52 @@ impl LoggerState {
     }
 
     #[track_caller]
-    pub(crate) fn log_action(&self, action: &str) -> bool {
+    pub(crate) fn log_action(&self, action: LoggerAction) -> bool {
         const ACTION_LEVEL: LoggerLevel = LoggerLevel::Info;
 
-        if !self.level.allows(ACTION_LEVEL) {
+        if !self.level.allows(ACTION_LEVEL)
+            || !module_filter_allows(self.module.as_deref(), MINIMAL_ACTION_LOG_MODULE)
+        {
             return false;
         }
-
-        if !module_filter_allows(self.module.as_deref(), MINIMAL_ACTION_LOG_MODULE) {
-            return false;
-        }
-
-        let Some(sink) = &self.sink else {
+        let Some(delivery) = &self.delivery else {
             return false;
         };
-
-        self.record_delivery(sink.write_action(
+        let record = LogRecord::encode(
             self.show_level,
             self.show_log_origin,
-            Location::caller(),
+            LogOrigin::from(Location::caller()),
             ACTION_LEVEL,
-            action,
-        ))
+            LoggerEvent::Action(action),
+        );
+        delivery.producer().deliver_host(LogBatch::one(record))
     }
 
     #[track_caller]
-    pub fn log_api_request(&self, method: &str, path: impl fmt::Display) -> bool {
+    pub fn log_api_request(&self, method: LoggerHttpMethod, route: LoggerApiRoute) -> bool {
         const API_REQUEST_LEVEL: LoggerLevel = LoggerLevel::Info;
 
-        if !self.level.allows(API_REQUEST_LEVEL) {
+        if !self.level.allows(API_REQUEST_LEVEL)
+            || !module_filter_allows(self.module.as_deref(), API_REQUEST_LOG_MODULE)
+        {
             return false;
         }
-
-        if !module_filter_allows(self.module.as_deref(), API_REQUEST_LOG_MODULE) {
-            return false;
-        }
-
-        let Some(sink) = &self.sink else {
+        let Some(delivery) = &self.delivery else {
             return false;
         };
-
-        self.record_delivery(sink.write_api_request(
+        let record = LogRecord::encode(
             self.show_level,
             self.show_log_origin,
-            Location::caller(),
+            LogOrigin::from(Location::caller()),
             API_REQUEST_LEVEL,
-            method,
-            path,
-        ))
+            LoggerEvent::ApiRequest { method, route },
+        );
+        delivery.producer().deliver_host(LogBatch::one(record))
     }
 
     pub fn boot_timer_logger(&self) -> BootTimerLogger {
         BootTimerLogger {
-            sink: self.sink.clone(),
+            producer: self.delivery.as_ref().map(LoggerDelivery::producer),
             level: self.level,
             show_level: self.show_level,
             show_log_origin: self.show_log_origin,
@@ -629,158 +621,25 @@ impl LoggerState {
 
     #[cfg(test)]
     pub const fn is_configured(&self) -> bool {
-        self.sink.is_some()
+        self.delivery.is_some()
     }
 
     #[cfg(test)]
     pub(crate) fn configure_test_writer(&mut self, writer: impl Write + Send + 'static) {
-        self.sink = Some(LoggerSink::from_writer(writer));
-    }
-}
-
-#[derive(Clone)]
-struct LoggerSink {
-    writer: Arc<Mutex<LineWriter<Box<dyn Write + Send>>>>,
-}
-
-impl fmt::Debug for LoggerSink {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LoggerSink").finish_non_exhaustive()
-    }
-}
-
-impl LoggerSink {
-    fn open(path: &Path) -> Result<Self, LoggerConfigError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-            .map_err(|err| LoggerConfigError::OpenFile(err.kind()))?;
-
-        Ok(Self::from_writer(file))
+        self.commit_writer(PreparedLoggerWriter::new(writer))
+            .expect("test logger writer should configure");
     }
 
-    fn from_file(file: File) -> Result<Self, LoggerConfigError> {
-        let file =
-            crate::output_file::adopt_write_only_file(file).map_err(LoggerConfigError::OpenFile)?;
-        Ok(Self::from_writer(file))
+    #[cfg(test)]
+    fn set_delivery_config_for_test(&mut self, config: LoggerDeliveryConfig) {
+        self.delivery_config = config;
     }
 
-    fn from_writer(writer: impl Write + Send + 'static) -> Self {
-        Self {
-            writer: Arc::new(Mutex::new(LineWriter::new(Box::new(writer)))),
-        }
-    }
-
-    fn write_action(
-        &self,
-        show_level: bool,
-        show_log_origin: bool,
-        origin: &Location<'_>,
-        level: LoggerLevel,
-        action: &str,
-    ) -> Result<(), LoggerDeliveryError> {
-        self.write_message(
-            show_level,
-            show_log_origin,
-            origin,
-            level,
-            format_args!("action={action}"),
-        )
-    }
-
-    fn write_api_request(
-        &self,
-        show_level: bool,
-        show_log_origin: bool,
-        origin: &Location<'_>,
-        level: LoggerLevel,
-        method: &str,
-        path: impl fmt::Display,
-    ) -> Result<(), LoggerDeliveryError> {
-        self.write_message(
-            show_level,
-            show_log_origin,
-            origin,
-            level,
-            format_args!("The API server received a {method} request on \"{path}\"."),
-        )
-    }
-
-    fn write_boot_timer(
-        &self,
-        show_level: bool,
-        show_log_origin: bool,
-        origin: &Location<'_>,
-        level: LoggerLevel,
-        wall_time_us: u64,
-        cpu_time_us: u64,
-    ) -> Result<(), LoggerDeliveryError> {
-        let wall_time_ms = wall_time_us / 1_000;
-        let cpu_time_ms = cpu_time_us / 1_000;
-        self.write_message(
-            show_level,
-            show_log_origin,
-            origin,
-            level,
-            format_args!(
-            "Guest-boot-time = {wall_time_us:>6} us {wall_time_ms} ms, {cpu_time_us:>6} CPU us {cpu_time_ms} CPU ms"
-            ),
-        )
-    }
-
-    fn write_rate_limit_recovery(
-        &self,
-        show_level: bool,
-        show_log_origin: bool,
-        origin: &Location<'_>,
-        level: LoggerLevel,
-        suppressed: u64,
-    ) -> Result<(), LoggerDeliveryError> {
-        self.write_message(
-            show_level,
-            show_log_origin,
-            origin,
-            level,
-            format_args!("{suppressed} messages were suppressed due to rate limiting"),
-        )
-    }
-
-    fn write_message(
-        &self,
-        show_level: bool,
-        show_log_origin: bool,
-        origin: &Location<'_>,
-        level: LoggerLevel,
-        message: fmt::Arguments<'_>,
-    ) -> Result<(), LoggerDeliveryError> {
-        let mut writer = match self.writer.try_lock() {
-            Ok(writer) => writer,
-            Err(TryLockError::WouldBlock) => return Err(LoggerDeliveryError::LockContended),
-            Err(TryLockError::Poisoned(_)) => return Err(LoggerDeliveryError::LockPoisoned),
-        };
-
-        match (show_level, show_log_origin) {
-            (true, true) => writeln!(
-                writer,
-                "level={} origin={}:{} {message}",
-                level.as_str(),
-                origin.file(),
-                origin.line()
-            ),
-            (true, false) => writeln!(writer, "level={} {message}", level.as_str()),
-            (false, true) => writeln!(
-                writer,
-                "origin={}:{} {message}",
-                origin.file(),
-                origin.line()
-            ),
-            (false, false) => writeln!(writer, "{message}"),
-        }
-        .map_err(|_| LoggerDeliveryError::Write)?;
-        writer.flush().map_err(|_| LoggerDeliveryError::Write)
+    #[cfg(test)]
+    fn disconnect_delivery_for_test(&self) -> bool {
+        self.delivery
+            .as_ref()
+            .is_some_and(LoggerDelivery::disconnect_for_test)
     }
 }
 
@@ -790,18 +649,21 @@ fn module_filter_allows(filter: Option<&str>, module_path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
     use std::fs::{self, OpenOptions};
-    use std::io::{Error, ErrorKind, Write};
-    use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::io::{Error, ErrorKind, Read, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use super::delivery::WorkerObserver;
     use super::{
-        API_REQUEST_LOG_MODULE, BOOT_TIMER_LOG_MODULE, BootTimerLogRateLimiter,
-        LogRateLimitDecision, LogRateLimiterClock, LoggerConfigError, LoggerConfigInput,
-        LoggerLevel, LoggerState, MINIMAL_ACTION_LOG_MODULE, SharedLoggerMetrics,
+        BootTimerLogRateLimiter, LogRateLimitDecision, LogRateLimiterClock, LoggerAction,
+        LoggerApiRoute, LoggerConfigError, LoggerConfigInput, LoggerDeliveryConfig,
+        LoggerHttpMethod, LoggerLevel, LoggerState, SharedLoggerMetrics,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -818,11 +680,26 @@ mod tests {
         ))
     }
 
+    #[derive(Debug, Default)]
+    struct TestClock(AtomicU64);
+
+    impl TestClock {
+        fn set(&self, now_ms: u64) {
+            self.0.store(now_ms, Ordering::Release);
+        }
+    }
+
+    impl LogRateLimiterClock for TestClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
     #[derive(Debug)]
     struct FailingWriter;
 
     impl Write for FailingWriter {
-        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
             Err(Error::from(ErrorKind::BrokenPipe))
         }
 
@@ -832,899 +709,513 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct FlushFailingWriter;
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
-    impl Write for FlushFailingWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            Ok(buf.len())
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("writer lock should succeed")
+                .extend(bytes);
+            Ok(bytes.len())
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            Err(Error::from(ErrorKind::BrokenPipe))
+            Ok(())
         }
     }
 
-    #[derive(Debug, Clone, Default)]
-    struct TestLogRateLimiterClock {
-        now_ms: Arc<AtomicU64>,
+    #[derive(Debug, Default)]
+    struct WriterGateState {
+        entered: bool,
+        released: bool,
     }
 
-    impl TestLogRateLimiterClock {
-        fn advance_ms(&self, elapsed_ms: u64) {
-            self.now_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
-        }
-
-        fn set_ms(&self, now_ms: u64) {
-            self.now_ms.store(now_ms, Ordering::Relaxed);
-        }
+    #[derive(Debug, Default)]
+    struct WriterGate {
+        state: Mutex<WriterGateState>,
+        changed: Condvar,
     }
 
-    impl LogRateLimiterClock for TestLogRateLimiterClock {
-        fn now_ms(&self) -> u64 {
-            self.now_ms.load(Ordering::Relaxed)
+    impl WriterGate {
+        fn wait_until_entered(&self) {
+            let mut state = self.state.lock().expect("gate lock should succeed");
+            while !state.entered {
+                state = self.changed.wait(state).expect("gate wait should succeed");
+            }
+        }
+
+        fn release(&self) {
+            self.state
+                .lock()
+                .expect("gate lock should succeed")
+                .released = true;
+            self.changed.notify_all();
         }
     }
 
     #[derive(Debug)]
-    struct PanickingDisplay;
+    struct HeldRecordingWriter {
+        gate: Arc<WriterGate>,
+        output: Arc<Mutex<Vec<u8>>>,
+    }
 
-    impl std::fmt::Display for PanickingDisplay {
-        fn fmt(&self, _formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            panic!("suppressed logger output should not format the API request path");
+    impl Write for HeldRecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut state = self.gate.state.lock().expect("gate lock should succeed");
+            state.entered = true;
+            self.gate.changed.notify_all();
+            while !state.released {
+                state = self
+                    .gate
+                    .changed
+                    .wait(state)
+                    .expect("gate wait should succeed");
+            }
+            drop(state);
+            self.output
+                .lock()
+                .expect("output lock should succeed")
+                .extend(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
-    #[test]
-    fn shared_logger_metrics_saturate_at_u64_max() {
-        let metrics = SharedLoggerMetrics::default();
-        metrics
-            .inner
-            .missed_log_count
-            .store(u64::MAX - 1, Ordering::Relaxed);
-        metrics
-            .inner
-            .rate_limited_log_count
-            .store(u64::MAX - 1, Ordering::Relaxed);
-
-        metrics.record_missed_log();
-        metrics.record_missed_log();
-        metrics.record_rate_limited_log();
-        metrics.record_rate_limited_log();
-
-        assert_eq!(metrics.missed_log_count(), u64::MAX);
-        assert_eq!(metrics.rate_limited_log_count(), u64::MAX);
+    #[derive(Debug)]
+    struct TestFifo {
+        path: PathBuf,
+        reader: fs::File,
     }
 
-    fn assert_action_output_with_origin(output: &str, level: Option<LoggerLevel>, action: &str) {
-        let mut lines = output.lines();
-        let line = lines
-            .next()
-            .expect("logger output should include action line");
-        assert_eq!(lines.next(), None);
-
-        let prefix = level.map_or_else(
-            || "origin=".to_string(),
-            |level| format!("level={} origin=", level.as_str()),
-        );
-        assert!(line.starts_with(&prefix));
-
-        let suffix = format!(" action={action}");
-        assert!(line.ends_with(&suffix));
-
-        let origin = line
-            .strip_prefix(&prefix)
-            .expect("logger output should include origin prefix")
-            .strip_suffix(&suffix)
-            .expect("logger output should include action suffix");
-        let (file, line_number) = origin
-            .rsplit_once(':')
-            .expect("logger origin should include file and line");
-
-        assert!(file.ends_with(file!()), "unexpected origin file: {file}");
-        assert!(
-            line_number.parse::<u32>().is_ok(),
-            "unexpected origin line: {line_number}"
-        );
-    }
-
-    #[test]
-    fn parses_logger_levels() {
-        for (input, expected) in [
-            ("off", LoggerLevel::Off),
-            ("TRACE", LoggerLevel::Trace),
-            ("Debug", LoggerLevel::Debug),
-            ("info", LoggerLevel::Info),
-            ("warning", LoggerLevel::Warn),
-            ("Warn", LoggerLevel::Warn),
-            ("ERROR", LoggerLevel::Error),
-        ] {
-            assert_eq!(input.parse::<LoggerLevel>(), Ok(expected));
+    impl TestFifo {
+        fn create(name: &str) -> Self {
+            let path = unique_logger_path(name);
+            let c_path = CString::new(path.as_os_str().as_bytes())
+                .expect("logger FIFO path should not contain NUL");
+            // SAFETY: `c_path` is a live NUL-terminated path owned by this fixture.
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            let reader = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .expect("logger FIFO reader should open");
+            Self { path, reader }
         }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn fill_to_capacity(&self) {
+            let mut writer = OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.path)
+                .expect("logger FIFO filler should open");
+            let chunk = [b'x'; 4096];
+            let mut written = 0;
+            loop {
+                match writer.write(&chunk) {
+                    Ok(0) => panic!("logger FIFO filler unexpectedly wrote zero bytes"),
+                    Ok(count) => written += count,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("logger FIFO filler should reach capacity: {error}"),
+                }
+            }
+            assert!(written != 0);
+        }
+
+        fn drain(&mut self) {
+            let mut chunk = [0; 4096];
+            loop {
+                match self.reader.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => return,
+                    Err(error) => panic!("logger FIFO should drain: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TestFifo {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn wait_for(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !condition() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(condition(), "asynchronous logger condition should arrive");
+    }
+
+    #[test]
+    fn logger_level_parsing_is_case_insensitive() {
+        assert_eq!("trace".parse(), Ok(LoggerLevel::Trace));
+        assert_eq!("WARNING".parse(), Ok(LoggerLevel::Warn));
         assert!("verbose".parse::<LoggerLevel>().is_err());
     }
 
     #[test]
-    fn validates_firecracker_shaped_logger_config() {
-        let config = LoggerConfigInput::new()
-            .with_log_path("/tmp/logger")
-            .with_level(LoggerLevel::Warn)
-            .with_show_level(true)
-            .with_show_log_origin(true)
-            .with_module("api_server")
-            .validate()
-            .expect("logger config should validate");
-
+    fn empty_path_is_rejected_without_mutation() {
+        let mut state = LoggerState::default();
         assert_eq!(
-            config.log_path(),
-            Some(PathBuf::from("/tmp/logger").as_path())
-        );
-        assert_eq!(config.level(), Some(LoggerLevel::Warn));
-        assert_eq!(config.show_level(), Some(true));
-        assert_eq!(config.show_log_origin(), Some(true));
-        assert_eq!(config.module(), Some("api_server"));
-    }
-
-    #[test]
-    fn rejects_empty_log_path() {
-        assert_eq!(
-            LoggerConfigInput::new()
-                .with_log_path(PathBuf::new())
-                .validate(),
+            state.configure(LoggerConfigInput::new().with_log_path("")),
             Err(LoggerConfigError::EmptyPath)
         );
+        assert!(!state.is_configured());
     }
 
     #[test]
-    fn default_state_matches_firecracker_defaults() {
-        let state = LoggerState::default();
+    fn api_and_action_records_preserve_short_text_and_template_selectors() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut state = LoggerState::default();
+        state.configure_test_writer(SharedWriter(output.clone()));
 
+        assert!(state.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Drive));
+        assert!(state.log_action(LoggerAction::InstanceStart));
+        assert_eq!(
+            String::from_utf8(output.lock().expect("output lock should succeed").clone())
+                .expect("logger output should be UTF-8"),
+            "The API server received a Put request on \"/drives/{drive_id}\".\naction=InstanceStart\n"
+        );
+    }
+
+    #[test]
+    fn filters_run_before_delivery_and_limiting() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(FailingWriter);
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_level(LoggerLevel::Error)
+                    .with_module("not-the-runtime"),
+            )
+            .expect("path-free update should succeed");
+
+        assert!(!state.log_api_request(LoggerHttpMethod::Get, LoggerApiRoute::Version));
+        assert!(!state.log_boot_timer(1_000, 200));
+        assert_eq!(metrics.missed_log_count(), 0);
+        assert_eq!(metrics.rate_limited_log_count(), 0);
+    }
+
+    #[test]
+    fn host_failure_is_counted_without_changing_caller() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(FailingWriter);
+
+        assert!(!state.log_action(LoggerAction::FlushMetrics));
+        assert_eq!(metrics.missed_log_count(), 1);
+    }
+
+    #[test]
+    fn boot_timer_submission_is_async_and_failure_is_eventually_counted() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(FailingWriter);
+        let logger = state.boot_timer_logger();
+
+        assert!(logger.log_boot_time(1_000, 200));
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(metrics.missed_log_count(), 1);
+    }
+
+    #[test]
+    fn replacement_reuses_delivery_and_switches_output_boundary() {
+        let first = Arc::new(Mutex::new(Vec::new()));
+        let second = Arc::new(Mutex::new(Vec::new()));
+        let observer = Arc::new(WorkerObserver::default());
+        let mut state = LoggerState::default();
+        state.set_delivery_config_for_test(
+            LoggerDeliveryConfig::for_test(4, Duration::from_millis(100))
+                .with_worker_observer(observer.clone()),
+        );
+        state.configure_test_writer(SharedWriter(first.clone()));
+        let stale = state.boot_timer_logger();
+
+        assert!(state.log_action(LoggerAction::InstanceStart));
+        state.configure_test_writer(SharedWriter(second.clone()));
+        assert!(stale.log_boot_time(1_000, 200));
+        assert!(stale.wait_for_delivery_for_test());
+
+        assert_eq!(
+            *first.lock().expect("first output lock should succeed"),
+            b"action=InstanceStart\n"
+        );
+        assert_eq!(
+            *second.lock().expect("second output lock should succeed"),
+            b"Guest-boot-time =   1000 us 1 ms,    200 CPU us 0 CPU ms\n"
+        );
+        assert_eq!(observer.started(), 1);
+        assert_eq!(observer.active(), 1);
+    }
+
+    #[test]
+    fn stalled_writer_cancels_replacement_and_preserves_facade() {
+        let gate = Arc::new(WriterGate::default());
+        let old_output = Arc::new(Mutex::new(Vec::new()));
+        let candidate_path = unique_logger_path("cancelled-replacement");
+        let observer = Arc::new(WorkerObserver::default());
+        let mut state = LoggerState::default();
+        state.set_delivery_config_for_test(
+            LoggerDeliveryConfig::for_test(2, Duration::from_millis(10))
+                .with_worker_observer(observer.clone()),
+        );
+        state.configure_test_writer(HeldRecordingWriter {
+            gate: gate.clone(),
+            output: old_output.clone(),
+        });
+        let stale = state.boot_timer_logger();
+        assert!(stale.log_boot_time(1_000, 200));
+        gate.wait_until_entered();
+
+        let candidate = LoggerConfigInput::new()
+            .with_log_path(&candidate_path)
+            .with_level(LoggerLevel::Error)
+            .with_show_level(true)
+            .validate()
+            .expect("replacement config should validate");
+        let prepared = LoggerState::prepare_config(candidate, None)
+            .expect("replacement writer should prepare");
+        assert_eq!(
+            state.commit_config(prepared),
+            Err(LoggerConfigError::ReplacementTimedOut)
+        );
+        assert_eq!(state.level(), LoggerLevel::Info);
+        assert!(!state.show_level());
+        assert_eq!(observer.started(), 1);
+
+        gate.release();
+        assert!(stale.wait_for_delivery_for_test());
+        assert!(state.log_action(LoggerAction::InstanceStart));
+        assert_eq!(
+            String::from_utf8(
+                old_output
+                    .lock()
+                    .expect("old output lock should succeed")
+                    .clone()
+            )
+            .expect("old output should be UTF-8"),
+            "Guest-boot-time =   1000 us 1 ms,    200 CPU us 0 CPU ms\naction=InstanceStart\n"
+        );
+        assert_eq!(
+            fs::metadata(&candidate_path)
+                .expect("candidate should have opened")
+                .len(),
+            0
+        );
+        fs::remove_file(candidate_path).expect("candidate fixture should clean up");
+    }
+
+    #[test]
+    fn repeated_stalled_replacements_never_spawn_another_generation() {
+        let gate = Arc::new(WriterGate::default());
+        let observer = Arc::new(WorkerObserver::default());
+        let mut state = LoggerState::default();
+        state.set_delivery_config_for_test(
+            LoggerDeliveryConfig::for_test(3, Duration::from_millis(5))
+                .with_worker_observer(observer.clone()),
+        );
+        state.configure_test_writer(HeldRecordingWriter {
+            gate: gate.clone(),
+            output: Arc::new(Mutex::new(Vec::new())),
+        });
+        let stale = state.boot_timer_logger();
+        assert!(stale.log_boot_time(1_000, 200));
+        gate.wait_until_entered();
+
+        let mut paths = Vec::new();
+        for attempt in 0..8 {
+            let path = unique_logger_path(&format!("repeated-{attempt}"));
+            let config = LoggerConfigInput::new()
+                .with_log_path(&path)
+                .validate()
+                .expect("replacement config should validate");
+            let prepared = LoggerState::prepare_config(config, None)
+                .expect("replacement writer should prepare");
+            let error = state
+                .commit_config(prepared)
+                .expect_err("held worker should reject replacement");
+            if attempt < 3 {
+                assert_eq!(error, LoggerConfigError::ReplacementTimedOut);
+            } else {
+                assert_eq!(error, LoggerConfigError::DeliveryQueueFull);
+            }
+            paths.push(path);
+        }
+        assert_eq!(observer.started(), 1);
+        assert_eq!(observer.active(), 1);
+
+        gate.release();
+        assert!(stale.wait_for_delivery_for_test());
+        assert_eq!(observer.started(), 1);
+        for path in paths {
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("candidate file should exist")
+                    .len(),
+                0
+            );
+            fs::remove_file(path).expect("candidate fixture should clean up");
+        }
+    }
+
+    #[test]
+    fn disconnected_worker_gets_one_successor_and_stale_clone_stays_disconnected() {
+        let observer = Arc::new(WorkerObserver::default());
+        let metrics = SharedLoggerMetrics::default();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.set_delivery_config_for_test(
+            LoggerDeliveryConfig::for_test(2, Duration::from_millis(10))
+                .with_worker_observer(observer.clone()),
+        );
+        state.configure_test_writer(SharedWriter(Arc::new(Mutex::new(Vec::new()))));
+        let stale = state.boot_timer_logger();
+
+        assert!(state.disconnect_delivery_for_test());
+        wait_for(|| observer.active() == 0);
+        assert_eq!(observer.started(), 1);
+        state.configure_test_writer(SharedWriter(output.clone()));
+        wait_for(|| observer.active() == 1);
+        assert_eq!(observer.started(), 2);
+
+        assert!(!stale.log_boot_time(1_000, 200));
+        assert!(state.log_action(LoggerAction::FlushMetrics));
+        assert_eq!(metrics.missed_log_count(), 1);
+        assert_eq!(
+            *output.lock().expect("successor output lock should succeed"),
+            b"action=FlushMetrics\n"
+        );
+    }
+
+    #[test]
+    fn genuinely_full_nonblocking_fifo_misses_without_blocking_guest() {
+        let mut fifo = TestFifo::create("full-fifo");
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state
+            .configure(LoggerConfigInput::new().with_log_path(fifo.path()))
+            .expect("FIFO logger should configure");
+        fifo.fill_to_capacity();
+        let logger = state.boot_timer_logger();
+
+        assert!(logger.log_boot_time(1_000, 200));
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(metrics.missed_log_count(), 1);
+        fifo.drain();
+    }
+
+    #[test]
+    fn initial_spawn_failure_preserves_all_facade_fields() {
+        let mut state = LoggerState::default();
+        let path = unique_logger_path("spawn-failure");
+        state.set_delivery_config_for_test(
+            LoggerDeliveryConfig::for_test(1, Duration::from_millis(10)).with_failed_spawn(),
+        );
+        let config = LoggerConfigInput::new()
+            .with_log_path(&path)
+            .with_level(LoggerLevel::Error)
+            .with_show_level(true)
+            .validate()
+            .expect("config should validate");
+        let prepared =
+            LoggerState::prepare_config(config, None).expect("candidate writer should prepare");
+
+        assert!(matches!(
+            state.commit_config(prepared),
+            Err(LoggerConfigError::SpawnWorker(_))
+        ));
         assert!(!state.is_configured());
         assert_eq!(state.level(), LoggerLevel::Info);
         assert!(!state.show_level());
-        assert!(!state.show_log_origin());
-        assert_eq!(state.module(), None);
+        fs::remove_file(path).expect("candidate fixture should clean up");
     }
 
     #[test]
-    fn configures_output_and_updates_fields() {
-        let path = unique_logger_path("configured");
-        let mut state = LoggerState::default();
-
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_level(LoggerLevel::Warn)
-                    .with_show_level(true)
-                    .with_show_log_origin(true)
-                    .with_module("bangbang"),
-            )
-            .expect("logger should configure");
-
-        assert!(state.is_configured());
-        assert!(path.exists());
-        assert_eq!(state.level(), LoggerLevel::Warn);
-        assert!(state.show_level());
-        assert!(state.show_log_origin());
-        assert_eq!(state.module(), Some("bangbang"));
-
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_action_without_configuration_is_noop() {
-        let state = LoggerState::default();
-
-        assert!(!state.log_action("InstanceStart"));
-        assert!(!state.is_configured());
-    }
-
-    #[test]
-    fn log_action_writes_minimal_action_lines() {
-        let path = unique_logger_path("actions");
+    fn path_free_update_retains_writer() {
+        let path = unique_logger_path("path-free");
         let mut state = LoggerState::default();
         state
             .configure(LoggerConfigInput::new().with_log_path(&path))
             .expect("logger should configure");
-
-        assert!(state.log_action("InstanceStart"));
-        assert!(state.log_action("FlushMetrics"));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_eq!(output, "action=InstanceStart\naction=FlushMetrics\n");
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_api_request_writes_firecracker_shaped_line() {
-        let path = unique_logger_path("api-request");
-        let mut state = LoggerState::default();
         state
-            .configure(LoggerConfigInput::new().with_log_path(&path))
-            .expect("logger should configure");
+            .configure(LoggerConfigInput::new().with_show_level(true))
+            .expect("path-free update should succeed");
+        assert!(state.log_action(LoggerAction::FlushMetrics));
 
-        assert!(state.log_api_request("Put", "/mmds"));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_eq!(
-            output,
-            "The API server received a Put request on \"/mmds\".\n"
-        );
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_api_request_respects_level_filter() {
-        let path = unique_logger_path("filtered-api-request");
-        let mut state = LoggerState::default();
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_level(LoggerLevel::Warn),
-            )
-            .expect("logger should configure");
-
-        assert!(!state.log_api_request("Get", "/version"));
-        assert_eq!(
-            fs::read_to_string(&path).expect("logger output should be readable"),
-            ""
-        );
-
-        state
-            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Info))
-            .expect("logger should update level");
-        assert!(state.log_api_request("Get", "/version"));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_eq!(
-            output,
-            "The API server received a Get request on \"/version\".\n"
-        );
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_api_request_respects_module_filter() {
-        let path = unique_logger_path("api-request-module-filter");
-        let mut state = LoggerState::default();
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_module(MINIMAL_ACTION_LOG_MODULE),
-            )
-            .expect("logger should configure");
-
-        assert!(!state.log_api_request("Get", "/version"));
-
-        state
-            .configure(LoggerConfigInput::new().with_module(API_REQUEST_LOG_MODULE))
-            .expect("logger should update module filter");
-        assert!(state.log_api_request("Get", "/version"));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_eq!(
-            output,
-            "The API server received a Get request on \"/version\".\n"
-        );
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_api_request_does_not_format_path_when_output_is_suppressed() {
-        let path = unique_logger_path("api-request-suppressed");
-        let mut state = LoggerState::default();
-
-        assert!(!state.log_api_request("Get", PanickingDisplay));
-
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_level(LoggerLevel::Warn),
-            )
-            .expect("logger should configure");
-        assert!(!state.log_api_request("Get", PanickingDisplay));
-
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_level(LoggerLevel::Info)
-                    .with_module(MINIMAL_ACTION_LOG_MODULE),
-            )
-            .expect("logger should update filters");
-        assert!(!state.log_api_request("Get", PanickingDisplay));
-
-        assert_eq!(
-            fs::read_to_string(&path).expect("logger output should be readable"),
-            ""
-        );
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_api_request_records_write_failure_without_failing_caller() {
-        let mut state = LoggerState::default();
-        state.configure_test_writer(FailingWriter);
-
-        assert!(!state.log_api_request("Patch", "/mmds"));
-        assert_eq!(state.metrics.missed_log_count(), 1);
-    }
-
-    #[test]
-    fn log_boot_timer_writes_firecracker_shaped_line() {
-        let path = unique_logger_path("boot-timer");
-        let mut state = LoggerState::default();
-        state
-            .configure(LoggerConfigInput::new().with_log_path(&path))
-            .expect("logger should configure");
-
-        assert!(state.log_boot_timer(7_123, 1_456));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_eq!(
-            output,
-            "Guest-boot-time =   7123 us 7 ms,   1456 CPU us 1 CPU ms\n"
-        );
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn boot_timer_logger_snapshot_shares_sink_with_action_logs() {
-        let path = unique_logger_path("boot-timer-shared");
-        let mut state = LoggerState::default();
-        state
-            .configure(LoggerConfigInput::new().with_log_path(&path))
-            .expect("logger should configure");
-        let boot_timer_logger = state.boot_timer_logger();
-
-        assert!(state.log_action("InstanceStart"));
-        assert!(boot_timer_logger.log_boot_time(1_000, 200));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_eq!(
-            output,
-            "action=InstanceStart\nGuest-boot-time =   1000 us 1 ms,    200 CPU us 0 CPU ms\n"
-        );
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn boot_timer_logger_records_missed_log_on_write_failure() {
-        let mut state = LoggerState::default();
-        state.configure_test_writer(FailingWriter);
-        let boot_timer_logger = state.boot_timer_logger();
-
-        assert!(!boot_timer_logger.log_boot_time(1_000, 200));
-        assert_eq!(state.metrics.missed_log_count(), 1);
-    }
-
-    #[test]
-    fn boot_timer_logger_does_not_record_missed_log_for_success_or_no_output() {
-        let path = unique_logger_path("boot-timer-no-miss");
-        let mut state = LoggerState::default();
-        state
-            .configure(LoggerConfigInput::new().with_log_path(&path))
-            .expect("logger should configure");
-
-        assert!(state.boot_timer_logger().log_boot_time(1_000, 200));
-        assert_eq!(state.metrics.missed_log_count(), 0);
-
-        let unconfigured_state = LoggerState::default();
-        assert!(
-            !unconfigured_state
-                .boot_timer_logger()
-                .log_boot_time(1_000, 200)
-        );
-        assert_eq!(unconfigured_state.metrics.missed_log_count(), 0);
-
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn boot_timer_logger_does_not_record_missed_log_for_filtered_output() {
-        let mut state = LoggerState::default();
-        state.configure_test_writer(FailingWriter);
-        state
-            .configure(LoggerConfigInput::new().with_module(MINIMAL_ACTION_LOG_MODULE))
-            .expect("logger should update module filter");
-        let boot_timer_logger = state.boot_timer_logger();
-
-        assert!(!boot_timer_logger.log_boot_time(1_000, 200));
-        assert_eq!(state.metrics.missed_log_count(), 0);
-        assert_eq!(state.metrics.rate_limited_log_count(), 0);
-    }
-
-    #[test]
-    fn log_action_includes_level_when_configured() {
-        let path = unique_logger_path("actions-with-level");
-        let mut state = LoggerState::default();
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_show_level(true),
-            )
-            .expect("logger should configure");
-
-        assert!(state.log_action("InstanceStart"));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_eq!(output, "level=Info action=InstanceStart\n");
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_action_includes_origin_when_configured() {
-        let path = unique_logger_path("actions-with-origin");
-        let mut state = LoggerState::default();
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_show_log_origin(true),
-            )
-            .expect("logger should configure");
-
-        assert!(state.log_action("InstanceStart"));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_action_output_with_origin(&output, None, "InstanceStart");
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_action_includes_level_and_origin_when_configured() {
-        let path = unique_logger_path("actions-with-level-origin");
-        let mut state = LoggerState::default();
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_show_level(true)
-                    .with_show_log_origin(true),
-            )
-            .expect("logger should configure");
-
-        assert!(state.log_action("FlushMetrics"));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_action_output_with_origin(&output, Some(LoggerLevel::Info), "FlushMetrics");
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_action_respects_level_filter_and_reconfiguration() {
-        let path = unique_logger_path("filtered-actions");
-        let mut state = LoggerState::default();
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_level(LoggerLevel::Warn),
-            )
-            .expect("logger should configure");
-
-        assert!(!state.log_action("InstanceStart"));
-        assert_eq!(
-            fs::read_to_string(&path).expect("logger output should be readable"),
-            ""
-        );
-
-        state
-            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Debug))
-            .expect("logger should update level without replacing sink");
-        assert!(state.log_action("FlushMetrics"));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_eq!(output, "action=FlushMetrics\n");
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_action_respects_module_filter_and_reconfiguration() {
-        let path = unique_logger_path("module-filtered-actions");
-        let mut state = LoggerState::default();
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_module("bangbang_runtime"),
-            )
-            .expect("logger should configure");
-
-        assert!(state.log_action("InstanceStart"));
-
-        state
-            .configure(LoggerConfigInput::new().with_module(MINIMAL_ACTION_LOG_MODULE))
-            .expect("logger should update module filter");
-        assert!(state.log_action("FlushMetrics"));
-
-        state
-            .configure(LoggerConfigInput::new().with_module("api_server"))
-            .expect("logger should update module filter");
-        assert!(!state.log_action("Suppressed"));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_eq!(output, "action=InstanceStart\naction=FlushMetrics\n");
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_boot_timer_respects_module_filter() {
-        let path = unique_logger_path("boot-timer-module-filter");
-        let mut state = LoggerState::default();
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_module(MINIMAL_ACTION_LOG_MODULE),
-            )
-            .expect("logger should configure");
-
-        assert!(!state.log_boot_timer(1, 1));
-
-        state
-            .configure(LoggerConfigInput::new().with_module(BOOT_TIMER_LOG_MODULE))
-            .expect("logger should update module filter");
-        assert!(state.log_boot_timer(1, 1));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_eq!(
-            output,
-            "Guest-boot-time =      1 us 0 ms,      1 CPU us 0 CPU ms\n"
-        );
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_action_treats_empty_module_filter_as_match_all() {
-        let path = unique_logger_path("empty-module-filter");
-        let mut state = LoggerState::default();
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_module(""),
-            )
-            .expect("logger should configure");
-
-        assert!(state.log_action("InstanceStart"));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        assert_eq!(output, "action=InstanceStart\n");
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn log_action_records_write_failure_without_failing_caller() {
-        let mut state = LoggerState::default();
-        state.configure_test_writer(FailingWriter);
-
-        assert!(!state.log_action("InstanceStart"));
-        assert_eq!(state.metrics.missed_log_count(), 1);
-    }
-
-    #[test]
-    fn log_action_records_flush_failure_without_failing_caller() {
-        let mut state = LoggerState::default();
-        state.configure_test_writer(FlushFailingWriter);
-
-        assert!(!state.log_action("InstanceStart"));
-        assert_eq!(state.metrics.missed_log_count(), 1);
-    }
-
-    #[test]
-    fn log_action_drops_contended_sink_without_blocking() {
-        let mut state = LoggerState::default();
-        state.configure_test_writer(std::io::sink());
-        let sink = state.sink.as_ref().expect("sink should exist").clone();
-        let guard = sink.writer.lock().expect("sink lock should be available");
-
-        assert!(!state.log_action("InstanceStart"));
-        assert_eq!(state.metrics.missed_log_count(), 1);
-
-        drop(guard);
-    }
-
-    #[test]
-    fn log_action_drops_poisoned_sink_without_panicking() {
-        let mut state = LoggerState::default();
-        state.configure_test_writer(std::io::sink());
-        let writer = state
-            .sink
-            .as_ref()
-            .expect("sink should exist")
-            .writer
-            .clone();
-        let poison_result = thread::spawn(move || {
-            let _guard = writer.lock().expect("sink lock should be available");
-            panic!("poison logger sink for test");
-        })
-        .join();
-        assert!(poison_result.is_err());
-
-        assert!(!state.log_action("InstanceStart"));
-        assert_eq!(state.metrics.missed_log_count(), 1);
-    }
-
-    #[test]
-    fn boot_timer_rate_limit_allows_burst_then_reports_recovery() {
-        let path = unique_logger_path("boot-timer-rate-limit");
-        let clock = TestLogRateLimiterClock::default();
-        let mut state = LoggerState {
-            boot_timer_rate_limiter: BootTimerLogRateLimiter::with_clock(Arc::new(clock.clone())),
-            ..LoggerState::default()
-        };
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_show_level(true),
-            )
-            .expect("logger should configure");
-        let first_session_logger = state.boot_timer_logger();
-
-        for _ in 0..10 {
-            assert!(first_session_logger.log_boot_time(1_000, 200));
-        }
-
-        let reconstructed_session_logger = state.boot_timer_logger();
-        assert!(!reconstructed_session_logger.log_boot_time(1_000, 200));
-        assert_eq!(state.metrics.rate_limited_log_count(), 1);
-        assert_eq!(state.metrics.missed_log_count(), 0);
-
-        clock.advance_ms(500);
-        assert!(reconstructed_session_logger.log_boot_time(2_000, 300));
-
-        let output = fs::read_to_string(&path).expect("logger output should be readable");
-        let lines = output.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 12);
-        assert_eq!(
-            lines[10],
-            "level=Warn 1 messages were suppressed due to rate limiting"
-        );
-        assert_eq!(
-            lines[11],
-            "level=Info Guest-boot-time =   2000 us 2 ms,    300 CPU us 0 CPU ms"
-        );
-
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn boot_timer_local_policy_does_not_consume_rate_limit_or_record_misses() {
-        let path = unique_logger_path("boot-timer-local-policy");
-        let clock = TestLogRateLimiterClock::default();
-        let mut state = LoggerState {
-            boot_timer_rate_limiter: BootTimerLogRateLimiter::with_clock(Arc::new(clock)),
-            ..LoggerState::default()
-        };
-
-        for _ in 0..20 {
-            assert!(!state.log_boot_timer(1_000, 200));
-        }
-
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_level(LoggerLevel::Warn),
-            )
-            .expect("logger should configure");
-        for _ in 0..20 {
-            assert!(!state.log_boot_timer(1_000, 200));
-        }
-
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_level(LoggerLevel::Info)
-                    .with_module(MINIMAL_ACTION_LOG_MODULE),
-            )
-            .expect("logger should update filters");
-        for _ in 0..20 {
-            assert!(!state.log_boot_timer(1_000, 200));
-        }
-
-        state
-            .configure(LoggerConfigInput::new().with_module(BOOT_TIMER_LOG_MODULE))
-            .expect("logger should update module filter");
-        for _ in 0..10 {
-            assert!(state.log_boot_timer(1_000, 200));
-        }
-        assert!(!state.log_boot_timer(1_000, 200));
-
-        assert_eq!(state.metrics.missed_log_count(), 0);
-        assert_eq!(state.metrics.rate_limited_log_count(), 1);
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn boot_timer_rate_limit_suppressed_count_saturates() {
-        let clock = TestLogRateLimiterClock::default();
-        let limiter = BootTimerLogRateLimiter::with_clock(Arc::new(clock.clone()));
-        {
-            let mut state = limiter
-                .inner
-                .state
-                .lock()
-                .expect("rate limiter lock should be available");
-            state.theoretical_arrival_time_ms = 5_000;
-            state.suppressed = u64::MAX - 1;
-        }
-
-        assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
-        assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
-        clock.advance_ms(500);
-        assert_eq!(
-            limiter.check(),
-            LogRateLimitDecision::Admitted {
-                suppressed: u64::MAX
-            }
-        );
-    }
-
-    #[test]
-    fn boot_timer_rate_limit_matches_refill_recovery_and_backwards_time_contract() {
-        let clock = TestLogRateLimiterClock::default();
-        clock.set_ms(1_000);
-        let limiter = BootTimerLogRateLimiter::with_clock(Arc::new(clock.clone()));
-
-        for _ in 0..10 {
-            assert_eq!(
-                limiter.check(),
-                LogRateLimitDecision::Admitted { suppressed: 0 }
-            );
-        }
-        for _ in 0..3 {
-            assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
-        }
-
-        clock.advance_ms(499);
-        assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
-        clock.advance_ms(1);
-        assert_eq!(
-            limiter.check(),
-            LogRateLimitDecision::Admitted { suppressed: 4 }
-        );
-
-        clock.advance_ms(5_000);
-        for _ in 0..10 {
-            assert_eq!(
-                limiter.check(),
-                LogRateLimitDecision::Admitted { suppressed: 0 }
-            );
-        }
-        assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
-
-        clock.set_ms(6_000);
-        assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
-        clock.set_ms(7_000);
-        assert_eq!(
-            limiter.check(),
-            LogRateLimitDecision::Admitted { suppressed: 2 }
-        );
-    }
-
-    #[test]
-    fn boot_timer_recovery_and_original_delivery_failures_are_counted_independently() {
-        let clock = TestLogRateLimiterClock::default();
-        let mut state = LoggerState {
-            boot_timer_rate_limiter: BootTimerLogRateLimiter::with_clock(Arc::new(clock.clone())),
-            ..LoggerState::default()
-        };
-        state.configure_test_writer(std::io::sink());
-
-        for _ in 0..10 {
-            assert!(state.log_boot_timer(1_000, 200));
-        }
-        assert!(!state.log_boot_timer(1_000, 200));
-        state.configure_test_writer(FailingWriter);
-        clock.advance_ms(500);
-
-        assert!(!state.log_boot_timer(2_000, 300));
-        assert_eq!(state.metrics.missed_log_count(), 2);
-        assert_eq!(state.metrics.rate_limited_log_count(), 1);
-    }
-
-    #[test]
-    fn boot_timer_rate_limiters_are_independent_between_logger_states() {
-        let mut first = LoggerState::default();
-        first.configure_test_writer(std::io::sink());
-        let mut second = LoggerState::default();
-        second.configure_test_writer(std::io::sink());
-
-        for _ in 0..10 {
-            assert!(first.log_boot_timer(1_000, 200));
-        }
-        assert!(!first.log_boot_timer(1_000, 200));
-        assert!(second.log_boot_timer(1_000, 200));
-    }
-
-    #[test]
-    fn repeated_configuration_updates_without_requiring_log_path() {
-        let path = unique_logger_path("repeat");
-        let mut state = LoggerState::default();
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&path)
-                    .with_level(LoggerLevel::Warn),
-            )
-            .expect("initial logger should configure");
-
-        state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_level(LoggerLevel::Debug)
-                    .with_show_level(true)
-                    .with_module("runtime"),
-            )
-            .expect("logger should update without a new path");
-
-        assert!(state.is_configured());
-        assert!(path.exists());
-        assert_eq!(state.level(), LoggerLevel::Debug);
-        assert!(state.show_level());
-        assert!(!state.show_log_origin());
-        assert_eq!(state.module(), Some("runtime"));
-
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn prepared_logger_adopts_write_only_file_and_appends_before_commit() {
-        let path = unique_logger_path("provided");
-        fs::write(&path, b"seed\n").expect("fixture should write");
-        let file = OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .expect("write-only fixture should open");
-        let config = LoggerConfigInput::new()
-            .with_log_path("bangbang-grant:logger")
-            .with_level(LoggerLevel::Info)
-            .validate()
-            .expect("logger config should validate");
-        let prepared = LoggerState::prepare_config(config, Some(file))
-            .expect("provided logger should prepare");
-        let debug = format!("{prepared:?}");
-        assert!(debug.contains("<redacted>"));
-        assert!(debug.contains("<owned>"));
-        assert!(!debug.contains("bangbang-grant:logger"));
-
-        let mut state = LoggerState::default();
-        state.commit_config(prepared);
-        assert!(state.log_action("ProvidedLogger"));
         assert_eq!(
             fs::read_to_string(&path).expect("logger output should read"),
-            "seed\naction=ProvidedLogger\n"
+            "level=Info action=FlushMetrics\n"
         );
-
         fs::remove_file(path).expect("fixture should clean up");
     }
 
     #[test]
-    fn open_errors_do_not_mutate_existing_state_or_echo_path() {
-        let missing_parent = unique_logger_path("parent").join("logger");
-        let mut state = LoggerState::default();
-        state
-            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Warn))
-            .expect("level-only logger update should succeed");
+    fn wrapper_limiter_preserves_recovery_count() {
+        let clock = Arc::new(TestClock::default());
+        let limiter = BootTimerLogRateLimiter::with_clock(clock.clone());
+        for _ in 0..10 {
+            assert_eq!(
+                limiter.check(),
+                LogRateLimitDecision::Admitted { suppressed: 0 }
+            );
+        }
+        assert_eq!(limiter.check(), LogRateLimitDecision::Denied);
+        clock.set(500);
+        assert_eq!(
+            limiter.check(),
+            LogRateLimitDecision::Admitted { suppressed: 1 }
+        );
+    }
 
-        let err = state
-            .configure(
-                LoggerConfigInput::new()
-                    .with_log_path(&missing_parent)
-                    .with_level(LoggerLevel::Debug),
-            )
-            .expect_err("missing parent should fail");
-        let missing_parent_text = missing_parent.to_string_lossy();
+    #[test]
+    fn recovery_and_admitted_boot_record_share_ordered_batch() {
+        let clock = Arc::new(TestClock::default());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.boot_timer_rate_limiter = BootTimerLogRateLimiter::with_clock(clock.clone());
+        state.configure_test_writer(SharedWriter(output.clone()));
+        let logger = state.boot_timer_logger();
 
-        assert!(matches!(err, LoggerConfigError::OpenFile(_)));
-        assert!(!err.to_string().contains(missing_parent_text.as_ref()));
-        assert_eq!(state.level(), LoggerLevel::Warn);
-        assert!(!state.is_configured());
+        for _ in 0..10 {
+            assert!(logger.log_boot_time(1_000, 200));
+        }
+        assert!(!logger.log_boot_time(1_000, 200));
+        clock.set(500);
+        assert!(logger.log_boot_time(2_000, 400));
+        assert!(logger.wait_for_delivery_for_test());
+
+        let output = String::from_utf8(output.lock().expect("output lock should succeed").clone())
+            .expect("logger output should be UTF-8");
+        let lines: Vec<_> = output.lines().collect();
+        assert_eq!(lines.len(), 12);
+        assert_eq!(lines[10], "1 messages were suppressed due to rate limiting");
+        assert_eq!(
+            lines[11],
+            "Guest-boot-time =   2000 us 2 ms,    400 CPU us 0 CPU ms"
+        );
+        assert_eq!(metrics.rate_limited_log_count(), 1);
+        assert_eq!(metrics.missed_log_count(), 0);
+    }
+
+    #[test]
+    fn debug_output_redacts_path_and_module() {
+        let input = LoggerConfigInput::new()
+            .with_log_path("/private/secret.log")
+            .with_module("private.module");
+        let debug = format!("{input:?}");
+        assert!(!debug.contains("secret.log"));
+        assert!(!debug.contains("private.module"));
     }
 }

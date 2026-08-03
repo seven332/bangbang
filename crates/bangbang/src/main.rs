@@ -2596,7 +2596,9 @@ mod tests {
     use bangbang_runtime::balloon::BalloonConfigInput;
     use bangbang_runtime::block::{DriveConfig, DriveConfigInput};
     use bangbang_runtime::boot::BootSourceConfigInput;
-    use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
+    use bangbang_runtime::logger::{
+        LoggerApiRoute, LoggerConfigError, LoggerConfigInput, LoggerHttpMethod, LoggerLevel,
+    };
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
@@ -2984,8 +2986,8 @@ mod tests {
         }
 
         #[track_caller]
-        fn log_api_request(&mut self, method: &str, path: impl std::fmt::Display) -> bool {
-            self.inner.log_api_request(method, path)
+        fn log_api_request(&mut self, method: LoggerHttpMethod, route: LoggerApiRoute) -> bool {
+            self.inner.log_api_request(method, route)
         }
 
         fn record_pause_vm_latency_us(&mut self, duration_us: u64) {

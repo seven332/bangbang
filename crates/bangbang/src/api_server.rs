@@ -52,7 +52,7 @@ use bangbang_runtime::cpu::{
 use bangbang_runtime::entropy::{
     EntropyConfigInput, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
 };
-use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
+use bangbang_runtime::logger::{LoggerApiRoute, LoggerConfigInput, LoggerHttpMethod, LoggerLevel};
 use bangbang_runtime::machine::{
     MachineConfig, MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
@@ -683,76 +683,125 @@ fn handle_request_bytes_with_limit(
 
 fn log_api_request(request: &ApiRequest, vmm: &mut impl VmmRequestHandler) -> bool {
     match request {
-        ApiRequest::GetInstanceInfo => vmm.log_api_request("Get", "/"),
-        ApiRequest::GetBalloon => vmm.log_api_request("Get", "/balloon"),
-        ApiRequest::GetBalloonStats => vmm.log_api_request("Get", "/balloon/statistics"),
+        ApiRequest::GetInstanceInfo => {
+            vmm.log_api_request(LoggerHttpMethod::Get, LoggerApiRoute::Root)
+        }
+        ApiRequest::GetBalloon => {
+            vmm.log_api_request(LoggerHttpMethod::Get, LoggerApiRoute::Balloon)
+        }
+        ApiRequest::GetBalloonStats => {
+            vmm.log_api_request(LoggerHttpMethod::Get, LoggerApiRoute::BalloonStatistics)
+        }
         ApiRequest::GetBalloonHintingStatus => {
-            vmm.log_api_request("Get", "/balloon/hinting/status")
+            vmm.log_api_request(LoggerHttpMethod::Get, LoggerApiRoute::BalloonHintingStatus)
         }
-        ApiRequest::GetMemoryHotplug => vmm.log_api_request("Get", "/hotplug/memory"),
-        ApiRequest::GetMachineConfig => vmm.log_api_request("Get", "/machine-config"),
-        ApiRequest::GetMmds => vmm.log_api_request("Get", "/mmds"),
-        ApiRequest::GetVmConfig => vmm.log_api_request("Get", "/vm/config"),
-        ApiRequest::GetVersion => vmm.log_api_request("Get", "/version"),
-        ApiRequest::PutAction(_) => vmm.log_api_request("Put", "/actions"),
-        ApiRequest::PutBalloon(_) => vmm.log_api_request("Put", "/balloon"),
-        ApiRequest::PutBootSource(_) => vmm.log_api_request("Put", "/boot-source"),
-        ApiRequest::PutCpuConfig(_) => vmm.log_api_request("Put", "/cpu-config"),
-        ApiRequest::PutDrive(config) => {
-            vmm.log_api_request("Put", format_args!("/drives/{}", config.path_drive_id()))
+        ApiRequest::GetMemoryHotplug => {
+            vmm.log_api_request(LoggerHttpMethod::Get, LoggerApiRoute::MemoryHotplug)
         }
-        ApiRequest::PutEntropy(_) => vmm.log_api_request("Put", "/entropy"),
-        ApiRequest::PutMemoryHotplug(_) => vmm.log_api_request("Put", "/hotplug/memory"),
-        ApiRequest::PatchBalloon(_) => vmm.log_api_request("Patch", "/balloon"),
-        ApiRequest::PatchBalloonStats(_) => vmm.log_api_request("Patch", "/balloon/statistics"),
+        ApiRequest::GetMachineConfig => {
+            vmm.log_api_request(LoggerHttpMethod::Get, LoggerApiRoute::MachineConfig)
+        }
+        ApiRequest::GetMmds => vmm.log_api_request(LoggerHttpMethod::Get, LoggerApiRoute::Mmds),
+        ApiRequest::GetVmConfig => {
+            vmm.log_api_request(LoggerHttpMethod::Get, LoggerApiRoute::VmConfig)
+        }
+        ApiRequest::GetVersion => {
+            vmm.log_api_request(LoggerHttpMethod::Get, LoggerApiRoute::Version)
+        }
+        ApiRequest::PutAction(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Actions)
+        }
+        ApiRequest::PutBalloon(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Balloon)
+        }
+        ApiRequest::PutBootSource(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::BootSource)
+        }
+        ApiRequest::PutCpuConfig(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::CpuConfig)
+        }
+        ApiRequest::PutDrive(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Drive)
+        }
+        ApiRequest::PutEntropy(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Entropy)
+        }
+        ApiRequest::PutMemoryHotplug(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::MemoryHotplug)
+        }
+        ApiRequest::PatchBalloon(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Patch, LoggerApiRoute::Balloon)
+        }
+        ApiRequest::PatchBalloonStats(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Patch, LoggerApiRoute::BalloonStatistics)
+        }
         ApiRequest::PatchBalloonHintingStart(_) => {
-            vmm.log_api_request("Patch", "/balloon/hinting/start")
+            vmm.log_api_request(LoggerHttpMethod::Patch, LoggerApiRoute::BalloonHintingStart)
         }
         ApiRequest::PatchBalloonHintingStop => {
-            vmm.log_api_request("Patch", "/balloon/hinting/stop")
+            vmm.log_api_request(LoggerHttpMethod::Patch, LoggerApiRoute::BalloonHintingStop)
         }
-        ApiRequest::PatchMemoryHotplug(_) => vmm.log_api_request("Patch", "/hotplug/memory"),
-        ApiRequest::PatchDrive(config) => {
-            vmm.log_api_request("Patch", format_args!("/drives/{}", config.path_drive_id()))
+        ApiRequest::PatchMemoryHotplug(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Patch, LoggerApiRoute::MemoryHotplug)
         }
-        ApiRequest::PatchVmState(_) => vmm.log_api_request("Patch", "/vm"),
-        ApiRequest::PutLogger(_) => vmm.log_api_request("Put", "/logger"),
-        ApiRequest::PutMachineConfig(_) => vmm.log_api_request("Put", "/machine-config"),
-        ApiRequest::PatchMachineConfig(_) => vmm.log_api_request("Patch", "/machine-config"),
-        ApiRequest::PutMetrics(_) => vmm.log_api_request("Put", "/metrics"),
-        ApiRequest::PutMmds(_) => vmm.log_api_request("Put", "/mmds"),
-        ApiRequest::PutMmdsConfig(_) => vmm.log_api_request("Put", "/mmds/config"),
-        ApiRequest::PutNetworkInterface(config) => vmm.log_api_request(
-            "Put",
-            format_args!("/network-interfaces/{}", config.path_iface_id()),
-        ),
-        ApiRequest::PatchNetworkInterface(config) => vmm.log_api_request(
-            "Patch",
-            format_args!("/network-interfaces/{}", config.path_iface_id()),
-        ),
+        ApiRequest::PatchDrive(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Patch, LoggerApiRoute::Drive)
+        }
+        ApiRequest::PatchVmState(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Patch, LoggerApiRoute::Vm)
+        }
+        ApiRequest::PutLogger(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Logger)
+        }
+        ApiRequest::PutMachineConfig(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::MachineConfig)
+        }
+        ApiRequest::PatchMachineConfig(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Patch, LoggerApiRoute::MachineConfig)
+        }
+        ApiRequest::PutMetrics(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Metrics)
+        }
+        ApiRequest::PutMmds(_) => vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Mmds),
+        ApiRequest::PutMmdsConfig(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::MmdsConfig)
+        }
+        ApiRequest::PutNetworkInterface(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::NetworkInterface)
+        }
+        ApiRequest::PatchNetworkInterface(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Patch, LoggerApiRoute::NetworkInterface)
+        }
         ApiRequest::HotUnplugDevice(request) => match request.kind() {
             ApiHotUnplugDeviceKind::Drive => {
-                vmm.log_api_request("Delete", format_args!("/drives/{}", request.id()))
+                vmm.log_api_request(LoggerHttpMethod::Delete, LoggerApiRoute::Drive)
             }
-            ApiHotUnplugDeviceKind::NetworkInterface => vmm.log_api_request(
-                "Delete",
-                format_args!("/network-interfaces/{}", request.id()),
-            ),
+            ApiHotUnplugDeviceKind::NetworkInterface => {
+                vmm.log_api_request(LoggerHttpMethod::Delete, LoggerApiRoute::NetworkInterface)
+            }
             ApiHotUnplugDeviceKind::Pmem => {
-                vmm.log_api_request("Delete", format_args!("/pmem/{}", request.id()))
+                vmm.log_api_request(LoggerHttpMethod::Delete, LoggerApiRoute::Pmem)
             }
         },
-        ApiRequest::PutPmem(config) => {
-            vmm.log_api_request("Put", format_args!("/pmem/{}", config.path_pmem_id()))
+        ApiRequest::PutPmem(_) => vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Pmem),
+        ApiRequest::PatchPmem(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Patch, LoggerApiRoute::Pmem)
         }
-        ApiRequest::PatchPmem(config) => {
-            vmm.log_api_request("Patch", format_args!("/pmem/{}", config.path_pmem_id()))
+        ApiRequest::PutSerial(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Serial)
         }
-        ApiRequest::PutSerial(_) => vmm.log_api_request("Put", "/serial"),
-        ApiRequest::PutSnapshotCreate(_) => vmm.log_api_request("Put", "/snapshot/create"),
-        ApiRequest::PutSnapshotLoad(_) => vmm.log_api_request("Put", "/snapshot/load"),
-        ApiRequest::PutVsock(_) => vmm.log_api_request("Put", "/vsock"),
-        ApiRequest::PatchMmds(_) => vmm.log_api_request("Patch", "/mmds"),
+        ApiRequest::PutSnapshotCreate(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::SnapshotCreate)
+        }
+        ApiRequest::PutSnapshotLoad(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::SnapshotLoad)
+        }
+        ApiRequest::PutVsock(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Vsock)
+        }
+        ApiRequest::PatchMmds(_) => {
+            vmm.log_api_request(LoggerHttpMethod::Patch, LoggerApiRoute::Mmds)
+        }
     }
 }
 
@@ -4408,8 +4457,8 @@ mod tests {
         }
 
         #[track_caller]
-        fn log_api_request(&mut self, method: &str, path: impl std::fmt::Display) -> bool {
-            self.inner.log_api_request(method, path)
+        fn log_api_request(&mut self, method: LoggerHttpMethod, route: LoggerApiRoute) -> bool {
+            self.inner.log_api_request(method, route)
         }
 
         fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
@@ -6333,10 +6382,21 @@ mod tests {
         );
         assert!(patch_mmds_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
+        let drive_selector = "private_selector";
+        let drive_body = format!(
+            r#"{{"drive_id":"{drive_selector}","path_on_host":"/tmp/private-drive.img","is_root_device":false}}"#
+        );
+        let drive_response = request_over_socket(
+            &mut vmm,
+            "api-log-d",
+            &request_with_body("PUT", &format!("/drives/{drive_selector}"), &drive_body),
+        );
+        assert!(drive_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
         let output = fs::read_to_string(&logger_path).expect("logger output should be readable");
         assert_eq!(
             output,
-            "The API server received a Get request on \"/version\".\nThe API server received a Put request on \"/mmds\".\nThe API server received a Patch request on \"/mmds\".\n"
+            "The API server received a Get request on \"/version\".\nThe API server received a Put request on \"/mmds\".\nThe API server received a Patch request on \"/mmds\".\nThe API server received a Put request on \"/drives/{drive_id}\".\n"
         );
         assert!(
             !output.contains("private-mmds-secret"),
@@ -6345,6 +6405,10 @@ mod tests {
         assert!(
             !output.contains("updated-secret"),
             "logger output must not include MMDS PATCH body: {output}"
+        );
+        assert!(
+            !output.contains(drive_selector) && !output.contains("private-drive.img"),
+            "logger output must not include drive selector or body values: {output}"
         );
 
         fs::remove_file(logger_path).expect("fixture should clean up");

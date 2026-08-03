@@ -2336,11 +2336,19 @@ external vmnet packet movement.
 Exact logger timing and failure semantics are normative in focused runtime
 tests, not wall-clock signed tests. Injected monotonic time covers the initial
 ten-record boot-timer burst, 500-ms refill, five-second budget, backwards time,
-saturating suppression count, clone sharing, independent logger states, and the
-single unrestricted recovery warning. Failing, contended, and poisoned sink
-tests prove `missed_log_count` and that API, action, startup, and guest boot
+saturating suppression count, bounded CAS exhaustion, concurrent conservation,
+named-identity/controller independence, and the ordered recovery batch. Fixed
+record tests cover every short shape, the 512-byte/UTF-8 ceiling, normalized
+absolute/multibyte origins, and static drive/network/pmem route templates.
+Deterministic worker gates cover queue full/disconnect, timeout before dequeue
+and during write, zero/short/`EAGAIN`/write/flush outcomes, a genuinely full
+FIFO, and exact per-record accounting. Replacement tests cover initial spawn,
+same-worker success, cancellation/commit races, held writer, repeated queue
+pressure with one worker generation, stale clones, disconnected recovery, and
+path-free retention. They also prove that API, action, startup, and guest boot
 timer MMIO outcomes do not change. API socket tests cover level/origin/module
-filters and verify that request bodies never reach logger output.
+filters and verify that request bodies and dynamic selectors never reach logger
+output.
 
 Metrics transaction tests use injected outputs to cover every implemented
 increment family and persistent store, first/no-new/new-event lines, lower/new

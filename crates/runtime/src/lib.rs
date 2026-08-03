@@ -1174,9 +1174,14 @@ impl VmmController {
             .map_err(VmmActionError::LoggerConfig)
     }
 
-    /// Commits a prepared logger update without further fallible work.
-    pub fn commit_logger_config(&mut self, prepared: logger::PreparedLoggerConfig) {
-        self.logger_state.commit_config(prepared);
+    /// Commits a prepared logger update after its bounded sink transaction.
+    pub fn commit_logger_config(
+        &mut self,
+        prepared: logger::PreparedLoggerConfig,
+    ) -> Result<(), VmmActionError> {
+        self.logger_state
+            .commit_config(prepared)
+            .map_err(VmmActionError::LoggerConfig)
     }
 
     /// Validates metrics configuration without opening or installing its sink.
@@ -1283,7 +1288,7 @@ impl VmmController {
     {
         self.preflight_instance_start()?;
         executor(self).map_err(VmmActionError::InstanceStart)?;
-        self.log_action(VmmAction::InstanceStart.name());
+        self.log_action(logger::LoggerAction::InstanceStart);
         self.instance_info.state = InstanceState::Running;
         Ok(VmmData::Empty)
     }
@@ -1592,13 +1597,17 @@ impl VmmController {
     }
 
     #[track_caller]
-    fn log_action(&self, action: &str) -> bool {
+    fn log_action(&self, action: logger::LoggerAction) -> bool {
         self.logger_state.log_action(action)
     }
 
     #[track_caller]
-    pub fn log_api_request(&mut self, method: &str, path: impl fmt::Display) -> bool {
-        self.logger_state.log_api_request(method, path)
+    pub fn log_api_request(
+        &mut self,
+        method: logger::LoggerHttpMethod,
+        route: logger::LoggerApiRoute,
+    ) -> bool {
+        self.logger_state.log_api_request(method, route)
     }
 
     pub fn record_put_actions_request(&mut self) {
@@ -1994,7 +2003,7 @@ impl VmmController {
             VmmAction::PutLogger(config) => {
                 let config = self.prepare_logger_config(config)?;
                 let prepared = self.prepare_logger_update(config, None)?;
-                self.commit_logger_config(prepared);
+                self.commit_logger_config(prepared)?;
 
                 Ok(VmmData::Empty)
             }
@@ -2191,7 +2200,7 @@ impl VmmController {
         self.metrics_state
             .flush_with_diagnostics(diagnostics)
             .map_err(VmmActionError::MetricsFlush)?;
-        self.log_action(VmmAction::FlushMetrics.name());
+        self.log_action(logger::LoggerAction::FlushMetrics);
         Ok(VmmData::Empty)
     }
 
@@ -2262,7 +2271,9 @@ mod tests {
         entropy::{
             EntropyConfig, EntropyConfigInput, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
         },
-        logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel},
+        logger::{
+            LoggerApiRoute, LoggerConfigError, LoggerConfigInput, LoggerHttpMethod, LoggerLevel,
+        },
         machine::{
             DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MAX_MEM_SIZE_MIB, MachineConfigCpuTemplate,
             MachineConfigError, MachineConfigHugePages, MachineConfigInput,
@@ -6520,7 +6531,8 @@ mod tests {
         controller.logger_state.configure_test_writer(FailingWriter);
         let boot_timer_logger = controller.boot_timer_logger();
 
-        assert!(!boot_timer_logger.log_boot_time(1_000, 200));
+        assert!(boot_timer_logger.log_boot_time(1_000, 200));
+        assert!(boot_timer_logger.wait_for_delivery_for_test());
         controller.instance_info.state = InstanceState::Running;
         assert_eq!(
             controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
@@ -6545,7 +6557,7 @@ mod tests {
             .expect("metrics config should be stored");
         controller.logger_state.configure_test_writer(FailingWriter);
 
-        assert!(!controller.log_api_request("Put", "/mmds"));
+        assert!(!controller.log_api_request(LoggerHttpMethod::Put, LoggerApiRoute::Mmds));
         controller.instance_info.state = InstanceState::Running;
         assert_eq!(
             controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
@@ -6578,7 +6590,8 @@ mod tests {
         first.logger_state.configure_test_writer(FailingWriter);
         let first_boot_timer_logger = first.boot_timer_logger();
 
-        assert!(!first_boot_timer_logger.log_boot_time(1_000, 200));
+        assert!(first_boot_timer_logger.log_boot_time(1_000, 200));
+        assert!(first_boot_timer_logger.wait_for_delivery_for_test());
         first.instance_info.state = InstanceState::Running;
         second.instance_info.state = InstanceState::Running;
 
