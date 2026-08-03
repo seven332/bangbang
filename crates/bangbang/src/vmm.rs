@@ -4328,6 +4328,7 @@ enum NativeSnapshotLoadError {
 fn native_v2_snapshot_load_is_cancelled(error: &NativeV2SnapshotLoadError) -> bool {
     match error {
         NativeV2SnapshotLoadError::Cancelled => true,
+        NativeV2SnapshotLoadError::Artifact(source) => source.is_cancelled(),
         NativeV2SnapshotLoadError::AfterResourceAdoption { source } => {
             native_v2_snapshot_load_is_cancelled(source)
         }
@@ -36258,8 +36259,8 @@ mod tests {
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::logger::{
-        LoggerConfigInput, LoggerLevel, LoggerLifecycleOutcome, ProcessStdoutLogger,
-        ProcessTerminalCategory,
+        LoggerConfigInput, LoggerLevel, LoggerLifecycleOutcome, LoggerSnapshotOutcome,
+        ProcessStdoutLogger, ProcessTerminalCategory,
     };
     use bangbang_runtime::machine::{MachineConfig, MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::memory::{
@@ -36333,7 +36334,8 @@ mod tests {
     use bangbang_runtime::snapshot_artifact::{
         NativeSnapshotArtifactFamily, NativeV2SnapshotCandidateState, SnapshotArtifactOutput,
         SnapshotCommitDurability, SnapshotPublicationStage, load_native_snapshot_artifacts,
-        load_snapshot_artifacts,
+        load_prepared_native_snapshot_memory_path_with_cancel, load_snapshot_artifacts,
+        prepare_native_snapshot_state_path,
     };
     use bangbang_runtime::snapshot_balloon_v2_9::{
         NATIVE_V2_BALLOON_STATE_COMPATIBILITY_VERSION, SnapshotV2BalloonState,
@@ -36499,8 +36501,8 @@ mod tests {
         ProcessSnapshotV2VsockLoadRequest, ProcessVmm, ProcessVmnetAuthority,
         ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
         SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
-        prepare_process_snapshot_v2_network_restore_plan,
+        default_hvf_boot_session_config, native_snapshot_load_logger_outcome,
+        native_v2_platform_capture_is_terminal, prepare_process_snapshot_v2_network_restore_plan,
         prepare_process_snapshot_v2_vsock_candidate, require_native_v1_composite_record,
         snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
@@ -46339,6 +46341,31 @@ mod tests {
             "operation=snapshot-load outcome=cancelled\n"
         );
         cancelled_snapshot.assert_no_staging();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn snapshot_load_logger_outcome_recognizes_artifact_cancellation_after_adoption() {
+        let (snapshot, _) =
+            native_v2_snapshot_load_fixture("snapshot-load-artifact-cancelled", false);
+        let paths = snapshot.paths();
+        let prepared = prepare_native_snapshot_state_path(paths.state())
+            .expect("native-v2 state should prepare");
+        let artifact_error =
+            load_prepared_native_snapshot_memory_path_with_cancel(prepared, paths.memory(), || {
+                true
+            })
+            .expect_err("cancelled artifact load should fail");
+        let error =
+            NativeSnapshotLoadError::NativeV2(NativeV2SnapshotLoadError::AfterResourceAdoption {
+                source: Box::new(NativeV2SnapshotLoadError::Artifact(artifact_error)),
+            });
+
+        assert_eq!(
+            native_snapshot_load_logger_outcome(&error),
+            LoggerSnapshotOutcome::LoadCancelled
+        );
+        snapshot.assert_no_staging();
     }
 
     #[cfg(target_os = "macos")]

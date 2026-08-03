@@ -3689,6 +3689,7 @@ fn diff_zero_root_materialization_cancellation_cleans_up_and_retries() {
             cancellation_polls.fetch_add(1, Ordering::SeqCst) > 12
         })
         .expect_err("materialization cancellation should abort the load");
+    assert!(error.is_cancelled());
     assert_eq!(
         error.stage(),
         SnapshotArtifactLoadStage::MemoryMaterialization

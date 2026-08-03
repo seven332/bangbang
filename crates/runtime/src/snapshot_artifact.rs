@@ -4752,6 +4752,23 @@ impl SnapshotArtifactLoadError {
     pub const fn failure(&self) -> &SnapshotArtifactLoadFailure {
         &self.failure
     }
+
+    /// Returns whether cooperative cancellation caused the load failure.
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(
+            &self.failure,
+            SnapshotArtifactLoadFailure::Cancelled
+                | SnapshotArtifactLoadFailure::MemoryHotplugMaterialization(
+                    SnapshotV2MemoryHotplugMaterializationError::Cancelled { .. }
+                )
+                | SnapshotArtifactLoadFailure::DiffVerification(
+                    SnapshotV2DiffVerifyError::Cancelled { .. }
+                )
+                | SnapshotArtifactLoadFailure::DiffMaterialization(
+                    SnapshotV2DiffMaterializationError::Cancelled { .. }
+                )
+        )
+    }
 }
 
 impl fmt::Display for SnapshotArtifactLoadError {
