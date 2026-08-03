@@ -318,6 +318,8 @@ fn run(
             #[cfg(not(target_os = "macos"))]
             let mut vmm = vmm;
             let _ = bridge.attach(vmm.emergency_logger());
+            let mut fatal_signal_handlers = None;
+            let mut sigpipe_signal_handler = None;
             let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let result = (|| {
                     apply_startup_metrics_config(&mut vmm, metrics_config)?;
@@ -336,8 +338,8 @@ fn run(
                     if contained_shutdown_requested(contained)? {
                         return Ok(());
                     }
-                    let _fatal_signal_handlers = FatalSignalHandlers::install()?;
-                    let _sigpipe_signal_handler = SigpipeSignalHandler::install(signal_metrics)?;
+                    fatal_signal_handlers = Some(FatalSignalHandlers::install()?);
+                    sigpipe_signal_handler = Some(SigpipeSignalHandler::install(signal_metrics)?);
                     if apply_startup_config_file_with_cancel(
                         &mut vmm,
                         config_file.as_deref(),
