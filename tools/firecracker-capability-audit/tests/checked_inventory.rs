@@ -577,7 +577,7 @@ fn logger_audit_mutations_fail_closed() {
     )
     .expect_err("unresolved local evidence must fail")
     .to_string();
-    assert!(error.contains("logger class local reference does not exist"));
+    assert!(error.contains("local reference path does not exist"));
 }
 
 fn local_reference_paths(references: &[Reference]) -> Option<BTreeSet<&str>> {

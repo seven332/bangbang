@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path};
-use std::process::Command;
+use std::path::{Component, Path, PathBuf};
 
+use crate::validate::{tracked_repository_files, validate_reference};
 use crate::{
     AuditMode, Baseline, FIRECRACKER_COMMIT, FIRECRACKER_TARGET, FIRECRACKER_VERSION,
     LOGGER_PRODUCER_GENERATOR_VERSION, LOGGER_PRODUCER_SCHEMA_VERSION, LoggerClassDisposition,
     LoggerCompiledEvent, LoggerDeliveryPolicy, LoggerInvocation, LoggerInvocationSyntax,
     LoggerLevelPolicy, LoggerLimiterPolicy, LoggerModulePolicy, LoggerNonApplicableReason,
     LoggerOriginPolicy, LoggerProducerAudit, LoggerProducerClass, LoggerProducerCounts,
-    LoggerProducerManifest, LoggerSourceContext, Reference, ValidationErrors,
+    LoggerProducerManifest, LoggerSourceContext, ValidationErrors,
 };
 
 const EXPECTED_SCANNED_RUST_FILES: usize = 362;
@@ -339,6 +339,7 @@ fn validate_audit(
     mode: AuditMode,
     errors: &mut Vec<String>,
 ) {
+    let tracked_files = tracked_repository_files(repository_root, errors);
     check_sorted_unique(
         audit.classes.iter().map(|class| class.id.as_str()),
         "logger class id",
@@ -350,7 +351,7 @@ fn validate_audit(
         .map(|class| (class.id.as_str(), class))
         .collect::<BTreeMap<_, _>>();
     for class in &audit.classes {
-        validate_class(class, repository_root, mode, errors);
+        validate_class(class, repository_root, &tracked_files, mode, errors);
     }
 
     check_sorted_unique(
@@ -424,6 +425,7 @@ fn validate_audit(
 fn validate_class(
     class: &LoggerProducerClass,
     repository_root: &Path,
+    tracked_files: &BTreeSet<PathBuf>,
     mode: AuditMode,
     errors: &mut Vec<String>,
 ) {
@@ -471,7 +473,13 @@ fn validate_class(
         errors,
     );
     for reference in class.implementation.iter().chain(&class.validation) {
-        validate_reference(reference, repository_root, &class.id, errors);
+        validate_reference(
+            reference,
+            repository_root,
+            tracked_files,
+            &format!("logger class {} evidence", class.id),
+            errors,
+        );
     }
     if (class.compiled_events.is_empty()
         && (!class.implementation.is_empty() || !class.validation.is_empty()))
@@ -678,61 +686,6 @@ fn validate_compiled_event_set(classes: &[LoggerProducerClass], errors: &mut Vec
             errors.push(format!(
                 "logger compiled event must have its exact class: {event:?} -> {owners:?}, expected {expected_class}"
             ));
-        }
-    }
-}
-
-fn validate_reference(
-    reference: &Reference,
-    repository_root: &Path,
-    class_id: &str,
-    errors: &mut Vec<String>,
-) {
-    match reference {
-        Reference::Local { path, anchor } => {
-            if !is_safe_relative_path(Path::new(path)) {
-                errors.push(format!(
-                    "logger class local reference must be repository-relative: {class_id} -> {path}"
-                ));
-                return;
-            }
-            if anchor
-                .as_deref()
-                .is_some_and(|anchor| anchor.trim().is_empty())
-            {
-                errors.push(format!(
-                    "logger class local reference anchor must not be empty: {class_id} -> {path}"
-                ));
-            }
-            let full_path = repository_root.join(path);
-            let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
-                errors.push(format!(
-                    "logger class local reference does not exist: {class_id} -> {path}"
-                ));
-                return;
-            };
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                errors.push(format!(
-                    "logger class local reference must be a regular non-symlink file: {class_id} -> {path}"
-                ));
-            }
-            let status = Command::new("git")
-                .arg("-C")
-                .arg(repository_root)
-                .args(["ls-files", "--error-unmatch", "--", path])
-                .output();
-            if !status.is_ok_and(|output| output.status.success()) {
-                errors.push(format!(
-                    "logger class local reference must be tracked: {class_id} -> {path}"
-                ));
-            }
-        }
-        Reference::Github { url } | Reference::Authoritative { url } => {
-            if !url.starts_with("https://") {
-                errors.push(format!(
-                    "logger class external reference must use HTTPS: {class_id}"
-                ));
-            }
         }
     }
 }
