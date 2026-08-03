@@ -479,6 +479,18 @@ fn logger_audit_mutations_fail_closed() {
     .to_string();
     assert!(error.contains("fingerprint is not lowercase SHA-256"));
 
+    let mut overflowing_counts = manifest.clone();
+    overflowing_counts.counts.production = usize::MAX;
+    let error = validate_logger_producers(
+        &overflowing_counts,
+        &audit,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("overflowing declared counts must fail without panicking")
+    .to_string();
+    assert!(error.contains("logger source-context counts must cover every invocation"));
+
     let mut catch_all = audit.clone();
     let class = catch_all
         .classes

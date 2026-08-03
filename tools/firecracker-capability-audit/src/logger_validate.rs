@@ -324,10 +324,16 @@ fn validate_expected_counts(counts: &LoggerProducerCounts, errors: &mut Vec<Stri
             ));
         }
     }
-    if counts.production + counts.test + counts.example != counts.ordinary + counts.unrestricted {
+    let invocation_total = counts.ordinary.checked_add(counts.unrestricted);
+    let context_total = counts
+        .production
+        .checked_add(counts.test)
+        .and_then(|total| total.checked_add(counts.example));
+    if context_total.is_none() || context_total != invocation_total {
         errors.push("logger source-context counts must cover every invocation".to_string());
     }
-    if counts.direct + counts.macro_template != counts.ordinary + counts.unrestricted {
+    let syntax_total = counts.direct.checked_add(counts.macro_template);
+    if syntax_total.is_none() || syntax_total != invocation_total {
         errors.push("logger syntax-kind counts must cover every invocation".to_string());
     }
 }
