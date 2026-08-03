@@ -2426,6 +2426,22 @@ mod macos_arm64 {
                 .stdout_snapshot()
                 .contains(GUEST_SERIAL_RX_FAILURE_MARKER)
         );
+        for (process_name, stdout) in [
+            ("concurrent process A", first.stdout_snapshot()),
+            ("concurrent process B", second.stdout_snapshot()),
+        ] {
+            for expected in [
+                "operation=server outcome=running\n",
+                "operation=process-startup outcome=running\n",
+                "action=request outcome=no-content\n",
+                GUEST_SERIAL_RX_SUCCESS_MARKER,
+            ] {
+                assert!(
+                    stdout.contains(expected),
+                    "{process_name} default stdout should multiplex {expected:?}: {stdout}"
+                );
+            }
+        }
         first.close_stdin();
         second.close_stdin();
         assert_clean_shutdown(
@@ -6421,6 +6437,7 @@ mod macos_arm64 {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let control_path = test_dir.path().join("remaining-device-control.img");
+        let logger_path = test_dir.path().join("remaining-device-logger.out");
         let metrics_path = test_dir.path().join("remaining-device-metrics.out");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
@@ -6429,6 +6446,14 @@ mod macos_arm64 {
         create_zeroed_block_backing_with_sectors(&control_path, 8);
 
         let configure = |context: &str| {
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/logger",
+                    &format!(r#"{{"log_path":{}}}"#, json_string(path_text(&logger_path))),
+                ),
+                &format!("PUT /logger remaining-device {context}"),
+            );
             assert_no_content_response(
                 &http_put_json(
                     &socket_path,
@@ -18154,11 +18179,16 @@ mod macos_arm64 {
     fn assert_logger_output_lines(output: &str, prefix: LoggerPrefixExpectation) {
         let mut action_lines = Vec::new();
         let mut saw_api_request_line = false;
+        let mut saw_api_result_line = false;
         let mut terminal_lines = 0usize;
         for line in output.lines() {
             let record = logger_record_without_prefix(line, prefix, output);
-            if record.starts_with("action=") {
+            if matches!(record, "action=InstanceStart" | "action=FlushMetrics") {
                 action_lines.push(record);
+                continue;
+            }
+            if is_api_result_logger_line(record) {
+                saw_api_result_line = true;
                 continue;
             }
             if let Some(category) = record.strip_prefix("event=process-exit category=") {
@@ -18172,10 +18202,13 @@ mod macos_arm64 {
                 terminal_lines += 1;
                 continue;
             }
+            if record == "event=process-panic" || is_closed_control_logger_line(record) {
+                continue;
+            }
 
             assert!(
                 is_api_request_logger_line(record),
-                "logger output line should be an action, API request, or terminal record; output:\n{output}\nline: {line}"
+                "logger output line should use the closed action, API, process, or terminal vocabulary; output:\n{output}\nline: {line}"
             );
             saw_api_request_line = true;
         }
@@ -18194,6 +18227,10 @@ mod macos_arm64 {
             saw_api_request_line,
             "logger output should include at least one API request record; output:\n{output}"
         );
+        assert!(
+            saw_api_result_line,
+            "logger output should include at least one API result record; output:\n{output}"
+        );
     }
 
     fn logger_record_without_prefix<'a>(
@@ -18204,11 +18241,20 @@ mod macos_arm64 {
         match prefix {
             LoggerPrefixExpectation::None => line,
             LoggerPrefixExpectation::LevelOrigin => {
-                let Some(rest) = line.strip_prefix("level=Info origin=") else {
+                let Some(rest) = line.strip_prefix("level=") else {
                     panic!(
                         "logger output line should include level and origin prefix; output:\n{output}\nline: {line}"
                     );
                 };
+                let Some((level, rest)) = rest.split_once(" origin=") else {
+                    panic!(
+                        "logger output line should include a closed level and origin prefix; output:\n{output}\nline: {line}"
+                    );
+                };
+                assert!(
+                    matches!(level, "Trace" | "Debug" | "Info" | "Warn" | "Error"),
+                    "logger output level should be closed; output:\n{output}\nline: {line}"
+                );
                 let Some((origin, record)) = rest.split_once(' ') else {
                     panic!(
                         "logger output line should include origin and record body; output:\n{output}\nline: {line}"
@@ -18227,9 +18273,66 @@ mod macos_arm64 {
                     line_number.parse::<u32>().is_ok(),
                     "logger output origin line should be numeric; output:\n{output}\nline: {line}"
                 );
+                if let Some(expected_level) = expected_logger_record_level(record) {
+                    assert_eq!(
+                        level, expected_level,
+                        "logger output level should match its closed record; output:\n{output}\nline: {line}"
+                    );
+                }
                 record
             }
         }
+    }
+
+    fn expected_logger_record_level(record: &str) -> Option<&'static str> {
+        match record {
+            "operation=server outcome=stopped" => Some("Debug"),
+            "operation=connection outcome=failed"
+            | "operation=request-parse outcome=bad-request"
+            | "operation=request-parse outcome=payload-too-large"
+            | "action=request outcome=bad-request"
+            | "action=request outcome=payload-too-large"
+            | "event=process-panic"
+            | "event=process-exit category=configuration"
+            | "event=process-exit category=process-failure"
+            | "event=process-exit category=panic" => Some("Error"),
+            "operation=request outcome=deprecated" => Some("Warn"),
+            "operation=server outcome=running"
+            | "operation=request outcome=completed"
+            | "operation=process-startup outcome=running"
+            | "action=request outcome=ok"
+            | "action=request outcome=no-content"
+            | "action=InstanceStart"
+            | "action=FlushMetrics"
+            | "event=process-exit category=success"
+            | "event=process-exit category=cancelled" => Some("Info"),
+            record if is_api_request_logger_line(record) => Some("Info"),
+            _ => None,
+        }
+    }
+
+    fn is_api_result_logger_line(line: &str) -> bool {
+        matches!(
+            line,
+            "action=request outcome=ok"
+                | "action=request outcome=no-content"
+                | "action=request outcome=bad-request"
+                | "action=request outcome=payload-too-large"
+        )
+    }
+
+    fn is_closed_control_logger_line(line: &str) -> bool {
+        matches!(
+            line,
+            "operation=server outcome=running"
+                | "operation=server outcome=stopped"
+                | "operation=connection outcome=failed"
+                | "operation=request outcome=deprecated"
+                | "operation=request outcome=completed"
+                | "operation=request-parse outcome=bad-request"
+                | "operation=request-parse outcome=payload-too-large"
+                | "operation=process-startup outcome=running"
+        )
     }
 
     fn is_api_request_logger_line(line: &str) -> bool {
@@ -18252,8 +18355,8 @@ mod macos_arm64 {
         });
 
         assert_eq!(
-            output, "action=InstanceStart\n",
-            "no-api logger output should include only the startup action record"
+            output, "action=InstanceStart\noperation=process-startup outcome=running\n",
+            "no-api logger output should include only action and process startup records"
         );
     }
 
@@ -18276,9 +18379,11 @@ mod macos_arm64 {
     fn logger_output_accepts_action_records_with_api_request_lines() {
         assert_logger_output_lines(
             "The API server received a Get request on \"/\".\n\
+             action=request outcome=ok\n\
              action=InstanceStart\n\
              The API server received a Put request on \"/actions\".\n\
-             action=FlushMetrics\n",
+             action=FlushMetrics\n\
+             action=request outcome=no-content\n",
             LoggerPrefixExpectation::None,
         );
     }
@@ -18287,17 +18392,18 @@ mod macos_arm64 {
     fn logger_output_accepts_level_origin_prefixed_records() {
         assert_logger_output_lines(
             "level=Info origin=crates/runtime/src/logger.rs:1 The API server received a Get request on \"/\".\n\
-             level=Info origin=crates/runtime/src/logger.rs:2 action=InstanceStart\n\
-             level=Info origin=crates/runtime/src/logger.rs:3 The API server received a Put request on \"/actions\".\n\
-             level=Info origin=crates/runtime/src/logger.rs:4 action=FlushMetrics\n",
+             level=Info origin=crates/runtime/src/logger.rs:2 action=request outcome=ok\n\
+             level=Info origin=crates/runtime/src/logger.rs:3 action=InstanceStart\n\
+             level=Warn origin=crates/runtime/src/logger.rs:4 operation=request outcome=deprecated\n\
+             level=Info origin=crates/runtime/src/logger.rs:5 The API server received a Put request on \"/actions\".\n\
+             level=Info origin=crates/runtime/src/logger.rs:6 action=FlushMetrics\n\
+             level=Info origin=crates/runtime/src/logger.rs:7 action=request outcome=no-content\n",
             LoggerPrefixExpectation::LevelOrigin,
         );
     }
 
     #[test]
-    #[should_panic(
-        expected = "logger output line should be an action, API request, or terminal record"
-    )]
+    #[should_panic(expected = "logger output line should use the closed action")]
     fn logger_output_rejects_unexpected_non_action_line() {
         assert_logger_output_lines(
             "action=InstanceStart\nunexpected\n",
@@ -18318,7 +18424,16 @@ mod macos_arm64 {
     #[should_panic(expected = "logger output should include at least one API request record")]
     fn logger_output_rejects_missing_api_request_record() {
         assert_logger_output_lines(
-            "action=InstanceStart\naction=FlushMetrics\n",
+            "action=InstanceStart\naction=FlushMetrics\naction=request outcome=ok\n",
+            LoggerPrefixExpectation::None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "logger output should include at least one API result record")]
+    fn logger_output_rejects_missing_api_result_record() {
+        assert_logger_output_lines(
+            "The API server received a Get request on \"/\".\naction=InstanceStart\naction=FlushMetrics\n",
             LoggerPrefixExpectation::None,
         );
     }

@@ -2101,33 +2101,49 @@ is resource-specific:
   error to its caller, and normal convergence makes one best-effort final
   attempt without replacing the process result. Ordinary handle drop closes
   the sink.
-- `/logger` opens `log_path` during pre-boot configuration when that field is
-  present and keeps one fixed-capacity queue plus one sink-owning worker per
-  process. Successfully parsed API requests encode closed method/route-template
-  lines before dispatch, and successful `InstanceStart` and explicit
-  `FlushMetrics` encode closed action-event lines when the configured level
-  allows `Info` and the optional module prefix matches the event module. API
-  records intentionally omit resource selectors and request bodies, including
-  MMDS payloads; optional origin prefixes cannot expose absolute build-host
-  paths. Every record is valid UTF-8 and at most 512 bytes including newline.
-  These host records are unrestricted and use at most a one-second receipt;
-  guest boot-timer records use immediate admission, a bounded atomic
+- Normal execution installs `/logger` delivery on one close-on-exec,
+  nonblocking internal pipe plus one process-owned stdout forwarder. The
+  forwarder owns a writable close-on-exec stdout duplicate but never changes
+  the real output's shared status flags, so a blocked stdout stalls only that
+  one thread and cannot interfere with default serial capture/restoration. One
+  fixed-capacity logger queue and one sink-owning worker remain process-local.
+  A path-bearing pre-boot configuration prepares its writer first and commits
+  through the stable worker; failed or path-free updates retain the prior
+  logger target, while best-effort status output retains the bounded adapter.
+  An unavailable, unwritable, or full stdout cannot change readiness or a
+  functional result. Normal convergence gives accepted adapter bytes one
+  bounded one-second drain opportunity without joining a stalled forwarder.
+  Logger, status, and default serial output share no cross-producer ordering
+  guarantee; a consumer requiring a private protocol must select an explicit
+  logger or serial destination.
+  Startup CLI flags and the later config-file logger section use the same
+  failure-atomic target and path-redaction rules.
+- Successfully parsed API requests encode closed method/route-template lines
+  before dispatch and exactly one closed HTTP result afterward. Parser
+  rejections encode a fixed control outcome and no result. Other closed host
+  events cover server/connection/request control, normal startup, successful
+  actions, panic, and convergence. They intentionally omit resource selectors,
+  request/response bodies, fault strings, paths, and guest values; optional
+  origins are implementation-owned and cannot expose absolute build-host paths.
+  Every record is valid UTF-8 and at most 512 bytes including newline. These
+  host records are unrestricted and use at most a one-second receipt; guest
+  boot-timer records use immediate admission, a bounded atomic
   ten-per-five-second limiter, and one ordered recovery warning. Queue,
   timeout, zero/short/error write, or flush failure increments exact
   missed-delivery accounting but cannot change the API, action, startup, or
-  guest-MMIO result. Preboot sink replacement reuses the worker through a
-  cancellable transaction, so a stalled sink preserves old state without
-  accumulating threads. Logger startup CLI flags use the same sink and
-  host-path error redaction rules before the API socket is served.
+  guest-MMIO result. A stalled sink preserves old state without accumulating
+  threads.
 - `scripts/run-integration-tests.sh` creates temporary files for signed
   integration tests and removes them when the wrapper exits normally. Its
   generated guest initrd is cached under `.tmp/guest-artifacts` by default.
 
-Metrics and logger outputs are opened with append/create semantics and
-`O_NONBLOCK` to avoid blocking on FIFO-like paths during configuration. Block
-backing code rejects unsupported file types such as directories, FIFOs, and Unix
-sockets for block devices instead of treating every path-like object as a disk
-image.
+Metrics and explicit logger outputs are opened with append/create semantics and
+`O_NONBLOCK` to avoid blocking on FIFO-like paths during configuration. Default
+logger/status output uses a nonblocking internal pipe and a sole forwarding
+thread; the writable stdout duplicate is never upgraded and its shared status
+flags are never mutated. Block backing code rejects
+unsupported file types such as directories, FIFOs, and Unix sockets for block
+devices instead of treating every path-like object as a disk image.
 
 Error messages for host file open failures should not echo configured host
 paths. Tests already cover this for several path surfaces, and new host path
@@ -2860,15 +2876,16 @@ cancel path; the backend-neutral dispatch path itself still does not sleep or
 busy-wait.
 
 Metrics and logger outputs are host observability state, not guest
-configuration, and are intentionally omitted from `GET /vm/config`. Current
-logger API request and action events are unrestricted host VMM records; they can
-expose API method/fixed-route metadata but not runtime selectors, request
-bodies, host paths, or guest serial output. The guest-triggerable boot-timer
-callsite alone uses a bounded limiter and emits one unrestricted warning when
-delivery recovers. Logger filtering, queue pressure, timeout ambiguity, and
-sink failures never change the API, action, or guest outcome; rate-limited
-records and exact per-record delivery failures are observable only through
-process-local counters.
+configuration, and are intentionally omitted from `GET /vm/config`. Logger API
+receipt, closed control/result, process startup, and action events are
+unrestricted host VMM records; they can expose only fixed method/route,
+operation, outcome, and action vocabulary, not runtime selectors,
+request/response bodies, faults, host paths, or guest serial output. The
+guest-triggerable boot-timer callsite alone uses a bounded limiter and emits one
+unrestricted warning when delivery recovers. Logger filtering, queue pressure,
+timeout ambiguity, and sink failures never change the API, action, readiness,
+or guest outcome; rate-limited records and exact per-record delivery failures
+are observable only through process-local counters.
 
 Process convergence adds only fixed, non-user-derived logger records. Normal
 records are `event=process-exit category=<fixed-category>` under the

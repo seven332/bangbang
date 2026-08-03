@@ -68,13 +68,13 @@ source calls only when subsystem, observable outcome, target fields, delivery,
 module/origin behavior, limiter policy, disposition, and delivery owner agree.
 There are no path selectors and no `other`, `unknown`, or catch-all class.
 
-The 31 classes contain 5 implemented classes, 19 planned classes, and 7 exact
-not-applicable classes. Across source mappings this is 9 implemented, 397
+The 31 classes contain 8 implemented classes, 16 planned classes, and 7 exact
+not-applicable classes. Across source mappings this is 26 implemented, 380
 planned, and 62 not-applicable invocations.
 
-`planned` is an explicit intermediate delivery state. The three owners are:
+`planned` is an explicit intermediate delivery state. The two remaining owners
+are:
 
-- #1807: logger defaults/configuration, API receipt/result, and startup;
 - #1808: host lifecycle, API/VMM worker, snapshot, signal, and observability
   outcomes; and
 - #1809: backend, vCPU, transport, and device outcomes.
@@ -82,11 +82,13 @@ planned, and 62 not-applicable invocations.
 Delivery validation accepts those named planned classes. Final validation
 rejects every planned class.
 
-`logger.api.result` is planned because general closed result/rejection coverage
-is not complete. Its metadata nevertheless records the already compiled
-`InstanceStart` and `FlushMetrics` events and their exact #1785 evidence. This
-does not promote the broader class; it prevents existing compiled behavior from
-being lost while #1807 completes the shared source boundary.
+Issue #1807 closes the configuration-owned classes. API control records cover
+server start/stop, discarded connection failure, deprecated requests,
+successful pause/resume and snapshot completion, and parse rejection. Every
+successfully parsed dispatch has one closed result record; parse rejection has
+one control record and no result. Process startup has one fixed `running`
+outcome after the no-API owner is ready or the API socket is bound and before
+readiness is announced.
 
 ## Closed class ledger
 
@@ -95,10 +97,10 @@ Owners apply only to planned work.
 
 | Class | Disposition | Owner/reason | Mappings |
 | --- | --- | --- | ---: |
-| `logger.api-control.outcome` | `planned` | #1807 | 7 |
+| `logger.api-control.outcome` | `implemented` | fixed server/connection/request outcomes | 7 |
 | `logger.api-worker.outcome` | `planned` | #1808 | 5 |
 | `logger.api.request` | `implemented` | parsed method/template receipt | 1 |
-| `logger.api.result` | `planned` | #1807; existing minimal actions retained | 5 |
+| `logger.api.result` | `implemented` | closed HTTP result plus retained actions | 5 |
 | `logger.backend.outcome` | `planned` | #1809 | 26 |
 | `logger.balloon.outcome` | `planned` | #1809 | 28 |
 | `logger.block.outcome` | `planned` | #1809 | 34 |
@@ -118,7 +120,7 @@ Owners apply only to planned work.
 | `logger.observability.outcome` | `planned` | #1808 | 4 |
 | `logger.pmem.outcome` | `planned` | #1809 | 18 |
 | `logger.process-signal.outcome` | `planned` | #1808 | 5 |
-| `logger.process-startup.outcome` | `planned` | #1807 | 5 |
+| `logger.process-startup.outcome` | `implemented` | fixed normal startup outcome | 5 |
 | `logger.process.exit` | `implemented` | fixed terminal category | 3 |
 | `logger.process.panic` | `implemented` | fixed emergency record | 3 |
 | `logger.serial.outcome` | `planned` | #1809 | 12 |
@@ -132,6 +134,20 @@ The outcome classes are semantic, not raw-line mirrors. Their fixed
 the closed outcome selects level. Adding a new operation/outcome requires
 deliberate class metadata and compiled-event review, never inheritance from a
 source-path selector.
+
+The newly closed records have exact fixed shapes:
+
+- API control: `operation=<server|connection|request|request-parse>
+  outcome=<closed-outcome>`;
+- parsed dispatch result: `action=request
+  outcome=<ok|no-content|bad-request|payload-too-large>`; and
+- normal startup: `operation=process-startup outcome=running`.
+
+Control/result levels are selected from the closed outcome: normal operation is
+`Info`, server stop is `Debug`, deprecation is `Warn`, and connection, parse,
+or error response outcomes are `Error`. These records use fixed modules and do
+not carry a URI, request/response body, fault text, status integer, path, or
+selector.
 
 ## Allowed fields and redaction
 
@@ -180,21 +196,39 @@ once.
 ## Default output and configuration projection
 
 Pinned Firecracker writes to process stdout when no logger path is configured.
-The challenged #1786 Plan selects that platform-feasible behavior, mediated by
-Bangbang's existing bounded worker. It remains planned under #1807 in this
-audit-only change: the current executable is not silently changed by this
-contract.
+Normal Bangbang execution now installs a process-owned stdout adapter before
+the first logger-capable startup step. The adapter feeds the existing bounded
+worker and normal status output into one close-on-exec, nonblocking internal
+pipe. One process-owned forwarder drains that pipe to a writable close-on-exec
+stdout duplicate without changing stdout's shared status flags. A blocked real
+stdout can therefore stall only that one forwarder; it cannot block producers,
+alter serial standard-stream ownership, or accumulate forwarding threads.
+Normal convergence waits at most one second for already accepted adapter bytes;
+a stalled output still cannot replace the process result.
+Runtime/library controllers remain silent unless an executable explicitly
+installs an output. An unavailable or unwritable stdout leaves the logger
+unconfigured and cannot change process readiness or results. Version/help/
+snapshot-inspection short commands remain exact and exit before normal VMM
+logger setup.
 
 A later explicit direct path or contained write-only sink replaces stdout
-through the existing failure-atomic worker transaction. A path-free update
-retains the active target. Producers never write synchronously to stdout or any
-other sink.
+as the logger target through the existing failure-atomic worker transaction.
+Because the adapter never mutates real stdout flags, default serial output can
+independently capture and restore its standard-stream lifetime before or after
+that commit. Logger, status, and default serial bytes may share process stdout,
+but no cross-producer byte or record ordering is promised; consumers that need
+an isolated serial or logger protocol must configure a separate target. Failed
+or path-free updates retain the logger target; the process keeps the same
+bounded adapter for best-effort status output. Producers never perform sink
+I/O.
 
 `FullVmConfiguration.logger` remains omitted. The pinned Firecracker ordinary
 configuration conversion also returns `logger: None`, and exporting Bangbang's
 process-local path, module, grant, delivery, or limiter state would leak host
-authority and create a misleading round trip. #1807 owns the final API/schema
-evidence for this optional-field decision.
+authority and create a misleading round trip. Startup configuration accepts the
+strict logger section before actions, and its provided values override the
+matching earlier CLI logger fields and target in one ordered startup
+transaction; omitted values retain their prior/default meaning.
 
 ## Update and verification workflow
 
@@ -223,6 +257,9 @@ all checked JSON files. Review identity, syntax, context, input, count, and
 fingerprint changes before deliberately updating the checked manifest. Resolve
 every missing/stale human mapping separately.
 
-This audit slice does not change `capabilities.json`: all eleven #1786 records
-remain `audit-required` until their owning behavior and aggregate evidence are
-complete.
+Issue #1807 promotes the nine concrete `/logger` operation, path, schema,
+property, and full-configuration records in `capabilities.json`. The two
+aggregate `corpus:logger` and
+`semantic.observability:logger-delivery-filtering-loss-and-redaction` records
+remain `audit-required` until #1808, #1809, and final certification close every
+planned producer class.

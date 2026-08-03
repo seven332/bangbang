@@ -1180,6 +1180,22 @@ impl VmmController {
         input.validate().map_err(VmmActionError::LoggerConfig)
     }
 
+    /// Installs the normal process stdout target before Logger field updates.
+    pub fn install_process_stdout_logger(
+        &mut self,
+        output: logger::ProcessStdoutLogger,
+    ) -> Result<(), VmmActionError> {
+        if self.instance_info.state != InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutLogger",
+                state: self.instance_info.state,
+            });
+        }
+        self.logger_state
+            .install_process_stdout(output)
+            .map_err(VmmActionError::LoggerConfig)
+    }
+
     /// Prepares a validated logger update with an optional provided sink file.
     pub fn prepare_logger_update(
         &self,
@@ -1618,12 +1634,27 @@ impl VmmController {
     }
 
     #[track_caller]
+    pub fn log_api_control(&mut self, outcome: logger::LoggerApiControlOutcome) -> bool {
+        self.logger_state.log_api_control(outcome)
+    }
+
+    #[track_caller]
     pub fn log_api_request(
         &mut self,
         method: logger::LoggerHttpMethod,
         route: logger::LoggerApiRoute,
     ) -> bool {
         self.logger_state.log_api_request(method, route)
+    }
+
+    #[track_caller]
+    pub fn log_api_result(&mut self, outcome: logger::LoggerApiResultOutcome) -> bool {
+        self.logger_state.log_api_result(outcome)
+    }
+
+    #[track_caller]
+    pub fn log_process_startup(&mut self, outcome: logger::ProcessStartupOutcome) -> bool {
+        self.logger_state.log_process_startup(outcome)
     }
 
     pub fn record_put_actions_request(&mut self) {

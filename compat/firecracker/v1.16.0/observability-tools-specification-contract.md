@@ -139,15 +139,15 @@ remain in the CPU-template contract.
 | `api-schema:MsrModifier` | #1784 | `proven-platform-impossible` |
 | `corpus:actions-api` | #1784 | `implemented-and-verified` |
 | `semantic.specification:api-availability-stability-and-failure-information` | #1784 | `implemented-and-verified` |
-| `api-operation:PUT /logger` | #1786 | `audit-required` |
-| `api-path:/logger` | #1786 | `audit-required` |
-| `api-property:FullVmConfiguration.logger` | #1786 | `audit-required` |
-| `api-property:Logger.level` | #1786 | `audit-required` |
-| `api-property:Logger.log_path` | #1786 | `audit-required` |
-| `api-property:Logger.module` | #1786 | `audit-required` |
-| `api-property:Logger.show_level` | #1786 | `audit-required` |
-| `api-property:Logger.show_log_origin` | #1786 | `audit-required` |
-| `api-schema:Logger` | #1786 | `audit-required` |
+| `api-operation:PUT /logger` | #1786 | `implemented-and-verified` |
+| `api-path:/logger` | #1786 | `implemented-and-verified` |
+| `api-property:FullVmConfiguration.logger` | #1786 | `implemented-and-verified` |
+| `api-property:Logger.level` | #1786 | `implemented-and-verified` |
+| `api-property:Logger.log_path` | #1786 | `implemented-and-verified` |
+| `api-property:Logger.module` | #1786 | `implemented-and-verified` |
+| `api-property:Logger.show_level` | #1786 | `implemented-and-verified` |
+| `api-property:Logger.show_log_origin` | #1786 | `implemented-and-verified` |
+| `api-schema:Logger` | #1786 | `implemented-and-verified` |
 | `corpus:logger` | #1786 | `audit-required` |
 | `semantic.observability:logger-delivery-filtering-loss-and-redaction` | #1786 | `audit-required` |
 | `api-operation:PUT /metrics` | #1787 | `audit-required` |
@@ -214,10 +214,13 @@ remain in the CPU-template contract.
 
 ## Disposition accounting
 
-#1784 moves 22 rows to `implemented-and-verified` and 13 rows to
-`proven-platform-impossible`. The post-#1784 inventory is therefore exactly
-318 implemented, 67 audit-required, three missing-platform-feasible, and 30
-proven-platform-impossible. If every other #1491-owned row later becomes
-implemented while the nine handoffs remain, the prospective Wave 7 endpoint
-is 376/9/3/30. These are exact consequences of the current row set, not quotas;
-the authoritative current totals remain derived from `capabilities.json`.
+#1784 moved 22 rows to `implemented-and-verified` and 13 rows to
+`proven-platform-impossible`. #1807 subsequently moves the nine concrete
+logger operation/path/schema/property rows to `implemented-and-verified` while
+retaining both aggregate logger rows for #1786 final certification. The current
+inventory is therefore exactly 327 implemented, 58 audit-required, three
+missing-platform-feasible, and 30 proven-platform-impossible. If every other
+#1491-owned row later becomes implemented while the nine handoffs remain, the
+prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the
+current row set, not quotas; the authoritative totals remain derived from
+`capabilities.json`.

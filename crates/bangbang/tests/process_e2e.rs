@@ -10,8 +10,13 @@
 mod support;
 
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::net::UnixStream;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use support::{
     BangbangProcess, TestDir, assert_bad_request_response, assert_clean_shutdown,
@@ -184,6 +189,283 @@ fn executable_short_version_alias_exits_before_socket_publication() {
 }
 
 #[test]
+fn executable_defaults_normal_logger_records_to_stdout() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("default-logger.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let startup = bangbang.stdout_snapshot();
+    let server = startup
+        .find("operation=server outcome=running\n")
+        .expect("default stdout should contain server startup");
+    let process = startup
+        .find("operation=process-startup outcome=running\n")
+        .expect("default stdout should contain process startup");
+    let ready = startup
+        .find("status: API server listening\n")
+        .expect("default stdout should contain readiness");
+    assert!(
+        server < process && process < ready,
+        "unexpected startup order: {startup}"
+    );
+
+    let version = http_get(&socket_path, "/version");
+    assert_ok_response(&version, "GET /version with default stdout logger");
+    bangbang
+        .wait_for_stdout_marker("action=request outcome=ok", Duration::from_secs(2))
+        .expect("default stdout should receive the API result");
+    let running = bangbang.stdout_snapshot();
+    assert!(running.contains("The API server received a Get request on \"/version\".\n"));
+
+    let output = bangbang.terminate();
+    assert!(
+        output
+            .stdout
+            .contains("event=process-exit category=success\n"),
+        "default stdout should receive terminal outcome: {}",
+        output.stdout
+    );
+    assert_clean_shutdown(output, &socket_path, "default stdout logger");
+}
+
+#[test]
+fn path_free_logger_update_retains_default_stdout_and_vm_config_omission() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("path-free-logger.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let response = http_put_json(&socket_path, "/logger", r#"{"show_level":true}"#);
+    assert_no_content_response(&response, "path-free PUT /logger");
+    bangbang
+        .wait_for_stdout_marker(
+            "level=Info action=request outcome=no-content",
+            Duration::from_secs(2),
+        )
+        .expect("path-free update result should remain on stdout");
+
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config after path-free logger update");
+    assert!(
+        !vm_config.contains("logger"),
+        "full VM config must omit logger state: {vm_config}"
+    );
+    bangbang
+        .wait_for_stdout_marker(
+            "level=Info action=request outcome=ok",
+            Duration::from_secs(2),
+        )
+        .expect("subsequent API results should remain on stdout");
+    let output = bangbang.terminate();
+    assert!(
+        output.stdout.contains(
+            "The API server received a Put request on \"/logger\".\nlevel=Info action=request outcome=no-content\n"
+        ),
+        "logger request should precede its newly prefixed result: {}",
+        output.stdout
+    );
+    assert!(
+        output
+            .stdout
+            .contains("level=Info event=process-exit category=success\n")
+    );
+    assert_clean_shutdown(output, &socket_path, "path-free default stdout logger");
+}
+
+#[test]
+fn unavailable_stdout_does_not_change_api_readiness_or_results() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("unavailable-stdout.socket");
+    let instance_id = test_dir.instance_id();
+    let read_only_stdout = File::open("/dev/null").expect("read-only stdout fixture should open");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bangbang"))
+        .arg("--api-sock")
+        .arg(&socket_path)
+        .arg("--id")
+        .arg(&instance_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(read_only_stdout))
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bangbang should spawn with unavailable stdout");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket_path.exists() && Instant::now() < deadline {
+        assert!(
+            child
+                .try_wait()
+                .expect("child status should inspect")
+                .is_none(),
+            "bangbang exited before API readiness"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(socket_path.exists(), "API socket should become ready");
+    let response = http_get(&socket_path, "/version");
+    assert_ok_response(&response, "GET /version with unavailable stdout");
+
+    let pid = i32::try_from(child.id()).expect("child pid should fit in pid_t");
+    // SAFETY: `pid` names the live child process owned by this test.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let output = child
+        .wait_with_output()
+        .expect("bangbang should exit after SIGTERM");
+    assert!(
+        output.status.success(),
+        "unavailable stdout must not change the process result; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !socket_path.exists(),
+        "clean exit should remove the API socket"
+    );
+}
+
+#[test]
+fn full_blocking_stdout_with_default_logger_does_not_block_api_or_shutdown() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("full-default-stdout.socket");
+    let instance_id = test_dir.instance_id();
+    let (_reader, mut writer) = UnixStream::pair().expect("stdout socket pair should create");
+    writer
+        .set_nonblocking(true)
+        .expect("stdout writer should become nonblocking");
+    let fill = [b'x'; 4096];
+    loop {
+        match writer.write(&fill) {
+            Ok(0) => panic!("stdout fixture made no progress"),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) => panic!("stdout fixture should fill: {error}"),
+        }
+    }
+    writer
+        .set_nonblocking(false)
+        .expect("stdout writer should start blocking");
+    let writer = std::os::fd::OwnedFd::from(writer);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bangbang"))
+        .arg("--api-sock")
+        .arg(&socket_path)
+        .arg("--id")
+        .arg(&instance_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bangbang should spawn with full default stdout");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket_path.exists() && Instant::now() < deadline {
+        assert!(
+            child
+                .try_wait()
+                .expect("child status should inspect")
+                .is_none(),
+            "bangbang exited before API readiness"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(socket_path.exists(), "API socket should become ready");
+    let response = http_get(&socket_path, "/version");
+    assert_ok_response(&response, "GET /version with full default stdout");
+
+    let pid = i32::try_from(child.id()).expect("child pid should fit in pid_t");
+    // SAFETY: `pid` names the live child process owned by this test.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let output = child
+        .wait_with_output()
+        .expect("bangbang should exit after SIGTERM");
+    assert!(
+        output.status.success(),
+        "full default stdout must not change the process result; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !socket_path.exists(),
+        "clean exit should remove the API socket"
+    );
+}
+
+#[test]
+fn full_blocking_stdout_after_logger_replacement_does_not_block_readiness() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("full-stdout.socket");
+    let logger_path = test_dir.path().join("full-stdout.log");
+    let instance_id = test_dir.instance_id();
+    let (_reader, mut writer) = UnixStream::pair().expect("stdout socket pair should create");
+    writer
+        .set_nonblocking(true)
+        .expect("stdout writer should become nonblocking");
+    let fill = [b'x'; 4096];
+    loop {
+        match writer.write(&fill) {
+            Ok(0) => panic!("stdout fixture made no progress"),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) => panic!("stdout fixture should fill: {error}"),
+        }
+    }
+    writer
+        .set_nonblocking(false)
+        .expect("stdout writer should start blocking");
+    let writer = std::os::fd::OwnedFd::from(writer);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bangbang"))
+        .arg("--api-sock")
+        .arg(&socket_path)
+        .arg("--id")
+        .arg(&instance_id)
+        .arg("--log-path")
+        .arg(&logger_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bangbang should spawn with full stdout");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket_path.exists() && Instant::now() < deadline {
+        assert!(
+            child
+                .try_wait()
+                .expect("child status should inspect")
+                .is_none(),
+            "bangbang exited before API readiness"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(socket_path.exists(), "API socket should become ready");
+    let response = http_get(&socket_path, "/version");
+    assert_ok_response(&response, "GET /version with full stdout");
+
+    let pid = i32::try_from(child.id()).expect("child pid should fit in pid_t");
+    // SAFETY: `pid` names the live child process owned by this test.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let output = child
+        .wait_with_output()
+        .expect("bangbang should exit after SIGTERM");
+    assert!(
+        output.status.success(),
+        "full stdout must not change the process result; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !socket_path.exists(),
+        "clean exit should remove the API socket"
+    );
+    let logger = fs::read_to_string(&logger_path).expect("logger output should be readable");
+    for expected in [
+        "operation=server outcome=running\n",
+        "operation=process-startup outcome=running\n",
+        "The API server received a Get request on \"/version\".\n",
+        "action=request outcome=ok\n",
+        "event=process-exit category=success\n",
+    ] {
+        assert!(logger.contains(expected), "missing {expected:?}: {logger}");
+    }
+}
+
+#[test]
 fn executable_logs_success_terminal_record_after_api_shutdown() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("terminal-success.socket");
@@ -199,7 +481,11 @@ fn executable_logs_success_terminal_record_after_api_shutdown() {
     assert_clean_shutdown(output, &socket_path, "API terminal logger");
     assert_eq!(
         fs::read_to_string(&logger_path).expect("terminal logger output should be readable"),
-        "event=process-exit category=success\n"
+        concat!(
+            "operation=server outcome=running\n",
+            "operation=process-startup outcome=running\n",
+            "event=process-exit category=success\n",
+        )
     );
 }
 
@@ -564,30 +850,37 @@ fn executable_applies_startup_logger_arguments() {
     assert_ok_response(&version, "GET /version with startup logger");
     let matching_output = fs::read_to_string(&matching_logger_path)
         .expect("startup logger output should be readable");
-    let matching_line = matching_output
-        .strip_suffix('\n')
-        .expect("startup logger output should end with one newline");
-    let matching_record = matching_line
-        .strip_prefix("level=Info origin=")
-        .expect("startup logger should include the configured level and origin");
-    let (origin, message) = matching_record
-        .split_once(' ')
-        .expect("startup logger origin should precede the message");
-    let (origin_file, origin_line) = origin
-        .rsplit_once(':')
-        .expect("startup logger origin should contain a file and line");
-    assert!(
-        !origin_file.is_empty(),
-        "logger origin file must not be empty"
-    );
-    assert!(
-        origin_line.parse::<u32>().is_ok(),
-        "logger origin line must be numeric: {origin_line}"
-    );
+    let records = matching_output.lines().collect::<Vec<_>>();
     assert_eq!(
-        message,
-        "The API server received a Get request on \"/version\"."
+        records.len(),
+        3,
+        "unexpected logger output: {matching_output}"
     );
+    for (record, expected_file, expected_message) in [
+        (records[0], "main.rs", "operation=server outcome=running"),
+        (
+            records[1],
+            "api_server.rs",
+            "The API server received a Get request on \"/version\".",
+        ),
+        (records[2], "api_server.rs", "action=request outcome=ok"),
+    ] {
+        let record = record
+            .strip_prefix("level=Info origin=")
+            .expect("startup logger should include the configured level and origin");
+        let (origin, message) = record
+            .split_once(' ')
+            .expect("startup logger origin should precede the message");
+        let (origin_file, origin_line) = origin
+            .rsplit_once(':')
+            .expect("startup logger origin should contain a file and line");
+        assert!(origin_file.ends_with(expected_file));
+        assert!(
+            origin_line.parse::<u32>().is_ok(),
+            "logger origin line must be numeric: {origin_line}"
+        );
+        assert_eq!(message, expected_message);
+    }
     assert_clean_shutdown(
         matching_bangbang.terminate(),
         &matching_socket_path,
@@ -2752,7 +3045,13 @@ fn executable_logs_api_request_methods_and_paths_without_bodies() {
     let logger_output = fs::read_to_string(&logger_path).expect("logger output should be readable");
     assert_eq!(
         logger_output,
-        "The API server received a Get request on \"/version\".\nThe API server received a Put request on \"/mmds\".\n"
+        concat!(
+            "action=request outcome=no-content\n",
+            "The API server received a Get request on \"/version\".\n",
+            "action=request outcome=ok\n",
+            "The API server received a Put request on \"/mmds\".\n",
+            "action=request outcome=no-content\n",
+        )
     );
     assert!(
         !logger_output.contains(private_value),
@@ -4397,6 +4696,51 @@ fn concurrent_executables_keep_api_resources_isolated() {
         &second_socket_path,
         "second bangbang",
     );
+}
+
+#[test]
+fn concurrent_executables_keep_logger_targets_isolated() {
+    let test_dir = TestDir::new();
+    let first_socket = test_dir.path().join("first-log.socket");
+    let second_socket = test_dir.path().join("second-log.socket");
+    let first_logger = test_dir.path().join("first.log");
+    let second_logger = test_dir.path().join("second.log");
+    let instance_id = test_dir.instance_id();
+    let first = BangbangProcess::start_with_extra_args(
+        &first_socket,
+        &format!("{instance_id}-first"),
+        &[
+            "--log-path",
+            path_text(&first_logger),
+            "--module",
+            "bangbang_runtime::api_server",
+        ],
+    );
+    let second = BangbangProcess::start_with_extra_args(
+        &second_socket,
+        &format!("{instance_id}-second"),
+        &[
+            "--log-path",
+            path_text(&second_logger),
+            "--module",
+            "bangbang_runtime::api_server",
+        ],
+    );
+
+    assert_ok_response(&http_get(&first_socket, "/version"), "first GET /version");
+    assert_ok_response(
+        &http_get(&second_socket, "/vm/config"),
+        "second GET /vm/config",
+    );
+    let first_output = fs::read_to_string(&first_logger).expect("first logger should read");
+    let second_output = fs::read_to_string(&second_logger).expect("second logger should read");
+    assert!(first_output.contains("Get request on \"/version\""));
+    assert!(!first_output.contains("/vm/config"));
+    assert!(second_output.contains("Get request on \"/vm/config\""));
+    assert!(!second_output.contains("/version"));
+
+    assert_clean_shutdown(first.terminate(), &first_socket, "first logger process");
+    assert_clean_shutdown(second.terminate(), &second_socket, "second logger process");
 }
 
 fn write_unavailable_drive_socket_config(

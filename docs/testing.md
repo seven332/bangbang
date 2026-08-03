@@ -2360,8 +2360,11 @@ tests, not wall-clock signed tests. Injected monotonic time covers the initial
 ten-record boot-timer burst, 500-ms refill, five-second budget, backwards time,
 saturating suppression count, bounded CAS exhaustion, concurrent conservation,
 named-identity/controller independence, and the ordered recovery batch. Fixed
-record tests cover every short shape, the 512-byte/UTF-8 ceiling, normalized
-absolute/multibyte origins, and static drive/network/pmem route templates.
+record tests cover API receipt, all seven control outcomes, all four HTTP
+results, retained action events, normal process startup, panic/terminal, timer,
+and limiter-recovery shapes; they also cover exact levels, the 512-byte/UTF-8
+ceiling, normalized absolute/multibyte origins, and static
+drive/network/pmem route templates.
 Deterministic worker gates cover queue full/disconnect, timeout before dequeue
 and during write, zero/short/`EAGAIN`/write/flush outcomes, a genuinely full
 FIFO, and exact per-record accounting. Replacement tests cover initial spawn,
@@ -2369,8 +2372,9 @@ same-worker success, cancellation/commit races, held writer, repeated queue
 pressure with one worker generation, stale clones, disconnected recovery, and
 path-free retention. They also prove that API, action, startup, and guest boot
 timer MMIO outcomes do not change. API socket tests cover level/origin/module
-filters and verify that request bodies and dynamic selectors never reach logger
-output.
+filters, one result after each parsed dispatch, control-only `400`/`413` parse
+rejections, deprecated/completed control seams, discarded connection failure,
+and the absence of request bodies, dynamic selectors, paths, or fault text.
 
 Emergency logger tests separately prove one compare-exchange publication,
 priority before an ordinary wake message, bounded idle polling, independence
@@ -2408,10 +2412,15 @@ failure/rearm/recovery, explicit failure propagation, initial/final sink
 failure, guest stop, worker terminal error, ordinary server error, exact result
 preservation, terminal logger-before-final-metrics ordering, terminal logger
 failure accounting, all fixed categories, idempotent finalization, and
-independent process ownership. Ordinary real-binary tests cover successful API
-shutdown plus configuration and process failures after logger setup. The
-60-second rule is checked with injected `Instant` values and due schedulers;
-tests do not sleep for a production interval.
+independent process ownership. Ordinary real-binary tests additionally prove
+normal default logger records on stdout, retention across path-free updates,
+unavailable and completely full stdout independence, explicit-target readiness
+on blocking stdout, and concurrent process target isolation. Focused process/
+startup tests prove stdout-adapter flag isolation from default serial capture
+and provided config-file fields/target overriding matching CLI values. The suite
+also covers successful API shutdown plus configuration and process failures
+after logger setup. The 60-second rule is checked with injected `Instant` values
+and due schedulers; tests do not sleep for a production interval.
 
 Run the focused process-observability evidence with:
 
@@ -2441,8 +2450,14 @@ rejects nonrepresentable live RX/status/intent state rather than silently
 discarding it. It does not preserve public output configuration, TX bytes,
 limiter state, counters, or the complete capture-ready UART state.
 
-Contained output tests separately cover transferred regular files: the shared
-adoption helper rejects non-regular or non-`O_WRONLY` descriptors, verifies
+Default logger-stdout tests use pipes, sockets, and descriptor flag inspection
+to prove a close-on-exec nonblocking internal pipe, ordered logger/status
+forwarding plus bounded convergence drain, write-access rejection, and
+preservation of real stdout flags across logger replacement and serial
+capture/restoration. Contained output
+tests separately cover transferred regular
+files: the shared adoption helper rejects non-regular or non-`O_WRONLY`
+descriptors, verifies
 append/nonblocking status without upgrading access, and appends across multiple
 writes. Logger prepare/commit tests cover path-free sink retention and atomic
 replacement; metrics tests retain duplicate-before-claim and flush-baseline
@@ -2452,8 +2467,9 @@ redaction. Direct create/FIFO/open timing remains covered by the original tests.
 
 Production reachability is intentionally narrower than those normative tests.
 The existing API-driven and config-file-driven signed executable scenarios each
-observe session-initial plus explicit output before shutdown and one additional
-normal-terminal metrics line and final fixed success logger record after exit.
+observe API server/startup control, receipt, closed result, session-initial plus
+explicit output before shutdown, and one additional normal-terminal metrics
+line and final fixed success logger record after exit.
 The normal production-bundle output-grant cases check the same terminal logger
 record, while module-filtered concurrent cases prove it is suppressed. The
 signed boot-timer scenario proves a guest
@@ -2463,9 +2479,12 @@ signed serial-stdio cases use a raw `/dev/ttyS0` guest protocol and an exact
 104-byte payload to prove default stdout, 64-byte FIFO backpressure/rearm,
 stdin exclusion for configured output, limiter drops, queued input across
 pause/capture/resume, EOF with a live API, two-process isolation, metrics, and
-clean process termination. The production-bundle case repeats default
-stdin/stdout flow across the launcher/App Sandbox worker boundary and verifies
-socket/session cleanup. Signed device cases otherwise cover
+clean process termination. Their mixed default-output assertions prove record
+reachability but intentionally impose no logger/serial cross-producer ordering;
+device tests that require an exact concurrent serial marker protocol configure
+an explicit logger file before guest startup. The production-bundle case
+repeats default stdin/stdout flow across the launcher/App Sandbox worker
+boundary and verifies socket/session cleanup. Signed device cases otherwise cover
 representative block, pmem, network/MMDS, vsock, entropy, RTC, balloon, UART,
 signal, latency, and startup producers. Guest poweroff/reset cases separately
 prove API and no-api terminal process paths. The two-process MMDS case proves
