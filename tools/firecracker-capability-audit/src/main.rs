@@ -56,13 +56,18 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     let root = repository_root()?;
     let manifest = read_source_manifest(&root.join(SOURCE_MANIFEST_PATH))?;
     let inventory = read_capability_inventory(&root.join(CAPABILITY_INVENTORY_PATH))?;
-    validate(&manifest, &inventory, &root, mode)
-        .map_err(|errors| AuditError::new(format!("inventory validation errors:\n{errors}")))?;
     let logger_manifest = read_logger_producer_manifest(&root.join(LOGGER_PRODUCER_MANIFEST_PATH))?;
     let logger_audit = read_logger_producer_audit(&root.join(LOGGER_PRODUCER_AUDIT_PATH))?;
-    validate_logger_producers(&logger_manifest, &logger_audit, &root, mode).map_err(|errors| {
-        AuditError::new(format!("logger producer validation errors:\n{errors}"))
-    })?;
+    let mut failures = Vec::new();
+    if let Err(errors) = validate(&manifest, &inventory, &root, mode) {
+        failures.push(format!("inventory validation errors:\n{errors}"));
+    }
+    if let Err(errors) = validate_logger_producers(&logger_manifest, &logger_audit, &root, mode) {
+        failures.push(format!("logger producer validation errors:\n{errors}"));
+    }
+    if !failures.is_empty() {
+        return Err(AuditError::new(failures.join("\n")));
+    }
     let mode_name = match mode {
         AuditMode::Delivery => "delivery",
         AuditMode::Final => "final",
@@ -390,5 +395,13 @@ mod tests {
                 .expect_err("checked inventory alias should be refused");
             assert!(error.to_string().contains("never overwrites"));
         }
+    }
+
+    #[test]
+    fn regeneration_refuses_an_existing_destination() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let error = candidate_output_path(root, Path::new("Cargo.toml"))
+            .expect_err("an existing candidate destination must be refused");
+        assert!(error.to_string().contains("already exists"));
     }
 }

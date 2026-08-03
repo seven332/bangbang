@@ -122,7 +122,11 @@ fn validate_manifest(manifest: &LoggerProducerManifest, errors: &mut Vec<String>
                 input.path
             ));
         }
-        if input.git_blob.len() < 40 || !input.git_blob.bytes().all(|byte| byte.is_ascii_hexdigit())
+        if input.git_blob.len() != 40
+            || !input
+                .git_blob
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             errors.push(format!(
                 "logger input git_blob is not a Git object id: {}",
@@ -585,10 +589,22 @@ fn validate_applicable_policy(class: &LoggerProducerClass, errors: &mut Vec<Stri
         ));
     }
     let is_recovery = class.compiled_events == [LoggerCompiledEvent::RateLimitRecovery];
+    if class.guest_triggerable != (class.delivery == LoggerDeliveryPolicy::NonblockingGuest) {
+        errors.push(format!(
+            "logger guest triggerability requires exact nonblocking-guest delivery: {}",
+            class.id
+        ));
+    }
     if class.guest_triggerable && class.limiter != LoggerLimiterPolicy::RateLimited && !is_recovery
     {
         errors.push(format!(
             "guest-triggerable logger class must be rate limited: {}",
+            class.id
+        ));
+    }
+    if is_recovery && class.limiter != LoggerLimiterPolicy::Unrestricted {
+        errors.push(format!(
+            "logger limiter recovery must be unrestricted: {}",
             class.id
         ));
     }

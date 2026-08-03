@@ -3,10 +3,11 @@ use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
     AuditMode, CAPABILITY_INVENTORY_PATH, Disposition, LOGGER_PRODUCER_AUDIT_PATH,
-    LOGGER_PRODUCER_MANIFEST_PATH, LoggerClassDisposition, LoggerCompiledEvent, Reference,
-    SOURCE_MANIFEST_PATH, logger_producer_audit_json, logger_producer_manifest_json,
-    read_capability_inventory, read_logger_producer_audit, read_logger_producer_manifest,
-    read_source_manifest, source_manifest_json, validate, validate_logger_producers,
+    LOGGER_PRODUCER_MANIFEST_PATH, LoggerClassDisposition, LoggerCompiledEvent,
+    LoggerDeliveryPolicy, Reference, SOURCE_MANIFEST_PATH, logger_producer_audit_json,
+    logger_producer_manifest_json, read_capability_inventory, read_logger_producer_audit,
+    read_logger_producer_manifest, read_source_manifest, source_manifest_json, validate,
+    validate_logger_producers,
 };
 
 #[test]
@@ -491,6 +492,18 @@ fn logger_audit_mutations_fail_closed() {
     .to_string();
     assert!(error.contains("logger source-context counts must cover every invocation"));
 
+    let mut malformed_blob = manifest.clone();
+    malformed_blob.inputs[0].git_blob = "A".repeat(40);
+    let error = validate_logger_producers(
+        &malformed_blob,
+        &audit,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("noncanonical Git blob ID must fail")
+    .to_string();
+    assert!(error.contains("logger input git_blob is not a Git object id"));
+
     let mut catch_all = audit.clone();
     let class = catch_all
         .classes
@@ -520,6 +533,23 @@ fn logger_audit_mutations_fail_closed() {
     .expect_err("not-applicable policy mismatch must fail")
     .to_string();
     assert!(error.contains("must use only not-applicable policy"));
+
+    let mut blocking_guest = audit.clone();
+    let class = blocking_guest
+        .classes
+        .iter_mut()
+        .find(|class| class.id == "logger.block.outcome")
+        .expect("block class must exist");
+    class.delivery = LoggerDeliveryPolicy::BoundedHost;
+    let error = validate_logger_producers(
+        &manifest,
+        &blocking_guest,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("guest-triggerable blocking delivery must fail")
+    .to_string();
+    assert!(error.contains("requires exact nonblocking-guest delivery"));
 
     let mut evidence_mismatch = audit.clone();
     let class = evidence_mismatch
