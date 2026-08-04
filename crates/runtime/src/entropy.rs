@@ -2813,7 +2813,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
-    use crate::logger::{LoggerConfigInput, LoggerTestCapture};
+    use crate::logger::{LoggerConfigInput, LoggerLevel, LoggerTestCapture};
     use crate::memory::{GuestMemoryError, GuestMemoryLayout, GuestMemoryRange};
     use crate::metrics::{EntropyDeviceMetrics, SharedEntropyDeviceMetrics};
     use crate::mmio::{
@@ -2848,12 +2848,14 @@ mod tests {
         PreparedEntropyDevice, VIRTIO_RNG_DEVICE_ID, VIRTIO_RNG_MAX_REQUEST_BYTES,
         VIRTIO_RNG_QUEUE_SIZES, VirtioRngBufferParseError, VirtioRngDevice,
         VirtioRngDeviceActivationError, VirtioRngDeviceCaptureError,
-        VirtioRngDeviceNotificationError, VirtioRngEntropySource, VirtioRngEntropySourceError,
-        VirtioRngMmioHandler, VirtioRngOsEntropySource, VirtioRngQueue, VirtioRngQueueBuildError,
+        VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError,
+        VirtioRngEntropySource, VirtioRngEntropySourceError, VirtioRngMmioHandler,
+        VirtioRngOsEntropySource, VirtioRngQueue, VirtioRngQueueBuildError,
         VirtioRngQueueCaptureError, VirtioRngQueueDispatch, VirtioRngQueueDispatchError,
         VirtioRngRateLimiter, VirtioRngRateLimiterCaptureError, VirtioRngRateLimiterReduction,
         VirtioRngRateLimiterRestoreState, VirtioRngRetryCaptureState,
         VirtioRngTokenBucketRestoreState, capture_rng_rate_limiter_state_at,
+        observe_entropy_notification_result,
     };
 
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
@@ -3766,6 +3768,44 @@ mod tests {
             1
         );
         assert!(!output.contains("queue-index"));
+    }
+
+    #[test]
+    fn entropy_observer_coalesces_request_and_limiter_outcomes_in_fixed_order() {
+        let capture = LoggerTestCapture::default();
+        let (mut logger_state, initial_logger) = capture.configured_guest_logger();
+        drop(initial_logger);
+        logger_state
+            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Debug))
+            .expect("debug entropy logger should configure");
+        let logger = logger_state.guest_logger();
+        let result = Ok(VirtioRngDeviceNotificationDispatch::new(
+            vec![0],
+            Some(VirtioRngQueueDispatch {
+                processed_requests: 4,
+                successful_requests: 1,
+                buffer_parse_failures: 1,
+                source_failures: 1,
+                rate_limiter_throttled_requests: 1,
+                rate_limiter_events: 1,
+                ..VirtioRngQueueDispatch::default()
+            }),
+        ));
+
+        observe_entropy_notification_result(&logger, &result);
+
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            [
+                "device-kind=entropy operation=request-parse outcome=failed",
+                "device-kind=entropy operation=fill outcome=failed",
+                "device-kind=entropy operation=rate-limiter outcome=throttled",
+                "device-kind=entropy operation=rate-limiter outcome=resumed",
+                "device-kind=entropy operation=fill outcome=succeeded",
+            ]
+        );
     }
 
     #[test]

@@ -1571,8 +1571,10 @@ backing paths, grant references, sockets, MAC addresses, or guest payloads.
 Balloon, virtio-mem, entropy, serial, and time/identity coverage checks every
 closed event encoding and level, independent limiter identities, summary-level
 deduplication, partial and rollback classifications, provider and interrupt
-supplements, serial input coalescing, RTC rejection, and normal/native-v2
-VMGenID, VMClock, PVTime, capture, publication, and ordered-restore outcomes.
+supplements, committed product-PCI configuration plus endpoint-failure
+classification, serial input coalescing across normal and restored
+continuations, RTC rejection, and normal/native-v2 VMGenID, VMClock, PVTime,
+capture, publication, and ordered-restore outcomes.
 Runtime and HVF tests assert unchanged functional results and absence of raw
 errors, identifiers, descriptors, byte/page counts, timestamps, and guest
 values. The signed executable parser admits the complete fixed vocabulary and

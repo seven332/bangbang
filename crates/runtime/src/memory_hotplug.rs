@@ -2656,6 +2656,12 @@ fn observe_memory_hotplug_notification_result(
                 None
             }
         });
+    let rollback_failed = [rollback, rollback_from_summary]
+        .into_iter()
+        .any(|outcome| outcome == Some(LoggerMemoryHotplugOutcome::MutationRollbackFailed));
+    let rollback_succeeded = [rollback, rollback_from_summary]
+        .into_iter()
+        .any(|outcome| outcome == Some(LoggerMemoryHotplugOutcome::MutationRollbackSucceeded));
     let successful_requests = dispatch.is_some_and(|dispatch| {
         dispatch
             .processed_requests()
@@ -2671,8 +2677,7 @@ fn observe_memory_hotplug_notification_result(
     logger.log_memory_hotplug_summary(
         [
             outer,
-            rollback,
-            rollback_from_summary,
+            rollback_failed.then_some(LoggerMemoryHotplugOutcome::MutationRollbackFailed),
             dispatch
                 .is_some_and(|dispatch| dispatch.memory_discard_failures() != 0)
                 .then_some(LoggerMemoryHotplugOutcome::MemoryDiscardFailed),
@@ -2691,6 +2696,7 @@ fn observe_memory_hotplug_notification_result(
             dispatch
                 .is_some_and(|dispatch| dispatch.unsupported_requests() != 0)
                 .then_some(LoggerMemoryHotplugOutcome::RequestUnsupported),
+            rollback_succeeded.then_some(LoggerMemoryHotplugOutcome::MutationRollbackSucceeded),
             successful_requests.then_some(LoggerMemoryHotplugOutcome::RequestSucceeded),
             dispatch
                 .is_some_and(|dispatch| dispatch.state_requests() != 0)
@@ -6128,6 +6134,106 @@ mod tests {
             1
         );
         assert!(!output.contains("queue-index"));
+    }
+
+    #[test]
+    fn memory_hotplug_observer_deduplicates_and_orders_rollback_outcomes() {
+        let capture = LoggerTestCapture::default();
+        let (_state, logger) = capture.configured_guest_logger();
+        let rollback_result = |summary_failures| {
+            let completed_dispatch = VirtioMemQueueDispatch {
+                processed_requests: 1,
+                mutation_failures: 1,
+                first_mutation_failure: Some(
+                    VirtioMemMutationError::new("summary mutation failure").with_rollback_outcome(
+                        VirtioMemMutationRollbackOutcome::new(1, summary_failures),
+                    ),
+                ),
+                ..VirtioMemQueueDispatch::default()
+            };
+            Err(VirtioMemDeviceNotificationError::QueueDispatch {
+                drained_notifications: vec![0],
+                source: VirtioMemQueueDispatchError::UsedRing {
+                    completed_dispatch: Box::new(completed_dispatch),
+                    descriptor_head: 0,
+                    bytes_written_to_guest: 0,
+                    rollback_attempted: true,
+                    rollback_error: None,
+                    source: VirtqueueUsedRingError::InvalidQueueSize { queue_size: 0 },
+                },
+            })
+        };
+
+        let duplicate_success: Result<
+            VirtioMemDeviceNotificationDispatch,
+            VirtioMemDeviceNotificationError,
+        > = rollback_result(0);
+        observe_memory_hotplug_notification_result(&logger, &duplicate_success);
+        let mixed_outcomes: Result<
+            VirtioMemDeviceNotificationDispatch,
+            VirtioMemDeviceNotificationError,
+        > = rollback_result(1);
+        observe_memory_hotplug_notification_result(&logger, &mixed_outcomes);
+
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.contains("operation=mutation-rollback"))
+                .collect::<Vec<_>>(),
+            [
+                "device-kind=memory-hotplug operation=mutation-rollback outcome=succeeded",
+                "device-kind=memory-hotplug operation=mutation-rollback outcome=failed",
+                "device-kind=memory-hotplug operation=mutation-rollback outcome=succeeded",
+            ]
+        );
+        assert!(!output.contains("summary mutation failure"));
+        assert!(!output.contains("queue_size"));
+    }
+
+    #[test]
+    fn memory_hotplug_observer_projects_all_summary_outcomes_in_fixed_order() {
+        let capture = LoggerTestCapture::default();
+        let (_state, logger) = capture.configured_guest_logger();
+        let result = Ok(VirtioMemDeviceNotificationDispatch::new(
+            vec![0],
+            Some(VirtioMemQueueDispatch {
+                processed_requests: 7,
+                state_requests: 1,
+                policy_errors: 1,
+                unsupported_requests: 1,
+                mutation_failures: 1,
+                parse_failures: 1,
+                response_write_failures: 1,
+                memory_discard_failures: 1,
+                first_mutation_failure: Some(
+                    VirtioMemMutationError::new("private mutation context")
+                        .with_rollback_outcome(VirtioMemMutationRollbackOutcome::new(2, 1)),
+                ),
+                ..VirtioMemQueueDispatch::default()
+            }),
+        ));
+
+        observe_memory_hotplug_notification_result(&logger, &result);
+
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            [
+                "device-kind=memory-hotplug operation=mutation-rollback outcome=failed",
+                "device-kind=memory-hotplug operation=memory-discard outcome=failed",
+                "device-kind=memory-hotplug operation=mutation outcome=failed",
+                "device-kind=memory-hotplug operation=request-parse outcome=failed",
+                "device-kind=memory-hotplug operation=response-write outcome=failed",
+                "device-kind=memory-hotplug operation=policy outcome=rejected",
+                "device-kind=memory-hotplug operation=request outcome=unsupported",
+                "device-kind=memory-hotplug operation=request outcome=succeeded",
+                "device-kind=memory-hotplug operation=state-query outcome=succeeded",
+            ]
+        );
+        assert!(!output.contains("private mutation context"));
     }
 
     #[test]

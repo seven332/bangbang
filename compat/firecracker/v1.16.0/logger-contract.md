@@ -119,9 +119,12 @@ token nor key material can enter a record.
 
 Issue #1816 closes balloon, virtio-mem, entropy, serial, and time/identity
 outcomes. Balloon, virtio-mem, and entropy observers consume complete typed
-queue summaries shared by MMIO and product PCI; serial input is coalesced once
-per run-loop dispatch while output and limiter failures stay at the owning
-wrapper. RTC, VMGenID, VMClock, PVTime, platform publication, capture, and
+queue summaries shared by MMIO and product PCI. Virtio-mem configuration
+commit and interrupt delivery remain separate outcomes when a committed PCI
+update is followed by endpoint failure. Serial input is coalesced once per
+run-loop dispatch or restored-continuation reconciliation while output and
+limiter failures stay at the owning wrapper. RTC, VMGenID, VMClock, PVTime,
+platform publication, capture, and
 ordered restore retain fixed component and aggregate commit classifications.
 Each class has an independent limiter identity. Raw errors, paths, device
 identities, descriptors, byte/page counts, time values, and guest data are

@@ -11331,6 +11331,72 @@ mod tests {
     }
 
     #[test]
+    fn balloon_observer_coalesces_five_queue_outcomes_in_fixed_order() {
+        let capture = LoggerTestCapture::default();
+        let (_state, logger) = capture.configured_guest_logger();
+        let failed_discard = VirtioBalloonDiscardOutcome {
+            failures: 1,
+            ..VirtioBalloonDiscardOutcome::default()
+        };
+        let result = Ok(VirtioBalloonDeviceNotificationDispatch {
+            drained_notifications: vec![
+                VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+                VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+                VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+                3,
+                4,
+            ],
+            inflate_notifications: 1,
+            deflate_notifications: 1,
+            statistics_notifications: 1,
+            hinting_notifications: 1,
+            reporting_notifications: 1,
+            inflate_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                completed_descriptors: 1,
+                inflate_discard: failed_discard,
+                ..VirtioBalloonQueueDispatch::default()
+            }),
+            deflate_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                completed_descriptors: 1,
+                ..VirtioBalloonQueueDispatch::default()
+            }),
+            statistics_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                statistics_reports: 1,
+                statistics_oversized_reports: 1,
+                ..VirtioBalloonQueueDispatch::default()
+            }),
+            hinting_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                completed_descriptors: 1,
+                hinting_discard: failed_discard,
+                ..VirtioBalloonQueueDispatch::default()
+            }),
+            reporting_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                completed_descriptors: 1,
+                reporting_discard: failed_discard,
+                ..VirtioBalloonQueueDispatch::default()
+            }),
+        });
+
+        observe_balloon_notification_result(&logger, &result);
+
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            [
+                "device-kind=balloon operation=memory-discard outcome=failed",
+                "device-kind=balloon operation=statistics outcome=oversized",
+                "device-kind=balloon operation=inflate outcome=succeeded",
+                "device-kind=balloon operation=deflate outcome=succeeded",
+                "device-kind=balloon operation=statistics outcome=updated",
+                "device-kind=balloon operation=hinting outcome=succeeded",
+                "device-kind=balloon operation=reporting outcome=succeeded",
+            ]
+        );
+        assert_eq!(output.matches("operation=memory-discard").count(), 1);
+    }
+
+    #[test]
     fn balloon_product_pci_interrupt_failure_has_exact_transport_and_class_owners() {
         let config = balloon_config(64, false, 0, false, false);
         let (config_space, features, queue_sizes, device) = prepared(config).into_parts();

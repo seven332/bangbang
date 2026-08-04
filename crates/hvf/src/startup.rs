@@ -2487,22 +2487,26 @@ impl HvfArm64BootPciDataDevices {
     fn update_memory_hotplug(
         &self,
         update: MemoryHotplugSizeUpdate,
-    ) -> Result<(), MemoryHotplugUpdateError> {
-        let device = self
-            .memory_hotplug
-            .as_ref()
-            .ok_or(MemoryHotplugUpdateError::ActiveSessionUnavailable)?;
-        match device
+    ) -> (Result<(), MemoryHotplugUpdateError>, bool) {
+        let Some(device) = self.memory_hotplug.as_ref() else {
+            return (
+                Err(MemoryHotplugUpdateError::ActiveSessionUnavailable),
+                false,
+            );
+        };
+        let operation = device
             .published
             .endpoint()
-            .update_mem_requested_size(update)
-        {
+            .update_mem_requested_size(update);
+        let configuration_updated = pci_memory_hotplug_configuration_updated(&operation);
+        let result = match operation {
             Ok(()) => Ok(()),
             Err(VirtioPciDeviceOperationError::Device(source)) => Err(*source),
             Err(source) => Err(MemoryHotplugUpdateError::ActiveSessionCommand {
                 message: source.to_string(),
             }),
-        }
+        };
+        (result, configuration_updated)
     }
 
     fn memory_hotplug_status(
@@ -3098,6 +3102,15 @@ impl HvfArm64BootPciBalloonDeviceUpdater {
             }),
         }
     }
+}
+
+fn pci_memory_hotplug_configuration_updated(
+    result: &Result<(), VirtioPciDeviceOperationError<MemoryHotplugUpdateError, ()>>,
+) -> bool {
+    result.is_ok()
+        || result
+            .as_ref()
+            .is_err_and(|source| source.completed_device_operation().is_some())
 }
 
 fn retain_earliest_retry(retained: &mut Option<Duration>, candidate: Option<Duration>) {
@@ -11079,6 +11092,27 @@ pub(crate) fn capture_hvf_snapshot_v2_time_state(
     .map_err(|source| HvfSnapshotV2TimeCaptureError::Build { source })
 }
 
+pub(crate) fn observe_pvtime_topology_capture<T>(
+    logger: &GuestLogger,
+    result: &Result<T, HvfArm64SnapshotV2TopologyCaptureError>,
+) {
+    let outcome = match result {
+        Ok(_) => Some(LoggerTimeIdentityOutcome::PvTimeAccountingPublished),
+        Err(HvfArm64SnapshotV2TopologyCaptureError::PvTime { .. }) => {
+            Some(LoggerTimeIdentityOutcome::PvTimeAccountingFailed)
+        }
+        Err(
+            HvfArm64SnapshotV2TopologyCaptureError::Lifecycle { .. }
+            | HvfArm64SnapshotV2TopologyCaptureError::Member { .. }
+            | HvfArm64SnapshotV2TopologyCaptureError::Allocation
+            | HvfArm64SnapshotV2TopologyCaptureError::LifecycleChanged,
+        ) => None,
+    };
+    if let Some(outcome) = outcome {
+        logger.log_time_identity(outcome);
+    }
+}
+
 impl fmt::Display for HvfArm64BootSnapshotV1DeviceCaptureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -13770,10 +13804,10 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
         let guest_logger = self.backend.guest_logger();
         let profile = hvf_arm64_boot_snapshot_v2_platform_profile(version);
         debug_assert!(profile.is_some());
-        let (stable, captures, pvtime_capture) =
-            self.runner
-                .capture_arm64_snapshot_v2_topology()
-                .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Topology { source })?;
+        let topology_result = self.runner.capture_arm64_snapshot_v2_topology();
+        observe_pvtime_topology_capture(&guest_logger, &topology_result);
+        let (stable, captures, pvtime_capture) = topology_result
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Topology { source })?;
         let memory = self
             .backend
             .mapped_guest_memory()
@@ -13896,21 +13930,15 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
             global_gic.ok_or(HvfArm64BootSnapshotV2CaptureError::GlobalGicShape { index: 0 })?;
 
         let rtc_mmio_layout = RtcMmioLayout::new(rtc.region.range().start(), rtc.region.id());
-        let time_result = capture_hvf_snapshot_v2_time_state(
+        let time = capture_hvf_snapshot_v2_time_state(
             memory,
             rtc_mmio_layout,
             &self.runtime_resources.vmgenid_device,
             &self.runtime_resources.vmclock_device,
             self.runtime_resources.pvtime_state.layout(),
             &pvtime_capture,
-        );
-        guest_logger.log_time_identity(if time_result.is_ok() {
-            LoggerTimeIdentityOutcome::PvTimeAccountingPublished
-        } else {
-            LoggerTimeIdentityOutcome::PvTimeAccountingFailed
-        });
-        let time =
-            time_result.map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
+        )
+        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
         let compatibility = HvfSnapshotV1CompatibilityState::new(
             primary_identification,
             primary_optional_identification,
@@ -16797,8 +16825,8 @@ impl HvfArm64BootSession<'_> {
             .as_ref()
             .filter(|devices| devices.memory_hotplug.is_some())
         {
-            let result = devices.update_memory_hotplug(update);
-            observe_memory_hotplug_configuration_update(&guest_logger, &result);
+            let (result, configuration_updated) = devices.update_memory_hotplug(update);
+            observe_memory_hotplug_configuration_update(&guest_logger, configuration_updated);
             return result;
         }
         update_memory_hotplug_requested_size_and_signal_interrupt(
@@ -29391,13 +29419,20 @@ impl OwnedHvfArm64BootSession {
     pub fn prepare_restored_serial_continuation(
         &mut self,
     ) -> Result<(), HvfArm64BootSerialInputDispatchError> {
-        let dispatch = dispatch_serial_input(
+        let result = dispatch_serial_input(
             &mut self.serial_input,
             &self.runtime_resources,
             &self.mmio_dispatcher,
             &self.gic,
             false,
-        )?;
+        );
+        if result
+            .as_ref()
+            .map_or(true, serial_input_dispatch_has_observable_outcome)
+        {
+            observe_serial_input_dispatch(&self.backend.guest_logger(), &result);
+        }
+        let dispatch = result?;
         debug_assert_eq!(dispatch.bytes_read, 0);
         debug_assert!(!dispatch.backpressured);
         debug_assert!(!dispatch.detached);
@@ -30764,8 +30799,8 @@ impl OwnedHvfArm64BootSession {
             .as_ref()
             .filter(|devices| devices.memory_hotplug.is_some())
         {
-            let result = devices.update_memory_hotplug(update);
-            observe_memory_hotplug_configuration_update(&guest_logger, &result);
+            let (result, configuration_updated) = devices.update_memory_hotplug(update);
+            observe_memory_hotplug_configuration_update(&guest_logger, configuration_updated);
             return result;
         }
         update_memory_hotplug_requested_size_and_signal_interrupt(
@@ -34548,15 +34583,12 @@ fn update_memory_hotplug_requested_size_and_signal_interrupt(
 
         Ok(())
     })();
-    observe_memory_hotplug_configuration_update(guest_logger, &result);
+    observe_memory_hotplug_configuration_update(guest_logger, result.is_ok());
     result
 }
 
-fn observe_memory_hotplug_configuration_update(
-    logger: &GuestLogger,
-    result: &Result<(), MemoryHotplugUpdateError>,
-) {
-    logger.log_memory_hotplug(if result.is_ok() {
+fn observe_memory_hotplug_configuration_update(logger: &GuestLogger, succeeded: bool) {
+    logger.log_memory_hotplug(if succeeded {
         LoggerMemoryHotplugOutcome::ConfigurationUpdateSucceeded
     } else {
         LoggerMemoryHotplugOutcome::ConfigurationUpdateFailed
@@ -38011,7 +38043,7 @@ mod tests {
     };
     use bangbang_runtime::memory_hotplug::{
         MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
-        VIRTIO_FEATURE_VERSION_1, VIRTIO_MEM_DEFAULT_REGION_ADDRESS,
+        MemoryHotplugUpdateError, VIRTIO_FEATURE_VERSION_1, VIRTIO_MEM_DEFAULT_REGION_ADDRESS,
         VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE, VIRTIO_MEM_REQUEST_SIZE, VIRTIO_MEM_RESPONSE_SIZE,
         VirtioMemAppliedMutation, VirtioMemMmioLayout, VirtioMemMutation, VirtioMemMutationError,
         VirtioMemMutationExecutor, VirtioMemMutationKind, VirtioMemMutationRollbackError,
@@ -38082,6 +38114,7 @@ mod tests {
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
         VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VirtioMmioRegister,
     };
+    use bangbang_runtime::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpointError};
     use bangbang_runtime::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
     };
@@ -38111,35 +38144,36 @@ mod tests {
         HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfArm64BootStorageCaptureErrorKind,
         HvfArm64BootTimeIdentityRestoreError, HvfArm64BootTimerDeviceConfig,
         HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
-        HvfArm64BootVsockNotificationDispatchError, HvfSnapshotLineageError,
-        PCI_ENDPOINT_SLOT_COUNT, allocate_interrupt_lines, capture_hvf_snapshot_v2_time_state,
-        collect_balloon_notification_dispatches, collect_block_notification_dispatches,
-        collect_entropy_notification_dispatches, collect_memory_hotplug_notification_dispatches,
-        collect_network_notification_dispatches, collect_vsock_notification_dispatches,
-        complete_live_snapshot_lineage,
+        HvfArm64BootVsockNotificationDispatchError, HvfArm64SnapshotV2TopologyCaptureError,
+        HvfSnapshotLineageError, PCI_ENDPOINT_SLOT_COUNT, allocate_interrupt_lines,
+        capture_hvf_snapshot_v2_time_state, collect_balloon_notification_dispatches,
+        collect_block_notification_dispatches, collect_entropy_notification_dispatches,
+        collect_memory_hotplug_notification_dispatches, collect_network_notification_dispatches,
+        collect_vsock_notification_dispatches, complete_live_snapshot_lineage,
         dispatch_memory_hotplug_runtime_notifications_with_executor,
         dispatch_network_runtime_notifications_with_packet_io, dispatch_serial_input_with,
         lock_boot_mmio_dispatcher, lock_boot_mmio_dispatcher_runtime,
         observe_balloon_interrupt_delivery, observe_entropy_interrupt_delivery,
         observe_memory_hotplug_interrupt_delivery, observe_ordered_time_identity_restore,
-        observe_serial_input_dispatch, observe_vmclock_restore, observe_vmgenid_restore,
-        pci_all_virtio_gic_msi_configuration, pci_all_virtio_resource_demand,
-        pci_balloon_restore_gic_msi_configuration, pci_data_available_bar_count, pci_data_bar_plan,
-        pci_data_endpoint_count, pci_data_region_id, pci_data_resource_demand,
-        pci_entropy_restore_gic_msi_configuration,
-        pci_memory_hotplug_restore_gic_msi_configuration, pci_root_restore_gic_msi_configuration,
-        preflight_pci_data_dispatcher, quiesce_limiter_retry_wakeups,
-        record_entropy_dispatch_metrics, record_memory_hotplug_signal_metrics,
-        record_memory_hotplug_teardown_metrics, record_pmem_dispatch_metrics,
-        replace_vmgenid_and_signal_with, restore_time_identity_and_signal_with,
-        run_boot_session_loop, run_boot_session_vcpu_step, signal_balloon_queue_interrupts,
-        signal_block_queue_interrupts, signal_capture_ready_mmio_block_interrupts,
-        signal_entropy_queue_interrupts, signal_memory_hotplug_queue_interrupts,
-        signal_network_queue_interrupts, signal_pmem_queue_interrupts,
-        signal_vsock_queue_interrupts, snapshot_limiter_retry_state_at,
-        update_memory_hotplug_requested_size_and_signal_interrupt, update_vmclock_and_signal_with,
+        observe_pvtime_topology_capture, observe_serial_input_dispatch, observe_vmclock_restore,
+        observe_vmgenid_restore, pci_all_virtio_gic_msi_configuration,
+        pci_all_virtio_resource_demand, pci_balloon_restore_gic_msi_configuration,
+        pci_data_available_bar_count, pci_data_bar_plan, pci_data_endpoint_count,
+        pci_data_region_id, pci_data_resource_demand, pci_entropy_restore_gic_msi_configuration,
+        pci_memory_hotplug_configuration_updated, pci_memory_hotplug_restore_gic_msi_configuration,
+        pci_root_restore_gic_msi_configuration, preflight_pci_data_dispatcher,
+        quiesce_limiter_retry_wakeups, record_entropy_dispatch_metrics,
+        record_memory_hotplug_signal_metrics, record_memory_hotplug_teardown_metrics,
+        record_pmem_dispatch_metrics, replace_vmgenid_and_signal_with,
+        restore_time_identity_and_signal_with, run_boot_session_loop, run_boot_session_vcpu_step,
+        signal_balloon_queue_interrupts, signal_block_queue_interrupts,
+        signal_capture_ready_mmio_block_interrupts, signal_entropy_queue_interrupts,
+        signal_memory_hotplug_queue_interrupts, signal_network_queue_interrupts,
+        signal_pmem_queue_interrupts, signal_vsock_queue_interrupts,
+        snapshot_limiter_retry_state_at, update_memory_hotplug_requested_size_and_signal_interrupt,
+        update_vmclock_and_signal_with,
     };
-    use crate::coordinator::HvfVcpuRunCoordinator;
+    use crate::coordinator::{HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError};
     use crate::dirty::HvfDirtyWriteEpochResetError;
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -39182,6 +39216,37 @@ mod tests {
         );
         assert!(!output.contains("sensitive VMClock signal detail"));
         assert!(!output.contains("InvalidRange"));
+    }
+
+    #[test]
+    fn pvtime_capture_observer_ignores_unrelated_topology_failures() {
+        let capture = TestGuestLoggerCapture::new("pvtime-capture-outcome-logger");
+        let success: Result<(), HvfArm64SnapshotV2TopologyCaptureError> = Ok(());
+        observe_pvtime_topology_capture(capture.logger(), &success);
+        let pvtime_failure: Result<(), HvfArm64SnapshotV2TopologyCaptureError> =
+            Err(HvfArm64SnapshotV2TopologyCaptureError::PvTime {
+                source: Box::new(HvfVcpuRunCoordinatorError::InvalidState(
+                    "private PVTime failure",
+                )),
+            });
+        observe_pvtime_topology_capture(capture.logger(), &pvtime_failure);
+        let later_identity_failure: Result<(), HvfArm64SnapshotV2TopologyCaptureError> =
+            Err(HvfArm64SnapshotV2TopologyCaptureError::LifecycleChanged);
+        observe_pvtime_topology_capture(capture.logger(), &later_identity_failure);
+
+        let output = capture.output_after_barrier();
+        let lines = output
+            .lines()
+            .filter(|line| line.starts_with("device-kind=time-identity "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                "device-kind=time-identity operation=pvtime-accounting outcome=published",
+                "device-kind=time-identity operation=pvtime-accounting outcome=failed",
+            ]
+        );
+        assert!(!output.contains("private PVTime failure"));
     }
 
     fn wait_for_limiter_retry_scheduler_status(
@@ -46861,6 +46926,27 @@ mod tests {
         assert_eq!(recorded_lines(&lines), vec![32]);
         assert_eq!(metrics.snapshot().interrupt_fails(), 1);
         assert_eq!(read_memory_hotplug_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn pci_memory_hotplug_configuration_completion_survives_endpoint_failure() {
+        type Operation = Result<(), VirtioPciDeviceOperationError<MemoryHotplugUpdateError, ()>>;
+
+        let completed: Operation = Err(VirtioPciDeviceOperationError::CompletedAndEndpoint {
+            completed: Box::new(()),
+            endpoint: VirtioPciEndpointError::StatePoisoned,
+        });
+        let rejected: Operation = Err(VirtioPciDeviceOperationError::Device(Box::new(
+            MemoryHotplugUpdateError::ActiveSessionUnavailable,
+        )));
+        let preflight: Operation = Err(VirtioPciDeviceOperationError::Endpoint(
+            VirtioPciEndpointError::StatePoisoned,
+        ));
+
+        assert!(pci_memory_hotplug_configuration_updated(&Ok(())));
+        assert!(pci_memory_hotplug_configuration_updated(&completed));
+        assert!(!pci_memory_hotplug_configuration_updated(&rejected));
+        assert!(!pci_memory_hotplug_configuration_updated(&preflight));
     }
 
     #[test]

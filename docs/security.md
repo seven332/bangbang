@@ -2900,9 +2900,10 @@ the API, action, readiness, VM lifecycle, snapshot, or guest outcome;
 rate-limited records and exact per-record delivery failures are observable only
 through process-local counters.
 
-Guest-triggerable backend and generic transport records use a separate
-cloneable `GuestLogger` capability with no writer, configuration mutation,
-arbitrary formatting, receipt, retry, sleep, or wait surface. Its immutable
+Guest-triggerable backend, generic transport, device data-plane, and
+time/identity records use a separate cloneable `GuestLogger` capability with
+no writer, configuration mutation, arbitrary formatting, receipt, retry,
+sleep, or wait surface. Its immutable
 producer snapshot shares the controller's sole worker and the independent
 `logger-rate.backend.outcome`, `logger-rate.transport.outcome`,
 `logger-rate.balloon.outcome`, `logger-rate.block.outcome`,
@@ -2935,9 +2936,12 @@ fields.
 
 Balloon, virtio-mem, and entropy observers consume completed typed summaries
 shared by MMIO and product PCI, so guest request, descriptor, byte, and page
-volume cannot multiply formatting work. Serial input emits only coalesced
-read/rearm/backpressure/detach/interrupt outcomes per run-loop dispatch; serial
-output and limiter failures remain at their owning wrappers. RTC, VMGenID,
+volume cannot multiply formatting work. Virtio-mem configuration commit and
+interrupt delivery are classified independently, including a committed PCI
+update followed by endpoint failure. Serial input emits only coalesced
+read/rearm/backpressure/detach/interrupt outcomes per run-loop dispatch or
+restored-continuation reconciliation; serial output and limiter failures remain
+at their owning wrappers. RTC, VMGenID,
 VMClock, PVTime, platform publication, capture, and ordered restore expose only
 fixed component and aggregate commit outcomes. Raw time and identity values,
 generation IDs, entropy and serial bytes, addresses, counts, and underlying

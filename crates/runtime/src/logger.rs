@@ -832,8 +832,8 @@ impl AsyncLogger {
     }
 }
 
-/// Narrow, cloneable admission capability for guest-triggerable backend and
-/// generic device transport events.
+/// Narrow, cloneable admission capability for guest-triggerable backend,
+/// device transport, data-plane, and time/identity events.
 ///
 /// This snapshot exposes no writer, mutable configuration, retry, wait, or
 /// delivery-receipt surface. Every production method accepts only a closed

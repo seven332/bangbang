@@ -82,9 +82,10 @@ use crate::startup::{
     HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage,
     HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError, PCI_ENDPOINT_SLOT_COUNT,
     backend_outcome_for_run_step_error, backend_outcome_for_run_step_outcome,
-    capture_hvf_snapshot_v2_time_state, observe_vmclock_restore, observe_vmgenid_restore,
-    pci_root_restore_bar_region_id, pci_root_restore_gic_msi_configuration,
-    replace_vmgenid_and_signal_with, update_vmclock_and_signal_with,
+    capture_hvf_snapshot_v2_time_state, observe_pvtime_topology_capture, observe_vmclock_restore,
+    observe_vmgenid_restore, pci_root_restore_bar_region_id,
+    pci_root_restore_gic_msi_configuration, replace_vmgenid_and_signal_with,
+    update_vmclock_and_signal_with,
 };
 use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError};
 use crate::vcpu::HvfArm64VcpuIdentificationRegisterState;
@@ -1244,9 +1245,9 @@ impl RestoredHvfSnapshotV2Platform {
     ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
         let parts = self.parts_mut();
         let guest_logger = parts.backend.guest_logger();
-        let (stable, captures, pvtime_capture) = parts
-            .runner
-            .capture_arm64_snapshot_v2_topology()
+        let topology_result = parts.runner.capture_arm64_snapshot_v2_topology();
+        observe_pvtime_topology_capture(&guest_logger, &topology_result);
+        let (stable, captures, pvtime_capture) = topology_result
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Topology { source })?;
         let memory = parts
             .backend
@@ -1326,21 +1327,15 @@ impl RestoredHvfSnapshotV2Platform {
             parts.rtc_device.region.range().start(),
             parts.rtc_device.region.id(),
         );
-        let time_result = capture_hvf_snapshot_v2_time_state(
+        let time = capture_hvf_snapshot_v2_time_state(
             memory,
             rtc_layout,
             &parts.vmgenid_device,
             &parts.vmclock_device,
             Some(&parts.pvtime_layout),
             &pvtime_capture,
-        );
-        guest_logger.log_time_identity(if time_result.is_ok() {
-            LoggerTimeIdentityOutcome::PvTimeAccountingPublished
-        } else {
-            LoggerTimeIdentityOutcome::PvTimeAccountingFailed
-        });
-        let time =
-            time_result.map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
+        )
+        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
         let memory_binding = write_snapshot_v2_memory_image_with_compatibility_version(
             memory,
             memory_writer,

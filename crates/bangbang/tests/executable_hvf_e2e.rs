@@ -18505,6 +18505,8 @@ mod macos_arm64 {
         });
 
         const HOST_STARTUP: &[&str] = &[
+            "device-kind=time-identity operation=platform-publication outcome=succeeded",
+            "device-kind=time-identity operation=pvtime-initialization outcome=succeeded",
             "operation=backend-startup outcome=succeeded",
             "action=InstanceStart",
             "operation=boot-worker outcome=running",
