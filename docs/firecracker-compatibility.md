@@ -647,39 +647,53 @@ or unrelated observability/tooling work.
 
 ### Metrics field and transaction model
 
-Every implemented event total is an interval increment: deprecated, GET, PUT,
-PATCH, logger, signal, and UART counters; block, pmem, network, MMDS, vsock,
-entropy, RTC, and balloon counts, byte totals, failures, errors, and limiter
-activity; and block latency `sum_us`. This applies to aggregate and stable-key
-per-drive, per-pmem-device, and per-interface objects. `*_bytes` fields are
-bytes, `*_us` fields are microseconds, and count/failure/event fields count the
-named events.
+Every line now has the exact Firecracker v1.16.0 arm64 public shape: 24 static
+roots with 243 numeric leaves in pinned serialization order. All required
+static fields are present. A numeric zero can mean a neutral architecture value
+or a producer that is not yet implemented; it is shape evidence, not a support
+or certification claim.
 
-The stores repeated with their latest value are process startup wall/CPU
-elapsed time, `boot_run_loop_status`, the most recent successful lifecycle or
-admitted snapshot action latencies, and block latency `min_us`, `max_us`, and
-`sample_count`. Each completely written line also contains bangbang's
-non-upstream `vmm.metrics_flush_count: 1` marker for that successful line.
+The only dynamic families are configured ordinary block
+`block_{drive_id}`, configured network `net_{iface_id}`, and configured
+vhost-user block `vhost_user_block_{drive_id}` roots. IDs come from committed
+validated configuration, are sorted, and never come from host paths, guest
+data, or observed metric registries. A configured device with no producer data
+still has a zero root. Vhost-user drives are excluded from ordinary block roots,
+and no dynamic pmem roots are emitted. The envelope is 985 total dynamic
+identities, at most 16 networks, and at most 51,429,376 copied identity bytes.
 
-The process keeps one typed previous-successful snapshot. A line is derived
-against that snapshot and the baseline advances only after the complete write
-succeeds. A monotonically increasing producer emits `current - previous`; a
-new or reset generation whose current value is lower emits its full current
-value. New keyed devices start from zero, disappeared devices are omitted, and
-reappearing or replaced same-ID producers follow the same reset rule. A failure
-increments `logger.missed_metrics_count` and retains the old baseline. Because
-a nonblocking writer can accept bytes before reporting an error, the next
-success deliberately replays the uncommitted interval with at-least-once rather
-than exactly-once semantics.
+Implemented increment producers emit their interval since the last successful
+publication. Store producers repeat their current value, including process
+startup timing, admitted VM/snapshot latencies, per-device latency extrema, and
+vhost-user configuration-change timing. Aggregate block and network values are
+saturating sums over their configured roots; aggregate latency `sum_us` is
+summed while aggregate `min_us` and `max_us` remain zero, matching the pinned
+construction. `*_bytes` fields are bytes, `*_us` fields are microseconds, and
+count/failure/event fields count the named events.
 
-The JSON schema stays sparse. Empty optional device families and empty keyed
-objects are omitted; bangbang does not synthesize a zero-filled Firecracker
-schema for absent or unimplemented devices. Omission is not a support claim.
+Bangbang-only extensions are not part of this strict line. In particular,
+`vmm.metrics_flush_count`, string boot-run-loop status, `pmem_*` roots, vmnet
+fields, newer balloon API/device fields, extra UART fields, and the ordinary
+block configuration-change value remain internal or are discarded at the
+public boundary. Adding an extension requires a separately versioned schema.
+
+One flush snapshots all producers and captures the Unix-millisecond clock once.
+It serializes that immutable value first into a counting writer and then into
+an exactly reserved fixed-capacity buffer. A complete JSON-plus-newline record
+may be at most 64 MiB. Count, allocation, serialization, or size failure occurs
+before sink access. Publication then writes all JSON bytes, exactly one newline,
+and flushes. The typed previous-successful baseline advances only after all
+three stages succeed; every failure increments `logger.missed_metrics_count`
+and retains the old baseline. A sink may accept a prefix before reporting an
+error, so a later success intentionally replays the interval with at-least-once,
+not exactly-once or durable, semantics.
+
 Issue #717 remains `NOT_PLANNED` because Firecracker exposes no
-`GET /vm/config` request metric field, so bangbang does not invent one. Issue
-#738 remains `NOT_PLANNED` because Firecracker's metrics write-failure path
-increments `missed_metrics_count`, not `logger.metrics_fails`; bangbang has no
-matching producer for the latter.
+`GET /vm/config` request metric field, so its absence from the schema is not
+filled with a Bangbang extension. Issue #738 remains `NOT_PLANNED` because
+Firecracker's write-failure path increments `missed_metrics_count`, not
+`logger.metrics_fails`; the required `logger.metrics_fails` field is emitted as
+zero until an exact producer exists.
 
 ### Metrics triggers and errors
 
@@ -758,8 +772,8 @@ The ordinary CLI has no production rotation, syslog, journald, tracing, remote
 telemetry, or resource-broker policy. Logger and metrics state remains
 per-controller; only the executable's bounded ownership interval uses the
 process-global panic hook. It carries no worker/double-panic/abort/fatal-signal
-durability claim. These named product and architecture boundaries, the sparse
-metrics schema, and the exact native-v1 plus 2.7-or-newer serial limits replace
+durability claim. These named product and architecture boundaries, the strict
+pinned metrics schema, and the exact native-v1 plus 2.7-or-newer serial limits replace
 an open-ended “full logging and metrics” placeholder.
 
 The ordinary `bangbang` CLI remains the direct, uncontained process entry point.
@@ -1139,7 +1153,7 @@ Startup timing arguments are intentionally not exposed in `GET /vm/config` or
 logs because they are process observability data, not guest configuration. When
 metrics are configured, session-initial, explicit `FlushMetrics`, Running or
 Paused periodic, and normal-terminal lines write the sampled store values under
-`api_server`; omitted timing arguments remain omitted. Parsed `GET /`, `GET /version`,
+`api_server`; omitted timing arguments leave their required fields at zero. Parsed `GET /`, `GET /version`,
 `GET /machine-config`, `GET /mmds`, `GET /balloon`,
 `GET /balloon/statistics`, `GET /balloon/hinting/status`, and
 `GET /hotplug/memory` API requests are counted under `get_api_requests`; parsed
@@ -1163,13 +1177,12 @@ counters when the endpoint is identifiable from the request line.
 Direct config-file and startup initialization paths are not API requests and
 are not included in these counters. `PATCH /vm` remains outside
 `patch_api_requests` because Firecracker does not expose a matching
-`PatchRequestsMetrics` field for VM state changes. The balloon API request
-fields are bangbang-specific extension counters: GET, PUT, and PATCH balloon
-routes report `balloon_count`, and PUT/PATCH failures also report
-`balloon_fails`. Firecracker exposes balloon device metrics but no matching
-balloon API request metric fields. bangbang emits minimal top-level device
-metrics objects for implemented behavior: aggregate `block` and non-empty
-per-drive `block_{drive_id}` entries report virtio-block queue events,
+`PatchRequestsMetrics` field for VM state changes. Balloon API request counters
+remain internal because Firecracker exposes balloon device metrics but no
+matching v1.16.0 GET, PUT, or PATCH balloon API request fields. Bangbang emits
+the complete static shape and configured dynamic device roots. Existing
+producers populate matching fields; for example, aggregate `block` and
+configured per-drive `block_{drive_id}` entries report virtio-block queue events,
 read/write/flush counts and bytes, runtime backing update success/failure
 counters, read/write latency aggregates, observable request/event failures, and
 implemented block limiter throttling; runtime block dispatch also exposes a
@@ -1183,20 +1196,24 @@ activity; aggregate `entropy` reports implemented virtio-rng request, byte,
 host-randomness failure, and event-failure activity, and runtime entropy queue
 dispatch exposes a backend-neutral retry delay when a limiter leaves a
 descriptor pending; `balloon` reports implemented virtio-balloon queue activity
-and failures, including separate inflate/hint/report discard attempts,
-zero-safe-reclaimed byte, skipped-edge byte, requested reporting byte, and
-failed-attempt fields; `memory_hotplug` reports Firecracker's exact singleton
-activation, queue-event, PLUG/UNPLUG/UNPLUG_ALL/STATE count/failure/byte and
-`min_us`/`max_us`/`sum_us` latency fields, with separate Bangbang interrupt,
-rollback, post-commit owner-cleanup, and teardown counters;
+and failures through Firecracker's exact inflate, free-page-hint, and
+free-page-report count/freed/failure fields; Bangbang's more detailed discard,
+requested-byte, and skipped-edge accounting remains internal. `memory_hotplug`
+reports Firecracker's exact singleton activation, queue-event,
+PLUG/UNPLUG/UNPLUG_ALL/STATE count/failure/byte and
+`min_us`/`max_us`/`sum_us` latency fields; Bangbang interrupt, rollback,
+post-commit owner-cleanup, and teardown counters remain internal;
 `signals.sigpipe` reports handled non-terminating `SIGPIPE`
 signals. HVF block, PMEM, network, and entropy limiter retry wakeups are wired
-for active queues and share acknowledged native-v1 quiescence. Direct and
-contained vhost-user block use the same per-drive block metric identity: guest kicks and
-interrupts follow the normal counters, while a closed or broken backend call
-path increments `event_fails` without exposing its socket. Producer classes
-that do not exist in the supported device subset remain absent rather than
-appearing as synthetic zero-filled fields. The startup timing stores match Firecracker's
+for active queues and share acknowledged native-v1 quiescence. Each configured
+direct or contained vhost-user block publishes only Firecracker's five-field
+`vhost_user_block_{drive_id}` initialization/configuration root and never a
+second `block_{drive_id}` root. Guest kicks, interrupts, and backend-disconnect
+state remain internal; closed redacted logger outcomes certify disconnect and
+terminal behavior without exposing the socket. Required fields without an exact
+producer remain numeric zero, which is not a support claim; only unconfigured
+dynamic roots and non-Firecracker extension fields are absent. The startup
+timing stores match Firecracker's
 `ProcessTimeReporter` field names for the implemented process path.
 
 Supported value-taking startup arguments accept both Firecracker-style
@@ -1316,8 +1333,9 @@ precedes ACK publication, device state commits after guest-visible completion,
 and partial or late failures roll applied ranges back in reverse order. One
 producer installed before activation emits Firecracker's exact 18 singleton
 `memory_hotplug` fields, including per-operation latency/count/failure and
-committed plug/unplug bytes; separate counters retain interrupt, rollback,
-post-commit discard, owner-cleanup, and teardown outcomes. Paused capture
+committed plug/unplug bytes; separate internal counters retain interrupt,
+rollback, post-commit discard, owner-cleanup, and teardown outcomes without
+extending the strict public line. Paused capture
 validates external configuration, feature negotiation, activation, exact queue
 geometry/cursors, pending notification and interrupt state, compact plugged
 ranges, one opaque shared-reservation mapping identity, guest owners, actual
@@ -1450,7 +1468,7 @@ compatibility targets.
 | `PATCH` | `/machine-config` | supported target; implemented | Applies pre-boot partial updates to the stored machine configuration, preserving omitted fields and rejecting invalid updates without mutation. |
 | `PUT` | `/boot-source` | supported target; implemented | Stores guest kernel path, optional initrd path, and optional boot arguments before boot. Direct paths open during startup preparation; contained grant tags claim exact read-only descriptors during the successful request and move them into startup without reopening the tags. |
 | `PUT` | `/drives/{drive_id}` | supported target; pre-boot plus PCI-only file and eligible direct/contained-vhost runtime attach implemented | Before boot, stores initial virtio-block configuration including optional file-backed bandwidth/ops rate limiters or the strict socket matrix. Direct vhost uses an operator path; contained vhost requires an exact connect-only directory grant plus child and receives only a brokered stream. After startup with public `--enable-pci`, Running or Paused requests may transactionally attach one new non-root file or vhost endpoint when the immutable live guest-memory profile is already shared. File paths open before owner submission; contained file requests may consume only an exact still-unused initial-manifest grant. Vhost requests run side-effect-free owner profile/capacity preflight before direct discovery or contained child reservation/broker I/O, materialize against exact live shared regions on the owner, and publish `/vm/config` only after every endpoint lease succeeds. Default MMIO, root, duplicate, anonymous RAM, invalid backing/grant/negotiation, unavailable session, and exhausted capacity are nonmutating; duplicate and owner-preflight failures do not contact a candidate socket or broker. Same-ID runtime PUT remains duplicate rejection. |
-| `PUT` | `/metrics` | implemented supported sparse subset | Opens one process-local file/FIFO sink before boot with nonblocking output and path-redacted errors; duplicate initialization fails without replacing it, and observability state is omitted from `GET /vm/config`. Configuration alone writes nothing. A retained session causes one best-effort initial line; 60-second output continues in Running and Paused; explicit runtime `FlushMetrics` is fallible; and normal process convergence makes one best-effort final attempt. Lines use the interval/store, successful-baseline, reset-aware, sparse-schema, and at-least-once retry contract above for all implemented API, logger, signal, UART, and device producers. |
+| `PUT` | `/metrics` | implemented strict v1.16.0 arm64 line construction | Opens one process-local file/FIFO sink before boot with nonblocking output and path-redacted errors; duplicate initialization fails without replacing it, and observability state is omitted from `GET /vm/config`. Configuration alone writes nothing. A retained session causes one best-effort initial line; 60-second output continues in Running and Paused; explicit runtime `FlushMetrics` is fallible; and normal process convergence makes one best-effort final attempt. Every line has the exact 24 static roots plus sorted configured block/network/vhost-user roots, uses the bounded immutable success-only transaction above, and zero-fills required fields whose producer evidence remains later-owned. |
 | `PUT` | `/actions` | supported target; internal startup execution and explicit metrics flush implemented | Parses `InstanceStart` and `FlushMetrics` and routes them through the process VMM owner. Parsed request and successful action logger records are best effort and never gate the functional result. `InstanceStart` validates boot source and state, prepares an owned HVF session with configured serial output or default process stdout/terminal-or-FIFO stdin, starts the worker, and commits `Running` after the worker handle is retained. `FlushMetrics` is rejected before startup; after startup it returns `204` for an unconfigured/successful sink or a metrics fault for a failed configured write, and it retains its API/action/logger effects. Automatic initial, periodic, and terminal writes do not route through `/actions` and create no action log. The aarch64 `SendCtrlAltDel` parser path contributes to `put_api_requests.actions_count` but not `actions_fails`, matching Firecracker's parser-entry placement. |
 | `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. The unsupported request is counted under `put_api_requests.actions_count` without incrementing `actions_fails`. |
 | `PUT` | `/logger` | implemented and verified process-local contract | Normal execution starts with a process-owned bounded stdout adapter whose nonblocking internal pipe leaves real stdout flags unchanged; a path-bearing pre-boot update failure-atomically replaces the logger target, while a path-free update retains it. Level/show/module filtering applies to fixed API receipt, control, result, action, startup, backend, transport, timer, panic, and terminal records; observability state is omitted from `GET /vm/config`. Parse rejections have a closed control record and no result; every parsed dispatch has one closed result. One fixed sink-owning worker isolates callers, and queue/receipt/write/flush failure increments `missed_log_count` exactly once without changing the request, action, guest, readiness, or process result. Paths, selectors, bodies, faults, and dynamic values are excluded. |
@@ -1461,7 +1479,7 @@ compatibility targets.
 | `GET`, `PUT`, `PATCH` | `/mmds` | supported target; bounded control-plane storage, guest HTTP/token handling, per-interface Ethernet/ARP/IPv4/TCP sessions, retransmission scheduling, vmnet detouring, MMDS-only packet I/O, and signed executable guest paths implemented | Stores bounded process-local JSON, serves control-plane GET and RFC 7396 PATCH, and preserves prior data on invalid or oversized updates. Guest HTTP supports GET plus token PUT, Firecracker-shaped v1/v2 behavior, stateless instance-bound AES-256-GCM tokens, accepted HTTP/1.0 and HTTP/1.1 response versions, IMDS text or JSON output, and redacted parse failures. Each selected interface owns an independent bounded stack while sharing only VM metadata, token authority, and aggregate metrics. A valid untagged Ethernet frame is speculatively owned from its ARP target or IPv4 destination; targeted malformed packets are consumed, VLAN is unsupported, non-TCP IPv4 is unusual, and IPv4 fragments are handled independently without reassembly. Exact ARP replies precede TCP output. Port 80 TCP follows the pinned 30-connection, 100-reset, 2,500-byte receive-buffer, single-response, MSS/window, sequence/ACK, FIN/RST, eviction, 1.2-second retransmission, and fifteenth-timeout reset rules. One generated frame is retained until guest RX commit; pending resets precede round-robin connection output. MMDS is offered before external vmnet RX, and an all-MMDS configuration never opens vmnet. Immediate readiness and the earliest future protocol deadline flow through generation-safe MMIO/PCI owner scheduling and merge with limiter deadlines across pause, hotplug deletion/reuse, and shutdown. Signed MMIO and PCI guests renew v2 tokens, consume a segmented 49,152-byte response, deliberately drop one ACK, and observe retransmission without external networking or credentials. ARP caching/gratuitous ARP/timeouts, IPv4 fragment reassembly, capture/restore of live network sessions, and positive external vmnet connectivity remain outside this slice. |
 | `PUT` | `/mmds/config` | supported target; control-plane config storage implemented | Parses Firecracker-shaped MMDS config with required `network_interfaces`, optional `version`, optional RFC 3927 usable link-local `ipv4_address`, and optional `imds_compat`; keeps empty or whitespace-only interface IDs as malformed request bodies, but routes empty interface lists to runtime semantic validation before mutation; validates referenced interface IDs against configured network interfaces; stores config before startup; and keeps post-start requests on the normal unsupported-state policy. The selected interfaces use the complete implemented bounded guest-visible MMDS path over MMIO or PCI; post-start config mutation remains intentionally unsupported. |
 | `PUT` | `/snapshot/create`, `/snapshot/load` | supported exact native-v2 2.12 Full/File and 2.13 Diff/File lifecycles with independently optional entropy, balloon, virtio-mem, network/MMDS, vsock, and regular-file block-and-pmem profile-3 storage; exact native-v2 2.3–2.12 loaders plus frozen native-v1 File/Uffd reader | Parses Firecracker-shaped bodies, rejects malformed input first, and keeps paths/overrides redacted. Paused-only `Full` or `Diff` create admits a 1–32-vCPU source with required serial and independently optional kinds 7 and 9–13 over coherent MMIO or PCI, yielding all 64 products; boot timer and vhost-user reject before artifacts. Full writes exact-2.12 state plus a complete image. Diff writes exact-2.13 state with mandatory kind 14 plus a layer selected from unified dirty pages when tracked or every current page otherwise. Load opens state once, selects frozen native-v1 or exact 2.3–2.13 File/COW, validates the complete graph and external authority transaction, requires exact `network_overrides` for kind 12, and accepts at most one validated `vsock_override` for kind 13. It accepts a proven zero-root layer or matching rebased result and rejects a standalone image-based layer before host ownership. It then maps the complete result and constructs fresh serial/entropy/balloon/virtio-mem/network/MMDS/vsock owners before Paused publication. State/layer/result inputs and guest File/COW RAM stay immutable/private; writable external block/pmem prefixes remain deliberately shared. No Firecracker artifact interoperability, native-v2 `Uffd`, live-peer migration, source owner/packet/session identity, synchronous RSS, or broad portability is claimed. |
-| `GET` | `/balloon` | supported target; pre-boot and runtime config read implemented | Returns the stored Firecracker-shaped balloon configuration after successful `PUT /balloon`, runtime `PATCH /balloon`, or valid runtime `PATCH /balloon/statistics`; returns the balloon-specific unsupported fault when no balloon configuration exists. Runtime derives backend-neutral virtio-balloon identity, features, queues, and config space from stored config. Startup attaches the current endpoint over the selected startup transport, and the HVF boot loop can dispatch inflate, deflate, statistics, free-page hinting, and free-page reporting notifications with interrupt signaling. Inflate/deflate descriptors update internal inflated-page accounting, hinting command descriptors update `guest_cmd`, and completed inflate plus accepted current-command hint and reporting ranges use best-effort inward-aligned Darwin zero/free advice before dispatch returns. Statistics queue reports are parsed and stored for `GET /balloon/statistics`, process-level periodic scheduling can complete a pending statistics descriptor with queue-interrupt intent while the VM is running, and device metrics distinguish discard attempts, reporting-requested bytes, actual advised bytes, skipped edges, and failures. |
+| `GET` | `/balloon` | supported target; pre-boot and runtime config read implemented | Returns the stored Firecracker-shaped balloon configuration after successful `PUT /balloon`, runtime `PATCH /balloon`, or valid runtime `PATCH /balloon/statistics`; returns the balloon-specific unsupported fault when no balloon configuration exists. Runtime derives backend-neutral virtio-balloon identity, features, queues, and config space from stored config. Startup attaches the current endpoint over the selected startup transport, and the HVF boot loop can dispatch inflate, deflate, statistics, free-page hinting, and free-page reporting notifications with interrupt signaling. Inflate/deflate descriptors update internal inflated-page accounting, hinting command descriptors update `guest_cmd`, and completed inflate plus accepted current-command hint and reporting ranges use best-effort inward-aligned Darwin zero/free advice before dispatch returns. Statistics queue reports are parsed and stored for `GET /balloon/statistics`, process-level periodic scheduling can complete a pending statistics descriptor with queue-interrupt intent while the VM is running, and internal device accounting distinguishes discard attempts, reporting-requested bytes, actual advised bytes, skipped edges, and failures while strict public metrics expose only Firecracker's matching count/freed/failure fields. |
 | `PUT`, `PATCH` | `/balloon` | implemented and verified; pre-boot configuration, live target/statistics updates, queue dispatch, accounting, and Darwin discard | `PUT /balloon` stores Firecracker-shaped balloon configuration before boot, rejects targets larger than current guest memory without mutating prior config, accepts and preserves `free_page_reporting: true`, appears in `GET /balloon` and `GET /vm/config`, and feeds startup attachment of a virtio-balloon endpoint over the selected transport with the reporting feature and compacted queue when enabled. Pre-boot machine-config updates also reject memory sizes smaller than an already configured balloon target. Runtime `PATCH /balloon` updates the stored `amount_mib`, active `num_pages` config space, config generation, and config interrupt. Runtime `PATCH /balloon/statistics` can update a nonzero statistics polling interval to another nonzero value while preserving Firecracker's rejection of runtime statistics enable/disable transitions. Runtime queue dispatch covers inflate, deflate, configured statistics reports, pending statistics descriptor completion from process-level periodic scheduling, active-run hinting ranges, and device-writable reporting ranges. Completed inflate plus accepted current-command hint and reporting ranges are zeroed and made clean/reclaimable on inward-aligned Darwin host-page interiors; advice is best effort, unsupported targets fail honestly, requested reporting bytes remain distinct from actual advised bytes, and no synchronous footprint reduction is promised. |
 | `GET` | `/balloon/statistics` | implemented and verified; required target/actual and optional guest-reported fields | Routes through the VMM state/action policy. Statistics queries are post-boot-only, require configured active balloon state, and return Firecracker-shaped required fields: `target_pages`, `actual_pages`, `target_mib`, and `actual_mib`. Target values come from the current stored balloon target, including runtime `PATCH /balloon` updates. Actual values come from active inflated-page accounting. Optional guest-reported fields are included only after a bounded statistics queue report records them; process-level periodic scheduling can complete a pending descriptor and request the next report while the VM is running. Linux's pre-`DRIVER_OK` statistics kick is admitted after `FEATURES_OK` and retained until balloon activation. |
 | `PATCH` | `/balloon/statistics` | implemented and verified; live nonzero interval update | Parses Firecracker-shaped statistics interval update request bodies and rejects malformed or invalid bodies first. Valid requests are post-boot-only, require a configured balloon, accept unchanged intervals as no-ops, and update stored plus active balloon state for nonzero-to-nonzero interval changes. Runtime `0 -> nonzero` and `nonzero -> 0` transitions are rejected without mutation, matching Firecracker's statistics state-change rule because the stats queue cannot be hot-added or removed. The updated interval feeds process-level periodic scheduling for running VMs. |
@@ -1470,7 +1488,7 @@ compatibility targets.
 | `GET` | `/balloon/hinting/status` | implemented and verified; host and guest command status | Routes through the VMM state/action policy. Hinting status is post-boot-only, requires a configured balloon with `free_page_hinting: true`, and returns Firecracker-shaped `host_cmd` and `guest_cmd` fields from active device state. Current status reports the latest start/stop host command and the latest 4-byte guest command observed on the hinting queue; `guest_cmd` remains `null` until the guest sends a command descriptor. Accepted active-run ranges are validated and discarded best effort on Darwin but are not exposed in this response. |
 | `PUT`, `PATCH` | `/pmem/{id}` | implemented direct MMIO-or-PCI startup, pmem root, non-root PCI runtime, capture-ready state, aggregate live certification, and exact native-v2 2.6 through current 2.13 serialization/restore | `PUT /pmem/{id}` stores strict Firecracker-shaped configuration with one cross-storage root, exact direct or contained regular-file authority, one file/private-tail mapping, and exact-prefix `MS_SYNC`. Runtime PCI insertion remains non-root-only and preflights every owner capacity before authority or mapping work. Profile 3 serializes exact file/mapped geometry plus configuration/runtime/limiter/queue/interrupt/mapping/transport state and restores it in the same typed complete-set transaction as block; exact 2.7 composes required serial, exact 2.8 may add entropy, exact 2.9 may add balloon, exact 2.10 may add virtio-mem, exact 2.11 may add network/MMDS, exact 2.12 may add vsock, and current 2.13 retains that product inside an exact Diff binding. Signed focused and aggregate coverage proves live protection/coherence/reuse; signed rooted pmem-only and rootless mixed MMIO/PCI direct/contained matrices prove shared writable prefix epochs, unchanged read-only peers, zero fresh private tails, immutable state/memory, recapture, exact grants after pathname replacement, and cleanup. |
 | `PUT` | `/entropy` | implemented and verified for supported MMIO-or-PCI startup, limiting, metrics, capture, and exact native-v2 2.8 serialization/restore | Stores one strict Firecracker-shaped virtio-rng configuration before boot. Missing, `null`, empty, and all-null `rate_limiter` objects remain unconfigured; valid `bandwidth` and `ops` buckets are stored, echoed through `GET /vm/config`, and applied to the selected queue path. Each writable request is capped at 64 KiB and filled by the session-owned host OS source. Throttled descriptors are returned and retained exactly once, with the earliest backend-neutral retry scheduled by the HVF session. Allocation, length, guest-write, and used-ring failures restore exact pre-consumption bucket state; a published zero-length host-source failure remains consumed. Paused capture validates exact features, activation, queue mapping/geometry/cursors, external limiter configuration, redacted bucket state, one pending descriptor, and scheduler agreement through exactly one MMIO or PCI owner. Exact 2.8 persists that portable state without random output, source identity, metrics, or host time and restores it against fresh destination owners. Signed Linux guests prove marker-gated live and restored `/dev/hwrng` reads, real dual-bucket throttling, retained retry without another kick, explicit/automatic resume, recapture, immutable clones, destination-local metrics, containment, and cleanup over both transports. Post-start PUT remains unsupported. Firecracker's exact Linux timerfd/eventfd identity, Firecracker artifact bytes, and broad cross-host source/clock portability remain deferred. |
-| `GET`, `PUT`, `PATCH` | `/hotplug/memory` | implemented and verified for supported MMIO-or-PCI startup, live metrics, capture, and exact native-v2 2.10 serialization/restore; DELETE excluded | `PUT` validates and stores block/slot/total sizing before boot; `GET` returns stored pre-start status or exact active requested/plugged status; `PATCH` validates and signals requested-size changes after start. Startup attaches one virtio-mem endpoint over the selected startup transport. Its queue validates request/response descriptors and complete block ranges, answers `STATE`, and applies `PLUG`, `UNPLUG`, and `UNPLUG_ALL` over exact block-owned guest/HVF mappings before ACK. Device state commits only after guest-visible completion; split/combined mappings and partial or late failures use reverse rollback and fail closed. Singleton metrics retain Firecracker's exact 18 fields while separate extensions expose interrupt, rollback, owner-cleanup, and teardown outcomes. Exact 2.10 kind 11 binds configuration, features, config space, queue, common virtio, transport, and a compact plugged bitmap to unchanged kind-1 extents. Restore validates the pair before publication and constructs a fresh shared aperture, block-granular plugged views, clean dirty epoch, and destination-local owners. Signed direct and normal-production/App-Sandbox MMIO/PCI destinations verify retained nonzero bytes before mutation, then continue partial UNPLUG, driver-reprobe UNPLUG_ALL/replug, later PLUG, and final UNPLUG through explicit-Paused/recapture and automatic clones. Runtime device deletion, broader public accounting, Firecracker KVM slot identity, source owner/dirty identity, synchronous RSS, and broad portability remain excluded. |
+| `GET`, `PUT`, `PATCH` | `/hotplug/memory` | implemented and verified for supported MMIO-or-PCI startup, live metrics, capture, and exact native-v2 2.10 serialization/restore; DELETE excluded | `PUT` validates and stores block/slot/total sizing before boot; `GET` returns stored pre-start status or exact active requested/plugged status; `PATCH` validates and signals requested-size changes after start. Startup attaches one virtio-mem endpoint over the selected startup transport. Its queue validates request/response descriptors and complete block ranges, answers `STATE`, and applies `PLUG`, `UNPLUG`, and `UNPLUG_ALL` over exact block-owned guest/HVF mappings before ACK. Device state commits only after guest-visible completion; split/combined mappings and partial or late failures use reverse rollback and fail closed. Singleton public metrics retain Firecracker's exact 18 fields while internal diagnostics retain interrupt, rollback, owner-cleanup, and teardown outcomes without extending that line. Exact 2.10 kind 11 binds configuration, features, config space, queue, common virtio, transport, and a compact plugged bitmap to unchanged kind-1 extents. Restore validates the pair before publication and constructs a fresh shared aperture, block-granular plugged views, clean dirty epoch, and destination-local owners. Signed direct and normal-production/App-Sandbox MMIO/PCI destinations verify retained nonzero bytes before mutation, then continue partial UNPLUG, driver-reprobe UNPLUG_ALL/replug, later PLUG, and final UNPLUG through explicit-Paused/recapture and automatic clones. Runtime device deletion, broader public accounting, Firecracker KVM slot identity, source owner/dirty identity, synchronous RSS, and broad portability remain excluded. |
 | `PATCH` | `/vm` | implemented and verified API semantics; native-v2 snapshot ownership implemented | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state. After startup, `Paused` transitions a `Running` instance to `Paused` only after a topology-wide active-run wakeup barrier drains every online vCPU and the process-owned boot worker closes its next-run gate. `Resumed` transitions it back to `Running` only after the worker accepts resume. Same-state `Paused` and `Resumed` requests return `204`, still require the retained process session, leave state unchanged, skip the backend command and generation, and record the successful API-request latency. Signed single-process and dual-process evidence repeats both requests, observes stable state and independent CPU0/CPU1 progress tokens, proves both stop while one process is paused as an isolated peer continues, and proves both resume without fixed sleeps. The native-v2 public profile layers a complete 1–32-vCPU four-scheduler capture/publication transaction over this topology barrier; current supported optional-device graph ownership is included in the same public transaction. |
 | `PATCH` | `/drives/{drive_id}` | supported target; file backing/rate-limiter update and ID-only direct/contained-vhost config refresh implemented | Parses the Firecracker-shaped block-device update request with required `drive_id`, optional `path_on_host`, and optional `rate_limiter`, then routes valid updates through `UpdateBlockDevice`. Empty or all-null rate limiter objects are file-backed no-op updates. Pre-boot requests fail as post-boot-only operations. An ordinary active drive obtains a replacement backing only when `path_on_host` is present and applies configured limiter buckets before stored-state commit; direct mode opens the path, while contained mode claims an exact unused grant without reopening its tag. For a vhost drive only an ID-only request is valid: it performs one bounded repeated `GET_CONFIG(0, 60)` on the existing direct or contained stream, validates the complete reply before transport mutation, replaces the exact config, increments one generation, delivers one configuration interrupt, and records optional latest-value `config_change_time_us`. It does not reconnect or consume contained directory authority. Path or limiter fields reject before backend I/O. Acquisition or confirmed pre-delivery failure preserves old config/generation/interrupt state; delivery ambiguity terminalizes the session. Ordinary limiter retry/wakeup semantics remain backend-neutral and do not claim Firecracker's exact Linux timerfd/eventfd identity. |
 | `PATCH` | `/network-interfaces/{iface_id}` | runtime rate-limiter updates implemented | Returns unsupported-state before startup, validates the target interface after startup, and accepts omitted, `null`, empty, or all-null `rx_rate_limiter` and `tx_rate_limiter` objects as runtime no-ops. In `Running` or `Paused`, configured bandwidth and ops buckets update the matching startup or hotplugged live RX/TX limiter and stored config. Omitted inner buckets preserve both stored values and exact live budget, enabled buckets start with a fresh full budget at one update instant, and explicit disabled buckets clear only the selected bucket. Active-device mutation completes before stored config is committed, so lookup, worker-command, or handler failures leave stored state unchanged. Limiter updates do not change virtio queue state, pending-work flags, config generation, or interrupt status; later retained work is scheduled from the updated live state. Per-interface and aggregate event/throttle metrics are emitted; deterministic capture-ready limiter/retry state is implemented; exact native-v2 2.11 retains that portable limiter/retry state and reconstructs destination-relative scheduling. |
@@ -1865,10 +1883,11 @@ Explicit `FlushMetrics` remains runtime-only and fallible. It fails before
 startup, succeeds without output when unconfigured, writes one transactional
 line on success, and returns a configured-sink error while retaining the last
 successful baseline. The detailed producer classes, increment/store mapping,
-sparse omission, generation replacement, and ambiguous at-least-once retry
-rules are defined in the observability contract above. API request fields that
-Firecracker does not define, absent device producers, and empty optional
-families remain absent rather than being fabricated for shape completeness.
+configured-root rules, generation replacement, and ambiguous at-least-once
+retry rules are defined in the observability contract above. Required static
+and configured fields remain present as numeric zero when no exact producer
+value exists; fields Firecracker does not define remain absent rather than
+becoming extensions.
 The process startup path and API/VMM state path implement the logger field
 policy above as pre-boot-only per-process observability configuration. Normal
 execution installs the bounded stdout adapter first. Startup CLI fields apply next; a
@@ -2075,8 +2094,10 @@ pending statistics descriptor and mark queue-interrupt intent while the VM is
 running. Linux can notify the statistics queue after committing `FEATURES_OK`
 and before `DRIVER_OK`; virtio-MMIO admits that healthy transition, while the
 balloon handler preserves the pending notification until activation before
-dispatching it. Metrics report separate inflate/hint/report discard attempts, actual
-advised bytes, skipped-edge bytes, failures, and reporting-requested bytes.
+dispatching it. Internal diagnostics retain separate inflate/hint/report
+discard attempts, actual advised bytes, skipped-edge bytes, failures, and
+reporting-requested bytes; the strict public line maps only the exact
+Firecracker count/freed/failure fields and omits the extra names.
 The live paired accounting and capture-ready state are implemented; byte
 encoding, restore construction, artifact portability, and synchronous footprint
 guarantees remain deferred.
@@ -4327,7 +4348,8 @@ Their eventual support level should follow the endpoint matrix:
   counters
 - durable catch-all worker/double-panic/abort/fatal observability and production rotation,
   syslog, journald, tracing, or remote telemetry; the implemented logger and
-  sparse interval metrics schema do not fabricate absent records or devices
+  strict metrics schema do not fabricate unconfigured dynamic devices or
+  non-Firecracker extension fields
 - memory hotplug beyond the implemented block-granular selected MMIO-or-PCI
   lifecycle, Firecracker-shaped singleton metrics, exact shared-aperture
   ownership, and capture-ready queue/HVF/dirty/accounting state, including

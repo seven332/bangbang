@@ -25,12 +25,14 @@ or overwrite policy. A field being required in every line does not mean its
 producer is implemented; a required numeric neutral value remains distinct
 from an evidence-backed producer.
 
-This authority-only delivery leaves all producer profiles nonterminal. #1822
-owns canonical line construction and timestamp publication, #1788 owns API,
-process, logger, signal, boot, and lifecycle producers, and #1789 owns device,
-MMDS, vCPU, time/device, configured-key, and retained-neutral producers. #1823
-owns the final #1787 API/schema certification. `corpus:metrics` and the
-cross-producer aggregate semantic remain #1790-owned.
+The runtime now compiles this authority into the canonical serializer and an
+exact descriptor-equality test. That construction evidence does not promote a
+producer policy: #1788 still owns API, process, logger, signal, boot, and
+lifecycle producers; #1789 owns device, MMDS, vCPU, time/device,
+configured-key, and retained-neutral producers; and #1823 owns final #1787
+API/schema certification. `corpus:metrics` and the cross-producer aggregate
+semantic remain #1790-owned. A required zero therefore proves wire-shape
+completeness only, never producer completion.
 
 ## Exact Arm64 Shape
 
@@ -96,6 +98,14 @@ serialization may iterate only the bounded device registries owned by the
 configuration model; it must not discover untrusted host paths, guest data, or
 unbounded keys while writing a line.
 
+The arm64 transport envelope admits at most 985 dynamic identities, including
+at most 16 networks. The 985 bound comes from 987 SPI INTIDs after reserving the
+mandatory VMGenID and VMClock identities. Total copied suffix bytes are limited
+to 51,429,376 bytes: one 1 MiB initial configuration plus 984 independently
+bounded 51,200-byte API payloads. Identifiers keep their validated UTF-8 bytes;
+JSON serialization does not use host paths or diagnostic registry keys as
+suffix sources.
+
 Pinned Rust also formats `pmem_{pmem_id}`, while the strict v1.16.0 fixture has
 no `pmem_` prefix branch and would reject such an extra root. The source
 authority retains this as the explicit
@@ -130,16 +140,36 @@ minimum/maximum/sum meaning.
 The arm64 schema keeps the i8042 fields and the x86-only vCPU PIO and KVM-clock
 fields as required numeric neutral values. Their `platform-zero` producer
 disposition is not an implementation claim; #1789 retains the terminal evidence
-responsibility. Other process and device fields remain `planned` until their
-owner slices provide exact production and validation evidence.
+responsibility. Every other required field without an exact current producer is
+also emitted as numeric zero while its policy remains nonterminal.
 
-## Bangbang Publication Rules for the Next Slice
+## Bangbang Publication Rules
 
-The checked shape is strict. Canonical Firecracker lines cannot retain public
-Bangbang-only fields such as `vmm.metrics_flush_count` or string-valued status
-extensions. Any extension needs a separately versioned and tested boundary;
-silently appending it to the pinned line is incompatible with
+The checked shape is strict. Canonical Firecracker lines do not retain public
+Bangbang-only fields such as `vmm.metrics_flush_count`, string-valued boot
+status, dynamic `pmem_*` roots, vmnet fields, newer balloon API counters, newer
+balloon/UART fields, or ordinary-block configuration-change fields. Their
+underlying internal state may remain for runtime decisions and focused tests.
+Any future extension needs a separately versioned and tested boundary;
+silently appending it to this pinned line is incompatible with
 `additionalProperties: false`.
+
+The migration decision census for every former Bangbang-only public group is:
+
+| Former public key or group | Strict v1.16.0 decision |
+| --- | --- |
+| `vmm.metrics_flush_count` | Removed; it was a synthetic successful-line marker, not a pinned metric. |
+| `vmm.boot_run_loop_status` | Retained only in internal lifecycle diagnostics; no string value enters the numeric line. |
+| GET/PUT/PATCH `balloon_count` and PUT/PATCH `balloon_fails` | Retained as internal API accounting; v1.16.0 has no matching API-request fields. |
+| `pmem_{device_id}` roots | Removed; per-device accounting remains internal and exact values continue to feed only the pinned aggregate `pmem` root. |
+| ordinary `block_{drive_id}.config_change_time_us` | Retained internally; ordinary pinned block metrics have no matching field. |
+| vhost-user values formerly exposed under `block_{drive_id}` | Reclassified exclusively to `vhost_user_block_{drive_id}`. Only the store-compatible `config_change_time_us` maps today; other vhost notification state remains internal or logger evidence. |
+| `net{,_<id>}.vmnet_{read,write}_{count,fails,packets_count,partial_batches}` and `vmnet_{read,write}_latency_us` | Retained only in vmnet backend diagnostics; tap metrics are not a name-only semantic substitute. |
+| `uart.input_count`, `uart.interrupt_count`, and `uart.overrun_count` | Retained only in serial internals; the remaining UART fields map exactly. |
+| `balloon.inflate_discard_{attempts,advised_bytes,skipped_bytes,fails}` | Retained internally; there is no matching pinned inflate-discard family. |
+| `balloon.hinting_discard_{attempts,advised_bytes,fails}` | Exact-mapped respectively to `free_page_hint_{count,freed,fails}`; `hinting_discard_skipped_bytes` remains internal. |
+| `balloon.free_page_report_{count,advised_bytes,fails}` | Exact-mapped respectively to `free_page_report_{count,freed,fails}`; `requested_bytes` and `skipped_bytes` remain internal. |
+| `memory_hotplug.interrupt_fails`, `rollback_{count,fails}`, `owner_cleanup_{count,fails}`, and `teardown_{count,fails}` | Retained only in device/owner diagnostics; all pinned memory-hotplug fields map independently. |
 
 `GET /vm/config` continues to omit active metrics output configuration, as does
 the pinned Firecracker full-configuration projection. Output sink ownership and
@@ -160,11 +190,31 @@ attempt transaction. Producer events arriving after the snapshot belong to a
 later attempt. No individual producer may reset independently during
 collection.
 
+One attempt captures the clock once, constructs one immutable typed value, and
+serializes it twice: first into a no-allocation counting writer, then into an
+exactly reserved fixed-capacity buffer. The complete JSON-plus-newline record
+is limited to 64 MiB. Count overflow, allocation failure, serialization drift,
+or a larger record fails before sink access. Publication writes all JSON bytes,
+then exactly one newline, then flushes. Short and interrupted writes are
+retried; zero progress, would-block, other write failures, newline failures,
+and flush failures are closed redacted stages. Only success of all three output
+stages advances the baseline.
+
+Exact compact fixtures live at
+`crates/runtime/src/metrics/fixtures/minimal.jsonl` and
+`crates/runtime/src/metrics/fixtures/all-static-nonzero.jsonl`. A generated
+maximum recipe exercises all 985 configured roots without checking a
+tens-of-megabytes fixture into the repository. The compiled upper-bound proof
+uses the identity budget, dynamic prefix/punctuation overhead, every family
+shape, and 20-digit `u64::MAX` values and remains below the 64 MiB record cap.
+
 ## Validation and Regeneration
 
 Ordinary delivery validation is self-contained:
 
 ```sh
+cargo test -p bangbang-runtime metrics::firecracker::tests --all-features --locked
+cargo test -p bangbang-runtime metrics::tests --all-features --locked
 cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --locked
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 ```

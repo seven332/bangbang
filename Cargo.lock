@@ -187,6 +187,7 @@ dependencies = [
  "device_tree",
  "getrandom",
  "libc",
+ "serde",
  "serde_json",
  "vm-fdt",
  "vm-superio",

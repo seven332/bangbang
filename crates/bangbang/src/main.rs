@@ -2752,10 +2752,10 @@ mod tests {
     };
 
     use super::{
-        ApiServerError, Args, Command, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID,
-        HTTP_MAX_PAYLOAD_SIZE, MAX_INSTANCE_ID_LEN, ProcessError, ProcessExitCode,
-        SnapshotInspectionPath, StartupConfig, StartupTimeClock, StartupTimeConfig,
-        parse_process_args,
+        ApiServerError, Args, CONFIG_FILE_MAX_BYTES, Command, DEFAULT_API_SOCK_PATH,
+        DEFAULT_INSTANCE_ID, HTTP_MAX_PAYLOAD_SIZE, MAX_INSTANCE_ID_LEN, ProcessError,
+        ProcessExitCode, SnapshotInspectionPath, StartupConfig, StartupTimeClock,
+        StartupTimeConfig, parse_process_args,
     };
 
     #[derive(Debug, Clone)]
@@ -3213,6 +3213,26 @@ mod tests {
             "bangbang-main-test-{}-{nanos}-{name}.metrics",
             std::process::id()
         ))
+    }
+
+    fn metrics_values_from_text(output: &str) -> Vec<serde_json::Value> {
+        output
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str(line).expect("metrics line should be valid JSON"))
+            .collect()
+    }
+
+    fn read_canonical_metrics_lines(path: &Path, expected: usize) -> Vec<serde_json::Value> {
+        let output = fs::read_to_string(path).expect("metrics output should be readable");
+        let values = metrics_values_from_text(&output);
+        assert_eq!(values.len(), expected, "metrics output: {output}");
+        for value in &values {
+            assert!(value["utc_timestamp_ms"].as_u64().is_some());
+            assert_eq!(value["vmm"]["panic_count"], 0);
+            assert!(value["vmm"].get("metrics_flush_count").is_none());
+        }
+        values
     }
 
     #[derive(Debug)]
@@ -3790,6 +3810,20 @@ mod tests {
         assert_eq!(config.metadata, None);
         assert!(!config.no_api);
         assert_eq!(config.startup_time, StartupTimeConfig::default());
+    }
+
+    #[test]
+    fn metrics_limits_cover_the_configured_identity_input_envelope() {
+        assert_eq!(
+            bangbang_runtime::metrics::FIRECRACKER_METRICS_MAX_IDENTITY_BYTES,
+            CONFIG_FILE_MAX_BYTES
+                + (bangbang_runtime::metrics::FIRECRACKER_METRICS_MAX_DYNAMIC_ROOTS - 1)
+                    * HTTP_MAX_PAYLOAD_SIZE
+        );
+        assert_eq!(
+            bangbang_runtime::metrics::FIRECRACKER_METRICS_MAX_LINE_BYTES,
+            64 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -5137,10 +5171,9 @@ mod tests {
 
         vmm.handle_action(VmmAction::FlushMetrics)
             .expect("flush metrics should succeed");
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let metrics = read_canonical_metrics_lines(&metrics_path, 2);
+        assert_eq!(metrics[0]["block_rootfs"]["update_count"], 0);
+        assert_eq!(metrics[1]["block_rootfs"]["update_count"], 0);
         assert_eq!(
             fs::read_to_string(&logger_path).expect("logger output should be readable"),
             concat!(
@@ -5267,11 +5300,8 @@ mod tests {
             )))
         );
         let expected =
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n";
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            expected
-        );
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable");
+        assert_eq!(metrics_values_from_text(&expected).len(), 2);
 
         assert_eq!(
             super::finish_process_with_terminal_observability(
@@ -5387,13 +5417,9 @@ mod tests {
                 ErrorKind::BrokenPipe
             )))
         );
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            concat!(
-                "{\"vmm\":{\"metrics_flush_count\":1}}\n",
-                "{\"logger\":{\"missed_log_count\":3},\"vmm\":{\"metrics_flush_count\":1}}\n",
-            )
-        );
+        let metrics = read_canonical_metrics_lines(&metrics_path, 2);
+        assert_eq!(metrics[0]["logger"]["missed_log_count"], 0);
+        assert_eq!(metrics[1]["logger"]["missed_log_count"], 3);
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
@@ -5434,10 +5460,7 @@ mod tests {
             ),
             Ok(())
         );
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        read_canonical_metrics_lines(&metrics_path, 2);
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
@@ -5478,10 +5501,7 @@ mod tests {
             ),
             Err(super::ProcessError::ProcessSessionTerminal)
         );
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        read_canonical_metrics_lines(&metrics_path, 2);
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
@@ -5523,10 +5543,7 @@ mod tests {
             ),
             Ok(())
         );
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        read_canonical_metrics_lines(&metrics_path, 2);
         fs::remove_file(metrics_path).expect("fixture metrics should clean up");
     }
 
@@ -5559,7 +5576,9 @@ mod tests {
         vmm.handle_initial_metrics_flush();
         let initial = String::from_utf8(metrics_fifo.drain_available())
             .expect("initial metrics should be UTF-8");
-        assert!(initial.contains(r#""metrics_flush_count":1"#));
+        let initial_values = metrics_values_from_text(&initial);
+        assert_eq!(initial_values.len(), 1);
+        assert_eq!(initial_values[0]["vmm"]["panic_count"], 0);
 
         metrics_fifo.fill_to_capacity();
         signal_metrics.record_sigpipe();
@@ -7029,10 +7048,7 @@ mod tests {
         vmm.handle_action(VmmAction::FlushMetrics)
             .expect("flush metrics should succeed");
 
-        assert_eq!(
-            fs::read_to_string(&path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        read_canonical_metrics_lines(&path, 2);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -7070,9 +7086,11 @@ mod tests {
             .expect("instance start should succeed");
         vmm.handle_initial_metrics_flush();
 
+        let metrics = read_canonical_metrics_lines(&path, 1);
+        assert_eq!(metrics[0]["api_server"]["process_startup_time_us"], 1_000);
         assert_eq!(
-            fs::read_to_string(&path).expect("initial metrics output should be readable"),
-            "{\"api_server\":{\"process_startup_time_cpu_us\":5000,\"process_startup_time_us\":1000},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            metrics[0]["api_server"]["process_startup_time_cpu_us"],
+            5_000
         );
 
         fs::remove_file(path).expect("fixture should clean up");

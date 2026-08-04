@@ -37292,6 +37292,27 @@ mod tests {
         }
     }
 
+    fn metrics_values_from_text(output: &str) -> Vec<serde_json::Value> {
+        output
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str(line).expect("metrics line should be valid JSON"))
+            .collect()
+    }
+
+    fn read_canonical_metrics_lines(path: &Path, expected: usize) -> Vec<serde_json::Value> {
+        let output = fs::read_to_string(path).expect("metrics output should read");
+        let values = metrics_values_from_text(&output);
+        assert_eq!(values.len(), expected, "metrics output: {output}");
+        for value in &values {
+            assert!(value["utc_timestamp_ms"].as_u64().is_some());
+            assert_eq!(value["vmm"]["panic_count"], 0);
+            assert!(value["vmm"].get("boot_run_loop_status").is_none());
+            assert!(value["vmm"].get("metrics_flush_count").is_none());
+        }
+        values
+    }
+
     #[cfg(target_os = "macos")]
     impl TempSnapshotDirectory {
         fn new(name: &str) -> Self {
@@ -46845,10 +46866,7 @@ mod tests {
         assert!(vmm.controller.boot_source_config().is_some());
         vmm.handle_initial_metrics_flush();
         vmm.handle_initial_metrics_flush();
-        assert_eq!(
-            fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        read_canonical_metrics_lines(metrics.path(), 1);
 
         assert_eq!(
             vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(false))),
@@ -46861,10 +46879,7 @@ mod tests {
         assert_eq!(vmm.metrics_session_epoch(), Some(session_epoch));
         vmm.handle_initial_metrics_flush();
         vmm.handle_periodic_metrics_flush();
-        assert_eq!(
-            fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        read_canonical_metrics_lines(metrics.path(), 2);
     }
 
     #[cfg(target_os = "macos")]
@@ -47206,10 +47221,7 @@ mod tests {
         );
         vmm.handle_initial_metrics_flush();
         vmm.handle_initial_metrics_flush();
-        assert_eq!(
-            fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        read_canonical_metrics_lines(metrics.path(), 1);
     }
 
     #[cfg(target_os = "macos")]
@@ -47346,10 +47358,7 @@ mod tests {
         );
         vmm.handle_initial_metrics_flush();
         vmm.handle_initial_metrics_flush();
-        assert_eq!(
-            fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        read_canonical_metrics_lines(metrics.path(), 1);
     }
 
     #[cfg(target_os = "macos")]
@@ -65557,15 +65566,18 @@ mod tests {
             .expect("metrics should flush");
 
         assert_eq!(vmm.starter.calls, 1);
+        let values = read_canonical_metrics_lines(metrics.path(), 1);
+        assert_eq!(values[0]["api_server"]["process_startup_time_us"], 1_000);
         assert_eq!(
-            fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"api_server\":{\"process_startup_time_us\":1000},\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
+            values[0]["api_server"]["process_startup_time_cpu_us"],
+            3_000
         );
     }
 
     #[test]
     fn active_session_replacement_starts_a_fresh_metrics_generation() {
         let metrics = TempFilePath::create("replacement-metrics");
+        let rootfs = TempFilePath::create("replacement-metrics-rootfs");
         let mut vmm = ProcessVmm::with_starter(
             "demo-1",
             "0.1.0",
@@ -65576,6 +65588,13 @@ mod tests {
             metrics.path(),
         )))
         .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "rootfs",
+            "rootfs",
+            rootfs.path(),
+            true,
+        )))
+        .expect("root drive should configure the dynamic metrics identity");
         vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
             "/tmp/vmlinux",
         )))
@@ -65598,18 +65617,9 @@ mod tests {
         vmm.handle_action(VmmAction::FlushMetrics)
             .expect("replacement session metrics should flush");
 
-        let lines: Vec<serde_json::Value> = fs::read_to_string(metrics.path())
-            .expect("metrics output should read")
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("metrics line should be valid JSON"))
-            .collect();
-        assert_eq!(lines.len(), 2);
+        let lines = read_canonical_metrics_lines(metrics.path(), 2);
         assert_eq!(lines[0]["block_rootfs"]["update_count"], 5);
-        assert_eq!(lines[0]["vmm"]["boot_run_loop_status"], "running");
-        assert_eq!(lines[0]["vmm"]["metrics_flush_count"], 1);
         assert_eq!(lines[1]["block_rootfs"]["update_count"], 2);
-        assert_eq!(lines[1]["vmm"]["boot_run_loop_status"], "paused");
-        assert_eq!(lines[1]["vmm"]["metrics_flush_count"], 1);
     }
 
     #[test]
@@ -65638,10 +65648,8 @@ mod tests {
         vmm.handle_action(VmmAction::FlushMetrics)
             .expect("metrics should flush");
 
-        assert_eq!(
-            fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"signals\":{\"sigpipe\":1},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
-        );
+        let values = read_canonical_metrics_lines(metrics.path(), 1);
+        assert_eq!(values[0]["signals"]["sigpipe"], 1);
     }
 
     #[test]
@@ -65671,10 +65679,11 @@ mod tests {
         vmm.handle_action(VmmAction::FlushMetrics)
             .expect("metrics should flush");
 
-        assert_eq!(
-            fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"uart\":{\"error_count\":0,\"flush_count\":0,\"input_count\":0,\"interrupt_count\":0,\"missed_read_count\":0,\"missed_write_count\":0,\"overrun_count\":0,\"rate_limiter_dropped_bytes\":2,\"read_count\":0,\"write_count\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
-        );
+        let values = read_canonical_metrics_lines(metrics.path(), 1);
+        assert_eq!(values[0]["uart"]["rate_limiter_dropped_bytes"], 2);
+        assert!(values[0]["uart"].get("input_count").is_none());
+        assert!(values[0]["uart"].get("interrupt_count").is_none());
+        assert!(values[0]["uart"].get("overrun_count").is_none());
     }
 
     #[test]
@@ -65788,9 +65797,11 @@ mod tests {
         vmm.handle_periodic_metrics_flush();
 
         assert_eq!(vmm.starter.calls, 1);
+        let values = read_canonical_metrics_lines(metrics.path(), 1);
+        assert_eq!(values[0]["api_server"]["process_startup_time_us"], 1_000);
         assert_eq!(
-            fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"api_server\":{\"process_startup_time_us\":1000},\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
+            values[0]["api_server"]["process_startup_time_cpu_us"],
+            3_000
         );
         assert_eq!(
             fs::read_to_string(logger.path()).expect("logger output should read"),
@@ -65836,10 +65847,7 @@ mod tests {
         vmm.handle_terminal_metrics_flush();
         vmm.handle_terminal_metrics_flush();
 
-        assert_eq!(
-            fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        read_canonical_metrics_lines(metrics.path(), 2);
         assert_eq!(
             fs::read_to_string(logger.path()).expect("logger output should read"),
             concat!(
@@ -65874,20 +65882,28 @@ mod tests {
         vmm.handle_terminal_observability(ProcessTerminalCategory::Success);
         vmm.handle_terminal_observability(ProcessTerminalCategory::Panic);
 
+        let output = fs::read_to_string(output.path()).expect("combined output should read");
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 9, "combined output: {output}");
         assert_eq!(
-            fs::read_to_string(output.path()).expect("combined output should read"),
-            concat!(
-                "operation=backend-startup outcome=succeeded\n",
-                "action=InstanceStart\n",
-                "operation=boot-worker outcome=running\n",
-                "operation=vm-start outcome=succeeded\n",
-                "{\"vmm\":{\"metrics_flush_count\":1}}\n",
-                "operation=vm-stop outcome=succeeded\n",
-                "operation=shutdown outcome=orderly\n",
-                "event=process-exit category=success\n",
-                "{\"vmm\":{\"metrics_flush_count\":1}}\n",
-            )
+            &lines[..4],
+            [
+                "operation=backend-startup outcome=succeeded",
+                "action=InstanceStart",
+                "operation=boot-worker outcome=running",
+                "operation=vm-start outcome=succeeded",
+            ]
         );
+        assert!(serde_json::from_str::<serde_json::Value>(lines[4]).is_ok());
+        assert_eq!(
+            &lines[5..8],
+            [
+                "operation=vm-stop outcome=succeeded",
+                "operation=shutdown outcome=orderly",
+                "event=process-exit category=success",
+            ]
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(lines[8]).is_ok());
     }
 
     #[test]
@@ -66139,13 +66155,9 @@ mod tests {
                 "event=process-exit category=panic\n",
             )
         );
-        assert_eq!(
-            fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            concat!(
-                "{\"vmm\":{\"metrics_flush_count\":1}}\n",
-                "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n",
-            )
-        );
+        let metrics = read_canonical_metrics_lines(metrics.path(), 2);
+        assert_eq!(metrics[0]["logger"]["missed_log_count"], 0);
+        assert_eq!(metrics[1]["logger"]["missed_log_count"], 1);
     }
 
     #[test]
@@ -66232,10 +66244,21 @@ mod tests {
         vmm.handle_action(VmmAction::FlushMetrics)
             .expect("metrics should flush");
 
-        assert_eq!(
-            fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let metrics = read_canonical_metrics_lines(metrics.path(), 1);
+        for section in [
+            "deprecated_api",
+            "get_api_requests",
+            "patch_api_requests",
+            "put_api_requests",
+        ] {
+            for value in metrics[0][section]
+                .as_object()
+                .expect("API metrics section should be an object")
+                .values()
+            {
+                assert_eq!(value.as_u64(), Some(0), "{section}: {value}");
+            }
+        }
     }
 
     #[test]
