@@ -6,10 +6,12 @@ use std::process::{Command, ExitCode};
 
 use bangbang_firecracker_capability_audit::{
     AuditError, AuditMode, CAPABILITY_INVENTORY_PATH, LOGGER_PRODUCER_AUDIT_PATH,
-    LOGGER_PRODUCER_MANIFEST_PATH, SOURCE_MANIFEST_PATH, derive_logger_producer_manifest,
-    derive_source_manifest, logger_producer_manifest_json, read_capability_inventory,
-    read_logger_producer_audit, read_logger_producer_manifest, read_source_manifest,
-    source_manifest_json, validate, validate_logger_compatibility, validate_logger_producers,
+    LOGGER_PRODUCER_MANIFEST_PATH, METRICS_SCHEMA_AUTHORITY_PATH, SOURCE_MANIFEST_PATH,
+    derive_logger_producer_manifest, derive_metrics_schema_source, derive_source_manifest,
+    logger_producer_manifest_json, metrics_schema_source_candidate_json, read_capability_inventory,
+    read_logger_producer_audit, read_logger_producer_manifest, read_metrics_schema_authority,
+    read_source_manifest, source_manifest_json, validate, validate_logger_compatibility,
+    validate_logger_producers, validate_metrics_schema,
 };
 
 fn main() -> ExitCode {
@@ -35,6 +37,7 @@ fn run(args: Vec<String>) -> Result<String, AuditError> {
         "compare" => run_compare(command_args),
         "regenerate" => run_regenerate(command_args),
         "regenerate-logger-producers" => run_regenerate_logger_producers(command_args),
+        "regenerate-metrics-schema-source" => run_regenerate_metrics_schema_source(command_args),
         "help" | "--help" | "-h" => Ok(usage().to_string()),
         _ => Err(AuditError::new(format!(
             "unknown command: {command}\n{}",
@@ -68,6 +71,8 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     let inventory = read_capability_inventory(&root.join(CAPABILITY_INVENTORY_PATH))?;
     let logger_manifest = read_logger_producer_manifest(&root.join(LOGGER_PRODUCER_MANIFEST_PATH))?;
     let logger_audit = read_logger_producer_audit(&root.join(LOGGER_PRODUCER_AUDIT_PATH))?;
+    let metrics_authority =
+        read_metrics_schema_authority(&root.join(METRICS_SCHEMA_AUTHORITY_PATH))?;
     let audit_mode = match mode {
         ValidateMode::Delivery => AuditMode::Delivery,
         ValidateMode::Final => AuditMode::Final,
@@ -82,8 +87,12 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
             .map_err(|errors| {
                 AuditError::new(format!("logger compatibility validation errors:\n{errors}"))
             })?;
+            validate_metrics_schema(&metrics_authority, &manifest, &root, AuditMode::Delivery)
+                .map_err(|errors| {
+                    AuditError::new(format!("metrics schema validation errors:\n{errors}"))
+                })?;
             return Ok(
-                "Firecracker capability inventory and logger producer audit are valid for the terminal logger compatibility scope"
+                "Firecracker capability inventory, logger producer audit, and metrics schema authority are valid for the terminal logger compatibility scope"
                     .to_string(),
             );
         }
@@ -97,6 +106,9 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     {
         failures.push(format!("logger producer validation errors:\n{errors}"));
     }
+    if let Err(errors) = validate_metrics_schema(&metrics_authority, &manifest, &root, audit_mode) {
+        failures.push(format!("metrics schema validation errors:\n{errors}"));
+    }
     if !failures.is_empty() {
         return Err(AuditError::new(failures.join("\n")));
     }
@@ -105,7 +117,7 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
         AuditMode::Final => "final",
     };
     Ok(format!(
-        "Firecracker capability inventory and logger producer audit are valid in {mode_name} mode"
+        "Firecracker capability inventory, logger producer audit, and metrics schema authority are valid in {mode_name} mode"
     ))
 }
 
@@ -116,6 +128,9 @@ fn run_compare(args: &[String]) -> Result<String, AuditError> {
     let derived = derive_source_manifest(Path::new(&firecracker))?;
     let checked_logger = read_logger_producer_manifest(&root.join(LOGGER_PRODUCER_MANIFEST_PATH))?;
     let derived_logger = derive_logger_producer_manifest(Path::new(&firecracker))?;
+    let checked_metrics = read_metrics_schema_authority(&root.join(METRICS_SCHEMA_AUTHORITY_PATH))?
+        .source_candidate();
+    let derived_metrics = derive_metrics_schema_source(Path::new(&firecracker))?;
     let mut differences = Vec::new();
     if checked_in != derived {
         let checked_json = String::from_utf8(source_manifest_json(&checked_in)?)
@@ -141,9 +156,23 @@ fn run_compare(args: &[String]) -> Result<String, AuditError> {
             canonical_line_diff(&checked_json, &derived_json)
         ));
     }
+    if checked_metrics != derived_metrics {
+        let checked_json = String::from_utf8(metrics_schema_source_candidate_json(
+            &checked_metrics,
+        )?)
+        .map_err(|_| AuditError::new("checked metrics schema source JSON is not valid UTF-8"))?;
+        let derived_json = String::from_utf8(metrics_schema_source_candidate_json(
+            &derived_metrics,
+        )?)
+        .map_err(|_| AuditError::new("derived metrics schema source JSON is not valid UTF-8"))?;
+        differences.push(format!(
+            "derived metrics schema source differs from {METRICS_SCHEMA_AUTHORITY_PATH}; run regenerate-metrics-schema-source to an explicit candidate path\n{}",
+            canonical_line_diff(&checked_json, &derived_json)
+        ));
+    }
     if differences.is_empty() {
         Ok(
-            "checked-in source and logger producer manifests match the pinned Firecracker checkout"
+            "checked-in source, logger producer, and metrics schema authorities match the pinned Firecracker checkout"
                 .to_string(),
         )
     } else {
@@ -221,18 +250,46 @@ fn run_regenerate_logger_producers(args: &[String]) -> Result<String, AuditError
     ))
 }
 
+fn run_regenerate_metrics_schema_source(args: &[String]) -> Result<String, AuditError> {
+    let options = required_options(args, &["--firecracker", "--output"])?;
+    let firecracker = options
+        .get("--firecracker")
+        .ok_or_else(|| AuditError::new("--firecracker is required"))?;
+    let output = options
+        .get("--output")
+        .ok_or_else(|| AuditError::new("--output is required"))?;
+    let root = repository_root()?;
+    let output_path = candidate_output_path(&root, Path::new(output))?;
+    let derived = derive_metrics_schema_source(Path::new(firecracker))?;
+    let bytes = metrics_schema_source_candidate_json(&derived)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output_path)
+        .map_err(|error| AuditError::new(format!("failed to create candidate output: {error}")))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| AuditError::new(format!("failed to write candidate output: {error}")))?;
+    Ok(format!(
+        "generated metrics schema source candidate: {}",
+        output_path.display()
+    ))
+}
+
 fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditError> {
     let output_path = absolute_from(root, output);
     let source_path = root.join(SOURCE_MANIFEST_PATH);
     let inventory_path = root.join(CAPABILITY_INVENTORY_PATH);
     let logger_manifest_path = root.join(LOGGER_PRODUCER_MANIFEST_PATH);
     let logger_audit_path = root.join(LOGGER_PRODUCER_AUDIT_PATH);
+    let metrics_schema_path = root.join(METRICS_SCHEMA_AUTHORITY_PATH);
     let normalized_output = normalize_lexically(&output_path);
     let checked_paths = [
         &source_path,
         &inventory_path,
         &logger_manifest_path,
         &logger_audit_path,
+        &metrics_schema_path,
     ];
     if checked_paths
         .iter()
@@ -354,7 +411,7 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH"
+    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
 }
 
 #[cfg(test)]
@@ -428,6 +485,7 @@ mod tests {
             CAPABILITY_INVENTORY_PATH,
             LOGGER_PRODUCER_MANIFEST_PATH,
             LOGGER_PRODUCER_AUDIT_PATH,
+            METRICS_SCHEMA_AUTHORITY_PATH,
         ] {
             let error = candidate_output_path(root, Path::new(path))
                 .expect_err("checked inventory path should be refused");
@@ -443,6 +501,7 @@ mod tests {
             "compat/firecracker/v1.16.0/./capabilities.json",
             "compat/firecracker/v1.16.0/./logger-producer-manifest.json",
             "compat/firecracker/v1.16.0/../v1.16.0/logger-producer-audit.json",
+            "compat/firecracker/v1.16.0/./metrics-schema.json",
         ] {
             let error = candidate_output_path(root, Path::new(path))
                 .expect_err("checked inventory alias should be refused");

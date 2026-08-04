@@ -1395,10 +1395,11 @@ cargo test -p bangbang-firecracker-capability-audit --all-targets --locked
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 ```
 
-The workspace suite also validates all four checked JSON files: the general
-source manifest and capability overlay plus the logger producer manifest and
-human audit. Ordinary validation uses only the pinned checked-in inventory and
-does not discover or require a sibling Firecracker checkout.
+The workspace suite also validates all five checked JSON files: the general
+source manifest and capability overlay, the logger producer manifest and human
+audit, and the combined metrics source/policy authority. Ordinary validation
+uses only the pinned checked-in inventory and does not discover or require a
+sibling Firecracker checkout.
 
 ### Evidence Responsibilities
 
@@ -1533,6 +1534,34 @@ not-applicable classes, representing 402 implemented and 66 not-applicable
 source mappings. Four i8042 mappings moved to the exact x86-only class because
 their upstream source module is shared but construction, PIO, API/runtime
 ownership, and observable execution remain x86_64-only.
+
+The checked metrics authority uses one envelope with a machine-owned `source`
+projection and human-owned policy profiles/mappings. It records exactly 24
+arm64 static roots and 243 static scalar paths, plus configured block/network/
+vhost-user field populations of 24/29/5. Run its focused local mutations with:
+
+```sh
+cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --locked
+```
+
+The ordinary `compare` command rederives the source projection together with
+the general and logger manifests. To create a metrics source-only candidate:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- \
+  regenerate-metrics-schema-source \
+  --firecracker /path/to/firecracker \
+  --output codex-work/tmp/metrics-schema-source.candidate.json
+```
+
+The command never emits or carries forward policy. Review source identities,
+root/field order, Rust and fixture anchors, types/reset classes, dynamic
+grammar, architecture, reconciliations, and fingerprints before manually
+updating `metrics-schema.json`. Then review every affected unit, aggregation,
+producer owner/disposition, delivery issue, rationale, and evidence mapping.
+The destination must be a new non-alias of every checked JSON file. The exact
+shape and publication boundary are documented in the
+[metrics schema contract](../compat/firecracker/v1.16.0/metrics-contract.md).
 
 Host lifecycle logger coverage exercises backend and VM transitions, all three
 live device kinds, boot-worker observation, automatic metrics failures,

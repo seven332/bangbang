@@ -4,6 +4,9 @@ mod logger_certify;
 mod logger_model;
 mod logger_upstream;
 mod logger_validate;
+mod metrics_model;
+mod metrics_upstream;
+mod metrics_validate;
 mod model;
 mod upstream;
 mod validate;
@@ -18,6 +21,16 @@ pub use logger_model::{
 };
 pub use logger_upstream::derive_logger_producer_manifest;
 pub use logger_validate::validate_logger_producers;
+pub use metrics_model::{
+    MetricsAggregation, MetricsArchitecture, MetricsCardinality, MetricsDynamicFamily,
+    MetricsFieldPolicy, MetricsJsonType, MetricsPolicyProfile, MetricsProducerDisposition,
+    MetricsProducerOwner, MetricsReconciliation, MetricsReconciliationKind, MetricsSchemaAuthority,
+    MetricsSchemaCounts, MetricsSchemaDisposition, MetricsSchemaSource,
+    MetricsSchemaSourceCandidate, MetricsSourceAnchor, MetricsSourceField, MetricsStaticRoot,
+    MetricsUnit, MetricsValueKind,
+};
+pub use metrics_upstream::derive_metrics_schema_source;
+pub use metrics_validate::validate_metrics_schema;
 pub use model::{
     AuditMode, Baseline, Capability, CapabilityInventory, Counts, Disposition, Input,
     PlatformExclusion, Reference, SourceItem, SourceManifest,
@@ -42,6 +55,10 @@ pub const GENERATOR_VERSION: u32 = 1;
 pub const LOGGER_PRODUCER_SCHEMA_VERSION: u32 = 1;
 /// Current generated logger producer format.
 pub const LOGGER_PRODUCER_GENERATOR_VERSION: u32 = 1;
+/// Current checked-in metrics schema authority.
+pub const METRICS_SCHEMA_VERSION: u32 = 1;
+/// Current generated metrics schema source format.
+pub const METRICS_SCHEMA_GENERATOR_VERSION: u32 = 1;
 /// Repository-relative generated source manifest path.
 pub const SOURCE_MANIFEST_PATH: &str = "compat/firecracker/v1.16.0/source-manifest.json";
 /// Repository-relative human capability overlay path.
@@ -52,6 +69,8 @@ pub const LOGGER_PRODUCER_MANIFEST_PATH: &str =
 /// Repository-relative human logger producer audit path.
 pub const LOGGER_PRODUCER_AUDIT_PATH: &str =
     "compat/firecracker/v1.16.0/logger-producer-audit.json";
+/// Repository-relative canonical metrics schema authority path.
+pub const METRICS_SCHEMA_AUTHORITY_PATH: &str = "compat/firecracker/v1.16.0/metrics-schema.json";
 
 /// Error produced while reading, parsing, or deriving an inventory.
 #[derive(Debug)]
@@ -108,6 +127,16 @@ pub fn read_logger_producer_audit(path: &Path) -> Result<LoggerProducerAudit, Au
         .map_err(|error| AuditError::new(format!("failed to parse logger producer audit: {error}")))
 }
 
+/// Read and parse the checked metrics schema authority.
+pub fn read_metrics_schema_authority(path: &Path) -> Result<MetricsSchemaAuthority, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!("failed to read metrics schema authority: {error}"))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!("failed to parse metrics schema authority: {error}"))
+    })
+}
+
 /// Serialize a generated source manifest using canonical pretty JSON.
 pub fn source_manifest_json(manifest: &SourceManifest) -> Result<Vec<u8>, AuditError> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -137,6 +166,27 @@ pub fn logger_producer_audit_json(audit: &LoggerProducerAudit) -> Result<Vec<u8>
             "failed to serialize logger producer audit: {error}"
         ))
     })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Serialize a source-only metrics schema candidate using canonical pretty JSON.
+pub fn metrics_schema_source_candidate_json(
+    candidate: &MetricsSchemaSourceCandidate,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(candidate, "metrics schema source candidate")
+}
+
+/// Serialize the checked metrics schema authority using canonical pretty JSON.
+pub fn metrics_schema_authority_json(
+    authority: &MetricsSchemaAuthority,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(authority, "metrics schema authority")
+}
+
+fn canonical_json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>, AuditError> {
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| AuditError::new(format!("failed to serialize {label}: {error}")))?;
     bytes.push(b'\n');
     Ok(bytes)
 }
