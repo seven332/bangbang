@@ -2915,6 +2915,11 @@ typed owner selects only a closed operation, outcome, and optional device kind
 before raw errors, addresses, registers, queue indexes, identifiers, or guest
 values can cross a formatting boundary.
 
+If failed HVF teardown requires intentionally retaining mapped memory for host
+safety, Bangbang first replaces the retained GuestMemory logger with an inert
+capability. Required memory retention therefore cannot retain the logger
+producer or prevent the sole logger worker from terminating.
+
 Host lifecycle records use only fixed backend/VM operation and outcome values.
 Live block, network, and pmem controls add a fixed device kind, never the
 device ID, backing path, MAC address, provider name, or backend error. Snapshot

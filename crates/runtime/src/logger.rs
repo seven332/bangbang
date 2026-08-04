@@ -1296,6 +1296,7 @@ mod tests {
         ObservabilityWorkerLogRateLimiter, ProcessStartupOutcome, ProcessTerminalCategory,
         SharedLoggerMetrics, TransportOutcomeLogRateLimiter,
     };
+    use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1614,6 +1615,29 @@ mod tests {
 
         assert!(Arc::ptr_eq(&logger.inner, &cloned.inner));
         assert!(!Arc::ptr_eq(&logger.inner, &refreshed.inner));
+    }
+
+    #[test]
+    fn guest_memory_can_release_logger_before_intentional_owner_retention() {
+        let observer = Arc::new(WorkerObserver::default());
+        let mut state = LoggerState::default();
+        state.set_delivery_config_for_test(
+            LoggerDeliveryConfig::for_test(2, Duration::from_millis(10))
+                .with_worker_observer(observer.clone()),
+        );
+        state.configure_test_writer(SharedWriter(Arc::new(Mutex::new(Vec::new()))));
+        wait_for(|| observer.active() == 1);
+        let range = GuestMemoryRange::new(GuestAddress::new(0), 0x4000)
+            .expect("guest-memory range should be valid");
+        let layout = GuestMemoryLayout::new(vec![range]).expect("layout should be valid");
+        let mut memory = GuestMemory::allocate(&layout).expect("guest memory should allocate");
+        memory.attach_guest_logger(state.guest_logger());
+
+        drop(state);
+        assert_eq!(observer.active(), 1);
+
+        memory.attach_guest_logger(GuestLogger::default());
+        wait_for(|| observer.active() == 0);
     }
 
     #[test]

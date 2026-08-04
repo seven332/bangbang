@@ -1074,7 +1074,7 @@ impl Drop for HvfBackend {
         if self.vm_created {
             let mut mapping_after_failed_unmap = None;
             let lazy_handler = self.lazy_guest_fault_handler.take();
-            let lazy_consumer = self.lazy_guest_memory_consumer.take();
+            let mut lazy_consumer = self.lazy_guest_memory_consumer.take();
 
             if let Some(signaler) = &self.gic_msi_signaler {
                 signaler.deactivate();
@@ -1103,6 +1103,17 @@ impl Drop for HvfBackend {
                 // The VM may still retain stage-two references after both
                 // unmap and destruction fail. Preserve every host and fault
                 // owner rather than releasing memory that HVF may still use.
+                // The logger capability is not part of that safety ownership:
+                // release its producer before intentionally leaking memory so
+                // the process's sole logger worker can still terminate.
+                if let Some(mapping) = mapping_after_failed_unmap.as_mut() {
+                    mapping.clear_guest_logger_before_safety_leak();
+                }
+                if let Some(consumer) = lazy_consumer.as_mut() {
+                    consumer
+                        .memory_mut()
+                        .attach_guest_logger(GuestLogger::default());
+                }
                 std::mem::forget(mapping_after_failed_unmap);
                 std::mem::forget(lazy_handler);
                 std::mem::forget(lazy_consumer);
