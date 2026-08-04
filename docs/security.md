@@ -2904,7 +2904,9 @@ Guest-triggerable backend and generic transport records use a separate
 cloneable `GuestLogger` capability with no writer, configuration mutation,
 arbitrary formatting, receipt, retry, sleep, or wait surface. Its immutable
 producer snapshot shares the controller's sole worker and the independent
-`logger-rate.backend.outcome` and `logger-rate.transport.outcome` states.
+`logger-rate.backend.outcome`, `logger-rate.transport.outcome`,
+`logger-rate.block.outcome`, `logger-rate.pmem.outcome`,
+`logger-rate.network.outcome`, and `logger-rate.vsock.outcome` states.
 Normal and native-v2 assembly install the capability before HVF and MMIO/PCI
 publication, and run-loop adapter traits require explicit logger forwarding so
 a wrapper cannot silently substitute an inert capability. Repeating successful
@@ -2914,6 +2916,25 @@ remains visible in exact metrics and is logged only at debug level. The last
 typed owner selects only a closed operation, outcome, and optional device kind
 before raw errors, addresses, registers, queue indexes, identifiers, or guest
 values can cross a formatting boundary.
+
+Block, pmem, network/MMDS, and vsock observers operate on completed typed
+notification summaries shared by MMIO and product PCI. They emit at most one
+fixed record for each nonzero category, with failures admitted before
+successes, so guest-controlled request, packet, descriptor, connection, and
+byte volume cannot multiply formatting work. Vsock's higher-cardinality
+summary uses one fixed-capacity producer batch only after MMIO or product-PCI
+interrupt handling completes, keeping logger scheduling outside the
+device-to-guest publication window. Packet-provider acquisition and HVF
+interrupt delivery use narrow fixed supplements. MMDS token-key records are
+emitted only for the transactional rollover boundary; token, key, nonce,
+instance, interface, socket, port, path, packet, and guest values are never
+fields.
+
+Production-bundle coverage routes representative records from all four classes
+through a separately granted write-only logger descriptor, replaces its source
+pathname after launcher adoption, and verifies that records follow the opened
+object while all grant, backing, socket, interface, and guest selectors remain
+absent.
 
 If failed HVF teardown requires intentionally retaining mapped memory for host
 safety, Bangbang first replaces the retained GuestMemory logger with an inert

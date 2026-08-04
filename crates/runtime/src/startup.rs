@@ -47,6 +47,7 @@ use crate::fdt::{
     write_arm64_fdt_with_pci,
 };
 use crate::interrupt::GuestInterruptLine;
+use crate::logger::{GuestLogger, LoggerNetworkOutcome};
 use crate::machine::MachineConfig;
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError,
@@ -2305,6 +2306,21 @@ pub enum Arm64BootVsockNotificationOutcome {
 }
 
 impl Arm64BootVsockNotificationOutcome {
+    /// Emits the closed device-owned summary after transport interrupt handling.
+    pub fn observe_with_guest_logger(&self, logger: &GuestLogger) {
+        match self {
+            Self::Dispatched(dispatch) => {
+                let result: Result<_, &VirtioVsockDeviceNotificationError> = Ok(dispatch.as_ref());
+                super::vsock::observe_vsock_notification_result(logger, result);
+            }
+            Self::DispatchFailed(error) => {
+                let result: Result<&VirtioVsockDeviceNotificationDispatch, _> = Err(error);
+                super::vsock::observe_vsock_notification_result(logger, result);
+            }
+            Self::HandlerLookupFailed(_) => {}
+        }
+    }
+
     pub fn needs_queue_interrupt(&self) -> bool {
         match self {
             Self::Dispatched(dispatch) => dispatch.needs_queue_interrupt(),
@@ -3780,6 +3796,9 @@ impl Arm64BootRuntimeResources {
                                 }
                             }
                             Err(source) => {
+                                mmio_dispatcher
+                                    .guest_logger()
+                                    .log_network(LoggerNetworkOutcome::PacketProviderFailed);
                                 Arm64BootNetworkNotificationOutcome::PacketIoProviderFailed(source)
                             }
                         }

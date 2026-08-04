@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
+use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerPmemOutcome, LoggerTransportOutcome};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryLayout,
     GuestMemoryRange, aarch64,
@@ -1433,6 +1433,23 @@ impl VirtioPmemDevice {
         flush: &mut impl FnMut() -> VirtioPmemFlushStatus,
         now: Instant,
     ) -> Result<VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError> {
+        let result = self.dispatch_drained_queue_notifications_at_unobserved(
+            memory,
+            drained_notifications,
+            flush,
+            now,
+        );
+        self.observe_notification_result(&result);
+        result
+    }
+
+    fn dispatch_drained_queue_notifications_at_unobserved(
+        &mut self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+        flush: &mut impl FnMut() -> VirtioPmemFlushStatus,
+        now: Instant,
+    ) -> Result<VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError> {
         if drained_notifications.is_empty() && !self.pending_rate_limited_queue {
             return Ok(VirtioPmemDeviceNotificationDispatch::new(
                 drained_notifications,
@@ -1525,6 +1542,32 @@ impl VirtioPmemDevice {
         }
     }
 
+    fn observe_notification_result(
+        &self,
+        result: &Result<VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError>,
+    ) {
+        let Some(logger) = &self.guest_logger else {
+            return;
+        };
+        match result {
+            Ok(dispatch) => {
+                if let Some(queue) = dispatch.queue_dispatch() {
+                    observe_pmem_queue_dispatch(logger, queue);
+                }
+            }
+            Err(VirtioPmemDeviceNotificationError::Inactive { .. }) => {
+                logger.log_pmem(LoggerPmemOutcome::QueueNotificationInactive);
+            }
+            Err(VirtioPmemDeviceNotificationError::UnsupportedQueue { .. }) => {
+                logger.log_pmem(LoggerPmemOutcome::QueueNotificationUnsupported);
+            }
+            Err(VirtioPmemDeviceNotificationError::QueueDispatch { source, .. }) => {
+                logger.log_pmem(LoggerPmemOutcome::QueueDispatchFailed);
+                observe_pmem_queue_dispatch(logger, source.completed_dispatch());
+            }
+        }
+    }
+
     pub fn activate_pmem(
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
@@ -1557,6 +1600,24 @@ impl VirtioPmemDevice {
         self.active_queue = None;
         self.pending_rate_limited_queue = false;
     }
+}
+
+fn observe_pmem_queue_dispatch(logger: &GuestLogger, dispatch: &VirtioPmemQueueDispatch) {
+    for outcome in pmem_queue_outcomes(dispatch).into_iter().flatten() {
+        logger.log_pmem(outcome);
+    }
+}
+
+fn pmem_queue_outcomes(dispatch: &VirtioPmemQueueDispatch) -> [Option<LoggerPmemOutcome>; 6] {
+    [
+        (dispatch.failed_flushes() != 0).then_some(LoggerPmemOutcome::FlushFailed),
+        (dispatch.parse_failures() != 0).then_some(LoggerPmemOutcome::RequestParseFailed),
+        (dispatch.status_write_failures() != 0).then_some(LoggerPmemOutcome::StatusWriteFailed),
+        (dispatch.rate_limiter_throttled_events() != 0)
+            .then_some(LoggerPmemOutcome::RateLimiterThrottled),
+        (dispatch.rate_limiter_events() != 0).then_some(LoggerPmemOutcome::RateLimiterResumed),
+        (dispatch.successful_flushes() != 0).then_some(LoggerPmemOutcome::FlushSucceeded),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1724,6 +1785,13 @@ impl VirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice> {
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
         let endpoint = work.drain_interrupt_intents();
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_pmem(LoggerPmemOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
         VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 }
@@ -5103,6 +5171,7 @@ mod tests {
 
     use super::*;
 
+    use crate::logger::{LoggerPmemOutcome, LoggerTestCapture};
     use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange, aarch64};
     use crate::metrics::{
         PmemDeviceMetrics, PmemDeviceMetricsByDevice, SharedPmemDeviceMetrics,
@@ -5441,6 +5510,65 @@ mod tests {
         ])
         .expect("test layout should be valid");
         GuestMemory::allocate(&layout).expect("test guest memory should allocate")
+    }
+
+    #[test]
+    fn pmem_notification_logger_preserves_inactive_result_and_redacts_metadata() {
+        let capture = LoggerTestCapture::default();
+        let (_logger_state, logger) = capture.configured_guest_logger();
+        let mut device = VirtioPmemDevice::new();
+        VirtioMmioDeviceActivationHandler::attach_guest_logger(&mut device, logger.clone());
+        let mut memory = request_memory();
+        let mut flush = || VirtioPmemFlushStatus::Success;
+
+        let error = device
+            .dispatch_drained_queue_notifications_at(
+                &mut memory,
+                vec![0],
+                &mut flush,
+                Instant::now(),
+            )
+            .expect_err("inactive pmem notification should remain an error");
+
+        assert!(matches!(
+            error,
+            VirtioPmemDeviceNotificationError::Inactive { .. }
+        ));
+        assert_eq!(error.drained_notifications(), &[0]);
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(
+            capture.output(),
+            "device-kind=pmem operation=queue-notification outcome=inactive\n"
+        );
+    }
+
+    #[test]
+    fn pmem_logger_summary_is_failure_first_and_deduplicated() {
+        let dispatch = VirtioPmemQueueDispatch {
+            processed_requests: 12,
+            successful_flushes: 2,
+            failed_flushes: 2,
+            parse_failures: 2,
+            status_write_failures: 2,
+            rate_limiter_throttled_events: 2,
+            rate_limiter_events: 2,
+            ..VirtioPmemQueueDispatch::default()
+        };
+
+        assert_eq!(
+            super::pmem_queue_outcomes(&dispatch)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            vec![
+                LoggerPmemOutcome::FlushFailed,
+                LoggerPmemOutcome::RequestParseFailed,
+                LoggerPmemOutcome::StatusWriteFailed,
+                LoggerPmemOutcome::RateLimiterThrottled,
+                LoggerPmemOutcome::RateLimiterResumed,
+                LoggerPmemOutcome::FlushSucceeded,
+            ]
+        );
     }
 
     fn write_request_type(memory: &mut GuestMemory, request_type: u32) {

@@ -113,7 +113,11 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             LoggerClassDisposition::Planned,
             28,
         ),
-        ("logger.block.outcome", LoggerClassDisposition::Planned, 34),
+        (
+            "logger.block.outcome",
+            LoggerClassDisposition::Implemented,
+            34,
+        ),
         ("logger.boot.time", LoggerClassDisposition::Implemented, 1),
         (
             "logger.entropy.outcome",
@@ -137,7 +141,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ),
         (
             "logger.network.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             26,
         ),
         (
@@ -180,7 +184,11 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             LoggerClassDisposition::Implemented,
             4,
         ),
-        ("logger.pmem.outcome", LoggerClassDisposition::Planned, 18),
+        (
+            "logger.pmem.outcome",
+            LoggerClassDisposition::Implemented,
+            18,
+        ),
         (
             "logger.process-signal.outcome",
             LoggerClassDisposition::Implemented,
@@ -217,7 +225,11 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             LoggerClassDisposition::Implemented,
             74,
         ),
-        ("logger.vsock.outcome", LoggerClassDisposition::Planned, 52),
+        (
+            "logger.vsock.outcome",
+            LoggerClassDisposition::Implemented,
+            52,
+        ),
     ];
     const LOGGER_CAPABILITIES: [&str; 11] = [
         "api-operation:PUT /logger",
@@ -308,7 +320,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             .iter()
             .filter(|class| class.disposition == LoggerClassDisposition::Implemented)
             .count(),
-        15
+        19
     );
     assert_eq!(
         audit
@@ -316,7 +328,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             .iter()
             .filter(|class| class.disposition == LoggerClassDisposition::Planned)
             .count(),
-        9
+        5
     );
     assert_eq!(
         audit
@@ -342,8 +354,8 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
     assert_eq!(
         mapped_dispositions,
         BTreeMap::from([
-            (LoggerClassDisposition::Implemented, 182),
-            (LoggerClassDisposition::Planned, 224),
+            (LoggerClassDisposition::Implemented, 312),
+            (LoggerClassDisposition::Planned, 94),
             (LoggerClassDisposition::NotApplicable, 62),
         ])
     );
@@ -359,7 +371,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             *counts.entry(issue).or_insert(0_usize) += 1;
             counts
         });
-    assert_eq!(planned_owners, BTreeMap::from([("#1809", 9)]));
+    assert_eq!(planned_owners, BTreeMap::from([("#1809", 5)]));
 
     let compiled_events = audit
         .classes
@@ -374,11 +386,14 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             LoggerCompiledEvent::ApiRequest,
             LoggerCompiledEvent::ApiResult,
             LoggerCompiledEvent::Backend,
+            LoggerCompiledEvent::Block,
             LoggerCompiledEvent::InstanceStart,
             LoggerCompiledEvent::FlushMetrics,
             LoggerCompiledEvent::BootTime,
             LoggerCompiledEvent::Lifecycle,
+            LoggerCompiledEvent::Network,
             LoggerCompiledEvent::Observability,
+            LoggerCompiledEvent::Pmem,
             LoggerCompiledEvent::RateLimitRecovery,
             LoggerCompiledEvent::ProcessStartup,
             LoggerCompiledEvent::ProcessPanic,
@@ -386,6 +401,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             LoggerCompiledEvent::ProcessSignal,
             LoggerCompiledEvent::Snapshot,
             LoggerCompiledEvent::Transport,
+            LoggerCompiledEvent::Vsock,
         ])
     );
     let planned_with_compiled_events = audit

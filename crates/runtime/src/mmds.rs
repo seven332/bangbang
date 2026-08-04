@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value};
 
+use crate::logger::GuestLogger;
 pub use crate::mmds_token::{
     MMDS_TOKEN_MAX_TTL_SECONDS, MMDS_TOKEN_MIN_TTL_SECONDS, MmdsTokenAuthority, MmdsTokenError,
 };
@@ -852,6 +853,10 @@ impl MmdsStateHandle {
         self.with(|state| state.config().cloned())
     }
 
+    pub fn attach_guest_logger(&self, logger: GuestLogger) -> Result<(), MmdsStateLockError> {
+        self.with_mut(|state| state.attach_guest_logger(logger))
+    }
+
     #[doc(hidden)]
     pub fn shares_state_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
@@ -896,6 +901,10 @@ impl MmdsState {
 
     pub fn config(&self) -> Option<&MmdsConfig> {
         self.config.as_ref()
+    }
+
+    pub fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.token_authority.attach_guest_logger(logger);
     }
 
     pub const fn data_store_present(&self) -> bool {

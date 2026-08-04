@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::logger::{GuestLogger, LoggerVsockOutcome};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
 };
@@ -7566,6 +7567,29 @@ impl VirtioVsockMmioCaptureState {
         memory: &GuestMemory,
         resource: &mut VirtioVsockReconstructionResource,
     ) -> Result<PreparedVsockDevice, VirtioVsockReconstructionError> {
+        self.reconstruct_snapshot_device_with_optional_guest_logger(memory, resource, None)
+    }
+
+    #[doc(hidden)]
+    pub fn reconstruct_snapshot_device_with_guest_logger(
+        &self,
+        memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+        guest_logger: GuestLogger,
+    ) -> Result<PreparedVsockDevice, VirtioVsockReconstructionError> {
+        self.reconstruct_snapshot_device_with_optional_guest_logger(
+            memory,
+            resource,
+            Some(guest_logger),
+        )
+    }
+
+    fn reconstruct_snapshot_device_with_optional_guest_logger(
+        &self,
+        memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+        guest_logger: Option<GuestLogger>,
+    ) -> Result<PreparedVsockDevice, VirtioVsockReconstructionError> {
         let queues = vsock_transport_queue_slice(self.transport.queues())
             .map_err(VirtioVsockReconstructionError::Capture)?;
         reconstruct_vsock_snapshot_device(
@@ -7575,6 +7599,7 @@ impl VirtioVsockMmioCaptureState {
             self.transport.is_device_activated(),
             memory,
             resource,
+            guest_logger,
         )
     }
 
@@ -7583,7 +7608,34 @@ impl VirtioVsockMmioCaptureState {
         memory: &GuestMemory,
         resource: &mut VirtioVsockReconstructionResource,
     ) -> Result<VirtioVsockMmioHandler, VirtioVsockReconstructionError> {
-        let prepared = self.reconstruct_snapshot_device(memory, resource)?;
+        self.reconstruct_snapshot_handler_with_optional_guest_logger(memory, resource, None)
+    }
+
+    #[doc(hidden)]
+    pub fn reconstruct_snapshot_handler_with_guest_logger(
+        &self,
+        memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+        guest_logger: GuestLogger,
+    ) -> Result<VirtioVsockMmioHandler, VirtioVsockReconstructionError> {
+        self.reconstruct_snapshot_handler_with_optional_guest_logger(
+            memory,
+            resource,
+            Some(guest_logger),
+        )
+    }
+
+    fn reconstruct_snapshot_handler_with_optional_guest_logger(
+        &self,
+        memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+        guest_logger: Option<GuestLogger>,
+    ) -> Result<VirtioVsockMmioHandler, VirtioVsockReconstructionError> {
+        let prepared = self.reconstruct_snapshot_device_with_optional_guest_logger(
+            memory,
+            resource,
+            guest_logger,
+        )?;
         let (_, _, config_space, device) = prepared.into_parts();
         let activation_is_active = device.is_activated();
         let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
@@ -7659,6 +7711,29 @@ impl VirtioVsockPciCaptureState {
         memory: &GuestMemory,
         resource: &mut VirtioVsockReconstructionResource,
     ) -> Result<PreparedVsockDevice, VirtioVsockReconstructionError> {
+        self.reconstruct_snapshot_device_with_optional_guest_logger(memory, resource, None)
+    }
+
+    #[doc(hidden)]
+    pub fn reconstruct_snapshot_device_with_guest_logger(
+        &self,
+        memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+        guest_logger: GuestLogger,
+    ) -> Result<PreparedVsockDevice, VirtioVsockReconstructionError> {
+        self.reconstruct_snapshot_device_with_optional_guest_logger(
+            memory,
+            resource,
+            Some(guest_logger),
+        )
+    }
+
+    fn reconstruct_snapshot_device_with_optional_guest_logger(
+        &self,
+        memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+        guest_logger: Option<GuestLogger>,
+    ) -> Result<PreparedVsockDevice, VirtioVsockReconstructionError> {
         let queues = vsock_transport_queues(self.transport.queues())
             .map_err(VirtioVsockReconstructionError::Capture)?;
         reconstruct_vsock_snapshot_device(
@@ -7668,6 +7743,7 @@ impl VirtioVsockPciCaptureState {
             self.transport.is_device_activated(),
             memory,
             resource,
+            guest_logger,
         )
     }
 }
@@ -8219,6 +8295,7 @@ fn reconstruct_vsock_snapshot_device(
     transport_activated: bool,
     memory: &GuestMemory,
     resource: &mut VirtioVsockReconstructionResource,
+    guest_logger: Option<GuestLogger>,
 ) -> Result<PreparedVsockDevice, VirtioVsockReconstructionError> {
     validate_vsock_capture_state(state, device_registers, queues, transport_activated, memory)
         .map_err(VirtioVsockReconstructionError::Capture)?;
@@ -8285,6 +8362,7 @@ fn reconstruct_vsock_snapshot_device(
     let (owner, guest_connector) =
         VsockHostSocketOwner::from_prepared_supplied(&uds_path, listener);
     let mut device = VirtioVsockDevice::with_host_socket_owner(guest_cid, owner);
+    device.guest_logger = guest_logger;
     device.guest_connector = guest_connector;
     device.host_connections =
         VsockHostConnectionTable::from_local_port_cursor(state.host_local_port_cursor());
@@ -8417,6 +8495,7 @@ impl VirtioVsockPendingRxPacket {
 #[derive(Debug)]
 pub struct VirtioVsockDevice {
     capture_owner_identity: Arc<()>,
+    guest_logger: Option<GuestLogger>,
     guest_cid: u32,
     active_rx_queue: Option<VirtioVsockRxQueue>,
     active_tx_queue: Option<VirtioVsockTxQueue>,
@@ -8441,6 +8520,7 @@ impl VirtioVsockDevice {
     fn with_guest_cid(guest_cid: u32) -> Self {
         Self {
             capture_owner_identity: Arc::new(()),
+            guest_logger: None,
             guest_cid,
             active_rx_queue: None,
             active_tx_queue: None,
@@ -8977,6 +9057,28 @@ impl VirtioVsockDevice {
         &mut self,
         memory: &mut GuestMemory,
     ) -> Result<VirtioVsockTransportResetAttempt, VirtioVsockTransportResetError> {
+        let result = self.prepare_transport_reset_unobserved(memory);
+        if let Some(logger) = &self.guest_logger {
+            match &result {
+                Ok(VirtioVsockTransportResetAttempt::Published(_)) => {
+                    logger.log_vsock(LoggerVsockOutcome::TransportResetSucceeded);
+                }
+                Ok(VirtioVsockTransportResetAttempt::QueueEmpty) | Err(_) => {
+                    logger.log_vsock(LoggerVsockOutcome::TransportResetFailed);
+                }
+                Ok(
+                    VirtioVsockTransportResetAttempt::Inactive
+                    | VirtioVsockTransportResetAttempt::AlreadyPending,
+                ) => {}
+            }
+        }
+        result
+    }
+
+    fn prepare_transport_reset_unobserved(
+        &mut self,
+        memory: &mut GuestMemory,
+    ) -> Result<VirtioVsockTransportResetAttempt, VirtioVsockTransportResetError> {
         if !self.is_activated() {
             return Ok(VirtioVsockTransportResetAttempt::Inactive);
         }
@@ -8995,12 +9097,20 @@ impl VirtioVsockDevice {
     }
 
     fn signal_restored_transport_reset(&mut self) -> VirtioVsockRestoredTransportResetSignal {
-        if !self.is_activated() {
-            return VirtioVsockRestoredTransportResetSignal::Inactive;
+        let already_pending = self.pending_event_ack;
+        let signal = if self.is_activated() {
+            self.pending_event_ack = true;
+            VirtioVsockRestoredTransportResetSignal::Signaled
+        } else {
+            VirtioVsockRestoredTransportResetSignal::Inactive
+        };
+        if !already_pending
+            && matches!(signal, VirtioVsockRestoredTransportResetSignal::Signaled)
+            && let Some(logger) = &self.guest_logger
+        {
+            logger.log_vsock(LoggerVsockOutcome::TransportResetSucceeded);
         }
-
-        self.pending_event_ack = true;
-        VirtioVsockRestoredTransportResetSignal::Signaled
+        signal
     }
 
     pub fn reset(&mut self) {
@@ -9863,10 +9973,16 @@ impl VirtioVsockDevice {
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
     ) -> Result<VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError> {
-        self.dispatch_drained_queue_notifications_at(memory, drained_notifications, Instant::now())
+        let result = self.dispatch_drained_queue_notifications_at_unobserved(
+            memory,
+            drained_notifications,
+            Instant::now(),
+        );
+        self.observe_notification_result(&result);
+        result
     }
 
-    fn dispatch_drained_queue_notifications_at(
+    fn dispatch_drained_queue_notifications_at_unobserved(
         &mut self,
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
@@ -9942,9 +10058,15 @@ impl VirtioVsockDevice {
                     (Some(dispatch), guest_tx_control_dispatch)
                 }
                 Err(source) => {
-                    return Err(VirtioVsockDeviceNotificationError::TxQueueDispatch {
+                    let partial_dispatch = VirtioVsockDeviceNotificationDispatch::new(
                         drained_notifications,
-                        completed_rx_dispatch: None,
+                        host_request_dispatch,
+                        VirtioVsockGuestTxControlDispatch::empty(),
+                        None,
+                        None,
+                    );
+                    return Err(VirtioVsockDeviceNotificationError::TxQueueDispatch {
+                        partial_dispatch: Box::new(partial_dispatch),
                         source,
                     });
                 }
@@ -9958,9 +10080,15 @@ impl VirtioVsockDevice {
             match self.dispatch_pending_rx_packets(memory, now) {
                 Ok(dispatch) => Some(dispatch),
                 Err(source) => {
-                    return Err(VirtioVsockDeviceNotificationError::RxQueueDispatch {
+                    let partial_dispatch = VirtioVsockDeviceNotificationDispatch::new(
                         drained_notifications,
-                        completed_tx_dispatch: tx_queue_dispatch.map(Box::new),
+                        host_request_dispatch,
+                        guest_tx_control_dispatch,
+                        None,
+                        tx_queue_dispatch,
+                    );
+                    return Err(VirtioVsockDeviceNotificationError::RxQueueDispatch {
+                        partial_dispatch: Box::new(partial_dispatch),
                         source,
                     });
                 }
@@ -9976,6 +10104,15 @@ impl VirtioVsockDevice {
             rx_queue_dispatch,
             tx_queue_dispatch,
         ))
+    }
+
+    fn observe_notification_result(
+        &self,
+        result: &Result<VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError>,
+    ) {
+        if let Some(logger) = &self.guest_logger {
+            VsockNotificationObservation::from_result(result).emit(logger);
+        }
     }
 }
 
@@ -10221,6 +10358,251 @@ impl VirtioVsockDeviceNotificationDispatch {
                 .as_ref()
                 .is_some_and(VirtioVsockRxQueueDispatch::needs_queue_interrupt)
     }
+}
+
+#[derive(Debug, Default)]
+struct VsockNotificationObservation {
+    rx_succeeded: bool,
+    rx_buffer_malformed: bool,
+    rx_buffer_too_small: bool,
+    tx_succeeded: bool,
+    tx_packet_malformed: bool,
+    queue_dispatch_failed: bool,
+    queue_notification_inactive: bool,
+    queue_notification_unsupported: bool,
+    host_connection_accepted: bool,
+    host_connection_completed: bool,
+    host_connection_pending: bool,
+    host_connection_dropped: bool,
+    guest_connection_retained: bool,
+    guest_connection_forwarded: bool,
+    guest_connection_updated: bool,
+    guest_connection_closed: bool,
+    guest_connection_ignored: bool,
+    guest_connection_dropped: bool,
+    connection_reset_queued: bool,
+    connection_reset_dropped: bool,
+}
+
+impl VsockNotificationObservation {
+    fn from_result(
+        result: &Result<VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError>,
+    ) -> Self {
+        Self::from_result_ref(result.as_ref())
+    }
+
+    fn from_result_ref(
+        result: Result<&VirtioVsockDeviceNotificationDispatch, &VirtioVsockDeviceNotificationError>,
+    ) -> Self {
+        let mut observation = Self::default();
+        match result {
+            Ok(dispatch) => observation.ingest_dispatch(dispatch),
+            Err(error) => {
+                match error {
+                    VirtioVsockDeviceNotificationError::Inactive { .. } => {
+                        observation.queue_notification_inactive = true;
+                    }
+                    VirtioVsockDeviceNotificationError::UnsupportedQueue { .. } => {
+                        observation.queue_notification_unsupported = true;
+                    }
+                    VirtioVsockDeviceNotificationError::TxQueueDispatch {
+                        partial_dispatch,
+                        ..
+                    }
+                    | VirtioVsockDeviceNotificationError::RxQueueDispatch {
+                        partial_dispatch,
+                        ..
+                    } => {
+                        observation.queue_dispatch_failed = true;
+                        observation.ingest_dispatch(partial_dispatch);
+                    }
+                }
+                if let Some(dispatch) = error.completed_rx_dispatch() {
+                    observation.ingest_rx(dispatch);
+                }
+                if let Some(dispatch) = error.completed_tx_dispatch() {
+                    observation.ingest_tx(dispatch);
+                }
+            }
+        }
+        observation
+    }
+
+    fn ingest_dispatch(&mut self, dispatch: &VirtioVsockDeviceNotificationDispatch) {
+        if let Some(rx) = dispatch.rx_queue_dispatch() {
+            self.ingest_rx(rx);
+        }
+        if let Some(tx) = dispatch.tx_queue_dispatch() {
+            self.ingest_tx(tx);
+        }
+
+        self.ingest_host_request(dispatch.host_request_dispatch());
+        self.ingest_guest_tx_control(&VirtioVsockGuestTxControlDispatch::new(
+            *dispatch.guest_response_dispatch(),
+            *dispatch.guest_request_dispatch(),
+            *dispatch.guest_rw_dispatch(),
+            *dispatch.guest_credit_dispatch(),
+            *dispatch.guest_rst_dispatch(),
+            *dispatch.guest_shutdown_dispatch(),
+            *dispatch.guest_reset_dispatch(),
+        ));
+    }
+
+    fn ingest_host_request(&mut self, host: &VirtioVsockHostRequestDispatch) {
+        self.host_connection_accepted |= host.accepted_connections() > 0;
+        self.host_connection_completed |= host.completed_requests() > 0;
+        self.host_connection_pending |= host.pending_connections() > 0;
+        self.host_connection_dropped |= host.dropped_connections() > 0;
+    }
+
+    fn ingest_guest_tx_control(&mut self, dispatch: &VirtioVsockGuestTxControlDispatch) {
+        let response = &dispatch.response_dispatch;
+        self.guest_connection_retained |= response.acknowledged_responses() > 0;
+        self.guest_connection_ignored |= response.ignored_responses() > 0;
+        self.guest_connection_dropped |= response.dropped_connections() > 0;
+
+        let request = &dispatch.request_dispatch;
+        self.guest_connection_retained |= request.retained_requests() > 0;
+        self.guest_connection_ignored |= request.ignored_requests() > 0;
+        self.guest_connection_dropped |= request.dropped_requests() > 0;
+
+        let rw = &dispatch.rw_dispatch;
+        self.guest_connection_forwarded |= rw.forwarded_packets() > 0;
+        self.guest_connection_ignored |= rw.ignored_packets() > 0;
+        self.guest_connection_dropped |= rw.dropped_connections() > 0;
+
+        let credit = &dispatch.credit_dispatch;
+        self.guest_connection_updated |= credit.update_packets() > 0 || credit.queued_updates() > 0;
+        self.guest_connection_ignored |= credit.ignored_packets() > 0;
+
+        let rst = &dispatch.guest_rst_dispatch;
+        self.guest_connection_closed |=
+            rst.closed_host_connections() > 0 || rst.closed_guest_connections() > 0;
+        self.guest_connection_ignored |= rst.ignored_packets() > 0;
+
+        let shutdown = &dispatch.guest_shutdown_dispatch;
+        self.guest_connection_updated |=
+            shutdown.updated_host_connections() > 0 || shutdown.updated_guest_connections() > 0;
+        self.guest_connection_closed |=
+            shutdown.closed_host_connections() > 0 || shutdown.closed_guest_connections() > 0;
+        self.guest_connection_ignored |= shutdown.ignored_packets() > 0;
+        self.connection_reset_queued |= shutdown.queued_resets() > 0;
+        self.connection_reset_dropped |= shutdown.dropped_resets() > 0;
+
+        let reset = &dispatch.reset_dispatch;
+        self.connection_reset_queued |= reset.queued_resets() > 0;
+        self.connection_reset_dropped |= reset.dropped_resets() > 0;
+    }
+
+    fn ingest_rx(&mut self, dispatch: &VirtioVsockRxQueueDispatch) {
+        let delivered = dispatch.delivered_requests()
+            + dispatch.delivered_responses()
+            + dispatch.delivered_reset_packets()
+            + dispatch.delivered_shutdown_packets()
+            + dispatch.delivered_credit_requests()
+            + dispatch.delivered_credit_updates()
+            + dispatch.delivered_host_rw_packets();
+        self.rx_succeeded |= delivered > 0;
+        self.rx_buffer_malformed |= dispatch.buffer_parse_failures() > 0;
+        self.rx_buffer_too_small |= dispatch.buffer_too_small_failures() > 0;
+    }
+
+    fn ingest_tx(&mut self, dispatch: &VirtioVsockTxQueueDispatch) {
+        self.tx_succeeded |= dispatch.successful_packets() > 0;
+        self.tx_packet_malformed |= dispatch.parse_failures() > 0;
+    }
+
+    fn outcomes(self) -> impl Iterator<Item = LoggerVsockOutcome> {
+        [
+            (
+                self.rx_buffer_malformed,
+                LoggerVsockOutcome::RxBufferMalformed,
+            ),
+            (
+                self.rx_buffer_too_small,
+                LoggerVsockOutcome::RxBufferTooSmall,
+            ),
+            (
+                self.tx_packet_malformed,
+                LoggerVsockOutcome::TxPacketMalformed,
+            ),
+            (
+                self.queue_dispatch_failed,
+                LoggerVsockOutcome::QueueDispatchFailed,
+            ),
+            (
+                self.queue_notification_inactive,
+                LoggerVsockOutcome::QueueNotificationInactive,
+            ),
+            (
+                self.queue_notification_unsupported,
+                LoggerVsockOutcome::QueueNotificationUnsupported,
+            ),
+            (
+                self.host_connection_dropped,
+                LoggerVsockOutcome::HostConnectionDropped,
+            ),
+            (
+                self.guest_connection_dropped,
+                LoggerVsockOutcome::GuestConnectionDropped,
+            ),
+            (
+                self.connection_reset_dropped,
+                LoggerVsockOutcome::ConnectionResetDropped,
+            ),
+            (self.rx_succeeded, LoggerVsockOutcome::RxSucceeded),
+            (self.tx_succeeded, LoggerVsockOutcome::TxSucceeded),
+            (
+                self.host_connection_accepted,
+                LoggerVsockOutcome::HostConnectionAccepted,
+            ),
+            (
+                self.host_connection_completed,
+                LoggerVsockOutcome::HostConnectionCompleted,
+            ),
+            (
+                self.host_connection_pending,
+                LoggerVsockOutcome::HostConnectionPending,
+            ),
+            (
+                self.guest_connection_retained,
+                LoggerVsockOutcome::GuestConnectionRetained,
+            ),
+            (
+                self.guest_connection_forwarded,
+                LoggerVsockOutcome::GuestConnectionForwarded,
+            ),
+            (
+                self.guest_connection_updated,
+                LoggerVsockOutcome::GuestConnectionUpdated,
+            ),
+            (
+                self.guest_connection_closed,
+                LoggerVsockOutcome::GuestConnectionClosed,
+            ),
+            (
+                self.guest_connection_ignored,
+                LoggerVsockOutcome::GuestConnectionIgnored,
+            ),
+            (
+                self.connection_reset_queued,
+                LoggerVsockOutcome::ConnectionResetQueued,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(observed, outcome)| observed.then_some(outcome))
+    }
+
+    fn emit(self, logger: &GuestLogger) {
+        logger.log_vsock_summary(self.outcomes());
+    }
+}
+
+pub(crate) fn observe_vsock_notification_result(
+    logger: &GuestLogger,
+    result: Result<&VirtioVsockDeviceNotificationDispatch, &VirtioVsockDeviceNotificationError>,
+) {
+    VsockNotificationObservation::from_result_ref(result).emit(logger);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10683,13 +11065,11 @@ pub enum VirtioVsockDeviceNotificationError {
         queue_index: usize,
     },
     TxQueueDispatch {
-        drained_notifications: Vec<usize>,
-        completed_rx_dispatch: Option<Box<VirtioVsockRxQueueDispatch>>,
+        partial_dispatch: Box<VirtioVsockDeviceNotificationDispatch>,
         source: VirtioVsockTxQueueDispatchError,
     },
     RxQueueDispatch {
-        drained_notifications: Vec<usize>,
-        completed_tx_dispatch: Option<Box<VirtioVsockTxQueueDispatch>>,
+        partial_dispatch: Box<VirtioVsockDeviceNotificationDispatch>,
         source: VirtioVsockRxQueueDispatchError,
     },
 }
@@ -10703,15 +11083,13 @@ impl VirtioVsockDeviceNotificationError {
             | Self::UnsupportedQueue {
                 drained_notifications,
                 ..
-            }
-            | Self::TxQueueDispatch {
-                drained_notifications,
-                ..
+            } => drained_notifications,
+            Self::TxQueueDispatch {
+                partial_dispatch, ..
             }
             | Self::RxQueueDispatch {
-                drained_notifications,
-                ..
-            } => drained_notifications,
+                partial_dispatch, ..
+            } => partial_dispatch.drained_notifications(),
         }
     }
 
@@ -10719,12 +11097,8 @@ impl VirtioVsockDeviceNotificationError {
         match self {
             Self::TxQueueDispatch { source, .. } => source.completed_dispatch(),
             Self::RxQueueDispatch {
-                completed_tx_dispatch,
-                ..
-            } => match completed_tx_dispatch {
-                Some(dispatch) => Some(dispatch),
-                None => None,
-            },
+                partial_dispatch, ..
+            } => partial_dispatch.tx_queue_dispatch(),
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
         }
     }
@@ -10733,12 +11107,8 @@ impl VirtioVsockDeviceNotificationError {
         match self {
             Self::RxQueueDispatch { source, .. } => source.completed_dispatch(),
             Self::TxQueueDispatch {
-                completed_rx_dispatch,
-                ..
-            } => match completed_rx_dispatch {
-                Some(dispatch) => Some(dispatch),
-                None => None,
-            },
+                partial_dispatch, ..
+            } => partial_dispatch.rx_queue_dispatch(),
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
         }
     }
@@ -10877,7 +11247,7 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioVsockD
         let drained_notifications = self.take_pending_queue_notifications();
         let dispatch = self
             .activation_handler_mut()
-            .dispatch_drained_queue_notifications_at(memory, drained_notifications, now);
+            .dispatch_drained_queue_notifications_at_unobserved(memory, drained_notifications, now);
         let (rx_interrupt, tx_interrupt) = match &dispatch {
             Ok(dispatch) => (
                 dispatch
@@ -10924,6 +11294,10 @@ fn virtio_feature_enabled(features: u64, feature: u32) -> bool {
 }
 
 impl VirtioMmioDeviceActivationHandler for VirtioVsockDevice {
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = Some(logger);
+    }
+
     fn activate(
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
@@ -11034,6 +11408,11 @@ impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
         let endpoint = work.drain_interrupt_intents();
         if signal_required && endpoint.is_err() {
             metrics.record_event_queue_signal_failure();
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_vsock(LoggerVsockOutcome::InterruptDeliveryFailed);
+                }
+            });
         }
         VirtioPciDeviceOperationError::combine(attempt, endpoint)
     }
@@ -11066,6 +11445,11 @@ impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
         let endpoint = work.drain_interrupt_intents();
         if signal.needs_queue_interrupt() && endpoint.is_err() {
             metrics.record_event_queue_signal_failure();
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_vsock(LoggerVsockOutcome::InterruptDeliveryFailed);
+                }
+            });
         }
         let device: Result<_, std::convert::Infallible> = Ok(signal);
         VirtioPciDeviceOperationError::combine(device, endpoint)
@@ -11088,11 +11472,13 @@ impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
             .with_core_mut(|core| {
                 let drained_notifications =
                     core.queue_notifications.take_pending_queue_notifications();
-                let dispatch = core.activation.dispatch_drained_queue_notifications_at(
-                    memory,
-                    drained_notifications,
-                    Instant::now(),
-                );
+                let dispatch = core
+                    .activation
+                    .dispatch_drained_queue_notifications_at_unobserved(
+                        memory,
+                        drained_notifications,
+                        Instant::now(),
+                    );
                 let (rx_interrupt, tx_interrupt) = match &dispatch {
                     Ok(dispatch) => (
                         dispatch
@@ -11124,7 +11510,16 @@ impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
                 dispatch
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
-        VirtioPciDeviceOperationError::combine(dispatch, work.drain_interrupt_intents())
+        let endpoint = work.drain_interrupt_intents();
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_vsock(LoggerVsockOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
+        let _ = work.with_core_mut(|core| core.activation.observe_notification_result(&dispatch));
+        VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 
     pub fn host_wakeup(
@@ -11548,11 +11943,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::interrupt::DeviceInterruptKind;
+    use crate::logger::{LoggerTestCapture, LoggerVsockOutcome};
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
     use crate::metrics::{SharedVsockDeviceMetrics, VsockDeviceMetrics};
     use crate::mmio::{
-        MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
-        MmioRegionId,
+        MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
+        MmioOperation, MmioRegionId,
     };
     use crate::snapshot::{SnapshotVsockOverride, resolve_snapshot_vsock_selectors};
     use crate::virtio_mmio::{
@@ -18597,7 +18993,14 @@ mod tests {
         assert_eq!(read_interrupt_status(&inactive), 0);
 
         activate_vsock_handler(&mut inactive);
+        let capture = LoggerTestCapture::default();
+        let (_logger_state, logger) = capture.configured_guest_logger();
+        inactive.attach_guest_logger(logger.clone());
         assert!(!inactive.activation_handler().pending_event_ack());
+        assert_eq!(
+            inactive.signal_restored_vsock_transport_reset(),
+            super::VirtioVsockRestoredTransportResetSignal::Signaled
+        );
         assert_eq!(
             inactive.signal_restored_vsock_transport_reset(),
             super::VirtioVsockRestoredTransportResetSignal::Signaled
@@ -18626,6 +19029,15 @@ mod tests {
             .expect("ordinary reset should succeed");
         assert!(!inactive.activation_handler().pending_event_ack());
         assert!(!inactive.activation_handler().is_activated());
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(
+            capture
+                .output()
+                .matches("device-kind=vsock operation=transport-reset outcome=succeeded\n")
+                .count(),
+            2,
+            "one record should be emitted for each false-to-true reset gate transition"
+        );
     }
 
     #[test]
@@ -18951,6 +19363,9 @@ mod tests {
     fn virtio_vsock_notifications_reject_inactive_device_with_drained_metadata() {
         let mut memory = vsock_tx_memory();
         let mut device = VirtioVsockDevice::new();
+        let capture = LoggerTestCapture::default();
+        let (_logger_state, logger) = capture.configured_guest_logger();
+        VirtioMmioDeviceActivationHandler::attach_guest_logger(&mut device, logger.clone());
 
         let error = device
             .dispatch_drained_queue_notifications(&mut memory, vec![VIRTIO_VSOCK_EVENT_QUEUE_INDEX])
@@ -18971,6 +19386,145 @@ mod tests {
         assert!(error.completed_tx_dispatch().is_none());
         assert!(error.completed_rx_dispatch().is_none());
         assert!(error.source().is_none());
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(
+            capture.output(),
+            "device-kind=vsock operation=queue-notification outcome=inactive\n"
+        );
+    }
+
+    #[test]
+    fn vsock_logger_summary_is_failure_first_and_deduplicated() {
+        let observation = super::VsockNotificationObservation {
+            rx_succeeded: true,
+            rx_buffer_malformed: true,
+            rx_buffer_too_small: true,
+            tx_succeeded: true,
+            tx_packet_malformed: true,
+            queue_dispatch_failed: true,
+            queue_notification_inactive: true,
+            queue_notification_unsupported: true,
+            host_connection_accepted: true,
+            host_connection_completed: true,
+            host_connection_pending: true,
+            host_connection_dropped: true,
+            guest_connection_retained: true,
+            guest_connection_forwarded: true,
+            guest_connection_updated: true,
+            guest_connection_closed: true,
+            guest_connection_ignored: true,
+            guest_connection_dropped: true,
+            connection_reset_queued: true,
+            connection_reset_dropped: true,
+        };
+
+        assert_eq!(
+            observation.outcomes().collect::<Vec<_>>(),
+            vec![
+                LoggerVsockOutcome::RxBufferMalformed,
+                LoggerVsockOutcome::RxBufferTooSmall,
+                LoggerVsockOutcome::TxPacketMalformed,
+                LoggerVsockOutcome::QueueDispatchFailed,
+                LoggerVsockOutcome::QueueNotificationInactive,
+                LoggerVsockOutcome::QueueNotificationUnsupported,
+                LoggerVsockOutcome::HostConnectionDropped,
+                LoggerVsockOutcome::GuestConnectionDropped,
+                LoggerVsockOutcome::ConnectionResetDropped,
+                LoggerVsockOutcome::RxSucceeded,
+                LoggerVsockOutcome::TxSucceeded,
+                LoggerVsockOutcome::HostConnectionAccepted,
+                LoggerVsockOutcome::HostConnectionCompleted,
+                LoggerVsockOutcome::HostConnectionPending,
+                LoggerVsockOutcome::GuestConnectionRetained,
+                LoggerVsockOutcome::GuestConnectionForwarded,
+                LoggerVsockOutcome::GuestConnectionUpdated,
+                LoggerVsockOutcome::GuestConnectionClosed,
+                LoggerVsockOutcome::GuestConnectionIgnored,
+                LoggerVsockOutcome::ConnectionResetQueued,
+            ]
+        );
+    }
+
+    #[test]
+    fn vsock_logger_preserves_host_and_guest_outcomes_before_rx_failure() {
+        let mut host_request_dispatch = super::VirtioVsockHostRequestDispatch::new();
+        host_request_dispatch.accepted_connections = 1;
+        let mut guest_tx_control_dispatch = super::VirtioVsockGuestTxControlDispatch::empty();
+        guest_tx_control_dispatch
+            .response_dispatch
+            .acknowledged_responses = 1;
+        let partial_dispatch = super::VirtioVsockDeviceNotificationDispatch::new(
+            vec![VIRTIO_VSOCK_RX_QUEUE_INDEX],
+            host_request_dispatch,
+            guest_tx_control_dispatch,
+            None,
+            None,
+        );
+        let result = Err(super::VirtioVsockDeviceNotificationError::RxQueueDispatch {
+            partial_dispatch: Box::new(partial_dispatch),
+            source: VirtioVsockRxQueueDispatchError::EmptyDescriptorChain {
+                completed_dispatch: Box::new(super::VirtioVsockRxQueueDispatch::new()),
+            },
+        });
+
+        assert_eq!(
+            super::VsockNotificationObservation::from_result(&result)
+                .outcomes()
+                .collect::<Vec<_>>(),
+            vec![
+                LoggerVsockOutcome::QueueDispatchFailed,
+                LoggerVsockOutcome::HostConnectionAccepted,
+                LoggerVsockOutcome::GuestConnectionRetained,
+            ]
+        );
+    }
+
+    #[test]
+    fn vsock_mmio_defers_summary_until_transport_observes_the_result() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+        let capture = LoggerTestCapture::default();
+        let (_logger_state, logger) = capture.configured_guest_logger();
+        VirtioMmioDeviceActivationHandler::attach_guest_logger(
+            handler.activation_handler_mut(),
+            logger.clone(),
+        );
+
+        activate_vsock_handler(&mut handler);
+        write_vsock_packet_header(
+            &mut memory,
+            TEST_VSOCK_HEADER,
+            guest_rw_tx_packet(42, 52, 4000).header(),
+        );
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let result = handler.dispatch_vsock_queue_notifications(&mut memory);
+        assert!(result.is_ok(), "orphan guest RW should dispatch");
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(
+            capture.output(),
+            "",
+            "device summary must remain deferred while the transport owns interrupt handling"
+        );
+
+        super::observe_vsock_notification_result(&logger, result.as_ref());
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(
+            capture.output(),
+            "device-kind=vsock operation=guest-connection outcome=dropped\n\
+             device-kind=vsock operation=tx outcome=succeeded\n\
+             device-kind=vsock operation=connection-reset outcome=queued\n"
+        );
     }
 
     #[test]

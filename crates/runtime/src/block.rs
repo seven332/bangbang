@@ -24,7 +24,7 @@ use bangbang_vhost_user::{
     create_call_notifier, create_kick_notifier,
 };
 
-use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
+use crate::logger::{GuestLogger, LoggerBlockOutcome, LoggerDeviceKind, LoggerTransportOutcome};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking, GuestMemoryError,
     GuestMemoryRange, GuestMemoryRegionBacking, GuestMemorySharedBacking,
@@ -6615,6 +6615,21 @@ impl VirtioBlockDevice {
         &mut self,
         cache_type: DriveCacheType,
     ) -> Result<VirtioBlockConfigSpace, VhostUserBlockConfigRefreshError> {
+        let result = self.refreshed_vhost_user_config_unobserved(cache_type);
+        if let Some(logger) = &self.guest_logger {
+            logger.log_block(if result.is_ok() {
+                LoggerBlockOutcome::VhostUserConfigSucceeded
+            } else {
+                LoggerBlockOutcome::VhostUserConfigFailed
+            });
+        }
+        result
+    }
+
+    fn refreshed_vhost_user_config_unobserved(
+        &mut self,
+        cache_type: DriveCacheType,
+    ) -> Result<VirtioBlockConfigSpace, VhostUserBlockConfigRefreshError> {
         let VirtioBlockBackend::VhostUser(backend) = &mut self.backend else {
             return Err(VhostUserBlockConfigRefreshError::UnsupportedBackend);
         };
@@ -6655,6 +6670,18 @@ impl VirtioBlockDevice {
     }
 
     fn dispatch_drained_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+    ) -> Result<VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError> {
+        let had_pending_rate_limited_queue = self.pending_rate_limited_queue;
+        let result =
+            self.dispatch_drained_queue_notifications_unobserved(memory, drained_notifications);
+        self.observe_notification_result(&result, had_pending_rate_limited_queue);
+        result
+    }
+
+    fn dispatch_drained_queue_notifications_unobserved(
         &mut self,
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
@@ -6759,6 +6786,61 @@ impl VirtioBlockDevice {
         }
     }
 
+    fn observe_notification_result(
+        &self,
+        result: &Result<VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError>,
+        had_pending_rate_limited_queue: bool,
+    ) {
+        let Some(logger) = &self.guest_logger else {
+            return;
+        };
+
+        match result {
+            Ok(dispatch) => {
+                if let Some(queue) = dispatch.queue_dispatch() {
+                    observe_block_queue_dispatch(logger, queue, had_pending_rate_limited_queue);
+                }
+                if dispatch.vhost_user_kicks() != 0 || dispatch.vhost_user_calls() != 0 {
+                    logger.log_block(LoggerBlockOutcome::VhostUserNotificationSucceeded);
+                }
+            }
+            Err(VirtioBlockDeviceNotificationError::Inactive { .. }) => {
+                logger.log_block(LoggerBlockOutcome::QueueNotificationInactive);
+            }
+            Err(VirtioBlockDeviceNotificationError::UnsupportedQueue { .. }) => {
+                logger.log_block(LoggerBlockOutcome::QueueNotificationUnsupported);
+            }
+            Err(VirtioBlockDeviceNotificationError::QueueDispatch { source, .. }) => {
+                logger.log_block(LoggerBlockOutcome::QueueDispatchFailed);
+                if matches!(source, VirtioBlockQueueDispatchError::AsyncRuntime { .. }) {
+                    logger.log_block(LoggerBlockOutcome::AsyncEngineFailed);
+                }
+                observe_block_queue_dispatch(
+                    logger,
+                    source.completed_dispatch(),
+                    had_pending_rate_limited_queue,
+                );
+            }
+            Err(VirtioBlockDeviceNotificationError::VhostUser { calls, source, .. }) => {
+                logger.log_block(match source {
+                    VhostUserBlockNotificationError::Kick(_)
+                    | VhostUserBlockNotificationError::Call(_) => {
+                        LoggerBlockOutcome::VhostUserNotificationFailed
+                    }
+                    VhostUserBlockNotificationError::Closed => {
+                        LoggerBlockOutcome::VhostUserDisconnected
+                    }
+                    VhostUserBlockNotificationError::Terminal => {
+                        LoggerBlockOutcome::VhostUserTerminal
+                    }
+                });
+                if *calls != 0 {
+                    logger.log_block(LoggerBlockOutcome::VhostUserNotificationSucceeded);
+                }
+            }
+        }
+    }
+
     pub fn activate_block(
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
@@ -6844,6 +6926,40 @@ impl VirtioBlockDevice {
             }
         }
     }
+}
+
+fn observe_block_queue_dispatch(
+    logger: &GuestLogger,
+    dispatch: &VirtioBlockQueueDispatch,
+    had_pending_rate_limited_queue: bool,
+) {
+    for outcome in block_queue_outcomes(dispatch, had_pending_rate_limited_queue)
+        .into_iter()
+        .flatten()
+    {
+        logger.log_block(outcome);
+    }
+}
+
+fn block_queue_outcomes(
+    dispatch: &VirtioBlockQueueDispatch,
+    had_pending_rate_limited_queue: bool,
+) -> [Option<LoggerBlockOutcome>; 8] {
+    [
+        (dispatch.parse_failures() != 0).then_some(LoggerBlockOutcome::RequestParseFailed),
+        (dispatch.io_errors() != 0).then_some(LoggerBlockOutcome::RequestIoFailed),
+        (dispatch.unsupported_requests() != 0).then_some(LoggerBlockOutcome::RequestUnsupported),
+        (dispatch.status_write_failures() != 0).then_some(LoggerBlockOutcome::StatusWriteFailed),
+        (dispatch.rate_limiter_throttled_requests() != 0)
+            .then_some(LoggerBlockOutcome::RateLimiterThrottled),
+        (dispatch.rate_limiter_throttled_requests() == 0
+            && had_pending_rate_limited_queue
+            && dispatch.processed_requests() != 0)
+            .then_some(LoggerBlockOutcome::RateLimiterResumed),
+        (dispatch.io_engine_throttled_events() != 0)
+            .then_some(LoggerBlockOutcome::AsyncEngineThrottled),
+        (dispatch.successful_requests() != 0).then_some(LoggerBlockOutcome::RequestSucceeded),
+    ]
 }
 
 fn mark_async_engine_terminal(io_engine: &mut VirtioBlockFileIoEngine) {
@@ -8377,6 +8493,13 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
         let endpoint = work.drain_interrupt_intents();
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_block(LoggerBlockOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
         VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 
@@ -8427,6 +8550,13 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
         let endpoint = work.drain_interrupt_intents();
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_block(LoggerBlockOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
         VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 
@@ -8457,7 +8587,15 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
             Ok::<(), VirtioPciEndpointError>(())
         })??;
         if backing_changed {
-            work.drain_interrupt_intents()?;
+            let endpoint = work.drain_interrupt_intents();
+            if endpoint.is_err() {
+                let _ = work.with_core_mut(|core| {
+                    if let Some(logger) = &core.activation.guest_logger {
+                        logger.log_block(LoggerBlockOutcome::InterruptDeliveryFailed);
+                    }
+                });
+            }
+            endpoint?;
         }
         Ok(())
     }
@@ -8508,6 +8646,13 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
             } else {
                 Ok(())
             };
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_block(LoggerBlockOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
         VirtioPciDeviceOperationError::combine(update, endpoint)
     }
 
@@ -8553,6 +8698,11 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
             })??;
 
         if let Err(source) = work.drain_interrupt_intents() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_block(LoggerBlockOutcome::InterruptDeliveryFailed);
+                }
+            });
             let message = source.to_string();
             if source.delivery_ambiguous() {
                 return Err(DriveUpdateError::TerminalActiveSessionCommand { message });
@@ -9032,6 +9182,7 @@ mod tests {
     };
 
     use crate::interrupt::DeviceInterruptKind;
+    use crate::logger::{LoggerBlockOutcome, LoggerConfigInput, LoggerTestCapture};
     use crate::memory::{
         GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryLayout, GuestMemoryRange,
     };
@@ -12990,6 +13141,9 @@ mod tests {
     #[test]
     fn vhost_user_config_refresh_rejects_pre_activation_without_frontend_io() {
         let (_config_space, mut device, _memory) = prepare_disconnected_test_vhost_user_device();
+        let capture = LoggerTestCapture::default();
+        let (_logger_state, logger) = capture.configured_guest_logger();
+        VirtioMmioDeviceActivationHandler::attach_guest_logger(&mut device, logger.clone());
 
         let error = device
             .refreshed_vhost_user_config(DriveCacheType::Unsafe)
@@ -12998,6 +13152,11 @@ mod tests {
         assert_eq!(error, VhostUserBlockConfigRefreshError::Inactive);
         assert!(!device.is_activated());
         assert!(device.vhost_user_call_fd().is_some());
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(
+            capture.output(),
+            "device-kind=block operation=vhost-user-config outcome=failed\n"
+        );
     }
 
     #[test]
@@ -13155,10 +13314,20 @@ mod tests {
     fn vhost_user_pci_refresh_rolls_back_confirmed_interrupt_failure() {
         let mut refreshed = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
         refreshed[..8].copy_from_slice(&2_u64.to_le_bytes());
+        let capture = LoggerTestCapture::default();
+        let (mut logger_state, initial_logger) = capture.configured_guest_logger();
+        drop(initial_logger);
+        logger_state
+            .configure(LoggerConfigInput::new().with_show_log_origin(true))
+            .expect("origin-prefixed PCI logger should configure");
+        let logger = logger_state.guest_logger();
         let (endpoint, _memory, peer, signals) = vhost_user_refresh_pci_endpoint(
             TestVhostUserConfigReply::Exact(refreshed),
             Some(false),
         );
+        let mut bar_handler = endpoint.bar_handler();
+        bar_handler.attach_guest_logger(logger.clone());
+        drop(bar_handler);
         let original = vhost_user_pci_config_snapshot(&endpoint);
 
         let error = endpoint
@@ -13175,6 +13344,34 @@ mod tests {
                 .lock()
                 .expect("test signal count should remain available"),
             0
+        );
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        let interrupt_suffix = "device-kind=block operation=interrupt-delivery outcome=failed";
+        let interrupt_records = output
+            .lines()
+            .filter(|line| line.ends_with(interrupt_suffix))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            interrupt_records.len(),
+            2,
+            "generic transport and block class owners should each emit once; output:\n{output}"
+        );
+        assert_eq!(
+            interrupt_records
+                .iter()
+                .filter(|line| line.contains("origin=crates/runtime/src/virtio_pci.rs:"))
+                .count(),
+            1,
+            "generic PCI transport owner should emit once; output:\n{output}"
+        );
+        assert_eq!(
+            interrupt_records
+                .iter()
+                .filter(|line| line.contains("origin=crates/runtime/src/block.rs:"))
+                .count(),
+            1,
+            "block class supplement should emit once; output:\n{output}"
         );
         peer.join().expect("refresh peer should finish");
     }
@@ -14307,6 +14504,9 @@ mod tests {
         device
             .activate_block(VirtioMmioDeviceActivation::new(&registers, &queues))
             .expect("vhost-user block should activate");
+        let capture = LoggerTestCapture::default();
+        let (_logger_state, logger) = capture.configured_guest_logger();
+        VirtioMmioDeviceActivationHandler::attach_guest_logger(&mut device, logger.clone());
         assert!(device.is_activated());
         assert!(device.vhost_user_call_fd().is_some());
 
@@ -14350,6 +14550,15 @@ mod tests {
                 ..
             }
         ));
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(
+            capture.output(),
+            concat!(
+                "device-kind=block operation=vhost-user-notification outcome=succeeded\n",
+                "device-kind=block operation=vhost-user-notification outcome=disconnected\n",
+                "device-kind=block operation=vhost-user-notification outcome=terminal\n",
+            )
+        );
     }
 
     #[test]
@@ -15006,6 +15215,9 @@ mod tests {
         handler
             .write_register(VirtioMmioRegister::QueueNotify, 0)
             .expect("queue notification should record after failed DRIVER_OK");
+        let capture = LoggerTestCapture::default();
+        let (_logger_state, logger) = capture.configured_guest_logger();
+        handler.attach_guest_logger(logger.clone());
 
         let error = handler
             .dispatch_block_queue_notifications(&mut memory)
@@ -15020,6 +15232,58 @@ mod tests {
         assert_eq!(read_interrupt_status(&handler), 0);
         assert!(handler.pending_queue_notifications().is_empty());
         assert!(!handler.activation_handler().is_activated());
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(
+            capture.output(),
+            "device-kind=block operation=queue-notification outcome=inactive\n"
+        );
+    }
+
+    #[test]
+    fn block_logger_summary_is_failure_first_deduplicated_and_distinguishes_resume() {
+        let dispatch = VirtioBlockQueueDispatch {
+            processed_requests: 12,
+            successful_requests: 3,
+            parse_failures: 2,
+            io_errors: 2,
+            unsupported_requests: 2,
+            status_write_failures: 2,
+            rate_limiter_throttled_requests: 2,
+            io_engine_throttled_events: 2,
+            ..VirtioBlockQueueDispatch::default()
+        };
+
+        assert_eq!(
+            super::block_queue_outcomes(&dispatch, true)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            vec![
+                LoggerBlockOutcome::RequestParseFailed,
+                LoggerBlockOutcome::RequestIoFailed,
+                LoggerBlockOutcome::RequestUnsupported,
+                LoggerBlockOutcome::StatusWriteFailed,
+                LoggerBlockOutcome::RateLimiterThrottled,
+                LoggerBlockOutcome::AsyncEngineThrottled,
+                LoggerBlockOutcome::RequestSucceeded,
+            ]
+        );
+
+        let resumed = VirtioBlockQueueDispatch {
+            processed_requests: 1,
+            successful_requests: 1,
+            ..VirtioBlockQueueDispatch::default()
+        };
+        assert_eq!(
+            super::block_queue_outcomes(&resumed, true)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            vec![
+                LoggerBlockOutcome::RateLimiterResumed,
+                LoggerBlockOutcome::RequestSucceeded,
+            ]
+        );
     }
 
     #[test]

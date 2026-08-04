@@ -1622,7 +1622,7 @@ impl VmmController {
             .unwrap_or(0);
         self.network_interface_configs = network_configs;
         self.vsock_config = vsock_config;
-        self.mmds_state = mmds_state.unwrap_or_else(|| {
+        let mmds_state = mmds_state.unwrap_or_else(|| {
             let data_store_limit_bytes = self
                 .mmds_state
                 .with(mmds::MmdsState::data_store_limit_bytes)
@@ -1632,6 +1632,8 @@ impl VmmController {
                 &self.instance_info.id,
             ))
         });
+        let _ = mmds_state.attach_guest_logger(self.guest_logger());
+        self.mmds_state = mmds_state;
         self.snapshot_load_history_fresh = false;
         self.instance_info.state = InstanceState::Paused;
         resume_requested
