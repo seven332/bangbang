@@ -4642,15 +4642,42 @@ mod tests {
                             serde_json::Value::from(current.saturating_add(increment)),
                         );
                     }
-                } else {
-                    total.insert(section.clone(), value.clone());
                 }
             }
         }
 
         let expected = serde_json::from_str::<serde_json::Value>(expected.trim())
             .expect("expected metrics should be valid JSON");
-        assert_eq!(serde_json::Value::Object(total), expected, "{output}");
+        for (section, expected_fields) in expected
+            .as_object()
+            .expect("expected metrics should be a JSON object")
+        {
+            if !matches!(
+                section.as_str(),
+                "deprecated_api" | "get_api_requests" | "patch_api_requests" | "put_api_requests"
+            ) {
+                continue;
+            }
+            let actual_fields = total
+                .get(section)
+                .and_then(serde_json::Value::as_object)
+                .expect("expected API metrics section should be emitted");
+            for (field, expected_value) in expected_fields
+                .as_object()
+                .expect("expected API metrics section should be an object")
+            {
+                // Balloon request counters are newer Bangbang-internal producers and are not
+                // part of Firecracker v1.16.0's public metrics schema.
+                if matches!(field.as_str(), "balloon_count" | "balloon_fails") {
+                    continue;
+                }
+                assert_eq!(
+                    actual_fields.get(field),
+                    Some(expected_value),
+                    "{section}.{field}; output: {output}"
+                );
+            }
+        }
         output
     }
 
@@ -7117,10 +7144,22 @@ mod tests {
         let flush_response = put_action_over_socket(&mut vmm, "bf", "FlushMetrics");
 
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert_two_line_api_metrics_total(
+        let metrics_output = assert_two_line_api_metrics_total(
             &metrics_path,
             "{\"get_api_requests\":{\"balloon_count\":3,\"hotplug_memory_count\":0,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"balloon_count\":4,\"balloon_fails\":4,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":2,\"balloon_fails\":2,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n",
         );
+        let latest = serde_json::from_str::<serde_json::Value>(
+            metrics_output
+                .lines()
+                .last()
+                .expect("metrics output should contain a line"),
+        )
+        .expect("latest metrics line should be JSON");
+        assert!(latest["get_api_requests"].get("balloon_count").is_none());
+        assert!(latest["patch_api_requests"].get("balloon_count").is_none());
+        assert!(latest["patch_api_requests"].get("balloon_fails").is_none());
+        assert!(latest["put_api_requests"].get("balloon_count").is_none());
+        assert!(latest["put_api_requests"].get("balloon_fails").is_none());
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
     }
@@ -7464,7 +7503,6 @@ mod tests {
         let metrics = read_metrics_json(&metrics_path);
         for (field, count, fails) in [
             ("actions", 1, 1),
-            ("balloon", 1, 1),
             ("boot_source", 2, 1),
             ("cpu_cfg", 1, 1),
             ("drive", 2, 2),
@@ -7492,7 +7530,6 @@ mod tests {
             );
         }
         for field in [
-            "balloon",
             "drive",
             "hotplug_memory",
             "machine_cfg",
@@ -7501,7 +7538,6 @@ mod tests {
             "pmem",
         ] {
             let (count, fails) = match field {
-                "balloon" => (3, 3),
                 "drive" | "network" | "pmem" => (2, 2),
                 _ => (1, 1),
             };
@@ -7518,6 +7554,10 @@ mod tests {
                 fails,
             );
         }
+        assert!(metrics["put_api_requests"].get("balloon_count").is_none());
+        assert!(metrics["put_api_requests"].get("balloon_fails").is_none());
+        assert!(metrics["patch_api_requests"].get("balloon_count").is_none());
+        assert!(metrics["patch_api_requests"].get("balloon_fails").is_none());
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
@@ -8426,7 +8466,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_metrics_flush_writes_boot_run_loop_status_over_unix_socket() {
+    fn configured_metrics_keeps_boot_run_loop_status_internal() {
         let mut vmm =
             test_controller_with_starter(TestInstanceStarter::success_with_boot_run_loop_status(
                 BootRunLoopMetricStatus::Running,
@@ -8458,10 +8498,20 @@ mod tests {
             put_action_over_socket(&mut vmm, "flush-with-boot-loop", "FlushMetrics");
 
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert_two_line_api_metrics_total(
+        let metrics_output = assert_two_line_api_metrics_total(
             &metrics_path,
             "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n",
         );
+        let latest = serde_json::from_str::<serde_json::Value>(
+            metrics_output
+                .lines()
+                .last()
+                .expect("metrics output should contain a line"),
+        )
+        .expect("latest metrics line should be JSON");
+        assert_eq!(latest["vmm"]["panic_count"], 0);
+        assert!(latest["vmm"].get("boot_run_loop_status").is_none());
+        assert!(latest["vmm"].get("metrics_flush_count").is_none());
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
     }
@@ -10588,8 +10638,9 @@ mod tests {
             resumed_metrics
                 .get("latencies_us")
                 .and_then(|latencies| latencies.get("pause_vm"))
-                .is_none(),
-            "idempotent resume must not emit pause latency"
+                .and_then(serde_json::Value::as_u64)
+                == Some(0),
+            "idempotent resume must leave the canonical pause latency at zero"
         );
 
         assert_eq!(vmm.handle_action(VmmAction::Pause), Ok(VmmData::Empty));
@@ -10612,14 +10663,14 @@ mod tests {
                 .and_then(|latencies| latencies.get("resume_vm"))
                 .and_then(serde_json::Value::as_u64),
             Some(resumed_latency),
-            "idempotent pause must not change resume latency"
+            "idempotent pause must not change the stored resume latency"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
     #[test]
-    fn configured_metrics_omits_failed_vm_state_update_latencies() {
+    fn configured_metrics_zeros_failed_vm_state_update_latencies() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let metrics_path =
             unique_socket_path("vm-state-latencies-failed").with_extension("metrics");
@@ -10663,10 +10714,8 @@ mod tests {
         let flush_response = put_action_over_socket(&mut vmm, "vmlff", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         let metrics = read_metrics_json(&metrics_path);
-        assert!(
-            metrics.get("latencies_us").is_none(),
-            "failed vm-state updates must not emit latency metrics"
-        );
+        assert_eq!(metrics["latencies_us"]["pause_vm"], 0);
+        assert_eq!(metrics["latencies_us"]["resume_vm"], 0);
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
@@ -10745,8 +10794,9 @@ mod tests {
             metrics
                 .get("latencies_us")
                 .and_then(|latencies| latencies.get("load_snapshot"))
-                .is_none(),
-            "create requests must not emit load_snapshot"
+                .and_then(serde_json::Value::as_u64)
+                == Some(0),
+            "create requests must leave load_snapshot at zero"
         );
         let raw_metrics =
             fs::read_to_string(&metrics_path).expect("metrics should remain readable");
@@ -10829,15 +10879,17 @@ mod tests {
             metrics
                 .get("latencies_us")
                 .and_then(|latencies| latencies.get("full_create_snapshot"))
-                .is_none(),
-            "load requests must not emit create snapshot latency"
+                .and_then(serde_json::Value::as_u64)
+                == Some(0),
+            "load requests must leave full-create latency at zero"
         );
         assert!(
             metrics
                 .get("latencies_us")
                 .and_then(|latencies| latencies.get("diff_create_snapshot"))
-                .is_none(),
-            "load requests must not emit diff snapshot latency"
+                .and_then(serde_json::Value::as_u64)
+                == Some(0),
+            "load requests must leave diff-create latency at zero"
         );
         let raw_metrics =
             fs::read_to_string(&metrics_path).expect("metrics should remain readable");
@@ -10854,7 +10906,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_metrics_omits_snapshot_latencies_for_parser_or_state_failures() {
+    fn configured_metrics_zeros_snapshot_latencies_for_parser_or_state_failures() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let metrics_path = unique_socket_path("slf").with_extension("metrics");
         let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
@@ -10915,10 +10967,16 @@ mod tests {
             "{flush_response}"
         );
         let metrics = read_metrics_json(&metrics_path);
-        assert!(
-            metrics.get("latencies_us").is_none(),
-            "snapshot parser or state failures must not emit latency metrics"
-        );
+        for field in [
+            "full_create_snapshot",
+            "diff_create_snapshot",
+            "load_snapshot",
+        ] {
+            assert_eq!(
+                metrics["latencies_us"][field], 0,
+                "snapshot parser or state failure must leave {field} at zero"
+            );
+        }
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
@@ -12860,10 +12918,12 @@ mod tests {
             Ok(())
         );
 
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let output = fs::read_to_string(&metrics_path).expect("metrics output should be readable");
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let metrics: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("periodic metrics line should be JSON");
+        assert_eq!(metrics["vmm"]["panic_count"], 0);
         fs::remove_file(metrics_path).expect("fixture should clean up");
         drop(client);
         drop(server);

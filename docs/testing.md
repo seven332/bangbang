@@ -1562,6 +1562,12 @@ producer owner/disposition, delivery issue, rationale, and evidence mapping.
 The destination must be a new non-alias of every checked JSON file. The exact
 shape and publication boundary are documented in the
 [metrics schema contract](../compat/firecracker/v1.16.0/metrics-contract.md).
+Runtime descriptor tests require exact equality with all 301 checked static and
+dynamic-template identities. Exact-byte fixtures at
+`crates/runtime/src/metrics/fixtures/minimal.jsonl` and
+`crates/runtime/src/metrics/fixtures/all-static-nonzero.jsonl` pin root/field
+order, numeric types, all required leaves, and no extras without duplicating
+the machine authority in prose.
 
 Host lifecycle logger coverage exercises backend and VM transitions, all three
 live device kinds, boot-worker observation, automatic metrics failures,
@@ -2488,14 +2494,29 @@ and failed fallback outcomes without mutating a hook. The double-panic case
 requires only bounded non-success and absence of both secrets; it deliberately
 makes no persistence claim.
 
-Metrics transaction tests use injected outputs to cover every implemented
-increment family and persistent store, first/no-new/new-event lines, lower/new
-producer generations, keyed disappearance and reappearance, independent
-owners, sparse omission, saturation, and writes that accept bytes before
-returning an error. They prove that only a complete success advances the typed
-baseline and that ambiguous failures replay at least once with
-`missed_metrics_count`. `metrics_flush_count` is asserted as `1` per successful
-line rather than as a cumulative producer.
+Metrics construction tests require the complete 24-root/243-leaf static shape,
+the three configured dynamic families, exact root/field byte order, and numeric
+zeroes for required fields without producer values. A reviewable maximum recipe
+materializes all 985 dynamic roots—485 ordinary blocks, 484 vhost-user blocks,
+and 16 networks—and proves sorted exclusive names, family shapes, aggregate
+behavior, and no vhost/ordinary duplication. Separate boundary tests cover the
+985/16/51,429,376 limits, the computed worst-case record below 64 MiB, exact
+count-writer capacity, one-byte-over rejection, a fixed second-pass overrun,
+and injected exact-reservation failure. Cross-layer executable tests tie the
+identity budget to the 1 MiB config-file and 51,200-byte API payload limits.
+
+Metrics transaction tests use injected clocks, serializers, and outputs to
+cover every implemented increment family and persistent store,
+first/no-new/new-event lines, lower/new producer generations, configured
+identity disappearance/reappearance, independent owners, saturation, and one
+clock capture across both serialization passes. They exercise pre-epoch and
+overflowing clocks, allocation/serialization/size failures before sink access,
+zero/short/interrupted/would-block writes, invalid progress, separate newline
+and flush failures, and writes that accept bytes before returning an error.
+Only JSON-plus-newline-plus-flush success advances the typed baseline. Every
+failure increments `missed_metrics_count`; ambiguous accepted prefixes replay
+at least once. Tests also require closed Display/Debug errors to omit paths,
+configured IDs, fragments, and values.
 
 Process-lifecycle tests cover configuration-origin-independent initial output,
 preboot scheduler dormancy, a session-epoch deadline, Running and Paused
@@ -2517,6 +2538,8 @@ and due schedulers; tests do not sleep for a production interval.
 Run the focused process-observability evidence with:
 
 ```sh
+cargo test -p bangbang-runtime metrics::firecracker::tests --all-features --locked
+cargo test -p bangbang-runtime metrics::tests --all-features --locked
 cargo test -p bangbang-runtime logger --all-features --locked
 cargo test -p bangbang --bin bangbang panic_bridge::tests --all-features --locked -- --test-threads=1
 cargo test -p bangbang --bin bangbang terminal_observability --all-features --locked

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{LineWriter, Write};
+use std::io::{self, LineWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,6 +31,20 @@ use crate::vsock::{
     VirtioVsockRxQueueDispatch, VirtioVsockTransportResetAttempt, VirtioVsockTransportResetError,
     VirtioVsockTxQueueDispatch,
 };
+
+mod firecracker;
+
+/// Maximum number of configured dynamic Firecracker metrics roots in one arm64 VM.
+pub const FIRECRACKER_METRICS_MAX_DYNAMIC_ROOTS: usize =
+    firecracker::FIRECRACKER_METRICS_MAX_DYNAMIC_ROOTS;
+
+/// Maximum combined configured drive and network identity bytes in one metrics attempt.
+pub const FIRECRACKER_METRICS_MAX_IDENTITY_BYTES: usize =
+    firecracker::FIRECRACKER_METRICS_MAX_IDENTITY_BYTES;
+
+/// Maximum byte length of one complete newline-terminated Firecracker metrics record.
+pub const FIRECRACKER_METRICS_MAX_LINE_BYTES: usize =
+    firecracker::FIRECRACKER_METRICS_MAX_LINE_BYTES;
 
 const fn incremental_delta(current: u64, previous: u64) -> u64 {
     if current >= previous {
@@ -139,18 +153,51 @@ impl std::error::Error for MetricsConfigError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricsFlushError {
+    Clock,
+    ConfiguredDevices,
+    Allocation,
+    Serialization,
+    LineTooLong,
     Write(std::io::ErrorKind),
+    Newline(std::io::ErrorKind),
+    Flush(std::io::ErrorKind),
 }
 
 impl fmt::Display for MetricsFlushError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Clock => f.write_str("failed to flush metrics: clock unavailable"),
+            Self::ConfiguredDevices => {
+                f.write_str("failed to flush metrics: configured device inventory is invalid")
+            }
+            Self::Allocation => f.write_str("failed to flush metrics: allocation failed"),
+            Self::Serialization => f.write_str("failed to flush metrics: serialization failed"),
+            Self::LineTooLong => f.write_str("failed to flush metrics: line exceeds size limit"),
             Self::Write(kind) => write!(f, "failed to flush metrics: {kind:?}"),
+            Self::Newline(kind) => write!(f, "failed to terminate metrics line: {kind:?}"),
+            Self::Flush(kind) => write!(f, "failed to publish metrics line: {kind:?}"),
         }
     }
 }
 
 impl std::error::Error for MetricsFlushError {}
+
+impl From<firecracker::MetricsLineBuildError> for MetricsFlushError {
+    fn from(error: firecracker::MetricsLineBuildError) -> Self {
+        match error {
+            firecracker::MetricsLineBuildError::Clock => Self::Clock,
+            firecracker::MetricsLineBuildError::TooManyConfiguredDevices
+            | firecracker::MetricsLineBuildError::TooManyNetworkInterfaces
+            | firecracker::MetricsLineBuildError::ConfiguredIdentityBytes
+            | firecracker::MetricsLineBuildError::DuplicateConfiguredIdentity => {
+                Self::ConfiguredDevices
+            }
+            firecracker::MetricsLineBuildError::Allocation => Self::Allocation,
+            firecracker::MetricsLineBuildError::Serialization => Self::Serialization,
+            firecracker::MetricsLineBuildError::LineTooLong => Self::LineTooLong,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MetricsSnapshot {
@@ -179,17 +226,37 @@ impl MetricsSnapshot {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MetricsState {
+    clock: Box<dyn firecracker::MetricsClock>,
     deprecated_api: DeprecatedApiMetrics,
     sink: Option<MetricsSink>,
     get_api_requests: GetApiRequestMetrics,
     latencies_us: LatencyMetrics,
     logger_metrics: LoggerMetrics,
     previous_successful: MetricsSnapshot,
+    serializer: Box<dyn firecracker::MetricsLineSerializer>,
     shared_logger_metrics: SharedLoggerMetrics,
     patch_api_requests: PatchApiRequestMetrics,
     put_api_requests: PutApiRequestMetrics,
+}
+
+impl Default for MetricsState {
+    fn default() -> Self {
+        Self {
+            clock: Box::<firecracker::SystemMetricsClock>::default(),
+            deprecated_api: DeprecatedApiMetrics::default(),
+            sink: None,
+            get_api_requests: GetApiRequestMetrics::default(),
+            latencies_us: LatencyMetrics::default(),
+            logger_metrics: LoggerMetrics::default(),
+            previous_successful: MetricsSnapshot::default(),
+            serializer: Box::<firecracker::SystemMetricsLineSerializer>::default(),
+            shared_logger_metrics: SharedLoggerMetrics::default(),
+            patch_api_requests: PatchApiRequestMetrics::default(),
+            put_api_requests: PutApiRequestMetrics::default(),
+        }
+    }
 }
 
 /// A fully validated metrics configuration with a ready output sink.
@@ -477,6 +544,17 @@ impl MetricsState {
         &mut self,
         diagnostics: &MetricsDiagnostics,
     ) -> Result<bool, MetricsFlushError> {
+        self.flush_with_diagnostics_and_devices(
+            diagnostics,
+            &firecracker::ConfiguredMetricsDevices::default(),
+        )
+    }
+
+    pub(crate) fn flush_with_diagnostics_and_devices(
+        &mut self,
+        diagnostics: &MetricsDiagnostics,
+        configured: &firecracker::ConfiguredMetricsDevices,
+    ) -> Result<bool, MetricsFlushError> {
         if self.sink.is_none() {
             return Ok(false);
         }
@@ -492,11 +570,17 @@ impl MetricsState {
             patch_api_requests: self.patch_api_requests,
             put_api_requests: self.put_api_requests,
         };
-        let emitted = current.delta_since(&self.previous_successful);
-        let Some(sink) = self.sink.as_mut() else {
-            return Ok(false);
-        };
-        if let Err(err) = sink.write_minimal_metrics(&emitted) {
+        let interval = current.delta_since(&self.previous_successful);
+        let result = (|| {
+            let timestamp = firecracker::unix_timestamp_ms(self.clock.as_ref())?;
+            let line = firecracker::build_metrics_line(timestamp, &current, &interval, configured)?;
+            let bytes = self.serializer.serialize(&line)?;
+            let Some(sink) = self.sink.as_mut() else {
+                return Ok(());
+            };
+            sink.write_metrics_line(&bytes)
+        })();
+        if let Err(err) = result {
             // The sink can report an error after some bytes became visible. Retaining the prior
             // successful baseline intentionally gives consumers at-least-once replay.
             self.logger_metrics.record_missed_metrics();
@@ -505,6 +589,26 @@ impl MetricsState {
         self.previous_successful = current;
 
         Ok(true)
+    }
+
+    pub(crate) fn flush_with_diagnostics_and_configs(
+        &mut self,
+        diagnostics: &MetricsDiagnostics,
+        drives: &[crate::block::DriveConfig],
+        networks: &[crate::network::NetworkInterfaceConfig],
+    ) -> Result<bool, MetricsFlushError> {
+        if self.sink.is_none() {
+            return Ok(false);
+        }
+        let configured =
+            match firecracker::ConfiguredMetricsDevices::try_from_configs(drives, networks) {
+                Ok(configured) => configured,
+                Err(error) => {
+                    self.logger_metrics.record_missed_metrics();
+                    return Err(MetricsFlushError::from(error));
+                }
+            };
+        self.flush_with_diagnostics_and_devices(diagnostics, &configured)
     }
 
     #[cfg(test)]
@@ -531,16 +635,8 @@ impl_incremental_delta!(DeprecatedApiMetrics {
 });
 
 impl DeprecatedApiMetrics {
-    const fn is_empty(self) -> bool {
-        self.deprecated_http_api_calls == 0
-    }
-
     fn record_deprecated_http_api_call(&mut self) {
         self.deprecated_http_api_calls = self.deprecated_http_api_calls.saturating_add(1);
-    }
-
-    const fn deprecated_http_api_calls(self) -> u64 {
-        self.deprecated_http_api_calls
     }
 }
 
@@ -577,12 +673,6 @@ impl_incremental_delta!(LoggerMetrics {
 });
 
 impl LoggerMetrics {
-    const fn is_empty(self) -> bool {
-        self.missed_log_count == 0
-            && self.missed_metrics_count == 0
-            && self.rate_limited_log_count == 0
-    }
-
     const fn with_log_counts(mut self, missed_log_count: u64, rate_limited_log_count: u64) -> Self {
         self.missed_log_count = missed_log_count;
         self.rate_limited_log_count = rate_limited_log_count;
@@ -591,18 +681,6 @@ impl LoggerMetrics {
 
     fn record_missed_metrics(&mut self) {
         self.missed_metrics_count = self.missed_metrics_count.saturating_add(1);
-    }
-
-    const fn missed_log_count(self) -> u64 {
-        self.missed_log_count
-    }
-
-    const fn missed_metrics_count(self) -> u64 {
-        self.missed_metrics_count
-    }
-
-    const fn rate_limited_log_count(self) -> u64 {
-        self.rate_limited_log_count
     }
 }
 
@@ -616,14 +694,6 @@ struct LatencyMetrics {
 }
 
 impl LatencyMetrics {
-    const fn is_empty(self) -> bool {
-        self.full_create_snapshot.is_none()
-            && self.diff_create_snapshot.is_none()
-            && self.load_snapshot.is_none()
-            && self.pause_vm.is_none()
-            && self.resume_vm.is_none()
-    }
-
     fn record_full_create_snapshot(&mut self, duration_us: u64) {
         self.full_create_snapshot = Some(duration_us);
     }
@@ -642,26 +712,6 @@ impl LatencyMetrics {
 
     fn record_resume_vm(&mut self, duration_us: u64) {
         self.resume_vm = Some(duration_us);
-    }
-
-    const fn full_create_snapshot(self) -> Option<u64> {
-        self.full_create_snapshot
-    }
-
-    const fn diff_create_snapshot(self) -> Option<u64> {
-        self.diff_create_snapshot
-    }
-
-    const fn load_snapshot(self) -> Option<u64> {
-        self.load_snapshot
-    }
-
-    const fn pause_vm(self) -> Option<u64> {
-        self.pause_vm
-    }
-
-    const fn resume_vm(self) -> Option<u64> {
-        self.resume_vm
     }
 }
 
@@ -713,15 +763,6 @@ struct SharedSignalMetricsInner {
 }
 
 impl GetApiRequestMetrics {
-    const fn is_empty(self) -> bool {
-        self.balloon_count == 0
-            && self.hotplug_memory_count == 0
-            && self.instance_info_count == 0
-            && self.vmm_version_count == 0
-            && self.machine_cfg_count == 0
-            && self.mmds_count == 0
-    }
-
     fn record_balloon_request(&mut self) {
         self.balloon_count = self.balloon_count.saturating_add(1);
     }
@@ -744,30 +785,6 @@ impl GetApiRequestMetrics {
 
     fn record_mmds_request(&mut self) {
         self.mmds_count = self.mmds_count.saturating_add(1);
-    }
-
-    const fn balloon_count(self) -> u64 {
-        self.balloon_count
-    }
-
-    const fn hotplug_memory_count(self) -> u64 {
-        self.hotplug_memory_count
-    }
-
-    const fn instance_info_count(self) -> u64 {
-        self.instance_info_count
-    }
-
-    const fn vmm_version_count(self) -> u64 {
-        self.vmm_version_count
-    }
-
-    const fn machine_cfg_count(self) -> u64 {
-        self.machine_cfg_count
-    }
-
-    const fn mmds_count(self) -> u64 {
-        self.mmds_count
     }
 }
 
@@ -807,23 +824,6 @@ impl_incremental_delta!(PatchApiRequestMetrics {
 });
 
 impl PatchApiRequestMetrics {
-    const fn is_empty(self) -> bool {
-        self.balloon_count == 0
-            && self.balloon_fails == 0
-            && self.drive_count == 0
-            && self.drive_fails == 0
-            && self.network_count == 0
-            && self.network_fails == 0
-            && self.machine_cfg_count == 0
-            && self.machine_cfg_fails == 0
-            && self.mmds_count == 0
-            && self.mmds_fails == 0
-            && self.hotplug_memory_count == 0
-            && self.hotplug_memory_fails == 0
-            && self.pmem_count == 0
-            && self.pmem_fails == 0
-    }
-
     fn record_drive_request(&mut self) {
         self.drive_count = self.drive_count.saturating_add(1);
     }
@@ -878,62 +878,6 @@ impl PatchApiRequestMetrics {
 
     fn record_pmem_failure(&mut self) {
         self.pmem_fails = self.pmem_fails.saturating_add(1);
-    }
-
-    const fn drive_count(self) -> u64 {
-        self.drive_count
-    }
-
-    const fn drive_fails(self) -> u64 {
-        self.drive_fails
-    }
-
-    const fn balloon_count(self) -> u64 {
-        self.balloon_count
-    }
-
-    const fn balloon_fails(self) -> u64 {
-        self.balloon_fails
-    }
-
-    const fn network_count(self) -> u64 {
-        self.network_count
-    }
-
-    const fn network_fails(self) -> u64 {
-        self.network_fails
-    }
-
-    const fn machine_cfg_count(self) -> u64 {
-        self.machine_cfg_count
-    }
-
-    const fn machine_cfg_fails(self) -> u64 {
-        self.machine_cfg_fails
-    }
-
-    const fn mmds_count(self) -> u64 {
-        self.mmds_count
-    }
-
-    const fn mmds_fails(self) -> u64 {
-        self.mmds_fails
-    }
-
-    const fn hotplug_memory_count(self) -> u64 {
-        self.hotplug_memory_count
-    }
-
-    const fn hotplug_memory_fails(self) -> u64 {
-        self.hotplug_memory_fails
-    }
-
-    const fn pmem_count(self) -> u64 {
-        self.pmem_count
-    }
-
-    const fn pmem_fails(self) -> u64 {
-        self.pmem_fails
     }
 }
 
@@ -1001,37 +945,6 @@ impl_incremental_delta!(PutApiRequestMetrics {
 });
 
 impl PutApiRequestMetrics {
-    const fn is_empty(self) -> bool {
-        self.actions_count == 0
-            && self.actions_fails == 0
-            && self.balloon_count == 0
-            && self.balloon_fails == 0
-            && self.boot_source_count == 0
-            && self.boot_source_fails == 0
-            && self.cpu_cfg_count == 0
-            && self.cpu_cfg_fails == 0
-            && self.drive_count == 0
-            && self.drive_fails == 0
-            && self.logger_count == 0
-            && self.logger_fails == 0
-            && self.machine_cfg_count == 0
-            && self.machine_cfg_fails == 0
-            && self.metrics_count == 0
-            && self.metrics_fails == 0
-            && self.hotplug_memory_count == 0
-            && self.hotplug_memory_fails == 0
-            && self.mmds_count == 0
-            && self.mmds_fails == 0
-            && self.network_count == 0
-            && self.network_fails == 0
-            && self.pmem_count == 0
-            && self.pmem_fails == 0
-            && self.serial_count == 0
-            && self.serial_fails == 0
-            && self.vsock_count == 0
-            && self.vsock_fails == 0
-    }
-
     fn record_actions_request(&mut self) {
         self.actions_count = self.actions_count.saturating_add(1);
     }
@@ -1142,118 +1055,6 @@ impl PutApiRequestMetrics {
 
     fn record_vsock_failure(&mut self) {
         self.vsock_fails = self.vsock_fails.saturating_add(1);
-    }
-
-    const fn actions_count(self) -> u64 {
-        self.actions_count
-    }
-
-    const fn actions_fails(self) -> u64 {
-        self.actions_fails
-    }
-
-    const fn balloon_count(self) -> u64 {
-        self.balloon_count
-    }
-
-    const fn balloon_fails(self) -> u64 {
-        self.balloon_fails
-    }
-
-    const fn boot_source_count(self) -> u64 {
-        self.boot_source_count
-    }
-
-    const fn boot_source_fails(self) -> u64 {
-        self.boot_source_fails
-    }
-
-    const fn cpu_cfg_count(self) -> u64 {
-        self.cpu_cfg_count
-    }
-
-    const fn cpu_cfg_fails(self) -> u64 {
-        self.cpu_cfg_fails
-    }
-
-    const fn drive_count(self) -> u64 {
-        self.drive_count
-    }
-
-    const fn drive_fails(self) -> u64 {
-        self.drive_fails
-    }
-
-    const fn logger_count(self) -> u64 {
-        self.logger_count
-    }
-
-    const fn logger_fails(self) -> u64 {
-        self.logger_fails
-    }
-
-    const fn machine_cfg_count(self) -> u64 {
-        self.machine_cfg_count
-    }
-
-    const fn machine_cfg_fails(self) -> u64 {
-        self.machine_cfg_fails
-    }
-
-    const fn metrics_count(self) -> u64 {
-        self.metrics_count
-    }
-
-    const fn metrics_fails(self) -> u64 {
-        self.metrics_fails
-    }
-
-    const fn hotplug_memory_count(self) -> u64 {
-        self.hotplug_memory_count
-    }
-
-    const fn hotplug_memory_fails(self) -> u64 {
-        self.hotplug_memory_fails
-    }
-
-    const fn mmds_count(self) -> u64 {
-        self.mmds_count
-    }
-
-    const fn mmds_fails(self) -> u64 {
-        self.mmds_fails
-    }
-
-    const fn network_count(self) -> u64 {
-        self.network_count
-    }
-
-    const fn network_fails(self) -> u64 {
-        self.network_fails
-    }
-
-    const fn pmem_count(self) -> u64 {
-        self.pmem_count
-    }
-
-    const fn pmem_fails(self) -> u64 {
-        self.pmem_fails
-    }
-
-    const fn serial_count(self) -> u64 {
-        self.serial_count
-    }
-
-    const fn serial_fails(self) -> u64 {
-        self.serial_fails
-    }
-
-    const fn vsock_count(self) -> u64 {
-        self.vsock_count
-    }
-
-    const fn vsock_fails(self) -> u64 {
-        self.vsock_fails
     }
 }
 
@@ -7357,17 +7158,6 @@ pub enum BootRunLoopMetricStatus {
     Failed,
 }
 
-impl BootRunLoopMetricStatus {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Paused => "paused",
-            Self::Exited => "exited",
-            Self::Failed => "failed",
-        }
-    }
-}
-
 struct MetricsSink {
     output: Box<dyn MetricsOutput>,
 }
@@ -7381,7 +7171,9 @@ impl fmt::Debug for MetricsSink {
 }
 
 trait MetricsOutput: fmt::Debug + Send {
-    fn write_json_line(&mut self, line: &serde_json::Value) -> Result<(), MetricsFlushError>;
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize>;
+
+    fn flush(&mut self) -> io::Result<()>;
 }
 
 struct FileMetricsOutput {
@@ -7397,616 +7189,13 @@ impl fmt::Debug for FileMetricsOutput {
 }
 
 impl MetricsOutput for FileMetricsOutput {
-    fn write_json_line(&mut self, line: &serde_json::Value) -> Result<(), MetricsFlushError> {
-        writeln!(self.writer, "{line}").map_err(|err| MetricsFlushError::Write(err.kind()))?;
-        self.writer
-            .flush()
-            .map_err(|err| MetricsFlushError::Write(err.kind()))
-    }
-}
-
-fn block_device_metrics_json_object(
-    metrics: BlockDeviceMetrics,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut block = serde_json::Map::new();
-    if let Some(duration_us) = metrics.config_change_time_us() {
-        block.insert(
-            "config_change_time_us".to_string(),
-            serde_json::Value::Number(duration_us.into()),
-        );
-    }
-    block.insert(
-        "event_fails".to_string(),
-        serde_json::Value::Number(metrics.event_fails().into()),
-    );
-    block.insert(
-        "execute_fails".to_string(),
-        serde_json::Value::Number(metrics.execute_fails().into()),
-    );
-    block.insert(
-        "flush_count".to_string(),
-        serde_json::Value::Number(metrics.flush_count().into()),
-    );
-    block.insert(
-        "invalid_reqs_count".to_string(),
-        serde_json::Value::Number(metrics.invalid_reqs_count().into()),
-    );
-    block.insert(
-        "io_engine_throttled_events".to_string(),
-        serde_json::Value::Number(metrics.io_engine_throttled_events().into()),
-    );
-    block.insert(
-        "queue_event_count".to_string(),
-        serde_json::Value::Number(metrics.queue_event_count().into()),
-    );
-    block.insert(
-        "rate_limiter_event_count".to_string(),
-        serde_json::Value::Number(metrics.rate_limiter_event_count().into()),
-    );
-    block.insert(
-        "rate_limiter_throttled_events".to_string(),
-        serde_json::Value::Number(metrics.rate_limiter_throttled_events().into()),
-    );
-    block.insert(
-        "update_count".to_string(),
-        serde_json::Value::Number(metrics.update_count().into()),
-    );
-    block.insert(
-        "update_fails".to_string(),
-        serde_json::Value::Number(metrics.update_fails().into()),
-    );
-    block.insert(
-        "read_bytes".to_string(),
-        serde_json::Value::Number(metrics.read_bytes().into()),
-    );
-    block.insert(
-        "read_count".to_string(),
-        serde_json::Value::Number(metrics.read_count().into()),
-    );
-    block.insert(
-        "write_bytes".to_string(),
-        serde_json::Value::Number(metrics.write_bytes().into()),
-    );
-    block.insert(
-        "write_count".to_string(),
-        serde_json::Value::Number(metrics.write_count().into()),
-    );
-    block.insert(
-        "read_agg".to_string(),
-        serde_json::Value::Object(latency_aggregate_metrics_json_object(metrics.read_agg())),
-    );
-    block.insert(
-        "write_agg".to_string(),
-        serde_json::Value::Object(latency_aggregate_metrics_json_object(metrics.write_agg())),
-    );
-    block
-}
-
-fn pmem_device_metrics_json_object(
-    metrics: PmemDeviceMetrics,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut pmem = serde_json::Map::new();
-    pmem.insert(
-        "activate_fails".to_string(),
-        serde_json::Value::Number(metrics.activate_fails().into()),
-    );
-    pmem.insert(
-        "cfg_fails".to_string(),
-        serde_json::Value::Number(metrics.cfg_fails().into()),
-    );
-    pmem.insert(
-        "event_fails".to_string(),
-        serde_json::Value::Number(metrics.event_fails().into()),
-    );
-    pmem.insert(
-        "queue_event_count".to_string(),
-        serde_json::Value::Number(metrics.queue_event_count().into()),
-    );
-    pmem.insert(
-        "rate_limiter_event_count".to_string(),
-        serde_json::Value::Number(metrics.rate_limiter_event_count().into()),
-    );
-    pmem.insert(
-        "rate_limiter_throttled_events".to_string(),
-        serde_json::Value::Number(metrics.rate_limiter_throttled_events().into()),
-    );
-    pmem
-}
-
-fn network_interface_metrics_json_object(
-    metrics: NetworkInterfaceMetrics,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut net = serde_json::Map::new();
-    net.insert(
-        "activate_fails".to_string(),
-        serde_json::Value::Number(metrics.activate_fails().into()),
-    );
-    net.insert(
-        "cfg_fails".to_string(),
-        serde_json::Value::Number(metrics.cfg_fails().into()),
-    );
-    net.insert(
-        "event_fails".to_string(),
-        serde_json::Value::Number(metrics.event_fails().into()),
-    );
-    net.insert(
-        "no_rx_avail_buffer".to_string(),
-        serde_json::Value::Number(metrics.no_rx_avail_buffer().into()),
-    );
-    net.insert(
-        "no_tx_avail_buffer".to_string(),
-        serde_json::Value::Number(metrics.no_tx_avail_buffer().into()),
-    );
-    net.insert(
-        "rx_bytes_count".to_string(),
-        serde_json::Value::Number(metrics.rx_bytes_count().into()),
-    );
-    net.insert(
-        "rx_count".to_string(),
-        serde_json::Value::Number(metrics.rx_count().into()),
-    );
-    net.insert(
-        "rx_fails".to_string(),
-        serde_json::Value::Number(metrics.rx_fails().into()),
-    );
-    net.insert(
-        "rx_packets_count".to_string(),
-        serde_json::Value::Number(metrics.rx_packets_count().into()),
-    );
-    net.insert(
-        "rx_queue_event_count".to_string(),
-        serde_json::Value::Number(metrics.rx_queue_event_count().into()),
-    );
-    net.insert(
-        "rx_event_rate_limiter_count".to_string(),
-        serde_json::Value::Number(metrics.rx_event_rate_limiter_count().into()),
-    );
-    net.insert(
-        "rx_rate_limiter_throttled".to_string(),
-        serde_json::Value::Number(metrics.rx_rate_limiter_throttled().into()),
-    );
-    net.insert(
-        "tx_bytes_count".to_string(),
-        serde_json::Value::Number(metrics.tx_bytes_count().into()),
-    );
-    net.insert(
-        "tx_count".to_string(),
-        serde_json::Value::Number(metrics.tx_count().into()),
-    );
-    net.insert(
-        "tx_fails".to_string(),
-        serde_json::Value::Number(metrics.tx_fails().into()),
-    );
-    net.insert(
-        "tx_malformed_frames".to_string(),
-        serde_json::Value::Number(metrics.tx_malformed_frames().into()),
-    );
-    net.insert(
-        "tx_packets_count".to_string(),
-        serde_json::Value::Number(metrics.tx_packets_count().into()),
-    );
-    net.insert(
-        "tx_queue_event_count".to_string(),
-        serde_json::Value::Number(metrics.tx_queue_event_count().into()),
-    );
-    net.insert(
-        "tx_rate_limiter_event_count".to_string(),
-        serde_json::Value::Number(metrics.tx_rate_limiter_event_count().into()),
-    );
-    net.insert(
-        "tx_rate_limiter_throttled".to_string(),
-        serde_json::Value::Number(metrics.tx_rate_limiter_throttled().into()),
-    );
-    net.insert(
-        "tx_remaining_reqs_count".to_string(),
-        serde_json::Value::Number(metrics.tx_remaining_reqs_count().into()),
-    );
-    net.insert(
-        "tx_spoofed_mac_count".to_string(),
-        serde_json::Value::Number(metrics.tx_spoofed_mac_count().into()),
-    );
-    net.insert(
-        "vmnet_read_count".to_string(),
-        serde_json::Value::Number(metrics.vmnet_read_count().into()),
-    );
-    net.insert(
-        "vmnet_read_fails".to_string(),
-        serde_json::Value::Number(metrics.vmnet_read_fails().into()),
-    );
-    net.insert(
-        "vmnet_read_packets_count".to_string(),
-        serde_json::Value::Number(metrics.vmnet_read_packets_count().into()),
-    );
-    net.insert(
-        "vmnet_read_partial_batches".to_string(),
-        serde_json::Value::Number(metrics.vmnet_read_partial_batches().into()),
-    );
-    net.insert(
-        "vmnet_read_latency_us".to_string(),
-        serde_json::Value::Object(network_latency_metrics_json_object(
-            metrics.vmnet_read_latency(),
-        )),
-    );
-    net.insert(
-        "vmnet_write_count".to_string(),
-        serde_json::Value::Number(metrics.vmnet_write_count().into()),
-    );
-    net.insert(
-        "vmnet_write_fails".to_string(),
-        serde_json::Value::Number(metrics.vmnet_write_fails().into()),
-    );
-    net.insert(
-        "vmnet_write_packets_count".to_string(),
-        serde_json::Value::Number(metrics.vmnet_write_packets_count().into()),
-    );
-    net.insert(
-        "vmnet_write_partial_batches".to_string(),
-        serde_json::Value::Number(metrics.vmnet_write_partial_batches().into()),
-    );
-    net.insert(
-        "vmnet_write_latency_us".to_string(),
-        serde_json::Value::Object(network_latency_metrics_json_object(
-            metrics.vmnet_write_latency(),
-        )),
-    );
-    net
-}
-
-fn network_latency_metrics_json_object(
-    metrics: VirtioNetworkLatencyAggregate,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut latency = serde_json::Map::new();
-    latency.insert(
-        "min_us".to_string(),
-        serde_json::Value::Number(metrics.min_us().into()),
-    );
-    latency.insert(
-        "max_us".to_string(),
-        serde_json::Value::Number(metrics.max_us().into()),
-    );
-    latency.insert(
-        "sum_us".to_string(),
-        serde_json::Value::Number(metrics.sum_us().into()),
-    );
-    latency.insert(
-        "samples".to_string(),
-        serde_json::Value::Number(metrics.samples().into()),
-    );
-    latency
-}
-
-fn mmds_metrics_json_object(metrics: MmdsMetrics) -> serde_json::Map<String, serde_json::Value> {
-    let mut mmds = serde_json::Map::new();
-    mmds.insert(
-        "rx_accepted".to_string(),
-        serde_json::Value::Number(metrics.rx_accepted().into()),
-    );
-    mmds.insert(
-        "rx_accepted_err".to_string(),
-        serde_json::Value::Number(metrics.rx_accepted_err().into()),
-    );
-    mmds.insert(
-        "rx_accepted_unusual".to_string(),
-        serde_json::Value::Number(metrics.rx_accepted_unusual().into()),
-    );
-    mmds.insert(
-        "rx_bad_eth".to_string(),
-        serde_json::Value::Number(metrics.rx_bad_eth().into()),
-    );
-    mmds.insert(
-        "rx_invalid_token".to_string(),
-        serde_json::Value::Number(metrics.rx_invalid_token().into()),
-    );
-    mmds.insert(
-        "rx_no_token".to_string(),
-        serde_json::Value::Number(metrics.rx_no_token().into()),
-    );
-    mmds.insert(
-        "rx_count".to_string(),
-        serde_json::Value::Number(metrics.rx_count().into()),
-    );
-    mmds.insert(
-        "tx_bytes".to_string(),
-        serde_json::Value::Number(metrics.tx_bytes().into()),
-    );
-    mmds.insert(
-        "tx_count".to_string(),
-        serde_json::Value::Number(metrics.tx_count().into()),
-    );
-    mmds.insert(
-        "tx_errors".to_string(),
-        serde_json::Value::Number(metrics.tx_errors().into()),
-    );
-    mmds.insert(
-        "tx_frames".to_string(),
-        serde_json::Value::Number(metrics.tx_frames().into()),
-    );
-    mmds.insert(
-        "connections_created".to_string(),
-        serde_json::Value::Number(metrics.connections_created().into()),
-    );
-    mmds.insert(
-        "connections_destroyed".to_string(),
-        serde_json::Value::Number(metrics.connections_destroyed().into()),
-    );
-    mmds
-}
-
-fn vsock_device_metrics_json_object(
-    metrics: VsockDeviceMetrics,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut vsock = serde_json::Map::new();
-    vsock.insert(
-        "activate_fails".to_string(),
-        serde_json::Value::Number(metrics.activate_fails().into()),
-    );
-    vsock.insert(
-        "cfg_fails".to_string(),
-        serde_json::Value::Number(metrics.cfg_fails().into()),
-    );
-    vsock.insert(
-        "rx_queue_event_fails".to_string(),
-        serde_json::Value::Number(metrics.rx_queue_event_fails().into()),
-    );
-    vsock.insert(
-        "tx_queue_event_fails".to_string(),
-        serde_json::Value::Number(metrics.tx_queue_event_fails().into()),
-    );
-    vsock.insert(
-        "ev_queue_event_fails".to_string(),
-        serde_json::Value::Number(metrics.ev_queue_event_fails().into()),
-    );
-    vsock.insert(
-        "muxer_event_fails".to_string(),
-        serde_json::Value::Number(metrics.muxer_event_fails().into()),
-    );
-    vsock.insert(
-        "conn_event_fails".to_string(),
-        serde_json::Value::Number(metrics.conn_event_fails().into()),
-    );
-    vsock.insert(
-        "rx_queue_event_count".to_string(),
-        serde_json::Value::Number(metrics.rx_queue_event_count().into()),
-    );
-    vsock.insert(
-        "tx_queue_event_count".to_string(),
-        serde_json::Value::Number(metrics.tx_queue_event_count().into()),
-    );
-    vsock.insert(
-        "rx_bytes_count".to_string(),
-        serde_json::Value::Number(metrics.rx_bytes_count().into()),
-    );
-    vsock.insert(
-        "tx_bytes_count".to_string(),
-        serde_json::Value::Number(metrics.tx_bytes_count().into()),
-    );
-    vsock.insert(
-        "rx_packets_count".to_string(),
-        serde_json::Value::Number(metrics.rx_packets_count().into()),
-    );
-    vsock.insert(
-        "tx_packets_count".to_string(),
-        serde_json::Value::Number(metrics.tx_packets_count().into()),
-    );
-    vsock.insert(
-        "conns_added".to_string(),
-        serde_json::Value::Number(metrics.conns_added().into()),
-    );
-    vsock.insert(
-        "conns_killed".to_string(),
-        serde_json::Value::Number(metrics.conns_killed().into()),
-    );
-    vsock.insert(
-        "conns_removed".to_string(),
-        serde_json::Value::Number(metrics.conns_removed().into()),
-    );
-    vsock.insert(
-        "killq_resync".to_string(),
-        serde_json::Value::Number(metrics.killq_resync().into()),
-    );
-    vsock.insert(
-        "tx_flush_fails".to_string(),
-        serde_json::Value::Number(metrics.tx_flush_fails().into()),
-    );
-    vsock.insert(
-        "tx_write_fails".to_string(),
-        serde_json::Value::Number(metrics.tx_write_fails().into()),
-    );
-    vsock.insert(
-        "rx_read_fails".to_string(),
-        serde_json::Value::Number(metrics.rx_read_fails().into()),
-    );
-    vsock
-}
-
-fn entropy_device_metrics_json_object(
-    metrics: EntropyDeviceMetrics,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut entropy = serde_json::Map::new();
-    entropy.insert(
-        "activate_fails".to_string(),
-        serde_json::Value::Number(metrics.activate_fails().into()),
-    );
-    entropy.insert(
-        "entropy_bytes".to_string(),
-        serde_json::Value::Number(metrics.entropy_bytes().into()),
-    );
-    entropy.insert(
-        "entropy_event_count".to_string(),
-        serde_json::Value::Number(metrics.entropy_event_count().into()),
-    );
-    entropy.insert(
-        "entropy_event_fails".to_string(),
-        serde_json::Value::Number(metrics.entropy_event_fails().into()),
-    );
-    entropy.insert(
-        "entropy_rate_limiter_throttled".to_string(),
-        serde_json::Value::Number(metrics.entropy_rate_limiter_throttled().into()),
-    );
-    entropy.insert(
-        "host_rng_fails".to_string(),
-        serde_json::Value::Number(metrics.host_rng_fails().into()),
-    );
-    entropy.insert(
-        "rate_limiter_event_count".to_string(),
-        serde_json::Value::Number(metrics.rate_limiter_event_count().into()),
-    );
-    entropy
-}
-
-fn rtc_device_metrics_json_object(
-    metrics: RtcDeviceMetrics,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut rtc = serde_json::Map::new();
-    rtc.insert(
-        "error_count".to_string(),
-        serde_json::Value::Number(metrics.error_count().into()),
-    );
-    rtc.insert(
-        "missed_read_count".to_string(),
-        serde_json::Value::Number(metrics.missed_read_count().into()),
-    );
-    rtc.insert(
-        "missed_write_count".to_string(),
-        serde_json::Value::Number(metrics.missed_write_count().into()),
-    );
-    rtc
-}
-
-fn serial_output_metrics_json_object(
-    metrics: SerialOutputMetrics,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut uart = serde_json::Map::new();
-    uart.insert(
-        "error_count".to_string(),
-        serde_json::Value::Number(metrics.error_count().into()),
-    );
-    uart.insert(
-        "flush_count".to_string(),
-        serde_json::Value::Number(metrics.flush_count().into()),
-    );
-    uart.insert(
-        "input_count".to_string(),
-        serde_json::Value::Number(metrics.input_count().into()),
-    );
-    uart.insert(
-        "interrupt_count".to_string(),
-        serde_json::Value::Number(metrics.interrupt_count().into()),
-    );
-    uart.insert(
-        "missed_read_count".to_string(),
-        serde_json::Value::Number(metrics.missed_read_count().into()),
-    );
-    uart.insert(
-        "missed_write_count".to_string(),
-        serde_json::Value::Number(metrics.missed_write_count().into()),
-    );
-    uart.insert(
-        "overrun_count".to_string(),
-        serde_json::Value::Number(metrics.overrun_count().into()),
-    );
-    uart.insert(
-        "read_count".to_string(),
-        serde_json::Value::Number(metrics.read_count().into()),
-    );
-    uart.insert(
-        "write_count".to_string(),
-        serde_json::Value::Number(metrics.write_count().into()),
-    );
-    uart.insert(
-        "rate_limiter_dropped_bytes".to_string(),
-        serde_json::Value::Number(metrics.rate_limiter_dropped_bytes().into()),
-    );
-    uart
-}
-
-fn signal_metrics_json_object(
-    metrics: SignalMetrics,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut signals = serde_json::Map::new();
-    if metrics.sigpipe() != 0 {
-        signals.insert(
-            "sigpipe".to_string(),
-            serde_json::Value::Number(metrics.sigpipe().into()),
-        );
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.writer.write(bytes)
     }
 
-    signals
-}
-
-fn latency_metrics_json_object(
-    metrics: LatencyMetrics,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut latencies = serde_json::Map::new();
-    if let Some(value) = metrics.full_create_snapshot() {
-        latencies.insert(
-            "full_create_snapshot".to_string(),
-            serde_json::Value::Number(value.into()),
-        );
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
-    if let Some(value) = metrics.diff_create_snapshot() {
-        latencies.insert(
-            "diff_create_snapshot".to_string(),
-            serde_json::Value::Number(value.into()),
-        );
-    }
-    if let Some(value) = metrics.load_snapshot() {
-        latencies.insert(
-            "load_snapshot".to_string(),
-            serde_json::Value::Number(value.into()),
-        );
-    }
-    if let Some(value) = metrics.pause_vm() {
-        latencies.insert(
-            "pause_vm".to_string(),
-            serde_json::Value::Number(value.into()),
-        );
-    }
-    if let Some(value) = metrics.resume_vm() {
-        latencies.insert(
-            "resume_vm".to_string(),
-            serde_json::Value::Number(value.into()),
-        );
-    }
-    latencies
-}
-
-fn latency_aggregate_metrics_json_object(
-    metrics: VirtioBlockLatencyAggregate,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut aggregate = serde_json::Map::new();
-    aggregate.insert(
-        "min_us".to_string(),
-        serde_json::Value::Number(metrics.min_us().into()),
-    );
-    aggregate.insert(
-        "max_us".to_string(),
-        serde_json::Value::Number(metrics.max_us().into()),
-    );
-    aggregate.insert(
-        "sum_us".to_string(),
-        serde_json::Value::Number(metrics.sum_us().into()),
-    );
-    aggregate
-}
-
-fn memory_hotplug_latency_metrics_json_object(
-    metrics: MemoryHotplugLatencyMetrics,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut aggregate = serde_json::Map::new();
-    aggregate.insert(
-        "min_us".to_string(),
-        serde_json::Value::Number(metrics.min_us().into()),
-    );
-    aggregate.insert(
-        "max_us".to_string(),
-        serde_json::Value::Number(metrics.max_us().into()),
-    );
-    aggregate.insert(
-        "sum_us".to_string(),
-        serde_json::Value::Number(metrics.sum_us().into()),
-    );
-    aggregate
 }
 
 impl MetricsSink {
@@ -8036,674 +7225,46 @@ impl MetricsSink {
         Self { output }
     }
 
-    fn write_minimal_metrics(
-        &mut self,
-        snapshot: &MetricsSnapshot,
-    ) -> Result<(), MetricsFlushError> {
-        let MetricsSnapshot {
-            diagnostics,
-            deprecated_api,
-            get_api_requests,
-            latencies_us,
-            logger_metrics,
-            patch_api_requests,
-            put_api_requests,
-        } = snapshot;
-        let mut vmm = serde_json::Map::new();
-        if let Some(status) = diagnostics.boot_run_loop_status() {
-            vmm.insert(
-                "boot_run_loop_status".to_string(),
-                serde_json::Value::String(status.as_str().to_string()),
-            );
-        }
-        vmm.insert(
-            "metrics_flush_count".to_string(),
-            serde_json::Value::Number(1_u64.into()),
-        );
-
-        let mut root = serde_json::Map::new();
-        let mut api_server = serde_json::Map::new();
-        if let Some(value) = diagnostics.start_time_us() {
-            api_server.insert(
-                "process_startup_time_us".to_string(),
-                serde_json::Value::Number(value.into()),
-            );
-        }
-        if let Some(value) = diagnostics.start_time_cpu_us() {
-            let process_startup_time_cpu_us =
-                value.saturating_add(diagnostics.parent_cpu_time_us().unwrap_or_default());
-            api_server.insert(
-                "process_startup_time_cpu_us".to_string(),
-                serde_json::Value::Number(process_startup_time_cpu_us.into()),
-            );
-        }
-        if !api_server.is_empty() {
-            root.insert(
-                "api_server".to_string(),
-                serde_json::Value::Object(api_server),
-            );
-        }
-        if !deprecated_api.is_empty() {
-            let mut deprecated = serde_json::Map::new();
-            deprecated.insert(
-                "deprecated_http_api_calls".to_string(),
-                serde_json::Value::Number(deprecated_api.deprecated_http_api_calls().into()),
-            );
-            root.insert(
-                "deprecated_api".to_string(),
-                serde_json::Value::Object(deprecated),
-            );
-        }
-        if let Some(block_device_metrics_by_drive) = diagnostics.block_device_metrics_by_drive() {
-            for (drive_id, metrics) in block_device_metrics_by_drive.iter() {
-                if !metrics.is_empty() {
-                    root.insert(
-                        format!("block_{drive_id}"),
-                        serde_json::Value::Object(block_device_metrics_json_object(metrics)),
-                    );
-                }
-            }
-        }
-        if let Some(block_device_metrics) = diagnostics.block_device_metrics()
-            && !block_device_metrics.is_empty()
-        {
-            root.insert(
-                "block".to_string(),
-                serde_json::Value::Object(block_device_metrics_json_object(block_device_metrics)),
-            );
-        }
-        if let Some(pmem_device_metrics_by_device) = diagnostics.pmem_device_metrics_by_device() {
-            for (device_id, metrics) in pmem_device_metrics_by_device.iter() {
-                if !metrics.is_empty() {
-                    root.insert(
-                        format!("pmem_{device_id}"),
-                        serde_json::Value::Object(pmem_device_metrics_json_object(metrics)),
-                    );
-                }
-            }
-        }
-        if let Some(pmem_device_metrics) = diagnostics.pmem_device_metrics()
-            && !pmem_device_metrics.is_empty()
-        {
-            root.insert(
-                "pmem".to_string(),
-                serde_json::Value::Object(pmem_device_metrics_json_object(pmem_device_metrics)),
-            );
-        }
-        if let Some(network_interface_metrics_by_interface) =
-            diagnostics.network_interface_metrics_by_interface()
-        {
-            for (iface_id, metrics) in network_interface_metrics_by_interface.iter() {
-                if !metrics.is_empty() {
-                    root.insert(
-                        format!("net_{iface_id}"),
-                        serde_json::Value::Object(network_interface_metrics_json_object(metrics)),
-                    );
-                }
-            }
-        }
-        if let Some(network_interface_metrics) = diagnostics.network_interface_metrics()
-            && !network_interface_metrics.is_empty()
-        {
-            root.insert(
-                "net".to_string(),
-                serde_json::Value::Object(network_interface_metrics_json_object(
-                    network_interface_metrics,
-                )),
-            );
-        }
-        if let Some(mmds_metrics) = diagnostics.mmds_metrics()
-            && !mmds_metrics.is_empty()
-        {
-            root.insert(
-                "mmds".to_string(),
-                serde_json::Value::Object(mmds_metrics_json_object(mmds_metrics)),
-            );
-        }
-        if let Some(vsock_device_metrics) = diagnostics.vsock_device_metrics()
-            && !vsock_device_metrics.is_empty()
-        {
-            root.insert(
-                "vsock".to_string(),
-                serde_json::Value::Object(vsock_device_metrics_json_object(vsock_device_metrics)),
-            );
-        }
-        if let Some(entropy_device_metrics) = diagnostics.entropy_device_metrics()
-            && !entropy_device_metrics.is_empty()
-        {
-            root.insert(
-                "entropy".to_string(),
-                serde_json::Value::Object(entropy_device_metrics_json_object(
-                    entropy_device_metrics,
-                )),
-            );
-        }
-        if let Some(rtc_device_metrics) = diagnostics.rtc_device_metrics()
-            && !rtc_device_metrics.is_empty()
-        {
-            root.insert(
-                "rtc".to_string(),
-                serde_json::Value::Object(rtc_device_metrics_json_object(rtc_device_metrics)),
-            );
-        }
-        if let Some(metrics) = diagnostics.memory_hotplug_device_metrics()
-            && !metrics.is_empty()
-        {
-            let mut memory_hotplug = serde_json::Map::new();
-            memory_hotplug.insert(
-                "activate_fails".to_string(),
-                serde_json::Value::Number(metrics.activate_fails().into()),
-            );
-            memory_hotplug.insert(
-                "queue_event_fails".to_string(),
-                serde_json::Value::Number(metrics.queue_event_fails().into()),
-            );
-            memory_hotplug.insert(
-                "queue_event_count".to_string(),
-                serde_json::Value::Number(metrics.queue_event_count().into()),
-            );
-            memory_hotplug.insert(
-                "plug_agg".to_string(),
-                serde_json::Value::Object(memory_hotplug_latency_metrics_json_object(
-                    metrics.plug_agg(),
-                )),
-            );
-            memory_hotplug.insert(
-                "plug_count".to_string(),
-                serde_json::Value::Number(metrics.plug_count().into()),
-            );
-            memory_hotplug.insert(
-                "plug_bytes".to_string(),
-                serde_json::Value::Number(metrics.plug_bytes().into()),
-            );
-            memory_hotplug.insert(
-                "plug_fails".to_string(),
-                serde_json::Value::Number(metrics.plug_fails().into()),
-            );
-            memory_hotplug.insert(
-                "unplug_agg".to_string(),
-                serde_json::Value::Object(memory_hotplug_latency_metrics_json_object(
-                    metrics.unplug_agg(),
-                )),
-            );
-            memory_hotplug.insert(
-                "unplug_count".to_string(),
-                serde_json::Value::Number(metrics.unplug_count().into()),
-            );
-            memory_hotplug.insert(
-                "unplug_bytes".to_string(),
-                serde_json::Value::Number(metrics.unplug_bytes().into()),
-            );
-            memory_hotplug.insert(
-                "unplug_fails".to_string(),
-                serde_json::Value::Number(metrics.unplug_fails().into()),
-            );
-            memory_hotplug.insert(
-                "unplug_discard_fails".to_string(),
-                serde_json::Value::Number(metrics.unplug_discard_fails().into()),
-            );
-            memory_hotplug.insert(
-                "unplug_all_agg".to_string(),
-                serde_json::Value::Object(memory_hotplug_latency_metrics_json_object(
-                    metrics.unplug_all_agg(),
-                )),
-            );
-            memory_hotplug.insert(
-                "unplug_all_count".to_string(),
-                serde_json::Value::Number(metrics.unplug_all_count().into()),
-            );
-            memory_hotplug.insert(
-                "unplug_all_fails".to_string(),
-                serde_json::Value::Number(metrics.unplug_all_fails().into()),
-            );
-            memory_hotplug.insert(
-                "state_agg".to_string(),
-                serde_json::Value::Object(memory_hotplug_latency_metrics_json_object(
-                    metrics.state_agg(),
-                )),
-            );
-            memory_hotplug.insert(
-                "state_count".to_string(),
-                serde_json::Value::Number(metrics.state_count().into()),
-            );
-            memory_hotplug.insert(
-                "state_fails".to_string(),
-                serde_json::Value::Number(metrics.state_fails().into()),
-            );
-            memory_hotplug.insert(
-                "interrupt_fails".to_string(),
-                serde_json::Value::Number(metrics.interrupt_fails().into()),
-            );
-            memory_hotplug.insert(
-                "rollback_count".to_string(),
-                serde_json::Value::Number(metrics.rollback_count().into()),
-            );
-            memory_hotplug.insert(
-                "rollback_fails".to_string(),
-                serde_json::Value::Number(metrics.rollback_fails().into()),
-            );
-            memory_hotplug.insert(
-                "owner_cleanup_count".to_string(),
-                serde_json::Value::Number(metrics.owner_cleanup_count().into()),
-            );
-            memory_hotplug.insert(
-                "owner_cleanup_fails".to_string(),
-                serde_json::Value::Number(metrics.owner_cleanup_fails().into()),
-            );
-            memory_hotplug.insert(
-                "teardown_count".to_string(),
-                serde_json::Value::Number(metrics.teardown_count().into()),
-            );
-            memory_hotplug.insert(
-                "teardown_fails".to_string(),
-                serde_json::Value::Number(metrics.teardown_fails().into()),
-            );
-            root.insert(
-                "memory_hotplug".to_string(),
-                serde_json::Value::Object(memory_hotplug),
-            );
-        }
-        if let Some(balloon_device_metrics) = diagnostics.balloon_device_metrics()
-            && !balloon_device_metrics.is_empty()
-        {
-            let mut balloon = serde_json::Map::new();
-            balloon.insert(
-                "activate_fails".to_string(),
-                serde_json::Value::Number(balloon_device_metrics.activate_fails().into()),
-            );
-            balloon.insert(
-                "deflate_count".to_string(),
-                serde_json::Value::Number(balloon_device_metrics.deflate_count().into()),
-            );
-            balloon.insert(
-                "event_fails".to_string(),
-                serde_json::Value::Number(balloon_device_metrics.event_fails().into()),
-            );
-            balloon.insert(
-                "inflate_count".to_string(),
-                serde_json::Value::Number(balloon_device_metrics.inflate_count().into()),
-            );
-            balloon.insert(
-                "inflate_discard_attempts".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics.inflate_discard().attempts().into(),
-                ),
-            );
-            balloon.insert(
-                "inflate_discard_advised_bytes".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics
-                        .inflate_discard()
-                        .advised_bytes()
-                        .into(),
-                ),
-            );
-            balloon.insert(
-                "inflate_discard_skipped_bytes".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics
-                        .inflate_discard()
-                        .skipped_bytes()
-                        .into(),
-                ),
-            );
-            balloon.insert(
-                "inflate_discard_fails".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics.inflate_discard().failures().into(),
-                ),
-            );
-            balloon.insert(
-                "hinting_discard_attempts".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics.hinting_discard().attempts().into(),
-                ),
-            );
-            balloon.insert(
-                "hinting_discard_advised_bytes".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics
-                        .hinting_discard()
-                        .advised_bytes()
-                        .into(),
-                ),
-            );
-            balloon.insert(
-                "hinting_discard_skipped_bytes".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics
-                        .hinting_discard()
-                        .skipped_bytes()
-                        .into(),
-                ),
-            );
-            balloon.insert(
-                "hinting_discard_fails".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics.hinting_discard().failures().into(),
-                ),
-            );
-            balloon.insert(
-                "free_page_report_count".to_string(),
-                serde_json::Value::Number(balloon_device_metrics.free_page_report().count().into()),
-            );
-            balloon.insert(
-                "free_page_report_requested_bytes".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics
-                        .free_page_report()
-                        .requested_bytes()
-                        .into(),
-                ),
-            );
-            balloon.insert(
-                "free_page_report_advised_bytes".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics
-                        .free_page_report()
-                        .advised_bytes()
-                        .into(),
-                ),
-            );
-            balloon.insert(
-                "free_page_report_skipped_bytes".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics
-                        .free_page_report()
-                        .skipped_bytes()
-                        .into(),
-                ),
-            );
-            balloon.insert(
-                "free_page_report_fails".to_string(),
-                serde_json::Value::Number(
-                    balloon_device_metrics.free_page_report().failures().into(),
-                ),
-            );
-            balloon.insert(
-                "stats_update_fails".to_string(),
-                serde_json::Value::Number(balloon_device_metrics.stats_update_fails().into()),
-            );
-            balloon.insert(
-                "stats_updates_count".to_string(),
-                serde_json::Value::Number(balloon_device_metrics.stats_updates_count().into()),
-            );
-            root.insert("balloon".to_string(), serde_json::Value::Object(balloon));
-        }
-        if !get_api_requests.is_empty() {
-            let mut get_requests = serde_json::Map::new();
-            get_requests.insert(
-                "balloon_count".to_string(),
-                serde_json::Value::Number(get_api_requests.balloon_count().into()),
-            );
-            get_requests.insert(
-                "hotplug_memory_count".to_string(),
-                serde_json::Value::Number(get_api_requests.hotplug_memory_count().into()),
-            );
-            get_requests.insert(
-                "instance_info_count".to_string(),
-                serde_json::Value::Number(get_api_requests.instance_info_count().into()),
-            );
-            get_requests.insert(
-                "machine_cfg_count".to_string(),
-                serde_json::Value::Number(get_api_requests.machine_cfg_count().into()),
-            );
-            get_requests.insert(
-                "mmds_count".to_string(),
-                serde_json::Value::Number(get_api_requests.mmds_count().into()),
-            );
-            get_requests.insert(
-                "vmm_version_count".to_string(),
-                serde_json::Value::Number(get_api_requests.vmm_version_count().into()),
-            );
-            root.insert(
-                "get_api_requests".to_string(),
-                serde_json::Value::Object(get_requests),
-            );
-        }
-        if !logger_metrics.is_empty() {
-            let mut logger = serde_json::Map::new();
-            if logger_metrics.missed_log_count() != 0 {
-                logger.insert(
-                    "missed_log_count".to_string(),
-                    serde_json::Value::Number(logger_metrics.missed_log_count().into()),
-                );
-            }
-            if logger_metrics.missed_metrics_count() != 0 {
-                logger.insert(
-                    "missed_metrics_count".to_string(),
-                    serde_json::Value::Number(logger_metrics.missed_metrics_count().into()),
-                );
-            }
-            if logger_metrics.rate_limited_log_count() != 0 {
-                logger.insert(
-                    "rate_limited_log_count".to_string(),
-                    serde_json::Value::Number(logger_metrics.rate_limited_log_count().into()),
-                );
-            }
-            root.insert("logger".to_string(), serde_json::Value::Object(logger));
-        }
-        if !latencies_us.is_empty() {
-            root.insert(
-                "latencies_us".to_string(),
-                serde_json::Value::Object(latency_metrics_json_object(*latencies_us)),
-            );
-        }
-        if let Some(serial_output_metrics) = diagnostics.serial_output_metrics()
-            && !serial_output_metrics.is_empty()
-        {
-            root.insert(
-                "uart".to_string(),
-                serde_json::Value::Object(serial_output_metrics_json_object(serial_output_metrics)),
-            );
-        }
-        if let Some(signal_metrics) = diagnostics.signal_metrics()
-            && !signal_metrics.is_empty()
-        {
-            root.insert(
-                "signals".to_string(),
-                serde_json::Value::Object(signal_metrics_json_object(signal_metrics)),
-            );
-        }
-        if !patch_api_requests.is_empty() {
-            let mut patch_requests = serde_json::Map::new();
-            patch_requests.insert(
-                "balloon_count".to_string(),
-                serde_json::Value::Number(patch_api_requests.balloon_count().into()),
-            );
-            patch_requests.insert(
-                "balloon_fails".to_string(),
-                serde_json::Value::Number(patch_api_requests.balloon_fails().into()),
-            );
-            patch_requests.insert(
-                "drive_count".to_string(),
-                serde_json::Value::Number(patch_api_requests.drive_count().into()),
-            );
-            patch_requests.insert(
-                "drive_fails".to_string(),
-                serde_json::Value::Number(patch_api_requests.drive_fails().into()),
-            );
-            patch_requests.insert(
-                "network_count".to_string(),
-                serde_json::Value::Number(patch_api_requests.network_count().into()),
-            );
-            patch_requests.insert(
-                "network_fails".to_string(),
-                serde_json::Value::Number(patch_api_requests.network_fails().into()),
-            );
-            patch_requests.insert(
-                "machine_cfg_count".to_string(),
-                serde_json::Value::Number(patch_api_requests.machine_cfg_count().into()),
-            );
-            patch_requests.insert(
-                "machine_cfg_fails".to_string(),
-                serde_json::Value::Number(patch_api_requests.machine_cfg_fails().into()),
-            );
-            patch_requests.insert(
-                "mmds_count".to_string(),
-                serde_json::Value::Number(patch_api_requests.mmds_count().into()),
-            );
-            patch_requests.insert(
-                "mmds_fails".to_string(),
-                serde_json::Value::Number(patch_api_requests.mmds_fails().into()),
-            );
-            patch_requests.insert(
-                "hotplug_memory_count".to_string(),
-                serde_json::Value::Number(patch_api_requests.hotplug_memory_count().into()),
-            );
-            patch_requests.insert(
-                "hotplug_memory_fails".to_string(),
-                serde_json::Value::Number(patch_api_requests.hotplug_memory_fails().into()),
-            );
-            patch_requests.insert(
-                "pmem_count".to_string(),
-                serde_json::Value::Number(patch_api_requests.pmem_count().into()),
-            );
-            patch_requests.insert(
-                "pmem_fails".to_string(),
-                serde_json::Value::Number(patch_api_requests.pmem_fails().into()),
-            );
-            root.insert(
-                "patch_api_requests".to_string(),
-                serde_json::Value::Object(patch_requests),
-            );
-        }
-        if !put_api_requests.is_empty() {
-            let mut put_requests = serde_json::Map::new();
-            put_requests.insert(
-                "actions_count".to_string(),
-                serde_json::Value::Number(put_api_requests.actions_count().into()),
-            );
-            put_requests.insert(
-                "actions_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.actions_fails().into()),
-            );
-            put_requests.insert(
-                "balloon_count".to_string(),
-                serde_json::Value::Number(put_api_requests.balloon_count().into()),
-            );
-            put_requests.insert(
-                "balloon_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.balloon_fails().into()),
-            );
-            put_requests.insert(
-                "boot_source_count".to_string(),
-                serde_json::Value::Number(put_api_requests.boot_source_count().into()),
-            );
-            put_requests.insert(
-                "boot_source_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.boot_source_fails().into()),
-            );
-            put_requests.insert(
-                "cpu_cfg_count".to_string(),
-                serde_json::Value::Number(put_api_requests.cpu_cfg_count().into()),
-            );
-            put_requests.insert(
-                "cpu_cfg_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.cpu_cfg_fails().into()),
-            );
-            put_requests.insert(
-                "drive_count".to_string(),
-                serde_json::Value::Number(put_api_requests.drive_count().into()),
-            );
-            put_requests.insert(
-                "drive_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.drive_fails().into()),
-            );
-            put_requests.insert(
-                "logger_count".to_string(),
-                serde_json::Value::Number(put_api_requests.logger_count().into()),
-            );
-            put_requests.insert(
-                "logger_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.logger_fails().into()),
-            );
-            put_requests.insert(
-                "machine_cfg_count".to_string(),
-                serde_json::Value::Number(put_api_requests.machine_cfg_count().into()),
-            );
-            put_requests.insert(
-                "machine_cfg_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.machine_cfg_fails().into()),
-            );
-            put_requests.insert(
-                "metrics_count".to_string(),
-                serde_json::Value::Number(put_api_requests.metrics_count().into()),
-            );
-            put_requests.insert(
-                "metrics_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.metrics_fails().into()),
-            );
-            put_requests.insert(
-                "hotplug_memory_count".to_string(),
-                serde_json::Value::Number(put_api_requests.hotplug_memory_count().into()),
-            );
-            put_requests.insert(
-                "hotplug_memory_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.hotplug_memory_fails().into()),
-            );
-            put_requests.insert(
-                "mmds_count".to_string(),
-                serde_json::Value::Number(put_api_requests.mmds_count().into()),
-            );
-            put_requests.insert(
-                "mmds_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.mmds_fails().into()),
-            );
-            put_requests.insert(
-                "network_count".to_string(),
-                serde_json::Value::Number(put_api_requests.network_count().into()),
-            );
-            put_requests.insert(
-                "network_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.network_fails().into()),
-            );
-            put_requests.insert(
-                "pmem_count".to_string(),
-                serde_json::Value::Number(put_api_requests.pmem_count().into()),
-            );
-            put_requests.insert(
-                "pmem_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.pmem_fails().into()),
-            );
-            put_requests.insert(
-                "serial_count".to_string(),
-                serde_json::Value::Number(put_api_requests.serial_count().into()),
-            );
-            put_requests.insert(
-                "serial_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.serial_fails().into()),
-            );
-            put_requests.insert(
-                "vsock_count".to_string(),
-                serde_json::Value::Number(put_api_requests.vsock_count().into()),
-            );
-            put_requests.insert(
-                "vsock_fails".to_string(),
-                serde_json::Value::Number(put_api_requests.vsock_fails().into()),
-            );
-            root.insert(
-                "put_api_requests".to_string(),
-                serde_json::Value::Object(put_requests),
-            );
-        }
-        root.insert("vmm".to_string(), serde_json::Value::Object(vmm));
-
+    fn write_metrics_line(&mut self, line: &[u8]) -> Result<(), MetricsFlushError> {
+        write_all_metrics(self.output.as_mut(), line, MetricsFlushError::Write)?;
+        write_all_metrics(self.output.as_mut(), b"\n", MetricsFlushError::Newline)?;
         self.output
-            .write_json_line(&serde_json::Value::Object(root))
+            .flush()
+            .map_err(|error| MetricsFlushError::Flush(error.kind()))
     }
 }
 
+fn write_all_metrics(
+    output: &mut dyn MetricsOutput,
+    mut bytes: &[u8],
+    error: fn(io::ErrorKind) -> MetricsFlushError,
+) -> Result<(), MetricsFlushError> {
+    while !bytes.is_empty() {
+        match output.write(bytes) {
+            Ok(0) => return Err(error(io::ErrorKind::WriteZero)),
+            Ok(written) => {
+                bytes = bytes
+                    .get(written..)
+                    .ok_or_else(|| error(io::ErrorKind::InvalidData))?;
+            }
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) => return Err(error(source.kind())),
+        }
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fs::{self, OpenOptions};
-    use std::io::ErrorKind;
+    use std::io::{self, ErrorKind};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use super::firecracker::ConfiguredMetricsDevices;
     use super::{
         BalloonDeviceMetrics, BalloonDiscardMetrics, BalloonFreePageReportMetrics,
         BlockDeviceMetrics, BlockDeviceMetricsByDrive, BlockDeviceMetricsRegistryError,
@@ -8718,14 +7279,71 @@ mod tests {
         SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
         SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
         SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics,
-        VirtioNetworkLatencyAggregate, VsockDeviceMetrics, network_interface_metrics_json_object,
+        VirtioNetworkLatencyAggregate, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::logger::SharedLoggerMetrics;
+    use crate::network::NetworkInterfaceConfigInput;
     use crate::network::VirtioNetworkBackendMetrics;
     use crate::serial::SerialOutputMetrics;
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn configured_metrics_devices(
+        ordinary_block_ids: &[&str],
+        vhost_user_block_ids: &[&str],
+        network_ids: &[&str],
+    ) -> ConfiguredMetricsDevices {
+        ConfiguredMetricsDevices::from_test_ids(
+            ordinary_block_ids,
+            vhost_user_block_ids,
+            network_ids,
+        )
+    }
+
+    fn metrics_values(output: &TestMetricsOutput) -> Vec<serde_json::Value> {
+        output
+            .lines()
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("metrics line should be valid JSON"))
+            .collect()
+    }
+
+    fn only_metrics_value(output: &TestMetricsOutput) -> serde_json::Value {
+        let values = metrics_values(output);
+        assert_eq!(
+            values.len(),
+            1,
+            "exactly one metrics line should be written"
+        );
+        values.into_iter().next().expect("one metrics value")
+    }
+
+    fn metrics_values_from_text(output: &str) -> Vec<serde_json::Value> {
+        output
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("metrics line should be valid JSON"))
+            .collect()
+    }
+
+    fn only_metrics_value_from_file(path: &std::path::Path) -> serde_json::Value {
+        let output = fs::read_to_string(path).expect("metrics output should be readable");
+        let values = metrics_values_from_text(&output);
+        assert_eq!(
+            values.len(),
+            1,
+            "exactly one metrics line should be written"
+        );
+        values.into_iter().next().expect("one metrics value")
+    }
+
+    fn without_timestamp(mut value: serde_json::Value) -> serde_json::Value {
+        value
+            .as_object_mut()
+            .expect("metrics line root should be an object")
+            .remove("utc_timestamp_ms");
+        value
+    }
 
     fn unique_metrics_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -8759,6 +7377,20 @@ mod tests {
                 .accept_next_write_then_fail = true;
         }
 
+        fn fail_next_newline(&self) {
+            self.state
+                .lock()
+                .expect("test metrics output lock should not be poisoned")
+                .fail_next_newline = true;
+        }
+
+        fn fail_next_flush(&self) {
+            self.state
+                .lock()
+                .expect("test metrics output lock should not be poisoned")
+                .fail_next_flush = true;
+        }
+
         fn lines(&self) -> Vec<String> {
             self.state
                 .lock()
@@ -8771,27 +7403,167 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestMetricsOutputState {
         accept_next_write_then_fail: bool,
+        fail_next_flush: bool,
+        fail_next_newline: bool,
         fail_next_write: bool,
         lines: Vec<String>,
     }
 
     impl MetricsOutput for TestMetricsOutput {
-        fn write_json_line(&mut self, line: &serde_json::Value) -> Result<(), MetricsFlushError> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             let mut state = self
                 .state
                 .lock()
                 .expect("test metrics output lock should not be poisoned");
             if state.fail_next_write {
                 state.fail_next_write = false;
-                return Err(MetricsFlushError::Write(ErrorKind::BrokenPipe));
+                return Err(io::Error::from(ErrorKind::BrokenPipe));
+            }
+            if bytes == b"\n" && state.fail_next_newline {
+                state.fail_next_newline = false;
+                return Err(io::Error::from(ErrorKind::BrokenPipe));
             }
 
-            state.lines.push(line.to_string());
+            if bytes != b"\n" {
+                state.lines.push(
+                    String::from_utf8(bytes.to_vec())
+                        .expect("canonical metrics line should be UTF-8"),
+                );
+            }
             if state.accept_next_write_then_fail {
                 state.accept_next_write_then_fail = false;
-                return Err(MetricsFlushError::Write(ErrorKind::BrokenPipe));
+                return Err(io::Error::from(ErrorKind::BrokenPipe));
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("test metrics output lock should not be poisoned");
+            if state.fail_next_flush {
+                state.fail_next_flush = false;
+                return Err(io::Error::from(ErrorKind::BrokenPipe));
             }
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ScriptedWrite {
+        Accept(usize),
+        Report(usize),
+        Error(ErrorKind),
+        Zero,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ScriptedMetricsOutput {
+        state: Arc<Mutex<ScriptedMetricsOutputState>>,
+    }
+
+    #[derive(Debug)]
+    struct ScriptedMetricsOutputState {
+        actions: VecDeque<ScriptedWrite>,
+        bytes: Vec<u8>,
+        flush_error: Option<ErrorKind>,
+        flush_count: usize,
+    }
+
+    impl ScriptedMetricsOutput {
+        fn new(actions: impl IntoIterator<Item = ScriptedWrite>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(ScriptedMetricsOutputState {
+                    actions: actions.into_iter().collect(),
+                    bytes: Vec::new(),
+                    flush_error: None,
+                    flush_count: 0,
+                })),
+            }
+        }
+
+        fn with_flush_error(self, error: ErrorKind) -> Self {
+            self.state
+                .lock()
+                .expect("scripted output lock should not be poisoned")
+                .flush_error = Some(error);
+            self
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.state
+                .lock()
+                .expect("scripted output lock should not be poisoned")
+                .bytes
+                .clone()
+        }
+
+        fn flush_count(&self) -> usize {
+            self.state
+                .lock()
+                .expect("scripted output lock should not be poisoned")
+                .flush_count
+        }
+    }
+
+    impl MetricsOutput for ScriptedMetricsOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("scripted output lock should not be poisoned");
+            match state.actions.pop_front() {
+                Some(ScriptedWrite::Accept(limit)) => {
+                    let accepted = limit.min(bytes.len());
+                    state.bytes.extend_from_slice(&bytes[..accepted]);
+                    Ok(accepted)
+                }
+                Some(ScriptedWrite::Report(progress)) => Ok(progress),
+                Some(ScriptedWrite::Error(error)) => Err(io::Error::from(error)),
+                Some(ScriptedWrite::Zero) => Ok(0),
+                None => {
+                    state.bytes.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("scripted output lock should not be poisoned");
+            state.flush_count += 1;
+            match state.flush_error.take() {
+                Some(error) => Err(io::Error::from(error)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingFixedClock {
+        now: SystemTime,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl super::firecracker::MetricsClock for CountingFixedClock {
+        fn now(&self) -> SystemTime {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.now
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingMetricsLineSerializer(super::firecracker::MetricsLineBuildError);
+
+    impl super::firecracker::MetricsLineSerializer for FailingMetricsLineSerializer {
+        fn serialize(
+            &self,
+            _line: &super::firecracker::FirecrackerMetricsLine,
+        ) -> Result<Vec<u8>, super::firecracker::MetricsLineBuildError> {
+            Err(self.0)
         }
     }
 
@@ -9052,12 +7824,9 @@ mod tests {
         let output = TestMetricsOutput::default();
         state.sink = Some(super::MetricsSink::new(Box::new(output.clone())));
         assert_eq!(state.flush(), Ok(true));
-        assert_eq!(
-            output.lines(),
-            [
-                r#"{"deprecated_api":{"deprecated_http_api_calls":1},"vmm":{"metrics_flush_count":1}}"#
-            ]
-        );
+        let value = only_metrics_value(&output);
+        assert_eq!(value["deprecated_api"]["deprecated_http_api_calls"], 1);
+        assert_eq!(value["vmm"]["panic_count"], 0);
     }
 
     #[test]
@@ -9073,10 +7842,14 @@ mod tests {
         assert_eq!(state.flush(), Ok(true));
 
         let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        let values = metrics_values_from_text(&output);
+        assert_eq!(values.len(), 2);
+        assert!(
+            values
+                .iter()
+                .all(|value| value.as_object().unwrap().len() == 24)
         );
+        assert!(values.iter().all(|value| value["vmm"]["panic_count"] == 0));
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -9096,24 +7869,41 @@ mod tests {
         record_all_process_metrics(&mut state);
         shared_logger_metrics.record_missed_log();
         shared_logger_metrics.record_rate_limited_log();
-        assert_eq!(state.flush_with_diagnostics(&first), Ok(true));
-        assert_eq!(state.flush_with_diagnostics(&first), Ok(true));
+        let configured = configured_metrics_devices(&["rootfs"], &[], &["eth0"]);
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&first, &configured),
+            Ok(true)
+        );
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&first, &configured),
+            Ok(true)
+        );
 
         record_all_process_metrics(&mut state);
         shared_logger_metrics.record_missed_log();
         shared_logger_metrics.record_rate_limited_log();
-        assert_eq!(state.flush_with_diagnostics(&next), Ok(true));
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&next, &configured),
+            Ok(true)
+        );
 
         let lines = output.lines();
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], lines[2]);
+        let first_value: serde_json::Value =
+            serde_json::from_str(&lines[0]).expect("metrics line should be valid JSON");
+        let third_value: serde_json::Value =
+            serde_json::from_str(&lines[2]).expect("metrics line should be valid JSON");
+        assert_eq!(
+            without_timestamp(first_value),
+            without_timestamp(third_value)
+        );
 
         let unchanged: serde_json::Value =
             serde_json::from_str(&lines[1]).expect("metrics line should be valid JSON");
         let root = unchanged
             .as_object()
             .expect("metrics line root should be an object");
-        assert_eq!(root.len(), 5);
+        assert_eq!(root.len(), 26);
         assert!(root.contains_key("api_server"));
         assert!(root.contains_key("block"));
         assert!(root.contains_key("block_rootfs"));
@@ -9124,16 +7914,18 @@ mod tests {
             unchanged["api_server"]["process_startup_time_cpu_us"],
             5_000
         );
-        assert_eq!(unchanged["block"]["read_agg"]["min_us"], 12);
-        assert_eq!(unchanged["block"]["read_agg"]["max_us"], 30);
+        assert_eq!(unchanged["block"]["read_agg"]["min_us"], 0);
+        assert_eq!(unchanged["block"]["read_agg"]["max_us"], 0);
         assert_eq!(unchanged["block"]["read_agg"]["sum_us"], 0);
-        assert_eq!(unchanged["block"]["write_agg"]["min_us"], 13);
-        assert_eq!(unchanged["block"]["write_agg"]["max_us"], 31);
+        assert_eq!(unchanged["block"]["write_agg"]["min_us"], 0);
+        assert_eq!(unchanged["block"]["write_agg"]["max_us"], 0);
         assert_eq!(unchanged["block"]["write_agg"]["sum_us"], 0);
+        assert_eq!(unchanged["block_rootfs"]["read_agg"]["min_us"], 12);
+        assert_eq!(unchanged["block_rootfs"]["read_agg"]["max_us"], 30);
         assert_eq!(unchanged["latencies_us"]["pause_vm"], 101);
         assert_eq!(unchanged["latencies_us"]["resume_vm"], 102);
-        assert_eq!(unchanged["vmm"]["boot_run_loop_status"], "running");
-        assert_eq!(unchanged["vmm"]["metrics_flush_count"], 1);
+        assert!(unchanged["vmm"].get("boot_run_loop_status").is_none());
+        assert_eq!(unchanged["vmm"]["panic_count"], 0);
     }
 
     #[test]
@@ -9149,18 +7941,12 @@ mod tests {
         state.deprecated_api.deprecated_http_api_calls = 2;
         assert_eq!(state.flush(), Ok(true));
 
-        assert_eq!(
-            output.lines(),
-            [
-                format!(
-                    r#"{{"deprecated_api":{{"deprecated_http_api_calls":{}}},"vmm":{{"metrics_flush_count":1}}}}"#,
-                    u64::MAX - 1
-                ),
-                r#"{"deprecated_api":{"deprecated_http_api_calls":1},"vmm":{"metrics_flush_count":1}}"#.to_owned(),
-                r#"{"vmm":{"metrics_flush_count":1}}"#.to_owned(),
-                r#"{"deprecated_api":{"deprecated_http_api_calls":2},"vmm":{"metrics_flush_count":1}}"#.to_owned(),
-            ]
-        );
+        let values = metrics_values(&output);
+        let counts: Vec<_> = values
+            .iter()
+            .map(|value| value["deprecated_api"]["deprecated_http_api_calls"].as_u64())
+            .collect();
+        assert_eq!(counts, [Some(u64::MAX - 1), Some(1), Some(0), Some(2)]);
     }
 
     #[test]
@@ -9183,10 +7969,23 @@ mod tests {
                 .with_drive_metrics("gone", BlockDeviceMetrics::default().with_update_count(4)),
         );
 
-        assert_eq!(state.flush_with_diagnostics(&first), Ok(true));
-        assert_eq!(state.flush_with_diagnostics(&second), Ok(true));
-        assert_eq!(state.flush_with_diagnostics(&third), Ok(true));
-        assert_eq!(state.flush_with_diagnostics(&third), Ok(true));
+        let configured = configured_metrics_devices(&["data", "gone", "new"], &[], &[]);
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&first, &configured),
+            Ok(true)
+        );
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&second, &configured),
+            Ok(true)
+        );
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&third, &configured),
+            Ok(true)
+        );
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&third, &configured),
+            Ok(true)
+        );
 
         let lines = output.lines();
         let values: Vec<serde_json::Value> = lines
@@ -9204,14 +8003,13 @@ mod tests {
         assert!(data_position < gone_position);
         assert_eq!(values[1]["block_data"]["update_count"], 3);
         assert_eq!(values[1]["block_new"]["update_count"], 2);
-        assert!(values[1].get("block_gone").is_none());
+        assert_eq!(values[1]["block_gone"]["update_count"], 0);
         assert_eq!(values[2]["block_data"]["update_count"], 1);
         assert_eq!(values[2]["block_gone"]["update_count"], 4);
-        assert!(values[2].get("block_new").is_none());
-        assert_eq!(
-            values[3],
-            serde_json::json!({"vmm": {"metrics_flush_count": 1}})
-        );
+        assert_eq!(values[2]["block_new"]["update_count"], 0);
+        assert_eq!(values[3]["block_data"]["update_count"], 0);
+        assert_eq!(values[3]["block_gone"]["update_count"], 0);
+        assert_eq!(values[3]["block_new"]["update_count"], 0);
     }
 
     #[test]
@@ -9231,12 +8029,15 @@ mod tests {
         assert_eq!(first.flush(), Ok(true));
         assert_eq!(second.flush(), Ok(true));
 
-        let expected = [
-            r#"{"logger":{"missed_log_count":1},"vmm":{"metrics_flush_count":1}}"#,
-            r#"{"logger":{"missed_log_count":1},"vmm":{"metrics_flush_count":1}}"#,
-        ];
-        assert_eq!(first_output.lines(), expected);
-        assert_eq!(second_output.lines(), expected);
+        for output in [&first_output, &second_output] {
+            let values = metrics_values(output);
+            assert_eq!(values.len(), 2);
+            assert!(
+                values
+                    .iter()
+                    .all(|value| value["logger"]["missed_log_count"] == 1)
+            );
+        }
     }
 
     #[test]
@@ -9252,12 +8053,9 @@ mod tests {
         );
         assert_eq!(state.flush(), Ok(true));
 
-        assert_eq!(
-            output.lines(),
-            [
-                r#"{"deprecated_api":{"deprecated_http_api_calls":1},"logger":{"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#
-            ]
-        );
+        let value = only_metrics_value(&output);
+        assert_eq!(value["deprecated_api"]["deprecated_http_api_calls"], 1);
+        assert_eq!(value["logger"]["missed_metrics_count"], 1);
     }
 
     #[test]
@@ -9278,8 +8076,8 @@ mod tests {
         assert_eq!(state.flush(), Ok(true));
 
         assert_eq!(
-            output.lines(),
-            [r#"{"logger":{"missed_metrics_count":2},"vmm":{"metrics_flush_count":1}}"#]
+            only_metrics_value(&output)["logger"]["missed_metrics_count"],
+            2
         );
     }
 
@@ -9299,13 +8097,10 @@ mod tests {
         state.record_deprecated_api_call();
         assert_eq!(state.flush(), Ok(true));
 
-        assert_eq!(
-            output.lines(),
-            [
-                r#"{"deprecated_api":{"deprecated_http_api_calls":1},"vmm":{"metrics_flush_count":1}}"#,
-                r#"{"deprecated_api":{"deprecated_http_api_calls":2},"logger":{"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#,
-            ]
-        );
+        let values = metrics_values(&output);
+        assert_eq!(values[0]["deprecated_api"]["deprecated_http_api_calls"], 1);
+        assert_eq!(values[1]["deprecated_api"]["deprecated_http_api_calls"], 2);
+        assert_eq!(values[1]["logger"]["missed_metrics_count"], 1);
     }
 
     #[test]
@@ -9322,13 +8117,210 @@ mod tests {
         state.record_deprecated_api_call();
         assert_eq!(state.flush(), Ok(true));
 
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["deprecated_api"]["deprecated_http_api_calls"], 1);
+        assert_eq!(values[1]["deprecated_api"]["deprecated_http_api_calls"], 2);
+        assert_eq!(values[1]["logger"]["missed_metrics_count"], 1);
+    }
+
+    #[test]
+    fn captures_the_clock_once_for_both_serialization_passes() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let calls = Arc::new(AtomicU64::new(0));
+        state.clock = Box::new(CountingFixedClock {
+            now: UNIX_EPOCH + Duration::from_millis(1_234),
+            calls: Arc::clone(&calls),
+        });
+
+        assert_eq!(state.flush(), Ok(true));
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(only_metrics_value(&output)["utc_timestamp_ms"], 1_234);
+    }
+
+    #[test]
+    fn clock_failure_retains_the_baseline_and_records_missed_metrics() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        state.record_deprecated_api_call();
+        state.clock = Box::new(CountingFixedClock {
+            now: UNIX_EPOCH - Duration::from_millis(1),
+            calls: Arc::new(AtomicU64::new(0)),
+        });
+
+        assert_eq!(state.flush(), Err(MetricsFlushError::Clock));
+        assert!(output.lines().is_empty());
+
+        state.clock = Box::new(CountingFixedClock {
+            now: UNIX_EPOCH + Duration::from_millis(1),
+            calls: Arc::new(AtomicU64::new(0)),
+        });
+        assert_eq!(state.flush(), Ok(true));
+
+        let value = only_metrics_value(&output);
+        assert_eq!(value["deprecated_api"]["deprecated_http_api_calls"], 1);
+        assert_eq!(value["logger"]["missed_metrics_count"], 1);
+    }
+
+    #[test]
+    fn construction_failures_do_not_touch_the_sink_or_advance_the_baseline() {
+        for (source, expected) in [
+            (
+                super::firecracker::MetricsLineBuildError::Allocation,
+                MetricsFlushError::Allocation,
+            ),
+            (
+                super::firecracker::MetricsLineBuildError::Serialization,
+                MetricsFlushError::Serialization,
+            ),
+            (
+                super::firecracker::MetricsLineBuildError::LineTooLong,
+                MetricsFlushError::LineTooLong,
+            ),
+        ] {
+            let output = TestMetricsOutput::default();
+            let mut state = MetricsState::with_test_output(output.clone());
+            state.record_deprecated_api_call();
+            state.serializer = Box::new(FailingMetricsLineSerializer(source));
+
+            assert_eq!(state.flush(), Err(expected));
+            assert!(output.lines().is_empty());
+
+            state.serializer = Box::<super::firecracker::SystemMetricsLineSerializer>::default();
+            assert_eq!(state.flush(), Ok(true));
+            let value = only_metrics_value(&output);
+            assert_eq!(value["deprecated_api"]["deprecated_http_api_calls"], 1);
+            assert_eq!(value["logger"]["missed_metrics_count"], 1);
+        }
+    }
+
+    #[test]
+    fn metrics_sink_retries_partial_and_interrupted_writes() {
+        let output = ScriptedMetricsOutput::new([
+            ScriptedWrite::Accept(1),
+            ScriptedWrite::Error(ErrorKind::Interrupted),
+        ]);
+        let mut sink = super::MetricsSink::new(Box::new(output.clone()));
+
+        assert_eq!(sink.write_metrics_line(b"{}"), Ok(()));
+        assert_eq!(output.bytes(), b"{}\n");
+        assert_eq!(output.flush_count(), 1);
+    }
+
+    #[test]
+    fn metrics_sink_reports_zero_and_invalid_write_progress() {
+        let zero = ScriptedMetricsOutput::new([ScriptedWrite::Zero]);
+        let mut zero_sink = super::MetricsSink::new(Box::new(zero));
         assert_eq!(
-            output.lines(),
-            [
-                r#"{"deprecated_api":{"deprecated_http_api_calls":1},"vmm":{"metrics_flush_count":1}}"#,
-                r#"{"deprecated_api":{"deprecated_http_api_calls":2},"logger":{"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#,
-            ]
+            zero_sink.write_metrics_line(b"{}"),
+            Err(MetricsFlushError::Write(ErrorKind::WriteZero))
         );
+
+        let overreported = ScriptedMetricsOutput::new([ScriptedWrite::Report(3)]);
+        let mut overreported_sink = super::MetricsSink::new(Box::new(overreported));
+        assert_eq!(
+            overreported_sink.write_metrics_line(b"{}"),
+            Err(MetricsFlushError::Write(ErrorKind::InvalidData))
+        );
+    }
+
+    #[test]
+    fn metrics_sink_reports_blocked_write_newline_and_flush_stages() {
+        let blocked = ScriptedMetricsOutput::new([ScriptedWrite::Error(ErrorKind::WouldBlock)]);
+        let mut blocked_sink = super::MetricsSink::new(Box::new(blocked));
+        assert_eq!(
+            blocked_sink.write_metrics_line(b"{}"),
+            Err(MetricsFlushError::Write(ErrorKind::WouldBlock))
+        );
+
+        let newline = ScriptedMetricsOutput::new([
+            ScriptedWrite::Accept(usize::MAX),
+            ScriptedWrite::Error(ErrorKind::BrokenPipe),
+        ]);
+        let mut newline_sink = super::MetricsSink::new(Box::new(newline));
+        assert_eq!(
+            newline_sink.write_metrics_line(b"{}"),
+            Err(MetricsFlushError::Newline(ErrorKind::BrokenPipe))
+        );
+
+        let flush = ScriptedMetricsOutput::new([]).with_flush_error(ErrorKind::BrokenPipe);
+        let mut flush_sink = super::MetricsSink::new(Box::new(flush));
+        assert_eq!(
+            flush_sink.write_metrics_line(b"{}"),
+            Err(MetricsFlushError::Flush(ErrorKind::BrokenPipe))
+        );
+    }
+
+    #[test]
+    fn newline_failure_retains_the_baseline_for_retry() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        state.record_deprecated_api_call();
+        output.fail_next_newline();
+
+        assert_eq!(
+            state.flush(),
+            Err(MetricsFlushError::Newline(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(state.flush(), Ok(true));
+
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["deprecated_api"]["deprecated_http_api_calls"], 1);
+        assert_eq!(values[1]["deprecated_api"]["deprecated_http_api_calls"], 1);
+        assert_eq!(values[1]["logger"]["missed_metrics_count"], 1);
+    }
+
+    #[test]
+    fn flush_failure_retains_the_baseline_for_retry() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        state.record_deprecated_api_call();
+        output.fail_next_flush();
+
+        assert_eq!(
+            state.flush(),
+            Err(MetricsFlushError::Flush(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(state.flush(), Ok(true));
+
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["deprecated_api"]["deprecated_http_api_calls"], 1);
+        assert_eq!(values[1]["deprecated_api"]["deprecated_http_api_calls"], 1);
+        assert_eq!(values[1]["logger"]["missed_metrics_count"], 1);
+    }
+
+    #[test]
+    fn invalid_configured_inventory_retains_the_baseline_and_redacts_ids() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        state.record_deprecated_api_call();
+        let networks = (0..17)
+            .map(|index| {
+                let id = format!("secret_network_{index}");
+                NetworkInterfaceConfigInput::new(&id, &id, format!("tap{index}"))
+                    .validate()
+                    .expect("individual network configuration should validate")
+            })
+            .collect::<Vec<_>>();
+
+        let error = state
+            .flush_with_diagnostics_and_configs(&MetricsDiagnostics::default(), &[], &networks)
+            .expect_err("the metrics inventory should reject more than sixteen networks");
+        assert_eq!(error, MetricsFlushError::ConfiguredDevices);
+        assert!(!error.to_string().contains("secret_network"));
+        assert!(!format!("{error:?}").contains("secret_network"));
+
+        assert_eq!(
+            state.flush_with_diagnostics_and_configs(&MetricsDiagnostics::default(), &[], &[],),
+            Ok(true)
+        );
+        let value = only_metrics_value(&output);
+        assert_eq!(value["deprecated_api"]["deprecated_http_api_calls"], 1);
+        assert_eq!(value["logger"]["missed_metrics_count"], 1);
     }
 
     #[test]
@@ -9347,12 +8339,10 @@ mod tests {
         );
         assert_eq!(state.flush(), Ok(true));
 
-        assert_eq!(
-            output.lines(),
-            [
-                r#"{"logger":{"missed_log_count":1,"missed_metrics_count":1,"rate_limited_log_count":1},"vmm":{"metrics_flush_count":1}}"#
-            ]
-        );
+        let value = only_metrics_value(&output);
+        assert_eq!(value["logger"]["missed_log_count"], 1);
+        assert_eq!(value["logger"]["missed_metrics_count"], 1);
+        assert_eq!(value["logger"]["rate_limited_log_count"], 1);
     }
 
     #[test]
@@ -9363,21 +8353,18 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(
-            output.lines(),
-            [r#"{"signals":{"sigpipe":2},"vmm":{"metrics_flush_count":1}}"#]
-        );
+        assert_eq!(only_metrics_value(&output)["signals"]["sigpipe"], 2);
     }
 
     #[test]
-    fn omits_signal_metrics_when_empty() {
+    fn writes_zero_signal_metrics_when_empty() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics = MetricsDiagnostics::new().with_signal_metrics(SignalMetrics::default());
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+        assert_eq!(only_metrics_value(&output)["signals"]["sigpipe"], 0);
     }
 
     #[test]
@@ -9391,7 +8378,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_boot_run_loop_diagnostics_when_provided() {
+    fn keeps_failed_boot_run_loop_diagnostics_internal() {
         let path = unique_metrics_path("diagnostics");
         let mut state = MetricsState::default();
         let diagnostics =
@@ -9402,17 +8389,15 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["vmm"]["panic_count"], 0);
+        assert!(value["vmm"].get("boot_run_loop_status").is_none());
 
         fs::remove_file(path).expect("fixture should clean up");
     }
 
     #[test]
-    fn writes_paused_boot_run_loop_diagnostics_when_provided() {
+    fn keeps_paused_boot_run_loop_diagnostics_internal() {
         let path = unique_metrics_path("paused-diagnostics");
         let mut state = MetricsState::default();
         let diagnostics =
@@ -9423,11 +8408,9 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"vmm\":{\"boot_run_loop_status\":\"paused\",\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["vmm"]["panic_count"], 0);
+        assert!(value["vmm"].get("boot_run_loop_status").is_none());
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -9446,16 +8429,16 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(
-            output.lines(),
-            [
-                r#"{"uart":{"error_count":1,"flush_count":0,"input_count":0,"interrupt_count":0,"missed_read_count":0,"missed_write_count":2,"overrun_count":0,"rate_limiter_dropped_bytes":4,"read_count":0,"write_count":3},"vmm":{"metrics_flush_count":1}}"#
-            ]
-        );
+        let value = only_metrics_value(&output);
+        assert_eq!(value["uart"]["error_count"], 1);
+        assert_eq!(value["uart"]["missed_write_count"], 2);
+        assert_eq!(value["uart"]["rate_limiter_dropped_bytes"], 4);
+        assert_eq!(value["uart"]["write_count"], 3);
+        assert!(value["uart"].get("input_count").is_none());
     }
 
     #[test]
-    fn omits_serial_output_diagnostics_when_dropped_bytes_are_zero() {
+    fn writes_zero_serial_output_metrics_when_empty() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics =
@@ -9463,28 +8446,37 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+        assert_eq!(only_metrics_value(&output)["uart"]["write_count"], 0);
     }
 
     #[test]
     fn writes_block_device_metrics_when_provided() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
-        let diagnostics =
-            MetricsDiagnostics::new().with_block_device_metrics(block_metrics_with_all_fields());
-
-        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+        let metrics = block_metrics_with_all_fields();
+        let diagnostics = MetricsDiagnostics::new()
+            .with_block_device_metrics(metrics)
+            .with_block_device_metrics_by_drive(
+                BlockDeviceMetricsByDrive::new().with_drive_metrics("rootfs", metrics),
+            );
+        let configured = configured_metrics_devices(&["rootfs"], &[], &[]);
 
         assert_eq!(
-            output.lines(),
-            [
-                r#"{"block":{"event_fails":1,"execute_fails":2,"flush_count":4,"invalid_reqs_count":3,"io_engine_throttled_events":14,"queue_event_count":5,"rate_limiter_event_count":12,"rate_limiter_throttled_events":13,"read_agg":{"max_us":30,"min_us":12,"sum_us":42},"read_bytes":6,"read_count":8,"update_count":10,"update_fails":11,"write_agg":{"max_us":31,"min_us":13,"sum_us":44},"write_bytes":7,"write_count":9},"vmm":{"metrics_flush_count":1}}"#
-            ]
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
         );
+
+        let value = only_metrics_value(&output);
+        assert_eq!(value["block"]["event_fails"], 1);
+        assert_eq!(value["block"]["read_agg"]["min_us"], 0);
+        assert_eq!(value["block"]["read_agg"]["max_us"], 0);
+        assert_eq!(value["block"]["read_agg"]["sum_us"], 42);
+        assert_eq!(value["block_rootfs"]["read_agg"]["min_us"], 12);
+        assert_eq!(value["block_rootfs"]["read_agg"]["max_us"], 30);
     }
 
     #[test]
-    fn omits_empty_block_device_metrics() {
+    fn writes_zero_block_metrics_when_empty() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics =
@@ -9492,7 +8484,7 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+        assert_eq!(only_metrics_value(&output)["block"]["event_fails"], 0);
     }
 
     #[test]
@@ -9518,14 +8510,29 @@ mod tests {
                     .with_drive_metrics("data", data_metrics),
             );
 
-        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
-
+        let configured = configured_metrics_devices(&["data", "rootfs"], &[], &[]);
         assert_eq!(
-            output.lines(),
-            [
-                r#"{"block":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"io_engine_throttled_events":0,"queue_event_count":2,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0,"read_agg":{"max_us":4,"min_us":2,"sum_us":6},"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_agg":{"max_us":5,"min_us":3,"sum_us":8},"write_bytes":256,"write_count":1},"block_data":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"io_engine_throttled_events":0,"queue_event_count":1,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0,"read_agg":{"max_us":0,"min_us":0,"sum_us":0},"read_bytes":0,"read_count":0,"update_count":0,"update_fails":0,"write_agg":{"max_us":5,"min_us":3,"sum_us":8},"write_bytes":256,"write_count":1},"block_rootfs":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"io_engine_throttled_events":0,"queue_event_count":1,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0,"read_agg":{"max_us":4,"min_us":2,"sum_us":6},"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_agg":{"max_us":0,"min_us":0,"sum_us":0},"write_bytes":0,"write_count":0},"vmm":{"metrics_flush_count":1}}"#
-            ]
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
         );
+
+        let value = only_metrics_value(&output);
+        assert_eq!(value["block"]["queue_event_count"], 2);
+        assert_eq!(
+            value["block"]["read_agg"],
+            serde_json::json!({
+                "min_us": 0, "max_us": 0, "sum_us": 6
+            })
+        );
+        assert_eq!(
+            value["block"]["write_agg"],
+            serde_json::json!({
+                "min_us": 0, "max_us": 0, "sum_us": 8
+            })
+        );
+        assert_eq!(value["block_data"]["write_bytes"], 256);
+        assert_eq!(value["block_rootfs"]["read_bytes"], 512);
+        assert!(value.get("block_noop").is_none());
     }
 
     #[test]
@@ -9554,11 +8561,16 @@ mod tests {
         let diagnostics = MetricsDiagnostics::new()
             .with_block_device_metrics(registry.aggregate_snapshot())
             .with_block_device_metrics_by_drive(by_drive);
-        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
-        let line = &output.lines()[0];
-        assert!(line.contains(r#""block":{"config_change_time_us":37"#));
-        assert!(line.contains(r#""block_vhost":{"config_change_time_us":37"#));
-        assert!(!line.contains("block_file"));
+        let configured = configured_metrics_devices(&["file"], &["vhost"], &[]);
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
+        let value = only_metrics_value(&output);
+        assert_eq!(value["vhost_user_block_vhost"]["config_change_time_us"], 37);
+        assert!(value.get("block_file").is_some());
+        assert!(value.get("block_vhost").is_none());
+        assert!(value["block"].get("config_change_time_us").is_none());
 
         let old_generation = registry
             .claim_drive_lease("vhost")
@@ -9877,15 +8889,20 @@ mod tests {
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
         assert_eq!(
-            output.lines(),
-            [
-                r#"{"pmem":{"activate_fails":1,"cfg_fails":2,"event_fails":3,"queue_event_count":4,"rate_limiter_event_count":5,"rate_limiter_throttled_events":6},"vmm":{"metrics_flush_count":1}}"#
-            ]
+            only_metrics_value(&output)["pmem"],
+            serde_json::json!({
+                "activate_fails": 1,
+                "cfg_fails": 2,
+                "event_fails": 3,
+                "queue_event_count": 4,
+                "rate_limiter_throttled_events": 6,
+                "rate_limiter_event_count": 5,
+            })
         );
     }
 
     #[test]
-    fn omits_empty_pmem_device_metrics() {
+    fn writes_zero_pmem_metrics_when_empty() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics =
@@ -9893,7 +8910,7 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+        assert_eq!(only_metrics_value(&output)["pmem"]["event_fails"], 0);
     }
 
     #[test]
@@ -9915,12 +8932,11 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(
-            output.lines(),
-            [
-                r#"{"pmem":{"activate_fails":0,"cfg_fails":0,"event_fails":1,"queue_event_count":3,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0},"pmem_pmem0":{"activate_fails":0,"cfg_fails":0,"event_fails":1,"queue_event_count":1,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0},"pmem_pmem1":{"activate_fails":0,"cfg_fails":0,"event_fails":0,"queue_event_count":2,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0},"vmm":{"metrics_flush_count":1}}"#
-            ]
-        );
+        let value = only_metrics_value(&output);
+        assert_eq!(value["pmem"]["event_fails"], 1);
+        assert_eq!(value["pmem"]["queue_event_count"], 3);
+        assert!(value.get("pmem_pmem0").is_none());
+        assert!(value.get("pmem_pmem1").is_none());
     }
 
     #[test]
@@ -10109,21 +9125,29 @@ mod tests {
     fn writes_network_interface_metrics_when_provided() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
+        let metrics = network_metrics_with_all_fields();
         let diagnostics = MetricsDiagnostics::new()
-            .with_network_interface_metrics(network_metrics_with_all_fields());
-
-        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+            .with_network_interface_metrics(metrics)
+            .with_network_interface_metrics_by_interface(
+                NetworkInterfaceMetricsByInterface::new().with_interface_metrics("eth0", metrics),
+            );
+        let configured = configured_metrics_devices(&[], &[], &["eth0"]);
 
         assert_eq!(
-            output.lines(),
-            [
-                r#"{"net":{"activate_fails":1,"cfg_fails":2,"event_fails":3,"no_rx_avail_buffer":4,"no_tx_avail_buffer":5,"rx_bytes_count":7,"rx_count":10,"rx_event_rate_limiter_count":11,"rx_fails":9,"rx_packets_count":8,"rx_queue_event_count":6,"rx_rate_limiter_throttled":12,"tx_bytes_count":13,"tx_count":16,"tx_fails":15,"tx_malformed_frames":14,"tx_packets_count":17,"tx_queue_event_count":18,"tx_rate_limiter_event_count":19,"tx_rate_limiter_throttled":20,"tx_remaining_reqs_count":21,"tx_spoofed_mac_count":22,"vmnet_read_count":23,"vmnet_read_fails":24,"vmnet_read_latency_us":{"max_us":32,"min_us":31,"samples":2,"sum_us":63},"vmnet_read_packets_count":25,"vmnet_read_partial_batches":26,"vmnet_write_count":27,"vmnet_write_fails":28,"vmnet_write_latency_us":{"max_us":34,"min_us":33,"samples":2,"sum_us":67},"vmnet_write_packets_count":29,"vmnet_write_partial_batches":30},"vmm":{"metrics_flush_count":1}}"#
-            ]
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
         );
+
+        let value = only_metrics_value(&output);
+        assert_eq!(value["net"]["activate_fails"], 1);
+        assert_eq!(value["net"]["rx_bytes_count"], 7);
+        assert_eq!(value["net"]["tx_remaining_reqs_count"], 21);
+        assert_eq!(value["net_eth0"]["tx_spoofed_mac_count"], 22);
+        assert!(value["net"].get("vmnet_read_count").is_none());
     }
 
     #[test]
-    fn omits_empty_network_interface_metrics() {
+    fn writes_zero_network_metrics_when_empty() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics = MetricsDiagnostics::new()
@@ -10131,7 +9155,7 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+        assert_eq!(only_metrics_value(&output)["net"]["event_fails"], 0);
     }
 
     #[test]
@@ -10157,36 +9181,25 @@ mod tests {
                     .with_interface_metrics("eth1", eth1_metrics),
             );
 
-        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+        let configured = configured_metrics_devices(&[], &[], &["eth0", "eth1"]);
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
 
         let lines = output.lines();
         let line = lines.first().expect("one metrics line should be written");
         let value: serde_json::Value =
             serde_json::from_str(line).expect("metrics line should be valid JSON");
         assert_eq!(lines.len(), 1);
-        assert_eq!(
-            value.get("net"),
-            Some(&serde_json::Value::Object(
-                network_interface_metrics_json_object(eth0_metrics.merged_with(eth1_metrics))
-            ))
-        );
-        assert_eq!(
-            value.get("net_eth0"),
-            Some(&serde_json::Value::Object(
-                network_interface_metrics_json_object(eth0_metrics)
-            ))
-        );
-        assert_eq!(
-            value.get("net_eth1"),
-            Some(&serde_json::Value::Object(
-                network_interface_metrics_json_object(eth1_metrics)
-            ))
-        );
+        assert_eq!(value["net"]["rx_bytes_count"], 128);
+        assert_eq!(value["net"]["tx_bytes_count"], 64);
+        assert_eq!(value["net_eth0"]["rx_bytes_count"], 128);
+        assert_eq!(value["net_eth0"]["tx_bytes_count"], 0);
+        assert_eq!(value["net_eth1"]["rx_bytes_count"], 0);
+        assert_eq!(value["net_eth1"]["tx_bytes_count"], 64);
         assert!(value.get("net_noop").is_none());
-        assert_eq!(
-            value.get("vmm"),
-            Some(&serde_json::json!({ "metrics_flush_count": 1 }))
-        );
+        assert_eq!(value["vmm"], serde_json::json!({ "panic_count": 0 }));
     }
 
     #[test]
@@ -10537,23 +9550,20 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(
-            output.lines(),
-            [
-                r#"{"mmds":{"connections_created":12,"connections_destroyed":13,"rx_accepted":1,"rx_accepted_err":2,"rx_accepted_unusual":3,"rx_bad_eth":4,"rx_count":7,"rx_invalid_token":5,"rx_no_token":6,"tx_bytes":8,"tx_count":9,"tx_errors":10,"tx_frames":11},"vmm":{"metrics_flush_count":1}}"#
-            ]
-        );
+        let value = only_metrics_value(&output);
+        assert_eq!(value["mmds"]["rx_accepted"], 1);
+        assert_eq!(value["mmds"]["connections_destroyed"], 13);
     }
 
     #[test]
-    fn omits_empty_mmds_metrics() {
+    fn writes_zero_mmds_metrics_when_empty() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics = MetricsDiagnostics::new().with_mmds_metrics(MmdsMetrics::default());
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+        assert_eq!(only_metrics_value(&output)["mmds"]["rx_count"], 0);
     }
 
     #[test]
@@ -10646,16 +9656,13 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(
-            output.lines(),
-            [
-                r#"{"vmm":{"metrics_flush_count":1},"vsock":{"activate_fails":1,"cfg_fails":2,"conn_event_fails":7,"conns_added":14,"conns_killed":15,"conns_removed":16,"ev_queue_event_fails":5,"killq_resync":17,"muxer_event_fails":6,"rx_bytes_count":10,"rx_packets_count":12,"rx_queue_event_count":8,"rx_queue_event_fails":3,"rx_read_fails":20,"tx_bytes_count":11,"tx_flush_fails":18,"tx_packets_count":13,"tx_queue_event_count":9,"tx_queue_event_fails":4,"tx_write_fails":19}}"#
-            ]
-        );
+        let value = only_metrics_value(&output);
+        assert_eq!(value["vsock"]["activate_fails"], 1);
+        assert_eq!(value["vsock"]["rx_read_fails"], 20);
     }
 
     #[test]
-    fn omits_empty_vsock_device_metrics() {
+    fn writes_zero_vsock_metrics_when_empty() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics =
@@ -10663,7 +9670,7 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+        assert_eq!(only_metrics_value(&output)["vsock"]["activate_fails"], 0);
     }
 
     #[test]
@@ -10767,16 +9774,13 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(
-            output.lines(),
-            [
-                r#"{"entropy":{"activate_fails":1,"entropy_bytes":4,"entropy_event_count":3,"entropy_event_fails":2,"entropy_rate_limiter_throttled":6,"host_rng_fails":5,"rate_limiter_event_count":7},"vmm":{"metrics_flush_count":1}}"#
-            ]
-        );
+        let value = only_metrics_value(&output);
+        assert_eq!(value["entropy"]["activate_fails"], 1);
+        assert_eq!(value["entropy"]["rate_limiter_event_count"], 7);
     }
 
     #[test]
-    fn omits_empty_entropy_device_metrics() {
+    fn writes_zero_entropy_metrics_when_empty() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics =
@@ -10784,7 +9788,7 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+        assert_eq!(only_metrics_value(&output)["entropy"]["entropy_bytes"], 0);
     }
 
     #[test]
@@ -10863,15 +9867,17 @@ mod tests {
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
         assert_eq!(
-            output.lines(),
-            [
-                r#"{"rtc":{"error_count":3,"missed_read_count":1,"missed_write_count":2},"vmm":{"metrics_flush_count":1}}"#
-            ]
+            only_metrics_value(&output)["rtc"],
+            serde_json::json!({
+                "error_count": 3,
+                "missed_read_count": 1,
+                "missed_write_count": 2,
+            })
         );
     }
 
     #[test]
-    fn omits_empty_rtc_device_metrics() {
+    fn writes_zero_rtc_metrics_when_empty() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics =
@@ -10879,7 +9885,7 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+        assert_eq!(only_metrics_value(&output)["rtc"]["error_count"], 0);
     }
 
     #[test]
@@ -10958,15 +9964,26 @@ mod tests {
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
         assert_eq!(
-            output.lines(),
-            [
-                r#"{"balloon":{"activate_fails":1,"deflate_count":5,"event_fails":6,"free_page_report_advised_bytes":17,"free_page_report_count":15,"free_page_report_fails":19,"free_page_report_requested_bytes":16,"free_page_report_skipped_bytes":18,"hinting_discard_advised_bytes":12,"hinting_discard_attempts":11,"hinting_discard_fails":14,"hinting_discard_skipped_bytes":13,"inflate_count":2,"inflate_discard_advised_bytes":8,"inflate_discard_attempts":7,"inflate_discard_fails":10,"inflate_discard_skipped_bytes":9,"stats_update_fails":4,"stats_updates_count":3},"vmm":{"metrics_flush_count":1}}"#
-            ]
+            only_metrics_value(&output)["balloon"],
+            serde_json::json!({
+                "activate_fails": 1,
+                "inflate_count": 2,
+                "stats_updates_count": 3,
+                "stats_update_fails": 4,
+                "deflate_count": 5,
+                "event_fails": 6,
+                "free_page_report_count": 15,
+                "free_page_report_freed": 17,
+                "free_page_report_fails": 19,
+                "free_page_hint_count": 11,
+                "free_page_hint_freed": 12,
+                "free_page_hint_fails": 14,
+            })
         );
     }
 
     #[test]
-    fn omits_empty_balloon_device_metrics() {
+    fn writes_zero_balloon_metrics_when_empty() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics =
@@ -10974,7 +9991,7 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+        assert_eq!(only_metrics_value(&output)["balloon"]["inflate_count"], 0);
     }
 
     #[test]
@@ -10994,7 +10011,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_firecracker_shaped_memory_hotplug_metrics_with_lifecycle_extensions() {
+    fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let metrics = SharedMemoryHotplugDeviceMetrics::default();
@@ -11046,13 +10063,6 @@ mod tests {
                 "state_agg": {"min_us": 17, "max_us": 17, "sum_us": 17},
                 "state_count": 1,
                 "state_fails": 0,
-                "interrupt_fails": 1,
-                "rollback_count": 3,
-                "rollback_fails": 1,
-                "owner_cleanup_count": 2,
-                "owner_cleanup_fails": 1,
-                "teardown_count": 2,
-                "teardown_fails": 1,
             })
         );
     }
@@ -11088,7 +10098,10 @@ mod tests {
         assert_eq!(second["memory_hotplug"]["plug_agg"]["min_us"], 7);
         assert_eq!(second["memory_hotplug"]["plug_agg"]["max_us"], 11);
         assert_eq!(second["memory_hotplug"]["plug_agg"]["sum_us"], 11);
-        assert!(unchanged.get("memory_hotplug").is_none());
+        assert_eq!(unchanged["memory_hotplug"]["plug_count"], 0);
+        assert_eq!(unchanged["memory_hotplug"]["plug_agg"]["min_us"], 0);
+        assert_eq!(unchanged["memory_hotplug"]["plug_agg"]["max_us"], 0);
+        assert_eq!(unchanged["memory_hotplug"]["plug_agg"]["sum_us"], 0);
     }
 
     #[test]
@@ -11231,17 +10244,15 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"api_server\":{\"process_startup_time_cpu_us\":5000,\"process_startup_time_us\":1000},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["api_server"]["process_startup_time_us"], 1_000);
+        assert_eq!(value["api_server"]["process_startup_time_cpu_us"], 5_000);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
 
     #[test]
-    fn omits_api_server_cpu_time_when_only_parent_cpu_time_is_provided() {
+    fn includes_parent_cpu_time_when_only_parent_cpu_time_is_provided() {
         let path = unique_metrics_path("startup-parent-only");
         let mut state = MetricsState::default();
         let diagnostics = MetricsDiagnostics::new().with_parent_cpu_time_us(3000);
@@ -11251,8 +10262,9 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(output, "{\"vmm\":{\"metrics_flush_count\":1}}\n");
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["api_server"]["process_startup_time_us"], 0);
+        assert_eq!(value["api_server"]["process_startup_time_cpu_us"], 3_000);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11268,11 +10280,9 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"api_server\":{\"process_startup_time_cpu_us\":2000},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["api_server"]["process_startup_time_us"], 0);
+        assert_eq!(value["api_server"]["process_startup_time_cpu_us"], 2_000);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11291,11 +10301,9 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"api_server\":{\"process_startup_time_cpu_us\":0,\"process_startup_time_us\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["api_server"]["process_startup_time_us"], 0);
+        assert_eq!(value["api_server"]["process_startup_time_cpu_us"], 0);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11313,11 +10321,8 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"api_server\":{\"process_startup_time_cpu_us\":18446744073709551615},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["api_server"]["process_startup_time_cpu_us"], u64::MAX);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11335,11 +10340,9 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":1,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["put_api_requests"]["actions_count"], 2);
+        assert_eq!(value["put_api_requests"]["actions_fails"], 1);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11363,11 +10366,11 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":1,\"drive_fails\":1,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":1,\"mmds_fails\":1,\"network_count\":1,\"network_fails\":1,\"pmem_count\":0,\"pmem_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["patch_api_requests"]["drive_count"], 1);
+        assert_eq!(value["patch_api_requests"]["drive_fails"], 1);
+        assert_eq!(value["patch_api_requests"]["machine_cfg_count"], 2);
+        assert_eq!(value["patch_api_requests"]["mmds_fails"], 1);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11396,11 +10399,13 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":2,\"boot_source_fails\":1,\"cpu_cfg_count\":1,\"cpu_cfg_fails\":1,\"drive_count\":1,\"drive_fails\":1,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":0,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":1,\"network_fails\":1,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":1,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["put_api_requests"]["boot_source_count"], 2);
+        assert_eq!(value["put_api_requests"]["cpu_cfg_fails"], 1);
+        assert_eq!(value["put_api_requests"]["drive_fails"], 1);
+        assert_eq!(value["put_api_requests"]["machine_cfg_count"], 2);
+        assert_eq!(value["put_api_requests"]["network_fails"], 1);
+        assert_eq!(value["put_api_requests"]["vsock_fails"], 1);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11418,11 +10423,9 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"mmds_count\":2,\"mmds_fails\":1,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["put_api_requests"]["mmds_count"], 2);
+        assert_eq!(value["put_api_requests"]["mmds_fails"], 1);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11442,11 +10445,11 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":1,\"pmem_fails\":1},\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["patch_api_requests"]["pmem_count"], 1);
+        assert_eq!(value["patch_api_requests"]["pmem_fails"], 1);
+        assert_eq!(value["put_api_requests"]["pmem_count"], 2);
+        assert_eq!(value["put_api_requests"]["pmem_fails"], 1);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11467,17 +10470,18 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"get_api_requests\":{\"balloon_count\":0,\"hotplug_memory_count\":1,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":1,\"hotplug_memory_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":2,\"hotplug_memory_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["get_api_requests"]["hotplug_memory_count"], 1);
+        assert_eq!(value["patch_api_requests"]["hotplug_memory_count"], 1);
+        assert_eq!(value["patch_api_requests"]["hotplug_memory_fails"], 1);
+        assert_eq!(value["put_api_requests"]["hotplug_memory_count"], 2);
+        assert_eq!(value["put_api_requests"]["hotplug_memory_fails"], 1);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
 
     #[test]
-    fn writes_balloon_api_request_metrics_when_recorded() {
+    fn omits_non_schema_balloon_api_request_metrics_when_recorded() {
         let path = unique_metrics_path("api-request-balloon");
         let mut state = MetricsState::default();
 
@@ -11494,11 +10498,10 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"get_api_requests\":{\"balloon_count\":2,\"hotplug_memory_count\":0,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"balloon_count\":2,\"balloon_fails\":1,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"balloon_count\":2,\"balloon_fails\":1,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert!(value["get_api_requests"].get("balloon_count").is_none());
+        assert!(value["patch_api_requests"].get("balloon_count").is_none());
+        assert!(value["put_api_requests"].get("balloon_count").is_none());
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11515,10 +10518,9 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
         assert_eq!(
-            output,
-            "{\"deprecated_api\":{\"deprecated_http_api_calls\":2},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            only_metrics_value_from_file(&path)["deprecated_api"]["deprecated_http_api_calls"],
+            2
         );
 
         fs::remove_file(path).expect("fixture should clean up");
@@ -11536,11 +10538,9 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"latencies_us\":{\"pause_vm\":0,\"resume_vm\":42},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["latencies_us"]["pause_vm"], 0);
+        assert_eq!(value["latencies_us"]["resume_vm"], 42);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11558,11 +10558,10 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"latencies_us\":{\"diff_create_snapshot\":2,\"full_create_snapshot\":1,\"load_snapshot\":3},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["latencies_us"]["full_create_snapshot"], 1);
+        assert_eq!(value["latencies_us"]["diff_create_snapshot"], 2);
+        assert_eq!(value["latencies_us"]["load_snapshot"], 3);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11584,11 +10583,13 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":1,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":1,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["put_api_requests"]["metrics_count"], 2);
+        assert_eq!(value["put_api_requests"]["metrics_fails"], 1);
+        assert_eq!(value["put_api_requests"]["logger_count"], 1);
+        assert_eq!(value["put_api_requests"]["logger_fails"], 1);
+        assert_eq!(value["put_api_requests"]["serial_count"], 1);
+        assert_eq!(value["put_api_requests"]["serial_fails"], 1);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11608,11 +10609,11 @@ mod tests {
             .expect("metrics should configure");
         assert_eq!(state.flush(), Ok(true));
 
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"get_api_requests\":{\"balloon_count\":0,\"hotplug_memory_count\":0,\"instance_info_count\":1,\"machine_cfg_count\":1,\"mmds_count\":2,\"vmm_version_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let value = only_metrics_value_from_file(&path);
+        assert_eq!(value["get_api_requests"]["instance_info_count"], 1);
+        assert_eq!(value["get_api_requests"]["machine_cfg_count"], 1);
+        assert_eq!(value["get_api_requests"]["mmds_count"], 2);
+        assert_eq!(value["get_api_requests"]["vmm_version_count"], 1);
 
         fs::remove_file(path).expect("fixture should clean up");
     }
@@ -11670,9 +10671,10 @@ mod tests {
         );
         assert_eq!(state.flush(), Ok(true));
 
-        let first_output =
-            fs::read_to_string(&first_path).expect("first metrics output should be readable");
-        assert_eq!(first_output, "{\"vmm\":{\"metrics_flush_count\":1}}\n");
+        assert_eq!(
+            only_metrics_value_from_file(&first_path)["vmm"]["panic_count"],
+            0
+        );
         assert!(!second_path.exists());
 
         fs::remove_file(first_path).expect("fixture should clean up");
@@ -11699,10 +10701,17 @@ mod tests {
 
         state.commit_config(prepared);
         assert_eq!(state.flush(), Ok(true));
-        assert_eq!(
-            fs::read_to_string(&path).expect("metrics output should read"),
-            "seed\n{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let output = fs::read_to_string(&path).expect("metrics output should read");
+        let mut lines = output.lines();
+        assert_eq!(lines.next(), Some("seed"));
+        let value: serde_json::Value = serde_json::from_str(
+            lines
+                .next()
+                .expect("canonical metrics line should follow seed"),
+        )
+        .expect("metrics line should be valid JSON");
+        assert_eq!(value["vmm"]["panic_count"], 0);
+        assert_eq!(lines.next(), None);
 
         fs::remove_file(path).expect("fixture should clean up");
     }

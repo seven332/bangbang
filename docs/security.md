@@ -2099,8 +2099,21 @@ is resource-specific:
   initial attempt, Running and Paused sessions make 60-second best-effort
   attempts, explicit runtime `FlushMetrics` propagates a configured-sink write
   error to its caller, and normal convergence makes one best-effort final
-  attempt without replacing the process result. Ordinary handle drop closes
-  the sink.
+  attempt without replacing the process result. Every attempt uses the strict
+  Firecracker v1.16.0 arm64 shape: 24 fixed numeric roots plus sorted roots for
+  committed ordinary-block, network, and vhost-user-block identities. Dynamic
+  suffixes never come from host paths, guest data, or diagnostic registry keys.
+  The inventory is limited to 985 identities, 16 networks, and 51,429,376
+  copied identifier bytes. Ordinary handle drop closes the sink.
+  The process captures producers and time once, counts serialization without
+  allocation, exactly reserves the second-pass buffer, and rejects a complete
+  JSON-plus-newline record above 64 MiB before sink access. It then writes JSON,
+  one newline, and flushes. Allocation/serialization/size errors and write,
+  newline, or flush error kinds are closed and omit IDs, paths, fragments, and
+  metric values. The previous-successful baseline changes only after all three
+  output stages succeed. A sink can expose an accepted prefix before failure,
+  so later replay is intentionally at-least-once and neither durable nor
+  exactly-once.
 - Normal execution installs `/logger` delivery on one close-on-exec,
   nonblocking internal pipe plus one process-owned stdout forwarder. The
   forwarder owns a writable close-on-exec stdout duplicate but never changes
@@ -3018,26 +3031,25 @@ output durable, grant a guest or worker sink authority, or implement the
 separately owned tracing surface.
 
 Current session-initial, periodic, explicit, and normal-terminal metrics lines
-can expose selected API request counters, startup timing fields, logger and
-serial counters, a terse boot run-loop status summary, and minimal device
-fields such as block
-queue/update/throttling activity, virtio-pmem queue activity, virtio-net packet
-counters, and virtio-vsock queue, packet, byte, and connection cleanup counters,
-plus virtio-rng request, byte, host-randomness failure, and event-failure
-counters, PL031 RTC invalid read/write and error counters, and balloon
-inflate/hint/report discard attempts, reporting-requested bytes, actual advised
-bytes, skipped-edge bytes, failed attempts, and block latency samples. Counters
-and accumulated durations are emitted as increments; startup timing, latest
-lifecycle latency, status, and block latency minima/maxima/sample counts are
-stores. The typed previous-success baseline advances only after the complete
-line is written, so failed or ambiguous writes retain data for an at-least-once
-retry. A lower generation emits a full current sample, and absent device
-families remain absent rather than being synthesized. None of these fields may
-expose Unix socket paths, guest payload bytes, host stream data, worker error
-strings, host paths or pointers, guest serial bytes, randomness bytes, host
-entropy-source details, guest descriptors, guest memory addresses, or
-unexpected guest data. Future observability changes must preserve these
-redaction, transaction, and failure-isolation boundaries.
+always expose the complete pinned numeric schema. Implemented matching
+producers populate API, startup, logger, signal, UART, block, pmem aggregate,
+network, MMDS, vsock, entropy, RTC, balloon, interrupt, and memory-hotplug
+fields; required fields without exact producer evidence remain zero. Zero is
+therefore not a capability claim. Configured ordinary block, network, and
+vhost-user identities receive roots even when their producer registry is empty,
+while unconfigured identities do not appear.
+
+The strict line excludes Bangbang-only `vmm.metrics_flush_count`, string boot
+status, dynamic pmem roots, vmnet fields, newer balloon API/device fields, extra
+UART diagnostics, and ordinary-block configuration-change values. Internal
+state for these concepts is not a public output entitlement. None of the
+canonical fields or errors may expose Unix socket paths, guest payload bytes,
+host stream data, worker error strings, host paths or pointers, guest serial
+bytes, randomness bytes, host entropy-source details, guest descriptors, guest
+memory addresses, configured IDs in failures, line fragments, or unexpected
+guest data. Future observability changes must preserve this exact schema,
+redaction, bounded-allocation, transaction, and failure-isolation boundary or
+introduce a separately versioned extension format.
 
 MMDS control-plane contents are process-local in-memory JSON state configured
 through the unauthenticated local API socket. Treat metadata as sensitive host

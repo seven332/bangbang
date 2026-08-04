@@ -9487,8 +9487,12 @@ mod tests {
         mut stream: UnixStream,
         features: u64,
         config: [u8; VIRTIO_BLOCK_CONFIG_SIZE],
-    ) -> thread::JoinHandle<TestVhostUserObservation> {
-        thread::spawn(move || {
+    ) -> (
+        thread::JoinHandle<TestVhostUserObservation>,
+        mpsc::Sender<()>,
+    ) {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let peer = thread::spawn(move || {
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("peer read timeout should set");
@@ -9574,13 +9578,17 @@ mod tests {
             write_test_vhost_user_pipe(&call.descriptors[0]);
             acknowledge_test_vhost_user_request(&mut stream, &enable);
             read_test_vhost_user_pipe(&kick.descriptors[0]);
+            release_receiver
+                .recv()
+                .expect("test frontend should observe the call before peer closure");
 
             TestVhostUserObservation {
                 guest_features,
                 memory_region_count,
                 queue_size,
             }
-        })
+        });
+        (peer, release_sender)
     }
 
     #[derive(Clone, Copy)]
@@ -14436,7 +14444,8 @@ mod tests {
         let mut config_bytes = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
         config_bytes[..8].copy_from_slice(&2_u64.to_le_bytes());
         config_bytes[20..24].copy_from_slice(&512_u32.to_le_bytes());
-        let peer = spawn_complete_test_vhost_user_peer(peer_stream, features, config_bytes);
+        let (peer, release_peer) =
+            spawn_complete_test_vhost_user_peer(peer_stream, features, config_bytes);
 
         let frontend = PreparedVhostUserBlockFrontend::discover(
             frontend_stream,
@@ -14519,6 +14528,9 @@ mod tests {
         assert!(dispatch.needs_queue_interrupt());
         assert!(dispatch.queue_dispatch().is_none());
 
+        release_peer
+            .send(())
+            .expect("test vhost-user peer should remain connected");
         let observation = peer.join().expect("vhost-user peer should finish");
         assert_eq!(observation.guest_features, features);
         assert_eq!(

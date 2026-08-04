@@ -2142,20 +2142,16 @@ mod macos_arm64 {
                 .expect("serial stdio metrics should contain a generation"),
         )
         .expect("serial stdio metrics generation should be JSON");
-        assert_eq!(
-            metrics.pointer("/uart/input_count"),
-            Some(&serde_json::json!(serial_input.len())),
-            "UART metrics must account for the exact bounded input stream"
-        );
+        for extension in ["input_count", "interrupt_count", "overrun_count"] {
+            assert!(
+                metrics["uart"].get(extension).is_none(),
+                "strict UART metrics must not publish {extension}"
+            );
+        }
         assert_eq!(
             metrics.pointer("/uart/error_count"),
             Some(&serde_json::json!(0)),
             "serial stdin EOF must detach without recording an input error"
-        );
-        assert_eq!(
-            metrics.pointer("/uart/overrun_count"),
-            Some(&serde_json::json!(0)),
-            "bounded host reads must not overrun the UART FIFO"
         );
 
         let output = bangbang.terminate();
@@ -2495,6 +2491,7 @@ mod macos_arm64 {
         let scratch_backend_socket = test_dir.path().join("scratch-vhost.sock");
         let scratch_path = test_dir.path().join("scratch.img");
         let metrics_path = test_dir.path().join("metrics.out");
+        let logger_path = test_dir.path().join("logger.out");
         let serial_path = test_dir.path().join("serial.out");
         let snapshot_state = test_dir.path().join("rejected-vhost.state");
         let snapshot_memory = test_dir.path().join("rejected-vhost.memory");
@@ -2513,6 +2510,7 @@ mod macos_arm64 {
             path
         };
         create_block_backing_with_prefix(&scratch_path, 8, VHOST_USER_BLOCK_HOST_MARKER);
+        create_empty_file(&logger_path);
         create_empty_file(&serial_path);
 
         let scratch_backend = VhostUserBlockBackend::start(
@@ -2555,6 +2553,17 @@ mod macos_arm64 {
                 r#"{"vcpu_count":1,"mem_size_mib":256}"#,
             ),
             "PUT /machine-config vhost-user block",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/logger",
+                &format!(
+                    r#"{{"log_path":{},"level":"Warn"}}"#,
+                    json_string(path_text(&logger_path))
+                ),
+            ),
+            "PUT /logger vhost-user block",
         );
         assert_no_content_response(
             &http_put_json(
@@ -2925,13 +2934,14 @@ mod macos_arm64 {
             .finish()
             .expect("scratch vhost-user backend should stop after disconnect");
         assert!(terminal_scratch_report.activated);
-        wait_for_block_event_failure(
+        wait_for_vhost_user_block_disconnect(
             &socket_path,
             &metrics_path,
+            &logger_path,
             "scratch",
             GUEST_EXECUTION_TIMEOUT,
         )
-        .expect("scratch backend closure should be reflected in block metrics");
+        .expect("scratch backend closure should reach the public log and metrics contracts");
         let after_disconnect = http_get(&socket_path, "/");
         assert_response_contains(
             &after_disconnect,
@@ -3109,15 +3119,15 @@ mod macos_arm64 {
         assert_eq!(report.memory_table_requests, 1);
     }
 
-    fn wait_for_block_event_failure(
+    fn wait_for_vhost_user_block_disconnect(
         socket_path: &Path,
         metrics_path: &Path,
+        logger_path: &Path,
         drive_id: &str,
         timeout: Duration,
     ) -> Result<(), String> {
         let started = Instant::now();
-        let metrics_key = format!("block_{drive_id}");
-        loop {
+        let logger_output = loop {
             let response =
                 http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#);
             if !response.starts_with("HTTP/1.1 204 No Content\r\n") {
@@ -3125,25 +3135,54 @@ mod macos_arm64 {
                     "FlushMetrics failed after backend death:\n{response}"
                 ));
             }
-            let event_fails = fs::read_to_string(metrics_path).ok().and_then(|output| {
-                output.lines().rev().find_map(|line| {
-                    serde_json::from_str::<serde_json::Value>(line)
-                        .ok()?
-                        .get(&metrics_key)?
-                        .get("event_fails")?
-                        .as_u64()
-                })
-            });
-            if event_fails.is_some_and(|count| count > 0) {
-                return Ok(());
+            let output = fs::read_to_string(logger_path).unwrap_or_default();
+            if output.lines().any(|line| {
+                line.contains("device-kind=block operation=vhost-user-notification")
+                    && (line.contains("outcome=disconnected") || line.contains("outcome=terminal"))
+            }) {
+                break output;
             }
             if started.elapsed() >= timeout {
                 return Err(format!(
-                    "timed out after {timeout:?} waiting for {metrics_key}.event_fails; latest={event_fails:?}"
+                    "timed out after {timeout:?} waiting for a terminal vhost-user notification; logger:\n{output}"
                 ));
             }
             std::thread::sleep(Duration::from_millis(25));
+        };
+
+        let metrics_key = format!("vhost_user_block_{drive_id}");
+        let output = fs::read_to_string(metrics_path).map_err(|error| {
+            format!(
+                "failed to read metrics {} after backend death: {error}",
+                metrics_path.display()
+            )
+        })?;
+        let metrics = output
+            .lines()
+            .rev()
+            .find_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()?
+                    .get(&metrics_key)?
+                    .as_object()
+                    .cloned()
+            })
+            .ok_or_else(|| format!("metrics should contain {metrics_key}; output:\n{output}"))?;
+        let expected = [
+            "activate_fails",
+            "cfg_fails",
+            "init_time_us",
+            "activate_time_us",
+            "config_change_time_us",
+        ];
+        if metrics.len() != expected.len()
+            || expected.iter().any(|field| !metrics.contains_key(*field))
+        {
+            return Err(format!(
+                "{metrics_key} should expose the exact Firecracker v1.16 fields; observed={metrics:?}; logger:\n{logger_output}"
+            ));
         }
+        Ok(())
     }
 
     fn create_mbr_partitioned_rootfs(source: &Path, destination: &Path) {
@@ -4178,7 +4217,6 @@ mod macos_arm64 {
             ("deflate_count", 1),
             ("inflate_count", 1),
             ("free_page_report_count", 1),
-            ("inflate_discard_attempts", 1),
         ] {
             assert!(
                 balloon_metric_total(metrics_path, field) >= minimum,
@@ -4186,6 +4224,24 @@ mod macos_arm64 {
                 fs::read_to_string(metrics_path).unwrap_or_default()
             );
         }
+        assert_metrics_family_extensions_absent(
+            metrics_path,
+            "balloon",
+            &[
+                "inflate_discard_attempts",
+                "inflate_discard_advised_bytes",
+                "inflate_discard_skipped_bytes",
+                "inflate_discard_fails",
+                "hinting_discard_attempts",
+                "hinting_discard_advised_bytes",
+                "hinting_discard_skipped_bytes",
+                "hinting_discard_fails",
+                "free_page_report_requested_bytes",
+                "free_page_report_advised_bytes",
+                "free_page_report_skipped_bytes",
+            ],
+            context,
+        );
         assert_clean_shutdown(
             destination.terminate(),
             socket_path,
@@ -4903,16 +4959,26 @@ mod macos_arm64 {
             "unplug_discard_fails",
             "unplug_all_fails",
             "state_fails",
-            "interrupt_fails",
-            "rollback_fails",
-            "owner_cleanup_fails",
-            "teardown_fails",
         ] {
             assert_eq!(
                 metrics[field].as_u64(),
                 Some(0),
                 "{context} destination memory_hotplug.{field} should remain zero; metrics:\n{}",
                 fs::read_to_string(metrics_path).unwrap_or_default()
+            );
+        }
+        for extension in [
+            "interrupt_fails",
+            "rollback_count",
+            "rollback_fails",
+            "owner_cleanup_count",
+            "owner_cleanup_fails",
+            "teardown_count",
+            "teardown_fails",
+        ] {
+            assert!(
+                metrics.get(extension).is_none(),
+                "{context} must not publish memory_hotplug.{extension}"
             );
         }
         assert_clean_shutdown(
@@ -6973,16 +7039,11 @@ mod macos_arm64 {
                 .expect("remaining-device metrics should contain a final generation"),
         )
         .expect("remaining-device final metrics generation should be JSON");
-        assert_eq!(
-            final_metrics.pointer("/uart/input_count"),
-            Some(&serde_json::json!(serial_input.len())),
-        );
+        for extension in ["input_count", "interrupt_count", "overrun_count"] {
+            assert!(final_metrics["uart"].get(extension).is_none());
+        }
         assert_eq!(
             final_metrics.pointer("/uart/error_count"),
-            Some(&serde_json::json!(0)),
-        );
-        assert_eq!(
-            final_metrics.pointer("/uart/overrun_count"),
             Some(&serde_json::json!(0)),
         );
         assert_clean_shutdown(
@@ -7500,6 +7561,7 @@ mod macos_arm64 {
         let runtime_pmem_one_path = test_dir.path().join("storage-runtime-pmem-one.img");
         let runtime_pmem_two_path = test_dir.path().join("storage-runtime-pmem-two.img");
         let metrics_path = test_dir.path().join("storage-metrics.out");
+        let logger_path = test_dir.path().join("storage-logger.out");
         let serial_path = test_dir.path().join("storage-serial.out");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
@@ -7527,6 +7589,7 @@ mod macos_arm64 {
         create_pmem_backing(&runtime_pmem_one_path, STORAGE_RUNTIME_PMEM_ONE_HOST_MARKER);
         create_pmem_backing(&runtime_pmem_two_path, STORAGE_RUNTIME_PMEM_TWO_HOST_MARKER);
         create_empty_file(&metrics_path);
+        create_empty_file(&logger_path);
         create_empty_file(&serial_path);
         let vhost_backend = VhostUserBlockBackend::start(
             &vhost_socket_path,
@@ -7544,6 +7607,17 @@ mod macos_arm64 {
                 r#"{"vcpu_count":1,"mem_size_mib":256}"#,
             ),
             "PUT aggregate storage machine config",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/logger",
+                &format!(
+                    r#"{{"log_path":{},"level":"Warn"}}"#,
+                    json_string(path_text(&logger_path))
+                ),
+            ),
+            "PUT aggregate storage logger",
         );
         assert_no_content_response(
             &http_put_json(
@@ -8104,13 +8178,14 @@ mod macos_arm64 {
         assert!(terminal_vhost_report.reads > 0);
         assert!(terminal_vhost_report.writes > 0);
         assert!(terminal_vhost_report.flushes > 0);
-        wait_for_block_event_failure(
+        wait_for_vhost_user_block_disconnect(
             &socket_path,
             &metrics_path,
+            &logger_path,
             "vhostdata",
             PCI_ALL_VIRTIO_GUEST_TIMEOUT,
         )
-        .expect("aggregate terminal vhost-user closure should reach block metrics");
+        .expect("aggregate terminal vhost-user closure should reach public observability");
         let after_backend_death = http_get(&socket_path, "/");
         assert_response_contains(
             &after_backend_death,
@@ -14832,6 +14907,7 @@ mod macos_arm64 {
         let memory_path = test_dir.path().join(format!("{case}.memory"));
         let source_socket = test_dir.path().join(format!("{}-s", product.code()));
         let source_metrics = test_dir.path().join(format!("{case}-source.metrics"));
+        let source_logger = test_dir.path().join(format!("{case}-source.logger"));
         let instance_id = test_dir.instance_id();
 
         fs::write(
@@ -14843,6 +14919,7 @@ mod macos_arm64 {
             create_zeroed_block_backing(&drive_path);
         }
         create_empty_file(&source_metrics);
+        create_empty_file(&source_logger);
 
         let mut source = BangbangProcess::start_with_extra_args(
             &source_socket,
@@ -14853,6 +14930,7 @@ mod macos_arm64 {
             &source_socket,
             &kernel_path,
             &source_metrics,
+            &source_logger,
             product.has_storage().then_some(drive_path.as_path()),
         );
         source
@@ -14863,21 +14941,12 @@ mod macos_arm64 {
             .unwrap_or_else(|error| panic!("{case} serial source should become ready: {error}"));
 
         source.write_stdin(&crate::snapshot_serial::source_input());
-        wait_for_uart_metric(
-            &source_socket,
-            &source_metrics,
-            "input_count",
-            u64::try_from(crate::snapshot_serial::SOURCE_PREFIX_LEN)
-                .expect("serial source prefix length should fit"),
-            &format!("{case} source RX fill"),
-        );
-        wait_for_uart_metric(
-            &source_socket,
-            &source_metrics,
-            "interrupt_count",
-            1,
-            &format!("{case} source receive interrupt"),
-        );
+        wait_for_file_contains_marker(
+            &source_logger,
+            b"device-kind=serial operation=input-read outcome=succeeded",
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .unwrap_or_else(|error| panic!("{case} source input should reach the UART owner: {error}"));
         assert_no_content_response(
             &http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
             &format!("PATCH {case} serial source Paused"),
@@ -14913,6 +14982,12 @@ mod macos_arm64 {
         assert_clean_shutdown(
             source_output,
             &source_socket,
+            &format!("{case} serial snapshot source"),
+        );
+        assert_metrics_family_extensions_absent(
+            &source_metrics,
+            "uart",
+            &["input_count", "interrupt_count", "overrun_count"],
             &format!("{case} serial snapshot source"),
         );
 
@@ -15017,11 +15092,11 @@ mod macos_arm64 {
                 &destination_socket,
                 &format!("{case} {mode} serial destination"),
             );
-            assert_eq!(
-                uart_metric_total(&destination_metrics, "input_count"),
-                u64::try_from(crate::snapshot_serial::DESTINATION_SUFFIX_LEN)
-                    .expect("serial destination suffix length should fit"),
-                "{case} {mode} metrics must count only fresh destination bytes"
+            assert_metrics_family_extensions_absent(
+                &destination_metrics,
+                "uart",
+                &["input_count", "interrupt_count", "overrun_count"],
+                &format!("{case} {mode} serial destination"),
             );
             assert!(
                 uart_metric_total(&destination_metrics, "read_count")
@@ -15049,8 +15124,17 @@ mod macos_arm64 {
         socket: &Path,
         kernel: &Path,
         metrics: &Path,
+        logger: &Path,
         drive: Option<&Path>,
     ) {
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/logger",
+                &format!(r#"{{"log_path":{}}}"#, json_string(path_text(logger))),
+            ),
+            "PUT serial snapshot source logger",
+        );
         assert_no_content_response(
             &http_put_json(
                 socket,
@@ -15212,34 +15296,6 @@ mod macos_arm64 {
         );
     }
 
-    fn wait_for_uart_metric(
-        socket: &Path,
-        metrics: &Path,
-        field: &str,
-        expected: u64,
-        context: &str,
-    ) {
-        let deadline = Instant::now()
-            .checked_add(GUEST_EXECUTION_TIMEOUT)
-            .expect("UART metric deadline should fit");
-        loop {
-            assert_no_content_response(
-                &http_put_json(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
-                &format!("FlushMetrics while waiting for {context}"),
-            );
-            let observed = uart_metric_total(metrics, field);
-            if observed >= expected {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{context} should reach uart.{field} >= {expected}; observed={observed}; metrics:\n{}",
-                fs::read_to_string(metrics).unwrap_or_default()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
     fn uart_metric_total(path: &Path, field: &str) -> u64 {
         fs::read_to_string(path)
             .unwrap_or_default()
@@ -15252,6 +15308,35 @@ mod macos_arm64 {
                     .as_u64()
             })
             .fold(0, u64::saturating_add)
+    }
+
+    fn assert_metrics_family_extensions_absent(
+        path: &Path,
+        family: &str,
+        extensions: &[&str],
+        context: &str,
+    ) {
+        let output = fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("{context} metrics should be readable: {error}"));
+        let mut line_count = 0;
+        for line in output.lines() {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("{context} metrics should be JSON: {error}"));
+            let object = value[family]
+                .as_object()
+                .unwrap_or_else(|| panic!("{context} metrics should contain object {family}"));
+            for extension in extensions {
+                assert!(
+                    !object.contains_key(*extension),
+                    "{context} must not publish {family}.{extension}"
+                );
+            }
+            line_count += 1;
+        }
+        assert!(
+            line_count > 0,
+            "{context} should publish at least one metrics line"
+        );
     }
 
     fn assert_configured_serial_snapshot_state(path: &Path, selector: &Path) {
@@ -16687,11 +16772,7 @@ mod macos_arm64 {
                 &http_put_json(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
                 &format!("PUT {context} FlushMetrics"),
             );
-            if snapshot_pmem_metric_total_if_readable(
-                metrics,
-                "epoch_rw",
-                "rate_limiter_throttled_events",
-            ) > 0
+            if snapshot_pmem_metric_total_if_readable(metrics, "rate_limiter_throttled_events") > 0
             {
                 return;
             }
@@ -17086,31 +17167,33 @@ mod macos_arm64 {
             panic!("{context} metrics {} should read: {error}", path.display())
         });
         assert!(
-            snapshot_pmem_metric_total_if_readable(path, "epoch_rw", "queue_event_count") > 0,
+            snapshot_pmem_metric_total_if_readable(path, "queue_event_count") > 0,
             "{context} should report writable pmem queue events; metrics:\n{output}"
         );
         assert!(
-            snapshot_pmem_metric_total_if_readable(
-                path,
-                "epoch_rw",
-                "rate_limiter_throttled_events"
-            ) > 0,
+            snapshot_pmem_metric_total_if_readable(path, "rate_limiter_throttled_events") > 0,
             "{context} should report a throttled writable pmem request; metrics:\n{output}"
         );
         if expect_retry {
             assert!(
-                snapshot_pmem_metric_total_if_readable(
-                    path,
-                    "epoch_rw",
-                    "rate_limiter_event_count"
-                ) > 0,
+                snapshot_pmem_metric_total_if_readable(path, "rate_limiter_event_count") > 0,
                 "{context} should report restored pmem limiter progress; metrics:\n{output}"
             );
         }
+        assert!(
+            output.lines().all(|line| {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    return false;
+                };
+                value
+                    .as_object()
+                    .is_some_and(|root| !root.keys().any(|key| key.starts_with("pmem_")))
+            }),
+            "{context} must not publish dynamic pmem roots; metrics:\n{output}"
+        );
     }
 
-    fn snapshot_pmem_metric_total_if_readable(path: &Path, pmem_id: &str, field: &str) -> u64 {
-        let section = format!("pmem_{pmem_id}");
+    fn snapshot_pmem_metric_total_if_readable(path: &Path, field: &str) -> u64 {
         let Ok(output) = fs::read_to_string(path) else {
             return 0;
         };
@@ -17119,7 +17202,7 @@ mod macos_arm64 {
             .filter_map(|line| {
                 serde_json::from_str::<serde_json::Value>(line)
                     .ok()?
-                    .get(&section)?
+                    .get("pmem")?
                     .get(field)?
                     .as_u64()
             })
@@ -17973,50 +18056,54 @@ mod macos_arm64 {
             (!total.is_empty()).then_some(serde_json::Value::Object(total))
         };
 
-        assert!(
-            output.contains(r#""metrics_flush_count":1"#),
-            "metrics output should include first flush count; output:\n{output}"
-        );
+        for line in &lines {
+            assert!(line["utc_timestamp_ms"].as_u64().is_some());
+            assert_eq!(line["vmm"]["panic_count"], 0);
+            assert!(line["vmm"].get("metrics_flush_count").is_none());
+            assert!(line["vmm"].get("boot_run_loop_status").is_none());
+        }
+
+        let assert_expected_section = |section: &str, expected: &str| {
+            let expected = serde_json::from_str::<serde_json::Value>(expected)
+                .unwrap_or_else(|err| panic!("expected {section} metrics should be JSON: {err}"));
+            let actual = sum_section(section)
+                .unwrap_or_else(|| panic!("canonical metrics should include {section}"));
+            let actual = actual
+                .as_object()
+                .expect("summed metrics section should be an object");
+            for (field, expected_value) in expected
+                .as_object()
+                .expect("expected metrics section should be an object")
+            {
+                if matches!(field.as_str(), "balloon_count" | "balloon_fails") {
+                    continue;
+                }
+                assert_eq!(
+                    actual.get(field),
+                    Some(expected_value),
+                    "metrics output should sum to expected {section}.{field}; output:\n{output}"
+                );
+            }
+        };
+
         if let Some(expected_get_api_requests) = expected_get_api_requests {
-            let expected = serde_json::from_str(expected_get_api_requests)
-                .expect("expected GET API request metrics should be valid JSON");
-            assert_eq!(
-                sum_section("get_api_requests"),
-                Some(expected),
-                "metrics output should sum to expected GET API request counters; output:\n{output}"
-            );
+            assert_expected_section("get_api_requests", expected_get_api_requests);
         }
-        let expected = serde_json::from_str(expected_put_api_requests)
-            .expect("expected PUT API request metrics should be valid JSON");
-        assert_eq!(
-            sum_section("put_api_requests"),
-            Some(expected),
-            "metrics output should sum to expected PUT API request counters; output:\n{output}"
-        );
+        assert_expected_section("put_api_requests", expected_put_api_requests);
         if let Some(expected_patch_api_requests) = expected_patch_api_requests {
-            let expected = serde_json::from_str(expected_patch_api_requests)
-                .expect("expected PATCH API request metrics should be valid JSON");
-            assert_eq!(
-                sum_section("patch_api_requests"),
-                Some(expected),
-                "metrics output should sum to expected PATCH API request counters; output:\n{output}"
-            );
+            assert_expected_section("patch_api_requests", expected_patch_api_requests);
         } else {
-            assert_eq!(
-                sum_section("patch_api_requests"),
-                None,
-                "metrics output should not include PATCH API request counters; output:\n{output}"
+            let patch = sum_section("patch_api_requests")
+                .expect("canonical metrics should include patch_api_requests");
+            assert!(
+                patch
+                    .as_object()
+                    .expect("PATCH metrics should be an object")
+                    .values()
+                    .all(|value| value.as_u64() == Some(0)),
+                "unused PATCH counters should remain zero; output:\n{output}"
             );
         }
-        assert!(
-            output.contains(r#""boot_run_loop_status":"running""#)
-                || output.contains(r#""boot_run_loop_status":"exited""#),
-            "metrics output should include a non-failed boot run-loop status; output:\n{output}"
-        );
-        assert!(
-            !output.contains(r#""boot_run_loop_status":"failed""#),
-            "metrics output should not report failed boot run-loop status; output:\n{output}"
-        );
     }
 
     fn assert_normal_terminal_metrics_output(path: &Path) {
@@ -18040,14 +18127,10 @@ mod macos_arm64 {
             3,
             "session initial, explicit, and normal-terminal attempts should emit three metrics lines; output:\n{output}"
         );
-        assert_eq!(
-            lines
-                .last()
-                .and_then(|line| line.pointer("/vmm/metrics_flush_count"))
-                .and_then(serde_json::Value::as_u64),
-            Some(1),
-            "normal-terminal metrics line should carry the per-success flush marker; output:\n{output}"
-        );
+        let terminal = lines.last().expect("terminal metrics line should exist");
+        assert_eq!(terminal["vmm"]["panic_count"], 0);
+        assert!(terminal["vmm"].get("metrics_flush_count").is_none());
+        assert!(terminal["vmm"].get("boot_run_loop_status").is_none());
     }
 
     fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str]) {
@@ -18220,7 +18303,12 @@ mod macos_arm64 {
             )
         });
         assert!(
-            output.contains(r#""signals":{"sigpipe":1}"#),
+            output.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|value| value.pointer("/signals/sigpipe")?.as_u64())
+                    .is_some_and(|count| count > 0)
+            }),
             "metrics output should include SIGPIPE signal metrics; output:\n{output}"
         );
     }

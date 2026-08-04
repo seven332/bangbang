@@ -1507,21 +1507,14 @@ fn run_production_default_serial_snapshot_continuation(bundle: &Path) {
         .unwrap_or_else(|error| panic!("production serial source should become ready: {error}"));
     let source_input = snapshot_serial::source_input();
     source.write_stdin(&source_input);
-    wait_for_production_uart_metric(
-        &source.socket,
-        &source_fixture.opened_metrics,
-        "input_count",
-        u64::try_from(snapshot_serial::SOURCE_PREFIX_LEN)
-            .expect("serial source prefix length should fit"),
-        "production serial source RX fill",
-    );
-    wait_for_production_uart_metric(
-        &source.socket,
-        &source_fixture.opened_metrics,
-        "interrupt_count",
-        1,
-        "production serial source receive interrupt",
-    );
+    wait_for_file_contains(
+        &source_logger.opened,
+        b"device-kind=serial operation=input-read outcome=succeeded",
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        panic!("production serial source input should reach the UART owner: {error}")
+    });
     assert_http_status(
         &http_request(&source.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
         204,
@@ -1566,6 +1559,10 @@ fn run_production_default_serial_snapshot_continuation(bundle: &Path) {
             String::from_utf8_lossy(&source_input).into_owned(),
             snapshot_serial::SOURCE_READY_MARKER.to_owned(),
         ]),
+    );
+    assert_production_uart_extensions_absent(
+        &source_fixture.opened_metrics,
+        "production serial source",
     );
     assert!(!source.socket.exists());
 
@@ -1622,11 +1619,9 @@ fn run_production_default_serial_snapshot_continuation(bundle: &Path) {
         "production serial destination",
     );
     assert!(!destination.socket.exists());
-    assert_eq!(
-        production_uart_metric_total(&destination_fixture.opened_metrics, "input_count"),
-        u64::try_from(snapshot_serial::DESTINATION_SUFFIX_LEN)
-            .expect("serial destination suffix length should fit"),
-        "destination metrics must exclude bytes left in the terminated source pipe"
+    assert_production_uart_extensions_absent(
+        &destination_fixture.opened_metrics,
+        "production serial destination",
     );
     assert!(
         production_uart_metric_total(&destination_fixture.opened_metrics, "read_count")
@@ -5723,16 +5718,26 @@ fn run_production_memory_hotplug_snapshot_destination(
         "unplug_discard_fails",
         "unplug_all_fails",
         "state_fails",
-        "interrupt_fails",
-        "rollback_fails",
-        "owner_cleanup_fails",
-        "teardown_fails",
     ] {
         assert_eq!(
             metrics[field].as_u64(),
             Some(0),
             "production {case} destination memory_hotplug.{field} should remain zero; metrics:\n{}",
             fs::read_to_string(&fixture.opened_metrics).unwrap_or_default()
+        );
+    }
+    for extension in [
+        "interrupt_fails",
+        "rollback_count",
+        "rollback_fails",
+        "owner_cleanup_count",
+        "owner_cleanup_fails",
+        "teardown_count",
+        "teardown_fails",
+    ] {
+        assert!(
+            metrics.get(extension).is_none(),
+            "production {case} destination must not publish memory_hotplug.{extension}"
         );
     }
     stop_running_launcher(
@@ -6439,13 +6444,30 @@ fn run_production_balloon_snapshot_destination(
         ("deflate_count", 1),
         ("inflate_count", 1),
         ("free_page_report_count", 1),
-        ("inflate_discard_attempts", 1),
     ] {
         assert!(
             production_balloon_metric_total(&fixture.opened_metrics, field) >= minimum,
             "production {case} should publish balloon.{field} >= {minimum}; metrics:\n{metrics}"
         );
     }
+    assert_metrics_family_extensions_absent(
+        &fixture.opened_metrics,
+        "balloon",
+        &[
+            "inflate_discard_attempts",
+            "inflate_discard_advised_bytes",
+            "inflate_discard_skipped_bytes",
+            "inflate_discard_fails",
+            "hinting_discard_attempts",
+            "hinting_discard_advised_bytes",
+            "hinting_discard_skipped_bytes",
+            "hinting_discard_fails",
+            "free_page_report_requested_bytes",
+            "free_page_report_advised_bytes",
+            "free_page_report_skipped_bytes",
+        ],
+        &format!("production {case} balloon destination"),
+    );
     stop_running_launcher(
         &mut running,
         &format!("production {case} restored balloon destination"),
@@ -16687,21 +16709,18 @@ impl OutputGrantFixture {
             lines.len() >= 2,
             "initial and terminal metrics writes should both be present"
         );
-        assert!(
-            lines
-                .iter()
-                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
-            "each appended metrics line should be valid JSON"
-        );
-        assert!(lines.iter().any(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .pointer("/vmm/metrics_flush_count")
-                        .and_then(serde_json::Value::as_u64)
-                })
-                == Some(1)
+        let metrics = lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .expect("each appended metrics line should be valid JSON")
+            })
+            .collect::<Vec<_>>();
+        assert!(metrics.iter().all(|line| {
+            line["utc_timestamp_ms"].as_u64().is_some()
+                && line["vmm"]["panic_count"].as_u64() == Some(0)
+                && line["vmm"].get("metrics_flush_count").is_none()
+                && line["vmm"].get("boot_run_loop_status").is_none()
         }));
 
         let serial = fs::read(serial_path).expect("granted serial output should read");
@@ -19229,35 +19248,6 @@ fn assert_production_entropy_config(socket: &Path, with_storage: bool, context: 
     );
 }
 
-fn wait_for_production_uart_metric(
-    socket: &Path,
-    metrics: &Path,
-    field: &str,
-    expected: u64,
-    context: &str,
-) {
-    let deadline = Instant::now()
-        .checked_add(PROCESS_TIMEOUT)
-        .expect("production UART metric deadline should fit");
-    loop {
-        assert_http_status(
-            &http_put(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
-            204,
-            &format!("FlushMetrics while waiting for {context}"),
-        );
-        let observed = production_uart_metric_total(metrics, field);
-        if observed >= expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{context} should reach uart.{field} >= {expected}; observed={observed}; metrics:\n{}",
-            fs::read_to_string(metrics).unwrap_or_default()
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
 fn production_uart_metric_total(path: &Path, field: &str) -> u64 {
     fs::read_to_string(path)
         .unwrap_or_default()
@@ -19270,6 +19260,44 @@ fn production_uart_metric_total(path: &Path, field: &str) -> u64 {
                 .as_u64()
         })
         .fold(0, u64::saturating_add)
+}
+
+fn assert_metrics_family_extensions_absent(
+    path: &Path,
+    family: &str,
+    extensions: &[&str],
+    context: &str,
+) {
+    let output = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{context} metrics should be readable: {error}"));
+    let mut line_count = 0;
+    for line in output.lines() {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|error| panic!("{context} metrics should be JSON: {error}"));
+        let object = value[family]
+            .as_object()
+            .unwrap_or_else(|| panic!("{context} metrics should contain object {family}"));
+        for extension in extensions {
+            assert!(
+                !object.contains_key(*extension),
+                "{context} must not publish {family}.{extension}"
+            );
+        }
+        line_count += 1;
+    }
+    assert!(
+        line_count > 0,
+        "{context} should publish at least one metrics line"
+    );
+}
+
+fn assert_production_uart_extensions_absent(path: &Path, context: &str) {
+    assert_metrics_family_extensions_absent(
+        path,
+        "uart",
+        &["input_count", "interrupt_count", "overrun_count"],
+        context,
+    );
 }
 
 fn assert_serial_snapshot_output_redacted(
@@ -19635,12 +19663,7 @@ fn wait_for_snapshot_pmem_throttle(
             204,
             &format!("PUT {context} FlushMetrics"),
         );
-        if snapshot_pmem_metric_total_if_readable(
-            metrics,
-            "epoch_rw",
-            "rate_limiter_throttled_events",
-        ) > 0
-        {
+        if snapshot_pmem_metric_total_if_readable(metrics, "rate_limiter_throttled_events") > 0 {
             return;
         }
         assert!(
@@ -19691,21 +19714,30 @@ fn assert_snapshot_pmem_metrics(path: &Path, expect_retry: bool, context: &str) 
         panic!("{context} metrics {} should read: {error}", path.display())
     });
     assert!(
-        snapshot_pmem_metric_total_if_readable(path, "epoch_rw", "queue_event_count") > 0,
+        snapshot_pmem_metric_total_if_readable(path, "queue_event_count") > 0,
         "{context} should report writable pmem queue events; metrics:\n{output}"
     );
     assert!(
-        snapshot_pmem_metric_total_if_readable(path, "epoch_rw", "rate_limiter_throttled_events")
-            > 0,
+        snapshot_pmem_metric_total_if_readable(path, "rate_limiter_throttled_events") > 0,
         "{context} should report a throttled writable pmem request; metrics:\n{output}"
     );
     if expect_retry {
         assert!(
-            snapshot_pmem_metric_total_if_readable(path, "epoch_rw", "rate_limiter_event_count")
-                > 0,
+            snapshot_pmem_metric_total_if_readable(path, "rate_limiter_event_count") > 0,
             "{context} should report restored pmem limiter progress; metrics:\n{output}"
         );
     }
+    assert!(
+        output.lines().all(|line| {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                return false;
+            };
+            value
+                .as_object()
+                .is_some_and(|root| !root.keys().any(|key| key.starts_with("pmem_")))
+        }),
+        "{context} must not publish dynamic pmem roots; metrics:\n{output}"
+    );
 }
 
 fn snapshot_block_metric_total(path: &Path, drive_id: &str, field: &str) -> u64 {
@@ -19728,8 +19760,7 @@ fn snapshot_block_metric_total(path: &Path, drive_id: &str, field: &str) -> u64 
         .fold(0, u64::saturating_add)
 }
 
-fn snapshot_pmem_metric_total_if_readable(path: &Path, pmem_id: &str, field: &str) -> u64 {
-    let section = format!("pmem_{pmem_id}");
+fn snapshot_pmem_metric_total_if_readable(path: &Path, field: &str) -> u64 {
     let Ok(output) = fs::read_to_string(path) else {
         return 0;
     };
@@ -19738,7 +19769,7 @@ fn snapshot_pmem_metric_total_if_readable(path: &Path, pmem_id: &str, field: &st
         .filter_map(|line| {
             serde_json::from_str::<serde_json::Value>(line)
                 .ok()?
-                .get(&section)?
+                .get("pmem")?
                 .get(field)?
                 .as_u64()
         })

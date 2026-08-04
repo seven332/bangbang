@@ -2266,7 +2266,11 @@ impl VmmController {
         }
 
         self.metrics_state
-            .flush_with_diagnostics(diagnostics)
+            .flush_with_diagnostics_and_configs(
+                diagnostics,
+                self.drive_configs.as_slice(),
+                self.network_interface_configs.as_slice(),
+            )
             .map_err(VmmActionError::MetricsFlush)?;
         self.log_action(logger::LoggerAction::FlushMetrics);
         Ok(VmmData::Empty)
@@ -2281,7 +2285,11 @@ impl VmmController {
         }
 
         self.metrics_state
-            .flush_with_diagnostics(diagnostics)
+            .flush_with_diagnostics_and_configs(
+                diagnostics,
+                self.drive_configs.as_slice(),
+                self.network_interface_configs.as_slice(),
+            )
             .map_err(VmmActionError::MetricsFlush)
     }
 }
@@ -2587,6 +2595,24 @@ mod tests {
             "bangbang-runtime-metrics-test-{}-{nanos}-{name}",
             std::process::id()
         ))
+    }
+
+    fn metrics_values_from_file(path: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(path)
+            .expect("metrics output should be readable")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("metrics line should be valid JSON"))
+            .collect()
+    }
+
+    fn only_metrics_value_from_file(path: &Path) -> serde_json::Value {
+        let values = metrics_values_from_file(path);
+        assert_eq!(
+            values.len(),
+            1,
+            "exactly one metrics line should be written"
+        );
+        values.into_iter().next().expect("one metrics value")
     }
 
     fn unique_logger_path(name: &str) -> PathBuf {
@@ -6580,8 +6606,8 @@ mod tests {
             Ok(true)
         );
         assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            only_metrics_value_from_file(&metrics_path)["logger"]["missed_log_count"],
+            1
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -6607,8 +6633,8 @@ mod tests {
             Ok(true)
         );
         assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            only_metrics_value_from_file(&metrics_path)["logger"]["missed_log_count"],
+            1
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -6632,8 +6658,8 @@ mod tests {
             Ok(true)
         );
         assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            only_metrics_value_from_file(&metrics_path)["logger"]["missed_log_count"],
+            1
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -6672,14 +6698,12 @@ mod tests {
             Ok(true)
         );
         assert_eq!(
-            fs::read_to_string(&first_metrics_path)
-                .expect("first metrics output should be readable"),
-            "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            only_metrics_value_from_file(&first_metrics_path)["logger"]["missed_log_count"],
+            1
         );
         assert_eq!(
-            fs::read_to_string(&second_metrics_path)
-                .expect("second metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+            only_metrics_value_from_file(&second_metrics_path)["logger"]["missed_log_count"],
+            0
         );
 
         fs::remove_file(first_metrics_path).expect("first metrics fixture should clean up");
@@ -6938,10 +6962,10 @@ mod tests {
             controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
         );
-        assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        let values = metrics_values_from_file(&metrics_path);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["logger"]["missed_log_count"], 0);
+        assert_eq!(values[1]["logger"]["missed_log_count"], 1);
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
@@ -6967,8 +6991,7 @@ mod tests {
         );
 
         assert_eq!(controller.instance_info().state, InstanceState::Running);
-        let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(output, "{\"vmm\":{\"metrics_flush_count\":1}}\n");
+        assert_eq!(only_metrics_value_from_file(&path)["vmm"]["panic_count"], 0);
         fs::remove_file(path).expect("fixture should clean up");
     }
 
@@ -7080,8 +7103,8 @@ mod tests {
         );
 
         assert_eq!(
-            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+            only_metrics_value_from_file(&metrics_path)["vmm"]["panic_count"],
+            0
         );
         assert_eq!(
             fs::read_to_string(&logger_path).expect("logger output should be readable"),
@@ -7104,10 +7127,7 @@ mod tests {
             controller.flush_automatic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
             Ok(true)
         );
-        assert_eq!(
-            fs::read_to_string(&path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        assert_eq!(only_metrics_value_from_file(&path)["vmm"]["panic_count"], 0);
 
         fs::remove_file(path).expect("metrics fixture should clean up");
     }
@@ -7138,9 +7158,10 @@ mod tests {
         controller
             .handle_action(VmmAction::FlushMetrics)
             .expect("flush should still use original metrics sink");
-        let first_output =
-            fs::read_to_string(&first_path).expect("first metrics output should be readable");
-        assert_eq!(first_output, "{\"vmm\":{\"metrics_flush_count\":1}}\n");
+        assert_eq!(
+            only_metrics_value_from_file(&first_path)["vmm"]["panic_count"],
+            0
+        );
         assert!(!second_path.exists());
         fs::remove_file(first_path).expect("fixture should clean up");
     }
