@@ -37685,6 +37685,9 @@ mod tests {
     use bangbang_runtime::interrupt::{
         DeviceInterruptKind, GuestInterruptLine, InterruptSignalError, InterruptSink,
     };
+    use bangbang_runtime::logger::{
+        GuestLogger, LoggerApiControlOutcome, LoggerConfigInput, LoggerState,
+    };
     use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange, aarch64,
@@ -40342,6 +40345,41 @@ mod tests {
     impl Drop for TempFile {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    struct TestGuestLoggerCapture {
+        state: LoggerState,
+        logger: GuestLogger,
+        file: TempFile,
+    }
+
+    impl TestGuestLoggerCapture {
+        fn new(name: &str) -> Self {
+            let file = temp_file(name, &[]);
+            let mut state = LoggerState::default();
+            state
+                .configure(LoggerConfigInput::new().with_log_path(file.path()))
+                .expect("test guest logger should configure");
+            let logger = state.guest_logger();
+            Self {
+                state,
+                logger,
+                file,
+            }
+        }
+
+        fn logger(&self) -> &GuestLogger {
+            &self.logger
+        }
+
+        fn output_after_barrier(&self) -> String {
+            assert!(
+                self.state
+                    .log_api_control(LoggerApiControlOutcome::RequestDeprecated),
+                "host record should provide a logger delivery barrier"
+            );
+            fs::read_to_string(self.file.path()).expect("test guest logger output should read")
         }
     }
 
@@ -44418,6 +44456,20 @@ mod tests {
             ),
             DeviceInterruptKind::Queue.status().bits()
         );
+        let capture = TestGuestLoggerCapture::new("block-interrupt-failure-logger");
+        let observed_result: Result<_, HvfArm64BootBlockNotificationDispatchError> = Ok(result);
+        super::observe_block_interrupt_delivery(capture.logger(), &observed_result);
+        let logger_output = capture.output_after_barrier();
+        assert_eq!(
+            logger_output
+                .lines()
+                .filter(|line| {
+                    *line == "device-kind=block operation=interrupt-delivery outcome=failed"
+                })
+                .count(),
+            1,
+            "MMIO block signal failure should emit one class supplement; output:\n{logger_output}"
+        );
     }
 
     #[test]
@@ -44796,6 +44848,20 @@ mod tests {
                     .with_event_fails(1)
                     .with_queue_event_count(1),
             )
+        );
+        let capture = TestGuestLoggerCapture::new("pmem-interrupt-failure-logger");
+        let observed_result: Result<_, HvfArm64BootPmemNotificationDispatchError> = Ok(result);
+        super::observe_pmem_interrupt_delivery(capture.logger(), &observed_result);
+        let logger_output = capture.output_after_barrier();
+        assert_eq!(
+            logger_output
+                .lines()
+                .filter(|line| {
+                    *line == "device-kind=pmem operation=interrupt-delivery outcome=failed"
+                })
+                .count(),
+            1,
+            "MMIO pmem signal failure should emit one class supplement; output:\n{logger_output}"
         );
     }
 
@@ -45353,8 +45419,10 @@ mod tests {
 
     #[test]
     fn network_notification_packet_io_dispatch_preserves_pending_on_provider_failure() {
+        let capture = TestGuestLoggerCapture::new("network-provider-failure-logger");
         let (mut memory, mut runtime, mut mmio_dispatcher) =
             boot_runtime_with_networks(&[("eth0", "tap0")]);
+        mmio_dispatcher.attach_guest_logger(capture.logger().clone());
         configure_boot_network_queues(&mut runtime, &mut mmio_dispatcher, 0);
         write_network_tx_header(&mut memory);
         memory
@@ -45410,6 +45478,19 @@ mod tests {
                 NetworkInterfaceMetrics::default().with_event_fails(1),
             )
         );
+        let logger_output = capture.output_after_barrier();
+        assert_eq!(
+            logger_output
+                .lines()
+                .filter(|line| {
+                    *line == "device-kind=network operation=packet-provider outcome=failed"
+                })
+                .count(),
+            1,
+            "provider acquisition failure should emit one closed supplement; output:\n{logger_output}"
+        );
+        assert!(!logger_output.contains("eth0"));
+        assert!(!logger_output.contains("tap0"));
 
         let retried =
             dispatch_boot_network_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
@@ -45567,6 +45648,20 @@ mod tests {
                 VirtioMmioRegister::InterruptStatus
             ),
             DeviceInterruptKind::Queue.status().bits()
+        );
+        let capture = TestGuestLoggerCapture::new("network-interrupt-failure-logger");
+        let observed_result: Result<_, HvfArm64BootNetworkNotificationDispatchError> = Ok(result);
+        super::observe_network_interrupt_delivery(capture.logger(), &observed_result);
+        let logger_output = capture.output_after_barrier();
+        assert_eq!(
+            logger_output
+                .lines()
+                .filter(|line| {
+                    *line == "device-kind=network operation=interrupt-delivery outcome=failed"
+                })
+                .count(),
+            1,
+            "MMIO network signal failure should emit one class supplement; output:\n{logger_output}"
         );
     }
 
@@ -46018,6 +46113,20 @@ mod tests {
                 .with_muxer_event_fails(1)
                 .with_tx_queue_event_count(1)
                 .with_tx_packets_count(1)
+        );
+        let capture = TestGuestLoggerCapture::new("vsock-interrupt-failure-logger");
+        let observed_result: Result<_, HvfArm64BootVsockNotificationDispatchError> = Ok(result);
+        super::observe_vsock_interrupt_delivery(capture.logger(), &observed_result);
+        let logger_output = capture.output_after_barrier();
+        assert_eq!(
+            logger_output
+                .lines()
+                .filter(|line| {
+                    *line == "device-kind=vsock operation=interrupt-delivery outcome=failed"
+                })
+                .count(),
+            1,
+            "MMIO vsock signal failure should emit one class supplement; output:\n{logger_output}"
         );
     }
 

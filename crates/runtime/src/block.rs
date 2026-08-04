@@ -9182,7 +9182,7 @@ mod tests {
     };
 
     use crate::interrupt::DeviceInterruptKind;
-    use crate::logger::{LoggerBlockOutcome, LoggerTestCapture};
+    use crate::logger::{LoggerBlockOutcome, LoggerConfigInput, LoggerTestCapture};
     use crate::memory::{
         GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryLayout, GuestMemoryRange,
     };
@@ -13314,10 +13314,20 @@ mod tests {
     fn vhost_user_pci_refresh_rolls_back_confirmed_interrupt_failure() {
         let mut refreshed = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
         refreshed[..8].copy_from_slice(&2_u64.to_le_bytes());
+        let capture = LoggerTestCapture::default();
+        let (mut logger_state, initial_logger) = capture.configured_guest_logger();
+        drop(initial_logger);
+        logger_state
+            .configure(LoggerConfigInput::new().with_show_log_origin(true))
+            .expect("origin-prefixed PCI logger should configure");
+        let logger = logger_state.guest_logger();
         let (endpoint, _memory, peer, signals) = vhost_user_refresh_pci_endpoint(
             TestVhostUserConfigReply::Exact(refreshed),
             Some(false),
         );
+        let mut bar_handler = endpoint.bar_handler();
+        bar_handler.attach_guest_logger(logger.clone());
+        drop(bar_handler);
         let original = vhost_user_pci_config_snapshot(&endpoint);
 
         let error = endpoint
@@ -13334,6 +13344,34 @@ mod tests {
                 .lock()
                 .expect("test signal count should remain available"),
             0
+        );
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        let interrupt_suffix = "device-kind=block operation=interrupt-delivery outcome=failed";
+        let interrupt_records = output
+            .lines()
+            .filter(|line| line.ends_with(interrupt_suffix))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            interrupt_records.len(),
+            2,
+            "generic transport and block class owners should each emit once; output:\n{output}"
+        );
+        assert_eq!(
+            interrupt_records
+                .iter()
+                .filter(|line| line.contains("origin=crates/runtime/src/virtio_pci.rs:"))
+                .count(),
+            1,
+            "generic PCI transport owner should emit once; output:\n{output}"
+        );
+        assert_eq!(
+            interrupt_records
+                .iter()
+                .filter(|line| line.contains("origin=crates/runtime/src/block.rs:"))
+                .count(),
+            1,
+            "block class supplement should emit once; output:\n{output}"
         );
         peer.join().expect("refresh peer should finish");
     }
