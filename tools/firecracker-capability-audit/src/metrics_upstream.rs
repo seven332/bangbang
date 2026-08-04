@@ -1339,22 +1339,46 @@ fn validate_fixture_assignment_boundary(
 ) -> Result<(), AuditError> {
     let marker = "    # validate timestamp before jsonschema validation";
     let end = unique_offset_in(source, function.clone(), marker)?;
+    let start = unique_offset_in(
+        source,
+        function.start..end,
+        "    latency_agg_metrics_fields =",
+    )?;
     let prefix = source
-        .get(function.start..end)
+        .get(start..end)
         .ok_or_else(|| AuditError::new("invalid metrics fixture schema boundary"))?;
-    let assignments = prefix
-        .lines()
-        .filter_map(|line| {
-            let rest = line.strip_prefix("    ")?;
-            if rest.starts_with(' ') {
-                return None;
-            }
-            let (name, _) = rest.split_once(" = ")?;
-            name.chars()
-                .all(|character| character == '_' || character.is_ascii_alphanumeric())
-                .then(|| name.to_string())
-        })
-        .collect::<Vec<_>>();
+    let mut assignments = Vec::new();
+    for line in prefix.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("    ") else {
+            return Err(AuditError::new(
+                "metrics fixture schema statements must use exact function indentation",
+            ));
+        };
+        if rest.starts_with(' ') {
+            continue;
+        }
+        let statement = rest.trim();
+        if statement.is_empty() || statement.starts_with('#') || matches!(statement, "]" | "}") {
+            continue;
+        }
+        let Some((name, _)) = statement.split_once(" = ") else {
+            return Err(AuditError::new(format!(
+                "unsupported top-level metrics fixture schema statement: {statement}"
+            )));
+        };
+        if !name
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+        {
+            return Err(AuditError::new(format!(
+                "unsupported top-level metrics fixture schema assignment: {name}"
+            )));
+        }
+        assignments.push(name.to_string());
+    }
     let expected = [
         "latency_agg_metrics_fields",
         "block_metrics",
@@ -1704,6 +1728,33 @@ class FcDeviceMetrics:
             .parse_value()
             .expect_err("escaped names must be outside the restricted grammar");
         assert!(error.to_string().contains("escaped"));
+    }
+
+    #[test]
+    fn restricted_fixture_rejects_an_unparsed_schema_mutation() {
+        let source = r#"def validate_fc_metrics(metrics):
+    latency_agg_metrics_fields = ["min_us", "max_us", "sum_us"]
+    block_metrics = [{"read_agg": latency_agg_metrics_fields}, "read_count"]
+    net_metrics = ["rx_count"]
+    firecracker_metrics = {"utc_timestamp_ms": "", "block": block_metrics}
+    firecracker_metrics["unparsed"] = ["count"]
+    # validate timestamp before jsonschema validation which some more time
+    if platform.machine() == "aarch64":
+        firecracker_metrics["rtc"] = ["error_count"]
+    for metrics_name in metrics.keys():
+        if metrics_name.startswith("vhost_user_"):
+            firecracker_metrics[metrics_name] = ["activate_fails"]
+        if metrics_name.startswith("block_"):
+            firecracker_metrics[metrics_name] = block_metrics
+        if metrics_name.startswith("net_"):
+            firecracker_metrics[metrics_name] = net_metrics
+
+class FcDeviceMetrics:
+    pass
+"#;
+        let error =
+            extract_fixture_schema(source).expect_err("unparsed schema mutations must fail closed");
+        assert!(error.to_string().contains("unsupported top-level"));
     }
 
     #[test]
