@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use crate::logger::{GuestLogger, LoggerTransportOutcome};
 use crate::memory::{GuestAddress, GuestMemoryError, GuestMemoryRange};
 use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioHandler, MmioHandlerError, MmioRegionId, MmioRegionRequest,
@@ -1760,44 +1761,95 @@ impl std::error::Error for PciSegmentLockError {}
 #[derive(Debug)]
 pub struct PciEcamHandler {
     segment: SharedPciSegment,
+    guest_logger: GuestLogger,
 }
 
 impl PciEcamHandler {
     pub fn new(segment: SharedPciSegment) -> Self {
-        Self { segment }
+        Self {
+            segment,
+            guest_logger: GuestLogger::default(),
+        }
+    }
+
+    fn log_bus_access_failure(&self) {
+        self.guest_logger
+            .log_transport(LoggerTransportOutcome::MmioAccessFailed(None));
     }
 }
 
 impl MmioHandler for PciEcamHandler {
     fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
         let mut bytes = [0_u8; 4];
-        let len = usize::try_from(access.range().size())
-            .map_err(|_| MmioHandlerError::new("PCI ECAM read width is not representable"))?;
-        let destination = bytes
-            .get_mut(..len)
-            .ok_or_else(|| MmioHandlerError::new("PCI ECAM read width exceeds four bytes"))?;
-        let result = self
+        let len = match usize::try_from(access.range().size()) {
+            Ok(len) => len,
+            Err(_) => {
+                self.log_bus_access_failure();
+                return Err(MmioHandlerError::new(
+                    "PCI ECAM read width is not representable",
+                ));
+            }
+        };
+        let Some(destination) = bytes.get_mut(..len) else {
+            self.log_bus_access_failure();
+            return Err(MmioHandlerError::new(
+                "PCI ECAM read width exceeds four bytes",
+            ));
+        };
+        let result = match self
             .segment
             .with_segment(|segment| segment.read_ecam(access.offset(), destination))
-            .map_err(|source| MmioHandlerError::new(source.to_string()))?;
+        {
+            Ok(result) => result,
+            Err(source) => {
+                self.log_bus_access_failure();
+                return Err(MmioHandlerError::new(source.to_string()));
+            }
+        };
         match result {
             Ok(()) => {}
             Err(PciEcamAccessError::CrossesRegister { .. }) => destination.fill(u8::MAX),
-            Err(source) => return Err(MmioHandlerError::new(source.to_string())),
+            Err(source) => {
+                if !matches!(&source, PciEcamAccessError::Configuration { .. }) {
+                    self.log_bus_access_failure();
+                }
+                return Err(MmioHandlerError::new(source.to_string()));
+            }
         }
-        MmioAccessBytes::new(destination)
-            .map_err(|source| MmioHandlerError::new(source.to_string()))
+        MmioAccessBytes::new(destination).map_err(|source| {
+            self.log_bus_access_failure();
+            MmioHandlerError::new(source.to_string())
+        })
     }
 
     fn write(&mut self, access: MmioAccess, data: MmioAccessBytes) -> Result<(), MmioHandlerError> {
-        let result = self
+        let result = match self
             .segment
             .with_segment(|segment| segment.write_ecam(access.offset(), data.as_slice()))
-            .map_err(|source| MmioHandlerError::new(source.to_string()))?;
+        {
+            Ok(result) => result,
+            Err(source) => {
+                self.log_bus_access_failure();
+                return Err(MmioHandlerError::new(source.to_string()));
+            }
+        };
         match result {
             Ok(()) | Err(PciEcamAccessError::CrossesRegister { .. }) => Ok(()),
-            Err(source) => Err(MmioHandlerError::new(source.to_string())),
+            Err(source) => {
+                if !matches!(&source, PciEcamAccessError::Configuration { .. }) {
+                    self.log_bus_access_failure();
+                }
+                Err(MmioHandlerError::new(source.to_string()))
+            }
         }
+    }
+
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = logger;
+    }
+
+    fn owns_transport_access_logging(&self) -> bool {
+        true
     }
 }
 

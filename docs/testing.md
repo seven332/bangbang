@@ -1528,8 +1528,8 @@ command never creates, carries forward, or rewrites semantic classes in
 `logger-producer-audit.json`; missing or stale mappings require human review.
 The class policy and safe-field boundary are documented in the
 [logger producer contract](../compat/firecracker/v1.16.0/logger-contract.md).
-The current overlay has exactly 13 implemented, 11 planned, and seven
-not-applicable classes, representing 82 implemented, 324 planned, and 62
+The current overlay has exactly 15 implemented, nine planned, and seven
+not-applicable classes, representing 182 implemented, 224 planned, and 62
 not-applicable source mappings. The remaining planned classes are all owned by
 #1809.
 
@@ -1543,6 +1543,17 @@ Runtime logger tests separately prove bounded host receipts, nonblocking async
 delivery, the independent observability limiter, filtering, and exact loss
 accounting. Process and signed integration targets verify the executable
 ordering boundary.
+
+Backend and generic transport coverage additionally proves the result-free
+`GuestLogger` facade, independent per-controller backend/transport limiters,
+filter-before-limit behavior, fixed encoding and redaction, MMIO and PCI
+attachment before normal or native-v2 publication, typed classification before
+string conversion, required run-loop-wrapper forwarding, virtual-timer success
+coalescing before terminal backend admission, debug-only expected device
+throttling, and unchanged functional results. The signed production bundle
+asserts representative transport publication and HVF guest-exit records from a
+real Apple Silicon session, while the entropy snapshot continuation proves
+normal throttling cannot split the default logger/serial guest marker.
 
 The final parent gate is:
 

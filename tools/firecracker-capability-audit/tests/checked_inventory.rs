@@ -105,7 +105,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ("logger.api.result", LoggerClassDisposition::Implemented, 5),
         (
             "logger.backend.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             26,
         ),
         (
@@ -214,7 +214,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ),
         (
             "logger.transport.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             74,
         ),
         ("logger.vsock.outcome", LoggerClassDisposition::Planned, 52),
@@ -308,7 +308,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             .iter()
             .filter(|class| class.disposition == LoggerClassDisposition::Implemented)
             .count(),
-        13
+        15
     );
     assert_eq!(
         audit
@@ -316,7 +316,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             .iter()
             .filter(|class| class.disposition == LoggerClassDisposition::Planned)
             .count(),
-        11
+        9
     );
     assert_eq!(
         audit
@@ -342,8 +342,8 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
     assert_eq!(
         mapped_dispositions,
         BTreeMap::from([
-            (LoggerClassDisposition::Implemented, 82),
-            (LoggerClassDisposition::Planned, 324),
+            (LoggerClassDisposition::Implemented, 182),
+            (LoggerClassDisposition::Planned, 224),
             (LoggerClassDisposition::NotApplicable, 62),
         ])
     );
@@ -359,7 +359,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             *counts.entry(issue).or_insert(0_usize) += 1;
             counts
         });
-    assert_eq!(planned_owners, BTreeMap::from([("#1809", 11)]));
+    assert_eq!(planned_owners, BTreeMap::from([("#1809", 9)]));
 
     let compiled_events = audit
         .classes
@@ -373,6 +373,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             LoggerCompiledEvent::ApiWorker,
             LoggerCompiledEvent::ApiRequest,
             LoggerCompiledEvent::ApiResult,
+            LoggerCompiledEvent::Backend,
             LoggerCompiledEvent::InstanceStart,
             LoggerCompiledEvent::FlushMetrics,
             LoggerCompiledEvent::BootTime,
@@ -384,6 +385,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             LoggerCompiledEvent::ProcessExit,
             LoggerCompiledEvent::ProcessSignal,
             LoggerCompiledEvent::Snapshot,
+            LoggerCompiledEvent::Transport,
         ])
     );
     let planned_with_compiled_events = audit

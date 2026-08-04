@@ -2900,6 +2900,21 @@ the API, action, readiness, VM lifecycle, snapshot, or guest outcome;
 rate-limited records and exact per-record delivery failures are observable only
 through process-local counters.
 
+Guest-triggerable backend and generic transport records use a separate
+cloneable `GuestLogger` capability with no writer, configuration mutation,
+arbitrary formatting, receipt, retry, sleep, or wait surface. Its immutable
+producer snapshot shares the controller's sole worker and the independent
+`logger-rate.backend.outcome` and `logger-rate.transport.outcome` states.
+Normal and native-v2 assembly install the capability before HVF and MMIO/PCI
+publication, and run-loop adapter traits require explicit logger forwarding so
+a wrapper cannot silently substitute an inert capability. Repeating successful
+virtual-timer exits are coalesced once per logger state before backend admission
+so terminal vCPU outcomes retain bounded capacity. Expected device throttling
+remains visible in exact metrics and is logged only at debug level. The last
+typed owner selects only a closed operation, outcome, and optional device kind
+before raw errors, addresses, registers, queue indexes, identifiers, or guest
+values can cross a formatting boundary.
+
 Host lifecycle records use only fixed backend/VM operation and outcome values.
 Live block, network, and pmem controls add a fixed device kind, never the
 device ID, backing path, MAC address, provider name, or backend error. Snapshot

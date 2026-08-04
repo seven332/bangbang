@@ -129,7 +129,7 @@ use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::entropy::{EntropyConfig, EntropyMmioLayout};
 use bangbang_runtime::lazy_memory::LazyGuestMemoryConsumerProfile;
 use bangbang_runtime::logger::{
-    EmergencyLogger, LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute,
+    EmergencyLogger, GuestLogger, LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute,
     LoggerApiWorkerOutcome, LoggerConfigInput, LoggerDeviceKind, LoggerHttpMethod,
     LoggerLifecycleOutcome, LoggerObservabilityOutcome, LoggerProcessSignalOutcome,
     LoggerSnapshotOutcome, ProcessStartupOutcome, ProcessStdoutLogger, ProcessTerminalCategory,
@@ -9372,7 +9372,8 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
                 } else {
                     source
                 }
-            })?;
+            })?
+            .with_guest_logger(self.controller.guest_logger());
         let restored = self
             .starter
             .load_prepared_snapshot_v2_process(prepared)
@@ -11229,6 +11230,13 @@ struct PreparedHvfSnapshotV2ProcessLoad {
     virtual_timer_intid: u32,
 }
 
+impl PreparedHvfSnapshotV2ProcessLoad {
+    fn with_guest_logger(mut self, guest_logger: GuestLogger) -> Self {
+        self.process_shell = self.process_shell.with_guest_logger(guest_logger);
+        self
+    }
+}
+
 #[allow(
     dead_code,
     reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
@@ -12963,6 +12971,7 @@ struct PrepareHvfSnapshotV2SerialDestinationInput {
     boot: bangbang_runtime::boot::BootSourceConfig,
     resume_requested: bool,
     cancellation: NativeV2SnapshotCaptureCancellation,
+    guest_logger: GuestLogger,
 }
 
 /// Reconstructs and atomically commits one internal exact-2.7 destination.
@@ -12989,6 +12998,7 @@ fn prepare_hvf_native_v2_serial_destination(
         boot,
         resume_requested,
         cancellation,
+        guest_logger,
     } = input;
     let expected_transport = if pci_enabled {
         SnapshotV2DeviceTransportKind::Pci
@@ -13093,7 +13103,8 @@ fn prepare_hvf_native_v2_serial_destination(
                 }
             };
             let serial_output = serial.output().clone();
-            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial);
+            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial)
+                .with_guest_logger(guest_logger.clone());
             let restored = match platform_plan {
                 HvfSnapshotV2SerialPlatformPlan::SerialOnly => {
                     debug_assert!(storage.is_none());
@@ -13290,6 +13301,7 @@ struct PrepareHvfSnapshotV2EntropyDestinationInput {
     resume_requested: bool,
     controller_version: HvfSnapshotV2EntropyControllerVersion,
     cancellation: NativeV2SnapshotCaptureCancellation,
+    guest_logger: GuestLogger,
 }
 
 /// Reconstructs and atomically commits one exact-2.8 or balloon-absent
@@ -13319,6 +13331,7 @@ fn prepare_hvf_native_v2_entropy_destination(
         resume_requested,
         controller_version,
         cancellation,
+        guest_logger,
     } = input;
     let expected_transport = if pci_enabled {
         SnapshotV2DeviceTransportKind::Pci
@@ -13511,7 +13524,8 @@ fn prepare_hvf_native_v2_entropy_destination(
                 }
             };
             let serial_output = serial.output().clone();
-            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial);
+            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial)
+                .with_guest_logger(guest_logger.clone());
             let restored = match platform_plan {
                 HvfSnapshotV2EntropyPlatformPlan::SerialOnly => {
                     debug_assert!(storage.is_none());
@@ -13813,6 +13827,7 @@ struct PrepareHvfSnapshotV2BalloonDestinationInput {
     boot: bangbang_runtime::boot::BootSourceConfig,
     resume_requested: bool,
     cancellation: NativeV2SnapshotCaptureCancellation,
+    guest_logger: GuestLogger,
 }
 
 /// Reconstructs and atomically commits one exact-2.9 balloon-bearing
@@ -13841,6 +13856,7 @@ fn prepare_hvf_native_v2_balloon_destination(
         boot,
         resume_requested,
         cancellation,
+        guest_logger,
     } = input;
     let expected_transport = if pci_enabled {
         SnapshotV2DeviceTransportKind::Pci
@@ -13948,7 +13964,8 @@ fn prepare_hvf_native_v2_balloon_destination(
                 }
             };
             let serial_output = serial.output().clone();
-            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial);
+            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial)
+                .with_guest_logger(guest_logger.clone());
             let restored = match platform_plan {
                 HvfSnapshotV2BalloonPlatformPlan::Mmio(plan) => {
                     OwnedHvfArm64BootSession::restore_snapshot_v2_serial_balloon_mmio(
@@ -14102,6 +14119,7 @@ struct PrepareHvfSnapshotV2MemoryHotplugDestinationInput {
     boot: bangbang_runtime::boot::BootSourceConfig,
     resume_requested: bool,
     cancellation: NativeV2SnapshotCaptureCancellation,
+    guest_logger: GuestLogger,
 }
 
 /// Reconstructs and atomically commits one exact-2.10 virtio-mem-bearing
@@ -14131,6 +14149,7 @@ fn prepare_hvf_native_v2_memory_hotplug_destination(
         boot,
         resume_requested,
         cancellation,
+        guest_logger,
     } = input;
     let expected_transport = if pci_enabled {
         SnapshotV2DeviceTransportKind::Pci
@@ -14277,7 +14296,8 @@ fn prepare_hvf_native_v2_memory_hotplug_destination(
                 }
             };
             let serial_output = serial.output().clone();
-            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial);
+            let process_shell =
+                HvfSnapshotV2RestoredSerialShell::new(serial).with_guest_logger(guest_logger.clone());
             let restored = match platform_plan {
                 HvfSnapshotV2MemoryHotplugPlatformPlan::Mmio(plan) => {
                     OwnedHvfArm64BootSession::restore_snapshot_v2_memory_hotplug_mmio(
@@ -14552,6 +14572,7 @@ struct PrepareHvfSnapshotV2NetworkDestinationInput<'a> {
     boot: bangbang_runtime::boot::BootSourceConfig,
     resume_requested: bool,
     cancellation: NativeV2SnapshotCaptureCancellation,
+    guest_logger: GuestLogger,
 }
 
 /// Reconstructs and atomically commits one retained exact-2.11 destination,
@@ -14583,6 +14604,7 @@ fn prepare_hvf_native_v2_network_destination(
         boot,
         resume_requested,
         cancellation,
+        guest_logger,
     } = input;
     let expected_transport = if pci_enabled {
         SnapshotV2DeviceTransportKind::Pci
@@ -14691,7 +14713,8 @@ fn prepare_hvf_native_v2_network_destination(
                 }
             };
             let serial_output = serial.output().clone();
-            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial);
+            let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial)
+                .with_guest_logger(guest_logger.clone());
             let restored = match platform_plan {
                 HvfSnapshotV2NetworkPlatformPlan::Mmio(plan) => {
                     let memory = static_memory
@@ -15326,7 +15349,8 @@ impl HvfInstanceStartExecutor {
                     ));
                 }
             };
-        let process_shell = HvfSnapshotV2DefaultProcessShell::new(serial_output.clone());
+        let process_shell = HvfSnapshotV2DefaultProcessShell::new(serial_output.clone())
+            .with_guest_logger(controller.guest_logger());
         let mut session = match OwnedHvfArm64BootSession::restore_snapshot_v2_root(
             platform,
             memory,
@@ -16008,7 +16032,8 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         } else {
             SharedSerialOutput::with_rate_limiter(self.serial_output.clone(), rate_limiter)
         };
-        let process_shell = HvfSnapshotV2DefaultProcessShell::new(serial_output.clone());
+        let process_shell = HvfSnapshotV2DefaultProcessShell::new(serial_output.clone())
+            .with_guest_logger(controller.guest_logger());
 
         let bundle =
             RequestedSnapshotRestoreResources::prepare_native_v2_multi_block_restore_bundle(
@@ -16194,7 +16219,8 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         } else {
             SharedSerialOutput::with_rate_limiter(self.serial_output.clone(), rate_limiter)
         };
-        let process_shell = HvfSnapshotV2DefaultProcessShell::new(serial_output.clone());
+        let process_shell = HvfSnapshotV2DefaultProcessShell::new(serial_output.clone())
+            .with_guest_logger(controller.guest_logger());
 
         let bundle = RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle(
             graph,
@@ -16435,6 +16461,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 boot,
                 resume_requested: input.resume_vm(),
                 cancellation,
+                guest_logger: controller.guest_logger(),
             })
             .map_err(|source| {
                 let terminal = source.is_terminal();
@@ -16597,6 +16624,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                             boot,
                             resume_requested: input.resume_vm(),
                             cancellation,
+                            guest_logger: controller.guest_logger(),
                         },
                     ),
                     None => prepare_hvf_native_v2_entropy_destination(
@@ -16616,6 +16644,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                             resume_requested: input.resume_vm(),
                             controller_version: HvfSnapshotV2EntropyControllerVersion::CurrentV2_9,
                             cancellation,
+                            guest_logger: controller.guest_logger(),
                         },
                     ),
                 };
@@ -16746,6 +16775,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                         boot,
                         resume_requested: input.resume_vm(),
                         cancellation,
+                        guest_logger: controller.guest_logger(),
                     },
                 )
                 .map_err(|source| {
@@ -16947,6 +16977,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 boot,
                 resume_requested: input.resume_vm(),
                 cancellation,
+                guest_logger: controller.guest_logger(),
             },
         )
         .map_err(|source| {
@@ -17221,13 +17252,14 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             })?;
         let now = Instant::now();
         let parts = if pci_enabled {
-            restore_process_snapshot_v2_vsock_pci(
+            restore_process_snapshot_v2_vsock_pci_with_logger(
                 platform,
                 memory,
                 resource_plan,
                 contained_restore_authority,
                 &controller.instance_info().id,
                 mmds_data_store_limit_bytes,
+                controller.guest_logger(),
                 now,
                 |_| cancellation.is_cancelled(),
             )
@@ -17243,13 +17275,14 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 )
             })?
         } else {
-            restore_process_snapshot_v2_vsock_mmio(
+            restore_process_snapshot_v2_vsock_mmio_with_logger(
                 platform,
                 memory,
                 resource_plan,
                 contained_restore_authority,
                 &controller.instance_info().id,
                 mmds_data_store_limit_bytes,
+                controller.guest_logger(),
                 now,
                 |_| cancellation.is_cancelled(),
             )
@@ -17396,6 +17429,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 resume_requested: input.resume_vm(),
                 controller_version: HvfSnapshotV2EntropyControllerVersion::RetainedV2_8,
                 cancellation,
+                guest_logger: controller.guest_logger(),
             },
         )
         .map_err(|source| {
@@ -17547,6 +17581,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                     boot,
                     resume_requested: input.resume_vm(),
                     cancellation,
+                    guest_logger: controller.guest_logger(),
                 },
             ),
             None => prepare_hvf_native_v2_entropy_destination(
@@ -17566,6 +17601,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                     resume_requested: input.resume_vm(),
                     controller_version: HvfSnapshotV2EntropyControllerVersion::CurrentV2_9,
                     cancellation,
+                    guest_logger: controller.guest_logger(),
                 },
             ),
         };
@@ -27073,13 +27109,14 @@ where
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn restore_process_snapshot_v2_vsock_mmio_with_factory<B, F, C>(
+fn restore_process_snapshot_v2_vsock_mmio_with_factory_and_logger<B, F, C>(
     platform: HvfSnapshotV2PlatformState,
     memory: GuestMemory,
     resource_plan: PreparedProcessSnapshotV2VsockResourcePlan,
     contained_authority: Option<&ContainedSnapshotRestoreAuthority>,
     destination_instance_id: &str,
     mmds_data_store_limit_bytes: usize,
+    guest_logger: GuestLogger,
     factory: &mut F,
     now: Instant,
     cancelled: C,
@@ -27492,7 +27529,8 @@ where
     staged.serial_output = Some(serial.output().clone());
     staged.serial_config = Some(serial_config);
     staged.serial_restoration = serial_restoration;
-    let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial);
+    let process_shell =
+        HvfSnapshotV2RestoredSerialShell::new(serial).with_guest_logger(guest_logger);
     let profiles = staged
         .network_resources
         .iter()
@@ -27882,6 +27920,68 @@ impl SystemRestoredProcessSnapshotV2VsockMmioOwners {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn restore_process_snapshot_v2_vsock_mmio_with_factory<B, F, C>(
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    resource_plan: PreparedProcessSnapshotV2VsockResourcePlan,
+    contained_authority: Option<&ContainedSnapshotRestoreAuthority>,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    factory: &mut F,
+    now: Instant,
+    cancelled: C,
+) -> Result<RestoredProcessSnapshotV2VsockMmioOwners<B>, ProcessSnapshotV2VsockMmioRestoreError>
+where
+    B: ProcessVmnetBackend,
+    F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    C: Fn(ProcessSnapshotV2VsockMmioRestoreStage) -> bool,
+{
+    restore_process_snapshot_v2_vsock_mmio_with_factory_and_logger(
+        platform,
+        memory,
+        resource_plan,
+        contained_authority,
+        destination_instance_id,
+        mmds_data_store_limit_bytes,
+        GuestLogger::default(),
+        factory,
+        now,
+        cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_process_snapshot_v2_vsock_mmio_with_logger<C>(
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    resource_plan: PreparedProcessSnapshotV2VsockResourcePlan,
+    contained_authority: Option<&ContainedSnapshotRestoreAuthority>,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    guest_logger: GuestLogger,
+    now: Instant,
+    cancelled: C,
+) -> Result<SystemRestoredProcessSnapshotV2VsockMmioOwners, ProcessSnapshotV2VsockMmioRestoreError>
+where
+    C: Fn(ProcessSnapshotV2VsockMmioRestoreStage) -> bool,
+{
+    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+    restore_process_snapshot_v2_vsock_mmio_with_factory_and_logger(
+        platform,
+        memory,
+        resource_plan,
+        contained_authority,
+        destination_instance_id,
+        mmds_data_store_limit_bytes,
+        guest_logger,
+        &mut factory,
+        now,
+        cancelled,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn restore_process_snapshot_v2_vsock_mmio<C>(
     platform: HvfSnapshotV2PlatformState,
@@ -27896,15 +27996,14 @@ fn restore_process_snapshot_v2_vsock_mmio<C>(
 where
     C: Fn(ProcessSnapshotV2VsockMmioRestoreStage) -> bool,
 {
-    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
-    restore_process_snapshot_v2_vsock_mmio_with_factory(
+    restore_process_snapshot_v2_vsock_mmio_with_logger(
         platform,
         memory,
         resource_plan,
         contained_authority,
         destination_instance_id,
         mmds_data_store_limit_bytes,
-        &mut factory,
+        GuestLogger::default(),
         now,
         cancelled,
     )
@@ -27928,13 +28027,14 @@ const _: SystemRestoreProcessSnapshotV2VsockMmioFn =
     restore_process_snapshot_v2_vsock_mmio::<fn(ProcessSnapshotV2VsockMmioRestoreStage) -> bool>;
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn restore_process_snapshot_v2_vsock_pci_with_factory<B, F, C>(
+fn restore_process_snapshot_v2_vsock_pci_with_factory_and_logger<B, F, C>(
     platform: HvfSnapshotV2PlatformState,
     memory: GuestMemory,
     resource_plan: PreparedProcessSnapshotV2VsockResourcePlan,
     contained_authority: Option<&ContainedSnapshotRestoreAuthority>,
     destination_instance_id: &str,
     mmds_data_store_limit_bytes: usize,
+    guest_logger: GuestLogger,
     factory: &mut F,
     now: Instant,
     cancelled: C,
@@ -28332,7 +28432,8 @@ where
     staged.serial_output = Some(serial.output().clone());
     staged.serial_config = Some(serial_config);
     staged.serial_restoration = serial_restoration;
-    let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial);
+    let process_shell =
+        HvfSnapshotV2RestoredSerialShell::new(serial).with_guest_logger(guest_logger);
     let profiles = staged
         .network_resources
         .iter()
@@ -28719,6 +28820,68 @@ impl SystemRestoredProcessSnapshotV2VsockPciOwners {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn restore_process_snapshot_v2_vsock_pci_with_factory<B, F, C>(
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    resource_plan: PreparedProcessSnapshotV2VsockResourcePlan,
+    contained_authority: Option<&ContainedSnapshotRestoreAuthority>,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    factory: &mut F,
+    now: Instant,
+    cancelled: C,
+) -> Result<RestoredProcessSnapshotV2VsockPciOwners<B>, ProcessSnapshotV2VsockPciRestoreError>
+where
+    B: ProcessVmnetBackend,
+    F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    C: Fn(ProcessSnapshotV2VsockPciRestoreStage) -> bool,
+{
+    restore_process_snapshot_v2_vsock_pci_with_factory_and_logger(
+        platform,
+        memory,
+        resource_plan,
+        contained_authority,
+        destination_instance_id,
+        mmds_data_store_limit_bytes,
+        GuestLogger::default(),
+        factory,
+        now,
+        cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_process_snapshot_v2_vsock_pci_with_logger<C>(
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    resource_plan: PreparedProcessSnapshotV2VsockResourcePlan,
+    contained_authority: Option<&ContainedSnapshotRestoreAuthority>,
+    destination_instance_id: &str,
+    mmds_data_store_limit_bytes: usize,
+    guest_logger: GuestLogger,
+    now: Instant,
+    cancelled: C,
+) -> Result<SystemRestoredProcessSnapshotV2VsockPciOwners, ProcessSnapshotV2VsockPciRestoreError>
+where
+    C: Fn(ProcessSnapshotV2VsockPciRestoreStage) -> bool,
+{
+    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+    restore_process_snapshot_v2_vsock_pci_with_factory_and_logger(
+        platform,
+        memory,
+        resource_plan,
+        contained_authority,
+        destination_instance_id,
+        mmds_data_store_limit_bytes,
+        guest_logger,
+        &mut factory,
+        now,
+        cancelled,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn restore_process_snapshot_v2_vsock_pci<C>(
     platform: HvfSnapshotV2PlatformState,
@@ -28733,15 +28896,14 @@ fn restore_process_snapshot_v2_vsock_pci<C>(
 where
     C: Fn(ProcessSnapshotV2VsockPciRestoreStage) -> bool,
 {
-    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
-    restore_process_snapshot_v2_vsock_pci_with_factory(
+    restore_process_snapshot_v2_vsock_pci_with_logger(
         platform,
         memory,
         resource_plan,
         contained_authority,
         destination_instance_id,
         mmds_data_store_limit_bytes,
-        &mut factory,
+        GuestLogger::default(),
         now,
         cancelled,
     )
@@ -61603,6 +61765,7 @@ mod tests {
                     boot: boot.clone(),
                     resume_requested: false,
                     cancellation,
+                    guest_logger: super::GuestLogger::default(),
                 },
             )
             .expect_err("cancellation should destroy the unpublished serial destination");
@@ -61641,6 +61804,7 @@ mod tests {
                         boot: boot.clone(),
                         resume_requested: false,
                         cancellation: NativeV2SnapshotCaptureCancellation::default(),
+                        guest_logger: super::GuestLogger::default(),
                     },
                 )
                 .unwrap_or_else(|error| {
@@ -61946,6 +62110,7 @@ mod tests {
                         boot: boot.clone(),
                         resume_requested: false,
                         cancellation: NativeV2SnapshotCaptureCancellation::default(),
+                        guest_logger: super::GuestLogger::default(),
                     },
                 )
                 .unwrap_or_else(|error| {

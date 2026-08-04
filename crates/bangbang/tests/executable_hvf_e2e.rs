@@ -18434,6 +18434,10 @@ mod macos_arm64 {
                 "operation=boot-worker outcome=running\n",
                 "operation=vm-start outcome=succeeded\n",
                 "operation=process-startup outcome=running\n",
+                "device-kind=block operation=device-reset outcome=succeeded\n",
+                "device-kind=vsock operation=device-reset outcome=succeeded\n",
+                "device-kind=block operation=device-activation outcome=succeeded\n",
+                "device-kind=vsock operation=device-activation outcome=succeeded\n",
             ),
             "no-api logger output should include the closed startup lifecycle"
         );

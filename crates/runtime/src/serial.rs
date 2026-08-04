@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
 use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioHandler, MmioHandlerError,
 };
@@ -43,6 +44,8 @@ pub const SERIAL_OUTPUT_BUFFER_DEFAULT_LIMIT: usize = 64 * 1024;
 pub const SERIAL_RECEIVE_FIFO_CAPACITY: usize = 0x40;
 
 pub trait SerialOutput: fmt::Debug + Send {
+    fn attach_guest_logger(&mut self, _logger: GuestLogger) {}
+
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError>;
 }
 
@@ -569,6 +572,10 @@ impl<O> MeteredSerialOutput<O> {
 }
 
 impl<O: SerialOutput> SerialOutput for MeteredSerialOutput<O> {
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.output.attach_guest_logger(logger);
+    }
+
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
         match self.output.write_byte(byte) {
             Ok(()) => {
@@ -640,6 +647,12 @@ impl From<SharedSerialOutputBuffer> for SharedSerialOutput {
 }
 
 impl SerialOutput for SharedSerialOutput {
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        if let Ok(mut output) = self.output.lock() {
+            output.attach_guest_logger(logger);
+        }
+    }
+
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
         let mut output = self.output.lock().map_err(|_| {
             self.metrics.record_missed_write();
@@ -656,6 +669,7 @@ struct RateLimitedSerialOutput<O> {
     output: O,
     bucket: TokenBucket,
     metrics: SharedSerialOutputMetrics,
+    guest_logger: Option<GuestLogger>,
 }
 
 impl<O> RateLimitedSerialOutput<O> {
@@ -666,6 +680,7 @@ impl<O> RateLimitedSerialOutput<O> {
             output,
             bucket,
             metrics,
+            guest_logger: None,
         })
     }
 
@@ -674,6 +689,7 @@ impl<O> RateLimitedSerialOutput<O> {
             output,
             bucket,
             metrics,
+            guest_logger: None,
         }
     }
 
@@ -684,11 +700,21 @@ impl<O> RateLimitedSerialOutput<O> {
 }
 
 impl<O: SerialOutput> SerialOutput for RateLimitedSerialOutput<O> {
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.output.attach_guest_logger(logger.clone());
+        self.guest_logger = Some(logger);
+    }
+
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
         if self.bucket.reduce(1) {
             self.output.write_byte(byte)
         } else {
             self.metrics.record_rate_limiter_dropped_bytes(1);
+            if let Some(logger) = &self.guest_logger {
+                logger.log_transport(LoggerTransportOutcome::RateLimiterRejected(
+                    LoggerDeviceKind::Serial,
+                ));
+            }
             Ok(())
         }
     }
@@ -2494,6 +2520,10 @@ impl<O: SerialOutput> MmioHandler for SerialMmioDevice<O> {
             MmioHandlerError::from(source)
         })
     }
+
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.output.attach_guest_logger(logger);
+    }
 }
 
 impl<O: SerialOutput> SerialMmioDevice<O> {
@@ -2672,6 +2702,7 @@ mod tests {
         SharedSerialOutputMetrics, SnapshotSerialOutputError, SnapshotSerialOutputKind,
         SnapshotSerialOutputReservation,
     };
+    use crate::logger::{LoggerConfigInput, LoggerLevel, LoggerState};
     use crate::memory::GuestAddress;
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioDispatchError, MmioDispatchOutcome, MmioDispatcher,
@@ -2679,6 +2710,23 @@ mod tests {
     };
     use crate::token_bucket::{TokenBucket, TokenBucketConfig};
     use vm_superio::{Serial as VmSuperioSerial, Trigger};
+
+    #[derive(Debug)]
+    struct RecordingLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for RecordingLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("logger output lock should succeed")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn access(offset: u64, size: u64) -> MmioAccess {
         let mut dispatcher = MmioDispatcher::new();
@@ -3929,6 +3977,14 @@ mod tests {
             SerialRateLimiterConfig::new(1, None, 100),
         )
         .expect("bucket should be enabled");
+        let log_output = Arc::new(Mutex::new(Vec::new()));
+        let mut logger_state = LoggerState::default();
+        logger_state.configure_test_writer(RecordingLogWriter(log_output.clone()));
+        logger_state
+            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Debug))
+            .expect("debug logger should configure");
+        let logger = logger_state.guest_logger();
+        output.attach_guest_logger(logger.clone());
 
         output.write_byte(b'a').expect("first byte should write");
         output
@@ -3937,6 +3993,16 @@ mod tests {
 
         assert_eq!(buffer.bytes().expect("shared bytes should read"), b"a");
         assert_eq!(output.metrics().rate_limiter_dropped_bytes(), 1);
+        assert!(logger.wait_for_delivery_for_test());
+        let log = String::from_utf8(
+            log_output
+                .lock()
+                .expect("logger output lock should succeed")
+                .clone(),
+        )
+        .expect("logger output should remain UTF-8");
+        assert!(log.contains("device-kind=serial operation=rate-limiter outcome=rejected\n"));
+        assert!(!log.contains("byte=98"), "guest byte must remain redacted");
     }
 
     #[test]

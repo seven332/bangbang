@@ -244,9 +244,65 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic backend, memory, interrupt, or vCPU outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1809"
+      "disposition": "implemented",
+      "rationale": "All mapped upstream calls converge on the same semantic backend, memory, interrupt, timer, or vCPU outcome. One controller-local GuestLogger observes the last typed HVF owner on normal and native-v2 paths, selects a fixed level from a closed outcome, and discards raw errors, paths, identifiers, descriptors, addresses, registers, exit values, and guest values.",
+      "compiled_events": [
+        "backend"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "typed VM, memory, interrupt, and vCPU backend outcome owners"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_platform.rs",
+          "anchor": "native-v2 restore logger attachment before backend construction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "typed cache, run-loop, exit, MMIO, interrupt, and timer outcome owners"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "closed nonblocking GuestLogger backend producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed backend outcome encoding and level selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent backend outcome limiter identity"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "backend result-preservation and cleanup tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "run-step, run-loop, interrupt, timer, and session tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed production backend outcome reachability and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "backend filtering, limiting, recovery, loss, and encoding tests"
+        }
+      ]
     },
     {
       "id": "logger.balloon.outcome",
@@ -1033,9 +1089,80 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic device transport, PCI, queue, or notification outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1809"
+      "disposition": "implemented",
+      "rationale": "All mapped upstream calls converge on the same semantic device transport, PCI, queue, or notification outcome. One controller-local GuestLogger is attached before normal and native-v2 MMIO or product-PCI publication; generic owners classify typed transitions before formatting, select a fixed level from a closed outcome, and discard raw errors, paths, identifiers, descriptors, addresses, registers, indices, and guest values.",
+      "compiled_events": [
+        "transport"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "controller logger propagation through native-v2 restore families"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "closed nonblocking GuestLogger transport producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed transport outcome encoding and level selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent transport outcome limiter identity"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmio.rs",
+          "anchor": "shared handler attachment and MMIO publication, rollback, release, and dispatch outcomes"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pci.rs",
+          "anchor": "typed PCI ECAM transport boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "typed virtio-MMIO feature, queue, config, activation, reset, and notification outcomes"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "typed product-PCI config, queue, MSI, publication, removal, and interrupt outcomes"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed production transport outcome reachability and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "transport filtering, limiting, recovery, loss, and encoding tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmio.rs",
+          "anchor": "existing and future handler attachment, publication, rollback, and result tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "typed MMIO transition and result-preservation tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "typed PCI transition, MSI, interrupt, teardown, and rollback tests"
+        }
+      ]
     },
     {
       "id": "logger.vsock.outcome",

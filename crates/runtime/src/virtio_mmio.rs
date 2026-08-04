@@ -4,6 +4,7 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 
 use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatus, DeviceInterruptStatusError};
+use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
 use crate::memory::GuestAddress;
 use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioHandler, MmioHandlerError,
@@ -1474,6 +1475,9 @@ impl<'a> VirtioMmioDeviceActivation<'a> {
 }
 
 pub trait VirtioMmioDeviceActivationHandler: fmt::Debug + Send {
+    /// Installs the controller-local, result-free guest logging capability.
+    fn attach_guest_logger(&mut self, _logger: GuestLogger) {}
+
     fn activate(
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
@@ -1568,14 +1572,24 @@ impl std::error::Error for VirtioMmioDeviceActivationError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct VirtioMmioRegisterHandler<
     C = UnsupportedVirtioMmioDeviceConfig,
     A = NoopVirtioMmioDeviceActivation,
 > {
     core: VirtioDeviceCore<C, A>,
     interrupts: VirtioMmioInterruptRegisters,
+    guest_logger: GuestLogger,
+    queue_notification_success_logging_enabled: bool,
 }
+
+impl<C: PartialEq, A: PartialEq> PartialEq for VirtioMmioRegisterHandler<C, A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.core == other.core && self.interrupts == other.interrupts
+    }
+}
+
+impl<C: Eq, A: Eq> Eq for VirtioMmioRegisterHandler<C, A> {}
 
 impl<C, A> Deref for VirtioMmioRegisterHandler<C, A> {
     type Target = VirtioDeviceCore<C, A>;
@@ -1823,6 +1837,8 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
                 requires_device_config_write_status,
             ),
             interrupts: VirtioMmioInterruptRegisters::new(),
+            guest_logger: GuestLogger::default(),
+            queue_notification_success_logging_enabled: false,
         })
     }
 
@@ -2063,16 +2079,26 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
                         source,
                     },
                 ),
-            VirtioMmioRegister::QueueNotify => self
-                .core
-                .queue_notifications
-                .write_register(register, value, status)
-                .map_err(
-                    |source| VirtioMmioRegisterHandlerError::QueueNotificationWrite {
-                        register,
-                        source,
-                    },
-                ),
+            VirtioMmioRegister::QueueNotify => {
+                let result = self
+                    .core
+                    .queue_notifications
+                    .write_register(register, value, status)
+                    .map_err(
+                        |source| VirtioMmioRegisterHandlerError::QueueNotificationWrite {
+                            register,
+                            source,
+                        },
+                    );
+                if result.is_ok()
+                    && self.queue_notification_success_logging_enabled
+                    && let Some(kind) = self.logger_device_kind()
+                {
+                    self.guest_logger
+                        .log_transport(LoggerTransportOutcome::QueueNotificationSucceeded(kind));
+                }
+                result
+            }
             VirtioMmioRegister::InterruptAck => {
                 self.interrupts
                     .write_register(register, value, self.device.status())
@@ -2130,6 +2156,10 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
 
         if register == VirtioMmioRegister::Status && value == VIRTIO_DEVICE_STATUS_INIT {
             self.reset_active_state();
+            if let Some(kind) = self.logger_device_kind() {
+                self.guest_logger
+                    .log_transport(LoggerTransportOutcome::DeviceResetSucceeded(kind));
+            }
         }
 
         if register == VirtioMmioRegister::Status
@@ -2143,15 +2173,23 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
     }
 
     fn activate_device(&mut self) -> Result<(), VirtioMmioRegisterHandlerError> {
+        let logger = self.guest_logger.clone();
+        let kind = self.logger_device_kind();
         let core = &mut self.core;
         let activation = VirtioMmioDeviceActivation::new(&core.device, &core.queues);
         match core.activation.activate(activation) {
             Ok(()) => {
                 core.device_activated = true;
+                if let Some(kind) = kind {
+                    logger.log_transport(LoggerTransportOutcome::DeviceActivationSucceeded(kind));
+                }
                 Ok(())
             }
             Err(source) => {
                 core.device.mark_device_needs_reset();
+                if let Some(kind) = kind {
+                    logger.log_transport(LoggerTransportOutcome::DeviceActivationFailed(kind));
+                }
                 Err(VirtioMmioRegisterHandlerError::DeviceActivation {
                     status: core.device.status(),
                     source,
@@ -2192,18 +2230,94 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
             .write_device_config(access, data)
             .map_err(|source| map_device_config_write_error(access, source))
     }
+
+    const fn logger_device_kind(&self) -> Option<LoggerDeviceKind> {
+        LoggerDeviceKind::from_virtio_device_id(self.core.device.device_id())
+    }
+
+    fn log_handler_error(&self, error: &VirtioMmioRegisterHandlerError) {
+        let Some(kind) = self.logger_device_kind() else {
+            return;
+        };
+        let outcome = match error {
+            VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { .. }
+            | VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigWrite { .. }
+            | VirtioMmioRegisterHandlerError::DeviceConfigWriteNotWritable { .. } => {
+                LoggerTransportOutcome::DeviceConfigRejected(kind)
+            }
+            VirtioMmioRegisterHandlerError::DeviceConfigRead { .. }
+            | VirtioMmioRegisterHandlerError::DeviceConfigWrite { .. }
+            | VirtioMmioRegisterHandlerError::DeviceConfigReadDataLength { .. } => {
+                LoggerTransportOutcome::DeviceConfigFailed(kind)
+            }
+            VirtioMmioRegisterHandlerError::DeviceRegisterWrite {
+                register:
+                    VirtioMmioRegister::DeviceFeaturesSel
+                    | VirtioMmioRegister::DriverFeatures
+                    | VirtioMmioRegister::DriverFeaturesSel,
+                ..
+            } => LoggerTransportOutcome::FeatureNegotiationRejected(kind),
+            VirtioMmioRegisterHandlerError::QueueRegisterInitialization { .. }
+            | VirtioMmioRegisterHandlerError::QueueRegisterRead { .. }
+            | VirtioMmioRegisterHandlerError::QueueRegisterWrite { .. } => {
+                LoggerTransportOutcome::QueueConfigurationRejected(kind)
+            }
+            VirtioMmioRegisterHandlerError::QueueNotificationInitialization { .. }
+            | VirtioMmioRegisterHandlerError::QueueNotificationWrite { .. } => {
+                LoggerTransportOutcome::QueueNotificationFailed(kind)
+            }
+            // Activation is observed inside `activate_device`, while the
+            // precise typed result is still available.
+            VirtioMmioRegisterHandlerError::DeviceActivation { .. } => return,
+            VirtioMmioRegisterHandlerError::InvalidOperation { .. }
+            | VirtioMmioRegisterHandlerError::DecodeAccess { .. }
+            | VirtioMmioRegisterHandlerError::RegisterReadData { .. }
+            | VirtioMmioRegisterHandlerError::RegisterWriteDataLength { .. }
+            | VirtioMmioRegisterHandlerError::UnsupportedRegisterRead { .. }
+            | VirtioMmioRegisterHandlerError::UnsupportedRegisterWrite { .. }
+            | VirtioMmioRegisterHandlerError::DeviceRegisterRead { .. }
+            | VirtioMmioRegisterHandlerError::DeviceRegisterWrite { .. }
+            | VirtioMmioRegisterHandlerError::InterruptRegisterRead { .. }
+            | VirtioMmioRegisterHandlerError::InterruptRegisterWrite { .. } => {
+                LoggerTransportOutcome::MmioAccessFailed(Some(kind))
+            }
+        };
+        self.guest_logger.log_transport(outcome);
+    }
 }
 
 impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler> MmioHandler
     for VirtioMmioRegisterHandler<C, A>
 {
     fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
-        self.read_access(access).map_err(MmioHandlerError::from)
+        let result = self.read_access(access);
+        if let Err(error) = &result {
+            self.log_handler_error(error);
+        }
+        result.map_err(MmioHandlerError::from)
     }
 
     fn write(&mut self, access: MmioAccess, data: MmioAccessBytes) -> Result<(), MmioHandlerError> {
-        self.write_access(access, data)
-            .map_err(MmioHandlerError::from)
+        let result = self.write_access(access, data);
+        if let Err(error) = &result {
+            self.log_handler_error(error);
+        }
+        result.map_err(MmioHandlerError::from)
+    }
+
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.queue_notification_success_logging_enabled =
+            self.logger_device_kind().is_some_and(|kind| {
+                logger.transport_outcome_enabled(
+                    LoggerTransportOutcome::QueueNotificationSucceeded(kind),
+                )
+            });
+        self.core.activation.attach_guest_logger(logger.clone());
+        self.guest_logger = logger;
+    }
+
+    fn owns_transport_access_logging(&self) -> bool {
+        self.logger_device_kind().is_some()
     }
 }
 
@@ -3269,6 +3383,8 @@ fn validate_queue_address(
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
 
     use super::{
         UnsupportedVirtioMmioDeviceConfig, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
@@ -3289,10 +3405,11 @@ mod tests {
         VirtioMmioRegisterStateError, VirtioMmioTransportStateError, decode_virtio_mmio_access,
     };
     use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatusError};
+    use crate::logger::{LoggerState, LoggerTransportOutcome};
     use crate::memory::GuestAddress;
     use crate::mmio::{
-        MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioHandlerError,
-        MmioOperation, MmioOperationKind, MmioRegionId,
+        MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
+        MmioHandlerError, MmioOperation, MmioOperationKind, MmioRegionId,
     };
     use crate::virtio::VirtioInterruptIntent;
 
@@ -3301,6 +3418,23 @@ mod tests {
         | VIRTIO_DEVICE_STATUS_DRIVER
         | VIRTIO_DEVICE_STATUS_FEATURES_OK;
     const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+
+    #[derive(Clone)]
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("recording writer lock should not be poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestDeviceConfig {
@@ -4992,6 +5126,79 @@ mod tests {
         assert_eq!(queue.descriptor_table(), GuestAddress::new(0x1000));
         assert_eq!(queue.driver_ring(), GuestAddress::new(0x2000));
         assert_eq!(queue.device_ring(), GuestAddress::new(0x3000));
+    }
+
+    #[test]
+    fn attached_logger_observes_typed_activation_and_reset_without_changing_results() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut logger_state = LoggerState::default();
+        logger_state.configure_test_writer(RecordingWriter(output.clone()));
+        let logger = logger_state.guest_logger();
+
+        let activation = TestDeviceActivation::new();
+        let mut handler = VirtioMmioRegisterHandler::with_activation(2, 0x2a, &[8], activation)
+            .expect("block handler should build");
+        handler.attach_guest_logger(logger.clone());
+        configure_handler_for_activation(&mut handler).expect("handler should be configurable");
+        let status_access = access(VirtioMmioRegister::Status.offset(), 4);
+        let driver_ok =
+            MmioAccessBytes::new(&DRIVER_OK_STATUS.to_le_bytes()).expect("status bytes should fit");
+        MmioHandler::write(&mut handler, status_access, driver_ok)
+            .expect("DRIVER_OK should activate");
+        let reset = MmioAccessBytes::new(&VIRTIO_DEVICE_STATUS_INIT.to_le_bytes())
+            .expect("reset bytes should fit");
+        MmioHandler::write(&mut handler, status_access, reset).expect("INIT should reset");
+
+        let mut failing_activation = TestDeviceActivation::new();
+        failing_activation.error = Some(MmioHandlerError::new(
+            "/private/activation-secret descriptor=19",
+        ));
+        let mut failing =
+            VirtioMmioRegisterHandler::with_activation(2, 0x2a, &[8], failing_activation)
+                .expect("failing block handler should build");
+        failing.attach_guest_logger(logger.clone());
+        configure_handler_for_activation(&mut failing).expect("handler should be configurable");
+        let error = MmioHandler::write(
+            &mut failing,
+            status_access,
+            MmioAccessBytes::new(&DRIVER_OK_STATUS.to_le_bytes()).expect("status bytes should fit"),
+        )
+        .expect_err("activation failure should remain visible to the caller");
+        assert!(error.message().contains("activation-secret"));
+
+        assert!(logger.wait_for_delivery_for_test());
+        let output = String::from_utf8(
+            output
+                .lock()
+                .expect("recording output should not be poisoned")
+                .clone(),
+        )
+        .expect("transport output should be UTF-8");
+        for (outcome, expected) in [
+            (
+                LoggerTransportOutcome::DeviceActivationSucceeded(
+                    crate::logger::LoggerDeviceKind::Block,
+                ),
+                "device-kind=block operation=device-activation outcome=succeeded\n",
+            ),
+            (
+                LoggerTransportOutcome::DeviceResetSucceeded(
+                    crate::logger::LoggerDeviceKind::Block,
+                ),
+                "device-kind=block operation=device-reset outcome=succeeded\n",
+            ),
+            (
+                LoggerTransportOutcome::DeviceActivationFailed(
+                    crate::logger::LoggerDeviceKind::Block,
+                ),
+                "device-kind=block operation=device-activation outcome=failed\n",
+            ),
+        ] {
+            let _closed_outcome = outcome;
+            assert_eq!(output.matches(expected).count(), 1);
+        }
+        assert!(!output.contains("activation-secret"));
+        assert!(!output.contains("descriptor=19"));
     }
 
     #[test]

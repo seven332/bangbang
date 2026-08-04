@@ -40,6 +40,8 @@ pub(super) enum LoggerRateLimitIdentity {
     BootTimer,
     ApiRequest,
     ObservabilityWorker,
+    BackendOutcome,
+    TransportOutcome,
 }
 
 impl LoggerRateLimitIdentity {
@@ -48,14 +50,18 @@ impl LoggerRateLimitIdentity {
             Self::BootTimer => 0,
             Self::ApiRequest => 1,
             Self::ObservabilityWorker => 2,
+            Self::BackendOutcome => 3,
+            Self::TransportOutcome => 4,
         }
     }
 }
 
-const LOGGER_RATE_LIMIT_IDENTITIES: [LoggerRateLimitIdentity; 3] = [
+const LOGGER_RATE_LIMIT_IDENTITIES: [LoggerRateLimitIdentity; 5] = [
     LoggerRateLimitIdentity::BootTimer,
     LoggerRateLimitIdentity::ApiRequest,
     LoggerRateLimitIdentity::ObservabilityWorker,
+    LoggerRateLimitIdentity::BackendOutcome,
+    LoggerRateLimitIdentity::TransportOutcome,
 ];
 const LOGGER_RATE_LIMIT_IDENTITY_COUNT: usize = LOGGER_RATE_LIMIT_IDENTITIES.len();
 
@@ -327,6 +333,28 @@ mod tests {
     }
 
     #[test]
+    fn backend_and_transport_identities_are_independent_after_cas_exhaustion() {
+        let limiter = LoggerRateLimiters::with_clock(Arc::new(TestClock::default()));
+        limiter.force_cas_failures(
+            LoggerRateLimitIdentity::BackendOutcome,
+            u64::try_from(LOG_RATE_LIMIT_CAS_ATTEMPTS).unwrap_or(u64::MAX),
+        );
+
+        assert_eq!(
+            limiter.check(LoggerRateLimitIdentity::BackendOutcome),
+            LogRateLimitDecision::Denied
+        );
+        assert_eq!(
+            limiter.check(LoggerRateLimitIdentity::TransportOutcome),
+            LogRateLimitDecision::Admitted { suppressed: 0 }
+        );
+        assert_eq!(
+            limiter.check(LoggerRateLimitIdentity::BackendOutcome),
+            LogRateLimitDecision::Admitted { suppressed: 1 }
+        );
+    }
+
+    #[test]
     fn concurrent_checks_conserve_every_denial() {
         const CHECKS: usize = 32;
 
@@ -339,7 +367,7 @@ mod tests {
             let start = start.clone();
             workers.push(thread::spawn(move || {
                 start.wait();
-                limiter.check(LoggerRateLimitIdentity::BootTimer)
+                limiter.check(LoggerRateLimitIdentity::TransportOutcome)
             }));
         }
 
@@ -360,7 +388,7 @@ mod tests {
 
         clock.set(500);
         let LogRateLimitDecision::Admitted { suppressed } =
-            limiter.check(LoggerRateLimitIdentity::BootTimer)
+            limiter.check(LoggerRateLimitIdentity::TransportOutcome)
         else {
             panic!("one exact refill should admit after concurrent checks");
         };

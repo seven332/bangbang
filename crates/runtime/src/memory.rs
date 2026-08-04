@@ -16,6 +16,7 @@ use std::sync::Weak;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 
+use crate::logger::{GuestLogger, LoggerBackendOutcome};
 use crate::memory_dirty::{GuestMemoryDirtyTracker, GuestMemoryDirtyTrackerError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -488,6 +489,7 @@ pub struct GuestMemory {
     dirty_tracker: Option<Arc<GuestMemoryDirtyTracker>>,
     backing: GuestMemoryBacking,
     access_profile: GuestMemoryAccessProfile,
+    guest_logger: GuestLogger,
 }
 
 #[cfg(test)]
@@ -594,6 +596,7 @@ impl GuestMemory {
             dirty_tracker: None,
             backing,
             access_profile: GuestMemoryAccessProfile::Eager,
+            guest_logger: GuestLogger::default(),
         }
     }
 
@@ -667,6 +670,7 @@ impl GuestMemory {
             dirty_tracker: None,
             backing,
             access_profile: GuestMemoryAccessProfile::Eager,
+            guest_logger: GuestLogger::default(),
         })
     }
 
@@ -753,6 +757,7 @@ impl GuestMemory {
             dirty_tracker: None,
             backing,
             access_profile: GuestMemoryAccessProfile::Eager,
+            guest_logger: GuestLogger::default(),
         })
     }
 
@@ -789,7 +794,18 @@ impl GuestMemory {
             dirty_tracker: None,
             backing: GuestMemoryBacking::Anonymous,
             access_profile: GuestMemoryAccessProfile::ProtectedLazy,
+            guest_logger: self.guest_logger.clone(),
         })
+    }
+
+    /// Installs the controller-local, result-free guest logging capability.
+    #[doc(hidden)]
+    pub fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = logger;
+    }
+
+    pub(crate) const fn guest_logger(&self) -> &GuestLogger {
+        &self.guest_logger
     }
 
     /// Install one shared dirty-page generation over every current region.
@@ -1150,21 +1166,29 @@ impl GuestMemory {
     ) -> GuestMemoryDiscardOutcome {
         let mut outcome = GuestMemoryDiscardOutcome::new(range.size());
         if self.is_protected_lazy() {
-            return outcome.fail_all(GuestMemoryDiscardFailureKind::UnsupportedTarget);
+            return self.observe_discard_outcome(
+                outcome.fail_all(GuestMemoryDiscardFailureKind::UnsupportedTarget),
+            );
         }
         if self.validate_mapped_range(range).is_err() {
-            return outcome.fail_all(GuestMemoryDiscardFailureKind::RangeValidation);
+            return self.observe_discard_outcome(
+                outcome.fail_all(GuestMemoryDiscardFailureKind::RangeValidation),
+            );
         }
 
         let page_size = match adviser.host_page_size() {
             Ok(page_size) => page_size,
-            Err(kind) => return outcome.fail_all(kind),
+            Err(kind) => return self.observe_discard_outcome(outcome.fail_all(kind)),
         };
         let Ok(page_size) = usize::try_from(page_size) else {
-            return outcome.fail_all(GuestMemoryDiscardFailureKind::InvalidHostPageSize);
+            return self.observe_discard_outcome(
+                outcome.fail_all(GuestMemoryDiscardFailureKind::InvalidHostPageSize),
+            );
         };
         if page_size == 0 || !page_size.is_power_of_two() {
-            return outcome.fail_all(GuestMemoryDiscardFailureKind::InvalidHostPageSize);
+            return self.observe_discard_outcome(
+                outcome.fail_all(GuestMemoryDiscardFailureKind::InvalidHostPageSize),
+            );
         }
 
         for region in &self.regions {
@@ -1264,6 +1288,17 @@ impl GuestMemory {
             outcome.record_advised(advice_size_u64);
         }
 
+        self.observe_discard_outcome(outcome)
+    }
+
+    fn observe_discard_outcome(
+        &self,
+        outcome: GuestMemoryDiscardOutcome,
+    ) -> GuestMemoryDiscardOutcome {
+        if outcome.failed_bytes() != 0 {
+            self.guest_logger
+                .log_backend(LoggerBackendOutcome::MemoryDiscardFailed);
+        }
         outcome
     }
 
@@ -3166,12 +3201,12 @@ impl Drop for GuestMemoryMapping {
 mod tests {
     use std::collections::HashSet;
     use std::ffi::c_void;
-    use std::io;
+    use std::io::{self, Write};
     use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::fs::{FileExt, MetadataExt};
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
     use super::{
@@ -3184,8 +3219,26 @@ mod tests {
         preflight_shared_memory_resource_values_with_limits,
         preflight_shared_memory_resources_with_limits,
     };
+    use crate::logger::LoggerState;
 
     const PAGE_SIZE: u64 = 4096;
+
+    #[derive(Debug)]
+    struct RecordingLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("logger output lock should succeed")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn range(start: u64, size: u64) -> GuestMemoryRange {
         GuestMemoryRange::new(GuestAddress::new(start), size)
@@ -3356,6 +3409,38 @@ mod tests {
             1
         );
         assert!(adviser.calls.is_empty());
+    }
+
+    #[test]
+    fn guest_memory_discard_logs_closed_failure_without_changing_outcome() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(0, page_size)]);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut logger_state = LoggerState::default();
+        logger_state.configure_test_writer(RecordingLogWriter(output.clone()));
+        let logger = logger_state.guest_logger();
+        memory.attach_guest_logger(logger.clone());
+        let unmapped = range(0xfeed_0000, page_size);
+
+        let outcome = memory.discard_range(unmapped);
+
+        assert_eq!(outcome.failed_bytes(), page_size);
+        assert_eq!(
+            outcome
+                .failures()
+                .count(GuestMemoryDiscardFailureKind::RangeValidation),
+            1
+        );
+        assert!(logger.wait_for_delivery_for_test());
+        let log = String::from_utf8(
+            output
+                .lock()
+                .expect("logger output lock should succeed")
+                .clone(),
+        )
+        .expect("logger output should remain UTF-8");
+        assert!(log.contains("operation=memory-discard outcome=failed\n"));
+        assert!(!log.contains("feed0000"));
     }
 
     #[test]
@@ -3655,6 +3740,7 @@ mod tests {
             dirty_tracker: None,
             backing: super::GuestMemoryBacking::Anonymous,
             access_profile: super::GuestMemoryAccessProfile::Eager,
+            guest_logger: super::GuestLogger::default(),
         };
         let mut adviser = TestDiscardAdviser::new(PAGE_SIZE);
 
