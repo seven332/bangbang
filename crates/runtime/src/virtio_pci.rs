@@ -4418,6 +4418,121 @@ impl std::error::Error for VirtioPciEndpointError {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::message_interrupt::{GuestMessageInterrupt, GuestMessageInterruptSignalError};
+
+    #[derive(Debug)]
+    struct FailingMessageRoute {
+        message: GuestMessage,
+    }
+
+    impl GuestMessageInterrupt for FailingMessageRoute {
+        fn matches(&self, message: GuestMessage) -> bool {
+            self.message == message
+        }
+
+        fn signal(&self, message: GuestMessage) -> Result<(), GuestMessageInterruptSignalError> {
+            if !self.matches(message) {
+                return Err(GuestMessageInterruptSignalError::new(
+                    "test route rejected a mismatched message",
+                    false,
+                ));
+            }
+            Err(GuestMessageInterruptSignalError::new(
+                "injected product PCI interrupt failure",
+                false,
+            ))
+        }
+    }
+
+    /// Builds one active endpoint whose configuration and queue MSI-X vectors
+    /// all resolve through deterministic failing routes.
+    pub(crate) fn endpoint_with_failing_interrupts<C, A>(
+        identity: VirtioPciIdentity,
+        queue_max_sizes: &[u16],
+        device_config: C,
+        activation: A,
+        logger: GuestLogger,
+    ) -> VirtioPciEndpoint<C, A>
+    where
+        C: VirtioDeviceConfigHandler,
+        A: VirtioDeviceActivationHandler,
+    {
+        let vector_count = queue_max_sizes
+            .len()
+            .checked_add(1)
+            .expect("test vector count should fit usize");
+        let messages = (0..vector_count)
+            .map(|index| {
+                GuestMessage::new(
+                    0x0800_1000,
+                    u32::try_from(0x100 + index).expect("test message data should fit u32"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let routes = messages
+            .iter()
+            .copied()
+            .map(|message| {
+                Arc::new(FailingMessageRoute { message }) as Arc<dyn GuestMessageInterrupt>
+            })
+            .collect();
+        let registry = GuestMessageInterruptRegistry::new(routes)
+            .expect("test product PCI message registry should validate");
+        let range = GuestMemoryRange::new(
+            GuestAddress::new(0x7_0000_0000),
+            VIRTIO_PCI_CAPABILITY_BAR_SIZE * 2,
+        )
+        .expect("test product PCI BAR range should validate");
+        let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, range);
+        let bar = allocator
+            .allocate(VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+            .expect("test product PCI BAR should allocate");
+        let endpoint = VirtioPciEndpoint::new(
+            identity,
+            queue_max_sizes,
+            device_config,
+            activation,
+            false,
+            &bar,
+            registry,
+        )
+        .expect("test product PCI endpoint should initialize");
+        endpoint.attach_guest_logger(logger);
+
+        {
+            let mut state = endpoint
+                .inner
+                .state
+                .lock()
+                .expect("test product PCI endpoint should remain available");
+            for (index, message) in messages.iter().copied().enumerate() {
+                let entry_offset = u64::try_from(index).expect("test MSI-X index should fit u64")
+                    * MSIX_TABLE_ENTRY_SIZE;
+                state
+                    .msix
+                    .write_table(entry_offset, &message.address().to_le_bytes())
+                    .expect("test MSI-X address should program");
+                state
+                    .msix
+                    .write_table(entry_offset + 8, &u64::from(message.data()).to_le_bytes())
+                    .expect("test MSI-X data and mask should program");
+            }
+            state.msix.set_config_vector(0);
+            for queue_index in 0..queue_max_sizes.len() {
+                state.msix.set_queue_vector(
+                    u16::try_from(queue_index).expect("test queue index should fit u16"),
+                    u16::try_from(queue_index + 1).expect("test queue vector should fit u16"),
+                );
+            }
+        }
+
+        endpoint
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::{self, Write};

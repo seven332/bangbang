@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
+use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerSerialOutcome, LoggerTransportOutcome};
 use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioHandler, MmioHandlerError,
 };
@@ -563,17 +563,23 @@ impl SerialOutput for SharedSerialOutputBuffer {
 struct MeteredSerialOutput<O> {
     output: O,
     metrics: SharedSerialOutputMetrics,
+    guest_logger: Option<GuestLogger>,
 }
 
 impl<O> MeteredSerialOutput<O> {
     fn new(output: O, metrics: SharedSerialOutputMetrics) -> Self {
-        Self { output, metrics }
+        Self {
+            output,
+            metrics,
+            guest_logger: None,
+        }
     }
 }
 
 impl<O: SerialOutput> SerialOutput for MeteredSerialOutput<O> {
     fn attach_guest_logger(&mut self, logger: GuestLogger) {
-        self.output.attach_guest_logger(logger);
+        self.output.attach_guest_logger(logger.clone());
+        self.guest_logger = Some(logger);
     }
 
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
@@ -585,6 +591,9 @@ impl<O: SerialOutput> SerialOutput for MeteredSerialOutput<O> {
             Err(err) => {
                 self.metrics.record_missed_write();
                 self.metrics.record_error();
+                if let Some(logger) = &self.guest_logger {
+                    logger.log_serial(LoggerSerialOutcome::OutputFailed);
+                }
                 Err(err)
             }
         }
@@ -595,6 +604,7 @@ impl<O: SerialOutput> SerialOutput for MeteredSerialOutput<O> {
 pub struct SharedSerialOutput {
     output: Arc<Mutex<Box<dyn SerialOutput>>>,
     metrics: SharedSerialOutputMetrics,
+    guest_logger: Option<GuestLogger>,
 }
 
 impl SharedSerialOutput {
@@ -606,6 +616,7 @@ impl SharedSerialOutput {
                 metrics.clone(),
             )))),
             metrics,
+            guest_logger: None,
         }
     }
 
@@ -627,6 +638,7 @@ impl SharedSerialOutput {
         Self {
             output: Arc::new(Mutex::new(output)),
             metrics,
+            guest_logger: None,
         }
     }
 
@@ -649,14 +661,18 @@ impl From<SharedSerialOutputBuffer> for SharedSerialOutput {
 impl SerialOutput for SharedSerialOutput {
     fn attach_guest_logger(&mut self, logger: GuestLogger) {
         if let Ok(mut output) = self.output.lock() {
-            output.attach_guest_logger(logger);
+            output.attach_guest_logger(logger.clone());
         }
+        self.guest_logger = Some(logger);
     }
 
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
         let mut output = self.output.lock().map_err(|_| {
             self.metrics.record_missed_write();
             self.metrics.record_error();
+            if let Some(logger) = &self.guest_logger {
+                logger.log_serial(LoggerSerialOutcome::OutputFailed);
+            }
             SerialOutputError::lock_poisoned()
         })?;
 
@@ -714,6 +730,7 @@ impl<O: SerialOutput> SerialOutput for RateLimitedSerialOutput<O> {
                 logger.log_transport(LoggerTransportOutcome::RateLimiterRejected(
                     LoggerDeviceKind::Serial,
                 ));
+                logger.log_serial(LoggerSerialOutcome::RateLimiterThrottled);
             }
             Ok(())
         }
@@ -4002,7 +4019,40 @@ mod tests {
         )
         .expect("logger output should remain UTF-8");
         assert!(log.contains("device-kind=serial operation=rate-limiter outcome=rejected\n"));
+        assert!(log.contains("device-kind=serial operation=rate-limiter outcome=throttled\n"));
         assert!(!log.contains("byte=98"), "guest byte must remain redacted");
+    }
+
+    #[test]
+    fn metered_output_failure_emits_one_fixed_serial_record() {
+        let mut output = SharedSerialOutput::new(FailingOutput);
+        let log_output = Arc::new(Mutex::new(Vec::new()));
+        let mut logger_state = LoggerState::default();
+        logger_state.configure_test_writer(RecordingLogWriter(log_output.clone()));
+        let logger = logger_state.guest_logger();
+        output.attach_guest_logger(logger.clone());
+
+        let error = output
+            .write_byte(b'q')
+            .expect_err("failing output should preserve its typed error");
+
+        assert_eq!(error.to_string(), "sink failed");
+        assert!(logger.wait_for_delivery_for_test());
+        let log = String::from_utf8(
+            log_output
+                .lock()
+                .expect("logger output lock should succeed")
+                .clone(),
+        )
+        .expect("logger output should remain UTF-8");
+        assert_eq!(
+            log.lines()
+                .filter(|line| *line == "device-kind=serial operation=output outcome=failed")
+                .count(),
+            1
+        );
+        assert!(!log.contains("q"));
+        assert!(!log.contains("sink failed"));
     }
 
     #[test]

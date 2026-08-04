@@ -6992,12 +6992,19 @@ mod macos_arm64 {
         );
         let logger_output = fs::read_to_string(&logger_path)
             .expect("remaining-device logger output should be readable after shutdown");
-        assert!(
-            logger_output
-                .lines()
-                .any(|record| record == "device-kind=block operation=request outcome=succeeded"),
-            "signed {transport} block activity should reach the closed block producer; output:\n{logger_output}"
-        );
+        for expected in [
+            "device-kind=balloon operation=inflate outcome=succeeded",
+            "device-kind=block operation=request outcome=succeeded",
+            "device-kind=entropy operation=fill outcome=succeeded",
+            "device-kind=memory-hotplug operation=configuration-update outcome=succeeded",
+            "device-kind=serial operation=input-read outcome=succeeded",
+            "device-kind=time-identity operation=platform-publication outcome=succeeded",
+        ] {
+            assert!(
+                logger_output.lines().any(|record| record == expected),
+                "signed {transport} remaining-device activity should reach the closed producer record {expected:?}; output:\n{logger_output}"
+            );
+        }
         for forbidden in [
             path_text(&control_path),
             instance_id.as_str(),
@@ -18634,6 +18641,18 @@ mod macos_arm64 {
     fn logger_output_accepts_only_closed_device_data_outcomes_with_exact_levels() {
         for (record, level) in [
             (
+                "device-kind=balloon operation=inflate outcome=succeeded",
+                "Info",
+            ),
+            (
+                "device-kind=balloon operation=statistics outcome=oversized",
+                "Warn",
+            ),
+            (
+                "device-kind=balloon operation=accounting outcome=failed",
+                "Error",
+            ),
+            (
                 "device-kind=block operation=rate-limiter outcome=throttled",
                 "Debug",
             ),
@@ -18647,6 +18666,34 @@ mod macos_arm64 {
             ),
             (
                 "device-kind=block operation=interrupt-delivery outcome=failed",
+                "Error",
+            ),
+            (
+                "device-kind=entropy operation=rate-limiter outcome=resumed",
+                "Debug",
+            ),
+            (
+                "device-kind=entropy operation=fill outcome=succeeded",
+                "Info",
+            ),
+            (
+                "device-kind=entropy operation=queue-notification outcome=unsupported",
+                "Warn",
+            ),
+            (
+                "device-kind=entropy operation=entropy-provider outcome=failed",
+                "Error",
+            ),
+            (
+                "device-kind=memory-hotplug operation=request outcome=succeeded",
+                "Info",
+            ),
+            (
+                "device-kind=memory-hotplug operation=mutation-rollback outcome=succeeded",
+                "Warn",
+            ),
+            (
+                "device-kind=memory-hotplug operation=mutation outcome=failed",
                 "Error",
             ),
             (
@@ -18679,6 +18726,34 @@ mod macos_arm64 {
                 "Error",
             ),
             (
+                "device-kind=serial operation=input-backpressure outcome=paused",
+                "Debug",
+            ),
+            (
+                "device-kind=serial operation=input-detach outcome=eof",
+                "Info",
+            ),
+            (
+                "device-kind=serial operation=output outcome=failed",
+                "Error",
+            ),
+            (
+                "device-kind=time-identity operation=pvtime-accounting outcome=discarded",
+                "Debug",
+            ),
+            (
+                "device-kind=time-identity operation=vmgenid-replacement outcome=succeeded",
+                "Info",
+            ),
+            (
+                "device-kind=time-identity operation=rtc-read outcome=rejected",
+                "Warn",
+            ),
+            (
+                "device-kind=time-identity operation=ordered-restore outcome=partially-committed",
+                "Error",
+            ),
+            (
                 "device-kind=vsock operation=guest-connection outcome=ignored",
                 "Debug",
             ),
@@ -18704,6 +18779,12 @@ mod macos_arm64 {
             "device-kind=network operation=host-connection outcome=accepted",
             "device-kind=vsock operation=tx-frame outcome=spoof-rejected",
             "device-kind=block operation=request outcome=succeeded id=secret",
+            "device-kind=balloon operation=inflate outcome=failed",
+            "device-kind=entropy operation=fill outcome=private",
+            "device-kind=memory-hotplug operation=request outcome=failed",
+            "device-kind=serial operation=input-backpressure outcome=succeeded",
+            "device-kind=time-identity operation=vmclock-update outcome=discarded",
+            "device-kind=time-identity operation=rtc-read outcome=rejected value=secret",
         ] {
             assert_eq!(closed_device_data_outcome_logger_level(malformed), None);
         }
@@ -19771,46 +19852,105 @@ fn closed_device_data_outcome_logger_level(line: &str) -> Option<&'static str> {
     match (kind, operation, outcome) {
         ("block", "rate-limiter", "throttled" | "resumed")
         | ("block", "async-engine", "throttled")
+        | ("entropy", "rate-limiter", "throttled" | "resumed")
         | ("pmem", "rate-limiter", "throttled" | "resumed")
         | ("network", "rx-buffer", "unavailable")
         | ("network", "rate-limiter", "throttled" | "resumed")
+        | ("serial", "input-rearm", "succeeded")
+        | ("serial", "input-backpressure", "paused")
+        | ("serial", "rate-limiter", "throttled")
+        | ("time-identity", "pvtime-accounting", "discarded")
         | ("vsock", "host-connection", "pending")
         | ("vsock", "guest-connection", "ignored") => Some("Debug"),
 
-        ("block", "request", "succeeded")
+        ("balloon", "inflate" | "deflate" | "hinting" | "reporting", "succeeded")
+        | ("balloon", "statistics", "updated")
+        | ("block", "request", "succeeded")
         | ("block", "vhost-user-notification", "succeeded")
         | ("block", "vhost-user-config", "succeeded")
+        | ("entropy", "fill", "succeeded")
+        | ("memory-hotplug", "request" | "state-query" | "configuration-update", "succeeded")
         | ("pmem", "flush", "succeeded")
         | ("network", "rx" | "tx", "succeeded")
         | ("network", "mmds-request", "detoured")
         | ("network", "mmds-token-key", "rotated")
+        | ("serial", "input-read" | "interrupt-delivery", "succeeded")
+        | ("serial", "input-detach", "eof")
+        | (
+            "time-identity",
+            "rtc-restore"
+            | "platform-publication"
+            | "vmgenid-replacement"
+            | "vmgenid-notification"
+            | "vmclock-update"
+            | "vmclock-notification"
+            | "ordered-restore"
+            | "pvtime-initialization",
+            "succeeded",
+        )
+        | ("time-identity", "pvtime-accounting", "published")
         | ("vsock", "rx" | "tx", "succeeded")
         | ("vsock", "host-connection", "accepted" | "completed")
         | ("vsock", "guest-connection", "retained" | "forwarded" | "updated" | "closed")
         | ("vsock", "connection-reset", "queued")
         | ("vsock", "transport-reset", "succeeded") => Some("Info"),
 
-        ("block", "request", "unsupported")
+        ("balloon", "statistics", "oversized")
+        | ("balloon", "queue-notification", "unsupported")
+        | ("block", "request", "unsupported")
         | ("block", "queue-notification", "unsupported")
         | ("block", "vhost-user-notification", "disconnected")
+        | ("entropy", "queue-notification", "unsupported")
+        | ("memory-hotplug", "request", "unsupported")
+        | ("memory-hotplug", "policy", "rejected")
+        | ("memory-hotplug", "mutation-rollback", "succeeded")
+        | ("memory-hotplug", "queue-notification", "unsupported")
         | ("pmem", "queue-notification", "unsupported")
         | ("network", "rx-buffer", "too-small")
         | ("network", "tx-frame", "spoof-rejected")
         | ("network", "queue-notification", "unsupported")
         | ("network", "packet-provider", "partial")
+        | ("time-identity", "rtc-read" | "rtc-write", "rejected")
         | ("vsock", "rx-buffer", "too-small")
         | ("vsock", "queue-notification", "unsupported")
         | ("vsock", "host-connection", "dropped")
         | ("vsock", "guest-connection", "dropped")
         | ("vsock", "connection-reset", "dropped") => Some("Warn"),
 
-        ("block", "request-parse" | "request-io" | "status-write", "failed")
+        (
+            "balloon",
+            "statistics" | "hinting" | "reporting" | "memory-discard" | "accounting"
+            | "queue-dispatch" | "interrupt-delivery",
+            "failed",
+        )
+        | ("balloon", "queue-notification", "inactive")
+        | ("block", "request-parse" | "request-io" | "status-write", "failed")
         | ("block", "queue-dispatch", "failed")
         | ("block", "queue-notification", "inactive")
         | ("block", "async-engine", "failed")
         | ("block", "vhost-user-notification", "failed" | "terminal")
         | ("block", "vhost-user-config", "failed")
         | ("block", "interrupt-delivery", "failed")
+        | (
+            "entropy",
+            "fill" | "request-parse" | "buffer-write" | "queue-dispatch" | "entropy-provider"
+            | "interrupt-delivery",
+            "failed",
+        )
+        | ("entropy", "queue-notification", "inactive")
+        | (
+            "memory-hotplug",
+            "mutation"
+            | "mutation-rollback"
+            | "request-parse"
+            | "response-write"
+            | "memory-discard"
+            | "configuration-update"
+            | "queue-dispatch"
+            | "interrupt-delivery",
+            "failed",
+        )
+        | ("memory-hotplug", "queue-notification", "inactive")
         | ("pmem", "flush" | "request-parse" | "status-write", "failed")
         | ("pmem", "queue-dispatch", "failed")
         | ("pmem", "queue-notification", "inactive")
@@ -19824,6 +19964,21 @@ fn closed_device_data_outcome_logger_level(line: &str) -> Option<&'static str> {
         | ("network", "packet-provider", "failed")
         | ("network", "mmds-token-key", "failed")
         | ("network", "interrupt-delivery", "failed")
+        | ("serial", "input-read" | "input-detach" | "output" | "interrupt-delivery", "failed")
+        | (
+            "time-identity",
+            "rtc-restore"
+            | "platform-publication"
+            | "vmgenid-replacement"
+            | "vmgenid-notification"
+            | "vmclock-update"
+            | "vmclock-notification"
+            | "ordered-restore"
+            | "pvtime-initialization"
+            | "pvtime-accounting",
+            "failed",
+        )
+        | ("time-identity", "vmclock-update" | "ordered-restore", "partially-committed")
         | ("vsock", "rx-buffer" | "tx-packet", "malformed")
         | ("vsock", "queue-dispatch", "failed")
         | ("vsock", "queue-notification", "inactive")

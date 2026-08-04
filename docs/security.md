@@ -2905,8 +2905,11 @@ cloneable `GuestLogger` capability with no writer, configuration mutation,
 arbitrary formatting, receipt, retry, sleep, or wait surface. Its immutable
 producer snapshot shares the controller's sole worker and the independent
 `logger-rate.backend.outcome`, `logger-rate.transport.outcome`,
-`logger-rate.block.outcome`, `logger-rate.pmem.outcome`,
-`logger-rate.network.outcome`, and `logger-rate.vsock.outcome` states.
+`logger-rate.balloon.outcome`, `logger-rate.block.outcome`,
+`logger-rate.entropy.outcome`, `logger-rate.memory-hotplug.outcome`,
+`logger-rate.network.outcome`, `logger-rate.pmem.outcome`,
+`logger-rate.serial.outcome`, `logger-rate.time-identity.outcome`, and
+`logger-rate.vsock.outcome` states.
 Normal and native-v2 assembly install the capability before HVF and MMIO/PCI
 publication, and run-loop adapter traits require explicit logger forwarding so
 a wrapper cannot silently substitute an inert capability. Repeating successful
@@ -2930,11 +2933,22 @@ emitted only for the transactional rollover boundary; token, key, nonce,
 instance, interface, socket, port, path, packet, and guest values are never
 fields.
 
-Production-bundle coverage routes representative records from all four classes
-through a separately granted write-only logger descriptor, replaces its source
-pathname after launcher adoption, and verifies that records follow the opened
-object while all grant, backing, socket, interface, and guest selectors remain
-absent.
+Balloon, virtio-mem, and entropy observers consume completed typed summaries
+shared by MMIO and product PCI, so guest request, descriptor, byte, and page
+volume cannot multiply formatting work. Serial input emits only coalesced
+read/rearm/backpressure/detach/interrupt outcomes per run-loop dispatch; serial
+output and limiter failures remain at their owning wrappers. RTC, VMGenID,
+VMClock, PVTime, platform publication, capture, and ordered restore expose only
+fixed component and aggregate commit outcomes. Raw time and identity values,
+generation IDs, entropy and serial bytes, addresses, counts, and underlying
+errors are never logger fields.
+
+Production-bundle coverage routes representative block, pmem, network, vsock,
+balloon, virtio-mem, entropy, serial, and time/identity records through a
+separately granted write-only logger descriptor, replaces its source pathname
+after launcher adoption, and verifies that records follow the opened object
+while grant, backing, socket, interface, fixture, guest-marker, identity, and
+payload selectors remain absent.
 
 If failed HVF teardown requires intentionally retaining mapped memory for host
 safety, Bangbang first replaces the retained GuestMemory logger with an inert

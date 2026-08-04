@@ -12,7 +12,7 @@ use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::boot::canonical_process_root_block_command_line;
 use bangbang_runtime::fdt::{ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET, Arm64FdtPciHost};
 use bangbang_runtime::interrupt::GuestInterruptLine;
-use bangbang_runtime::logger::{GuestLogger, LoggerBackendOutcome};
+use bangbang_runtime::logger::{GuestLogger, LoggerBackendOutcome, LoggerTimeIdentityOutcome};
 use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange, aarch64,
 };
@@ -82,9 +82,9 @@ use crate::startup::{
     HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage,
     HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError, PCI_ENDPOINT_SLOT_COUNT,
     backend_outcome_for_run_step_error, backend_outcome_for_run_step_outcome,
-    capture_hvf_snapshot_v2_time_state, pci_root_restore_bar_region_id,
-    pci_root_restore_gic_msi_configuration, replace_vmgenid_and_signal_with,
-    update_vmclock_and_signal_with,
+    capture_hvf_snapshot_v2_time_state, observe_vmclock_restore, observe_vmgenid_restore,
+    pci_root_restore_bar_region_id, pci_root_restore_gic_msi_configuration,
+    replace_vmgenid_and_signal_with, update_vmclock_and_signal_with,
 };
 use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError};
 use crate::vcpu::HvfArm64VcpuIdentificationRegisterState;
@@ -1243,6 +1243,7 @@ impl RestoredHvfSnapshotV2Platform {
         memory_writer: &mut W,
     ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
         let parts = self.parts_mut();
+        let guest_logger = parts.backend.guest_logger();
         let (stable, captures, pvtime_capture) = parts
             .runner
             .capture_arm64_snapshot_v2_topology()
@@ -1325,15 +1326,21 @@ impl RestoredHvfSnapshotV2Platform {
             parts.rtc_device.region.range().start(),
             parts.rtc_device.region.id(),
         );
-        let time = capture_hvf_snapshot_v2_time_state(
+        let time_result = capture_hvf_snapshot_v2_time_state(
             memory,
             rtc_layout,
             &parts.vmgenid_device,
             &parts.vmclock_device,
             Some(&parts.pvtime_layout),
             &pvtime_capture,
-        )
-        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
+        );
+        guest_logger.log_time_identity(if time_result.is_ok() {
+            LoggerTimeIdentityOutcome::PvTimeAccountingPublished
+        } else {
+            LoggerTimeIdentityOutcome::PvTimeAccountingFailed
+        });
+        let time =
+            time_result.map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
         let memory_binding = write_snapshot_v2_memory_image_with_compatibility_version(
             memory,
             memory_writer,
@@ -1876,6 +1883,30 @@ fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
         .as_ref()
         .map(HvfSnapshotV2ProcessShellRestore::guest_logger)
         .unwrap_or_default();
+    let result = restore_hvf_snapshot_v2_platform_with_shell_and_mapping_inner(
+        state,
+        memory,
+        process_shell,
+        mapping,
+    );
+    guest_logger.log_time_identity(if result.is_ok() {
+        LoggerTimeIdentityOutcome::PlatformPublicationSucceeded
+    } else {
+        LoggerTimeIdentityOutcome::PlatformPublicationFailed
+    });
+    result
+}
+
+fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping_inner(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    process_shell: Option<HvfSnapshotV2ProcessShellRestore<'_>>,
+    mapping: HvfSnapshotV2MemoryMappingRestore<'_>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    let guest_logger = process_shell
+        .as_ref()
+        .map(HvfSnapshotV2ProcessShellRestore::guest_logger)
+        .unwrap_or_default();
     debug_assert!(cleanup_sequence(RestoreOwnership::Empty).is_empty());
     let mut cleanup = Vec::new();
     if cleanup.try_reserve_exact(2).is_err() {
@@ -2210,8 +2241,16 @@ fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
     }
 
     let rtc_device = match register_arm64_boot_rtc_mmio(&mut dispatcher, time.rtc_layout()) {
-        Ok(device) => device,
+        Ok(device) => {
+            backend
+                .guest_logger()
+                .log_time_identity(LoggerTimeIdentityOutcome::RtcRestoreSucceeded);
+            device
+        }
         Err(source) => {
+            backend
+                .guest_logger()
+                .log_time_identity(LoggerTimeIdentityOutcome::RtcRestoreFailed);
             return Err(failed_restore(
                 HvfSnapshotV2PlatformRestoreStage::Rtc,
                 HvfSnapshotV2PlatformRestoreFailure::Rtc(source),
@@ -2225,6 +2264,9 @@ fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
     let pvtime_configs = match prepare_snapshot_v2_pvtime_configs(&backend, &time) {
         Ok(configs) => configs,
         Err(failure) => {
+            backend
+                .guest_logger()
+                .log_time_identity(LoggerTimeIdentityOutcome::PvTimeInitializationFailed);
             let (index, failure) = *failure;
             return Err(failed_restore(
                 HvfSnapshotV2PlatformRestoreStage::PvTime { index },
@@ -2236,6 +2278,9 @@ fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
         }
     };
     let Some(created_topology) = topology.as_ref() else {
+        backend
+            .guest_logger()
+            .log_time_identity(LoggerTimeIdentityOutcome::PvTimeInitializationFailed);
         return Err(failed_restore(
             HvfSnapshotV2PlatformRestoreStage::Topology,
             HvfSnapshotV2PlatformRestoreFailure::TopologyIdentity,
@@ -2246,6 +2291,9 @@ fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
     };
     for index in 0..pvtime_configs.len() {
         if let Err(source) = created_topology.ensure_snapshot_restore_available(index) {
+            backend
+                .guest_logger()
+                .log_time_identity(LoggerTimeIdentityOutcome::PvTimeInitializationFailed);
             return Err(failed_restore(
                 HvfSnapshotV2PlatformRestoreStage::PvTime { index },
                 HvfSnapshotV2PlatformRestoreFailure::PvTime(source),
@@ -2257,6 +2305,9 @@ fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
     }
     for (index, config) in pvtime_configs.into_iter().enumerate() {
         if let Err(source) = created_topology.configure_arm64_snapshot_v2_pvtime(index, config) {
+            backend
+                .guest_logger()
+                .log_time_identity(LoggerTimeIdentityOutcome::PvTimeInitializationFailed);
             return Err(failed_restore(
                 HvfSnapshotV2PlatformRestoreStage::PvTime { index },
                 HvfSnapshotV2PlatformRestoreFailure::PvTime(source),
@@ -2266,6 +2317,9 @@ fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
             ));
         }
     }
+    backend
+        .guest_logger()
+        .log_time_identity(LoggerTimeIdentityOutcome::PvTimeInitializationSucceeded);
 
     if let Err(failure) = restore_snapshot_v2_time_identity(
         created_topology,
@@ -2413,10 +2467,12 @@ fn restore_snapshot_v2_time_identity(
         HvfSnapshotV2PlatformRestoreFailure,
     )>,
 > {
+    let guest_logger = backend.guest_logger();
     for index in 0..time.pvtime_vcpus().len() {
         topology
             .ensure_snapshot_restore_available(index)
             .map_err(|source| {
+                guest_logger.log_time_identity(LoggerTimeIdentityOutcome::OrderedRestoreFailed);
                 Box::new((
                     HvfSnapshotV2PlatformRestoreStage::TimeIdentityPreflight,
                     HvfSnapshotV2PlatformRestoreFailure::TimeIdentityRunner(source),
@@ -2424,6 +2480,7 @@ fn restore_snapshot_v2_time_identity(
             })?;
     }
     let signaler = HvfGicSpiSignaler::from_metadata(&gic).map_err(|source| {
+        guest_logger.log_time_identity(LoggerTimeIdentityOutcome::OrderedRestoreFailed);
         Box::new((
             HvfSnapshotV2PlatformRestoreStage::TimeIdentityPreflight,
             HvfSnapshotV2PlatformRestoreFailure::TimeIdentitySignaler(source),
@@ -2434,6 +2491,7 @@ fn restore_snapshot_v2_time_identity(
         time.vmclock().interrupt_line(),
     ] {
         signaler.validate_line(line).map_err(|source| {
+            guest_logger.log_time_identity(LoggerTimeIdentityOutcome::OrderedRestoreFailed);
             Box::new((
                 HvfSnapshotV2PlatformRestoreStage::TimeIdentityPreflight,
                 HvfSnapshotV2PlatformRestoreFailure::TimeIdentitySignaler(source),
@@ -2441,32 +2499,44 @@ fn restore_snapshot_v2_time_identity(
         })?;
     }
     let memory = backend.mapped_guest_memory_mut().map_err(|source| {
+        guest_logger.log_time_identity(LoggerTimeIdentityOutcome::OrderedRestoreFailed);
         Box::new((
             HvfSnapshotV2PlatformRestoreStage::TimeIdentityPreflight,
             HvfSnapshotV2PlatformRestoreFailure::TimeIdentityMemory(source),
         ))
     })?;
-    replace_vmgenid_and_signal_with(memory, vmgenid, replace_arm64_boot_vmgenid, || {
-        signaler.set_level(time.vmgenid().interrupt_line(), true)
-    })
-    .map_err(|source| {
-        Box::new((
+    let vmgenid_result =
+        replace_vmgenid_and_signal_with(memory, vmgenid, replace_arm64_boot_vmgenid, || {
+            signaler.set_level(time.vmgenid().interrupt_line(), true)
+        });
+    observe_vmgenid_restore(&guest_logger, &vmgenid_result);
+    if let Err(source) = vmgenid_result {
+        guest_logger.log_time_identity(if source.is_committed() {
+            LoggerTimeIdentityOutcome::OrderedRestorePartiallyCommitted
+        } else {
+            LoggerTimeIdentityOutcome::OrderedRestoreFailed
+        });
+        return Err(Box::new((
             HvfSnapshotV2PlatformRestoreStage::VmGenId,
             HvfSnapshotV2PlatformRestoreFailure::VmGenId(source),
-        ))
-    })?;
-    update_vmclock_and_signal_with(
+        )));
+    }
+    let vmclock_result = update_vmclock_and_signal_with(
         memory,
         vmclock,
         |memory, device| device.abi.update_after_restore(memory, device.range),
         || signaler.set_level(time.vmclock().interrupt_line(), true),
-    )
-    .map_err(|source| {
-        Box::new((
+    );
+    observe_vmclock_restore(&guest_logger, &vmclock_result);
+    if let Err(source) = vmclock_result {
+        guest_logger.log_time_identity(LoggerTimeIdentityOutcome::OrderedRestorePartiallyCommitted);
+        return Err(Box::new((
             HvfSnapshotV2PlatformRestoreStage::VmClock,
             HvfSnapshotV2PlatformRestoreFailure::VmClock(source),
-        ))
-    })
+        )));
+    }
+    guest_logger.log_time_identity(LoggerTimeIdentityOutcome::OrderedRestoreSucceeded);
+    Ok(())
 }
 
 fn failed_restore(

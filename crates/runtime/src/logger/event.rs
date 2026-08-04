@@ -192,6 +192,7 @@ pub enum LoggerDeviceKind {
     Network,
     Pmem,
     Serial,
+    TimeIdentity,
     Vsock,
 }
 
@@ -205,6 +206,7 @@ impl LoggerDeviceKind {
             Self::Network => "network",
             Self::Pmem => "pmem",
             Self::Serial => "serial",
+            Self::TimeIdentity => "time-identity",
             Self::Vsock => "vsock",
         }
     }
@@ -220,6 +222,413 @@ impl LoggerDeviceKind {
             24 => Some(Self::MemoryHotplug),
             27 => Some(Self::Pmem),
             _ => None,
+        }
+    }
+}
+
+/// Fixed, value-free balloon data-plane outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerBalloonOutcome {
+    InflateSucceeded,
+    DeflateSucceeded,
+    StatisticsUpdated,
+    StatisticsOversized,
+    StatisticsFailed,
+    HintingSucceeded,
+    HintingFailed,
+    ReportingSucceeded,
+    ReportingFailed,
+    MemoryDiscardFailed,
+    AccountingFailed,
+    QueueDispatchFailed,
+    QueueNotificationInactive,
+    QueueNotificationUnsupported,
+    InterruptDeliveryFailed,
+}
+
+impl LoggerBalloonOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::InflateSucceeded => "inflate",
+            Self::DeflateSucceeded => "deflate",
+            Self::StatisticsUpdated | Self::StatisticsOversized | Self::StatisticsFailed => {
+                "statistics"
+            }
+            Self::HintingSucceeded | Self::HintingFailed => "hinting",
+            Self::ReportingSucceeded | Self::ReportingFailed => "reporting",
+            Self::MemoryDiscardFailed => "memory-discard",
+            Self::AccountingFailed => "accounting",
+            Self::QueueDispatchFailed => "queue-dispatch",
+            Self::QueueNotificationInactive | Self::QueueNotificationUnsupported => {
+                "queue-notification"
+            }
+            Self::InterruptDeliveryFailed => "interrupt-delivery",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::InflateSucceeded
+            | Self::DeflateSucceeded
+            | Self::HintingSucceeded
+            | Self::ReportingSucceeded => "succeeded",
+            Self::StatisticsUpdated => "updated",
+            Self::StatisticsOversized => "oversized",
+            Self::StatisticsFailed
+            | Self::HintingFailed
+            | Self::ReportingFailed
+            | Self::MemoryDiscardFailed
+            | Self::AccountingFailed
+            | Self::QueueDispatchFailed
+            | Self::InterruptDeliveryFailed => "failed",
+            Self::QueueNotificationInactive => "inactive",
+            Self::QueueNotificationUnsupported => "unsupported",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::InflateSucceeded
+            | Self::DeflateSucceeded
+            | Self::StatisticsUpdated
+            | Self::HintingSucceeded
+            | Self::ReportingSucceeded => LoggerLevel::Info,
+            Self::StatisticsOversized | Self::QueueNotificationUnsupported => LoggerLevel::Warn,
+            Self::StatisticsFailed
+            | Self::HintingFailed
+            | Self::ReportingFailed
+            | Self::MemoryDiscardFailed
+            | Self::AccountingFailed
+            | Self::QueueDispatchFailed
+            | Self::QueueNotificationInactive
+            | Self::InterruptDeliveryFailed => LoggerLevel::Error,
+        }
+    }
+}
+
+/// Fixed, value-free virtio-mem data-plane outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerMemoryHotplugOutcome {
+    RequestSucceeded,
+    RequestUnsupported,
+    StateQuerySucceeded,
+    PolicyRejected,
+    MutationFailed,
+    MutationRollbackSucceeded,
+    MutationRollbackFailed,
+    RequestParseFailed,
+    ResponseWriteFailed,
+    MemoryDiscardFailed,
+    ConfigurationUpdateSucceeded,
+    ConfigurationUpdateFailed,
+    QueueDispatchFailed,
+    QueueNotificationInactive,
+    QueueNotificationUnsupported,
+    InterruptDeliveryFailed,
+}
+
+impl LoggerMemoryHotplugOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::RequestSucceeded | Self::RequestUnsupported => "request",
+            Self::StateQuerySucceeded => "state-query",
+            Self::PolicyRejected => "policy",
+            Self::MutationFailed => "mutation",
+            Self::MutationRollbackSucceeded | Self::MutationRollbackFailed => "mutation-rollback",
+            Self::RequestParseFailed => "request-parse",
+            Self::ResponseWriteFailed => "response-write",
+            Self::MemoryDiscardFailed => "memory-discard",
+            Self::ConfigurationUpdateSucceeded | Self::ConfigurationUpdateFailed => {
+                "configuration-update"
+            }
+            Self::QueueDispatchFailed => "queue-dispatch",
+            Self::QueueNotificationInactive | Self::QueueNotificationUnsupported => {
+                "queue-notification"
+            }
+            Self::InterruptDeliveryFailed => "interrupt-delivery",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::RequestSucceeded
+            | Self::StateQuerySucceeded
+            | Self::MutationRollbackSucceeded
+            | Self::ConfigurationUpdateSucceeded => "succeeded",
+            Self::RequestUnsupported | Self::QueueNotificationUnsupported => "unsupported",
+            Self::PolicyRejected => "rejected",
+            Self::MutationFailed
+            | Self::MutationRollbackFailed
+            | Self::RequestParseFailed
+            | Self::ResponseWriteFailed
+            | Self::MemoryDiscardFailed
+            | Self::ConfigurationUpdateFailed
+            | Self::QueueDispatchFailed
+            | Self::InterruptDeliveryFailed => "failed",
+            Self::QueueNotificationInactive => "inactive",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::RequestSucceeded
+            | Self::StateQuerySucceeded
+            | Self::ConfigurationUpdateSucceeded => LoggerLevel::Info,
+            Self::RequestUnsupported
+            | Self::PolicyRejected
+            | Self::MutationRollbackSucceeded
+            | Self::QueueNotificationUnsupported => LoggerLevel::Warn,
+            Self::MutationFailed
+            | Self::MutationRollbackFailed
+            | Self::RequestParseFailed
+            | Self::ResponseWriteFailed
+            | Self::MemoryDiscardFailed
+            | Self::ConfigurationUpdateFailed
+            | Self::QueueDispatchFailed
+            | Self::QueueNotificationInactive
+            | Self::InterruptDeliveryFailed => LoggerLevel::Error,
+        }
+    }
+}
+
+/// Fixed, value-free entropy data-plane outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerEntropyOutcome {
+    FillSucceeded,
+    FillFailed,
+    RequestParseFailed,
+    BufferWriteFailed,
+    QueueDispatchFailed,
+    QueueNotificationInactive,
+    QueueNotificationUnsupported,
+    RateLimiterThrottled,
+    RateLimiterResumed,
+    EntropyProviderFailed,
+    InterruptDeliveryFailed,
+}
+
+impl LoggerEntropyOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::FillSucceeded | Self::FillFailed => "fill",
+            Self::RequestParseFailed => "request-parse",
+            Self::BufferWriteFailed => "buffer-write",
+            Self::QueueDispatchFailed => "queue-dispatch",
+            Self::QueueNotificationInactive | Self::QueueNotificationUnsupported => {
+                "queue-notification"
+            }
+            Self::RateLimiterThrottled | Self::RateLimiterResumed => "rate-limiter",
+            Self::EntropyProviderFailed => "entropy-provider",
+            Self::InterruptDeliveryFailed => "interrupt-delivery",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::FillSucceeded => "succeeded",
+            Self::FillFailed
+            | Self::RequestParseFailed
+            | Self::BufferWriteFailed
+            | Self::QueueDispatchFailed
+            | Self::EntropyProviderFailed
+            | Self::InterruptDeliveryFailed => "failed",
+            Self::QueueNotificationInactive => "inactive",
+            Self::QueueNotificationUnsupported => "unsupported",
+            Self::RateLimiterThrottled => "throttled",
+            Self::RateLimiterResumed => "resumed",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::RateLimiterThrottled | Self::RateLimiterResumed => LoggerLevel::Debug,
+            Self::FillSucceeded => LoggerLevel::Info,
+            Self::QueueNotificationUnsupported => LoggerLevel::Warn,
+            Self::FillFailed
+            | Self::RequestParseFailed
+            | Self::BufferWriteFailed
+            | Self::QueueDispatchFailed
+            | Self::QueueNotificationInactive
+            | Self::EntropyProviderFailed
+            | Self::InterruptDeliveryFailed => LoggerLevel::Error,
+        }
+    }
+}
+
+/// Fixed, value-free serial input and output outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerSerialOutcome {
+    InputReadSucceeded,
+    InputReadFailed,
+    InputRearmSucceeded,
+    InputBackpressurePaused,
+    InputDetachEof,
+    InputDetachFailed,
+    OutputFailed,
+    RateLimiterThrottled,
+    InterruptDeliverySucceeded,
+    InterruptDeliveryFailed,
+}
+
+impl LoggerSerialOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::InputReadSucceeded | Self::InputReadFailed => "input-read",
+            Self::InputRearmSucceeded => "input-rearm",
+            Self::InputBackpressurePaused => "input-backpressure",
+            Self::InputDetachEof | Self::InputDetachFailed => "input-detach",
+            Self::OutputFailed => "output",
+            Self::RateLimiterThrottled => "rate-limiter",
+            Self::InterruptDeliverySucceeded | Self::InterruptDeliveryFailed => {
+                "interrupt-delivery"
+            }
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::InputReadSucceeded
+            | Self::InputRearmSucceeded
+            | Self::InterruptDeliverySucceeded => "succeeded",
+            Self::InputReadFailed
+            | Self::InputDetachFailed
+            | Self::OutputFailed
+            | Self::InterruptDeliveryFailed => "failed",
+            Self::InputBackpressurePaused => "paused",
+            Self::InputDetachEof => "eof",
+            Self::RateLimiterThrottled => "throttled",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::InputRearmSucceeded
+            | Self::InputBackpressurePaused
+            | Self::RateLimiterThrottled => LoggerLevel::Debug,
+            Self::InputReadSucceeded | Self::InputDetachEof | Self::InterruptDeliverySucceeded => {
+                LoggerLevel::Info
+            }
+            Self::InputReadFailed
+            | Self::InputDetachFailed
+            | Self::OutputFailed
+            | Self::InterruptDeliveryFailed => LoggerLevel::Error,
+        }
+    }
+}
+
+/// Fixed, value-free arm64 time and clone-identity outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerTimeIdentityOutcome {
+    RtcReadRejected,
+    RtcWriteRejected,
+    RtcRestoreSucceeded,
+    RtcRestoreFailed,
+    PlatformPublicationSucceeded,
+    PlatformPublicationFailed,
+    VmGenIdReplacementSucceeded,
+    VmGenIdReplacementFailed,
+    VmGenIdNotificationSucceeded,
+    VmGenIdNotificationFailed,
+    VmClockUpdateSucceeded,
+    VmClockUpdateFailed,
+    VmClockUpdatePartiallyCommitted,
+    VmClockNotificationSucceeded,
+    VmClockNotificationFailed,
+    OrderedRestoreSucceeded,
+    OrderedRestoreFailed,
+    OrderedRestorePartiallyCommitted,
+    PvTimeInitializationSucceeded,
+    PvTimeInitializationFailed,
+    PvTimeAccountingPublished,
+    PvTimeAccountingDiscarded,
+    PvTimeAccountingFailed,
+}
+
+impl LoggerTimeIdentityOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::RtcReadRejected => "rtc-read",
+            Self::RtcWriteRejected => "rtc-write",
+            Self::RtcRestoreSucceeded | Self::RtcRestoreFailed => "rtc-restore",
+            Self::PlatformPublicationSucceeded | Self::PlatformPublicationFailed => {
+                "platform-publication"
+            }
+            Self::VmGenIdReplacementSucceeded | Self::VmGenIdReplacementFailed => {
+                "vmgenid-replacement"
+            }
+            Self::VmGenIdNotificationSucceeded | Self::VmGenIdNotificationFailed => {
+                "vmgenid-notification"
+            }
+            Self::VmClockUpdateSucceeded
+            | Self::VmClockUpdateFailed
+            | Self::VmClockUpdatePartiallyCommitted => "vmclock-update",
+            Self::VmClockNotificationSucceeded | Self::VmClockNotificationFailed => {
+                "vmclock-notification"
+            }
+            Self::OrderedRestoreSucceeded
+            | Self::OrderedRestoreFailed
+            | Self::OrderedRestorePartiallyCommitted => "ordered-restore",
+            Self::PvTimeInitializationSucceeded | Self::PvTimeInitializationFailed => {
+                "pvtime-initialization"
+            }
+            Self::PvTimeAccountingPublished
+            | Self::PvTimeAccountingDiscarded
+            | Self::PvTimeAccountingFailed => "pvtime-accounting",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::RtcReadRejected | Self::RtcWriteRejected => "rejected",
+            Self::RtcRestoreSucceeded
+            | Self::PlatformPublicationSucceeded
+            | Self::VmGenIdReplacementSucceeded
+            | Self::VmGenIdNotificationSucceeded
+            | Self::VmClockUpdateSucceeded
+            | Self::VmClockNotificationSucceeded
+            | Self::OrderedRestoreSucceeded
+            | Self::PvTimeInitializationSucceeded => "succeeded",
+            Self::RtcRestoreFailed
+            | Self::PlatformPublicationFailed
+            | Self::VmGenIdReplacementFailed
+            | Self::VmGenIdNotificationFailed
+            | Self::VmClockUpdateFailed
+            | Self::VmClockNotificationFailed
+            | Self::OrderedRestoreFailed
+            | Self::PvTimeInitializationFailed
+            | Self::PvTimeAccountingFailed => "failed",
+            Self::VmClockUpdatePartiallyCommitted | Self::OrderedRestorePartiallyCommitted => {
+                "partially-committed"
+            }
+            Self::PvTimeAccountingPublished => "published",
+            Self::PvTimeAccountingDiscarded => "discarded",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::PvTimeAccountingDiscarded => LoggerLevel::Debug,
+            Self::RtcRestoreSucceeded
+            | Self::PlatformPublicationSucceeded
+            | Self::VmGenIdReplacementSucceeded
+            | Self::VmGenIdNotificationSucceeded
+            | Self::VmClockUpdateSucceeded
+            | Self::VmClockNotificationSucceeded
+            | Self::OrderedRestoreSucceeded
+            | Self::PvTimeInitializationSucceeded
+            | Self::PvTimeAccountingPublished => LoggerLevel::Info,
+            Self::RtcReadRejected | Self::RtcWriteRejected => LoggerLevel::Warn,
+            Self::RtcRestoreFailed
+            | Self::PlatformPublicationFailed
+            | Self::VmGenIdReplacementFailed
+            | Self::VmGenIdNotificationFailed
+            | Self::VmClockUpdateFailed
+            | Self::VmClockUpdatePartiallyCommitted
+            | Self::VmClockNotificationFailed
+            | Self::OrderedRestoreFailed
+            | Self::OrderedRestorePartiallyCommitted
+            | Self::PvTimeInitializationFailed
+            | Self::PvTimeAccountingFailed => LoggerLevel::Error,
         }
     }
 }
@@ -1157,8 +1566,11 @@ pub(super) enum LoggerEvent {
         cpu_time_us: u64,
     },
     Backend(LoggerBackendOutcome),
+    Balloon(LoggerBalloonOutcome),
     Block(LoggerBlockOutcome),
+    Entropy(LoggerEntropyOutcome),
     Lifecycle(LoggerLifecycleOutcome),
+    MemoryHotplug(LoggerMemoryHotplugOutcome),
     Network(LoggerNetworkOutcome),
     Observability(LoggerObservabilityOutcome),
     Pmem(LoggerPmemOutcome),
@@ -1169,7 +1581,9 @@ pub(super) enum LoggerEvent {
     ProcessSignal(LoggerProcessSignalOutcome),
     ProcessStartup(ProcessStartupOutcome),
     ProcessExit(ProcessTerminalCategory),
+    Serial(LoggerSerialOutcome),
     Snapshot(LoggerSnapshotOutcome),
+    TimeIdentity(LoggerTimeIdentityOutcome),
     Transport(LoggerTransportOutcome),
     Vsock(LoggerVsockOutcome),
 }
@@ -1282,10 +1696,26 @@ impl LogRecord {
                 encoder.push_str(" outcome=");
                 encoder.push_str(outcome.outcome());
             }
+            LoggerEvent::Balloon(outcome) => {
+                encode_fixed_device_outcome(
+                    &mut encoder,
+                    LoggerDeviceKind::Balloon,
+                    outcome.operation(),
+                    outcome.outcome(),
+                );
+            }
             LoggerEvent::Block(outcome) => {
                 encode_fixed_device_outcome(
                     &mut encoder,
                     LoggerDeviceKind::Block,
+                    outcome.operation(),
+                    outcome.outcome(),
+                );
+            }
+            LoggerEvent::Entropy(outcome) => {
+                encode_fixed_device_outcome(
+                    &mut encoder,
+                    LoggerDeviceKind::Entropy,
                     outcome.operation(),
                     outcome.outcome(),
                 );
@@ -1300,6 +1730,14 @@ impl LogRecord {
                 encoder.push_str(outcome.operation());
                 encoder.push_str(" outcome=");
                 encoder.push_str(outcome.outcome());
+            }
+            LoggerEvent::MemoryHotplug(outcome) => {
+                encode_fixed_device_outcome(
+                    &mut encoder,
+                    LoggerDeviceKind::MemoryHotplug,
+                    outcome.operation(),
+                    outcome.outcome(),
+                );
             }
             LoggerEvent::Network(outcome) => {
                 encode_fixed_device_outcome(
@@ -1342,11 +1780,27 @@ impl LogRecord {
                 encoder.push_str("event=process-exit category=");
                 encoder.push_str(category.as_str());
             }
+            LoggerEvent::Serial(outcome) => {
+                encode_fixed_device_outcome(
+                    &mut encoder,
+                    LoggerDeviceKind::Serial,
+                    outcome.operation(),
+                    outcome.outcome(),
+                );
+            }
             LoggerEvent::Snapshot(outcome) => {
                 encoder.push_str("operation=");
                 encoder.push_str(outcome.operation());
                 encoder.push_str(" outcome=");
                 encoder.push_str(outcome.outcome());
+            }
+            LoggerEvent::TimeIdentity(outcome) => {
+                encode_fixed_device_outcome(
+                    &mut encoder,
+                    LoggerDeviceKind::TimeIdentity,
+                    outcome.operation(),
+                    outcome.outcome(),
+                );
             }
             LoggerEvent::Transport(outcome) => {
                 if let Some(kind) = outcome.device_kind() {
@@ -1476,7 +1930,7 @@ impl PanicLogRecords {
     }
 }
 
-const MAX_LOG_BATCH_RECORDS: usize = 11;
+const MAX_LOG_BATCH_RECORDS: usize = 16;
 
 #[derive(Debug)]
 pub(super) struct LogBatch {
@@ -1709,12 +2163,13 @@ fn utf8_prefix_len(value: &str, maximum: usize) -> usize {
 mod tests {
     use super::{
         LogOrigin, LogRecord, LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome,
-        LoggerApiRoute, LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerBlockOutcome,
-        LoggerDeviceKind, LoggerEvent, LoggerHttpMethod, LoggerLifecycleOutcome,
-        LoggerNetworkOutcome, LoggerObservabilityOutcome, LoggerPmemOutcome,
-        LoggerProcessSignalOutcome, LoggerSnapshotOutcome, LoggerTransportOutcome,
-        LoggerVsockOutcome, MAX_LOG_RECORD_BYTES, PanicLogRecords, ProcessStartupOutcome,
-        ProcessTerminalCategory, normalize_origin,
+        LoggerApiRoute, LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerBalloonOutcome,
+        LoggerBlockOutcome, LoggerDeviceKind, LoggerEntropyOutcome, LoggerEvent, LoggerHttpMethod,
+        LoggerLifecycleOutcome, LoggerMemoryHotplugOutcome, LoggerNetworkOutcome,
+        LoggerObservabilityOutcome, LoggerPmemOutcome, LoggerProcessSignalOutcome,
+        LoggerSerialOutcome, LoggerSnapshotOutcome, LoggerTimeIdentityOutcome,
+        LoggerTransportOutcome, LoggerVsockOutcome, MAX_LOG_RECORD_BYTES, PanicLogRecords,
+        ProcessStartupOutcome, ProcessTerminalCategory, normalize_origin,
     };
     use crate::logger::LoggerLevel;
 
@@ -1895,6 +2350,34 @@ mod tests {
             assert_eq!(record.as_str(), expected);
             assert!(record.as_bytes().len() <= MAX_LOG_RECORD_BYTES);
             assert!(std::str::from_utf8(record.as_bytes()).is_ok());
+        }
+    }
+
+    fn assert_device_outcome_cases<T: Copy>(
+        kind: &str,
+        cases: &[(T, LoggerLevel, &str, &str)],
+        event: impl Fn(T) -> LoggerEvent,
+        actual_level: impl Fn(T) -> LoggerLevel,
+    ) {
+        for &(outcome, level, operation, result) in cases {
+            assert_eq!(actual_level(outcome), level);
+            let body = format!("device-kind={kind} operation={operation} outcome={result}");
+            assert_closed_event(event(outcome), level, &body);
+            for forbidden in [
+                "0xfeedface",
+                "pfn=",
+                "size=",
+                "id=",
+                "path=",
+                "descriptor=",
+                "serial-byte=",
+                "clock=",
+                "generation-id=",
+                "vcpu=",
+                "provider-error=",
+            ] {
+                assert!(!body.contains(forbidden));
+            }
         }
     }
 
@@ -2147,6 +2630,516 @@ mod tests {
                 assert!(!expected.contains(forbidden));
             }
         }
+    }
+
+    #[test]
+    fn encodes_every_closed_balloon_outcome() {
+        use LoggerBalloonOutcome as Outcome;
+        let cases = [
+            (
+                Outcome::InflateSucceeded,
+                LoggerLevel::Info,
+                "inflate",
+                "succeeded",
+            ),
+            (
+                Outcome::DeflateSucceeded,
+                LoggerLevel::Info,
+                "deflate",
+                "succeeded",
+            ),
+            (
+                Outcome::StatisticsUpdated,
+                LoggerLevel::Info,
+                "statistics",
+                "updated",
+            ),
+            (
+                Outcome::StatisticsOversized,
+                LoggerLevel::Warn,
+                "statistics",
+                "oversized",
+            ),
+            (
+                Outcome::StatisticsFailed,
+                LoggerLevel::Error,
+                "statistics",
+                "failed",
+            ),
+            (
+                Outcome::HintingSucceeded,
+                LoggerLevel::Info,
+                "hinting",
+                "succeeded",
+            ),
+            (
+                Outcome::HintingFailed,
+                LoggerLevel::Error,
+                "hinting",
+                "failed",
+            ),
+            (
+                Outcome::ReportingSucceeded,
+                LoggerLevel::Info,
+                "reporting",
+                "succeeded",
+            ),
+            (
+                Outcome::ReportingFailed,
+                LoggerLevel::Error,
+                "reporting",
+                "failed",
+            ),
+            (
+                Outcome::MemoryDiscardFailed,
+                LoggerLevel::Error,
+                "memory-discard",
+                "failed",
+            ),
+            (
+                Outcome::AccountingFailed,
+                LoggerLevel::Error,
+                "accounting",
+                "failed",
+            ),
+            (
+                Outcome::QueueDispatchFailed,
+                LoggerLevel::Error,
+                "queue-dispatch",
+                "failed",
+            ),
+            (
+                Outcome::QueueNotificationInactive,
+                LoggerLevel::Error,
+                "queue-notification",
+                "inactive",
+            ),
+            (
+                Outcome::QueueNotificationUnsupported,
+                LoggerLevel::Warn,
+                "queue-notification",
+                "unsupported",
+            ),
+            (
+                Outcome::InterruptDeliveryFailed,
+                LoggerLevel::Error,
+                "interrupt-delivery",
+                "failed",
+            ),
+        ];
+        assert_device_outcome_cases(
+            "balloon",
+            &cases,
+            LoggerEvent::Balloon,
+            LoggerBalloonOutcome::level,
+        );
+    }
+
+    #[test]
+    fn encodes_every_closed_memory_hotplug_outcome() {
+        use LoggerMemoryHotplugOutcome as Outcome;
+        let cases = [
+            (
+                Outcome::RequestSucceeded,
+                LoggerLevel::Info,
+                "request",
+                "succeeded",
+            ),
+            (
+                Outcome::RequestUnsupported,
+                LoggerLevel::Warn,
+                "request",
+                "unsupported",
+            ),
+            (
+                Outcome::StateQuerySucceeded,
+                LoggerLevel::Info,
+                "state-query",
+                "succeeded",
+            ),
+            (
+                Outcome::PolicyRejected,
+                LoggerLevel::Warn,
+                "policy",
+                "rejected",
+            ),
+            (
+                Outcome::MutationFailed,
+                LoggerLevel::Error,
+                "mutation",
+                "failed",
+            ),
+            (
+                Outcome::MutationRollbackSucceeded,
+                LoggerLevel::Warn,
+                "mutation-rollback",
+                "succeeded",
+            ),
+            (
+                Outcome::MutationRollbackFailed,
+                LoggerLevel::Error,
+                "mutation-rollback",
+                "failed",
+            ),
+            (
+                Outcome::RequestParseFailed,
+                LoggerLevel::Error,
+                "request-parse",
+                "failed",
+            ),
+            (
+                Outcome::ResponseWriteFailed,
+                LoggerLevel::Error,
+                "response-write",
+                "failed",
+            ),
+            (
+                Outcome::MemoryDiscardFailed,
+                LoggerLevel::Error,
+                "memory-discard",
+                "failed",
+            ),
+            (
+                Outcome::ConfigurationUpdateSucceeded,
+                LoggerLevel::Info,
+                "configuration-update",
+                "succeeded",
+            ),
+            (
+                Outcome::ConfigurationUpdateFailed,
+                LoggerLevel::Error,
+                "configuration-update",
+                "failed",
+            ),
+            (
+                Outcome::QueueDispatchFailed,
+                LoggerLevel::Error,
+                "queue-dispatch",
+                "failed",
+            ),
+            (
+                Outcome::QueueNotificationInactive,
+                LoggerLevel::Error,
+                "queue-notification",
+                "inactive",
+            ),
+            (
+                Outcome::QueueNotificationUnsupported,
+                LoggerLevel::Warn,
+                "queue-notification",
+                "unsupported",
+            ),
+            (
+                Outcome::InterruptDeliveryFailed,
+                LoggerLevel::Error,
+                "interrupt-delivery",
+                "failed",
+            ),
+        ];
+        assert_device_outcome_cases(
+            "memory-hotplug",
+            &cases,
+            LoggerEvent::MemoryHotplug,
+            LoggerMemoryHotplugOutcome::level,
+        );
+    }
+
+    #[test]
+    fn encodes_every_closed_entropy_outcome() {
+        use LoggerEntropyOutcome as Outcome;
+        let cases = [
+            (
+                Outcome::FillSucceeded,
+                LoggerLevel::Info,
+                "fill",
+                "succeeded",
+            ),
+            (Outcome::FillFailed, LoggerLevel::Error, "fill", "failed"),
+            (
+                Outcome::RequestParseFailed,
+                LoggerLevel::Error,
+                "request-parse",
+                "failed",
+            ),
+            (
+                Outcome::BufferWriteFailed,
+                LoggerLevel::Error,
+                "buffer-write",
+                "failed",
+            ),
+            (
+                Outcome::QueueDispatchFailed,
+                LoggerLevel::Error,
+                "queue-dispatch",
+                "failed",
+            ),
+            (
+                Outcome::QueueNotificationInactive,
+                LoggerLevel::Error,
+                "queue-notification",
+                "inactive",
+            ),
+            (
+                Outcome::QueueNotificationUnsupported,
+                LoggerLevel::Warn,
+                "queue-notification",
+                "unsupported",
+            ),
+            (
+                Outcome::RateLimiterThrottled,
+                LoggerLevel::Debug,
+                "rate-limiter",
+                "throttled",
+            ),
+            (
+                Outcome::RateLimiterResumed,
+                LoggerLevel::Debug,
+                "rate-limiter",
+                "resumed",
+            ),
+            (
+                Outcome::EntropyProviderFailed,
+                LoggerLevel::Error,
+                "entropy-provider",
+                "failed",
+            ),
+            (
+                Outcome::InterruptDeliveryFailed,
+                LoggerLevel::Error,
+                "interrupt-delivery",
+                "failed",
+            ),
+        ];
+        assert_device_outcome_cases(
+            "entropy",
+            &cases,
+            LoggerEvent::Entropy,
+            LoggerEntropyOutcome::level,
+        );
+    }
+
+    #[test]
+    fn encodes_every_closed_serial_outcome() {
+        use LoggerSerialOutcome as Outcome;
+        let cases = [
+            (
+                Outcome::InputReadSucceeded,
+                LoggerLevel::Info,
+                "input-read",
+                "succeeded",
+            ),
+            (
+                Outcome::InputReadFailed,
+                LoggerLevel::Error,
+                "input-read",
+                "failed",
+            ),
+            (
+                Outcome::InputRearmSucceeded,
+                LoggerLevel::Debug,
+                "input-rearm",
+                "succeeded",
+            ),
+            (
+                Outcome::InputBackpressurePaused,
+                LoggerLevel::Debug,
+                "input-backpressure",
+                "paused",
+            ),
+            (
+                Outcome::InputDetachEof,
+                LoggerLevel::Info,
+                "input-detach",
+                "eof",
+            ),
+            (
+                Outcome::InputDetachFailed,
+                LoggerLevel::Error,
+                "input-detach",
+                "failed",
+            ),
+            (
+                Outcome::OutputFailed,
+                LoggerLevel::Error,
+                "output",
+                "failed",
+            ),
+            (
+                Outcome::RateLimiterThrottled,
+                LoggerLevel::Debug,
+                "rate-limiter",
+                "throttled",
+            ),
+            (
+                Outcome::InterruptDeliverySucceeded,
+                LoggerLevel::Info,
+                "interrupt-delivery",
+                "succeeded",
+            ),
+            (
+                Outcome::InterruptDeliveryFailed,
+                LoggerLevel::Error,
+                "interrupt-delivery",
+                "failed",
+            ),
+        ];
+        assert_device_outcome_cases(
+            "serial",
+            &cases,
+            LoggerEvent::Serial,
+            LoggerSerialOutcome::level,
+        );
+    }
+
+    #[test]
+    fn encodes_every_closed_time_identity_outcome() {
+        use LoggerTimeIdentityOutcome as Outcome;
+        let cases = [
+            (
+                Outcome::RtcReadRejected,
+                LoggerLevel::Warn,
+                "rtc-read",
+                "rejected",
+            ),
+            (
+                Outcome::RtcWriteRejected,
+                LoggerLevel::Warn,
+                "rtc-write",
+                "rejected",
+            ),
+            (
+                Outcome::RtcRestoreSucceeded,
+                LoggerLevel::Info,
+                "rtc-restore",
+                "succeeded",
+            ),
+            (
+                Outcome::RtcRestoreFailed,
+                LoggerLevel::Error,
+                "rtc-restore",
+                "failed",
+            ),
+            (
+                Outcome::PlatformPublicationSucceeded,
+                LoggerLevel::Info,
+                "platform-publication",
+                "succeeded",
+            ),
+            (
+                Outcome::PlatformPublicationFailed,
+                LoggerLevel::Error,
+                "platform-publication",
+                "failed",
+            ),
+            (
+                Outcome::VmGenIdReplacementSucceeded,
+                LoggerLevel::Info,
+                "vmgenid-replacement",
+                "succeeded",
+            ),
+            (
+                Outcome::VmGenIdReplacementFailed,
+                LoggerLevel::Error,
+                "vmgenid-replacement",
+                "failed",
+            ),
+            (
+                Outcome::VmGenIdNotificationSucceeded,
+                LoggerLevel::Info,
+                "vmgenid-notification",
+                "succeeded",
+            ),
+            (
+                Outcome::VmGenIdNotificationFailed,
+                LoggerLevel::Error,
+                "vmgenid-notification",
+                "failed",
+            ),
+            (
+                Outcome::VmClockUpdateSucceeded,
+                LoggerLevel::Info,
+                "vmclock-update",
+                "succeeded",
+            ),
+            (
+                Outcome::VmClockUpdateFailed,
+                LoggerLevel::Error,
+                "vmclock-update",
+                "failed",
+            ),
+            (
+                Outcome::VmClockUpdatePartiallyCommitted,
+                LoggerLevel::Error,
+                "vmclock-update",
+                "partially-committed",
+            ),
+            (
+                Outcome::VmClockNotificationSucceeded,
+                LoggerLevel::Info,
+                "vmclock-notification",
+                "succeeded",
+            ),
+            (
+                Outcome::VmClockNotificationFailed,
+                LoggerLevel::Error,
+                "vmclock-notification",
+                "failed",
+            ),
+            (
+                Outcome::OrderedRestoreSucceeded,
+                LoggerLevel::Info,
+                "ordered-restore",
+                "succeeded",
+            ),
+            (
+                Outcome::OrderedRestoreFailed,
+                LoggerLevel::Error,
+                "ordered-restore",
+                "failed",
+            ),
+            (
+                Outcome::OrderedRestorePartiallyCommitted,
+                LoggerLevel::Error,
+                "ordered-restore",
+                "partially-committed",
+            ),
+            (
+                Outcome::PvTimeInitializationSucceeded,
+                LoggerLevel::Info,
+                "pvtime-initialization",
+                "succeeded",
+            ),
+            (
+                Outcome::PvTimeInitializationFailed,
+                LoggerLevel::Error,
+                "pvtime-initialization",
+                "failed",
+            ),
+            (
+                Outcome::PvTimeAccountingPublished,
+                LoggerLevel::Info,
+                "pvtime-accounting",
+                "published",
+            ),
+            (
+                Outcome::PvTimeAccountingDiscarded,
+                LoggerLevel::Debug,
+                "pvtime-accounting",
+                "discarded",
+            ),
+            (
+                Outcome::PvTimeAccountingFailed,
+                LoggerLevel::Error,
+                "pvtime-accounting",
+                "failed",
+            ),
+        ];
+        assert_device_outcome_cases(
+            "time-identity",
+            &cases,
+            LoggerEvent::TimeIdentity,
+            LoggerTimeIdentityOutcome::level,
+        );
     }
 
     #[test]

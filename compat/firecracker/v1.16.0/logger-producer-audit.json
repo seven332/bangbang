@@ -320,9 +320,65 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic balloon device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1809"
+      "disposition": "implemented",
+      "rationale": "All mapped upstream calls converge on one bounded balloon queue, statistics, hinting, reporting, memory-discard, accounting, notification, or interrupt outcome per nonzero summary category. The device owner emits closed levels only after the complete typed result is known while discarding raw errors, paths, identifiers, descriptors, addresses, page counts, and guest values.",
+      "compiled_events": [
+        "balloon"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "MMIO balloon interrupt outcome supplement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "device-owned balloon notification outcome convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "closed nonblocking GuestLogger balloon producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed balloon outcome encoding and level selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent balloon outcome limiter identity"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed balloon outcome vocabulary and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "balloon interrupt result and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "production-bundle balloon logger grant reachability and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "balloon queue, product-PCI interrupt, and unchanged-result tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "balloon filtering, limiting, delivery, and exact encoding tests"
+        }
+      ]
     },
     {
       "id": "logger.block.outcome",
@@ -471,9 +527,65 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic entropy device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1809"
+      "disposition": "implemented",
+      "rationale": "All mapped upstream calls converge on one bounded entropy fill, parse, write, limiter, provider, notification, queue, or interrupt outcome per nonzero summary category. The device and provider owners emit closed levels only after typed results are known while discarding entropy bytes, raw errors, paths, identifiers, descriptors, addresses, byte counts, and guest values.",
+      "compiled_events": [
+        "entropy"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "entropy provider and MMIO interrupt outcome supplements"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "device-owned entropy notification outcome convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "closed nonblocking GuestLogger entropy producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed entropy outcome encoding and level selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent entropy outcome limiter identity"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed entropy outcome vocabulary and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "entropy provider, interrupt, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "production-bundle entropy logger grant reachability and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "entropy queue, source, limiter, product-PCI combined failure, and unchanged-result tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "entropy filtering, limiting, delivery, and exact encoding tests"
+        }
+      ]
     },
     {
       "id": "logger.lifecycle.outcome",
@@ -594,9 +706,65 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic virtio-mem outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1809"
+      "disposition": "implemented",
+      "rationale": "All mapped upstream calls converge on one bounded virtio-mem request, policy, mutation, rollback, discard, configuration, notification, queue, or interrupt outcome per nonzero summary category. The device owner emits closed levels only after the complete typed result is known while discarding raw errors, paths, identifiers, descriptors, addresses, sizes, and guest values.",
+      "compiled_events": [
+        "memory-hotplug"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "virtio-mem configuration and MMIO interrupt outcome supplements"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "closed nonblocking GuestLogger memory-hotplug producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed memory-hotplug outcome encoding and level selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent memory-hotplug outcome limiter identity"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "device-owned virtio-mem notification outcome convergence"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed memory-hotplug outcome vocabulary and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "memory-hotplug configuration, interrupt, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "production-bundle memory-hotplug logger grant reachability and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "memory-hotplug filtering, limiting, delivery, and exact encoding tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "virtio-mem request, rollback, discard, product-PCI interrupt, and unchanged-result tests"
+        }
+      ]
     },
     {
       "id": "logger.network.outcome",
@@ -792,7 +960,7 @@
       "allowed_fields": [],
       "disposition": "not-applicable",
       "non_applicable_reason": "x86-only",
-      "rationale": "The containing code is compiled only for Firecracker's x86_64 backend and has no identity-preserving macOS arm64/HVF execution path."
+      "rationale": "The mapped architecture, CPUID, xstate, interrupt, debug-register, and i8042 producers have no identity-preserving macOS arm64/HVF execution path. Firecracker's i8042 source module is shared, but its construction, PIO registration, API exposure, and runtime ownership are x86_64-only; Bangbang's arm64 platform instead exposes PL031 RTC without an i8042 controller."
     },
     {
       "id": "logger.observability.outcome",
@@ -1173,9 +1341,65 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic serial device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1809"
+      "disposition": "implemented",
+      "rationale": "All mapped upstream calls converge on one bounded serial input, output, rearm, backpressure, detach, limiter, or interrupt outcome per semantic transition. The input and output owners emit closed levels only after typed results are known while discarding bytes, raw errors, paths, identifiers, descriptors, addresses, counts, and guest values.",
+      "compiled_events": [
+        "serial"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "serial input and interrupt outcome convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "closed nonblocking GuestLogger serial producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed serial outcome encoding and level selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent serial outcome limiter identity"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "serial output and limiter outcome convergence"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed serial outcome vocabulary and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "serial input aggregation, interrupt, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "production-bundle serial logger grant reachability and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "serial filtering, limiting, delivery, and exact encoding tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "serial output, lock, limiter, and unchanged-result tests"
+        }
+      ]
     },
     {
       "id": "logger.snapshot.outcome",
@@ -1234,7 +1458,7 @@
     {
       "id": "logger.time-identity.outcome",
       "subsystem": "remaining-devices",
-      "summary": "Fixed redacted time, identity, or legacy platform-device outcome.",
+      "summary": "Fixed redacted time and guest-identity outcome.",
       "guest_triggerable": true,
       "delivery": "nonblocking-guest",
       "level": "outcome-derived",
@@ -1247,9 +1471,75 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic time, identity, or legacy platform-device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1809"
+      "disposition": "implemented",
+      "rationale": "The twelve applicable mapped upstream calls converge on bounded RTC, VMGenID, VMClock, PVTime, platform-publication, or aggregate time-identity outcomes. Component observers preserve committed and partially committed restore classifications while emitting only closed levels and discarding generation IDs, timestamps, raw errors, paths, identifiers, addresses, and guest values; the four i8042 producers are classified separately as x86-only.",
+      "compiled_events": [
+        "time-identity"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_platform.rs",
+          "anchor": "native-v2 RTC, PVTime, identity restore, and platform-publication outcomes"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "normal boot RTC, PVTime, identity restore, capture, and platform outcomes"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "closed nonblocking GuestLogger time-identity producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed time-identity outcome encoding and level selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent time-identity outcome limiter identity"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/rtc.rs",
+          "anchor": "PL031 RTC access outcome convergence"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed time-identity outcome vocabulary and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/snapshot_v2_platform.rs",
+          "anchor": "native-v2 time component ordering and commit-state tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "time-identity component, aggregate, capture, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "production-bundle time-identity logger grant reachability and redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "time-identity filtering, limiting, delivery, and exact encoding tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/rtc.rs",
+          "anchor": "RTC rejection classification and redaction tests"
+        }
+      ]
     },
     {
       "id": "logger.transport.outcome",
@@ -1833,19 +2123,19 @@
     },
     {
       "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:152:13",
-      "class_id": "logger.time-identity.outcome"
+      "class_id": "logger.nonapp.x86"
     },
     {
       "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:236:21",
-      "class_id": "logger.time-identity.outcome"
+      "class_id": "logger.nonapp.x86"
     },
     {
       "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:263:21",
-      "class_id": "logger.time-identity.outcome"
+      "class_id": "logger.nonapp.x86"
     },
     {
       "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/i8042.rs:325:21",
-      "class_id": "logger.time-identity.outcome"
+      "class_id": "logger.nonapp.x86"
     },
     {
       "invocation_id": "logger-invocation:src/vmm/src/devices/legacy/rtc_pl031.rs:114:13",

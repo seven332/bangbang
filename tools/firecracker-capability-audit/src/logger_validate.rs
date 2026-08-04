@@ -29,7 +29,7 @@ const EXPECTED_EXAMPLE: usize = 22;
 const EXPECTED_DIRECT: usize = 466;
 const EXPECTED_MACRO_TEMPLATE: usize = 2;
 const LOGGER_EXTRACTOR: &str = "rust-logger-macro-v1";
-const PLANNED_ISSUES: [&str; 1] = ["#1809"];
+const PLANNED_ISSUES: [&str; 0] = [];
 
 /// Validate the checked logger source manifest and human classification overlay.
 pub fn validate_logger_producers(
@@ -540,7 +540,7 @@ fn validate_class(
                 .is_some_and(|issue| PLANNED_ISSUES.contains(&issue))
             {
                 errors.push(format!(
-                    "planned logger class must be owned by #1809: {}",
+                    "planned logger class must name an approved delivery issue: {}",
                     class.id
                 ));
             }
@@ -685,11 +685,17 @@ fn validate_compiled_event_set(classes: &[LoggerProducerClass], errors: &mut Vec
         (LoggerCompiledEvent::ApiRequest, "logger.api.request"),
         (LoggerCompiledEvent::ApiResult, "logger.api.result"),
         (LoggerCompiledEvent::Backend, "logger.backend.outcome"),
+        (LoggerCompiledEvent::Balloon, "logger.balloon.outcome"),
         (LoggerCompiledEvent::Block, "logger.block.outcome"),
         (LoggerCompiledEvent::InstanceStart, "logger.api.result"),
         (LoggerCompiledEvent::FlushMetrics, "logger.api.result"),
         (LoggerCompiledEvent::BootTime, "logger.boot.time"),
+        (LoggerCompiledEvent::Entropy, "logger.entropy.outcome"),
         (LoggerCompiledEvent::Lifecycle, "logger.lifecycle.outcome"),
+        (
+            LoggerCompiledEvent::MemoryHotplug,
+            "logger.memory-hotplug.outcome",
+        ),
         (
             LoggerCompiledEvent::Observability,
             "logger.observability.outcome",
@@ -710,7 +716,12 @@ fn validate_compiled_event_set(classes: &[LoggerProducerClass], errors: &mut Vec
             LoggerCompiledEvent::ProcessSignal,
             "logger.process-signal.outcome",
         ),
+        (LoggerCompiledEvent::Serial, "logger.serial.outcome"),
         (LoggerCompiledEvent::Snapshot, "logger.snapshot.outcome"),
+        (
+            LoggerCompiledEvent::TimeIdentity,
+            "logger.time-identity.outcome",
+        ),
         (LoggerCompiledEvent::Transport, "logger.transport.outcome"),
         (LoggerCompiledEvent::Vsock, "logger.vsock.outcome"),
     ]);

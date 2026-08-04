@@ -2,7 +2,7 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
+use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerEntropyOutcome, LoggerTransportOutcome};
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError};
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId,
@@ -1778,6 +1778,26 @@ impl VirtioRngDevice {
         entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
         now: Instant,
     ) -> Result<VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError> {
+        let logger = self.guest_logger.clone();
+        let result = self.dispatch_drained_queue_notifications_at_inner(
+            memory,
+            drained_notifications,
+            entropy_source,
+            now,
+        );
+        if let Some(logger) = logger {
+            observe_entropy_notification_result(&logger, &result);
+        }
+        result
+    }
+
+    fn dispatch_drained_queue_notifications_at_inner(
+        &mut self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+        entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+        now: Instant,
+    ) -> Result<VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError> {
         if drained_notifications.is_empty() {
             return Ok(VirtioRngDeviceNotificationDispatch::new(
                 drained_notifications,
@@ -1972,7 +1992,15 @@ impl VirtioPciEndpoint<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevice> {
                 dispatch
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
-        VirtioPciDeviceOperationError::combine(dispatch, work.drain_interrupt_intents())
+        let endpoint = work.drain_interrupt_intents();
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_entropy(LoggerEntropyOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
+        VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 }
 
@@ -2170,6 +2198,55 @@ impl std::error::Error for VirtioRngDeviceNotificationError {
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
         }
     }
+}
+
+fn observe_entropy_notification_result(
+    logger: &GuestLogger,
+    result: &Result<VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError>,
+) {
+    let (outer, buffer_write, dispatch) = match result {
+        Ok(dispatch) => (None, None, dispatch.queue_dispatch()),
+        Err(VirtioRngDeviceNotificationError::Inactive { .. }) => (
+            Some(LoggerEntropyOutcome::QueueNotificationInactive),
+            None,
+            None,
+        ),
+        Err(VirtioRngDeviceNotificationError::UnsupportedQueue { .. }) => (
+            Some(LoggerEntropyOutcome::QueueNotificationUnsupported),
+            None,
+            None,
+        ),
+        Err(VirtioRngDeviceNotificationError::QueueDispatch { source, .. }) => (
+            Some(LoggerEntropyOutcome::QueueDispatchFailed),
+            matches!(source, VirtioRngQueueDispatchError::BufferWrite { .. })
+                .then_some(LoggerEntropyOutcome::BufferWriteFailed),
+            Some(source.completed_dispatch()),
+        ),
+    };
+
+    logger.log_entropy_summary(
+        [
+            outer,
+            buffer_write,
+            dispatch
+                .is_some_and(|dispatch| dispatch.buffer_parse_failures() != 0)
+                .then_some(LoggerEntropyOutcome::RequestParseFailed),
+            dispatch
+                .is_some_and(|dispatch| dispatch.source_failures() != 0)
+                .then_some(LoggerEntropyOutcome::FillFailed),
+            dispatch
+                .is_some_and(|dispatch| dispatch.rate_limiter_throttled_requests() != 0)
+                .then_some(LoggerEntropyOutcome::RateLimiterThrottled),
+            dispatch
+                .is_some_and(|dispatch| dispatch.rate_limiter_events() != 0)
+                .then_some(LoggerEntropyOutcome::RateLimiterResumed),
+            dispatch
+                .is_some_and(|dispatch| dispatch.successful_requests() != 0)
+                .then_some(LoggerEntropyOutcome::FillSucceeded),
+        ]
+        .into_iter()
+        .flatten(),
+    );
 }
 
 #[derive(Debug, Default)]
@@ -2736,6 +2813,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
+    use crate::logger::{LoggerConfigInput, LoggerTestCapture};
     use crate::memory::{GuestMemoryError, GuestMemoryLayout, GuestMemoryRange};
     use crate::metrics::{EntropyDeviceMetrics, SharedEntropyDeviceMetrics};
     use crate::mmio::{
@@ -2746,13 +2824,18 @@ mod tests {
         NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, SnapshotV2EntropyRetryState,
         SnapshotV2EntropyState, SnapshotV2EntropyStateCaptureError,
     };
+    use crate::virtio::VirtioDeviceType;
     use crate::virtio_mmio::{
-        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
-        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
-        VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_VERSION_1_FEATURE,
-        VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
-        VirtioMmioDeviceActivationHandler, VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters,
-        VirtioMmioRegister,
+        UnsupportedVirtioMmioDeviceConfig, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK,
+        VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT,
+        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioDeviceActivation,
+        VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
+        VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
+    };
+    use crate::virtio_pci::{
+        VirtioPciDeviceOperationError, VirtioPciIdentity,
+        test_support::endpoint_with_failing_interrupts,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
@@ -3657,6 +3740,9 @@ mod tests {
         let mut memory = memory();
         let mut source = TestEntropySource::default();
         let mut device = VirtioRngDevice::new();
+        let capture = LoggerTestCapture::default();
+        let (_state, logger) = capture.configured_guest_logger();
+        VirtioMmioDeviceActivationHandler::attach_guest_logger(&mut device, logger.clone());
 
         let error = device
             .dispatch_drained_queue_notifications(&mut memory, vec![0], &mut source)
@@ -3671,6 +3757,15 @@ mod tests {
             error.to_string(),
             "virtio-rng queue notification cannot be dispatched before activation"
         );
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        assert_eq!(
+            output
+                .matches("device-kind=entropy operation=queue-notification outcome=inactive")
+                .count(),
+            1
+        );
+        assert!(!output.contains("queue-index"));
     }
 
     #[test]
@@ -3811,6 +3906,103 @@ mod tests {
                 .interrupt_registers()
                 .pending_status()
                 .contains(DeviceInterruptKind::Queue)
+        );
+    }
+
+    #[test]
+    fn entropy_product_pci_combined_failure_preserves_result_and_exact_log_owners() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        queue_head(&mut memory, 1, TEST_QUEUE_SIZE);
+        set_available_index(&mut memory, 2);
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
+        let device_registers = rng_device_registers();
+        let mut device = VirtioRngDevice::new();
+        device
+            .activate_rng(rng_device_activation(&device_registers, &queues))
+            .expect("product PCI virtio-rng device should activate");
+        let capture = LoggerTestCapture::default();
+        let (mut logger_state, initial_logger) = capture.configured_guest_logger();
+        drop(initial_logger);
+        logger_state
+            .configure(LoggerConfigInput::new().with_show_log_origin(true))
+            .expect("origin-prefixed product PCI logger should configure");
+        let logger = logger_state.guest_logger();
+        let endpoint = endpoint_with_failing_interrupts(
+            VirtioPciIdentity::new(
+                VirtioDeviceType::new(VIRTIO_RNG_DEVICE_ID)
+                    .expect("virtio-rng device type should validate"),
+                0,
+            ),
+            &VIRTIO_RNG_QUEUE_SIZES,
+            UnsupportedVirtioMmioDeviceConfig,
+            device,
+            logger.clone(),
+        );
+        endpoint
+            .admit_device_work()
+            .expect("product PCI work should admit")
+            .with_core_mut(|core| {
+                core.queue_notifications.write_register(
+                    VirtioMmioRegister::QueueNotify,
+                    0,
+                    DRIVER_OK_STATUS,
+                )
+            })
+            .expect("product PCI endpoint should remain available")
+            .expect("product PCI queue notification should record");
+        let mut source = TestEntropySource::default();
+
+        let error = endpoint
+            .dispatch_rng_queue_notifications(&mut memory, &mut source)
+            .expect_err("partial device result and product PCI interrupt should both fail");
+
+        assert!(matches!(
+            error,
+            VirtioPciDeviceOperationError::DeviceAndEndpoint { .. }
+        ));
+        let device_error = error
+            .device_error()
+            .expect("combined failure should retain the device error");
+        let completed = device_error
+            .completed_dispatch()
+            .expect("combined failure should retain the completed prefix");
+        assert_eq!(completed.processed_requests(), 1);
+        assert_eq!(completed.successful_requests(), 1);
+        assert!(completed.needs_queue_interrupt());
+        assert!(error.endpoint_error().is_some());
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_guest_bytes(&memory, TEST_DATA, 4), vec![0, 1, 2, 3]);
+        assert_eq!(source.calls(), &[4]);
+        assert!(endpoint.pending_queue_notifications().unwrap().is_empty());
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        let suffix = "device-kind=entropy operation=interrupt-delivery outcome=failed";
+        let records = output
+            .lines()
+            .filter(|line| line.ends_with(suffix))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records.len(),
+            2,
+            "generic transport and entropy class owners should each emit once; output:\n{output}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|line| line.contains("origin=crates/runtime/src/virtio_pci.rs:"))
+                .count(),
+            1,
+            "generic product PCI owner should emit once; output:\n{output}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|line| line.contains("origin=crates/runtime/src/entropy.rs:"))
+                .count(),
+            1,
+            "entropy class owner should emit once; output:\n{output}"
         );
     }
 

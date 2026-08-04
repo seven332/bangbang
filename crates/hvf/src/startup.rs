@@ -51,8 +51,9 @@ use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
 use bangbang_runtime::logger::{
-    GuestLogger, LoggerBackendOutcome, LoggerBlockOutcome, LoggerNetworkOutcome, LoggerPmemOutcome,
-    LoggerVsockOutcome,
+    GuestLogger, LoggerBackendOutcome, LoggerBalloonOutcome, LoggerBlockOutcome,
+    LoggerEntropyOutcome, LoggerMemoryHotplugOutcome, LoggerNetworkOutcome, LoggerPmemOutcome,
+    LoggerSerialOutcome, LoggerTimeIdentityOutcome, LoggerVsockOutcome,
 };
 use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking, GuestMemoryLayout,
@@ -13766,6 +13767,7 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
     where
         W: std::io::Write + std::io::Seek,
     {
+        let guest_logger = self.backend.guest_logger();
         let profile = hvf_arm64_boot_snapshot_v2_platform_profile(version);
         debug_assert!(profile.is_some());
         let (stable, captures, pvtime_capture) =
@@ -13894,15 +13896,21 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
             global_gic.ok_or(HvfArm64BootSnapshotV2CaptureError::GlobalGicShape { index: 0 })?;
 
         let rtc_mmio_layout = RtcMmioLayout::new(rtc.region.range().start(), rtc.region.id());
-        let time = capture_hvf_snapshot_v2_time_state(
+        let time_result = capture_hvf_snapshot_v2_time_state(
             memory,
             rtc_mmio_layout,
             &self.runtime_resources.vmgenid_device,
             &self.runtime_resources.vmclock_device,
             self.runtime_resources.pvtime_state.layout(),
             &pvtime_capture,
-        )
-        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
+        );
+        guest_logger.log_time_identity(if time_result.is_ok() {
+            LoggerTimeIdentityOutcome::PvTimeAccountingPublished
+        } else {
+            LoggerTimeIdentityOutcome::PvTimeAccountingFailed
+        });
+        let time =
+            time_result.map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
         let compatibility = HvfSnapshotV1CompatibilityState::new(
             primary_identification,
             primary_optional_identification,
@@ -16722,6 +16730,7 @@ impl HvfArm64BootSession<'_> {
             }
             Err(_) => self.balloon_device_metrics.record_event_failure(),
         }
+        observe_balloon_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -16774,6 +16783,7 @@ impl HvfArm64BootSession<'_> {
         if let Some(metrics) = &self.memory_hotplug_device_metrics {
             record_memory_hotplug_signal_metrics(metrics, needs_queue_interrupt, &result);
         }
+        observe_memory_hotplug_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -16781,18 +16791,22 @@ impl HvfArm64BootSession<'_> {
         &mut self,
         update: MemoryHotplugSizeUpdate,
     ) -> Result<(), MemoryHotplugUpdateError> {
+        let guest_logger = self.backend.guest_logger();
         if let Some(devices) = self
             .pci_data_devices
             .as_ref()
             .filter(|devices| devices.memory_hotplug.is_some())
         {
-            return devices.update_memory_hotplug(update);
+            let result = devices.update_memory_hotplug(update);
+            observe_memory_hotplug_configuration_update(&guest_logger, &result);
+            return result;
         }
         update_memory_hotplug_requested_size_and_signal_interrupt(
             &self.runtime_resources,
             &self.mmio_dispatcher,
             &self.gic,
             update,
+            &guest_logger,
         )
     }
 
@@ -16888,6 +16902,9 @@ impl HvfArm64BootSession<'_> {
                 Err(_) => {
                     self.entropy_device_metrics
                         .record_entropy_source_provider_failure();
+                    self.backend
+                        .guest_logger()
+                        .log_entropy(LoggerEntropyOutcome::EntropyProviderFailed);
                     return Ok(HvfArm64BootEntropyNotificationDispatches::new(Vec::new()));
                 }
             };
@@ -30680,6 +30697,7 @@ impl OwnedHvfArm64BootSession {
             }
             Err(_) => self.balloon_device_metrics.record_event_failure(),
         }
+        observe_balloon_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -30732,6 +30750,7 @@ impl OwnedHvfArm64BootSession {
         if let Some(metrics) = &self.memory_hotplug_device_metrics {
             record_memory_hotplug_signal_metrics(metrics, needs_queue_interrupt, &result);
         }
+        observe_memory_hotplug_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -30739,18 +30758,22 @@ impl OwnedHvfArm64BootSession {
         &mut self,
         update: MemoryHotplugSizeUpdate,
     ) -> Result<(), MemoryHotplugUpdateError> {
+        let guest_logger = self.backend.guest_logger();
         if let Some(devices) = self
             .pci_data_devices
             .as_ref()
             .filter(|devices| devices.memory_hotplug.is_some())
         {
-            return devices.update_memory_hotplug(update);
+            let result = devices.update_memory_hotplug(update);
+            observe_memory_hotplug_configuration_update(&guest_logger, &result);
+            return result;
         }
         update_memory_hotplug_requested_size_and_signal_interrupt(
             &self.runtime_resources,
             &self.mmio_dispatcher,
             &self.gic,
             update,
+            &guest_logger,
         )
     }
 
@@ -30846,6 +30869,9 @@ impl OwnedHvfArm64BootSession {
                 Err(_) => {
                     self.entropy_device_metrics
                         .record_entropy_source_provider_failure();
+                    self.backend
+                        .guest_logger()
+                        .log_entropy(LoggerEntropyOutcome::EntropyProviderFailed);
                     return Ok(HvfArm64BootEntropyNotificationDispatches::new(Vec::new()));
                 }
             };
@@ -32508,6 +32534,7 @@ struct HvfArm64BootSerialInputDispatch {
     rearmed: bool,
     backpressured: bool,
     detached: bool,
+    input_read_failed: bool,
     interrupt_delivered: bool,
 }
 
@@ -32706,6 +32733,7 @@ fn dispatch_serial_input_with(
             drop(dispatcher);
             *serial_input = None;
             dispatch.detached = true;
+            dispatch.input_read_failed = true;
             return Ok(dispatch);
         }
     };
@@ -33052,13 +33080,71 @@ fn dispatch_run_loop_serial_input_for_step(
     steps_completed: usize,
     read_ready: bool,
 ) -> Result<(), HvfArm64BootRunLoopError> {
-    session
-        .dispatch_run_loop_serial_input(read_ready)
+    let result = session.dispatch_run_loop_serial_input(read_ready);
+    if result
+        .as_ref()
+        .map_or(true, serial_input_dispatch_has_observable_outcome)
+    {
+        observe_serial_input_dispatch(&session.guest_logger(), &result);
+    }
+    result
         .map(|_| ())
         .map_err(|source| HvfArm64BootRunLoopError::DispatchSerialInput {
             steps_completed,
             source: Box::new(source),
         })
+}
+
+const fn serial_input_dispatch_has_observable_outcome(
+    dispatch: &HvfArm64BootSerialInputDispatch,
+) -> bool {
+    dispatch.bytes_read != 0
+        || dispatch.rearmed
+        || dispatch.backpressured
+        || dispatch.detached
+        || dispatch.input_read_failed
+        || dispatch.interrupt_delivered
+}
+
+fn observe_serial_input_dispatch(
+    logger: &GuestLogger,
+    result: &Result<HvfArm64BootSerialInputDispatch, HvfArm64BootSerialInputDispatchError>,
+) {
+    match result {
+        Ok(dispatch) => {
+            if dispatch.bytes_read > 0 {
+                logger.log_serial(LoggerSerialOutcome::InputReadSucceeded);
+            }
+            if dispatch.rearmed {
+                logger.log_serial(LoggerSerialOutcome::InputRearmSucceeded);
+            }
+            if dispatch.backpressured {
+                logger.log_serial(LoggerSerialOutcome::InputBackpressurePaused);
+            }
+            if dispatch.detached {
+                if dispatch.input_read_failed {
+                    logger.log_serial(LoggerSerialOutcome::InputReadFailed);
+                    logger.log_serial(LoggerSerialOutcome::InputDetachFailed);
+                } else {
+                    logger.log_serial(LoggerSerialOutcome::InputDetachEof);
+                }
+            }
+            if dispatch.interrupt_delivered {
+                logger.log_serial(LoggerSerialOutcome::InterruptDeliverySucceeded);
+            }
+        }
+        Err(
+            HvfArm64BootSerialInputDispatchError::CreateSignaler { .. }
+            | HvfArm64BootSerialInputDispatchError::Signal { .. }
+            | HvfArm64BootSerialInputDispatchError::InterruptIntentChanged,
+        ) => logger.log_serial(LoggerSerialOutcome::InterruptDeliveryFailed),
+        Err(
+            HvfArm64BootSerialInputDispatchError::MissingDevice
+            | HvfArm64BootSerialInputDispatchError::MmioDispatcher { .. }
+            | HvfArm64BootSerialInputDispatchError::Runtime { .. }
+            | HvfArm64BootSerialInputDispatchError::InvalidInjectionOutcome,
+        ) => logger.log_serial(LoggerSerialOutcome::InputReadFailed),
+    }
 }
 
 fn dispatch_run_loop_block_retry_notifications_for_step(
@@ -33203,7 +33289,15 @@ fn run_boot_session_loop_with_observer(
         .as_ref()
         .err()
         .and_then(backend_outcome_for_run_loop_error);
-    if virtual_timer_activated || terminal_step_outcome.is_some() || error_outcome.is_some() {
+    let time_identity_error_outcome = result
+        .as_ref()
+        .err()
+        .and_then(time_identity_outcome_for_run_loop_error);
+    if virtual_timer_activated
+        || terminal_step_outcome.is_some()
+        || error_outcome.is_some()
+        || time_identity_error_outcome.is_some()
+    {
         let guest_logger = session.guest_logger();
         if virtual_timer_activated {
             guest_logger.log_backend(LoggerBackendOutcome::VirtualTimerActivated);
@@ -33213,6 +33307,9 @@ fn run_boot_session_loop_with_observer(
         }
         if let Some(outcome) = error_outcome {
             guest_logger.log_backend(outcome);
+        }
+        if let Some(outcome) = time_identity_error_outcome {
+            guest_logger.log_time_identity(outcome);
         }
     }
     if !matches!(
@@ -33304,6 +33401,24 @@ fn backend_outcome_for_run_loop_error(
             Some(LoggerBackendOutcome::VcpuRunFailed)
         }
     }
+}
+
+fn time_identity_outcome_for_run_loop_error(
+    error: &HvfArm64BootRunLoopError,
+) -> Option<LoggerTimeIdentityOutcome> {
+    let HvfArm64BootRunLoopError::RunStep { source, .. } = error else {
+        return None;
+    };
+    let HvfArm64BootVcpuError::Member { source, .. } = source.as_ref() else {
+        return None;
+    };
+    matches!(
+        source.as_ref(),
+        HvfVcpuRunnerError::PvTimeMeasurement(_)
+            | HvfVcpuRunnerError::PvTimeSampling { .. }
+            | HvfVcpuRunnerError::PvTimeAccounting { .. }
+    )
+    .then_some(LoggerTimeIdentityOutcome::PvTimeAccountingFailed)
 }
 
 fn run_boot_session_loop_with_observer_inner(
@@ -34402,33 +34517,50 @@ fn update_memory_hotplug_requested_size_and_signal_interrupt(
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
     gic: &HvfGicMetadata,
     update: MemoryHotplugSizeUpdate,
+    guest_logger: &GuestLogger,
 ) -> Result<(), MemoryHotplugUpdateError> {
-    let device = runtime_resources
-        .memory_hotplug_device
-        .as_ref()
-        .ok_or(MemoryHotplugUpdateError::ActiveSessionUnavailable)?;
-    {
-        let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher).map_err(|source| {
-            MemoryHotplugUpdateError::ActiveSessionCommand {
-                message: source.to_string(),
-            }
-        })?;
-        update_memory_hotplug_config_for_device(device, &mut mmio_dispatcher, update)?;
-    }
+    let result = (|| {
+        let device = runtime_resources
+            .memory_hotplug_device
+            .as_ref()
+            .ok_or(MemoryHotplugUpdateError::ActiveSessionUnavailable)?;
+        {
+            let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher).map_err(|source| {
+                MemoryHotplugUpdateError::ActiveSessionCommand {
+                    message: source.to_string(),
+                }
+            })?;
+            update_memory_hotplug_config_for_device(device, &mut mmio_dispatcher, update)?;
+        }
 
-    let interrupt_delivered = HvfGicSpiSignaler::from_metadata(gic).is_ok_and(|signaler| {
-        signal_device_interrupt(
-            device.fdt_device.interrupt_line,
-            DeviceInterruptKind::Config,
-            &signaler,
-        )
-        .is_ok()
+        let interrupt_delivered = HvfGicSpiSignaler::from_metadata(gic).is_ok_and(|signaler| {
+            signal_device_interrupt(
+                device.fdt_device.interrupt_line,
+                DeviceInterruptKind::Config,
+                &signaler,
+            )
+            .is_ok()
+        });
+        if !interrupt_delivered {
+            device.metrics.record_interrupt_failure();
+            guest_logger.log_memory_hotplug(LoggerMemoryHotplugOutcome::InterruptDeliveryFailed);
+        }
+
+        Ok(())
+    })();
+    observe_memory_hotplug_configuration_update(guest_logger, &result);
+    result
+}
+
+fn observe_memory_hotplug_configuration_update(
+    logger: &GuestLogger,
+    result: &Result<(), MemoryHotplugUpdateError>,
+) {
+    logger.log_memory_hotplug(if result.is_ok() {
+        LoggerMemoryHotplugOutcome::ConfigurationUpdateSucceeded
+    } else {
+        LoggerMemoryHotplugOutcome::ConfigurationUpdateFailed
     });
-    if !interrupt_delivered {
-        device.metrics.record_interrupt_failure();
-    }
-
-    Ok(())
 }
 
 fn memory_hotplug_status(
@@ -34711,6 +34843,68 @@ fn observe_vsock_interrupt_delivery(
     }
 }
 
+fn observe_balloon_interrupt_delivery(
+    logger: &GuestLogger,
+    result: &Result<
+        HvfArm64BootBalloonNotificationDispatches,
+        HvfArm64BootBalloonNotificationDispatchError,
+    >,
+) {
+    if matches!(result, Ok(dispatches) if dispatches.has_signal_failure())
+        || matches!(
+            result,
+            Err(HvfArm64BootBalloonNotificationDispatchError::CreateSignalSink { .. })
+        )
+    {
+        logger.log_balloon(LoggerBalloonOutcome::InterruptDeliveryFailed);
+    }
+}
+
+fn observe_memory_hotplug_interrupt_delivery(
+    logger: &GuestLogger,
+    result: &Result<
+        HvfArm64BootMemoryHotplugNotificationDispatches,
+        HvfArm64BootMemoryHotplugNotificationDispatchError,
+    >,
+) {
+    if matches!(result, Ok(dispatches) if dispatches.has_signal_failure())
+        || matches!(
+            result,
+            Err(HvfArm64BootMemoryHotplugNotificationDispatchError::CreateSignalSink { .. })
+        )
+    {
+        logger.log_memory_hotplug(LoggerMemoryHotplugOutcome::InterruptDeliveryFailed);
+    }
+}
+
+fn observe_entropy_provider_errors(
+    logger: &GuestLogger,
+    dispatches: &[Arm64BootEntropyNotificationDispatch],
+) {
+    for dispatch in dispatches {
+        if dispatch.outcome().entropy_source_error().is_some() {
+            logger.log_entropy(LoggerEntropyOutcome::EntropyProviderFailed);
+        }
+    }
+}
+
+fn observe_entropy_interrupt_delivery(
+    logger: &GuestLogger,
+    result: &Result<
+        HvfArm64BootEntropyNotificationDispatches,
+        HvfArm64BootEntropyNotificationDispatchError,
+    >,
+) {
+    if matches!(result, Ok(dispatches) if dispatches.has_signal_failure())
+        || matches!(
+            result,
+            Err(HvfArm64BootEntropyNotificationDispatchError::CreateSignalSink { .. })
+        )
+    {
+        logger.log_entropy(LoggerEntropyOutcome::InterruptDeliveryFailed);
+    }
+}
+
 #[cfg(test)]
 fn record_balloon_dispatch_metrics(
     metrics: &SharedBalloonDeviceMetrics,
@@ -34889,11 +35083,14 @@ fn dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
     };
 
     record_entropy_runtime_dispatch_metrics(metrics, dispatches.as_slice());
+    let guest_logger = backend.guest_logger();
+    observe_entropy_provider_errors(&guest_logger, dispatches.as_slice());
     let result = collect_or_signal_entropy_queue_interrupts(dispatches, gic);
     match &result {
         Ok(dispatches) => record_entropy_signal_metrics(metrics, dispatches),
         Err(_) => metrics.record_event_failure(),
     }
+    observe_entropy_interrupt_delivery(&guest_logger, &result);
     result
 }
 
@@ -35207,25 +35404,30 @@ fn replace_vmgenid_for_snapshot_restore(
     gic: HvfGicMetadata,
     interrupt_line: GuestInterruptLine,
 ) -> Result<(), HvfArm64BootVmGenIdRestoreError> {
-    runner
-        .ensure_snapshot_restore_available()
-        .map_err(|source| HvfArm64BootVmGenIdRestoreError::RunnerPreflight { source })?;
+    let guest_logger = backend.guest_logger();
+    let result = (|| {
+        runner
+            .ensure_snapshot_restore_available()
+            .map_err(|source| HvfArm64BootVmGenIdRestoreError::RunnerPreflight { source })?;
 
-    let signaler = HvfGicSpiSignaler::from_metadata(&gic)
-        .map_err(|source| HvfArm64BootVmGenIdRestoreError::SignalerPreflight { source })?;
-    signaler
-        .validate_line(interrupt_line)
-        .map_err(|source| HvfArm64BootVmGenIdRestoreError::SignalerPreflight { source })?;
+        let signaler = HvfGicSpiSignaler::from_metadata(&gic)
+            .map_err(|source| HvfArm64BootVmGenIdRestoreError::SignalerPreflight { source })?;
+        signaler
+            .validate_line(interrupt_line)
+            .map_err(|source| HvfArm64BootVmGenIdRestoreError::SignalerPreflight { source })?;
 
-    let memory = backend
-        .mapped_guest_memory_mut()
-        .map_err(|source| HvfArm64BootVmGenIdRestoreError::GuestMemory { source })?;
-    replace_vmgenid_and_signal_with(
-        memory,
-        &mut runtime_resources.vmgenid_device,
-        replace_arm64_boot_vmgenid,
-        || signaler.set_level(interrupt_line, true),
-    )
+        let memory = backend
+            .mapped_guest_memory_mut()
+            .map_err(|source| HvfArm64BootVmGenIdRestoreError::GuestMemory { source })?;
+        replace_vmgenid_and_signal_with(
+            memory,
+            &mut runtime_resources.vmgenid_device,
+            replace_arm64_boot_vmgenid,
+            || signaler.set_level(interrupt_line, true),
+        )
+    })();
+    observe_vmgenid_restore(&guest_logger, &result);
+    result
 }
 
 pub(crate) fn replace_vmgenid_and_signal_with(
@@ -35249,25 +35451,30 @@ fn update_vmclock_for_snapshot_restore(
     gic: HvfGicMetadata,
     interrupt_line: GuestInterruptLine,
 ) -> Result<(), HvfArm64BootVmClockRestoreError> {
-    runner
-        .ensure_snapshot_restore_available()
-        .map_err(|source| HvfArm64BootVmClockRestoreError::RunnerPreflight { source })?;
+    let guest_logger = backend.guest_logger();
+    let result = (|| {
+        runner
+            .ensure_snapshot_restore_available()
+            .map_err(|source| HvfArm64BootVmClockRestoreError::RunnerPreflight { source })?;
 
-    let signaler = HvfGicSpiSignaler::from_metadata(&gic)
-        .map_err(|source| HvfArm64BootVmClockRestoreError::SignalerPreflight { source })?;
-    signaler
-        .validate_line(interrupt_line)
-        .map_err(|source| HvfArm64BootVmClockRestoreError::SignalerPreflight { source })?;
+        let signaler = HvfGicSpiSignaler::from_metadata(&gic)
+            .map_err(|source| HvfArm64BootVmClockRestoreError::SignalerPreflight { source })?;
+        signaler
+            .validate_line(interrupt_line)
+            .map_err(|source| HvfArm64BootVmClockRestoreError::SignalerPreflight { source })?;
 
-    let memory = backend
-        .mapped_guest_memory_mut()
-        .map_err(|source| HvfArm64BootVmClockRestoreError::GuestMemory { source })?;
-    update_vmclock_and_signal_with(
-        memory,
-        &mut runtime_resources.vmclock_device,
-        |memory, device| device.abi.update_after_restore(memory, device.range),
-        || signaler.set_level(interrupt_line, true),
-    )
+        let memory = backend
+            .mapped_guest_memory_mut()
+            .map_err(|source| HvfArm64BootVmClockRestoreError::GuestMemory { source })?;
+        update_vmclock_and_signal_with(
+            memory,
+            &mut runtime_resources.vmclock_device,
+            |memory, device| device.abi.update_after_restore(memory, device.range),
+            || signaler.set_level(interrupt_line, true),
+        )
+    })();
+    observe_vmclock_restore(&guest_logger, &result);
+    result
 }
 
 pub(crate) fn update_vmclock_and_signal_with(
@@ -35291,45 +35498,50 @@ fn restore_time_identity_for_snapshot(
     vmgenid_interrupt_line: GuestInterruptLine,
     vmclock_interrupt_line: GuestInterruptLine,
 ) -> Result<(), HvfArm64BootTimeIdentityRestoreError> {
-    runner
-        .ensure_snapshot_restore_available()
-        .map_err(|source| HvfArm64BootTimeIdentityRestoreError::RunnerPreflight { source })?;
+    let guest_logger = backend.guest_logger();
+    let result = (|| {
+        runner
+            .ensure_snapshot_restore_available()
+            .map_err(|source| HvfArm64BootTimeIdentityRestoreError::RunnerPreflight { source })?;
 
-    let signaler = HvfGicSpiSignaler::from_metadata(&gic).map_err(|source| {
-        HvfArm64BootTimeIdentityRestoreError::SignalerPreflight {
-            device: HvfArm64BootInterruptLinePurpose::VmGenIdDevice,
-            source,
-        }
-    })?;
-    signaler
-        .validate_line(vmgenid_interrupt_line)
-        .map_err(
-            |source| HvfArm64BootTimeIdentityRestoreError::SignalerPreflight {
+        let signaler = HvfGicSpiSignaler::from_metadata(&gic).map_err(|source| {
+            HvfArm64BootTimeIdentityRestoreError::SignalerPreflight {
                 device: HvfArm64BootInterruptLinePurpose::VmGenIdDevice,
                 source,
-            },
-        )?;
-    signaler
-        .validate_line(vmclock_interrupt_line)
-        .map_err(
-            |source| HvfArm64BootTimeIdentityRestoreError::SignalerPreflight {
-                device: HvfArm64BootInterruptLinePurpose::VmClockDevice,
-                source,
-            },
-        )?;
+            }
+        })?;
+        signaler
+            .validate_line(vmgenid_interrupt_line)
+            .map_err(
+                |source| HvfArm64BootTimeIdentityRestoreError::SignalerPreflight {
+                    device: HvfArm64BootInterruptLinePurpose::VmGenIdDevice,
+                    source,
+                },
+            )?;
+        signaler
+            .validate_line(vmclock_interrupt_line)
+            .map_err(
+                |source| HvfArm64BootTimeIdentityRestoreError::SignalerPreflight {
+                    device: HvfArm64BootInterruptLinePurpose::VmClockDevice,
+                    source,
+                },
+            )?;
 
-    let memory = backend
-        .mapped_guest_memory_mut()
-        .map_err(|source| HvfArm64BootTimeIdentityRestoreError::GuestMemory { source })?;
-    restore_time_identity_and_signal_with(
-        memory,
-        &mut runtime_resources.vmgenid_device,
-        &mut runtime_resources.vmclock_device,
-        replace_arm64_boot_vmgenid,
-        |memory, device| device.abi.update_after_restore(memory, device.range),
-        || signaler.set_level(vmgenid_interrupt_line, true),
-        || signaler.set_level(vmclock_interrupt_line, true),
-    )
+        let memory = backend
+            .mapped_guest_memory_mut()
+            .map_err(|source| HvfArm64BootTimeIdentityRestoreError::GuestMemory { source })?;
+        restore_time_identity_and_signal_with(
+            memory,
+            &mut runtime_resources.vmgenid_device,
+            &mut runtime_resources.vmclock_device,
+            replace_arm64_boot_vmgenid,
+            |memory, device| device.abi.update_after_restore(memory, device.range),
+            || signaler.set_level(vmgenid_interrupt_line, true),
+            || signaler.set_level(vmclock_interrupt_line, true),
+        )
+    })();
+    observe_ordered_time_identity_restore(&guest_logger, &result);
+    result
 }
 
 pub(crate) fn restore_time_identity_and_signal_with(
@@ -35351,6 +35563,96 @@ pub(crate) fn restore_time_identity_and_signal_with(
         .map_err(|source| HvfArm64BootTimeIdentityRestoreError::VmGenId { source })?;
     update_vmclock_and_signal_with(memory, vmclock, update_vmclock, signal_vmclock)
         .map_err(|source| HvfArm64BootTimeIdentityRestoreError::VmClock { source })
+}
+
+pub(crate) fn observe_vmgenid_restore(
+    logger: &GuestLogger,
+    result: &Result<(), HvfArm64BootVmGenIdRestoreError>,
+) {
+    match result {
+        Ok(()) => {
+            logger.log_time_identity(LoggerTimeIdentityOutcome::VmGenIdReplacementSucceeded);
+            logger.log_time_identity(LoggerTimeIdentityOutcome::VmGenIdNotificationSucceeded);
+        }
+        Err(source) => observe_vmgenid_restore_error(logger, source),
+    }
+}
+
+fn observe_vmgenid_restore_error(logger: &GuestLogger, error: &HvfArm64BootVmGenIdRestoreError) {
+    match error {
+        HvfArm64BootVmGenIdRestoreError::Signal { .. } => {
+            logger.log_time_identity(LoggerTimeIdentityOutcome::VmGenIdReplacementSucceeded);
+            logger.log_time_identity(LoggerTimeIdentityOutcome::VmGenIdNotificationFailed);
+        }
+        HvfArm64BootVmGenIdRestoreError::RunnerPreflight { .. }
+        | HvfArm64BootVmGenIdRestoreError::SignalerPreflight { .. }
+        | HvfArm64BootVmGenIdRestoreError::GuestMemory { .. }
+        | HvfArm64BootVmGenIdRestoreError::Replacement { .. } => {
+            logger.log_time_identity(LoggerTimeIdentityOutcome::VmGenIdReplacementFailed);
+        }
+    }
+}
+
+pub(crate) fn observe_vmclock_restore(
+    logger: &GuestLogger,
+    result: &Result<(), HvfArm64BootVmClockRestoreError>,
+) {
+    match result {
+        Ok(()) => {
+            logger.log_time_identity(LoggerTimeIdentityOutcome::VmClockUpdateSucceeded);
+            logger.log_time_identity(LoggerTimeIdentityOutcome::VmClockNotificationSucceeded);
+        }
+        Err(source) => observe_vmclock_restore_error(logger, source),
+    }
+}
+
+fn observe_vmclock_restore_error(logger: &GuestLogger, error: &HvfArm64BootVmClockRestoreError) {
+    match error {
+        HvfArm64BootVmClockRestoreError::Signal { .. } => {
+            logger.log_time_identity(LoggerTimeIdentityOutcome::VmClockUpdateSucceeded);
+            logger.log_time_identity(LoggerTimeIdentityOutcome::VmClockNotificationFailed);
+        }
+        HvfArm64BootVmClockRestoreError::Update { source } if source.is_committed() => {
+            logger.log_time_identity(LoggerTimeIdentityOutcome::VmClockUpdatePartiallyCommitted)
+        }
+        HvfArm64BootVmClockRestoreError::RunnerPreflight { .. }
+        | HvfArm64BootVmClockRestoreError::SignalerPreflight { .. }
+        | HvfArm64BootVmClockRestoreError::GuestMemory { .. }
+        | HvfArm64BootVmClockRestoreError::Update { .. } => {
+            logger.log_time_identity(LoggerTimeIdentityOutcome::VmClockUpdateFailed);
+        }
+    }
+}
+
+fn observe_ordered_time_identity_restore(
+    logger: &GuestLogger,
+    result: &Result<(), HvfArm64BootTimeIdentityRestoreError>,
+) {
+    match result {
+        Ok(()) => {
+            observe_vmgenid_restore(logger, &Ok(()));
+            observe_vmclock_restore(logger, &Ok(()));
+            logger.log_time_identity(LoggerTimeIdentityOutcome::OrderedRestoreSucceeded);
+        }
+        Err(HvfArm64BootTimeIdentityRestoreError::VmGenId { source }) => {
+            observe_vmgenid_restore_error(logger, source);
+            logger.log_time_identity(if source.is_committed() {
+                LoggerTimeIdentityOutcome::OrderedRestorePartiallyCommitted
+            } else {
+                LoggerTimeIdentityOutcome::OrderedRestoreFailed
+            });
+        }
+        Err(HvfArm64BootTimeIdentityRestoreError::VmClock { source }) => {
+            observe_vmgenid_restore(logger, &Ok(()));
+            observe_vmclock_restore_error(logger, source);
+            logger.log_time_identity(LoggerTimeIdentityOutcome::OrderedRestorePartiallyCommitted);
+        }
+        Err(
+            HvfArm64BootTimeIdentityRestoreError::RunnerPreflight { .. }
+            | HvfArm64BootTimeIdentityRestoreError::SignalerPreflight { .. }
+            | HvfArm64BootTimeIdentityRestoreError::GuestMemory { .. },
+        ) => logger.log_time_identity(LoggerTimeIdentityOutcome::OrderedRestoreFailed),
+    }
 }
 
 fn signal_device_interrupt(
@@ -36118,36 +36420,45 @@ fn configure_arm64_boot_pvtime(
     if !is_hvf_arm64_pvtime_measurement_available() {
         return Ok(());
     }
-    let Some(layout) = runtime.pvtime_state.layout() else {
+    let Some(layout) = runtime.pvtime_state.layout().cloned() else {
         return Ok(());
     };
-    let memory = backend
-        .mapped_guest_memory()
-        .map_err(|source| HvfArm64BootSessionError::MapGuestMemory { source })?;
-    let mut configs = Vec::new();
-    configs
-        .try_reserve_exact(layout.len())
-        .map_err(|source| HvfArm64BootSessionError::PvTimeConfigStorage { source })?;
-    for (index, record) in layout.records().iter().copied().enumerate() {
-        let address = record
-            .start()
-            .checked_add(ARM64_PVTIME_STOLEN_TIME_OFFSET as u64)
-            .ok_or(HvfArm64BootSessionError::PvTimeAddressOverflow { index })?;
-        let publisher = memory
-            .atomic_u64(address)
-            .map_err(|source| HvfArm64BootSessionError::PvTimePublisher { index, source })?;
-        configs.push(HvfArm64PvTimeAccountingConfig::new(
-            record.start().raw_value(),
-            publisher,
-            0,
-            contention_probe.clone(),
-        ));
-    }
-    coordinator
-        .configure_arm64_pvtime(configs)
-        .map_err(|source| HvfArm64BootSessionError::ConfigurePvTime { source })?;
-    runtime.pvtime_state.mark_advertised();
-    Ok(())
+    let guest_logger = backend.guest_logger();
+    let result = (|| {
+        let memory = backend
+            .mapped_guest_memory()
+            .map_err(|source| HvfArm64BootSessionError::MapGuestMemory { source })?;
+        let mut configs = Vec::new();
+        configs
+            .try_reserve_exact(layout.len())
+            .map_err(|source| HvfArm64BootSessionError::PvTimeConfigStorage { source })?;
+        for (index, record) in layout.records().iter().copied().enumerate() {
+            let address = record
+                .start()
+                .checked_add(ARM64_PVTIME_STOLEN_TIME_OFFSET as u64)
+                .ok_or(HvfArm64BootSessionError::PvTimeAddressOverflow { index })?;
+            let publisher = memory
+                .atomic_u64(address)
+                .map_err(|source| HvfArm64BootSessionError::PvTimePublisher { index, source })?;
+            configs.push(HvfArm64PvTimeAccountingConfig::new(
+                record.start().raw_value(),
+                publisher,
+                0,
+                contention_probe.clone(),
+            ));
+        }
+        coordinator
+            .configure_arm64_pvtime(configs)
+            .map_err(|source| HvfArm64BootSessionError::ConfigurePvTime { source })?;
+        runtime.pvtime_state.mark_advertised();
+        Ok(())
+    })();
+    guest_logger.log_time_identity(if result.is_ok() {
+        LoggerTimeIdentityOutcome::PvTimeInitializationSucceeded
+    } else {
+        LoggerTimeIdentityOutcome::PvTimeInitializationFailed
+    });
+    result
 }
 
 fn prepare_arm64_boot_session_parts_with_cache<'vm>(
@@ -36279,7 +36590,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
             .zip(interrupt_lines.memory_hotplug)
             .map(|(memory_hotplug, interrupt_line)| memory_hotplug.into_runtime(interrupt_line))
     };
-    let resources =
+    let resources_result =
         Arm64BootResources::assemble_from_controller_with_startup_resources_and_pci_validation(
             controller,
             Arm64BootResourceConfig {
@@ -36311,7 +36622,13 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
             },
             startup_resources,
             pci_validation,
-        )
+        );
+    guest_logger.log_time_identity(if resources_result.is_ok() {
+        LoggerTimeIdentityOutcome::PlatformPublicationSucceeded
+    } else {
+        LoggerTimeIdentityOutcome::PlatformPublicationFailed
+    });
+    let resources = resources_result
         .map_err(|source| HvfArm64BootSessionError::AssembleResources { source })?;
     let boot_registers = HvfArm64BootRegisters {
         kernel_entry: resources.loaded_boot_source.kernel.entry_address,
@@ -37686,7 +38003,7 @@ mod tests {
         DeviceInterruptKind, GuestInterruptLine, InterruptSignalError, InterruptSink,
     };
     use bangbang_runtime::logger::{
-        GuestLogger, LoggerApiControlOutcome, LoggerConfigInput, LoggerState,
+        GuestLogger, LoggerApiControlOutcome, LoggerConfigInput, LoggerLevel, LoggerState,
     };
     use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::memory::{
@@ -37790,18 +38107,22 @@ mod tests {
         HvfArm64BootPmemNotificationDispatchError, HvfArm64BootRunLoopControl,
         HvfArm64BootRunLoopControlWakeupToken, HvfArm64BootRunLoopOutcome,
         HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSerialInput,
-        HvfArm64BootSerialInputDispatchError, HvfArm64BootSessionConfig, HvfArm64BootSessionError,
-        HvfArm64BootStorageCaptureErrorKind, HvfArm64BootTimeIdentityRestoreError,
-        HvfArm64BootTimerDeviceConfig, HvfArm64BootVmClockRestoreError,
-        HvfArm64BootVmGenIdRestoreError, HvfArm64BootVsockNotificationDispatchError,
-        HvfSnapshotLineageError, PCI_ENDPOINT_SLOT_COUNT, allocate_interrupt_lines,
-        capture_hvf_snapshot_v2_time_state, collect_balloon_notification_dispatches,
-        collect_block_notification_dispatches, collect_entropy_notification_dispatches,
-        collect_memory_hotplug_notification_dispatches, collect_network_notification_dispatches,
-        collect_vsock_notification_dispatches, complete_live_snapshot_lineage,
+        HvfArm64BootSerialInputDispatch, HvfArm64BootSerialInputDispatchError,
+        HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfArm64BootStorageCaptureErrorKind,
+        HvfArm64BootTimeIdentityRestoreError, HvfArm64BootTimerDeviceConfig,
+        HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
+        HvfArm64BootVsockNotificationDispatchError, HvfSnapshotLineageError,
+        PCI_ENDPOINT_SLOT_COUNT, allocate_interrupt_lines, capture_hvf_snapshot_v2_time_state,
+        collect_balloon_notification_dispatches, collect_block_notification_dispatches,
+        collect_entropy_notification_dispatches, collect_memory_hotplug_notification_dispatches,
+        collect_network_notification_dispatches, collect_vsock_notification_dispatches,
+        complete_live_snapshot_lineage,
         dispatch_memory_hotplug_runtime_notifications_with_executor,
         dispatch_network_runtime_notifications_with_packet_io, dispatch_serial_input_with,
         lock_boot_mmio_dispatcher, lock_boot_mmio_dispatcher_runtime,
+        observe_balloon_interrupt_delivery, observe_entropy_interrupt_delivery,
+        observe_memory_hotplug_interrupt_delivery, observe_ordered_time_identity_restore,
+        observe_serial_input_dispatch, observe_vmclock_restore, observe_vmgenid_restore,
         pci_all_virtio_gic_msi_configuration, pci_all_virtio_resource_demand,
         pci_balloon_restore_gic_msi_configuration, pci_data_available_bar_count, pci_data_bar_plan,
         pci_data_endpoint_count, pci_data_region_id, pci_data_resource_demand,
@@ -38768,6 +39089,99 @@ mod tests {
             }
         ));
         assert!(error.is_committed());
+    }
+
+    #[test]
+    fn serial_input_observer_coalesces_fixed_activity_without_dynamic_values() {
+        let capture = TestGuestLoggerCapture::new_with_level(
+            "serial-input-outcome-logger",
+            LoggerLevel::Debug,
+        );
+        let activity = Ok(HvfArm64BootSerialInputDispatch {
+            bytes_read: 4,
+            rearmed: true,
+            backpressured: true,
+            detached: false,
+            input_read_failed: false,
+            interrupt_delivered: true,
+        });
+        observe_serial_input_dispatch(capture.logger(), &activity);
+        let eof = Ok(HvfArm64BootSerialInputDispatch {
+            detached: true,
+            ..HvfArm64BootSerialInputDispatch::default()
+        });
+        observe_serial_input_dispatch(capture.logger(), &eof);
+        let failed_detach = Ok(HvfArm64BootSerialInputDispatch {
+            detached: true,
+            input_read_failed: true,
+            ..HvfArm64BootSerialInputDispatch::default()
+        });
+        observe_serial_input_dispatch(capture.logger(), &failed_detach);
+        let signal_failure = Err(HvfArm64BootSerialInputDispatchError::InterruptIntentChanged);
+        observe_serial_input_dispatch(capture.logger(), &signal_failure);
+        observe_serial_input_dispatch(
+            capture.logger(),
+            &Ok(HvfArm64BootSerialInputDispatch::default()),
+        );
+
+        let output = capture.output_after_barrier();
+        let serial_lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.starts_with("device-kind=serial "))
+            .collect();
+        assert_eq!(
+            serial_lines,
+            [
+                "device-kind=serial operation=input-read outcome=succeeded",
+                "device-kind=serial operation=input-rearm outcome=succeeded",
+                "device-kind=serial operation=input-backpressure outcome=paused",
+                "device-kind=serial operation=interrupt-delivery outcome=succeeded",
+                "device-kind=serial operation=input-detach outcome=eof",
+                "device-kind=serial operation=input-read outcome=failed",
+                "device-kind=serial operation=input-detach outcome=failed",
+                "device-kind=serial operation=interrupt-delivery outcome=failed",
+            ]
+        );
+        assert!(!output.contains("bytes-read=4"));
+        assert!(!output.contains("byte-count=4"));
+        assert!(!output.contains("InterruptIntentChanged"));
+    }
+
+    #[test]
+    fn time_identity_observers_preserve_component_and_partial_commit_classification() {
+        let capture = TestGuestLoggerCapture::new("time-identity-outcome-logger");
+        observe_vmgenid_restore(capture.logger(), &Ok(()));
+        let vmclock_signal_failure = Err(HvfArm64BootVmClockRestoreError::Signal {
+            source: HvfGicSpiSignalError::InvalidState("sensitive VMClock signal detail"),
+        });
+        observe_vmclock_restore(capture.logger(), &vmclock_signal_failure);
+        let aggregate_failure = Err(HvfArm64BootTimeIdentityRestoreError::VmClock {
+            source: HvfArm64BootVmClockRestoreError::Update {
+                source: VmClockRestoreUpdateError::InvalidRange,
+            },
+        });
+        observe_ordered_time_identity_restore(capture.logger(), &aggregate_failure);
+
+        let output = capture.output_after_barrier();
+        let lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.starts_with("device-kind=time-identity "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "device-kind=time-identity operation=vmgenid-replacement outcome=succeeded",
+                "device-kind=time-identity operation=vmgenid-notification outcome=succeeded",
+                "device-kind=time-identity operation=vmclock-update outcome=succeeded",
+                "device-kind=time-identity operation=vmclock-notification outcome=failed",
+                "device-kind=time-identity operation=vmgenid-replacement outcome=succeeded",
+                "device-kind=time-identity operation=vmgenid-notification outcome=succeeded",
+                "device-kind=time-identity operation=vmclock-update outcome=failed",
+                "device-kind=time-identity operation=ordered-restore outcome=partially-committed",
+            ]
+        );
+        assert!(!output.contains("sensitive VMClock signal detail"));
+        assert!(!output.contains("InvalidRange"));
     }
 
     fn wait_for_limiter_retry_scheduler_status(
@@ -40356,10 +40770,18 @@ mod tests {
 
     impl TestGuestLoggerCapture {
         fn new(name: &str) -> Self {
+            Self::new_with_level(name, LoggerLevel::Info)
+        }
+
+        fn new_with_level(name: &str, level: LoggerLevel) -> Self {
             let file = temp_file(name, &[]);
             let mut state = LoggerState::default();
             state
-                .configure(LoggerConfigInput::new().with_log_path(file.path()))
+                .configure(
+                    LoggerConfigInput::new()
+                        .with_log_path(file.path())
+                        .with_level(level),
+                )
                 .expect("test guest logger should configure");
             let logger = state.guest_logger();
             Self {
@@ -45039,6 +45461,20 @@ mod tests {
             ),
             DeviceInterruptKind::Queue.status().bits()
         );
+        let capture = TestGuestLoggerCapture::new("entropy-interrupt-failure-logger");
+        let observed_result: Result<_, HvfArm64BootEntropyNotificationDispatchError> = Ok(result);
+        observe_entropy_interrupt_delivery(capture.logger(), &observed_result);
+        let output = capture.output_after_barrier();
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| {
+                    *line == "device-kind=entropy operation=interrupt-delivery outcome=failed"
+                })
+                .count(),
+            1,
+            "entropy signal failure should have one class owner; output:\n{output}"
+        );
     }
 
     #[test]
@@ -46403,6 +46839,20 @@ mod tests {
         let result = signal_memory_hotplug_queue_interrupts(dispatches, sink.as_ref());
         let metrics = SharedMemoryHotplugDeviceMetrics::default();
         record_memory_hotplug_signal_metrics(&metrics, true, &result);
+        let capture = TestGuestLoggerCapture::new("memory-hotplug-interrupt-failure-logger");
+        observe_memory_hotplug_interrupt_delivery(capture.logger(), &result);
+        let output = capture.output_after_barrier();
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| {
+                    *line
+                        == "device-kind=memory-hotplug operation=interrupt-delivery outcome=failed"
+                })
+                .count(),
+            1,
+            "memory-hotplug signal failure should have one class owner; output:\n{output}"
+        );
         let dispatches = result.expect("memory-hotplug signal failure should stay per-device");
 
         let device = &dispatches.as_slice()[0];
@@ -46429,12 +46879,14 @@ mod tests {
             .validate_size_update(MemoryHotplugSizeUpdateInput::new(2))
             .expect("test memory-hotplug requested size should be valid");
         let invalid_gic = gic_with_spi_range(0, 1);
+        let capture = TestGuestLoggerCapture::new("memory-hotplug-config-update-logger");
 
         update_memory_hotplug_requested_size_and_signal_interrupt(
             &runtime,
             &dispatcher,
             &invalid_gic,
             update,
+            capture.logger(),
         )
         .expect("requested-size update should stay committed after signal failure");
 
@@ -46451,6 +46903,16 @@ mod tests {
                 .expect("updated memory-hotplug status should remain readable")
                 .requested_size_mib(),
             2
+        );
+        drop(dispatcher);
+        let output = capture.output_after_barrier();
+        assert!(output.contains(
+            "device-kind=memory-hotplug operation=configuration-update outcome=succeeded\n"
+        ));
+        assert!(
+            output.contains(
+                "device-kind=memory-hotplug operation=interrupt-delivery outcome=failed\n"
+            )
         );
     }
 
@@ -46650,6 +47112,20 @@ mod tests {
             metrics.snapshot(),
             BalloonDeviceMetrics::new(0, 1, 0, 0, 0, 1)
                 .with_discard_metrics(inflate_discard.into(), Default::default())
+        );
+        let capture = TestGuestLoggerCapture::new("balloon-interrupt-failure-logger");
+        let observed_result: Result<_, HvfArm64BootBalloonNotificationDispatchError> = Ok(result);
+        observe_balloon_interrupt_delivery(capture.logger(), &observed_result);
+        let output = capture.output_after_barrier();
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| {
+                    *line == "device-kind=balloon operation=interrupt-delivery outcome=failed"
+                })
+                .count(),
+            1,
+            "balloon signal failure should have one class owner; output:\n{output}"
         );
     }
 

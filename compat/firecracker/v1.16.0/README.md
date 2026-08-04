@@ -64,7 +64,7 @@ reviewed delta.
 | [Snapshot editor state](snapshot-editor-contract.md) | Native-state version/vCPU/VM inspection, finite reviewed-register editing, no-clobber publication, signed Full/Diff product restore, and the exact twelve-row closure |
 | [Snapshot Wave 6](snapshot-wave6-contract.md) | Exact 70-row load, artifact, version, device, tool, time/identity, portability, and downstream-owner certification |
 | [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
-| [Logger producers](logger-contract.md) | Exact 468-invocation source closure, 19 implemented configuration/API/host-lifecycle/worker/snapshot/backend/transport/storage/network/vsock classes, safe fields, bounded default-stdout admission/forwarding policy, and five remaining #1809 classes |
+| [Logger producers](logger-contract.md) | Exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
 
 ## Dispositions
 

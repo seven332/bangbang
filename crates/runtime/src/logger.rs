@@ -25,10 +25,12 @@ use rate_limiter::{LogRateLimitDecision, LoggerRateLimitIdentity, LoggerRateLimi
 
 pub use event::{
     LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute,
-    LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerBlockOutcome, LoggerDeviceKind,
-    LoggerHttpMethod, LoggerLifecycleOutcome, LoggerNetworkOutcome, LoggerObservabilityOutcome,
-    LoggerPmemOutcome, LoggerProcessSignalOutcome, LoggerSnapshotOutcome, LoggerTransportOutcome,
-    LoggerVsockOutcome, PanicLogRecords, ProcessStartupOutcome, ProcessTerminalCategory,
+    LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerBalloonOutcome, LoggerBlockOutcome,
+    LoggerDeviceKind, LoggerEntropyOutcome, LoggerHttpMethod, LoggerLifecycleOutcome,
+    LoggerMemoryHotplugOutcome, LoggerNetworkOutcome, LoggerObservabilityOutcome,
+    LoggerPmemOutcome, LoggerProcessSignalOutcome, LoggerSerialOutcome, LoggerSnapshotOutcome,
+    LoggerTimeIdentityOutcome, LoggerTransportOutcome, LoggerVsockOutcome, PanicLogRecords,
+    ProcessStartupOutcome, ProcessTerminalCategory,
 };
 pub use process_stdout::{ProcessStdoutLogger, ProcessStdoutLoggerError};
 
@@ -494,6 +496,24 @@ impl TransportOutcomeLogRateLimiter {
 }
 
 #[derive(Debug, Clone, Default)]
+struct BalloonOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl BalloonOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner.check(LoggerRateLimitIdentity::BalloonOutcome)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct BlockOutcomeLogRateLimiter {
     inner: LoggerRateLimiters,
 }
@@ -508,6 +528,43 @@ impl BlockOutcomeLogRateLimiter {
 
     fn check(&self) -> LogRateLimitDecision {
         self.inner.check(LoggerRateLimitIdentity::BlockOutcome)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct EntropyOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl EntropyOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner.check(LoggerRateLimitIdentity::EntropyOutcome)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryHotplugOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl MemoryHotplugOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner
+            .check(LoggerRateLimitIdentity::MemoryHotplugOutcome)
     }
 }
 
@@ -544,6 +601,43 @@ impl NetworkOutcomeLogRateLimiter {
 
     fn check(&self) -> LogRateLimitDecision {
         self.inner.check(LoggerRateLimitIdentity::NetworkOutcome)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SerialOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl SerialOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner.check(LoggerRateLimitIdentity::SerialOutcome)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TimeIdentityOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl TimeIdentityOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner
+            .check(LoggerRateLimitIdentity::TimeIdentityOutcome)
     }
 }
 
@@ -759,9 +853,14 @@ struct GuestLoggerInner {
     metrics: SharedLoggerMetrics,
     backend_rate_limiter: BackendOutcomeLogRateLimiter,
     transport_rate_limiter: TransportOutcomeLogRateLimiter,
+    balloon_rate_limiter: BalloonOutcomeLogRateLimiter,
     block_rate_limiter: BlockOutcomeLogRateLimiter,
+    entropy_rate_limiter: EntropyOutcomeLogRateLimiter,
+    memory_hotplug_rate_limiter: MemoryHotplugOutcomeLogRateLimiter,
     pmem_rate_limiter: PmemOutcomeLogRateLimiter,
     network_rate_limiter: NetworkOutcomeLogRateLimiter,
+    serial_rate_limiter: SerialOutcomeLogRateLimiter,
+    time_identity_rate_limiter: TimeIdentityOutcomeLogRateLimiter,
     vsock_rate_limiter: VsockOutcomeLogRateLimiter,
 }
 
@@ -777,9 +876,20 @@ impl fmt::Debug for GuestLogger {
             .field("metrics", &self.inner.metrics)
             .field("backend_rate_limiter", &self.inner.backend_rate_limiter)
             .field("transport_rate_limiter", &self.inner.transport_rate_limiter)
+            .field("balloon_rate_limiter", &self.inner.balloon_rate_limiter)
             .field("block_rate_limiter", &self.inner.block_rate_limiter)
+            .field("entropy_rate_limiter", &self.inner.entropy_rate_limiter)
+            .field(
+                "memory_hotplug_rate_limiter",
+                &self.inner.memory_hotplug_rate_limiter,
+            )
             .field("pmem_rate_limiter", &self.inner.pmem_rate_limiter)
             .field("network_rate_limiter", &self.inner.network_rate_limiter)
+            .field("serial_rate_limiter", &self.inner.serial_rate_limiter)
+            .field(
+                "time_identity_rate_limiter",
+                &self.inner.time_identity_rate_limiter,
+            )
             .field("vsock_rate_limiter", &self.inner.vsock_rate_limiter)
             .finish()
     }
@@ -818,12 +928,81 @@ impl GuestLogger {
     }
 
     #[track_caller]
+    pub fn log_balloon(&self, outcome: LoggerBalloonOutcome) {
+        self.log_limited(
+            outcome.level(),
+            DEVICE_LOG_MODULE,
+            LoggerEvent::Balloon(outcome),
+            || self.inner.balloon_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub(crate) fn log_balloon_summary(
+        &self,
+        outcomes: impl IntoIterator<Item = LoggerBalloonOutcome>,
+    ) {
+        self.log_limited_summary(
+            outcomes
+                .into_iter()
+                .map(|outcome| (outcome.level(), LoggerEvent::Balloon(outcome))),
+            || self.inner.balloon_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
     pub fn log_block(&self, outcome: LoggerBlockOutcome) {
         self.log_limited(
             outcome.level(),
             DEVICE_LOG_MODULE,
             LoggerEvent::Block(outcome),
             || self.inner.block_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub fn log_entropy(&self, outcome: LoggerEntropyOutcome) {
+        self.log_limited(
+            outcome.level(),
+            DEVICE_LOG_MODULE,
+            LoggerEvent::Entropy(outcome),
+            || self.inner.entropy_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub(crate) fn log_entropy_summary(
+        &self,
+        outcomes: impl IntoIterator<Item = LoggerEntropyOutcome>,
+    ) {
+        self.log_limited_summary(
+            outcomes
+                .into_iter()
+                .map(|outcome| (outcome.level(), LoggerEvent::Entropy(outcome))),
+            || self.inner.entropy_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub fn log_memory_hotplug(&self, outcome: LoggerMemoryHotplugOutcome) {
+        self.log_limited(
+            outcome.level(),
+            DEVICE_LOG_MODULE,
+            LoggerEvent::MemoryHotplug(outcome),
+            || self.inner.memory_hotplug_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub(crate) fn log_memory_hotplug_summary(
+        &self,
+        outcomes: impl IntoIterator<Item = LoggerMemoryHotplugOutcome>,
+    ) {
+        self.log_limited_summary(
+            outcomes
+                .into_iter()
+                .map(|outcome| (outcome.level(), LoggerEvent::MemoryHotplug(outcome))),
+            || self.inner.memory_hotplug_rate_limiter.check(),
         );
     }
 
@@ -844,6 +1023,26 @@ impl GuestLogger {
             DEVICE_LOG_MODULE,
             LoggerEvent::Network(outcome),
             || self.inner.network_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub fn log_serial(&self, outcome: LoggerSerialOutcome) {
+        self.log_limited(
+            outcome.level(),
+            DEVICE_LOG_MODULE,
+            LoggerEvent::Serial(outcome),
+            || self.inner.serial_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub fn log_time_identity(&self, outcome: LoggerTimeIdentityOutcome) {
+        self.log_limited(
+            outcome.level(),
+            DEVICE_LOG_MODULE,
+            LoggerEvent::TimeIdentity(outcome),
+            || self.inner.time_identity_rate_limiter.check(),
         );
     }
 
@@ -999,9 +1198,14 @@ pub struct LoggerState {
     observability_rate_limiter: ObservabilityWorkerLogRateLimiter,
     backend_rate_limiter: BackendOutcomeLogRateLimiter,
     transport_rate_limiter: TransportOutcomeLogRateLimiter,
+    balloon_rate_limiter: BalloonOutcomeLogRateLimiter,
     block_rate_limiter: BlockOutcomeLogRateLimiter,
+    entropy_rate_limiter: EntropyOutcomeLogRateLimiter,
+    memory_hotplug_rate_limiter: MemoryHotplugOutcomeLogRateLimiter,
     pmem_rate_limiter: PmemOutcomeLogRateLimiter,
     network_rate_limiter: NetworkOutcomeLogRateLimiter,
+    serial_rate_limiter: SerialOutcomeLogRateLimiter,
+    time_identity_rate_limiter: TimeIdentityOutcomeLogRateLimiter,
     vsock_rate_limiter: VsockOutcomeLogRateLimiter,
     delivery_config: LoggerDeliveryConfig,
 }
@@ -1023,9 +1227,20 @@ impl fmt::Debug for LoggerState {
             )
             .field("backend_rate_limiter", &self.backend_rate_limiter)
             .field("transport_rate_limiter", &self.transport_rate_limiter)
+            .field("balloon_rate_limiter", &self.balloon_rate_limiter)
             .field("block_rate_limiter", &self.block_rate_limiter)
+            .field("entropy_rate_limiter", &self.entropy_rate_limiter)
+            .field(
+                "memory_hotplug_rate_limiter",
+                &self.memory_hotplug_rate_limiter,
+            )
             .field("pmem_rate_limiter", &self.pmem_rate_limiter)
             .field("network_rate_limiter", &self.network_rate_limiter)
+            .field("serial_rate_limiter", &self.serial_rate_limiter)
+            .field(
+                "time_identity_rate_limiter",
+                &self.time_identity_rate_limiter,
+            )
             .field("vsock_rate_limiter", &self.vsock_rate_limiter)
             .field("delivery_config", &self.delivery_config)
             .finish()
@@ -1071,9 +1286,14 @@ impl LoggerState {
             observability_rate_limiter: ObservabilityWorkerLogRateLimiter::default(),
             backend_rate_limiter: BackendOutcomeLogRateLimiter::default(),
             transport_rate_limiter: TransportOutcomeLogRateLimiter::default(),
+            balloon_rate_limiter: BalloonOutcomeLogRateLimiter::default(),
             block_rate_limiter: BlockOutcomeLogRateLimiter::default(),
+            entropy_rate_limiter: EntropyOutcomeLogRateLimiter::default(),
+            memory_hotplug_rate_limiter: MemoryHotplugOutcomeLogRateLimiter::default(),
             pmem_rate_limiter: PmemOutcomeLogRateLimiter::default(),
             network_rate_limiter: NetworkOutcomeLogRateLimiter::default(),
+            serial_rate_limiter: SerialOutcomeLogRateLimiter::default(),
+            time_identity_rate_limiter: TimeIdentityOutcomeLogRateLimiter::default(),
             vsock_rate_limiter: VsockOutcomeLogRateLimiter::default(),
             delivery_config: LoggerDeliveryConfig::default(),
         }
@@ -1376,9 +1596,14 @@ impl LoggerState {
                 metrics: self.metrics.clone(),
                 backend_rate_limiter: self.backend_rate_limiter.clone(),
                 transport_rate_limiter: self.transport_rate_limiter.clone(),
+                balloon_rate_limiter: self.balloon_rate_limiter.clone(),
                 block_rate_limiter: self.block_rate_limiter.clone(),
+                entropy_rate_limiter: self.entropy_rate_limiter.clone(),
+                memory_hotplug_rate_limiter: self.memory_hotplug_rate_limiter.clone(),
                 pmem_rate_limiter: self.pmem_rate_limiter.clone(),
                 network_rate_limiter: self.network_rate_limiter.clone(),
+                serial_rate_limiter: self.serial_rate_limiter.clone(),
+                time_identity_rate_limiter: self.time_identity_rate_limiter.clone(),
                 vsock_rate_limiter: self.vsock_rate_limiter.clone(),
             }),
         }
@@ -1532,16 +1757,19 @@ mod tests {
 
     use super::delivery::WorkerObserver;
     use super::{
-        BackendOutcomeLogRateLimiter, BlockOutcomeLogRateLimiter, BootTimerLogRateLimiter,
-        GuestLogger, LogRateLimitDecision, LogRateLimiterClock, LoggerAction,
-        LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute, LoggerApiWorkerOutcome,
-        LoggerBackendOutcome, LoggerBlockOutcome, LoggerConfigError, LoggerConfigInput,
-        LoggerDeliveryConfig, LoggerDeviceKind, LoggerHttpMethod, LoggerLevel,
-        LoggerLifecycleOutcome, LoggerNetworkOutcome, LoggerObservabilityOutcome,
-        LoggerPmemOutcome, LoggerProcessSignalOutcome, LoggerSnapshotOutcome, LoggerState,
-        LoggerTransportOutcome, LoggerVsockOutcome, NetworkOutcomeLogRateLimiter,
-        ObservabilityWorkerLogRateLimiter, PmemOutcomeLogRateLimiter, ProcessStartupOutcome,
-        ProcessTerminalCategory, SharedLoggerMetrics, TransportOutcomeLogRateLimiter,
+        BackendOutcomeLogRateLimiter, BalloonOutcomeLogRateLimiter, BlockOutcomeLogRateLimiter,
+        BootTimerLogRateLimiter, EntropyOutcomeLogRateLimiter, GuestLogger, LogRateLimitDecision,
+        LogRateLimiterClock, LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome,
+        LoggerApiRoute, LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerBalloonOutcome,
+        LoggerBlockOutcome, LoggerConfigError, LoggerConfigInput, LoggerDeliveryConfig,
+        LoggerDeviceKind, LoggerEntropyOutcome, LoggerHttpMethod, LoggerLevel,
+        LoggerLifecycleOutcome, LoggerMemoryHotplugOutcome, LoggerNetworkOutcome,
+        LoggerObservabilityOutcome, LoggerPmemOutcome, LoggerProcessSignalOutcome,
+        LoggerSerialOutcome, LoggerSnapshotOutcome, LoggerState, LoggerTimeIdentityOutcome,
+        LoggerTransportOutcome, LoggerVsockOutcome, MemoryHotplugOutcomeLogRateLimiter,
+        NetworkOutcomeLogRateLimiter, ObservabilityWorkerLogRateLimiter, PmemOutcomeLogRateLimiter,
+        ProcessStartupOutcome, ProcessTerminalCategory, SerialOutcomeLogRateLimiter,
+        SharedLoggerMetrics, TimeIdentityOutcomeLogRateLimiter, TransportOutcomeLogRateLimiter,
         VsockOutcomeLogRateLimiter,
     };
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
@@ -2025,14 +2253,21 @@ mod tests {
     }
 
     #[test]
-    fn four_device_limiters_are_independent_and_filter_before_admission() {
+    fn nine_device_limiters_are_independent_and_filter_before_admission() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let metrics = SharedLoggerMetrics::default();
         let clock = Arc::new(TestClock::default());
         let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.balloon_rate_limiter = BalloonOutcomeLogRateLimiter::with_clock(clock.clone());
         state.block_rate_limiter = BlockOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.entropy_rate_limiter = EntropyOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.memory_hotplug_rate_limiter =
+            MemoryHotplugOutcomeLogRateLimiter::with_clock(clock.clone());
         state.pmem_rate_limiter = PmemOutcomeLogRateLimiter::with_clock(clock.clone());
         state.network_rate_limiter = NetworkOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.serial_rate_limiter = SerialOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.time_identity_rate_limiter =
+            TimeIdentityOutcomeLogRateLimiter::with_clock(clock.clone());
         state.vsock_rate_limiter = VsockOutcomeLogRateLimiter::with_clock(clock.clone());
         state.configure_test_writer(SharedWriter(output.clone()));
         state
@@ -2041,9 +2276,14 @@ mod tests {
 
         let filtered = state.guest_logger();
         for _ in 0..20 {
+            filtered.log_balloon(LoggerBalloonOutcome::InflateSucceeded);
             filtered.log_block(LoggerBlockOutcome::RequestSucceeded);
+            filtered.log_entropy(LoggerEntropyOutcome::FillSucceeded);
+            filtered.log_memory_hotplug(LoggerMemoryHotplugOutcome::RequestSucceeded);
             filtered.log_pmem(LoggerPmemOutcome::FlushSucceeded);
             filtered.log_network(LoggerNetworkOutcome::RxSucceeded);
+            filtered.log_serial(LoggerSerialOutcome::InputReadSucceeded);
+            filtered.log_time_identity(LoggerTimeIdentityOutcome::RtcRestoreSucceeded);
             filtered.log_vsock(LoggerVsockOutcome::RxSucceeded);
         }
 
@@ -2052,30 +2292,50 @@ mod tests {
             .expect("device filter should configure");
         let active = state.guest_logger();
         for _ in 0..10 {
+            active.log_balloon(LoggerBalloonOutcome::InflateSucceeded);
             active.log_block(LoggerBlockOutcome::RequestSucceeded);
+            active.log_entropy(LoggerEntropyOutcome::FillSucceeded);
+            active.log_memory_hotplug(LoggerMemoryHotplugOutcome::RequestSucceeded);
             active.log_pmem(LoggerPmemOutcome::FlushSucceeded);
             active.log_network(LoggerNetworkOutcome::RxSucceeded);
+            active.log_serial(LoggerSerialOutcome::InputReadSucceeded);
+            active.log_time_identity(LoggerTimeIdentityOutcome::RtcRestoreSucceeded);
             active.log_vsock(LoggerVsockOutcome::RxSucceeded);
         }
+        active.log_balloon(LoggerBalloonOutcome::InflateSucceeded);
         active.log_block(LoggerBlockOutcome::RequestSucceeded);
+        active.log_entropy(LoggerEntropyOutcome::FillSucceeded);
+        active.log_memory_hotplug(LoggerMemoryHotplugOutcome::RequestSucceeded);
         active.log_pmem(LoggerPmemOutcome::FlushSucceeded);
         active.log_network(LoggerNetworkOutcome::RxSucceeded);
+        active.log_serial(LoggerSerialOutcome::InputReadSucceeded);
+        active.log_time_identity(LoggerTimeIdentityOutcome::RtcRestoreSucceeded);
         active.log_vsock(LoggerVsockOutcome::RxSucceeded);
-        assert_eq!(metrics.rate_limited_log_count(), 4);
+        assert_eq!(metrics.rate_limited_log_count(), 9);
 
         clock.set(500);
+        active.log_balloon(LoggerBalloonOutcome::InflateSucceeded);
         active.log_block(LoggerBlockOutcome::RequestSucceeded);
+        active.log_entropy(LoggerEntropyOutcome::FillSucceeded);
+        active.log_memory_hotplug(LoggerMemoryHotplugOutcome::RequestSucceeded);
         active.log_pmem(LoggerPmemOutcome::FlushSucceeded);
         active.log_network(LoggerNetworkOutcome::RxSucceeded);
+        active.log_serial(LoggerSerialOutcome::InputReadSucceeded);
+        active.log_time_identity(LoggerTimeIdentityOutcome::RtcRestoreSucceeded);
         active.log_vsock(LoggerVsockOutcome::RxSucceeded);
         assert!(active.wait_for_delivery_for_test());
 
         let output = String::from_utf8(output.lock().expect("output lock should succeed").clone())
             .expect("device logger output should be UTF-8");
         for record in [
+            "device-kind=balloon operation=inflate outcome=succeeded\n",
             "device-kind=block operation=request outcome=succeeded\n",
+            "device-kind=entropy operation=fill outcome=succeeded\n",
+            "device-kind=memory-hotplug operation=request outcome=succeeded\n",
             "device-kind=pmem operation=flush outcome=succeeded\n",
             "device-kind=network operation=rx outcome=succeeded\n",
+            "device-kind=serial operation=input-read outcome=succeeded\n",
+            "device-kind=time-identity operation=rtc-restore outcome=succeeded\n",
             "device-kind=vsock operation=rx outcome=succeeded\n",
         ] {
             assert_eq!(output.matches(record).count(), 11);
@@ -2084,7 +2344,7 @@ mod tests {
             output
                 .matches("1 messages were suppressed due to rate limiting\n")
                 .count(),
-            4
+            9
         );
     }
 
