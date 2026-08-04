@@ -26,14 +26,19 @@ For commands and test-layer selection, see the
 - [`logger-producer-audit.json`](logger-producer-audit.json) is human-owned. It
   maps every logger invocation explicitly to one closed semantic class and its
   reviewed delivery, limiter, disposition, owner, and evidence policy.
+- [`metrics-schema.json`](metrics-schema.json) is one strict authority envelope.
+  Its `source` projection is machine-derived from the pinned Rust serializers
+  and Python fixture; its policy profiles and exact field mappings are
+  human-owned and never regenerated.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
 
-Regeneration may create a candidate source manifest. It must never create or
-rewrite capability dispositions, owners, evidence references, delivery issues,
-or Challenge results. A generated identity change must instead surface as a
-missing or stale overlay for review.
+Regeneration may create a candidate source manifest or machine-owned source
+projection. It must never create or rewrite capability dispositions, owners,
+evidence references, delivery issues, policy mappings, or Challenge results. A
+generated identity change must instead surface as missing or stale human policy
+for review.
 
 Stable source IDs use `<kind>:<upstream-key>`. Semantic IDs use
 `semantic.<namespace>:<slug>`. IDs are scoped to this immutable baseline; a
@@ -65,6 +70,7 @@ reviewed delta.
 | [Snapshot Wave 6](snapshot-wave6-contract.md) | Exact 70-row load, artifact, version, device, tool, time/identity, portability, and downstream-owner certification |
 | [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
 | [Logger producers](logger-contract.md) | Certified 11-row logger aggregate with exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
+| [Metrics schema](metrics-contract.md) | Exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, and truthful #1822/#1788/#1789 producer handoffs |
 
 ## Dispositions
 
@@ -131,6 +137,7 @@ full evidence and Challenge gate.
 Validate the checked inventory, compare or regenerate candidates, and run the
 normal repository checks using
 [Testing Guide](../../../docs/testing.md#firecracker-capability-inventory).
-Review candidate identity changes before updating either machine-owned
-manifest. Never use regeneration to alter `capabilities.json` or
-`logger-producer-audit.json`.
+Review candidate identity changes before updating a machine-owned projection.
+Never use regeneration to alter `capabilities.json`,
+`logger-producer-audit.json`, or the human policy projections in
+`metrics-schema.json`.
