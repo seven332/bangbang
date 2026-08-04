@@ -3030,6 +3030,19 @@ method/route ownership are rejected. This certification does not make logger
 output durable, grant a guest or worker sink authority, or implement the
 separately owned tracing surface.
 
+The terminal metrics API/schema certification binds the corresponding
+confidentiality boundary to exactly twelve #1787 records. Its scoped validator
+requires strict `Metrics`, `RateLimiter`, and `TokenBucket` request shapes, the
+complete unsigned-64 numeric domain, the implemented schema-runtime timestamp
+profile, and exact later-owner handoffs. Direct and ordinary-production/App
+Sandbox tests compare `GET /vm/config` before and after metrics configuration
+and reject disclosure of the path, grant ID/reference, adopted descriptor,
+private error, or metrics section. The signed HVF lifecycle oracle additionally
+observes canonical initial, real 60-second Paused and Running periodic,
+explicit, and terminal records through one adopted write-only sink. This does
+not grant new authority, promote #1788/#1789 producer policies, close either
+#1790 aggregate, or turn best-effort metrics into a durable audit channel.
+
 Current session-initial, periodic, explicit, and normal-terminal metrics lines
 always expose the complete pinned numeric schema. Implemented matching
 producers populate API, startup, logger, signal, UART, block, pmem aggregate,

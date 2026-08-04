@@ -1356,11 +1356,65 @@
     {
       "id": "api-operation:PUT /metrics",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /metrics.",
+      "summary": "Initialize exactly one preboot metrics file or FIFO sink through the strict Firecracker v1.16 PUT /metrics body, with failure-atomic direct or contained write-only ownership, closed errors, and no sink disclosure through full configuration.",
       "source_refs": [
         "api-operation:PUT /metrics"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict PUT /metrics route and request body"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "metrics request conversion and response dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "direct and contained metrics sink preparation and commit"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "one-shot failure-atomic metrics sink state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict metrics method path and body tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "metrics API state flush and omission tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup periodic and terminal metrics process tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct metrics lifecycle and canonical output evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained metrics grant and lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "file FIFO one-shot rollback and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /mmds",
@@ -2346,11 +2400,50 @@
     {
       "id": "api-path:/metrics",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /metrics.",
+      "summary": "Expose only the Firecracker v1.16 PUT operation at /metrics, reject every other method or path shape, and route accepted requests to the one-shot preboot metrics transaction.",
       "source_refs": [
         "api-path:/metrics"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact metrics method and path dispatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "metrics request dispatch to VMM action"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "PutMetrics lifecycle admission"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "valid PUT and rejected metrics method path tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "socket-level metrics request and response tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed executable metrics API requests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed production contained metrics API requests"
+        }
+      ]
     },
     {
       "id": "api-path:/mmds",
@@ -5883,11 +5976,35 @@
     {
       "id": "api-property:FullVmConfiguration.metrics",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.metrics.",
+      "summary": "Implement the optional pinned FullVmConfiguration.metrics property through deliberate omission before and after direct or contained sink configuration, preventing output authority, paths, descriptors, grants, and closed errors from entering GET /vm/config.",
       "source_refs": [
         "api-property:FullVmConfiguration.metrics"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "FullVmConfiguration serialization omits metrics authority"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "runtime full configuration projection"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "direct metrics full-config omission and private sentinel tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "contained metrics grant full-config omission and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.mmds-config",
@@ -7349,11 +7466,55 @@
     {
       "id": "api-property:Metrics.metrics_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Metrics.metrics_path.",
+      "summary": "Require exactly one string metrics_path, reject missing, null, wrong, duplicate, or unknown values, apply the explicit empty-path policy, and use the value only as redacted direct authority or an exact contained MetricsSink grant reference.",
       "source_refs": [
         "api-property:Metrics.metrics_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict required metrics_path request field"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "direct path and contained grant authority selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "redacted metrics path validation and sink opening"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "metrics_path required type unknown and duplicate tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "metrics path API omission and lifecycle tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup metrics path redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "contained metrics grant path redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "empty path file FIFO adoption and redaction tests"
+        }
+      ]
     },
     {
       "id": "api-property:MmdsConfig.imds_compat",
@@ -8435,20 +8596,98 @@
     {
       "id": "api-property:RateLimiter.bandwidth",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property RateLimiter.bandwidth.",
+      "summary": "Accept an optional independent bandwidth TokenBucket across the reused Firecracker rate-limiter surfaces, preserve missing and null as unconfigured, and convert configured values without changing the ops bucket.",
       "source_refs": [
         "api-property:RateLimiter.bandwidth"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "shared RateLimiter bandwidth parsing and serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "bandwidth request and runtime conversion"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "independent live bandwidth token bucket"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "shared missing null independent duplicate and boundary tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "rate-limiter request conversion and full-config response tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "representative live bandwidth replacement and persistence tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "bandwidth budget retry disable and persisted-state tests"
+        }
+      ]
     },
     {
       "id": "api-property:RateLimiter.ops",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property RateLimiter.ops.",
+      "summary": "Accept an optional independent operations TokenBucket across the reused Firecracker rate-limiter surfaces, preserve missing and null as unconfigured, and convert configured values without changing the bandwidth bucket.",
       "source_refs": [
         "api-property:RateLimiter.ops"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "shared RateLimiter ops parsing and serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "ops request and runtime conversion"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "independent live operations token bucket"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "shared missing null independent duplicate and boundary tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "rate-limiter request conversion and full-config response tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "representative live ops replacement and persistence tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "operations budget retry disable and persisted-state tests"
+        }
+      ]
     },
     {
       "id": "api-property:SerialDevice.rate_limiter",
@@ -9160,29 +9399,146 @@
     {
       "id": "api-property:TokenBucket.one_time_burst",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property TokenBucket.one_time_burst.",
+      "summary": "Accept an optional or null nonnegative u64 one_time_burst, serialize omission as null in committed rate-limiter responses, consume it before recurring budget, and preserve its bounded live and persisted state.",
       "source_refs": [
         "api-property:TokenBucket.one_time_burst"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "optional TokenBucket one_time_burst parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "one-time burst runtime conversion"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "one-time burst consumption and persisted state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "null omitted duplicate and u64 burst boundary tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "rate-limiter round-trip tests with present and null bursts"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live and snapshot rate-limiter burst tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "burst consumption retry and persisted bound tests"
+        }
+      ]
     },
     {
       "id": "api-property:TokenBucket.refill_time",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property TokenBucket.refill_time.",
+      "summary": "Require a nonnegative u64 refill_time in milliseconds, round-trip its exact request value, and explicitly disable the live bucket when zero or when nanosecond conversion overflows without rejecting the request shape.",
       "source_refs": [
         "api-property:TokenBucket.refill_time"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "required u64 TokenBucket refill_time parsing and serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "refill-time runtime conversion"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "millisecond refill timing and overflow disable policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "required zero int64 u64 and overflow refill boundary tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "refill-time request and response round-trip tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live refill replacement retry and snapshot tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "zero overflow retry timing and persisted age tests"
+        }
+      ]
     },
     {
       "id": "api-property:TokenBucket.size",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property TokenBucket.size.",
+      "summary": "Require and round-trip a nonnegative u64 TokenBucket size, treat zero as an explicit disabled control, and enforce the configured capacity across live consumption, retry, replacement, and persisted-state bounds.",
       "source_refs": [
         "api-property:TokenBucket.size"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "required u64 TokenBucket size parsing and serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "bucket size runtime conversion"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "live capacity disable and persisted bound implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "required zero int64 u64 and overflow size boundary tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "bucket size request and response round-trip tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live bucket capacity replacement and snapshot tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "zero capacity consumption retry and persisted bound tests"
+        }
+      ]
     },
     {
       "id": "api-property:VcpuFeatures.bitmap",
@@ -10807,11 +11163,65 @@
     {
       "id": "api-schema:Metrics",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema Metrics.",
+      "summary": "Implement the strict Firecracker v1.16 Metrics request schema with one required string metrics_path, exact method and path routing, one-shot failure-atomic sink ownership, redaction, and deliberate omission from ordinary full configuration.",
       "source_refs": [
         "api-schema:Metrics"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/metrics-schema.json",
+          "anchor": "checked canonical metrics source and schema-runtime policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict Metrics request schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "Metrics sink ownership transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "Metrics state and canonical publication"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict Metrics schema boundary tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "Metrics API omission lifecycle and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct canonical metrics schema evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained canonical metrics schema evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "compiled authority and exact canonical fixture tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "checked authority and policy mutation tests"
+        }
+      ]
     },
     {
       "id": "api-schema:MmdsConfig",
@@ -11226,11 +11636,50 @@
     {
       "id": "api-schema:RateLimiter",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema RateLimiter.",
+      "summary": "Implement the strict reusable Firecracker v1.16 RateLimiter schema with independent optional bandwidth and ops TokenBuckets, missing/null/empty no-op semantics, duplicate and unknown-field rejection, exact response projection, and live conversion.",
       "source_refs": [
         "api-schema:RateLimiter"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict shared RateLimiter parsing and response schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "shared RateLimiter request and runtime conversions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "independent live bandwidth and operations buckets"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "shared RateLimiter strict shape default duplicate and boundary tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "drive network pmem and entropy RateLimiter round-trip tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "representative live RateLimiter update and persistence tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "independent budget retry and persisted-state tests"
+        }
+      ]
     },
     {
       "id": "api-schema:SerialDevice",
@@ -11384,11 +11833,50 @@
     {
       "id": "api-schema:TokenBucket",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema TokenBucket.",
+      "summary": "Implement the strict Firecracker v1.16 TokenBucket schema with required nonnegative u64 size and refill_time, optional/null nonnegative u64 one_time_burst, exact-key and duplicate rejection, deterministic response serialization, live limiting, retry, and persisted state.",
       "source_refs": [
         "api-schema:TokenBucket"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict TokenBucket request and response schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "TokenBucket request and runtime conversions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "live TokenBucket and persisted state implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "required optional null duplicate unknown and numeric boundary tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "TokenBucket request conversion and response round-trip tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live TokenBucket update retry and snapshot tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "TokenBucket consumption disable retry and persisted-state tests"
+        }
+      ]
     },
     {
       "id": "api-schema:VcpuFeatures",

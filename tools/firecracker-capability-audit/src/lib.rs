@@ -4,6 +4,7 @@ mod logger_certify;
 mod logger_model;
 mod logger_upstream;
 mod logger_validate;
+mod metrics_certify;
 mod metrics_model;
 mod metrics_upstream;
 mod metrics_validate;
@@ -21,6 +22,10 @@ pub use logger_model::{
 };
 pub use logger_upstream::derive_logger_producer_manifest;
 pub use logger_validate::validate_logger_producers;
+pub use metrics_certify::{
+    METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS, RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS,
+    validate_metrics_schema_compatibility,
+};
 pub use metrics_model::{
     MetricsAggregation, MetricsArchitecture, MetricsCardinality, MetricsDynamicFamily,
     MetricsFieldPolicy, MetricsJsonType, MetricsPolicyProfile, MetricsProducerDisposition,

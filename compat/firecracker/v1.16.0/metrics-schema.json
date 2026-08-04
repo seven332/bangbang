@@ -7426,15 +7426,32 @@
       "validation": []
     },
     {
-      "id": "milliseconds-since-unix-epoch-none-schema-runtime-planned",
+      "id": "milliseconds-since-unix-epoch-none-schema-runtime-implemented",
       "unit": "milliseconds-since-unix-epoch",
       "aggregation": "none",
       "producer_owner": "schema-runtime",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1822",
-      "rationale": "Canonical line construction and timestamp publication are delivered by #1822 before producer closure.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "typed utc_timestamp_ms construction and canonical serialization"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "compiled authority synchronization and canonical timestamp fixtures"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "single-clock capture and timestamp failure transaction tests"
+        }
+      ]
     }
   ],
   "field_policies": [
@@ -8484,7 +8501,7 @@
     },
     {
       "field_id": "static:utc_timestamp_ms",
-      "profile_id": "milliseconds-since-unix-epoch-none-schema-runtime-planned"
+      "profile_id": "milliseconds-since-unix-epoch-none-schema-runtime-implemented"
     },
     {
       "field_id": "static:vcpu.exit_io_in",

@@ -6263,8 +6263,18 @@ mod tests {
     #[test]
     fn configures_metrics_without_adding_vm_config_section() {
         let mut vmm = test_controller();
-        let metrics_path = unique_socket_path("metrics-output").with_extension("metrics");
-        let body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        let metrics_path =
+            unique_socket_path("private-metrics-path-sentinel").with_extension("metrics");
+        let metrics_path_text = metrics_path.to_string_lossy();
+        let before = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+        assert_eq!(before.status(), bangbang_api::http::StatusCode::Ok);
+        assert!(!before.body().contains("metrics"));
+        assert!(!before.body().contains(metrics_path_text.as_ref()));
+
+        let body = format!(r#"{{"metrics_path":"{metrics_path_text}"}}"#);
         let request = format!(
             "PUT /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -6278,7 +6288,9 @@ mod tests {
             &mut vmm,
         );
         assert_eq!(config_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert_eq!(config_response.body(), before.body());
         assert!(!config_response.body().contains("metrics"));
+        assert!(!config_response.body().contains(metrics_path_text.as_ref()));
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
     }

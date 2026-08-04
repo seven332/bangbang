@@ -4357,6 +4357,22 @@ mod tests {
         format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").into_bytes()
     }
 
+    fn rate_limited_drive_body(bucket: &str, field: &str, value: &str) -> String {
+        let size = if field == "size" { value } else { "1" };
+        let one_time_burst = if field == "one_time_burst" {
+            value
+        } else {
+            "2"
+        };
+        let refill_time = if field == "refill_time" { value } else { "3" };
+
+        r#"{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true,"rate_limiter":{"BUCKET":{"size":SIZE,"one_time_burst":BURST,"refill_time":REFILL}}}"#
+            .replacen("BUCKET", bucket, 1)
+            .replacen("SIZE", size, 1)
+            .replacen("BURST", one_time_burst, 1)
+            .replacen("REFILL", refill_time, 1)
+    }
+
     #[test]
     fn empty_mutating_request_fault_messages_are_firecracker_shaped() {
         for (err, message) in [
@@ -5472,6 +5488,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_put_metrics_duplicate_metrics_path() {
+        let request = request_with_body(
+            "PUT",
+            "/metrics",
+            r#"{"metrics_path":"/tmp/first","metrics_path":"/tmp/second"}"#,
+        );
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
     fn rejects_put_metrics_unknown_field() {
         let request = request_with_body(
             "PUT",
@@ -6213,6 +6240,37 @@ mod tests {
                 Err(RequestError::MalformedRequest),
                 "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn rate_limiter_token_bucket_numbers_accept_exact_u64_domain() {
+        const ACCEPTED: [&str; 4] = [
+            "0",
+            "9223372036854775807",
+            "9223372036854775808",
+            "18446744073709551615",
+        ];
+        const REJECTED: [&str; 3] = ["-1", "1.5", "18446744073709551616"];
+
+        for bucket in ["bandwidth", "ops"] {
+            for field in ["size", "one_time_burst", "refill_time"] {
+                for value in ACCEPTED {
+                    let body = rate_limited_drive_body(bucket, field, value);
+                    assert!(
+                        parse_request(&request_with_body("PUT", "/drives/rootfs", &body)).is_ok(),
+                        "expected {bucket}.{field}={value} to be accepted"
+                    );
+                }
+                for value in REJECTED {
+                    let body = rate_limited_drive_body(bucket, field, value);
+                    assert_eq!(
+                        parse_request(&request_with_body("PUT", "/drives/rootfs", &body)),
+                        Err(RequestError::MalformedRequest),
+                        "expected {bucket}.{field}={value} to be rejected"
+                    );
+                }
+            }
         }
     }
 

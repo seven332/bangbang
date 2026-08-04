@@ -25,14 +25,53 @@ or overwrite policy. A field being required in every line does not mean its
 producer is implemented; a required numeric neutral value remains distinct
 from an evidence-backed producer.
 
-The runtime now compiles this authority into the canonical serializer and an
-exact descriptor-equality test. That construction evidence does not promote a
-producer policy: #1788 still owns API, process, logger, signal, boot, and
-lifecycle producers; #1789 owns device, MMDS, vCPU, time/device,
-configured-key, and retained-neutral producers; and #1823 owns final #1787
-API/schema certification. `corpus:metrics` and the cross-producer aggregate
-semantic remain #1790-owned. A required zero therefore proves wire-shape
-completeness only, never producer completion.
+The runtime compiles this authority into the canonical serializer and an exact
+descriptor-equality test. #1823 certifies the bounded #1787 API/schema slice,
+including the schema-runtime timestamp producer. That result does not promote
+another producer policy: #1788 still owns API, process, logger, signal, boot,
+and lifecycle producers; #1789 owns device, MMDS, vCPU, time/device,
+configured-key, and retained-neutral producers. `corpus:metrics` and the
+cross-producer aggregate semantic remain #1790-owned. A required zero therefore
+proves wire-shape completeness only, never producer completion.
+
+## Terminal API and Schema Certification
+
+The terminal #1787 slice contains exactly twelve capability records:
+
+- `api-operation:PUT /metrics`, `api-path:/metrics`,
+  `api-property:FullVmConfiguration.metrics`, and
+  `api-property:Metrics.metrics_path`;
+- `api-property:RateLimiter.bandwidth`,
+  `api-property:RateLimiter.ops`,
+  `api-property:TokenBucket.one_time_burst`,
+  `api-property:TokenBucket.refill_time`, and
+  `api-property:TokenBucket.size`;
+- `api-schema:Metrics`, `api-schema:RateLimiter`, and
+  `api-schema:TokenBucket`.
+
+The scoped gate requires those exact records and their #1787 contract rows to
+be `implemented-and-verified`, while both #1790 aggregate records remain
+`audit-required`. It also pins the policy partition to one implemented
+schema-runtime timestamp profile, two planned #1788 process-lifecycle
+profiles, ten planned #1789 device profiles, and four #1789 platform-zero
+device profiles. Missing, extra, promoted, stale, or differently handed-off
+members fail closed.
+
+Focused API evidence rejects duplicate `metrics_path`, rate-limiter, and token
+bucket fields. Every token-bucket number accepts the complete JSON `u64`
+domain from zero through `18446744073709551615` and rejects negative,
+fractional, and overflowing values. Direct and contained tests prove metrics
+configuration leaves `GET /vm/config` byte-for-byte unchanged and cannot
+expose paths, grant identifiers/references, descriptors, or private errors.
+One signed ordinary-production/App Sandbox HVF guest supplies product evidence:
+the initial line is followed by real 60-second lines while Paused and Running,
+then one explicit line and one normal-terminal line. Each observed record is a
+newline-terminated numeric JSON tree with the canonical timestamp and without
+Bangbang-only fields.
+
+This certification is deliberately narrower than producer or corpus closure.
+It does not complete #1788, #1789, either #1790 aggregate, tracing, durable
+delivery, remote telemetry, or a versioned extension format.
 
 ## Exact Arm64 Shape
 
@@ -217,7 +256,14 @@ cargo test -p bangbang-runtime metrics::firecracker::tests --all-features --lock
 cargo test -p bangbang-runtime metrics::tests --all-features --locked
 cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --locked
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 ```
+
+`validate --metrics-schema-final` runs repository delivery validation, the
+metrics authority delivery gate, the exact twelve-row #1787 certification, and
+the logger producer delivery gate needed by metrics collection. It permits only
+the explicit #1788/#1789 producer handoffs and retained #1790 aggregate rows;
+repository-global `validate --final` remains the stronger all-capability gate.
 
 With an explicit clean sibling at the pinned commit, compare every source
 identity, Git blob, root/path/template, type/reset fact, architecture rule, and

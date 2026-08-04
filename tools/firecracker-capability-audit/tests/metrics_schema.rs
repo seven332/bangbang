@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
     AuditMode, METRICS_SCHEMA_AUTHORITY_PATH, MetricsAggregation, MetricsArchitecture,
-    MetricsProducerDisposition, MetricsSchemaAuthority, MetricsUnit, MetricsValueKind, Reference,
-    SOURCE_MANIFEST_PATH, metrics_schema_authority_json, read_metrics_schema_authority,
-    read_source_manifest, validate_metrics_schema,
+    MetricsProducerDisposition, MetricsProducerOwner, MetricsSchemaAuthority, MetricsUnit,
+    MetricsValueKind, Reference, SOURCE_MANIFEST_PATH, metrics_schema_authority_json,
+    read_metrics_schema_authority, read_source_manifest, validate_metrics_schema,
 };
 
 fn repository_root() -> PathBuf {
@@ -53,12 +53,46 @@ fn checked_metrics_authority_is_canonical_and_valid_without_a_sibling() {
 }
 
 #[test]
-fn checked_metrics_authority_keeps_all_producers_nonterminal() {
+fn checked_metrics_authority_has_exact_schema_runtime_and_later_owner_partition() {
     let authority = checked_authority();
-    assert!(authority.policy_profiles.iter().all(|profile| matches!(
-        profile.producer_disposition,
-        MetricsProducerDisposition::Planned | MetricsProducerDisposition::PlatformZero
-    )));
+    let count = |owner, disposition| {
+        authority
+            .policy_profiles
+            .iter()
+            .filter(|profile| {
+                profile.producer_owner == owner && profile.producer_disposition == disposition
+            })
+            .count()
+    };
+    assert_eq!(
+        count(
+            MetricsProducerOwner::SchemaRuntime,
+            MetricsProducerDisposition::Implemented,
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            MetricsProducerOwner::ProcessLifecycle,
+            MetricsProducerDisposition::Planned,
+        ),
+        2
+    );
+    assert_eq!(
+        count(
+            MetricsProducerOwner::Device,
+            MetricsProducerDisposition::Planned,
+        ),
+        10
+    );
+    assert_eq!(
+        count(
+            MetricsProducerOwner::Device,
+            MetricsProducerDisposition::PlatformZero,
+        ),
+        4
+    );
+    assert_eq!(authority.policy_profiles.len(), 17);
     let root = repository_root();
     let manifest = read_source_manifest(&root.join(SOURCE_MANIFEST_PATH))
         .expect("checked source manifest must parse");
