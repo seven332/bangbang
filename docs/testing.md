@@ -1569,6 +1569,23 @@ dynamic-template identities. Exact-byte fixtures at
 order, numeric types, all required leaves, and no extras without duplicating
 the machine authority in prose.
 
+The terminal metrics API/schema gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
+```
+
+Metrics-schema-final mode requires the exact twelve #1787 rows to be terminal,
+the schema-runtime timestamp profile to be implemented, both #1790 aggregates
+to remain nonterminal, and the remaining policy profiles to retain their exact
+#1788/#1789 owner/disposition partition. Focused tests inject missing, extra,
+promoted, stale, and wrongly handed-off records; API tests cover duplicate keys
+and the full unsigned token-bucket boundary; direct and contained process tests
+cover `/vm/config` privacy. The signed product oracle
+`normal_bundle_certifies_metrics_schema_across_real_periodic_and_terminal_lifecycle`
+uses the unmodified 60-second scheduler and observes initial,
+Paused-periodic, Running-periodic, explicit, and terminal canonical lines.
+
 Host lifecycle logger coverage exercises backend and VM transitions, all three
 live device kinds, boot-worker observation, automatic metrics failures,
 snapshot create/load success/rejection/failure/cancellation, host signals,
@@ -1645,6 +1662,7 @@ Run the standard workspace checks before opening or updating a PR:
 cargo fmt --all -- --check
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo check --workspace --all-targets --all-features --locked
 cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 cargo check -p bangbang-snapshot-tools --all-targets --all-features --locked --target aarch64-unknown-linux-musl

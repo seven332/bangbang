@@ -70,7 +70,7 @@ reviewed delta.
 | [Snapshot Wave 6](snapshot-wave6-contract.md) | Exact 70-row load, artifact, version, device, tool, time/identity, portability, and downstream-owner certification |
 | [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
 | [Logger producers](logger-contract.md) | Certified 11-row logger aggregate with exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
-| [Metrics schema](metrics-contract.md) | Exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, and truthful #1822/#1788/#1789 producer handoffs |
+| [Metrics schema](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, and truthful #1788/#1789 producer handoffs |
 
 ## Dispositions
 
@@ -125,6 +125,24 @@ class or alter another capability's disposition. Repository-global
 `validate --final` remains the stronger all-capabilities completion gate and
 must continue to fail while any unrelated `audit-required` or
 `missing-platform-feasible` record remains.
+
+## Scoped Metrics Schema Certification
+
+The terminal metrics API/schema slice has a separate checked gate:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
+```
+
+This command validates the complete capability inventory and metrics authority
+in delivery mode, requires the exact twelve #1787 capability and contract rows
+as `implemented-and-verified`, pins the one implemented schema-runtime profile
+and exact #1788/#1789 producer partition, and requires both #1790 aggregate rows
+to remain `audit-required`. Focused parser, direct-process privacy, signed
+ordinary-production/App Sandbox privacy, and real Paused/Running 60-second
+lifecycle evidence support the terminal claim. It does not promote later
+producer, corpus, or cross-producer work; repository-global `validate --final`
+continues to fail until those unrelated records are terminal.
 
 ## Contributor Update Rule
 

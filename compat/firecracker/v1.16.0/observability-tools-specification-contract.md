@@ -46,6 +46,13 @@ no early disposition; their work feeds #1786, #1790, and #1799 respectively.
 - **SIGNED**: signed real-HVF lifecycle in
   `crates/bangbang/tests/executable_hvf_e2e.rs`, plus App Sandbox and production
   API boundaries in the owning signed targets.
+- **METRICS-AUTHORITY**: strict source/policy envelope and exact scoped gate in
+  `compat/firecracker/v1.16.0/metrics-schema.json` and
+  `tools/firecracker-capability-audit/src/metrics_certify.rs`.
+- **METRICS-PRODUCT**: strict parser and direct privacy cases plus the signed
+  ordinary-production/App Sandbox real-period lifecycle in
+  `crates/api/src/http.rs`, `crates/bangbang/src/api_server.rs`, and
+  `crates/launcher/tests/production_bundle_e2e.rs`.
 
 ## Core API certification
 
@@ -76,6 +83,23 @@ atomic boot admission, one fixed queue/sink owner, exact loss accounting, and
 failure-atomic stable-worker replacement are prerequisites for the separately
 owned #1786 logger audit. They do not by themselves promote any logger row,
 change an evidence owner, or claim comprehensive producer/failure coverage.
+
+## Metrics API/schema certification
+
+The exact twelve #1787 rows are terminal under one fail-closed scoped gate.
+Strict `Metrics`, `RateLimiter`, and `TokenBucket` parsing rejects duplicates,
+unknowns, negative/fractional/overflowing numbers, and accepts the complete
+`u64` domain. Direct and contained `GET /vm/config` responses remain unchanged
+after metrics configuration and omit sink paths, grant authority, descriptors,
+and private failures. The schema-runtime timestamp profile is implemented, and
+one signed product guest observes canonical initial, real 60-second Paused and
+Running periodic, explicit, and terminal lines.
+
+The gate requires the exact #1787 row set, one implemented schema-runtime
+profile, two planned #1788 process-lifecycle profiles, ten planned #1789 device
+profiles, four #1789 platform-zero profiles, and both #1790 aggregates still
+`audit-required`. It therefore certifies the API/schema slice without claiming
+later producer-population or cross-producer completion.
 
 ## X86 CPUID/MSR platform boundary
 
@@ -150,18 +174,18 @@ remain in the CPU-template contract.
 | `api-schema:Logger` | #1786 | `implemented-and-verified` |
 | `corpus:logger` | #1786 | `implemented-and-verified` |
 | `semantic.observability:logger-delivery-filtering-loss-and-redaction` | #1786 | `implemented-and-verified` |
-| `api-operation:PUT /metrics` | #1787 | `audit-required` |
-| `api-path:/metrics` | #1787 | `audit-required` |
-| `api-property:FullVmConfiguration.metrics` | #1787 | `audit-required` |
-| `api-property:Metrics.metrics_path` | #1787 | `audit-required` |
-| `api-property:RateLimiter.bandwidth` | #1787 | `audit-required` |
-| `api-property:RateLimiter.ops` | #1787 | `audit-required` |
-| `api-property:TokenBucket.one_time_burst` | #1787 | `audit-required` |
-| `api-property:TokenBucket.refill_time` | #1787 | `audit-required` |
-| `api-property:TokenBucket.size` | #1787 | `audit-required` |
-| `api-schema:Metrics` | #1787 | `audit-required` |
-| `api-schema:RateLimiter` | #1787 | `audit-required` |
-| `api-schema:TokenBucket` | #1787 | `audit-required` |
+| `api-operation:PUT /metrics` | #1787 | `implemented-and-verified` |
+| `api-path:/metrics` | #1787 | `implemented-and-verified` |
+| `api-property:FullVmConfiguration.metrics` | #1787 | `implemented-and-verified` |
+| `api-property:Metrics.metrics_path` | #1787 | `implemented-and-verified` |
+| `api-property:RateLimiter.bandwidth` | #1787 | `implemented-and-verified` |
+| `api-property:RateLimiter.ops` | #1787 | `implemented-and-verified` |
+| `api-property:TokenBucket.one_time_burst` | #1787 | `implemented-and-verified` |
+| `api-property:TokenBucket.refill_time` | #1787 | `implemented-and-verified` |
+| `api-property:TokenBucket.size` | #1787 | `implemented-and-verified` |
+| `api-schema:Metrics` | #1787 | `implemented-and-verified` |
+| `api-schema:RateLimiter` | #1787 | `implemented-and-verified` |
+| `api-schema:TokenBucket` | #1787 | `implemented-and-verified` |
 | `corpus:metrics` | #1790 | `audit-required` |
 | `semantic.observability:metrics-schema-producers-flush-and-lifecycle` | #1790 | `audit-required` |
 | `corpus:tracing` | #1791 | `audit-required` |
@@ -219,8 +243,10 @@ remain in the CPU-template contract.
 logger operation/path/schema/property rows to `implemented-and-verified`, and
 #1810 certifies and promotes both aggregate logger rows after the exact
 producer, focused, process, signed, contained, and isolation gates pass. The
-current inventory is therefore exactly 329 implemented, 56 audit-required, three
-missing-platform-feasible, and 30 proven-platform-impossible. If every other
+#1787 metrics schema/API certification moves its exact twelve rows
+to `implemented-and-verified` while retaining both #1790 aggregate rows. The
+current inventory is therefore exactly 341 implemented, 44 audit-required,
+three missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the
 prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the
 current row set, not quotas; the authoritative totals remain derived from

@@ -461,6 +461,7 @@ const BAD_CONFIGURATION_EXIT_CODE: i32 = 152;
 const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
 const PROCESS_FAILURE_EXIT_CODE: i32 = 1;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+const REAL_PERIODIC_METRICS_TIMEOUT: Duration = Duration::from_secs(90);
 const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -9987,6 +9988,12 @@ fn normal_bundle_adopts_delayed_output_grants_by_descriptor_identity() {
     );
     assert_output_private_grant_fault(&wrong_metrics_role, &fixture);
 
+    let vm_config_before_metrics = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &vm_config_before_metrics,
+        200,
+        "GET VM config before granted metrics",
+    );
     assert_http_status(
         &http_put(
             &running.socket,
@@ -9999,6 +10006,23 @@ fn normal_bundle_adopts_delayed_output_grants_by_descriptor_identity() {
         204,
         "PUT granted metrics",
     );
+    let vm_config_after_metrics = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &vm_config_after_metrics,
+        200,
+        "GET VM config after granted metrics",
+    );
+    assert_eq!(vm_config_after_metrics, vm_config_before_metrics);
+    for private in fixture.sensitive_strings().into_iter().chain([
+        r#""metrics""#.to_owned(),
+        "private resource grant failed".to_owned(),
+        "descriptor".to_owned(),
+    ]) {
+        assert!(
+            !vm_config_after_metrics.contains(&private),
+            "VM config leaked contained metrics authority: {private}"
+        );
+    }
     let repeated_metrics = http_put(
         &running.socket,
         "/metrics",
@@ -10082,6 +10106,154 @@ fn normal_bundle_adopts_delayed_output_grants_by_descriptor_identity() {
     assert!(session_entries().is_empty());
 
     fixture.assert_original_outputs();
+    fixture.assert_replacement_outputs_unchanged();
+}
+
+#[test]
+fn normal_bundle_certifies_metrics_schema_across_real_periodic_and_terminal_lifecycle() {
+    let bundle = production_bundle();
+    let fixture = OutputGrantFixture::new("metrics-schema-lifecycle");
+    let mut running = spawn_ready_serial_snapshot_grant_api_launcher(
+        &bundle,
+        &fixture.manifest,
+        "metrics-schema-lifecycle",
+        false,
+    );
+    fixture.replace_source_pathnames();
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/metrics",
+            &serde_json::json!({"metrics_path": OUTPUT_METRICS_REF}).to_string(),
+        ),
+        204,
+        "PUT lifecycle metrics grant",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT lifecycle metrics machine config",
+    );
+    let resources = worker_bundle(&bundle).join("Contents/Resources");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&resources.join("guest-kernel")),
+        "initrd_path": path_text(&resources.join("guest-initrd")),
+        "boot_args": GUEST_SERIAL_RX_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(&running.socket, "/boot-source", &boot_source.to_string()),
+        204,
+        "PUT lifecycle metrics boot source",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start lifecycle metrics guest",
+    );
+    running
+        .wait_for_stdout_marker(GUEST_SERIAL_RX_READY_MARKER, PROCESS_TIMEOUT)
+        .unwrap_or_else(|error| panic!("lifecycle metrics guest should become ready: {error}"));
+
+    let initial = wait_for_canonical_output_metrics_lines(
+        &fixture.opened_metrics,
+        1,
+        PROCESS_TIMEOUT,
+        "initial",
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause lifecycle metrics guest",
+    );
+    assert!(http_get(&running.socket, "/").contains(r#""state":"Paused""#));
+
+    let paused_periodic = wait_for_canonical_output_metrics_lines(
+        &fixture.opened_metrics,
+        2,
+        REAL_PERIODIC_METRICS_TIMEOUT,
+        "real periodic while Paused",
+    );
+    assert_real_periodic_metrics_spacing(&paused_periodic, 0, 1, "Paused");
+    assert!(http_get(&running.socket, "/").contains(r#""state":"Paused""#));
+
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume lifecycle metrics guest",
+    );
+    assert!(http_get(&running.socket, "/").contains(r#""state":"Running""#));
+    let running_periodic = wait_for_canonical_output_metrics_lines(
+        &fixture.opened_metrics,
+        3,
+        REAL_PERIODIC_METRICS_TIMEOUT,
+        "real periodic while Running",
+    );
+    assert_real_periodic_metrics_spacing(&running_periodic, 1, 2, "Running");
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"FlushMetrics"}"#,
+        ),
+        204,
+        "explicit lifecycle metrics flush",
+    );
+    wait_for_canonical_output_metrics_lines(
+        &fixture.opened_metrics,
+        4,
+        PROCESS_TIMEOUT,
+        "explicit",
+    );
+
+    let launcher_pid = i32::try_from(running.child.id()).expect("launcher PID should fit");
+    // SAFETY: This targets the live unreaped launcher owned by the test and
+    // exercises its ordinary cancellation and terminal-observability path.
+    assert_eq!(unsafe { libc::kill(launcher_pid, libc::SIGTERM) }, 0);
+    let (status, stdout, stderr) = running.wait("lifecycle metrics graceful stop");
+    assert!(
+        status.success(),
+        "lifecycle metrics launcher should stop cleanly: {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let terminal = wait_for_canonical_output_metrics_lines(
+        &fixture.opened_metrics,
+        5,
+        PROCESS_TIMEOUT,
+        "terminal",
+    );
+    assert_eq!(
+        initial[0]["utc_timestamp_ms"],
+        terminal[0]["utc_timestamp_ms"]
+    );
+    assert!(!running.socket.exists());
+    assert!(session_entries().is_empty());
+    for sensitive in fixture.sensitive_strings() {
+        assert!(
+            !stdout.contains(&sensitive),
+            "stdout leaked metrics authority"
+        );
+        assert!(
+            !stderr.contains(&sensitive),
+            "stderr leaked metrics authority"
+        );
+    }
+    assert_eq!(
+        fs::read(&fixture.opened_logger).expect("unclaimed logger grant should read"),
+        OUTPUT_LOGGER_SEED,
+    );
+    assert_eq!(
+        fs::read(&fixture.opened_serial).expect("unclaimed serial grant should read"),
+        OUTPUT_SERIAL_SEED,
+    );
     fixture.assert_replacement_outputs_unchanged();
 }
 
@@ -16762,6 +16934,95 @@ impl OutputGrantFixture {
         .map(str::to_owned)
         .collect()
     }
+}
+
+fn wait_for_canonical_output_metrics_lines(
+    path: &Path,
+    expected: usize,
+    timeout: Duration,
+    context: &str,
+) -> Vec<serde_json::Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!(
+                "{context} metrics output {} should be readable: {error}",
+                path.display()
+            )
+        });
+        let seed = std::str::from_utf8(OUTPUT_METRICS_SEED)
+            .expect("metrics output seed should be valid UTF-8");
+        let payload = output
+            .strip_prefix(seed)
+            .unwrap_or_else(|| panic!("{context} metrics output lost its original seed: {output}"));
+        if payload.is_empty() || payload.ends_with('\n') {
+            let lines = payload
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                        panic!(
+                            "{context} metrics line should be valid JSON: {error}; line:\n{line}"
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                lines.len() <= expected,
+                "{context} emitted more than the expected {expected} metrics lines: {output}"
+            );
+            if lines.len() == expected {
+                for line in &lines {
+                    assert_canonical_metrics_tree(line, "metrics");
+                    assert!(line["utc_timestamp_ms"].as_u64().is_some());
+                    assert_eq!(line["vmm"]["panic_count"].as_u64(), Some(0));
+                    assert!(line["vmm"].get("metrics_flush_count").is_none());
+                    assert!(line["vmm"].get("boot_run_loop_status").is_none());
+                }
+                return lines;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {timeout:?} waiting for {expected} {context} metrics lines; output:\n{output}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn assert_canonical_metrics_tree(value: &serde_json::Value, path: &str) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (field, value) in fields {
+                assert_canonical_metrics_tree(value, &format!("{path}.{field}"));
+            }
+        }
+        serde_json::Value::Number(number) => assert!(
+            number.as_u64().is_some(),
+            "canonical metrics leaf {path} must be a nonnegative integer: {number}"
+        ),
+        other => panic!("canonical metrics node {path} has an invalid value: {other}"),
+    }
+}
+
+fn assert_real_periodic_metrics_spacing(
+    lines: &[serde_json::Value],
+    previous: usize,
+    periodic: usize,
+    state: &str,
+) {
+    let previous = lines[previous]["utc_timestamp_ms"]
+        .as_u64()
+        .expect("previous metrics timestamp should be an integer");
+    let periodic = lines[periodic]["utc_timestamp_ms"]
+        .as_u64()
+        .expect("periodic metrics timestamp should be an integer");
+    let spacing = periodic
+        .checked_sub(previous)
+        .expect("periodic metrics timestamp should advance");
+    assert!(
+        (55_000..=95_000).contains(&spacing),
+        "real {state} periodic metrics spacing should certify the 60-second scheduler, found {spacing} ms"
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
