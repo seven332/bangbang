@@ -182,20 +182,292 @@ impl ProcessStartupOutcome {
     }
 }
 
-/// Fixed public device kinds admitted by host lifecycle records.
+/// Fixed public device kinds admitted by logger records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoggerDeviceKind {
+    Balloon,
     Block,
+    Entropy,
+    MemoryHotplug,
     Network,
     Pmem,
+    Serial,
+    Vsock,
 }
 
 impl LoggerDeviceKind {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Balloon => "balloon",
             Self::Block => "block",
+            Self::Entropy => "entropy",
+            Self::MemoryHotplug => "memory-hotplug",
             Self::Network => "network",
             Self::Pmem => "pmem",
+            Self::Serial => "serial",
+            Self::Vsock => "vsock",
+        }
+    }
+
+    pub(crate) const fn from_virtio_device_id(device_id: u32) -> Option<Self> {
+        match device_id {
+            1 => Some(Self::Network),
+            2 => Some(Self::Block),
+            3 => Some(Self::Serial),
+            4 => Some(Self::Entropy),
+            5 => Some(Self::Balloon),
+            19 => Some(Self::Vsock),
+            24 => Some(Self::MemoryHotplug),
+            27 => Some(Self::Pmem),
+            _ => None,
+        }
+    }
+}
+
+/// Fixed, value-free backend outcomes observed before HVF errors are formatted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerBackendOutcome {
+    CacheConfigurationFailed,
+    MemoryMappingFailed,
+    MemoryDiscardFailed,
+    VmCreationFailed,
+    VmCleanupFailed,
+    VcpuStartFailed,
+    VcpuRunFailed,
+    VcpuExitGuestShutdown,
+    VcpuExitGuestReset,
+    VcpuExitUnsupported,
+    MmioDispatchFailed,
+    InterruptDeliveryFailed,
+    VirtualTimerActivated,
+    VirtualTimerFailed,
+}
+
+impl LoggerBackendOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::CacheConfigurationFailed => "cache-configuration",
+            Self::MemoryMappingFailed => "memory-map",
+            Self::MemoryDiscardFailed => "memory-discard",
+            Self::VmCreationFailed => "vm-create",
+            Self::VmCleanupFailed => "vm-cleanup",
+            Self::VcpuStartFailed => "vcpu-start",
+            Self::VcpuRunFailed => "vcpu-run",
+            Self::VcpuExitGuestShutdown | Self::VcpuExitGuestReset | Self::VcpuExitUnsupported => {
+                "vcpu-exit"
+            }
+            Self::MmioDispatchFailed => "mmio-dispatch",
+            Self::InterruptDeliveryFailed => "interrupt-delivery",
+            Self::VirtualTimerActivated | Self::VirtualTimerFailed => "virtual-timer",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::CacheConfigurationFailed
+            | Self::MemoryMappingFailed
+            | Self::MemoryDiscardFailed
+            | Self::VmCreationFailed
+            | Self::VmCleanupFailed
+            | Self::VcpuStartFailed
+            | Self::VcpuRunFailed
+            | Self::MmioDispatchFailed
+            | Self::InterruptDeliveryFailed
+            | Self::VirtualTimerFailed => "failed",
+            Self::VcpuExitGuestShutdown => "guest-shutdown",
+            Self::VcpuExitGuestReset => "guest-reset",
+            Self::VcpuExitUnsupported => "unsupported",
+            Self::VirtualTimerActivated => "activated",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::VcpuExitGuestShutdown | Self::VcpuExitGuestReset => LoggerLevel::Info,
+            Self::VirtualTimerActivated => LoggerLevel::Debug,
+            Self::VcpuExitUnsupported => LoggerLevel::Warn,
+            Self::CacheConfigurationFailed
+            | Self::MemoryMappingFailed
+            | Self::MemoryDiscardFailed
+            | Self::VmCreationFailed
+            | Self::VmCleanupFailed
+            | Self::VcpuStartFailed
+            | Self::VcpuRunFailed
+            | Self::MmioDispatchFailed
+            | Self::InterruptDeliveryFailed
+            | Self::VirtualTimerFailed => LoggerLevel::Error,
+        }
+    }
+}
+
+/// Fixed, value-free generic device transport outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerTransportOutcome {
+    MmioRegistrationSucceeded,
+    MmioRegistrationFailed,
+    MmioReleaseSucceeded,
+    MmioReleaseFailed,
+    MmioAccessFailed(Option<LoggerDeviceKind>),
+    FeatureNegotiationRejected(LoggerDeviceKind),
+    DeviceConfigRejected(LoggerDeviceKind),
+    DeviceConfigFailed(LoggerDeviceKind),
+    QueueConfigurationRejected(LoggerDeviceKind),
+    QueueNotificationSucceeded(LoggerDeviceKind),
+    QueueNotificationFailed(LoggerDeviceKind),
+    UsedRingRejected(Option<LoggerDeviceKind>),
+    DeviceActivationSucceeded(LoggerDeviceKind),
+    DeviceActivationFailed(LoggerDeviceKind),
+    DeviceResetSucceeded(LoggerDeviceKind),
+    DeviceResetUnsupported(LoggerDeviceKind),
+    DeviceResetFailed(LoggerDeviceKind),
+    PciFunctionPublished(LoggerDeviceKind),
+    PciFunctionPublicationFailed(LoggerDeviceKind),
+    PciFunctionRemoved(LoggerDeviceKind),
+    PciFunctionRemovalFailed(LoggerDeviceKind),
+    PciConfigRejected(LoggerDeviceKind),
+    MsiConfigurationSucceeded(LoggerDeviceKind),
+    MsiConfigurationFailed(LoggerDeviceKind),
+    InterruptDelivered(LoggerDeviceKind),
+    InterruptDeliveryFailed(LoggerDeviceKind),
+    PublicationRollbackSucceeded(Option<LoggerDeviceKind>),
+    PublicationRollbackFailed(Option<LoggerDeviceKind>),
+    RateLimiterRejected(LoggerDeviceKind),
+}
+
+impl LoggerTransportOutcome {
+    pub const fn device_kind(self) -> Option<LoggerDeviceKind> {
+        match self {
+            Self::MmioRegistrationSucceeded
+            | Self::MmioRegistrationFailed
+            | Self::MmioReleaseSucceeded
+            | Self::MmioReleaseFailed => None,
+            Self::MmioAccessFailed(kind)
+            | Self::UsedRingRejected(kind)
+            | Self::PublicationRollbackSucceeded(kind)
+            | Self::PublicationRollbackFailed(kind) => kind,
+            Self::FeatureNegotiationRejected(kind)
+            | Self::DeviceConfigRejected(kind)
+            | Self::DeviceConfigFailed(kind)
+            | Self::QueueConfigurationRejected(kind)
+            | Self::QueueNotificationSucceeded(kind)
+            | Self::QueueNotificationFailed(kind)
+            | Self::DeviceActivationSucceeded(kind)
+            | Self::DeviceActivationFailed(kind)
+            | Self::DeviceResetSucceeded(kind)
+            | Self::DeviceResetUnsupported(kind)
+            | Self::DeviceResetFailed(kind)
+            | Self::PciFunctionPublished(kind)
+            | Self::PciFunctionPublicationFailed(kind)
+            | Self::PciFunctionRemoved(kind)
+            | Self::PciFunctionRemovalFailed(kind)
+            | Self::PciConfigRejected(kind)
+            | Self::MsiConfigurationSucceeded(kind)
+            | Self::MsiConfigurationFailed(kind)
+            | Self::InterruptDelivered(kind)
+            | Self::InterruptDeliveryFailed(kind)
+            | Self::RateLimiterRejected(kind) => Some(kind),
+        }
+    }
+
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::MmioRegistrationSucceeded | Self::MmioRegistrationFailed => "mmio-registration",
+            Self::MmioReleaseSucceeded | Self::MmioReleaseFailed => "mmio-release",
+            Self::MmioAccessFailed(_) => "mmio-access",
+            Self::FeatureNegotiationRejected(_) => "feature-negotiation",
+            Self::DeviceConfigRejected(_) | Self::DeviceConfigFailed(_) => "device-config",
+            Self::QueueConfigurationRejected(_) => "queue-configuration",
+            Self::QueueNotificationSucceeded(_) | Self::QueueNotificationFailed(_) => {
+                "queue-notification"
+            }
+            Self::UsedRingRejected(_) => "used-ring",
+            Self::DeviceActivationSucceeded(_) | Self::DeviceActivationFailed(_) => {
+                "device-activation"
+            }
+            Self::DeviceResetSucceeded(_)
+            | Self::DeviceResetUnsupported(_)
+            | Self::DeviceResetFailed(_) => "device-reset",
+            Self::PciFunctionPublished(_) | Self::PciFunctionPublicationFailed(_) => {
+                "pci-publication"
+            }
+            Self::PciFunctionRemoved(_) | Self::PciFunctionRemovalFailed(_) => "pci-removal",
+            Self::PciConfigRejected(_) => "pci-config",
+            Self::MsiConfigurationSucceeded(_) | Self::MsiConfigurationFailed(_) => {
+                "msi-configuration"
+            }
+            Self::InterruptDelivered(_) | Self::InterruptDeliveryFailed(_) => "interrupt-delivery",
+            Self::PublicationRollbackSucceeded(_) | Self::PublicationRollbackFailed(_) => {
+                "publication-rollback"
+            }
+            Self::RateLimiterRejected(_) => "rate-limiter",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::MmioRegistrationSucceeded
+            | Self::MmioReleaseSucceeded
+            | Self::QueueNotificationSucceeded(_)
+            | Self::DeviceActivationSucceeded(_)
+            | Self::DeviceResetSucceeded(_)
+            | Self::MsiConfigurationSucceeded(_)
+            | Self::PublicationRollbackSucceeded(_) => "succeeded",
+            Self::PciFunctionPublished(_) => "published",
+            Self::PciFunctionRemoved(_) => "removed",
+            Self::InterruptDelivered(_) => "delivered",
+            Self::FeatureNegotiationRejected(_)
+            | Self::DeviceConfigRejected(_)
+            | Self::QueueConfigurationRejected(_)
+            | Self::UsedRingRejected(_)
+            | Self::PciConfigRejected(_)
+            | Self::RateLimiterRejected(_) => "rejected",
+            Self::DeviceResetUnsupported(_) => "unsupported",
+            Self::MmioRegistrationFailed
+            | Self::MmioReleaseFailed
+            | Self::MmioAccessFailed(_)
+            | Self::DeviceConfigFailed(_)
+            | Self::QueueNotificationFailed(_)
+            | Self::DeviceActivationFailed(_)
+            | Self::DeviceResetFailed(_)
+            | Self::PciFunctionPublicationFailed(_)
+            | Self::PciFunctionRemovalFailed(_)
+            | Self::MsiConfigurationFailed(_)
+            | Self::InterruptDeliveryFailed(_)
+            | Self::PublicationRollbackFailed(_) => "failed",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::MmioRegistrationSucceeded
+            | Self::MmioReleaseSucceeded
+            | Self::QueueNotificationSucceeded(_)
+            | Self::MsiConfigurationSucceeded(_)
+            | Self::InterruptDelivered(_)
+            | Self::RateLimiterRejected(_) => LoggerLevel::Debug,
+            Self::DeviceActivationSucceeded(_)
+            | Self::DeviceResetSucceeded(_)
+            | Self::PciFunctionPublished(_)
+            | Self::PciFunctionRemoved(_) => LoggerLevel::Info,
+            Self::FeatureNegotiationRejected(_)
+            | Self::DeviceConfigRejected(_)
+            | Self::QueueConfigurationRejected(_)
+            | Self::UsedRingRejected(_)
+            | Self::DeviceResetUnsupported(_)
+            | Self::PciConfigRejected(_)
+            | Self::PublicationRollbackSucceeded(_) => LoggerLevel::Warn,
+            Self::MmioRegistrationFailed
+            | Self::MmioReleaseFailed
+            | Self::MmioAccessFailed(_)
+            | Self::DeviceConfigFailed(_)
+            | Self::QueueNotificationFailed(_)
+            | Self::DeviceActivationFailed(_)
+            | Self::DeviceResetFailed(_)
+            | Self::PciFunctionPublicationFailed(_)
+            | Self::PciFunctionRemovalFailed(_)
+            | Self::MsiConfigurationFailed(_)
+            | Self::InterruptDeliveryFailed(_)
+            | Self::PublicationRollbackFailed(_) => LoggerLevel::Error,
         }
     }
 }
@@ -527,6 +799,7 @@ pub(super) enum LoggerEvent {
         wall_time_us: u64,
         cpu_time_us: u64,
     },
+    Backend(LoggerBackendOutcome),
     Lifecycle(LoggerLifecycleOutcome),
     Observability(LoggerObservabilityOutcome),
     RateLimitRecovery {
@@ -537,6 +810,7 @@ pub(super) enum LoggerEvent {
     ProcessStartup(ProcessStartupOutcome),
     ProcessExit(ProcessTerminalCategory),
     Snapshot(LoggerSnapshotOutcome),
+    Transport(LoggerTransportOutcome),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -641,6 +915,12 @@ impl LogRecord {
                 encoder.push_u64(cpu_time_us / 1_000);
                 encoder.push_str(" CPU ms");
             }
+            LoggerEvent::Backend(outcome) => {
+                encoder.push_str("operation=");
+                encoder.push_str(outcome.operation());
+                encoder.push_str(" outcome=");
+                encoder.push_str(outcome.outcome());
+            }
             LoggerEvent::Lifecycle(outcome) => {
                 if let Some(kind) = outcome.device_kind() {
                     encoder.push_str("device-kind=");
@@ -678,6 +958,17 @@ impl LogRecord {
                 encoder.push_str(category.as_str());
             }
             LoggerEvent::Snapshot(outcome) => {
+                encoder.push_str("operation=");
+                encoder.push_str(outcome.operation());
+                encoder.push_str(" outcome=");
+                encoder.push_str(outcome.outcome());
+            }
+            LoggerEvent::Transport(outcome) => {
+                if let Some(kind) = outcome.device_kind() {
+                    encoder.push_str("device-kind=");
+                    encoder.push_str(kind.as_str());
+                    encoder.push_byte(b' ');
+                }
                 encoder.push_str("operation=");
                 encoder.push_str(outcome.operation());
                 encoder.push_str(" outcome=");
@@ -969,10 +1260,11 @@ fn utf8_prefix_len(value: &str, maximum: usize) -> usize {
 mod tests {
     use super::{
         LogOrigin, LogRecord, LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome,
-        LoggerApiRoute, LoggerApiWorkerOutcome, LoggerDeviceKind, LoggerEvent, LoggerHttpMethod,
-        LoggerLifecycleOutcome, LoggerObservabilityOutcome, LoggerProcessSignalOutcome,
-        LoggerSnapshotOutcome, MAX_LOG_RECORD_BYTES, PanicLogRecords, ProcessStartupOutcome,
-        ProcessTerminalCategory, normalize_origin,
+        LoggerApiRoute, LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerDeviceKind,
+        LoggerEvent, LoggerHttpMethod, LoggerLifecycleOutcome, LoggerObservabilityOutcome,
+        LoggerProcessSignalOutcome, LoggerSnapshotOutcome, LoggerTransportOutcome,
+        MAX_LOG_RECORD_BYTES, PanicLogRecords, ProcessStartupOutcome, ProcessTerminalCategory,
+        normalize_origin,
     };
     use crate::logger::LoggerLevel;
 
@@ -1153,6 +1445,257 @@ mod tests {
             assert_eq!(record.as_str(), expected);
             assert!(record.as_bytes().len() <= MAX_LOG_RECORD_BYTES);
             assert!(std::str::from_utf8(record.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn encodes_every_closed_backend_outcome() {
+        let cases = [
+            (
+                LoggerBackendOutcome::CacheConfigurationFailed,
+                LoggerLevel::Error,
+                "operation=cache-configuration outcome=failed",
+            ),
+            (
+                LoggerBackendOutcome::MemoryMappingFailed,
+                LoggerLevel::Error,
+                "operation=memory-map outcome=failed",
+            ),
+            (
+                LoggerBackendOutcome::MemoryDiscardFailed,
+                LoggerLevel::Error,
+                "operation=memory-discard outcome=failed",
+            ),
+            (
+                LoggerBackendOutcome::VmCreationFailed,
+                LoggerLevel::Error,
+                "operation=vm-create outcome=failed",
+            ),
+            (
+                LoggerBackendOutcome::VmCleanupFailed,
+                LoggerLevel::Error,
+                "operation=vm-cleanup outcome=failed",
+            ),
+            (
+                LoggerBackendOutcome::VcpuStartFailed,
+                LoggerLevel::Error,
+                "operation=vcpu-start outcome=failed",
+            ),
+            (
+                LoggerBackendOutcome::VcpuRunFailed,
+                LoggerLevel::Error,
+                "operation=vcpu-run outcome=failed",
+            ),
+            (
+                LoggerBackendOutcome::VcpuExitGuestShutdown,
+                LoggerLevel::Info,
+                "operation=vcpu-exit outcome=guest-shutdown",
+            ),
+            (
+                LoggerBackendOutcome::VcpuExitGuestReset,
+                LoggerLevel::Info,
+                "operation=vcpu-exit outcome=guest-reset",
+            ),
+            (
+                LoggerBackendOutcome::VcpuExitUnsupported,
+                LoggerLevel::Warn,
+                "operation=vcpu-exit outcome=unsupported",
+            ),
+            (
+                LoggerBackendOutcome::MmioDispatchFailed,
+                LoggerLevel::Error,
+                "operation=mmio-dispatch outcome=failed",
+            ),
+            (
+                LoggerBackendOutcome::InterruptDeliveryFailed,
+                LoggerLevel::Error,
+                "operation=interrupt-delivery outcome=failed",
+            ),
+            (
+                LoggerBackendOutcome::VirtualTimerActivated,
+                LoggerLevel::Debug,
+                "operation=virtual-timer outcome=activated",
+            ),
+            (
+                LoggerBackendOutcome::VirtualTimerFailed,
+                LoggerLevel::Error,
+                "operation=virtual-timer outcome=failed",
+            ),
+        ];
+
+        for (outcome, level, expected) in cases {
+            assert_eq!(outcome.level(), level);
+            assert_closed_event(LoggerEvent::Backend(outcome), level, expected);
+        }
+    }
+
+    #[test]
+    fn encodes_every_closed_transport_outcome_without_dynamic_values() {
+        use LoggerDeviceKind::{
+            Balloon, Block, Entropy, MemoryHotplug, Network, Pmem, Serial, Vsock,
+        };
+
+        let cases = [
+            (
+                LoggerTransportOutcome::MmioRegistrationSucceeded,
+                LoggerLevel::Debug,
+                "operation=mmio-registration outcome=succeeded",
+            ),
+            (
+                LoggerTransportOutcome::MmioRegistrationFailed,
+                LoggerLevel::Error,
+                "operation=mmio-registration outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::MmioReleaseSucceeded,
+                LoggerLevel::Debug,
+                "operation=mmio-release outcome=succeeded",
+            ),
+            (
+                LoggerTransportOutcome::MmioReleaseFailed,
+                LoggerLevel::Error,
+                "operation=mmio-release outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::MmioAccessFailed(Some(Block)),
+                LoggerLevel::Error,
+                "device-kind=block operation=mmio-access outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::FeatureNegotiationRejected(Network),
+                LoggerLevel::Warn,
+                "device-kind=network operation=feature-negotiation outcome=rejected",
+            ),
+            (
+                LoggerTransportOutcome::DeviceConfigRejected(Pmem),
+                LoggerLevel::Warn,
+                "device-kind=pmem operation=device-config outcome=rejected",
+            ),
+            (
+                LoggerTransportOutcome::DeviceConfigFailed(Vsock),
+                LoggerLevel::Error,
+                "device-kind=vsock operation=device-config outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::QueueConfigurationRejected(Balloon),
+                LoggerLevel::Warn,
+                "device-kind=balloon operation=queue-configuration outcome=rejected",
+            ),
+            (
+                LoggerTransportOutcome::QueueNotificationSucceeded(Entropy),
+                LoggerLevel::Debug,
+                "device-kind=entropy operation=queue-notification outcome=succeeded",
+            ),
+            (
+                LoggerTransportOutcome::QueueNotificationFailed(MemoryHotplug),
+                LoggerLevel::Error,
+                "device-kind=memory-hotplug operation=queue-notification outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::UsedRingRejected(None),
+                LoggerLevel::Warn,
+                "operation=used-ring outcome=rejected",
+            ),
+            (
+                LoggerTransportOutcome::DeviceActivationSucceeded(Block),
+                LoggerLevel::Info,
+                "device-kind=block operation=device-activation outcome=succeeded",
+            ),
+            (
+                LoggerTransportOutcome::DeviceActivationFailed(Network),
+                LoggerLevel::Error,
+                "device-kind=network operation=device-activation outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::DeviceResetSucceeded(Pmem),
+                LoggerLevel::Info,
+                "device-kind=pmem operation=device-reset outcome=succeeded",
+            ),
+            (
+                LoggerTransportOutcome::DeviceResetUnsupported(Vsock),
+                LoggerLevel::Warn,
+                "device-kind=vsock operation=device-reset outcome=unsupported",
+            ),
+            (
+                LoggerTransportOutcome::DeviceResetFailed(Balloon),
+                LoggerLevel::Error,
+                "device-kind=balloon operation=device-reset outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::PciFunctionPublished(Entropy),
+                LoggerLevel::Info,
+                "device-kind=entropy operation=pci-publication outcome=published",
+            ),
+            (
+                LoggerTransportOutcome::PciFunctionPublicationFailed(MemoryHotplug),
+                LoggerLevel::Error,
+                "device-kind=memory-hotplug operation=pci-publication outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::PciFunctionRemoved(Serial),
+                LoggerLevel::Info,
+                "device-kind=serial operation=pci-removal outcome=removed",
+            ),
+            (
+                LoggerTransportOutcome::PciFunctionRemovalFailed(Block),
+                LoggerLevel::Error,
+                "device-kind=block operation=pci-removal outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::PciConfigRejected(Network),
+                LoggerLevel::Warn,
+                "device-kind=network operation=pci-config outcome=rejected",
+            ),
+            (
+                LoggerTransportOutcome::MsiConfigurationSucceeded(Vsock),
+                LoggerLevel::Debug,
+                "device-kind=vsock operation=msi-configuration outcome=succeeded",
+            ),
+            (
+                LoggerTransportOutcome::MsiConfigurationFailed(Balloon),
+                LoggerLevel::Error,
+                "device-kind=balloon operation=msi-configuration outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::InterruptDelivered(Entropy),
+                LoggerLevel::Debug,
+                "device-kind=entropy operation=interrupt-delivery outcome=delivered",
+            ),
+            (
+                LoggerTransportOutcome::InterruptDeliveryFailed(MemoryHotplug),
+                LoggerLevel::Error,
+                "device-kind=memory-hotplug operation=interrupt-delivery outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::PublicationRollbackSucceeded(Some(Serial)),
+                LoggerLevel::Warn,
+                "device-kind=serial operation=publication-rollback outcome=succeeded",
+            ),
+            (
+                LoggerTransportOutcome::PublicationRollbackFailed(Some(Block)),
+                LoggerLevel::Error,
+                "device-kind=block operation=publication-rollback outcome=failed",
+            ),
+            (
+                LoggerTransportOutcome::RateLimiterRejected(Network),
+                LoggerLevel::Debug,
+                "device-kind=network operation=rate-limiter outcome=rejected",
+            ),
+        ];
+
+        for (outcome, level, expected) in cases {
+            assert_eq!(outcome.level(), level);
+            assert_closed_event(LoggerEvent::Transport(outcome), level, expected);
+            for forbidden in [
+                "/private/forbidden",
+                "device-secret",
+                "0xfeedface",
+                "queue-index=7",
+                "descriptor=11",
+                "guest-bytes",
+            ] {
+                assert!(!expected.contains(forbidden));
+            }
         }
     }
 

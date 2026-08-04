@@ -2,6 +2,7 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError};
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId,
@@ -1593,6 +1594,7 @@ pub struct VirtioRngDevice {
     active_queue: Option<VirtioRngQueue>,
     rate_limiter: Option<VirtioRngRateLimiter>,
     pending_rate_limited_queue: bool,
+    guest_logger: Option<GuestLogger>,
 }
 
 impl VirtioRngDevice {
@@ -1601,6 +1603,7 @@ impl VirtioRngDevice {
             active_queue: None,
             rate_limiter: None,
             pending_rate_limited_queue: false,
+            guest_logger: None,
         }
     }
 
@@ -1615,6 +1618,7 @@ impl VirtioRngDevice {
                 .rate_limiter()
                 .and_then(|rate_limiter| VirtioRngRateLimiter::new_at(rate_limiter, now)),
             pending_rate_limited_queue: false,
+            guest_logger: None,
         }
     }
 
@@ -1627,6 +1631,7 @@ impl VirtioRngDevice {
             active_queue,
             rate_limiter,
             pending_rate_limited_queue,
+            guest_logger: None,
         }
     }
 
@@ -1805,6 +1810,13 @@ impl VirtioRngDevice {
                     dispatch.record_rate_limiter_event();
                 }
                 self.pending_rate_limited_queue = dispatch.rate_limiter_throttled_requests() != 0;
+                if self.pending_rate_limited_queue
+                    && let Some(logger) = &self.guest_logger
+                {
+                    logger.log_transport(LoggerTransportOutcome::RateLimiterRejected(
+                        LoggerDeviceKind::Entropy,
+                    ));
+                }
                 Ok(VirtioRngDeviceNotificationDispatch::new(
                     drained_notifications,
                     Some(dispatch),
@@ -1965,6 +1977,10 @@ impl VirtioPciEndpoint<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevice> {
 }
 
 impl VirtioMmioDeviceActivationHandler for VirtioRngDevice {
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = Some(logger);
+    }
+
     fn activate(
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,

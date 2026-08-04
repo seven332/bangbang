@@ -730,6 +730,10 @@ impl VmmController {
         self.logger_state.async_logger()
     }
 
+    pub fn guest_logger(&self) -> logger::GuestLogger {
+        self.logger_state.guest_logger()
+    }
+
     /// Returns the narrow panic-record admission handle for this controller.
     pub fn emergency_logger(&self) -> logger::EmergencyLogger {
         self.logger_state.emergency_logger()

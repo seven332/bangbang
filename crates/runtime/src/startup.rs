@@ -5393,6 +5393,8 @@ impl Arm64BootResources {
             }
         }
         .map_err(|source| Arm64BootResourceError::PrepareNetworkDevices { source })?;
+        let mut initial_mmio_dispatcher = MmioDispatcher::new();
+        initial_mmio_dispatcher.attach_guest_logger(controller.guest_logger());
         let (
             mut mmio_dispatcher,
             block_devices,
@@ -5404,7 +5406,7 @@ impl Arm64BootResources {
             mut fdt_devices,
         ) = if pci_data_devices {
             (
-                MmioDispatcher::new(),
+                initial_mmio_dispatcher,
                 Vec::new(),
                 prepared_blocks.into_vec(),
                 prepared_pmems.into_vec(),
@@ -5414,12 +5416,11 @@ impl Arm64BootResources {
                 Vec::new(),
             )
         } else {
-            let block_mmio =
-                prepared_blocks
-                    .register_mmio(block_mmio_layout)
-                    .map_err(|source| Arm64BootResourceError::RegisterBlockMmio {
-                        source: Box::new(source),
-                    })?;
+            let block_mmio = prepared_blocks
+                .register_mmio_with_dispatcher(block_mmio_layout, initial_mmio_dispatcher)
+                .map_err(|source| Arm64BootResourceError::RegisterBlockMmio {
+                    source: Box::new(source),
+                })?;
             let (mmio_dispatcher, registrations) = block_mmio.into_parts();
             let (block_devices, mut fdt_devices) =
                 block_device_metadata(&registrations, block_interrupt_lines)?;

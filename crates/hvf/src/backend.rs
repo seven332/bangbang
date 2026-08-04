@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bangbang_runtime::logger::{GuestLogger, LoggerBackendOutcome};
 use bangbang_runtime::memory::{GuestMemory, GuestMemoryRange};
 use bangbang_runtime::memory_hotplug::VirtioMemDeviceCaptureState;
 use bangbang_runtime::pmem::PreparedPmemDevice;
@@ -45,6 +46,7 @@ pub struct HvfBackend {
     vcpu_topology_started: bool,
     memory_mapper: Arc<dyn HvfMemoryMapper>,
     gic_creator: Arc<dyn HvfGicCreator>,
+    guest_logger: GuestLogger,
 }
 
 impl Default for HvfBackend {
@@ -59,6 +61,7 @@ impl Default for HvfBackend {
             vcpu_topology_started: false,
             memory_mapper: Arc::new(RealHvfMemoryMapper),
             gic_creator: Arc::new(RealHvfGicCreator),
+            guest_logger: GuestLogger::default(),
         }
     }
 }
@@ -66,6 +69,18 @@ impl Default for HvfBackend {
 impl HvfBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Installs the controller-local, result-free guest logging capability.
+    pub fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = logger.clone();
+        if let Ok(memory) = self.mapped_guest_memory_mut() {
+            memory.attach_guest_logger(logger);
+        }
+    }
+
+    pub(crate) fn guest_logger(&self) -> GuestLogger {
+        self.guest_logger.clone()
     }
 
     pub fn is_supported_target() -> bool {
@@ -93,16 +108,21 @@ impl HvfBackend {
         memory: GuestMemory,
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
-        if !Self::is_supported_target() {
-            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        let result = if !Self::is_supported_target() {
+            Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into())
+        } else {
+            self.map_guest_memory_with_configured_mapper(memory, permissions)
+        };
+        if result.is_err() {
+            self.guest_logger
+                .log_backend(LoggerBackendOutcome::MemoryMappingFailed);
         }
-
-        self.map_guest_memory_with_configured_mapper(memory, permissions)
+        result
     }
 
     pub(crate) fn map_snapshot_v2_memory_hotplug(
         &mut self,
-        memory: GuestMemory,
+        mut memory: GuestMemory,
         plan: &HvfSnapshotV2MemoryHotplugMappingPlan,
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
@@ -110,24 +130,32 @@ impl HvfBackend {
             return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
         }
 
-        self.validate_guest_memory_mapping_state()?;
-        match HvfGuestMemoryMapping::map_snapshot_v2_memory_hotplug_with_mapper(
-            memory,
-            plan,
-            permissions,
-            Arc::clone(&self.memory_mapper),
-        ) {
-            Ok(mapping) => {
-                self.guest_memory = Some(mapping);
-                Ok(())
-            }
-            Err(failed_mapping) => {
-                if failed_mapping.mapping.has_mapped_regions() {
-                    self.guest_memory = Some(failed_mapping.mapping);
+        let result = (|| {
+            self.validate_guest_memory_mapping_state()?;
+            memory.attach_guest_logger(self.guest_logger.clone());
+            match HvfGuestMemoryMapping::map_snapshot_v2_memory_hotplug_with_mapper(
+                memory,
+                plan,
+                permissions,
+                Arc::clone(&self.memory_mapper),
+            ) {
+                Ok(mapping) => {
+                    self.guest_memory = Some(mapping);
+                    Ok(())
                 }
-                Err(failed_mapping.error)
+                Err(failed_mapping) => {
+                    if failed_mapping.mapping.has_mapped_regions() {
+                        self.guest_memory = Some(failed_mapping.mapping);
+                    }
+                    Err(failed_mapping.error)
+                }
             }
+        })();
+        if result.is_err() {
+            self.guest_logger
+                .log_backend(LoggerBackendOutcome::MemoryMappingFailed);
         }
+        result
     }
 
     /// Map resolver-owned anonymous memory and force first guest accesses to
@@ -137,11 +165,16 @@ impl HvfBackend {
         resolver: HvfLazyPageResolver,
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
-        if !Self::is_supported_target() {
-            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        let result = if !Self::is_supported_target() {
+            Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into())
+        } else {
+            self.map_lazy_guest_memory_with_configured_mapper(resolver, permissions)
+        };
+        if result.is_err() {
+            self.guest_logger
+                .log_backend(LoggerBackendOutcome::MemoryMappingFailed);
         }
-
-        self.map_lazy_guest_memory_with_configured_mapper(resolver, permissions)
+        result
     }
 
     /// Map protected lazy memory while retaining the only view available to
@@ -151,11 +184,16 @@ impl HvfBackend {
         consumer: HvfLazyGuestMemoryConsumer,
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
-        if !Self::is_supported_target() {
-            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        let result = if !Self::is_supported_target() {
+            Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into())
+        } else {
+            self.map_lazy_guest_memory_consumer_with_configured_mapper(consumer, permissions)
+        };
+        if result.is_err() {
+            self.guest_logger
+                .log_backend(LoggerBackendOutcome::MemoryMappingFailed);
         }
-
-        self.map_lazy_guest_memory_consumer_with_configured_mapper(consumer, permissions)
+        result
     }
 
     pub(crate) fn map_guest_memory_with_pmem_devices(
@@ -164,15 +202,20 @@ impl HvfBackend {
         pmem_devices: &[PreparedPmemDevice],
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
-        if !Self::is_supported_target() {
-            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        let result = if !Self::is_supported_target() {
+            Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into())
+        } else {
+            self.map_guest_memory_with_pmem_devices_and_configured_mapper(
+                memory,
+                pmem_devices,
+                permissions,
+            )
+        };
+        if result.is_err() {
+            self.guest_logger
+                .log_backend(LoggerBackendOutcome::MemoryMappingFailed);
         }
-
-        self.map_guest_memory_with_pmem_devices_and_configured_mapper(
-            memory,
-            pmem_devices,
-            permissions,
-        )
+        result
     }
 
     pub(crate) fn map_runtime_pmem_device(
@@ -214,14 +257,21 @@ impl HvfBackend {
     }
 
     pub fn unmap_guest_memory(&mut self) -> Result<(), HvfGuestMemoryMappingError> {
-        if let Some(mapping) = self.guest_memory.as_mut() {
-            mapping.unmap_all()?;
-        }
+        let result = (|| {
+            if let Some(mapping) = self.guest_memory.as_mut() {
+                mapping.unmap_all()?;
+            }
 
-        self.guest_memory = None;
-        self.lazy_guest_fault_handler = None;
-        self.lazy_guest_memory_consumer = None;
-        Ok(())
+            self.guest_memory = None;
+            self.lazy_guest_fault_handler = None;
+            self.lazy_guest_memory_consumer = None;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.guest_logger
+                .log_backend(LoggerBackendOutcome::MemoryMappingFailed);
+        }
+        result
     }
 
     /// Write-protect every currently mapped writable guest-memory range for
@@ -409,11 +459,16 @@ impl HvfBackend {
         range: GuestMemoryRange,
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
-        if !Self::is_supported_target() {
-            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        let result = if !Self::is_supported_target() {
+            Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into())
+        } else {
+            self.map_dynamic_guest_memory_region_with_configured_mapper(range, permissions)
+        };
+        if result.is_err() {
+            self.guest_logger
+                .log_backend(LoggerBackendOutcome::MemoryMappingFailed);
         }
-
-        self.map_dynamic_guest_memory_region_with_configured_mapper(range, permissions)
+        result
     }
 
     fn map_dynamic_guest_memory_region_with_configured_mapper(
@@ -438,7 +493,12 @@ impl HvfBackend {
         &mut self,
         range: GuestMemoryRange,
     ) -> Result<(), HvfGuestMemoryMappingError> {
-        self.unmap_dynamic_guest_memory_region_with_configured_mapper(range)
+        let result = self.unmap_dynamic_guest_memory_region_with_configured_mapper(range);
+        if result.is_err() {
+            self.guest_logger
+                .log_backend(LoggerBackendOutcome::MemoryMappingFailed);
+        }
+        result
     }
 
     fn unmap_dynamic_guest_memory_region_with_configured_mapper(
@@ -454,13 +514,18 @@ impl HvfBackend {
     }
 
     pub fn create_gic(&mut self) -> Result<&HvfGicMetadata, HvfGicError> {
-        if !Self::is_supported_target() {
-            return Err(HvfGicError::Unsupported(
+        let logger = self.guest_logger.clone();
+        let result = if !Self::is_supported_target() {
+            Err(HvfGicError::Unsupported(
                 crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
-            ));
+            ))
+        } else {
+            self.create_gic_with_configured_creator(None)
+        };
+        if result.is_err() {
+            logger.log_backend(LoggerBackendOutcome::InterruptDeliveryFailed);
         }
-
-        self.create_gic_with_configured_creator(None)
+        result
     }
 
     /// Create a GIC with one demand-sized, message-only SPI range.
@@ -471,13 +536,18 @@ impl HvfBackend {
         &mut self,
         configuration: HvfGicMsiConfiguration,
     ) -> Result<&HvfGicMetadata, HvfGicError> {
-        if !Self::is_supported_target() {
-            return Err(HvfGicError::Unsupported(
+        let logger = self.guest_logger.clone();
+        let result = if !Self::is_supported_target() {
+            Err(HvfGicError::Unsupported(
                 crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
-            ));
+            ))
+        } else {
+            self.create_gic_with_configured_creator(Some(configuration))
+        };
+        if result.is_err() {
+            logger.log_backend(LoggerBackendOutcome::InterruptDeliveryFailed);
         }
-
-        self.create_gic_with_configured_creator(Some(configuration))
+        result
     }
 
     pub fn gic_metadata(&self) -> Option<&HvfGicMetadata> {
@@ -529,6 +599,15 @@ impl HvfBackend {
     }
 
     pub fn start_vcpu_runner(&mut self) -> Result<HvfVcpuRunner<'_>, HvfVcpuRunnerError> {
+        let logger = self.guest_logger.clone();
+        let result = self.start_vcpu_runner_inner();
+        if result.is_err() {
+            logger.log_backend(LoggerBackendOutcome::VcpuStartFailed);
+        }
+        result
+    }
+
+    fn start_vcpu_runner_inner(&mut self) -> Result<HvfVcpuRunner<'_>, HvfVcpuRunnerError> {
         self.validate_vcpu_runner_start()?;
 
         let tracker = self
@@ -543,6 +622,17 @@ impl HvfBackend {
     }
 
     pub(crate) fn start_session_vcpu_runner<'vm>(
+        &mut self,
+    ) -> Result<HvfVcpuRunner<'vm>, HvfVcpuRunnerError> {
+        let logger = self.guest_logger.clone();
+        let result = self.start_session_vcpu_runner_inner();
+        if result.is_err() {
+            logger.log_backend(LoggerBackendOutcome::VcpuStartFailed);
+        }
+        result
+    }
+
+    fn start_session_vcpu_runner_inner<'vm>(
         &mut self,
     ) -> Result<HvfVcpuRunner<'vm>, HvfVcpuRunnerError> {
         // The session object holds the backend borrow separately; keep this
@@ -564,6 +654,18 @@ impl HvfBackend {
         &mut self,
         vcpu_count: u8,
     ) -> Result<HvfVcpuTopology<'vm>, HvfVcpuTopologyError> {
+        let logger = self.guest_logger.clone();
+        let result = self.start_session_vcpu_topology_inner(vcpu_count);
+        if result.is_err() {
+            logger.log_backend(LoggerBackendOutcome::VcpuStartFailed);
+        }
+        result
+    }
+
+    fn start_session_vcpu_topology_inner<'vm>(
+        &mut self,
+        vcpu_count: u8,
+    ) -> Result<HvfVcpuTopology<'vm>, HvfVcpuTopologyError> {
         // The session object holds the backend borrow separately; keep this
         // constructor crate-private so arbitrary callers cannot outlive the VM.
         self.validate_vcpu_topology_start()?;
@@ -580,6 +682,18 @@ impl HvfBackend {
     /// This internal compatibility prerequisite does not activate multi-vCPU
     /// boot. All runners remain idle until callers explicitly issue commands.
     pub fn start_vcpu_topology(
+        &mut self,
+        vcpu_count: u8,
+    ) -> Result<HvfVcpuTopology<'_>, HvfVcpuTopologyError> {
+        let logger = self.guest_logger.clone();
+        let result = self.start_vcpu_topology_inner(vcpu_count);
+        if result.is_err() {
+            logger.log_backend(LoggerBackendOutcome::VcpuStartFailed);
+        }
+        result
+    }
+
+    fn start_vcpu_topology_inner(
         &mut self,
         vcpu_count: u8,
     ) -> Result<HvfVcpuTopology<'_>, HvfVcpuTopologyError> {
@@ -729,6 +843,11 @@ impl HvfBackend {
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
         self.validate_lazy_guest_memory_mapping_state()?;
+        if let Some(consumer) = consumer.as_mut() {
+            consumer
+                .memory_mut()
+                .attach_guest_logger(self.guest_logger.clone());
+        }
         let handler = HvfLazyGuestFaultHandler::prepare(
             resolver.clone(),
             permissions,
@@ -798,11 +917,12 @@ impl HvfBackend {
 
     fn map_guest_memory_with_host_mappings(
         &mut self,
-        memory: GuestMemory,
+        mut memory: GuestMemory,
         permissions: HvfMemoryPermissions,
         host_mappings: Vec<HvfHostMemoryMapping>,
     ) -> Result<(), HvfGuestMemoryMappingError> {
         self.validate_guest_memory_mapping_state()?;
+        memory.attach_guest_logger(self.guest_logger.clone());
 
         match HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
             memory,
@@ -852,6 +972,7 @@ impl HvfBackend {
             vcpu_topology_started: false,
             memory_mapper,
             gic_creator: Arc::new(RealHvfGicCreator),
+            guest_logger: GuestLogger::default(),
         }
     }
 
@@ -867,6 +988,7 @@ impl HvfBackend {
             vcpu_topology_started: false,
             memory_mapper: Arc::new(RealHvfMemoryMapper),
             gic_creator,
+            guest_logger: GuestLogger::default(),
         }
     }
 }
@@ -915,23 +1037,35 @@ impl VmBackend for HvfBackend {
             return Ok(());
         }
 
-        crate::ffi::create_vm()?;
+        if let Err(source) = crate::ffi::create_vm() {
+            self.guest_logger
+                .log_backend(LoggerBackendOutcome::VmCreationFailed);
+            return Err(source);
+        }
         self.vm_created = true;
         Ok(())
     }
 
     fn destroy_vm(&mut self) -> Result<(), BackendError> {
-        if self.vm_created {
-            if let Some(signaler) = &self.gic_msi_signaler {
-                signaler.deactivate();
-            }
+        if !self.vm_created {
+            return Ok(());
+        }
+        if let Some(signaler) = &self.gic_msi_signaler {
+            signaler.deactivate();
+        }
+        let result = (|| {
             self.unmap_guest_memory()
                 .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
             crate::ffi::destroy_vm()?;
             self.vm_created = false;
             self.clear_vm_owned_state();
+            Ok(())
+        })();
+        if result.is_err() {
+            self.guest_logger
+                .log_backend(LoggerBackendOutcome::VmCleanupFailed);
         }
-        Ok(())
+        result
     }
 }
 
@@ -940,18 +1074,25 @@ impl Drop for HvfBackend {
         if self.vm_created {
             let mut mapping_after_failed_unmap = None;
             let lazy_handler = self.lazy_guest_fault_handler.take();
-            let lazy_consumer = self.lazy_guest_memory_consumer.take();
+            let mut lazy_consumer = self.lazy_guest_memory_consumer.take();
 
             if let Some(signaler) = &self.gic_msi_signaler {
                 signaler.deactivate();
             }
             if let Some(mut mapping) = self.guest_memory.take()
                 && mapping.unmap_all().is_err()
-                && mapping.has_mapped_regions()
             {
-                mapping_after_failed_unmap = Some(mapping);
+                self.guest_logger
+                    .log_backend(LoggerBackendOutcome::MemoryMappingFailed);
+                if mapping.has_mapped_regions() {
+                    mapping_after_failed_unmap = Some(mapping);
+                }
             }
             let vm_destroyed = crate::ffi::destroy_vm().is_ok();
+            if !vm_destroyed {
+                self.guest_logger
+                    .log_backend(LoggerBackendOutcome::VmCleanupFailed);
+            }
             self.vm_created = false;
             self.clear_vm_owned_state();
 
@@ -962,6 +1103,17 @@ impl Drop for HvfBackend {
                 // The VM may still retain stage-two references after both
                 // unmap and destruction fail. Preserve every host and fault
                 // owner rather than releasing memory that HVF may still use.
+                // The logger capability is not part of that safety ownership:
+                // release its producer before intentionally leaking memory so
+                // the process's sole logger worker can still terminate.
+                if let Some(mapping) = mapping_after_failed_unmap.as_mut() {
+                    mapping.clear_guest_logger_before_safety_leak();
+                }
+                if let Some(consumer) = lazy_consumer.as_mut() {
+                    consumer
+                        .memory_mut()
+                        .attach_guest_logger(GuestLogger::default());
+                }
                 std::mem::forget(mapping_after_failed_unmap);
                 std::mem::forget(lazy_handler);
                 std::mem::forget(lazy_consumer);

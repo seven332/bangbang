@@ -5,6 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
 };
@@ -3136,6 +3137,7 @@ pub struct VirtioNetworkDevice {
     pending_rate_limited_rx_queue: bool,
     pending_rate_limited_tx_queue: bool,
     metrics: Option<VirtioNetworkTransportMetrics>,
+    guest_logger: Option<GuestLogger>,
 }
 
 impl PartialEq for VirtioNetworkDevice {
@@ -3178,6 +3180,7 @@ impl VirtioNetworkDevice {
             pending_rate_limited_rx_queue: false,
             pending_rate_limited_tx_queue: false,
             metrics: None,
+            guest_logger: None,
         }
     }
 
@@ -3206,6 +3209,7 @@ impl VirtioNetworkDevice {
             pending_rate_limited_rx_queue: false,
             pending_rate_limited_tx_queue,
             metrics: None,
+            guest_logger: None,
         })
     }
 
@@ -3570,6 +3574,14 @@ impl VirtioNetworkDevice {
         self.pending_rate_limited_tx_queue = false;
     }
 
+    fn log_rate_limiter_rejection(&self, rejected: bool) {
+        if rejected && let Some(logger) = &self.guest_logger {
+            logger.log_transport(LoggerTransportOutcome::RateLimiterRejected(
+                LoggerDeviceKind::Network,
+            ));
+        }
+    }
+
     fn dispatch_drained_queue_notifications_with_tx_sink(
         &mut self,
         memory: &mut GuestMemory,
@@ -3678,6 +3690,7 @@ impl VirtioNetworkDevice {
                 Ok(dispatch) => {
                     self.pending_rate_limited_rx_queue =
                         dispatch.rate_limiter_throttled_packets() != 0;
+                    self.log_rate_limiter_rejection(self.pending_rate_limited_rx_queue);
                     Some(dispatch)
                 }
                 Err(source) => {
@@ -3704,6 +3717,7 @@ impl VirtioNetworkDevice {
                 Ok(dispatch) => {
                     self.pending_rate_limited_tx_queue =
                         dispatch.rate_limiter_throttled_frames() != 0;
+                    self.log_rate_limiter_rejection(self.pending_rate_limited_tx_queue);
                     Some(dispatch)
                 }
                 Err(source) => {
@@ -3733,6 +3747,7 @@ impl VirtioNetworkDevice {
                 Ok(dispatch) => {
                     self.pending_rate_limited_rx_queue =
                         dispatch.rate_limiter_throttled_packets() != 0;
+                    self.log_rate_limiter_rejection(self.pending_rate_limited_rx_queue);
                     Some(dispatch)
                 }
                 Err(source) => {
@@ -6475,6 +6490,10 @@ fn network_queue_interrupts(
 }
 
 impl VirtioMmioDeviceActivationHandler for VirtioNetworkDevice {
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = Some(logger);
+    }
+
     fn activate(
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,

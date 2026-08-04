@@ -12,6 +12,7 @@ use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::boot::canonical_process_root_block_command_line;
 use bangbang_runtime::fdt::{ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET, Arm64FdtPciHost};
 use bangbang_runtime::interrupt::GuestInterruptLine;
+use bangbang_runtime::logger::{GuestLogger, LoggerBackendOutcome};
 use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange, aarch64,
 };
@@ -80,6 +81,7 @@ use crate::snapshot_v2_storage_platform::{
 use crate::startup::{
     HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage,
     HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError, PCI_ENDPOINT_SLOT_COUNT,
+    backend_outcome_for_run_step_error, backend_outcome_for_run_step_outcome,
     capture_hvf_snapshot_v2_time_state, pci_root_restore_bar_region_id,
     pci_root_restore_gic_msi_configuration, replace_vmgenid_and_signal_with,
     update_vmclock_and_signal_with,
@@ -338,12 +340,21 @@ impl std::error::Error for PrepareHvfSnapshotV2RootPlanError {
 /// Closed fresh-output shell accepted by native-v2 process reconstruction.
 pub struct HvfSnapshotV2DefaultProcessShell {
     serial_output: SharedSerialOutput,
+    guest_logger: GuestLogger,
 }
 
 impl HvfSnapshotV2DefaultProcessShell {
     /// Bind one fresh destination output to the canonical process UART.
-    pub const fn new(serial_output: SharedSerialOutput) -> Self {
-        Self { serial_output }
+    pub fn new(serial_output: SharedSerialOutput) -> Self {
+        Self {
+            serial_output,
+            guest_logger: GuestLogger::default(),
+        }
+    }
+
+    pub fn with_guest_logger(mut self, logger: GuestLogger) -> Self {
+        self.guest_logger = logger;
+        self
     }
 }
 
@@ -361,12 +372,21 @@ impl fmt::Debug for HvfSnapshotV2DefaultProcessShell {
 #[doc(hidden)]
 pub struct HvfSnapshotV2RestoredSerialShell {
     serial: SerialMmioDevice<SharedSerialOutput>,
+    guest_logger: GuestLogger,
 }
 
 impl HvfSnapshotV2RestoredSerialShell {
     /// Bind one complete restored UART to destination platform placement.
-    pub const fn new(serial: SerialMmioDevice<SharedSerialOutput>) -> Self {
-        Self { serial }
+    pub fn new(serial: SerialMmioDevice<SharedSerialOutput>) -> Self {
+        Self {
+            serial,
+            guest_logger: GuestLogger::default(),
+        }
+    }
+
+    pub fn with_guest_logger(mut self, logger: GuestLogger) -> Self {
+        self.guest_logger = logger;
+        self
     }
 }
 
@@ -415,6 +435,15 @@ impl HvfSnapshotV2SerialOnlyProcessConfig {
 enum HvfSnapshotV2ProcessSerialShell {
     Default(HvfSnapshotV2DefaultProcessShell),
     Restored(HvfSnapshotV2RestoredSerialShell),
+}
+
+impl HvfSnapshotV2ProcessSerialShell {
+    fn guest_logger(&self) -> GuestLogger {
+        match self {
+            Self::Default(shell) => shell.guest_logger.clone(),
+            Self::Restored(shell) => shell.guest_logger.clone(),
+        }
+    }
 }
 
 impl From<HvfSnapshotV2DefaultProcessShell> for HvfSnapshotV2ProcessSerialShell {
@@ -563,6 +592,26 @@ enum HvfSnapshotV2ProcessShellRestore<'a> {
         shell: HvfSnapshotV2ProcessSerialShell,
         plan: HvfSnapshotV2StoragePciShellPlan<'a>,
     },
+}
+
+impl HvfSnapshotV2ProcessShellRestore<'_> {
+    fn guest_logger(&self) -> GuestLogger {
+        match self {
+            Self::DeviceFree(shell)
+            | Self::SerialOnly { shell, .. }
+            | Self::SerialEntropyMmio { shell, .. }
+            | Self::Root { shell, .. }
+            | Self::MultiBlockMmio { shell, .. }
+            | Self::MultiBlockPci { shell, .. }
+            | Self::StorageMmio { shell, .. }
+            | Self::StorageEntropyMmio { shell, .. }
+            | Self::BalloonMmio { shell, .. }
+            | Self::MemoryHotplugMmio { shell, .. }
+            | Self::NetworkMmio { shell, .. }
+            | Self::NetworkPci { shell, .. }
+            | Self::StoragePci { shell, .. } => shell.guest_logger(),
+        }
+    }
 }
 
 enum HvfSnapshotV2ProcessBlockFdtPlan<'a> {
@@ -1323,13 +1372,28 @@ impl RestoredHvfSnapshotV2Platform {
         &mut self,
         entry_is_valid: impl FnMut(u64) -> bool,
     ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
-        self.parts_mut().runner.run_step(entry_is_valid)
+        let result = self.parts_mut().runner.run_step(entry_is_valid);
+        let logger_outcome = match &result {
+            Ok(outcome) => backend_outcome_for_run_step_outcome(outcome),
+            Err(error) => backend_outcome_for_run_step_error(error),
+        };
+        if let Some(outcome) = logger_outcome {
+            self.parts().backend.guest_logger().log_backend(outcome);
+        }
+        result
     }
 
     /// Set the last stepped member's PPI pending bit.
     #[doc(hidden)]
     pub fn set_last_step_ppi_pending(&self, intid: u32) -> Result<(), HvfArm64BootVcpuError> {
-        self.parts().runner.set_last_step_ppi_pending(intid)
+        let result = self.parts().runner.set_last_step_ppi_pending(intid);
+        if result.is_err() {
+            self.parts()
+                .backend
+                .guest_logger()
+                .log_backend(LoggerBackendOutcome::VirtualTimerFailed);
+        }
+        result
     }
 
     /// Borrow already-authorized destination guest memory.
@@ -1808,6 +1872,10 @@ fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
     process_shell: Option<HvfSnapshotV2ProcessShellRestore<'_>>,
     mapping: HvfSnapshotV2MemoryMappingRestore<'_>,
 ) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    let guest_logger = process_shell
+        .as_ref()
+        .map(HvfSnapshotV2ProcessShellRestore::guest_logger)
+        .unwrap_or_default();
     debug_assert!(cleanup_sequence(RestoreOwnership::Empty).is_empty());
     let mut cleanup = Vec::new();
     if cleanup.try_reserve_exact(2).is_err() {
@@ -1881,6 +1949,7 @@ fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
     let destination_cache = match HvfBackend::arm64_vcpu_cache_manifest() {
         Ok(destination_cache) => destination_cache,
         Err(source) => {
+            guest_logger.log_backend(LoggerBackendOutcome::CacheConfigurationFailed);
             return Err(HvfSnapshotV2PlatformRestoreError::new(
                 HvfSnapshotV2PlatformRestoreStage::Preflight,
                 HvfSnapshotV2PlatformRestoreFailure::CacheQuery(source),
@@ -1900,6 +1969,7 @@ fn restore_hvf_snapshot_v2_platform_with_shell_and_mapping(
     let (compatibility, global_gic) = global.into_parts();
     let (mut vmgenid_device, mut vmclock_device) = prepared_time_identity.into_parts();
     let mut backend = HvfBackend::new();
+    backend.attach_guest_logger(guest_logger);
     let mut topology: Option<HvfVcpuTopology<'static>> = None;
 
     if let Err(source) = <HvfBackend as VmBackend>::create_vm(&mut backend) {
@@ -2741,6 +2811,7 @@ fn prepare_process_shell(
     let Some(shell_restore) = shell else {
         return Ok((dispatcher, None));
     };
+    dispatcher.attach_guest_logger(shell_restore.guest_logger());
 
     let gic = state.global().compatibility().gic_metadata();
     if state.time().rtc_layout()

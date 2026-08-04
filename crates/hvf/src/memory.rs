@@ -1307,6 +1307,14 @@ struct HvfGuestMemoryMappingState {
 }
 
 impl HvfGuestMemoryMapping {
+    /// Drop the guest logger producer before this owner must be intentionally
+    /// retained after an unsafe unmap failure.
+    pub(crate) fn clear_guest_logger_before_safety_leak(&mut self) {
+        if let Some(memory) = self.memory.as_mut() {
+            memory.attach_guest_logger(Default::default());
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn map_with_mapper(
         memory: GuestMemory,
@@ -2681,6 +2689,7 @@ fn hvf_mutation_rollback_error(
 impl Drop for HvfGuestMemoryMapping {
     fn drop(&mut self) {
         if self.unmap_all().is_err() && self.has_mapped_regions() {
+            self.clear_guest_logger_before_safety_leak();
             if let Some(memory) = self.memory.take() {
                 std::mem::forget(memory);
             }

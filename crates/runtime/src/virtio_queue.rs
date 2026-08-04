@@ -4,6 +4,7 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::sync::atomic::{Ordering, fence};
 
+use crate::logger::LoggerTransportOutcome;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange};
 
 pub const VIRTQUEUE_DESCRIPTOR_SIZE: usize = 16;
@@ -719,6 +720,25 @@ impl VirtqueueUsedRing {
     }
 
     pub(crate) fn publish_used_elements_with_notification(
+        &mut self,
+        memory: &mut GuestMemory,
+        elements: &[(u16, u32)],
+        notification_suppression: VirtqueueNotificationSuppression,
+    ) -> Result<VirtqueueUsedRingPublication, VirtqueueUsedRingError> {
+        let result = self.publish_used_elements_without_observation(
+            memory,
+            elements,
+            notification_suppression,
+        );
+        if result.is_err() {
+            memory
+                .guest_logger()
+                .log_transport(LoggerTransportOutcome::UsedRingRejected(None));
+        }
+        result
+    }
+
+    fn publish_used_elements_without_observation(
         &mut self,
         memory: &mut GuestMemory,
         elements: &[(u16, u32)],
@@ -1737,6 +1757,8 @@ fn parse_raw_descriptor(bytes: [u8; VIRTQUEUE_DESCRIPTOR_SIZE]) -> RawVirtqueueD
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
 
     use super::{
         VIRTQUEUE_AVAILABLE_RING_ALIGNMENT, VIRTQUEUE_AVAILABLE_RING_ENTRY_SIZE_U64,
@@ -1751,6 +1773,7 @@ mod tests {
         read_descriptor_chain, read_descriptor_chain_with_options,
         virtqueue_event_idx_needs_notification,
     };
+    use crate::logger::LoggerState;
     use crate::memory::{
         GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryLayout, GuestMemoryRange,
     };
@@ -1759,6 +1782,23 @@ mod tests {
     const AVAIL: GuestAddress = GuestAddress::new(0x2000);
     const USED: GuestAddress = GuestAddress::new(0x2800);
     const INDIRECT_TABLE: GuestAddress = GuestAddress::new(0x3000);
+
+    #[derive(Debug)]
+    struct RecordingLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("logger output lock should succeed")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn guest_memory(size: u64) -> GuestMemory {
         let range = GuestMemoryRange::new(GuestAddress::new(0), size)
@@ -2685,6 +2725,11 @@ mod tests {
     #[test]
     fn rejects_invalid_descriptor_head_without_advancing_or_writing() {
         let mut memory = guest_memory(0x4000);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut logger_state = LoggerState::default();
+        logger_state.configure_test_writer(RecordingLogWriter(output.clone()));
+        let logger = logger_state.guest_logger();
+        memory.attach_guest_logger(logger.clone());
         let mut queue =
             VirtqueueUsedRing::with_next_used(USED, 8, 3).expect("used ring should be valid");
 
@@ -2711,6 +2756,16 @@ mod tests {
 
         let entry = used_ring_entry_address(USED, 3);
         assert_eq!(read_u32_field(&memory, entry), 0);
+        assert!(logger.wait_for_delivery_for_test());
+        let log = String::from_utf8(
+            output
+                .lock()
+                .expect("logger output lock should succeed")
+                .clone(),
+        )
+        .expect("logger output should remain UTF-8");
+        assert!(log.contains("operation=used-ring outcome=rejected\n"));
+        assert!(!log.contains("descriptor_head=8"));
         assert_eq!(
             read_u32_field(
                 &memory,

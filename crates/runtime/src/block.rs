@@ -24,6 +24,7 @@ use bangbang_vhost_user::{
     create_call_notifier, create_kick_notifier,
 };
 
+use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking, GuestMemoryError,
     GuestMemoryRange, GuestMemoryRegionBacking, GuestMemorySharedBacking,
@@ -6022,6 +6023,7 @@ pub struct VirtioBlockDevice {
     backend: VirtioBlockBackend,
     device_id: VirtioBlockDeviceId,
     pending_rate_limited_queue: bool,
+    guest_logger: Option<GuestLogger>,
 }
 
 impl VirtioBlockDevice {
@@ -6035,6 +6037,7 @@ impl VirtioBlockDevice {
             },
             device_id,
             pending_rate_limited_queue: false,
+            guest_logger: None,
         }
     }
 
@@ -6060,6 +6063,7 @@ impl VirtioBlockDevice {
             }),
             device_id,
             pending_rate_limited_queue: false,
+            guest_logger: None,
         })
     }
 
@@ -6090,6 +6094,7 @@ impl VirtioBlockDevice {
             },
             device_id,
             pending_rate_limited_queue,
+            guest_logger: None,
         }
     }
 
@@ -6739,6 +6744,13 @@ impl VirtioBlockDevice {
                         .and_then(VirtioBlockQueueDispatch::rate_limiter_retry_after),
                 }
                 .is_some();
+                if self.pending_rate_limited_queue
+                    && let Some(logger) = &self.guest_logger
+                {
+                    logger.log_transport(LoggerTransportOutcome::RateLimiterRejected(
+                        LoggerDeviceKind::Block,
+                    ));
+                }
                 result
             }
             VirtioBlockBackend::VhostUser(backend) => {
@@ -7625,6 +7637,14 @@ impl PreparedBlockDevices {
     ) -> Result<BlockMmioDevices, BlockMmioRegistrationError> {
         BlockMmioDevices::from_prepared(self, layout)
     }
+
+    pub(crate) fn register_mmio_with_dispatcher(
+        self,
+        layout: BlockMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<BlockMmioDevices, BlockMmioRegistrationError> {
+        BlockMmioDevices::from_prepared_with_dispatcher(self, layout, dispatcher)
+    }
 }
 
 #[derive(Debug)]
@@ -7890,6 +7910,14 @@ impl BlockMmioDevices {
         prepared: PreparedBlockDevices,
         layout: BlockMmioLayout,
     ) -> Result<Self, BlockMmioRegistrationError> {
+        Self::from_prepared_with_dispatcher(prepared, layout, MmioDispatcher::new())
+    }
+
+    fn from_prepared_with_dispatcher(
+        prepared: PreparedBlockDevices,
+        layout: BlockMmioLayout,
+        mut dispatcher: MmioDispatcher,
+    ) -> Result<Self, BlockMmioRegistrationError> {
         layout.validate()?;
 
         let prepared_devices = prepared.into_vec();
@@ -7905,7 +7933,6 @@ impl BlockMmioDevices {
             placements.push(layout.placement(index)?);
         }
 
-        let mut dispatcher = MmioDispatcher::new();
         for (prepared_device, placement) in prepared_devices.into_iter().zip(placements) {
             let (drive_id, _is_root_device, config_space, device) = prepared_device.into_parts();
             let handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
@@ -8677,6 +8704,10 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
 }
 
 impl VirtioMmioDeviceActivationHandler for VirtioBlockDevice {
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = Some(logger);
+    }
+
     fn activate(
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,

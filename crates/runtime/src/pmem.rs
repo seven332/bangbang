@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryLayout,
     GuestMemoryRange, aarch64,
@@ -1279,6 +1280,7 @@ pub struct VirtioPmemDevice {
     file_len: u64,
     rate_limiter: Option<VirtioPmemRateLimiter>,
     pending_rate_limited_queue: bool,
+    guest_logger: Option<GuestLogger>,
 }
 
 impl VirtioPmemDevice {
@@ -1288,6 +1290,7 @@ impl VirtioPmemDevice {
             file_len: 0,
             rate_limiter: None,
             pending_rate_limited_queue: false,
+            guest_logger: None,
         }
     }
 
@@ -1306,6 +1309,7 @@ impl VirtioPmemDevice {
             rate_limiter: rate_limiter
                 .and_then(|rate_limiter| VirtioPmemRateLimiter::new_at(rate_limiter, now)),
             pending_rate_limited_queue: false,
+            guest_logger: None,
         }
     }
 
@@ -1338,6 +1342,7 @@ impl VirtioPmemDevice {
             file_len,
             rate_limiter,
             pending_rate_limited_queue,
+            guest_logger: None,
         })
     }
 
@@ -1485,6 +1490,11 @@ impl VirtioPmemDevice {
         {
             admission_dispatch.record_rate_limiter_throttle(retry_after);
             self.pending_rate_limited_queue = true;
+            if let Some(logger) = &self.guest_logger {
+                logger.log_transport(LoggerTransportOutcome::RateLimiterRejected(
+                    LoggerDeviceKind::Pmem,
+                ));
+            }
             return Ok(VirtioPmemDeviceNotificationDispatch::new(
                 drained_notifications,
                 Some(admission_dispatch),
@@ -1719,6 +1729,10 @@ impl VirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice> {
 }
 
 impl VirtioMmioDeviceActivationHandler for VirtioPmemDevice {
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = Some(logger);
+    }
+
     fn activate(
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,

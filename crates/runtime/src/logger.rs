@@ -25,13 +25,16 @@ use rate_limiter::{LogRateLimitDecision, LoggerRateLimitIdentity, LoggerRateLimi
 
 pub use event::{
     LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute,
-    LoggerApiWorkerOutcome, LoggerDeviceKind, LoggerHttpMethod, LoggerLifecycleOutcome,
-    LoggerObservabilityOutcome, LoggerProcessSignalOutcome, LoggerSnapshotOutcome, PanicLogRecords,
-    ProcessStartupOutcome, ProcessTerminalCategory,
+    LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerDeviceKind, LoggerHttpMethod,
+    LoggerLifecycleOutcome, LoggerObservabilityOutcome, LoggerProcessSignalOutcome,
+    LoggerSnapshotOutcome, LoggerTransportOutcome, PanicLogRecords, ProcessStartupOutcome,
+    ProcessTerminalCategory,
 };
 pub use process_stdout::{ProcessStdoutLogger, ProcessStdoutLoggerError};
 
 const BOOT_TIMER_LOG_MODULE: &str = "bangbang_runtime::boot_timer";
+const BACKEND_LOG_MODULE: &str = "bangbang_hvf::backend";
+const DEVICE_LOG_MODULE: &str = "bangbang_runtime::device";
 const API_REQUEST_LOG_MODULE: &str = "bangbang_runtime::api_server";
 const MINIMAL_ACTION_LOG_MODULE: &str = "bangbang_runtime::vmm_action";
 const PROCESS_LOG_MODULE: &str = "bangbang::process";
@@ -443,6 +446,53 @@ struct ObservabilityWorkerLogRateLimiter {
     inner: LoggerRateLimiters,
 }
 
+#[derive(Debug, Clone, Default)]
+struct BackendOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+    virtual_timer_activation_logged: Arc<AtomicBool>,
+}
+
+impl BackendOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+            virtual_timer_activation_logged: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner.check(LoggerRateLimitIdentity::BackendOutcome)
+    }
+
+    /// Coalesces the repeating successful timer exit before it can consume the
+    /// bounded backend budget needed by a later terminal vCPU outcome.
+    fn should_log(&self, outcome: LoggerBackendOutcome) -> bool {
+        !matches!(outcome, LoggerBackendOutcome::VirtualTimerActivated)
+            || !self
+                .virtual_timer_activation_logged
+                .swap(true, Ordering::AcqRel)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TransportOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl TransportOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner.check(LoggerRateLimitIdentity::TransportOutcome)
+    }
+}
+
 impl ObservabilityWorkerLogRateLimiter {
     #[cfg(test)]
     fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
@@ -616,6 +666,138 @@ impl AsyncLogger {
     }
 }
 
+/// Narrow, cloneable admission capability for guest-triggerable backend and
+/// generic device transport events.
+///
+/// This snapshot exposes no writer, mutable configuration, retry, wait, or
+/// delivery-receipt surface. Every production method accepts only a closed
+/// semantic outcome and makes at most one nonblocking delivery attempt.
+#[derive(Clone, Default)]
+pub struct GuestLogger {
+    inner: Arc<GuestLoggerInner>,
+}
+
+#[derive(Default)]
+struct GuestLoggerInner {
+    producer: Option<LoggerProducer>,
+    level: LoggerLevel,
+    show_level: bool,
+    show_log_origin: bool,
+    module: Option<String>,
+    metrics: SharedLoggerMetrics,
+    backend_rate_limiter: BackendOutcomeLogRateLimiter,
+    transport_rate_limiter: TransportOutcomeLogRateLimiter,
+}
+
+impl fmt::Debug for GuestLogger {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestLogger")
+            .field("producer", &self.inner.producer.as_ref().map(|_| "<owned>"))
+            .field("level", &self.inner.level)
+            .field("show_level", &self.inner.show_level)
+            .field("show_log_origin", &self.inner.show_log_origin)
+            .field("module", &self.inner.module.as_ref().map(|_| "<redacted>"))
+            .field("metrics", &self.inner.metrics)
+            .field("backend_rate_limiter", &self.inner.backend_rate_limiter)
+            .field("transport_rate_limiter", &self.inner.transport_rate_limiter)
+            .finish()
+    }
+}
+
+impl GuestLogger {
+    #[track_caller]
+    pub fn log_backend(&self, outcome: LoggerBackendOutcome) {
+        let level = outcome.level();
+        if !self.inner.level.allows(level)
+            || !module_filter_allows(self.inner.module.as_deref(), BACKEND_LOG_MODULE)
+            || self.inner.producer.is_none()
+            || !self.inner.backend_rate_limiter.should_log(outcome)
+        {
+            return;
+        }
+        self.log_limited(
+            level,
+            BACKEND_LOG_MODULE,
+            LoggerEvent::Backend(outcome),
+            || self.inner.backend_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub fn log_transport(&self, outcome: LoggerTransportOutcome) {
+        if !self.transport_outcome_enabled(outcome) {
+            return;
+        }
+        self.log_limited(
+            outcome.level(),
+            DEVICE_LOG_MODULE,
+            LoggerEvent::Transport(outcome),
+            || self.inner.transport_rate_limiter.check(),
+        );
+    }
+
+    pub(crate) fn transport_outcome_enabled(&self, outcome: LoggerTransportOutcome) -> bool {
+        self.inner.level.allows(outcome.level())
+            && module_filter_allows(self.inner.module.as_deref(), DEVICE_LOG_MODULE)
+            && self.inner.producer.is_some()
+    }
+
+    #[track_caller]
+    fn log_limited(
+        &self,
+        level: LoggerLevel,
+        module: &str,
+        event: LoggerEvent,
+        check_limiter: impl FnOnce() -> LogRateLimitDecision,
+    ) {
+        if !self.inner.level.allows(level)
+            || !module_filter_allows(self.inner.module.as_deref(), module)
+        {
+            return;
+        }
+        let Some(producer) = &self.inner.producer else {
+            return;
+        };
+        let suppressed = match check_limiter() {
+            LogRateLimitDecision::Admitted { suppressed } => suppressed,
+            LogRateLimitDecision::Denied => {
+                self.inner.metrics.record_rate_limited_log();
+                return;
+            }
+        };
+        let origin = LogOrigin::from(Location::caller());
+        let outcome = LogRecord::encode(
+            self.inner.show_level,
+            self.inner.show_log_origin,
+            origin,
+            level,
+            event,
+        );
+        let batch = if suppressed == 0 {
+            LogBatch::one(outcome)
+        } else {
+            let recovery = LogRecord::encode(
+                self.inner.show_level,
+                self.inner.show_log_origin,
+                origin,
+                LoggerLevel::Warn,
+                LoggerEvent::RateLimitRecovery { suppressed },
+            );
+            LogBatch::two(recovery, outcome)
+        };
+        let _delivered = producer.deliver_nonblocking(batch);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_delivery_for_test(&self) -> bool {
+        self.inner
+            .producer
+            .as_ref()
+            .is_none_or(LoggerProducer::wait_for_idle_for_test)
+    }
+}
+
 pub struct LoggerState {
     delivery: Option<LoggerDelivery>,
     level: LoggerLevel,
@@ -627,6 +809,8 @@ pub struct LoggerState {
     emergency_logger: EmergencyLogger,
     boot_timer_rate_limiter: BootTimerLogRateLimiter,
     observability_rate_limiter: ObservabilityWorkerLogRateLimiter,
+    backend_rate_limiter: BackendOutcomeLogRateLimiter,
+    transport_rate_limiter: TransportOutcomeLogRateLimiter,
     delivery_config: LoggerDeliveryConfig,
 }
 
@@ -645,6 +829,8 @@ impl fmt::Debug for LoggerState {
                 "observability_rate_limiter",
                 &self.observability_rate_limiter,
             )
+            .field("backend_rate_limiter", &self.backend_rate_limiter)
+            .field("transport_rate_limiter", &self.transport_rate_limiter)
             .field("delivery_config", &self.delivery_config)
             .finish()
     }
@@ -687,6 +873,8 @@ impl LoggerState {
             emergency_logger,
             boot_timer_rate_limiter: BootTimerLogRateLimiter::default(),
             observability_rate_limiter: ObservabilityWorkerLogRateLimiter::default(),
+            backend_rate_limiter: BackendOutcomeLogRateLimiter::default(),
+            transport_rate_limiter: TransportOutcomeLogRateLimiter::default(),
             delivery_config: LoggerDeliveryConfig::default(),
         }
     }
@@ -977,6 +1165,21 @@ impl LoggerState {
         }
     }
 
+    pub fn guest_logger(&self) -> GuestLogger {
+        GuestLogger {
+            inner: Arc::new(GuestLoggerInner {
+                producer: self.delivery.as_ref().map(LoggerDelivery::producer),
+                level: self.level,
+                show_level: self.show_level,
+                show_log_origin: self.show_log_origin,
+                module: self.module.clone(),
+                metrics: self.metrics.clone(),
+                backend_rate_limiter: self.backend_rate_limiter.clone(),
+                transport_rate_limiter: self.transport_rate_limiter.clone(),
+            }),
+        }
+    }
+
     #[track_caller]
     pub fn log_lifecycle(&self, outcome: LoggerLifecycleOutcome) -> bool {
         let level = outcome.level();
@@ -1084,14 +1287,16 @@ mod tests {
 
     use super::delivery::WorkerObserver;
     use super::{
-        BootTimerLogRateLimiter, LogRateLimitDecision, LogRateLimiterClock, LoggerAction,
-        LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute, LoggerApiWorkerOutcome,
-        LoggerConfigError, LoggerConfigInput, LoggerDeliveryConfig, LoggerDeviceKind,
-        LoggerHttpMethod, LoggerLevel, LoggerLifecycleOutcome, LoggerObservabilityOutcome,
-        LoggerProcessSignalOutcome, LoggerSnapshotOutcome, LoggerState,
+        BackendOutcomeLogRateLimiter, BootTimerLogRateLimiter, GuestLogger, LogRateLimitDecision,
+        LogRateLimiterClock, LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome,
+        LoggerApiRoute, LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerConfigError,
+        LoggerConfigInput, LoggerDeliveryConfig, LoggerDeviceKind, LoggerHttpMethod, LoggerLevel,
+        LoggerLifecycleOutcome, LoggerObservabilityOutcome, LoggerProcessSignalOutcome,
+        LoggerSnapshotOutcome, LoggerState, LoggerTransportOutcome,
         ObservabilityWorkerLogRateLimiter, ProcessStartupOutcome, ProcessTerminalCategory,
-        SharedLoggerMetrics,
+        SharedLoggerMetrics, TransportOutcomeLogRateLimiter,
     };
+    use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1399,6 +1604,257 @@ mod tests {
                 "operation=metrics-worker outcome=failed\n",
             )
         );
+    }
+
+    #[test]
+    fn guest_logger_clone_reuses_one_immutable_snapshot() {
+        let state = LoggerState::default();
+        let logger = state.guest_logger();
+        let cloned = logger.clone();
+        let refreshed = state.guest_logger();
+
+        assert!(Arc::ptr_eq(&logger.inner, &cloned.inner));
+        assert!(!Arc::ptr_eq(&logger.inner, &refreshed.inner));
+    }
+
+    #[test]
+    fn guest_memory_can_release_logger_before_intentional_owner_retention() {
+        let observer = Arc::new(WorkerObserver::default());
+        let mut state = LoggerState::default();
+        state.set_delivery_config_for_test(
+            LoggerDeliveryConfig::for_test(2, Duration::from_millis(10))
+                .with_worker_observer(observer.clone()),
+        );
+        state.configure_test_writer(SharedWriter(Arc::new(Mutex::new(Vec::new()))));
+        wait_for(|| observer.active() == 1);
+        let range = GuestMemoryRange::new(GuestAddress::new(0), 0x4000)
+            .expect("guest-memory range should be valid");
+        let layout = GuestMemoryLayout::new(vec![range]).expect("layout should be valid");
+        let mut memory = GuestMemory::allocate(&layout).expect("guest memory should allocate");
+        memory.attach_guest_logger(state.guest_logger());
+
+        drop(state);
+        assert_eq!(observer.active(), 1);
+
+        memory.attach_guest_logger(GuestLogger::default());
+        wait_for(|| observer.active() == 0);
+    }
+
+    #[test]
+    fn guest_logger_uses_closed_backend_and_transport_shapes() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut state = LoggerState::default();
+        state.configure_test_writer(SharedWriter(output.clone()));
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_level(LoggerLevel::Debug)
+                    .with_show_level(true),
+            )
+            .expect("guest logger prefix should configure");
+        let logger = state.guest_logger();
+
+        logger.log_backend(LoggerBackendOutcome::VcpuExitGuestReset);
+        logger.log_backend(LoggerBackendOutcome::VirtualTimerActivated);
+        logger.log_transport(LoggerTransportOutcome::DeviceActivationSucceeded(
+            LoggerDeviceKind::Block,
+        ));
+        logger.log_transport(LoggerTransportOutcome::MmioRegistrationSucceeded);
+        assert!(logger.wait_for_delivery_for_test());
+
+        assert_eq!(
+            String::from_utf8(output.lock().expect("output lock should succeed").clone())
+                .expect("guest logger output should be UTF-8"),
+            concat!(
+                "level=Info operation=vcpu-exit outcome=guest-reset\n",
+                "level=Debug operation=virtual-timer outcome=activated\n",
+                "level=Info device-kind=block operation=device-activation outcome=succeeded\n",
+                "level=Debug operation=mmio-registration outcome=succeeded\n",
+            )
+        );
+    }
+
+    #[test]
+    fn guest_logger_coalesces_virtual_timer_activation_before_terminal_backend_outcome() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(SharedWriter(output.clone()));
+        state
+            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Debug))
+            .expect("debug logger should configure");
+        let first = state.guest_logger();
+        let second = state.guest_logger();
+
+        for index in 0..20 {
+            if index % 2 == 0 {
+                first.log_backend(LoggerBackendOutcome::VirtualTimerActivated);
+            } else {
+                second.log_backend(LoggerBackendOutcome::VirtualTimerActivated);
+            }
+        }
+        second.log_backend(LoggerBackendOutcome::VcpuExitGuestShutdown);
+        assert!(second.wait_for_delivery_for_test());
+
+        let output = String::from_utf8(output.lock().expect("output lock should succeed").clone())
+            .expect("guest logger output should be UTF-8");
+        assert_eq!(
+            output
+                .matches("operation=virtual-timer outcome=activated\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            output
+                .matches("operation=vcpu-exit outcome=guest-shutdown\n")
+                .count(),
+            1
+        );
+        assert_eq!(metrics.rate_limited_log_count(), 0);
+    }
+
+    #[test]
+    fn guest_logger_filters_before_independent_limiters_and_recovers_exactly() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let metrics = SharedLoggerMetrics::default();
+        let clock = Arc::new(TestClock::default());
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.backend_rate_limiter = BackendOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.transport_rate_limiter = TransportOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.configure_test_writer(SharedWriter(output.clone()));
+        state
+            .configure(LoggerConfigInput::new().with_module("bangbang_runtime::device"))
+            .expect("transport module filter should configure");
+
+        let filtered = state.guest_logger();
+        for _ in 0..20 {
+            filtered.log_backend(LoggerBackendOutcome::VcpuRunFailed);
+        }
+        filtered.log_transport(LoggerTransportOutcome::DeviceActivationSucceeded(
+            LoggerDeviceKind::Entropy,
+        ));
+
+        state
+            .configure(LoggerConfigInput::new().with_module("bangbang_hvf::backend"))
+            .expect("backend module filter should configure");
+        let backend = state.guest_logger();
+        for _ in 0..10 {
+            backend.log_backend(LoggerBackendOutcome::VcpuRunFailed);
+        }
+        backend.log_backend(LoggerBackendOutcome::VcpuRunFailed);
+        assert_eq!(metrics.rate_limited_log_count(), 1);
+
+        clock.set(500);
+        backend.log_backend(LoggerBackendOutcome::VcpuRunFailed);
+        assert!(backend.wait_for_delivery_for_test());
+        let output = String::from_utf8(output.lock().expect("output lock should succeed").clone())
+            .expect("guest logger output should be UTF-8");
+        assert_eq!(
+            output
+                .matches("operation=vcpu-run outcome=failed\n")
+                .count(),
+            11
+        );
+        assert_eq!(
+            output
+                .matches("device-kind=entropy operation=device-activation outcome=succeeded\n")
+                .count(),
+            1
+        );
+        assert!(output.contains("1 messages were suppressed due to rate limiting\n"));
+    }
+
+    #[test]
+    fn guest_logger_delivery_failure_is_observational_and_counted() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(FailingWriter);
+        let logger = state.guest_logger();
+
+        logger.log_backend(LoggerBackendOutcome::MemoryMappingFailed);
+        logger.log_transport(LoggerTransportOutcome::MmioAccessFailed(Some(
+            LoggerDeviceKind::Vsock,
+        )));
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(metrics.missed_log_count(), 2);
+    }
+
+    #[test]
+    fn guest_logger_snapshot_follows_failure_atomic_writer_replacement() {
+        let first = Arc::new(Mutex::new(Vec::new()));
+        let second = Arc::new(Mutex::new(Vec::new()));
+        let mut state = LoggerState::default();
+        state.configure_test_writer(SharedWriter(first.clone()));
+        let logger = state.guest_logger();
+
+        logger.log_backend(LoggerBackendOutcome::VcpuExitGuestShutdown);
+        assert!(logger.wait_for_delivery_for_test());
+        state.configure_test_writer(SharedWriter(second.clone()));
+        logger.log_transport(LoggerTransportOutcome::DeviceActivationSucceeded(
+            LoggerDeviceKind::Block,
+        ));
+        assert!(logger.wait_for_delivery_for_test());
+
+        assert_eq!(
+            *first.lock().expect("first output lock should succeed"),
+            b"operation=vcpu-exit outcome=guest-shutdown\n"
+        );
+        assert_eq!(
+            *second.lock().expect("second output lock should succeed"),
+            b"device-kind=block operation=device-activation outcome=succeeded\n"
+        );
+    }
+
+    #[test]
+    fn guest_logger_queue_pressure_counts_loss_without_a_receipt() {
+        let gate = Arc::new(WriterGate::default());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.set_delivery_config_for_test(LoggerDeliveryConfig::for_test(
+            1,
+            Duration::from_millis(100),
+        ));
+        state.configure_test_writer(HeldRecordingWriter {
+            gate: gate.clone(),
+            output,
+        });
+        let logger = state.guest_logger();
+
+        logger.log_backend(LoggerBackendOutcome::VcpuRunFailed);
+        gate.wait_until_entered();
+        logger.log_transport(LoggerTransportOutcome::DeviceActivationSucceeded(
+            LoggerDeviceKind::Network,
+        ));
+        logger.log_transport(LoggerTransportOutcome::DeviceResetSucceeded(
+            LoggerDeviceKind::Network,
+        ));
+        assert_eq!(metrics.missed_log_count(), 1);
+
+        gate.release();
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(metrics.missed_log_count(), 1);
+    }
+
+    #[test]
+    fn disconnected_guest_logger_counts_each_closed_record() {
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.configure_test_writer(SharedWriter(Arc::new(Mutex::new(Vec::new()))));
+        let logger = state.guest_logger();
+        assert!(state.disconnect_delivery_for_test());
+
+        logger.log_backend(LoggerBackendOutcome::VcpuRunFailed);
+        logger.log_transport(LoggerTransportOutcome::MmioRegistrationFailed);
+        assert_eq!(metrics.missed_log_count(), 2);
+    }
+
+    #[test]
+    fn inert_guest_logger_has_no_delivery_or_wait_surface_in_production() {
+        let logger = GuestLogger::default();
+        logger.log_backend(LoggerBackendOutcome::VcpuRunFailed);
+        logger.log_transport(LoggerTransportOutcome::MmioRegistrationFailed);
+        assert!(logger.wait_for_delivery_for_test());
     }
 
     #[test]
@@ -1906,5 +2362,13 @@ mod tests {
         let debug = format!("{input:?}");
         assert!(!debug.contains("secret.log"));
         assert!(!debug.contains("private.module"));
+
+        let mut state = LoggerState::default();
+        state
+            .configure(LoggerConfigInput::new().with_module("private.guest.module"))
+            .expect("guest logger module should configure");
+        let debug = format!("{:?}", state.guest_logger());
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("private.guest.module"));
     }
 }

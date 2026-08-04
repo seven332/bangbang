@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::logger::{GuestLogger, LoggerTransportOutcome};
 use crate::memory::{GuestAddress, GuestMemoryError, GuestMemoryRange};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -339,6 +340,15 @@ pub trait MmioHandler: fmt::Debug + Send {
     fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError>;
 
     fn write(&mut self, access: MmioAccess, data: MmioAccessBytes) -> Result<(), MmioHandlerError>;
+
+    /// Installs the controller-local guest logger on handlers that own typed
+    /// transport outcomes. Non-transport handlers deliberately ignore it.
+    fn attach_guest_logger(&mut self, _logger: GuestLogger) {}
+
+    /// Reports whether this handler observes its own typed access failures.
+    fn owns_transport_access_logging(&self) -> bool {
+        false
+    }
 }
 
 trait StoredMmioHandler: Any + MmioHandler {
@@ -416,6 +426,7 @@ pub enum MmioDispatchOutcome {
 pub struct MmioDispatcher {
     bus: MmioBus,
     handlers: BTreeMap<MmioRegionId, Box<dyn StoredMmioHandler>>,
+    guest_logger: GuestLogger,
     provenance: Arc<MmioDispatcherProvenance>,
     next_registration_generation: u64,
     registrations: BTreeMap<u64, MmioRegistrationRecord>,
@@ -455,6 +466,7 @@ impl MmioDispatcher {
         Self {
             bus: MmioBus::new(),
             handlers: BTreeMap::new(),
+            guest_logger: GuestLogger::default(),
             provenance: Arc::new(MmioDispatcherProvenance),
             next_registration_generation: 0,
             registrations: BTreeMap::new(),
@@ -467,6 +479,27 @@ impl MmioDispatcher {
 
     pub fn regions(&self) -> &[MmioRegion] {
         self.bus.regions()
+    }
+
+    /// Installs one immutable controller-local capability on every current and
+    /// future typed transport handler owned by this dispatcher.
+    pub fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        for handler in self.handlers.values_mut() {
+            handler.attach_guest_logger(logger.clone());
+        }
+        for handler in self
+            .registrations
+            .values_mut()
+            .filter_map(|registration| registration.suspended_handler.as_mut())
+        {
+            handler.attach_guest_logger(logger.clone());
+        }
+        self.guest_logger = logger;
+    }
+
+    /// Returns the same narrow capability for generic publication owners.
+    pub fn guest_logger(&self) -> GuestLogger {
+        self.guest_logger.clone()
     }
 
     /// Reports whether a region identifier is already visible on the bus or
@@ -501,17 +534,26 @@ impl MmioDispatcher {
     pub fn register_handler(
         &mut self,
         region_id: MmioRegionId,
-        handler: impl MmioHandler + 'static,
+        mut handler: impl MmioHandler + 'static,
     ) -> Result<(), MmioDispatchError> {
         if self.has_leased_region_id(region_id) {
+            self.guest_logger
+                .log_transport(LoggerTransportOutcome::MmioRegistrationFailed);
             return Err(MmioDispatchError::LeasedHandler { region_id });
         }
         match self.handlers.entry(region_id) {
             Entry::Vacant(entry) => {
+                handler.attach_guest_logger(self.guest_logger.clone());
                 entry.insert(Box::new(handler));
+                self.guest_logger
+                    .log_transport(LoggerTransportOutcome::MmioRegistrationSucceeded);
                 Ok(())
             }
-            Entry::Occupied(_) => Err(MmioDispatchError::DuplicateHandler { region_id }),
+            Entry::Occupied(_) => {
+                self.guest_logger
+                    .log_transport(LoggerTransportOutcome::MmioRegistrationFailed);
+                Err(MmioDispatchError::DuplicateHandler { region_id })
+            }
         }
     }
 
@@ -520,9 +562,17 @@ impl MmioDispatcher {
         owner: &MmioRegistrationOwner,
         region_id: MmioRegionId,
         regions: &[MmioRegionRequest],
-        handler: impl MmioHandler + 'static,
+        mut handler: impl MmioHandler + 'static,
     ) -> Result<MmioRegistrationLease, MmioRegistrationError> {
-        let plan = self.plan_owned_handler(region_id, regions)?;
+        let plan = match self.plan_owned_handler(region_id, regions) {
+            Ok(plan) => plan,
+            Err(source) => {
+                self.guest_logger
+                    .log_transport(LoggerTransportOutcome::MmioRegistrationFailed);
+                return Err(source);
+            }
+        };
+        handler.attach_guest_logger(self.guest_logger.clone());
         let handler: Box<dyn StoredMmioHandler> = Box::new(handler);
 
         self.bus = plan.bus;
@@ -540,13 +590,16 @@ impl MmioDispatcher {
         debug_assert!(replaced_registration.is_none());
         self.next_registration_generation = plan.next_generation;
 
-        Ok(MmioRegistrationLease {
+        let lease = MmioRegistrationLease {
             dispatcher: Arc::clone(&self.provenance),
             owner: Arc::clone(&owner.provenance),
             generation: plan.generation,
             region_id,
             regions: plan.regions,
-        })
+        };
+        self.guest_logger
+            .log_transport(LoggerTransportOutcome::MmioRegistrationSucceeded);
+        Ok(lease)
     }
 
     /// Validate one exact owned handler registration without changing the
@@ -619,12 +672,20 @@ impl MmioDispatcher {
         owner: &MmioRegistrationOwner,
         lease: &MmioRegistrationLease,
     ) -> Result<(), MmioRegistrationReleaseError> {
-        self.unpublish_owned_handler(owner, lease)?;
-        if let Err(source) = self.release_unpublished_handler(owner, lease) {
-            let _ = self.republish_owned_handler(owner, lease);
-            return Err(source);
-        }
-        Ok(())
+        let result = (|| {
+            self.unpublish_owned_handler(owner, lease)?;
+            if let Err(source) = self.release_unpublished_handler(owner, lease) {
+                let _ = self.republish_owned_handler(owner, lease);
+                return Err(source);
+            }
+            Ok(())
+        })();
+        self.guest_logger.log_transport(if result.is_ok() {
+            LoggerTransportOutcome::MmioReleaseSucceeded
+        } else {
+            LoggerTransportOutcome::MmioReleaseFailed
+        });
+        result
     }
 
     /// Makes one exact owned registration unreachable while retaining its
@@ -677,6 +738,20 @@ impl MmioDispatcher {
 
     /// Republishes the exact suspended registration after a recoverable abort.
     pub fn republish_owned_handler(
+        &mut self,
+        owner: &MmioRegistrationOwner,
+        lease: &MmioRegistrationLease,
+    ) -> Result<(), MmioRegistrationReleaseError> {
+        let result = self.republish_owned_handler_inner(owner, lease);
+        self.guest_logger.log_transport(if result.is_ok() {
+            LoggerTransportOutcome::PublicationRollbackSucceeded(None)
+        } else {
+            LoggerTransportOutcome::PublicationRollbackFailed(None)
+        });
+        result
+    }
+
+    fn republish_owned_handler_inner(
         &mut self,
         owner: &MmioRegistrationOwner,
         lease: &MmioRegistrationLease,
@@ -791,6 +866,32 @@ impl MmioDispatcher {
     }
 
     pub fn dispatch(
+        &mut self,
+        operation: MmioOperation,
+    ) -> Result<MmioDispatchOutcome, MmioDispatchError> {
+        let result = self.dispatch_inner(operation);
+        if let Err(source) = &result {
+            let handler_owns_transport_logging = match source {
+                MmioDispatchError::HandlerFailed { region_id, .. } => self
+                    .handlers
+                    .get(region_id)
+                    .is_some_and(|handler| handler.owns_transport_access_logging()),
+                MmioDispatchError::LeasedHandler { .. }
+                | MmioDispatchError::DuplicateHandler { .. }
+                | MmioDispatchError::MissingHandler { .. }
+                | MmioDispatchError::UnregisteredAccess { .. }
+                | MmioDispatchError::AccessMismatch { .. }
+                | MmioDispatchError::ReadDataLengthMismatch { .. } => false,
+            };
+            if !handler_owns_transport_logging {
+                self.guest_logger
+                    .log_transport(LoggerTransportOutcome::MmioAccessFailed(None));
+            }
+        }
+        result
+    }
+
+    fn dispatch_inner(
         &mut self,
         operation: MmioOperation,
     ) -> Result<MmioDispatchOutcome, MmioDispatchError> {
@@ -1296,6 +1397,7 @@ fn mmio_operation_len(access: MmioAccess) -> Result<usize, MmioOperationError> {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
 
     use super::{
@@ -1304,6 +1406,10 @@ mod tests {
         MmioHandlerError, MmioHandlerLookupError, MmioOperation, MmioOperationError,
         MmioOperationKind, MmioRegion, MmioRegionId, MmioRegionRequest, MmioRegistrationError,
         MmioRegistrationOwner, MmioRegistrationReleaseError,
+    };
+    use crate::logger::{
+        GuestLogger, LoggerConfigInput, LoggerDeviceKind, LoggerLevel, LoggerState,
+        LoggerTransportOutcome,
     };
     use crate::memory::{GuestAddress, GuestMemoryError, GuestMemoryRange};
 
@@ -1424,6 +1530,272 @@ mod tests {
         ) -> Result<(), MmioHandlerError> {
             Err(MmioHandlerError::new("other handler write should not run"))
         }
+    }
+
+    #[derive(Clone)]
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("recording writer lock should not be poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct LoggerAwareHandler {
+        attachments: Arc<Mutex<usize>>,
+    }
+
+    impl MmioHandler for LoggerAwareHandler {
+        fn read(&mut self, _access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
+            MmioAccessBytes::new(&[0]).map_err(|error| MmioHandlerError::new(error.to_string()))
+        }
+
+        fn write(
+            &mut self,
+            _access: MmioAccess,
+            _data: MmioAccessBytes,
+        ) -> Result<(), MmioHandlerError> {
+            Ok(())
+        }
+
+        fn attach_guest_logger(&mut self, logger: GuestLogger) {
+            *self
+                .attachments
+                .lock()
+                .expect("attachment counter should not be poisoned") += 1;
+            logger.log_transport(LoggerTransportOutcome::DeviceActivationSucceeded(
+                LoggerDeviceKind::Block,
+            ));
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TypedLoggingHandler {
+        guest_logger: GuestLogger,
+    }
+
+    impl MmioHandler for TypedLoggingHandler {
+        fn read(&mut self, _access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
+            self.guest_logger
+                .log_transport(LoggerTransportOutcome::DeviceConfigFailed(
+                    LoggerDeviceKind::Block,
+                ));
+            Err(MmioHandlerError::new("/private/typed-secret descriptor=22"))
+        }
+
+        fn write(
+            &mut self,
+            _access: MmioAccess,
+            _data: MmioAccessBytes,
+        ) -> Result<(), MmioHandlerError> {
+            self.guest_logger
+                .log_transport(LoggerTransportOutcome::DeviceConfigFailed(
+                    LoggerDeviceKind::Block,
+                ));
+            Err(MmioHandlerError::new("/private/typed-secret descriptor=22"))
+        }
+
+        fn attach_guest_logger(&mut self, logger: GuestLogger) {
+            self.guest_logger = logger;
+        }
+
+        fn owns_transport_access_logging(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn dispatcher_attaches_one_guest_logger_to_existing_future_and_suspended_handlers() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut logger_state = LoggerState::default();
+        logger_state.configure_test_writer(RecordingWriter(output.clone()));
+        logger_state
+            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Debug))
+            .expect("debug logger should configure");
+        let logger = logger_state.guest_logger();
+
+        let existing_attachments = Arc::new(Mutex::new(0));
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .register_handler(
+                id(1),
+                LoggerAwareHandler {
+                    attachments: existing_attachments.clone(),
+                },
+            )
+            .expect("inert handler registration should succeed");
+        assert_eq!(
+            *existing_attachments
+                .lock()
+                .expect("existing attachment counter should not be poisoned"),
+            1
+        );
+
+        dispatcher.attach_guest_logger(logger.clone());
+        assert_eq!(
+            *existing_attachments
+                .lock()
+                .expect("existing attachment counter should not be poisoned"),
+            2
+        );
+
+        let future_attachments = Arc::new(Mutex::new(0));
+        dispatcher
+            .register_handler(
+                id(2),
+                LoggerAwareHandler {
+                    attachments: future_attachments.clone(),
+                },
+            )
+            .expect("live handler registration should succeed");
+        assert_eq!(
+            *future_attachments
+                .lock()
+                .expect("future attachment counter should not be poisoned"),
+            1
+        );
+
+        let owner = MmioRegistrationOwner::new();
+        let suspended_attachments = Arc::new(Mutex::new(0));
+        let lease = dispatcher
+            .register_owned_handler(
+                &owner,
+                id(3),
+                &[MmioRegionRequest::new(address(0x3000), 0x100)],
+                LoggerAwareHandler {
+                    attachments: suspended_attachments.clone(),
+                },
+            )
+            .expect("owned handler registration should succeed");
+        dispatcher
+            .unpublish_owned_handler(&owner, &lease)
+            .expect("owned handler should suspend");
+        dispatcher.attach_guest_logger(logger.clone());
+        assert_eq!(
+            *suspended_attachments
+                .lock()
+                .expect("suspended attachment counter should not be poisoned"),
+            2
+        );
+
+        let rejected_attachments = Arc::new(Mutex::new(0));
+        assert!(matches!(
+            dispatcher.register_handler(
+                id(2),
+                LoggerAwareHandler {
+                    attachments: rejected_attachments.clone(),
+                },
+            ),
+            Err(MmioDispatchError::DuplicateHandler { region_id }) if region_id == id(2)
+        ));
+        assert_eq!(
+            *rejected_attachments
+                .lock()
+                .expect("rejected attachment counter should not be poisoned"),
+            0
+        );
+        assert!(logger.wait_for_delivery_for_test());
+        let output = String::from_utf8(
+            output
+                .lock()
+                .expect("recording output should not be poisoned")
+                .clone(),
+        )
+        .expect("transport output should be UTF-8");
+        assert_eq!(
+            output
+                .matches("device-kind=block operation=device-activation outcome=succeeded\n")
+                .count(),
+            6
+        );
+        assert_eq!(
+            output
+                .matches("operation=mmio-registration outcome=succeeded\n")
+                .count(),
+            2
+        );
+        assert!(output.contains("operation=mmio-registration outcome=failed\n"));
+    }
+
+    #[test]
+    fn dispatcher_logs_generic_handler_failure_once_without_duplicating_typed_owner() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut logger_state = LoggerState::default();
+        logger_state.configure_test_writer(RecordingWriter(output.clone()));
+        logger_state
+            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Debug))
+            .expect("debug logger should configure");
+        let logger = logger_state.guest_logger();
+
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher.attach_guest_logger(logger.clone());
+        dispatcher
+            .insert_region(id(10), address(0x1000), 0x100)
+            .expect("generic region should register");
+        dispatcher
+            .insert_region(id(11), address(0x2000), 0x100)
+            .expect("typed region should register");
+        let (_, generic) = ScriptedHandler::failing(
+            Err(MmioHandlerError::new(
+                "/private/generic-secret descriptor=11",
+            )),
+            Ok(()),
+        );
+        dispatcher
+            .register_handler(id(10), generic)
+            .expect("generic handler should register");
+        dispatcher
+            .register_handler(id(11), TypedLoggingHandler::default())
+            .expect("typed handler should register");
+
+        let generic_access = dispatcher
+            .lookup(address(0x1000), 1)
+            .expect("generic access should resolve");
+        let generic_error = dispatcher
+            .dispatch(MmioOperation::read(generic_access).expect("generic read should build"))
+            .expect_err("generic handler should fail");
+        assert!(generic_error.to_string().contains("generic-secret"));
+
+        let typed_access = dispatcher
+            .lookup(address(0x2000), 1)
+            .expect("typed access should resolve");
+        let typed_error = dispatcher
+            .dispatch(MmioOperation::read(typed_access).expect("typed read should build"))
+            .expect_err("typed handler should fail");
+        assert!(typed_error.to_string().contains("typed-secret"));
+
+        assert!(logger.wait_for_delivery_for_test());
+        let output = String::from_utf8(
+            output
+                .lock()
+                .expect("recording output should not be poisoned")
+                .clone(),
+        )
+        .expect("transport output should be UTF-8");
+        assert_eq!(
+            output
+                .matches("operation=mmio-access outcome=failed\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            output
+                .matches("device-kind=block operation=device-config outcome=failed\n")
+                .count(),
+            1
+        );
+        assert!(!output.contains("generic-secret"));
+        assert!(!output.contains("typed-secret"));
+        assert!(!output.contains("descriptor="));
     }
 
     #[test]

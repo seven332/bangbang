@@ -6,8 +6,10 @@
 //! backend routes.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
 use crate::memory::{GuestAddress, GuestMemoryRange};
 use crate::message_interrupt::{
     GuestMessage, GuestMessageInterruptRegistry, GuestMessageInterruptRegistryError,
@@ -636,6 +638,7 @@ impl<C, A> Clone for VirtioPciEndpoint<C, A> {
 struct VirtioPciEndpointInner<C, A> {
     state: Mutex<VirtioPciEndpointState<C, A>>,
     messages: GuestMessageInterruptRegistry,
+    interrupt_success_logging_enabled: AtomicBool,
 }
 
 struct VirtioPciEndpointState<C, A> {
@@ -651,6 +654,8 @@ struct VirtioPciEndpointState<C, A> {
     queue_select: u16,
     core: VirtioDeviceCore<C, A>,
     msix: VirtioPciMsixState,
+    guest_logger: GuestLogger,
+    queue_notification_success_logging_enabled: bool,
 }
 
 impl<C, A> fmt::Debug for VirtioPciEndpoint<C, A> {
@@ -694,6 +699,8 @@ impl<C, A> fmt::Debug for VirtioPciConfigFunction<C, A> {
 #[derive(Clone)]
 pub struct VirtioPciBarHandler<C, A> {
     inner: Arc<VirtioPciEndpointInner<C, A>>,
+    guest_logger: GuestLogger,
+    device_kind: Option<LoggerDeviceKind>,
 }
 
 impl<C, A> fmt::Debug for VirtioPciBarHandler<C, A> {
@@ -779,8 +786,11 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
                     queue_select: 0,
                     core,
                     msix: VirtioPciMsixState::new(vector_count, queue_count),
+                    guest_logger: GuestLogger::default(),
+                    queue_notification_success_logging_enabled: false,
                 }),
                 messages,
+                interrupt_success_logging_enabled: AtomicBool::new(false),
             }),
         })
     }
@@ -792,9 +802,43 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
     }
 
     pub fn bar_handler(&self) -> VirtioPciBarHandler<C, A> {
+        let logging = self.logging_context();
         VirtioPciBarHandler {
             inner: Arc::clone(&self.inner),
+            guest_logger: logging
+                .as_ref()
+                .map_or_else(GuestLogger::default, |(logger, _)| logger.clone()),
+            device_kind: logging.map(|(_, kind)| kind),
         }
+    }
+
+    fn attach_guest_logger(&self, logger: GuestLogger) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            let interrupt_success_logging_enabled = LoggerDeviceKind::from_virtio_device_id(
+                state.core.device.device_id(),
+            )
+            .is_some_and(|kind| {
+                logger.transport_outcome_enabled(LoggerTransportOutcome::InterruptDelivered(kind))
+            });
+            state.queue_notification_success_logging_enabled =
+                LoggerDeviceKind::from_virtio_device_id(state.core.device.device_id()).is_some_and(
+                    |kind| {
+                        logger.transport_outcome_enabled(
+                            LoggerTransportOutcome::QueueNotificationSucceeded(kind),
+                        )
+                    },
+                );
+            state.core.activation.attach_guest_logger(logger.clone());
+            state.guest_logger = logger;
+            self.inner
+                .interrupt_success_logging_enabled
+                .store(interrupt_success_logging_enabled, Ordering::Release);
+        }
+    }
+
+    fn logging_context(&self) -> Option<(GuestLogger, LoggerDeviceKind)> {
+        let state = self.inner.state.lock().ok()?;
+        state.logging_context()
     }
 
     pub fn phase(&self) -> Result<VirtioPciEndpointPhase, VirtioPciEndpointError> {
@@ -1163,8 +1207,11 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler>
                     queue_select: retained.queue_select,
                     core,
                     msix: retained.msix.clone(),
+                    guest_logger: GuestLogger::default(),
+                    queue_notification_success_logging_enabled: false,
                 }),
                 messages,
+                interrupt_success_logging_enabled: AtomicBool::new(false),
             }),
         };
         if endpoint.transport_state()? != *retained {
@@ -1736,8 +1783,9 @@ where
     }
 }
 
-impl<C, A> VirtioPciEndpointInner<C, A> {
+impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEndpointInner<C, A> {
     fn signal_messages(&self, messages: Vec<GuestMessage>) -> Result<(), VirtioPciEndpointError> {
+        let attempted = !messages.is_empty();
         let mut first_error = None;
         for message in messages {
             if let Err(source) = self.messages.signal(message) {
@@ -1745,7 +1793,18 @@ impl<C, A> VirtioPciEndpointInner<C, A> {
             }
         }
         if let Some(source) = first_error {
+            if let Ok(state) = self.state.lock() {
+                state.log_transport(LoggerTransportOutcome::InterruptDeliveryFailed);
+            }
             return Err(VirtioPciEndpointError::MessageRegistry { source });
+        }
+        if attempted
+            && self
+                .interrupt_success_logging_enabled
+                .load(Ordering::Acquire)
+            && let Ok(state) = self.state.lock()
+        {
+            state.log_transport(LoggerTransportOutcome::InterruptDelivered);
         }
         Ok(())
     }
@@ -2315,6 +2374,21 @@ fn read_u16(data: &[u8]) -> u16 {
 }
 
 impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEndpointState<C, A> {
+    fn logging_context(&self) -> Option<(GuestLogger, LoggerDeviceKind)> {
+        LoggerDeviceKind::from_virtio_device_id(self.core.device.device_id())
+            .map(|kind| (self.guest_logger.clone(), kind))
+    }
+
+    fn log_transport(&self, outcome: impl FnOnce(LoggerDeviceKind) -> LoggerTransportOutcome) {
+        if let Some(kind) = LoggerDeviceKind::from_virtio_device_id(self.core.device.device_id()) {
+            self.guest_logger.log_transport(outcome(kind));
+        }
+    }
+
+    fn log_endpoint_error(&self, error: &VirtioPciEndpointError) {
+        self.log_transport(|kind| transport_outcome_for_endpoint_error(kind, error));
+    }
+
     fn ensure_active(&self) -> Result<(), VirtioPciEndpointError> {
         if self.phase == VirtioPciEndpointPhase::Active {
             Ok(())
@@ -2403,7 +2477,9 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
             self.configuration
                 .read_config(msix_control, &mut control)
                 .map_err(|_| VirtioPciEndpointError::PciConfigurationAccess)?;
-            return Ok(self.msix.set_message_control(u16::from_le_bytes(control)));
+            let messages = self.msix.set_message_control(u16::from_le_bytes(control));
+            self.log_transport(LoggerTransportOutcome::MsiConfigurationSucceeded);
+            return Ok(messages);
         }
         Ok(Vec::new())
     }
@@ -2562,6 +2638,9 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
             VIRTIO_PCI_NOTIFICATION_SIZE,
         ) {
             self.write_notification(offset - VIRTIO_PCI_NOTIFICATION_OFFSET, data)?;
+            if self.queue_notification_success_logging_enabled {
+                self.log_transport(LoggerTransportOutcome::QueueNotificationSucceeded);
+            }
             Ok(Vec::new())
         } else if access_within(
             offset,
@@ -2569,8 +2648,11 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
             VIRTIO_PCI_MSIX_TABLE_OFFSET,
             VIRTIO_PCI_MSIX_TABLE_SIZE,
         ) {
-            self.msix
-                .write_table(offset - VIRTIO_PCI_MSIX_TABLE_OFFSET, data)
+            let messages = self
+                .msix
+                .write_table(offset - VIRTIO_PCI_MSIX_TABLE_OFFSET, data)?;
+            self.log_transport(LoggerTransportOutcome::MsiConfigurationSucceeded);
+            Ok(messages)
         } else if access_within(
             offset,
             data.len(),
@@ -2672,6 +2754,7 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
             }
             (VIRTIO_PCI_COMMON_MSIX_CONFIG, 2) => {
                 self.msix.set_config_vector(read_u16(data));
+                self.log_transport(LoggerTransportOutcome::MsiConfigurationSucceeded);
                 Ok(Vec::new())
             }
             (VIRTIO_PCI_COMMON_QUEUE_SELECT, 2) => {
@@ -2695,6 +2778,7 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
             (VIRTIO_PCI_COMMON_QUEUE_MSIX_VECTOR, 2) => {
                 self.msix
                     .set_queue_vector(self.queue_select, read_u16(data));
+                self.log_transport(LoggerTransportOutcome::MsiConfigurationSucceeded);
                 Ok(Vec::new())
             }
             (VIRTIO_PCI_COMMON_QUEUE_ENABLE, 2) => {
@@ -2795,11 +2879,17 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
                 .core
                 .reset_common_state_with_outcome()
                 .map_err(|source| VirtioPciEndpointError::DeviceReset { source })?;
-            if outcome == VirtioDeviceResetOutcome::Reset {
-                self.device_feature_select = 0;
-                self.driver_feature_select = 0;
-                self.queue_select = 0;
-                self.msix.reset_common_vectors();
+            match outcome {
+                VirtioDeviceResetOutcome::Reset => {
+                    self.device_feature_select = 0;
+                    self.driver_feature_select = 0;
+                    self.queue_select = 0;
+                    self.msix.reset_common_vectors();
+                    self.log_transport(LoggerTransportOutcome::DeviceResetSucceeded);
+                }
+                VirtioDeviceResetOutcome::Unsupported => {
+                    self.log_transport(LoggerTransportOutcome::DeviceResetUnsupported);
+                }
             }
             return Ok(Vec::new());
         }
@@ -2807,9 +2897,13 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
             let core = &mut self.core;
             let activation = VirtioDeviceActivation::new(&core.device, &core.queues);
             match core.activation.activate(activation) {
-                Ok(()) => core.device_activated = true,
+                Ok(()) => {
+                    core.device_activated = true;
+                    self.log_transport(LoggerTransportOutcome::DeviceActivationSucceeded);
+                }
                 Err(_source) => {
                     core.device.mark_device_needs_reset();
+                    self.log_transport(LoggerTransportOutcome::DeviceActivationFailed);
                     return self.msix.trigger(VirtioInterruptIntent::Configuration);
                 }
             }
@@ -2956,10 +3050,13 @@ where
             .map_err(|_| PciConfigAccessError::Handler {
                 message: VirtioPciEndpointError::StatePoisoned.to_string(),
             })?;
-        state.ensure_active().map_err(pci_handler_error)?;
-        state
-            .read_pci_config(offset, data)
-            .map_err(pci_handler_error)
+        let result = state
+            .ensure_active()
+            .and_then(|()| state.read_pci_config(offset, data));
+        if let Err(error) = &result {
+            state.log_endpoint_error(error);
+        }
+        result.map_err(pci_handler_error)
     }
 
     fn write_config(&mut self, offset: u16, data: &[u8]) -> Result<(), PciConfigAccessError> {
@@ -2971,14 +3068,96 @@ where
                 .map_err(|_| PciConfigAccessError::Handler {
                     message: VirtioPciEndpointError::StatePoisoned.to_string(),
                 })?;
-            state.ensure_active().map_err(pci_handler_error)?;
-            state
-                .write_pci_config(offset, data)
-                .map_err(pci_handler_error)?
+            let result = state
+                .ensure_active()
+                .and_then(|()| state.write_pci_config(offset, data));
+            if let Err(error) = &result {
+                state.log_endpoint_error(error);
+            }
+            result.map_err(pci_handler_error)?
         };
         self.inner
             .signal_messages(messages)
             .map_err(pci_handler_error)
+    }
+}
+
+impl<C, A> VirtioPciBarHandler<C, A>
+where
+    C: VirtioDeviceConfigHandler + 'static,
+    A: VirtioDeviceActivationHandler + 'static,
+{
+    fn logging_context(&self) -> Option<(GuestLogger, LoggerDeviceKind)> {
+        self.device_kind
+            .map(|kind| (self.guest_logger.clone(), kind))
+    }
+
+    fn log_endpoint_error(&self, error: &VirtioPciEndpointError) {
+        if let Some((logger, kind)) = self.logging_context() {
+            logger.log_transport(transport_outcome_for_endpoint_error(kind, error));
+        }
+    }
+
+    fn read_typed(&self, access: MmioAccess) -> Result<MmioAccessBytes, VirtioPciEndpointError> {
+        let gate = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| VirtioPciEndpointError::StatePoisoned)?;
+            state.ensure_active()?;
+            state.core.work_gate().clone()
+        };
+        let _work = gate
+            .admit()
+            .map_err(|source| VirtioPciEndpointError::WorkGate { source })?;
+        let len = usize::try_from(access.range().size())
+            .map_err(|_| VirtioPciEndpointError::InvalidBarAccessWidth { len: usize::MAX })?;
+        if !matches!(len, 1 | 2 | 4 | 8) {
+            return Err(VirtioPciEndpointError::InvalidBarAccessWidth { len });
+        }
+        let mut bytes = [0_u8; 8];
+        let destination = bytes
+            .get_mut(..len)
+            .ok_or(VirtioPciEndpointError::InvalidBarAccessWidth { len })?;
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| VirtioPciEndpointError::StatePoisoned)?;
+            state.read_bar_bytes(access.offset(), destination)?;
+        }
+        MmioAccessBytes::new(destination)
+            .map_err(|_| VirtioPciEndpointError::InvalidBarAccessWidth { len })
+    }
+
+    fn write_typed(
+        &self,
+        access: MmioAccess,
+        data: MmioAccessBytes,
+    ) -> Result<(), VirtioPciEndpointError> {
+        let gate = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| VirtioPciEndpointError::StatePoisoned)?;
+            state.ensure_active()?;
+            state.core.work_gate().clone()
+        };
+        let _work = gate
+            .admit()
+            .map_err(|source| VirtioPciEndpointError::WorkGate { source })?;
+        let messages = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| VirtioPciEndpointError::StatePoisoned)?;
+            state.write_bar_bytes(access.offset(), data.as_slice())?
+        };
+        self.inner.signal_messages(messages)
     }
 }
 
@@ -2988,66 +3167,46 @@ where
     A: VirtioDeviceActivationHandler + 'static,
 {
     fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
-        let gate = {
-            let state = self.inner.state.lock().map_err(|_| {
-                MmioHandlerError::new(VirtioPciEndpointError::StatePoisoned.to_string())
-            })?;
-            state
-                .ensure_active()
-                .map_err(|source| MmioHandlerError::new(source.to_string()))?;
-            state.core.work_gate().clone()
-        };
-        let _work = gate
-            .admit()
-            .map_err(|source| MmioHandlerError::new(source.to_string()))?;
-        let len = usize::try_from(access.range().size()).map_err(|_| {
-            MmioHandlerError::new("virtio-pci BAR access width is not representable")
-        })?;
-        if !matches!(len, 1 | 2 | 4 | 8) {
-            return Err(MmioHandlerError::new(
-                VirtioPciEndpointError::InvalidBarAccessWidth { len }.to_string(),
-            ));
+        let result = self.read_typed(access);
+        if let Err(error) = &result {
+            self.log_endpoint_error(error);
         }
-        let mut bytes = [0_u8; 8];
-        let destination = bytes.get_mut(..len).ok_or_else(|| {
-            MmioHandlerError::new("virtio-pci BAR access width is not representable")
-        })?;
-        {
-            let mut state = self.inner.state.lock().map_err(|_| {
-                MmioHandlerError::new(VirtioPciEndpointError::StatePoisoned.to_string())
-            })?;
-            state
-                .read_bar_bytes(access.offset(), destination)
-                .map_err(|source| MmioHandlerError::new(source.to_string()))?;
-        }
-        MmioAccessBytes::new(destination)
-            .map_err(|source| MmioHandlerError::new(source.to_string()))
+        result.map_err(|source| MmioHandlerError::new(source.to_string()))
     }
 
     fn write(&mut self, access: MmioAccess, data: MmioAccessBytes) -> Result<(), MmioHandlerError> {
-        let gate = {
-            let state = self.inner.state.lock().map_err(|_| {
-                MmioHandlerError::new(VirtioPciEndpointError::StatePoisoned.to_string())
-            })?;
-            state
-                .ensure_active()
-                .map_err(|source| MmioHandlerError::new(source.to_string()))?;
-            state.core.work_gate().clone()
-        };
-        let _work = gate
-            .admit()
-            .map_err(|source| MmioHandlerError::new(source.to_string()))?;
-        let messages = {
-            let mut state = self.inner.state.lock().map_err(|_| {
-                MmioHandlerError::new(VirtioPciEndpointError::StatePoisoned.to_string())
-            })?;
-            state
-                .write_bar_bytes(access.offset(), data.as_slice())
-                .map_err(|source| MmioHandlerError::new(source.to_string()))?
-        };
-        self.inner
-            .signal_messages(messages)
-            .map_err(|source| MmioHandlerError::new(source.to_string()))
+        let result = self.write_typed(access, data);
+        if let Err(error) = &result
+            && !matches!(error, VirtioPciEndpointError::MessageRegistry { .. })
+        {
+            self.log_endpoint_error(error);
+        }
+        result.map_err(|source| MmioHandlerError::new(source.to_string()))
+    }
+
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            let kind = LoggerDeviceKind::from_virtio_device_id(state.core.device.device_id());
+            state.queue_notification_success_logging_enabled = kind.is_some_and(|kind| {
+                logger.transport_outcome_enabled(
+                    LoggerTransportOutcome::QueueNotificationSucceeded(kind),
+                )
+            });
+            self.inner.interrupt_success_logging_enabled.store(
+                kind.is_some_and(|kind| {
+                    logger
+                        .transport_outcome_enabled(LoggerTransportOutcome::InterruptDelivered(kind))
+                }),
+                Ordering::Release,
+            );
+            state.core.activation.attach_guest_logger(logger.clone());
+            state.guest_logger = logger.clone();
+        }
+        self.guest_logger = logger;
+    }
+
+    fn owns_transport_access_logging(&self) -> bool {
+        self.device_kind.is_some()
     }
 }
 
@@ -3074,7 +3233,18 @@ where
     where
         I: GuestMessageInterruptResources,
     {
-        self.publish_with_hook(bar_allocator, segment, dispatcher, interrupts, |_| Ok(()))
+        self.endpoint.attach_guest_logger(dispatcher.guest_logger());
+        let logging = self.endpoint.logging_context();
+        let result =
+            self.publish_with_hook(bar_allocator, segment, dispatcher, interrupts, |_| Ok(()));
+        if let Some((logger, kind)) = logging {
+            logger.log_transport(if result.is_ok() {
+                LoggerTransportOutcome::PciFunctionPublished(kind)
+            } else {
+                LoggerTransportOutcome::PciFunctionPublicationFailed(kind)
+            });
+        }
+        result
     }
 
     fn publish_with_hook<I>(
@@ -3306,117 +3476,131 @@ where
         region_id: MmioRegionId,
         mut interrupts: I,
     ) -> Result<Self, VirtioPciPublicationError> {
-        let bar_lease = match bar_allocator.allocate(VIRTIO_PCI_CAPABILITY_BAR_SIZE) {
-            Ok(lease) => lease,
-            Err(source) => {
-                let primary = VirtioPciPublicationError::BarAllocation { source };
-                let mut cleanup = String::new();
-                if let Err(source) = interrupts.release() {
-                    append_cleanup(&mut cleanup, "interrupt resources", &source);
-                }
-                return Err(publication_rollback(primary, cleanup));
-            }
-        };
-        let endpoint = match VirtioPciEndpoint::new(
-            identity,
-            queue_max_sizes,
-            device_config,
-            activation,
-            requires_device_config_write_status,
-            &bar_lease,
-            interrupts.registry(),
-        ) {
-            Ok(endpoint) => endpoint,
-            Err(source) => {
-                let primary = VirtioPciPublicationError::Endpoint { source };
-                let mut cleanup = String::new();
-                if let Err(source) = interrupts.release() {
-                    append_cleanup(&mut cleanup, "interrupt resources", &source);
-                }
-                if let Err(source) = bar_allocator.release(&bar_lease) {
-                    append_cleanup(&mut cleanup, "BAR", &source);
-                }
-                return Err(publication_rollback(primary, cleanup));
-            }
-        };
-
-        let function_lease = match segment
-            .with_segment(|segment| segment.add_function(endpoint.config_function()))
-        {
-            Ok(Ok(lease)) => lease,
-            Ok(Err(source)) => {
-                let primary = VirtioPciPublicationError::SegmentAdd { source };
-                let cleanup = cleanup_unpublished_endpoint(
-                    &endpoint,
-                    &mut interrupts,
-                    bar_allocator,
-                    &bar_lease,
-                );
-                return Err(publication_rollback(primary, cleanup));
-            }
-            Err(source) => {
-                let primary = VirtioPciPublicationError::SegmentLock { source };
-                let cleanup = cleanup_unpublished_endpoint(
-                    &endpoint,
-                    &mut interrupts,
-                    bar_allocator,
-                    &bar_lease,
-                );
-                return Err(publication_rollback(primary, cleanup));
-            }
-        };
-
-        let owner = MmioRegistrationOwner::new();
-        let regions = [MmioRegionRequest::new(
-            bar_lease.range().start(),
-            bar_lease.range().size(),
-        )];
-        let mmio_lease = match dispatcher.register_owned_handler(
-            &owner,
-            region_id,
-            &regions,
-            endpoint.bar_handler(),
-        ) {
-            Ok(lease) => lease,
-            Err(source) => {
-                let primary = VirtioPciPublicationError::MmioRegistration { source };
-                let mut cleanup = String::new();
-                match segment.with_segment(|segment| segment.remove_function(&function_lease)) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(source)) => {
-                        append_cleanup(&mut cleanup, "PCI function", &source);
+        let guest_logger = dispatcher.guest_logger();
+        let logger_device_kind =
+            LoggerDeviceKind::from_virtio_device_id(identity.device_type().raw_value());
+        let result = (|| {
+            let bar_lease = match bar_allocator.allocate(VIRTIO_PCI_CAPABILITY_BAR_SIZE) {
+                Ok(lease) => lease,
+                Err(source) => {
+                    let primary = VirtioPciPublicationError::BarAllocation { source };
+                    let mut cleanup = String::new();
+                    if let Err(source) = interrupts.release() {
+                        append_cleanup(&mut cleanup, "interrupt resources", &source);
                     }
-                    Err(source) => append_cleanup(&mut cleanup, "PCI segment lock", &source),
+                    return Err(publication_rollback(primary, cleanup));
                 }
-                let remainder = cleanup_unpublished_endpoint(
-                    &endpoint,
-                    &mut interrupts,
-                    bar_allocator,
-                    &bar_lease,
-                );
-                if !remainder.is_empty() {
-                    if !cleanup.is_empty() {
-                        cleanup.push_str("; ");
+            };
+            let endpoint = match VirtioPciEndpoint::new(
+                identity,
+                queue_max_sizes,
+                device_config,
+                activation,
+                requires_device_config_write_status,
+                &bar_lease,
+                interrupts.registry(),
+            ) {
+                Ok(endpoint) => endpoint,
+                Err(source) => {
+                    let primary = VirtioPciPublicationError::Endpoint { source };
+                    let mut cleanup = String::new();
+                    if let Err(source) = interrupts.release() {
+                        append_cleanup(&mut cleanup, "interrupt resources", &source);
                     }
-                    cleanup.push_str(&remainder);
+                    if let Err(source) = bar_allocator.release(&bar_lease) {
+                        append_cleanup(&mut cleanup, "BAR", &source);
+                    }
+                    return Err(publication_rollback(primary, cleanup));
                 }
-                return Err(publication_rollback(primary, cleanup));
-            }
-        };
+            };
+            endpoint.attach_guest_logger(guest_logger.clone());
 
-        Ok(Self {
-            endpoint,
-            segment,
-            owner,
-            mmio_lease: Some(mmio_lease),
-            mmio_published: true,
-            function_lease: Some(function_lease),
-            function_published: true,
-            bar_lease: Some(bar_lease),
-            interrupts,
-            teardown_prepared: false,
-            released: false,
-        })
+            let function_lease = match segment
+                .with_segment(|segment| segment.add_function(endpoint.config_function()))
+            {
+                Ok(Ok(lease)) => lease,
+                Ok(Err(source)) => {
+                    let primary = VirtioPciPublicationError::SegmentAdd { source };
+                    let cleanup = cleanup_unpublished_endpoint(
+                        &endpoint,
+                        &mut interrupts,
+                        bar_allocator,
+                        &bar_lease,
+                    );
+                    return Err(publication_rollback(primary, cleanup));
+                }
+                Err(source) => {
+                    let primary = VirtioPciPublicationError::SegmentLock { source };
+                    let cleanup = cleanup_unpublished_endpoint(
+                        &endpoint,
+                        &mut interrupts,
+                        bar_allocator,
+                        &bar_lease,
+                    );
+                    return Err(publication_rollback(primary, cleanup));
+                }
+            };
+
+            let owner = MmioRegistrationOwner::new();
+            let regions = [MmioRegionRequest::new(
+                bar_lease.range().start(),
+                bar_lease.range().size(),
+            )];
+            let mmio_lease = match dispatcher.register_owned_handler(
+                &owner,
+                region_id,
+                &regions,
+                endpoint.bar_handler(),
+            ) {
+                Ok(lease) => lease,
+                Err(source) => {
+                    let primary = VirtioPciPublicationError::MmioRegistration { source };
+                    let mut cleanup = String::new();
+                    match segment.with_segment(|segment| segment.remove_function(&function_lease)) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(source)) => {
+                            append_cleanup(&mut cleanup, "PCI function", &source);
+                        }
+                        Err(source) => append_cleanup(&mut cleanup, "PCI segment lock", &source),
+                    }
+                    let remainder = cleanup_unpublished_endpoint(
+                        &endpoint,
+                        &mut interrupts,
+                        bar_allocator,
+                        &bar_lease,
+                    );
+                    if !remainder.is_empty() {
+                        if !cleanup.is_empty() {
+                            cleanup.push_str("; ");
+                        }
+                        cleanup.push_str(&remainder);
+                    }
+                    return Err(publication_rollback(primary, cleanup));
+                }
+            };
+
+            Ok(Self {
+                endpoint,
+                segment,
+                owner,
+                mmio_lease: Some(mmio_lease),
+                mmio_published: true,
+                function_lease: Some(function_lease),
+                function_published: true,
+                bar_lease: Some(bar_lease),
+                interrupts,
+                teardown_prepared: false,
+                released: false,
+            })
+        })();
+        if let Some(kind) = logger_device_kind {
+            guest_logger.log_transport(if result.is_ok() {
+                LoggerTransportOutcome::PciFunctionPublished(kind)
+            } else {
+                LoggerTransportOutcome::PciFunctionPublicationFailed(kind)
+            });
+        }
+        result
     }
 
     pub const fn endpoint(&self) -> &VirtioPciEndpoint<C, A> {
@@ -3577,37 +3761,48 @@ where
         if self.released {
             return Ok(());
         }
-        if !self.teardown_prepared {
-            return Err(VirtioPciPublicationError::TeardownNotPrepared);
+        let logging = self.endpoint.logging_context();
+        let result = (|| {
+            if !self.teardown_prepared {
+                return Err(VirtioPciPublicationError::TeardownNotPrepared);
+            }
+            self.endpoint
+                .release()
+                .map_err(|source| VirtioPciPublicationError::EndpointRelease { source })?;
+            self.interrupts
+                .release()
+                .map_err(|source| VirtioPciPublicationError::InterruptRelease { source })?;
+            if let Some(lease) = self.bar_lease.as_ref() {
+                bar_allocator
+                    .release(lease)
+                    .map_err(|source| VirtioPciPublicationError::BarRelease { source })?;
+                self.bar_lease = None;
+            }
+            if let Some(lease) = self.function_lease.as_ref() {
+                self.segment
+                    .with_segment(|segment| segment.release_function_lease(lease))
+                    .map_err(|source| VirtioPciPublicationError::SegmentLock { source })?
+                    .map_err(|source| VirtioPciPublicationError::FunctionRelease { source })?;
+                self.function_lease = None;
+            }
+            if let Some(lease) = self.mmio_lease.as_ref() {
+                dispatcher
+                    .release_unpublished_handler(&self.owner, lease)
+                    .map_err(|source| VirtioPciPublicationError::MmioRelease { source })?;
+                self.mmio_lease = None;
+            }
+            self.teardown_prepared = false;
+            self.released = true;
+            Ok(())
+        })();
+        if let Some((logger, kind)) = logging {
+            logger.log_transport(if result.is_ok() {
+                LoggerTransportOutcome::PciFunctionRemoved(kind)
+            } else {
+                LoggerTransportOutcome::PciFunctionRemovalFailed(kind)
+            });
         }
-        self.endpoint
-            .release()
-            .map_err(|source| VirtioPciPublicationError::EndpointRelease { source })?;
-        self.interrupts
-            .release()
-            .map_err(|source| VirtioPciPublicationError::InterruptRelease { source })?;
-        if let Some(lease) = self.bar_lease.as_ref() {
-            bar_allocator
-                .release(lease)
-                .map_err(|source| VirtioPciPublicationError::BarRelease { source })?;
-            self.bar_lease = None;
-        }
-        if let Some(lease) = self.function_lease.as_ref() {
-            self.segment
-                .with_segment(|segment| segment.release_function_lease(lease))
-                .map_err(|source| VirtioPciPublicationError::SegmentLock { source })?
-                .map_err(|source| VirtioPciPublicationError::FunctionRelease { source })?;
-            self.function_lease = None;
-        }
-        if let Some(lease) = self.mmio_lease.as_ref() {
-            dispatcher
-                .release_unpublished_handler(&self.owner, lease)
-                .map_err(|source| VirtioPciPublicationError::MmioRelease { source })?;
-            self.mmio_lease = None;
-        }
-        self.teardown_prepared = false;
-        self.released = true;
-        Ok(())
+        result
     }
 
     /// Unpublish guest paths, drain work and messages, then return all leases.
@@ -3901,6 +4096,64 @@ fn pci_handler_error(source: VirtioPciEndpointError) -> PciConfigAccessError {
     }
 }
 
+fn transport_outcome_for_endpoint_error(
+    kind: LoggerDeviceKind,
+    error: &VirtioPciEndpointError,
+) -> LoggerTransportOutcome {
+    match error {
+        VirtioPciEndpointError::DeviceConfigNotWritable { .. } => {
+            LoggerTransportOutcome::DeviceConfigRejected(kind)
+        }
+        VirtioPciEndpointError::DeviceConfig { .. }
+        | VirtioPciEndpointError::DeviceConfigReadLength { .. } => {
+            LoggerTransportOutcome::DeviceConfigFailed(kind)
+        }
+        VirtioPciEndpointError::UnsupportedDeviceOperation => {
+            LoggerTransportOutcome::DeviceResetUnsupported(kind)
+        }
+        VirtioPciEndpointError::DeviceReset { .. } => {
+            LoggerTransportOutcome::DeviceResetFailed(kind)
+        }
+        VirtioPciEndpointError::QueueInitialization { .. }
+        | VirtioPciEndpointError::Queue { .. }
+        | VirtioPciEndpointError::InvalidQueueIndex { .. } => {
+            LoggerTransportOutcome::QueueConfigurationRejected(kind)
+        }
+        VirtioPciEndpointError::QueueNotificationInitialization { .. }
+        | VirtioPciEndpointError::QueueNotification { .. } => {
+            LoggerTransportOutcome::QueueNotificationFailed(kind)
+        }
+        VirtioPciEndpointError::DeviceRegisters { .. } => {
+            LoggerTransportOutcome::FeatureNegotiationRejected(kind)
+        }
+        VirtioPciEndpointError::PciConfigurationAccess => {
+            LoggerTransportOutcome::PciConfigRejected(kind)
+        }
+        VirtioPciEndpointError::MessageRegistry { .. } => {
+            LoggerTransportOutcome::InterruptDeliveryFailed(kind)
+        }
+        VirtioPciEndpointError::VectorCountOverflow
+        | VirtioPciEndpointError::TooManyVectors { .. }
+        | VirtioPciEndpointError::MessageRouteCount { .. }
+        | VirtioPciEndpointError::InvalidVectorIndex { .. }
+        | VirtioPciEndpointError::RetainedState {
+            kind: VirtioPciRetainedStateError::Msix,
+        } => LoggerTransportOutcome::MsiConfigurationFailed(kind),
+        VirtioPciEndpointError::CapabilityBarSize { .. }
+        | VirtioPciEndpointError::CapabilityBarAddressSpace { .. }
+        | VirtioPciEndpointError::BarConfiguration { .. }
+        | VirtioPciEndpointError::Capability { .. }
+        | VirtioPciEndpointError::StatePoisoned
+        | VirtioPciEndpointError::NotActive { .. }
+        | VirtioPciEndpointError::WorkGate { .. }
+        | VirtioPciEndpointError::OutsideCapabilityBar { .. }
+        | VirtioPciEndpointError::InvalidBarAccessWidth { .. }
+        | VirtioPciEndpointError::RetainedState { .. } => {
+            LoggerTransportOutcome::MmioAccessFailed(Some(kind))
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum VirtioPciEndpointError {
     QueueInitialization {
@@ -4167,6 +4420,7 @@ impl std::error::Error for VirtioPciEndpointError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{self, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::mpsc::{self, TryRecvError};
     use std::sync::{Arc, Mutex};
@@ -4174,6 +4428,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::logger::{LoggerConfigInput, LoggerLevel, LoggerState};
     use crate::memory::{GuestMemory, GuestMemoryLayout, GuestMemoryRange};
     use crate::message_interrupt::{
         GuestMessageInterrupt, GuestMessageInterruptResources, GuestMessageInterruptResourcesError,
@@ -4196,6 +4451,23 @@ mod tests {
     };
 
     const TEST_VSOCK_PCI_UDS_PATH: &str = "/tmp/bangbang-vsock-pci-capture.sock";
+
+    #[derive(Clone)]
+    struct RecordingLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("logger output lock should succeed")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Debug)]
     struct RejectingVsockGuestConnector;
@@ -5226,6 +5498,103 @@ mod tests {
         assert!(!fixture.endpoint.diagnostics().unwrap().device_activated);
         bar_write(&mut bar, &bus, base, 0x14, &[1]).unwrap();
         assert_eq!(bar_read(&mut bar, &bus, base, 0x14, 1), [1]);
+    }
+
+    #[test]
+    fn attached_logger_observes_pci_transitions_without_changing_results() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut logger_state = LoggerState::default();
+        logger_state.configure_test_writer(RecordingLogWriter(output.clone()));
+        logger_state
+            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Debug))
+            .expect("debug logger should configure");
+        let logger = logger_state.guest_logger();
+
+        let fixture = fixture(&[8]);
+        fixture.endpoint.attach_guest_logger(logger.clone());
+        let bus = bar_bus(&fixture);
+        let base = fixture.bar.range().start();
+        let mut bar = fixture.endpoint.bar_handler();
+        for status in [1_u8, 3, 11] {
+            bar_write(&mut bar, &bus, base, 0x14, &[status]).expect("status setup should succeed");
+        }
+        bar_write(&mut bar, &bus, base, 0x18, &8_u16.to_le_bytes())
+            .expect("queue size should configure");
+        bar_write(&mut bar, &bus, base, 0x20, &0x1000_u32.to_le_bytes())
+            .expect("descriptor address should configure");
+        bar_write(&mut bar, &bus, base, 0x28, &0x2000_u32.to_le_bytes())
+            .expect("available address should configure");
+        bar_write(&mut bar, &bus, base, 0x30, &0x3000_u32.to_le_bytes())
+            .expect("used address should configure");
+        bar_write(&mut bar, &bus, base, 0x1c, &1_u16.to_le_bytes()).expect("queue should enable");
+        bar_write(&mut bar, &bus, base, 0x14, &[15]).expect("device should activate");
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_NOTIFICATION_OFFSET,
+            &0_u16.to_le_bytes(),
+        )
+        .expect("queue notification should succeed");
+        bar_write(&mut bar, &bus, base, 0x14, &[0]).expect("device reset should succeed");
+        assert!(!fixture.endpoint.diagnostics().unwrap().device_activated);
+
+        let (failing, failing_bar, _allocator, statistics) =
+            fixture_with_reset_mode(ResetMode::Failure);
+        failing.attach_guest_logger(logger.clone());
+        let failing_bus = bar_bus_for_bar(&failing_bar);
+        let failing_base = failing_bar.range().start();
+        let mut failing_handler = failing.bar_handler();
+        for status in [1_u8, 3, 11, 15] {
+            bar_write(
+                &mut failing_handler,
+                &failing_bus,
+                failing_base,
+                0x14,
+                &[status],
+            )
+            .expect("failing fixture setup should succeed");
+        }
+        let error = bar_write(&mut failing_handler, &failing_bus, failing_base, 0x14, &[0])
+            .expect_err("typed reset failure should remain visible");
+        assert!(error.message().contains("injected reset failure"));
+        assert_eq!(
+            statistics
+                .lock()
+                .expect("reset statistics should be healthy")
+                .reset_attempts,
+            1
+        );
+
+        assert!(logger.wait_for_delivery_for_test());
+        let log = String::from_utf8(
+            output
+                .lock()
+                .expect("logger output lock should succeed")
+                .clone(),
+        )
+        .expect("logger output should remain UTF-8");
+        assert_eq!(
+            log.matches("device-kind=entropy operation=device-activation outcome=succeeded\n")
+                .count(),
+            2
+        );
+        assert_eq!(
+            log.matches("device-kind=entropy operation=queue-notification outcome=succeeded\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            log.matches("device-kind=entropy operation=device-reset outcome=succeeded\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            log.matches("device-kind=entropy operation=device-reset outcome=failed\n")
+                .count(),
+            1
+        );
+        assert!(!log.contains("injected reset failure"));
     }
 
     #[test]

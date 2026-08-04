@@ -68,13 +68,14 @@ source calls only when subsystem, observable outcome, target fields, delivery,
 module/origin behavior, limiter policy, disposition, and delivery owner agree.
 There are no path selectors and no `other`, `unknown`, or catch-all class.
 
-The 31 classes contain 13 implemented classes, 11 planned classes, and 7 exact
-not-applicable classes. Across source mappings this is 82 implemented, 324
+The 31 classes contain 15 implemented classes, 9 planned classes, and 7 exact
+not-applicable classes. Across source mappings this is 182 implemented, 224
 planned, and 62 not-applicable invocations.
 
 `planned` is an explicit intermediate delivery state. The remaining owner is:
 
-- #1809: backend, vCPU, transport, and device outcomes.
+- #1809: storage, network/MMDS, vsock, memory-device, serial, entropy, and
+  time/identity outcomes.
 
 Delivery validation accepts those named planned classes. Final validation
 rejects every planned class.
@@ -93,6 +94,19 @@ guest power convergence, cancellation, and orderly/abnormal shutdown. These
 records use typed fixed vocabularies, discard payloads before encoding, and
 preserve the functional result when logger delivery fails.
 
+Issue #1814 closes the cross-cutting backend and generic device-transport
+classes. One controller-local `GuestLogger` snapshot shares the existing
+worker, metrics, immutable filter/prefix state, and independent backend and
+transport limiter identities. Normal and native-v2 assembly install it before
+HVF, MMIO, or product-PCI work, and every run-loop wrapper must explicitly
+forward the capability. Typed owners emit fixed outcomes before an error is
+formatted; filtered, limited, full, disconnected, or failed delivery never
+changes the backend or transport result. Repeating successful virtual-timer
+exits are coalesced to one debug record per logger state so they cannot consume
+the budget required by a later terminal vCPU outcome. Expected device
+rate-limiter rejection remains exact in metrics and is a debug record rather
+than a warning.
+
 ## Closed class ledger
 
 `Mappings` is the exact number of source identities assigned to the class.
@@ -104,7 +118,7 @@ Owners apply only to planned work.
 | `logger.api-worker.outcome` | `implemented` | fixed worker lifecycle | 5 |
 | `logger.api.request` | `implemented` | parsed method/template receipt | 1 |
 | `logger.api.result` | `implemented` | closed HTTP result plus retained actions | 5 |
-| `logger.backend.outcome` | `planned` | #1809 | 26 |
+| `logger.backend.outcome` | `implemented` | typed HVF backend, vCPU, interrupt, and timer outcomes | 26 |
 | `logger.balloon.outcome` | `planned` | #1809 | 28 |
 | `logger.block.outcome` | `planned` | #1809 | 34 |
 | `logger.boot.time` | `implemented` | bounded boot timing | 1 |
@@ -129,7 +143,7 @@ Owners apply only to planned work.
 | `logger.serial.outcome` | `planned` | #1809 | 12 |
 | `logger.snapshot.outcome` | `implemented` | fixed create/load result | 18 |
 | `logger.time-identity.outcome` | `planned` | #1809 | 16 |
-| `logger.transport.outcome` | `planned` | #1809 | 74 |
+| `logger.transport.outcome` | `implemented` | typed generic MMIO, virtio, PCI, queue, and interrupt outcomes | 74 |
 | `logger.vsock.outcome` | `planned` | #1809 | 52 |
 
 The outcome classes are semantic, not raw-line mirrors. Their fixed
@@ -150,6 +164,12 @@ The implemented host-owned records have exact fixed shapes:
 - live device control: `device-kind=<block|network|pmem>
   operation=<device-attach|device-update|device-detach>
   outcome=<succeeded|rejected|failed>`;
+- HVF backend: `operation=<closed-backend-operation>
+  outcome=<closed-backend-outcome>`;
+- generic transport: optional
+  `device-kind=<balloon|block|entropy|memory-hotplug|network|pmem|serial|vsock>`
+  plus `operation=<closed-transport-operation>
+  outcome=<closed-transport-outcome>`;
 - snapshots: `operation=<snapshot-create|snapshot-load>
   outcome=<succeeded|rejected|failed|cancelled>`;
 - worker and observability status:
@@ -202,9 +222,10 @@ A guest-capable class applies the guest-safe policy to every mapped producer,
 including a host-only member of the same semantic class. This is deliberately
 conservative: it cannot grant a producer a blocking or unrestricted path.
 
-Every guest-capable class is rate-limited under its own fixed class identity,
-and the repeating asynchronous metrics-worker class independently uses
-`logger-rate.observability-worker`. The sole exception is
+Every guest-capable class is rate-limited under its own fixed class identity.
+Backend and transport use `logger-rate.backend.outcome` and
+`logger-rate.transport.outcome`; the repeating asynchronous metrics-worker
+class independently uses `logger-rate.observability-worker`. The sole exception is
 `logger.limiter.recovery`, which must be unrestricted to report a prior
 admitted recovery without recursively limiting itself. Queue,
 receipt, write, flush, and replacement loss never changes the request, VM,

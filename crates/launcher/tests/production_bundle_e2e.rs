@@ -10147,6 +10147,7 @@ fn normal_bundle_adopts_output_grants_from_config_file_and_startup_cli() {
             .arg("--");
         if matches!(mode, OutputStartupMode::StartupCli) {
             command.args(["--log-path", OUTPUT_LOGGER_REF]);
+            command.args(["--level", "Debug"]);
             command.args(["--metrics-path", OUTPUT_METRICS_REF]);
         }
         command.args(["--config-file", OUTPUT_CONFIG_REF, "--no-api"]);
@@ -16302,6 +16303,23 @@ impl OutputGrantFixture {
                 .any(|window| window == b"operation=process-startup outcome=running\n"),
             "startup output grant should receive the no-API process startup record"
         );
+        for (name, expected) in [
+            (
+                "transport MMIO registration",
+                b"operation=mmio-registration outcome=succeeded\n".as_slice(),
+            ),
+            (
+                "backend guest shutdown",
+                b"operation=vcpu-exit outcome=guest-shutdown\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                logger
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "startup output grant should receive {name} record"
+            );
+        }
     }
 
     fn assert_outputs_at(
@@ -16468,7 +16486,10 @@ impl OutputStartupGrantFixture {
             );
             object.insert(
                 "logger".to_owned(),
-                serde_json::json!({"log_path": OUTPUT_LOGGER_REF}),
+                serde_json::json!({
+                    "log_path": OUTPUT_LOGGER_REF,
+                    "level": "Debug",
+                }),
             );
         }
         fs::write(

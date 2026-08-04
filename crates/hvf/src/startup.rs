@@ -50,6 +50,7 @@ use bangbang_runtime::fdt::{
 use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
+use bangbang_runtime::logger::{GuestLogger, LoggerBackendOutcome};
 use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking, GuestMemoryLayout,
     GuestMemoryRange,
@@ -30841,6 +30842,10 @@ impl OwnedHvfArm64BootSession {
 }
 
 impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
+    fn guest_logger(&self) -> GuestLogger {
+        self.backend.guest_logger()
+    }
+
     fn start_run_loop_wakeup_monitor(
         &mut self,
     ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
@@ -31049,6 +31054,10 @@ impl<P> BootSessionRunLoopSession for NetworkPacketIoBootSessionRunLoopSession<'
 where
     P: Arm64BootNetworkPacketIoProvider,
 {
+    fn guest_logger(&self) -> GuestLogger {
+        self.session.backend.guest_logger()
+    }
+
     fn start_run_loop_wakeup_monitor(
         &mut self,
     ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
@@ -32679,6 +32688,8 @@ fn dispatch_serial_input_with(
 }
 
 trait BootSessionRunLoopSession {
+    fn guest_logger(&self) -> GuestLogger;
+
     fn start_run_loop_wakeup_monitor(
         &mut self,
     ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
@@ -32776,6 +32787,10 @@ trait BootSessionRunLoopSession {
 }
 
 impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
+    fn guest_logger(&self) -> GuestLogger {
+        self.backend.guest_logger()
+    }
+
     fn start_run_loop_wakeup_monitor(
         &mut self,
     ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
@@ -33122,10 +33137,37 @@ fn run_boot_session_loop_with_observer(
     session: &mut impl BootSessionRunLoopSession,
     stop_token: &HvfArm64BootRunLoopStopToken,
     max_steps: NonZeroUsize,
-    observe_step: impl FnMut(&HvfVcpuRunStepOutcome),
+    mut observe_step: impl FnMut(&HvfVcpuRunStepOutcome),
 ) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
+    let mut virtual_timer_activated = false;
+    let mut terminal_step_outcome = None;
     let result =
-        run_boot_session_loop_with_observer_inner(session, stop_token, max_steps, observe_step);
+        run_boot_session_loop_with_observer_inner(session, stop_token, max_steps, |outcome| {
+            match backend_outcome_for_run_step_outcome(outcome) {
+                Some(LoggerBackendOutcome::VirtualTimerActivated) => {
+                    virtual_timer_activated = true;
+                }
+                Some(outcome) => terminal_step_outcome = Some(outcome),
+                None => {}
+            }
+            observe_step(outcome);
+        });
+    let error_outcome = result
+        .as_ref()
+        .err()
+        .and_then(backend_outcome_for_run_loop_error);
+    if virtual_timer_activated || terminal_step_outcome.is_some() || error_outcome.is_some() {
+        let guest_logger = session.guest_logger();
+        if virtual_timer_activated {
+            guest_logger.log_backend(LoggerBackendOutcome::VirtualTimerActivated);
+        }
+        if let Some(outcome) = terminal_step_outcome {
+            guest_logger.log_backend(outcome);
+        }
+        if let Some(outcome) = error_outcome {
+            guest_logger.log_backend(outcome);
+        }
+    }
     if !matches!(
         &result,
         Ok(HvfArm64BootRunLoopOutcome::StepLimitReached { .. })
@@ -33136,6 +33178,85 @@ fn run_boot_session_loop_with_observer(
     }
 
     result
+}
+
+pub(crate) fn backend_outcome_for_run_step_outcome(
+    outcome: &HvfVcpuRunStepOutcome,
+) -> Option<LoggerBackendOutcome> {
+    match outcome {
+        HvfVcpuRunStepOutcome::GuestShutdown { .. } => {
+            Some(LoggerBackendOutcome::VcpuExitGuestShutdown)
+        }
+        HvfVcpuRunStepOutcome::GuestReset { .. } => Some(LoggerBackendOutcome::VcpuExitGuestReset),
+        HvfVcpuRunStepOutcome::Unknown { .. } => Some(LoggerBackendOutcome::VcpuExitUnsupported),
+        HvfVcpuRunStepOutcome::VtimerActivated => Some(LoggerBackendOutcome::VirtualTimerActivated),
+        HvfVcpuRunStepOutcome::Canceled
+        | HvfVcpuRunStepOutcome::Hvc { .. }
+        | HvfVcpuRunStepOutcome::CpuOff { .. }
+        | HvfVcpuRunStepOutcome::CpuSuspend { .. }
+        | HvfVcpuRunStepOutcome::Sys64 { .. }
+        | HvfVcpuRunStepOutcome::Mmio { .. }
+        | HvfVcpuRunStepOutcome::DirtyWrite { .. }
+        | HvfVcpuRunStepOutcome::LazyPage { .. } => None,
+    }
+}
+
+pub(crate) fn backend_outcome_for_run_step_error(
+    error: &HvfArm64BootVcpuError,
+) -> Option<LoggerBackendOutcome> {
+    match error {
+        HvfArm64BootVcpuError::Member { source, .. }
+            if matches!(
+                source.as_ref(),
+                HvfVcpuRunnerError::MmioDispatch(
+                    crate::mmio::HvfMmioDispatchError::Dispatch { .. }
+                )
+            ) =>
+        {
+            // The attached runtime dispatcher owns this exact failure. Keep
+            // the HVF layer silent so one transition produces one record.
+            None
+        }
+        HvfArm64BootVcpuError::Member { source, .. }
+            if matches!(source.as_ref(), HvfVcpuRunnerError::MmioDispatch(_)) =>
+        {
+            Some(LoggerBackendOutcome::MmioDispatchFailed)
+        }
+        HvfArm64BootVcpuError::Member { source, .. }
+            if matches!(source.as_ref(), HvfVcpuRunnerError::Gic(_)) =>
+        {
+            Some(LoggerBackendOutcome::InterruptDeliveryFailed)
+        }
+        HvfArm64BootVcpuError::GuestMemory { .. }
+        | HvfArm64BootVcpuError::Member { .. }
+        | HvfArm64BootVcpuError::Power { .. }
+        | HvfArm64BootVcpuError::Coordinator { .. } => Some(LoggerBackendOutcome::VcpuRunFailed),
+    }
+}
+
+fn backend_outcome_for_run_loop_error(
+    error: &HvfArm64BootRunLoopError,
+) -> Option<LoggerBackendOutcome> {
+    match error {
+        HvfArm64BootRunLoopError::HandleVirtualTimer { .. } => {
+            Some(LoggerBackendOutcome::VirtualTimerFailed)
+        }
+        HvfArm64BootRunLoopError::RunStep { source, .. } => {
+            backend_outcome_for_run_step_error(source)
+        }
+        HvfArm64BootRunLoopError::StartWakeupMonitor { .. }
+        | HvfArm64BootRunLoopError::StopWakeupMonitor { .. }
+        | HvfArm64BootRunLoopError::DispatchSerialInput { .. }
+        | HvfArm64BootRunLoopError::DispatchBlockNotifications { .. }
+        | HvfArm64BootRunLoopError::DispatchPmemNotifications { .. }
+        | HvfArm64BootRunLoopError::DispatchNetworkNotifications { .. }
+        | HvfArm64BootRunLoopError::DispatchVsockNotifications { .. }
+        | HvfArm64BootRunLoopError::DispatchBalloonNotifications { .. }
+        | HvfArm64BootRunLoopError::DispatchMemoryHotplugNotifications { .. }
+        | HvfArm64BootRunLoopError::DispatchEntropyNotifications { .. } => {
+            Some(LoggerBackendOutcome::VcpuRunFailed)
+        }
+    }
 }
 
 fn run_boot_session_loop_with_observer_inner(
@@ -35869,6 +35990,8 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         crate::cache::HvfArm64CacheTopologyError,
     >,
 ) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
+    let guest_logger = controller.guest_logger();
+    backend.attach_guest_logger(guest_logger.clone());
     let pvtime_contention_probe = config.pvtime_contention_probe.clone();
     let serial_input = startup_resources
         .take_serial_input()
@@ -35881,8 +36004,11 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         .map(crate::cpu_template::PreparedHvfArm64CpuTemplate::from_runtime)
         .transpose()
         .map_err(|source| HvfArm64BootSessionError::CpuTemplate { source })?;
-    let prepared_cache = prepare_cache(controller.machine_config().vcpu_count())
-        .map_err(|source| HvfArm64BootSessionError::CacheTopology { source })?;
+    let prepared_cache =
+        prepare_cache(controller.machine_config().vcpu_count()).map_err(|source| {
+            guest_logger.log_backend(LoggerBackendOutcome::CacheConfigurationFailed);
+            HvfArm64BootSessionError::CacheTopology { source }
+        })?;
     let (cache_source, cache_hierarchy) = prepared_cache.into_parts();
     let retained_cache_hierarchy = cache_hierarchy.clone();
     if config.pci_enabled && config.pci_validation.is_some() {
@@ -36021,6 +36147,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         mut mmio_dispatcher,
         mut runtime,
     } = resources.into_parts();
+    mmio_dispatcher.attach_guest_logger(guest_logger);
     if let Some(boot_timer) = config.boot_timer_device {
         register_boot_timer_mmio(
             &mut mmio_dispatcher,
@@ -40424,6 +40551,7 @@ mod tests {
         >,
         timer_results: VecDeque<Result<(), HvfVcpuRunnerError>>,
         events: Vec<&'static str>,
+        guest_logger_snapshot_count: Cell<usize>,
         request_stop_on_run: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_pmem_dispatch: Option<HvfArm64BootRunLoopStopToken>,
@@ -40464,6 +40592,7 @@ mod tests {
                 entropy_dispatch_results: VecDeque::new(),
                 timer_results: VecDeque::new(),
                 events: Vec::new(),
+                guest_logger_snapshot_count: Cell::new(0),
                 request_stop_on_run: None,
                 request_stop_on_dispatch: None,
                 request_stop_on_pmem_dispatch: None,
@@ -40504,6 +40633,7 @@ mod tests {
                 entropy_dispatch_results: VecDeque::new(),
                 timer_results: VecDeque::new(),
                 events: Vec::new(),
+                guest_logger_snapshot_count: Cell::new(0),
                 request_stop_on_run: None,
                 request_stop_on_dispatch: None,
                 request_stop_on_pmem_dispatch: None,
@@ -40695,6 +40825,12 @@ mod tests {
     }
 
     impl super::BootSessionRunLoopSession for RecordingBootSessionRunLoopSession {
+        fn guest_logger(&self) -> super::GuestLogger {
+            self.guest_logger_snapshot_count
+                .set(self.guest_logger_snapshot_count.get().saturating_add(1));
+            super::GuestLogger::default()
+        }
+
         fn start_run_loop_wakeup_monitor(
             &mut self,
         ) -> Result<
@@ -46379,6 +46515,7 @@ mod tests {
             outcome,
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
         );
+        assert_eq!(session.guest_logger_snapshot_count.get(), 0);
         assert_eq!(
             session.events,
             [
@@ -47441,6 +47578,38 @@ mod tests {
     }
 
     #[test]
+    fn backend_run_loop_outcome_defers_dispatcher_owned_mmio_failure() {
+        let run_loop_error = |source| super::HvfArm64BootRunLoopError::RunStep {
+            steps_completed: 0,
+            source: Box::new(super::HvfArm64BootVcpuError::Member {
+                index: 0,
+                mpidr: 0,
+                generation: 0,
+                source: Box::new(HvfVcpuRunnerError::MmioDispatch(source)),
+            }),
+        };
+        let dispatcher_owned = run_loop_error(crate::mmio::HvfMmioDispatchError::Dispatch {
+            source: bangbang_runtime::mmio::MmioDispatchError::MissingHandler {
+                region_id: MmioRegionId::new(99),
+            },
+        });
+        assert_eq!(
+            super::backend_outcome_for_run_loop_error(&dispatcher_owned),
+            None
+        );
+
+        let hvf_owned = run_loop_error(crate::mmio::HvfMmioDispatchError::Operation {
+            source: crate::mmio::HvfMmioCompletionError::UnsupportedRegister {
+                register: HvfMmioRegister::new(31).expect("test register should decode"),
+            },
+        });
+        assert_eq!(
+            super::backend_outcome_for_run_loop_error(&hvf_owned),
+            Some(bangbang_runtime::logger::LoggerBackendOutcome::MmioDispatchFailed)
+        );
+    }
+
+    #[test]
     fn boot_session_run_loop_preserves_notification_error_after_mmio_step() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
@@ -47731,6 +47900,7 @@ mod tests {
             outcome,
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
         );
+        assert_eq!(session.guest_logger_snapshot_count.get(), 1);
         assert_eq!(
             session.events,
             [
