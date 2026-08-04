@@ -1390,6 +1390,42 @@ fn validate_fixture_assignment_boundary(
             "unsupported metrics fixture schema assignments: {assignments:?}"
         )));
     }
+
+    let body = source
+        .get(start..function.end)
+        .ok_or_else(|| AuditError::new("invalid metrics fixture schema body"))?;
+    let schema_uses = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.split(|character: char| character != '_' && !character.is_ascii_alphanumeric())
+                .any(|token| token == "firecracker_metrics")
+        })
+        .map(|line| {
+            if line.starts_with("firecracker_metrics = ") {
+                "firecracker_metrics ="
+            } else if line.starts_with("firecracker_metrics[\"rtc\"] = ") {
+                "firecracker_metrics[\"rtc\"] ="
+            } else if line.starts_with("firecracker_metrics[metrics_name] = ") {
+                "firecracker_metrics[metrics_name] ="
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+    let expected_schema_uses = [
+        "firecracker_metrics =",
+        "firecracker_metrics[\"rtc\"] =",
+        "firecracker_metrics[metrics_name] =",
+        "firecracker_metrics[metrics_name] =",
+        "firecracker_metrics[metrics_name] =",
+        "firecracker_metrics_schema = create_metrics_schema_objects(firecracker_metrics)",
+    ];
+    if schema_uses != expected_schema_uses {
+        return Err(AuditError::new(format!(
+            "unsupported metrics fixture schema use: {schema_uses:?}"
+        )));
+    }
     Ok(())
 }
 
@@ -1687,6 +1723,7 @@ mod tests {
             firecracker_metrics[metrics_name] = block_metrics
         if metrics_name.startswith("net_"):
             firecracker_metrics[metrics_name] = net_metrics
+    firecracker_metrics_schema = create_metrics_schema_objects(firecracker_metrics)
 
 class FcDeviceMetrics:
     pass
@@ -1731,7 +1768,7 @@ class FcDeviceMetrics:
     }
 
     #[test]
-    fn restricted_fixture_rejects_an_unparsed_schema_mutation() {
+    fn restricted_fixture_rejects_an_unparsed_schema_mutation_before_the_timestamp_boundary() {
         let source = r#"def validate_fc_metrics(metrics):
     latency_agg_metrics_fields = ["min_us", "max_us", "sum_us"]
     block_metrics = [{"read_agg": latency_agg_metrics_fields}, "read_count"]
@@ -1748,6 +1785,7 @@ class FcDeviceMetrics:
             firecracker_metrics[metrics_name] = block_metrics
         if metrics_name.startswith("net_"):
             firecracker_metrics[metrics_name] = net_metrics
+    firecracker_metrics_schema = create_metrics_schema_objects(firecracker_metrics)
 
 class FcDeviceMetrics:
     pass
@@ -1755,6 +1793,38 @@ class FcDeviceMetrics:
         let error =
             extract_fixture_schema(source).expect_err("unparsed schema mutations must fail closed");
         assert!(error.to_string().contains("unsupported top-level"));
+    }
+
+    #[test]
+    fn restricted_fixture_rejects_an_unparsed_schema_mutation_after_the_timestamp_boundary() {
+        let source = r#"def validate_fc_metrics(metrics):
+    latency_agg_metrics_fields = ["min_us", "max_us", "sum_us"]
+    block_metrics = [{"read_agg": latency_agg_metrics_fields}, "read_count"]
+    net_metrics = ["rx_count"]
+    firecracker_metrics = {"utc_timestamp_ms": "", "block": block_metrics}
+    # validate timestamp before jsonschema validation which some more time
+    firecracker_metrics["unparsed"] = ["count"]
+    if platform.machine() == "aarch64":
+        firecracker_metrics["rtc"] = ["error_count"]
+    for metrics_name in metrics.keys():
+        if metrics_name.startswith("vhost_user_"):
+            firecracker_metrics[metrics_name] = ["activate_fails"]
+        if metrics_name.startswith("block_"):
+            firecracker_metrics[metrics_name] = block_metrics
+        if metrics_name.startswith("net_"):
+            firecracker_metrics[metrics_name] = net_metrics
+    firecracker_metrics_schema = create_metrics_schema_objects(firecracker_metrics)
+
+class FcDeviceMetrics:
+    pass
+"#;
+        let error = extract_fixture_schema(source)
+            .expect_err("post-marker schema mutations must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported metrics fixture schema use")
+        );
     }
 
     #[test]
