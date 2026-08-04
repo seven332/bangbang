@@ -12203,11 +12203,100 @@
     {
       "id": "corpus:logger",
       "family": "observability",
-      "summary": "Audit all applicable capability claims owned by the pinned logger source corpus.",
+      "summary": "The exact pinned Firecracker v1.16 logger corpus is implemented and verified for Bangbang's macOS arm64/HVF VMM: all 468 ordinary and unrestricted invocation identities have one checked mapping, 402 applicable mappings belong to 24 compiled closed event classes, no applicable class remains planned, and 66 mappings belong to seven exact example, developer-instrumentation, Linux/KVM-only, separate-tool, tracing-owned, or x86-only exclusions. Local runtime, API, process, HVF, signed direct, and ordinary-production/App Sandbox evidence covers configuration and default stdout, host and worker lifecycle, guest and device outcomes, snapshots, panic/final convergence, filtering, limiter recovery, loss, redaction, containment, cleanup, and independent processes without claiming durable delivery or tracing implementation.",
       "source_refs": [
         "corpus:logger"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "closed API receipt, control, and result ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "process startup, convergence, and terminal logger ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/panic_bridge.rs",
+          "anchor": "fixed redacted panic admission and settlement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "transactional configuration and host lifecycle observation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "HVF guest, transport, device, snapshot, and time outcome propagation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "bounded worker, filters, limiters, loss accounting, and guest facade"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed bounded event vocabulary and encoding"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/logger_validate.rs",
+          "anchor": "exact pinned producer audit validation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/logger-contract.md",
+          "anchor": "terminal source, semantic, delivery, and exclusion ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "API logger success, rejection, redaction, and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup, terminal, panic, loss, and isolation tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed closed-vocabulary lifecycle, snapshot, guest, and device evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "ordinary process stdout, reconfiguration, failure, and two-process evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "focused HVF outcome propagation and result-preservation tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed ordinary-production and App Sandbox logger grant evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "bounded delivery, filtering, limiter recovery, loss, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "terminal logger aggregate and mutation certification"
+        }
+      ]
     },
     {
       "id": "corpus:memory-hotplug",
@@ -14881,12 +14970,91 @@
     {
       "id": "semantic.observability:logger-delivery-filtering-loss-and-redaction",
       "family": "observability",
-      "summary": "Audit logger configuration, records, filtering, rate limits, delivery/loss, panic/fatal behavior, redaction, isolation, and cleanup.",
+      "summary": "Logger configuration, delivery, filtering, loss, and redaction are implemented and verified as one process-local best-effort contract. Normal VMM execution installs a bounded worker-mediated stdout target; strict preboot /logger updates replace path-bearing targets failure-atomically and retain the current target for path-free updates, while full VM configuration omits observability authority. Fixed API, action, host, worker, guest, transport, device, snapshot, signal, panic, and final records apply module and level filters before independent bounded limiters and nonblocking admission; every delivery failure is loss-accounted without changing API, VM, snapshot, guest, or process results. Records are bounded UTF-8 and exclude paths, selectors, identities, descriptors, errors, credentials, payloads, addresses, registers, timestamps, and guest values. Signed direct and ordinary-production/App Sandbox tests cover MMIO/PCI reachability, write-only grants, pathname replacement, containment, cleanup, and two-process isolation. Delivery is not durable, and developer tracing remains separately owned by #1791.",
       "source_refs": [
         "corpus:logger",
         "corpus:tracing"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "closed redacted API logger request and result boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "process-owned default delivery and fixed terminal convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/panic_bridge.rs",
+          "anchor": "bounded value-free panic bridge"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "failure-atomic logger configuration and lifecycle ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "nonblocking typed guest and device outcome observation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "worker-mediated delivery, filtering, limiters, loss, and cleanup"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed 512-byte redacted record encoding"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/logger-contract.md",
+          "anchor": "terminal configuration, delivery, redaction, and nonclaim contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "panic, finalization, loss settlement, and cross-controller tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed exact logger vocabulary and MMIO/PCI outcome evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "default stdout, reconfiguration, filtering, failure, and isolation evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "contained write-only grant, replacement, redaction, and cleanup evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "filter-before-limit, recovery, queue and sink loss, bounds, and result tests"
+        },
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "logger confidentiality, boundedness, panic, retention, and isolation boundary"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "aggregate terminal scope, exact exclusions, totals, and mutations"
+        }
+      ]
     },
     {
       "id": "semantic.observability:metrics-schema-producers-flush-and-lifecycle",

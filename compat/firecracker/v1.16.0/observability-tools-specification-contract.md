@@ -148,8 +148,8 @@ remain in the CPU-template contract.
 | `api-property:Logger.show_level` | #1786 | `implemented-and-verified` |
 | `api-property:Logger.show_log_origin` | #1786 | `implemented-and-verified` |
 | `api-schema:Logger` | #1786 | `implemented-and-verified` |
-| `corpus:logger` | #1786 | `audit-required` |
-| `semantic.observability:logger-delivery-filtering-loss-and-redaction` | #1786 | `audit-required` |
+| `corpus:logger` | #1786 | `implemented-and-verified` |
+| `semantic.observability:logger-delivery-filtering-loss-and-redaction` | #1786 | `implemented-and-verified` |
 | `api-operation:PUT /metrics` | #1787 | `audit-required` |
 | `api-path:/metrics` | #1787 | `audit-required` |
 | `api-property:FullVmConfiguration.metrics` | #1787 | `audit-required` |
@@ -216,9 +216,10 @@ remain in the CPU-template contract.
 
 #1784 moved 22 rows to `implemented-and-verified` and 13 rows to
 `proven-platform-impossible`. #1807 subsequently moves the nine concrete
-logger operation/path/schema/property rows to `implemented-and-verified` while
-retaining both aggregate logger rows for #1786 final certification. The current
-inventory is therefore exactly 327 implemented, 58 audit-required, three
+logger operation/path/schema/property rows to `implemented-and-verified`, and
+#1810 certifies and promotes both aggregate logger rows after the exact
+producer, focused, process, signed, contained, and isolation gates pass. The
+current inventory is therefore exactly 329 implemented, 56 audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the
 prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the

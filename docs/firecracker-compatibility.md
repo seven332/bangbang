@@ -633,6 +633,18 @@ finalizer. A second hook invocation is silent; double panic, `panic=abort`, an
 explicit abort, fatal `_exit`, and uncatchable signals have no terminal metrics
 or delivery guarantee.
 
+The pinned logger aggregate is certified by
+`bangbang-firecracker-capability-audit validate --logger-final`. That gate
+joins all 468 source invocations to 24 compiled classes or seven reviewed
+non-applicable classes, requires all eleven logger capability rows to be
+terminal, and is backed by focused runtime/API/panic, ordinary process, signed
+direct MMIO/PCI, and ordinary-production/App Sandbox evidence. The signed
+process oracle accepts exactly the 41 emitted API method/route pairs and the
+closed action, control, host, guest, device, snapshot, panic, and final
+vocabularies. Certification does not broaden this best-effort contract into a
+durability guarantee and does not claim developer tracing, complete metrics,
+or unrelated observability/tooling work.
+
 ### Metrics field and transaction model
 
 Every implemented event total is an interval increment: deprecated, GET, PUT,

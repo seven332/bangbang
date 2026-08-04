@@ -395,9 +395,12 @@ or add equivalent direct evidence; component-only inference is insufficient.
 
 Run
 `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`
-when the PR changes Firecracker-facing behavior or inventory data. Final parent
-certification additionally runs `validate --final`; ordinary feature PRs must
-not weaken that gate to make unresolved records pass.
+when the PR changes Firecracker-facing behavior or inventory data. A checked
+scope may define a narrower terminal command such as logger
+`validate --logger-final`; it must still run general delivery validation and
+must name every record in that scope exactly. Repository-wide parent
+certification runs `validate --final`. Ordinary feature or scoped-certification
+PRs must not weaken that global gate to make unrelated unresolved records pass.
 
 Avoid overstating scaffold behavior: if a PR adds constants, internal helpers,
 or planning docs without public API behavior, describe that narrower state

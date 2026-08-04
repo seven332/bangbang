@@ -1577,8 +1577,9 @@ continuations, RTC rejection, and normal/native-v2 VMGenID, VMClock, PVTime,
 capture, publication, and ordered-restore outcomes.
 Runtime and HVF tests assert unchanged functional results and absence of raw
 errors, identifiers, descriptors, byte/page counts, timestamps, and guest
-values. The signed executable parser admits the complete fixed vocabulary and
-rejects extra fields or invented operation/outcome pairs.
+values. The signed executable parser admits the complete fixed vocabulary,
+including exactly 41 API method/route pairs, and rejects extra fields, invented
+routes, mismatched method/route ownership, or invented operation/outcome pairs.
 The aggregate remaining-device signed workload proves representative records
 over both MMIO and product PCI. Production-bundle cases separately adopt an
 exact write-only logger grant and require at least one balloon, virtio-mem,
@@ -1586,16 +1587,20 @@ entropy, serial, and time/identity record after replacing the source pathname;
 they also reject fixture paths, grant identities, guest markers, serial or
 entropy payloads, and time/identity fingerprints.
 
-The final parent gate is:
+The terminal logger parent gate is:
 
 ```sh
-cargo run -p bangbang-firecracker-capability-audit --locked -- validate --final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger-final
 ```
 
-Final mode fails while any `audit-required` or
-`missing-platform-feasible` capability record or any planned logger class
-remains. An inventory-only change does not promote a capability without
-record-specific implementation and validation evidence.
+Logger-final mode runs general delivery validation, requires every logger
+producer class to be terminal, and requires all eleven #1786 capability rows
+to be implemented with record-specific evidence. It intentionally permits
+unrelated delivery work. Repository-global `validate --final` remains
+unchanged and fails while any capability record is `audit-required` or
+`missing-platform-feasible`, or any logger class is planned. An inventory-only
+change cannot promote a capability without implementation and validation
+evidence.
 
 ## Running Tests
 
@@ -1604,6 +1609,7 @@ Run the standard workspace checks before opening or updating a PR:
 ```sh
 cargo fmt --all -- --check
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger-final
 cargo check --workspace --all-targets --all-features --locked
 cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 cargo check -p bangbang-snapshot-tools --all-targets --all-features --locked --target aarch64-unknown-linux-musl

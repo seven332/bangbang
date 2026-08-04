@@ -18485,18 +18485,52 @@ mod macos_arm64 {
         }
     }
 
-    fn is_api_request_logger_line(line: &str) -> bool {
-        let Some(rest) = line.strip_prefix("The API server received a ") else {
-            return false;
-        };
-        let Some((method, path)) = rest.split_once(" request on \"") else {
-            return false;
-        };
-        let Some(path) = path.strip_suffix("\".") else {
-            return false;
-        };
+    const API_REQUEST_LOGGER_LINES: [&str; 41] = [
+        "The API server received a Delete request on \"/drives/{drive_id}\".",
+        "The API server received a Delete request on \"/network-interfaces/{iface_id}\".",
+        "The API server received a Delete request on \"/pmem/{pmem_id}\".",
+        "The API server received a Get request on \"/\".",
+        "The API server received a Get request on \"/balloon\".",
+        "The API server received a Get request on \"/balloon/hinting/status\".",
+        "The API server received a Get request on \"/balloon/statistics\".",
+        "The API server received a Get request on \"/hotplug/memory\".",
+        "The API server received a Get request on \"/machine-config\".",
+        "The API server received a Get request on \"/mmds\".",
+        "The API server received a Get request on \"/version\".",
+        "The API server received a Get request on \"/vm/config\".",
+        "The API server received a Patch request on \"/balloon\".",
+        "The API server received a Patch request on \"/balloon/hinting/start\".",
+        "The API server received a Patch request on \"/balloon/hinting/stop\".",
+        "The API server received a Patch request on \"/balloon/statistics\".",
+        "The API server received a Patch request on \"/drives/{drive_id}\".",
+        "The API server received a Patch request on \"/hotplug/memory\".",
+        "The API server received a Patch request on \"/machine-config\".",
+        "The API server received a Patch request on \"/mmds\".",
+        "The API server received a Patch request on \"/network-interfaces/{iface_id}\".",
+        "The API server received a Patch request on \"/pmem/{pmem_id}\".",
+        "The API server received a Patch request on \"/vm\".",
+        "The API server received a Put request on \"/actions\".",
+        "The API server received a Put request on \"/balloon\".",
+        "The API server received a Put request on \"/boot-source\".",
+        "The API server received a Put request on \"/cpu-config\".",
+        "The API server received a Put request on \"/drives/{drive_id}\".",
+        "The API server received a Put request on \"/entropy\".",
+        "The API server received a Put request on \"/hotplug/memory\".",
+        "The API server received a Put request on \"/logger\".",
+        "The API server received a Put request on \"/machine-config\".",
+        "The API server received a Put request on \"/metrics\".",
+        "The API server received a Put request on \"/mmds\".",
+        "The API server received a Put request on \"/mmds/config\".",
+        "The API server received a Put request on \"/network-interfaces/{iface_id}\".",
+        "The API server received a Put request on \"/pmem/{pmem_id}\".",
+        "The API server received a Put request on \"/serial\".",
+        "The API server received a Put request on \"/snapshot/create\".",
+        "The API server received a Put request on \"/snapshot/load\".",
+        "The API server received a Put request on \"/vsock\".",
+    ];
 
-        !method.is_empty() && path.starts_with('/')
+    fn is_api_request_logger_line(line: &str) -> bool {
+        API_REQUEST_LOGGER_LINES.contains(&line)
     }
 
     fn assert_no_api_logger_output(path: &Path) {
@@ -18581,6 +18615,41 @@ mod macos_arm64 {
              action=request outcome=no-content\n",
             LoggerPrefixExpectation::None,
         );
+    }
+
+    #[test]
+    fn logger_output_accepts_only_the_exact_api_method_route_matrix() {
+        assert!(
+            API_REQUEST_LOGGER_LINES
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "API request logger oracle should be sorted and unique"
+        );
+        for line in API_REQUEST_LOGGER_LINES {
+            assert!(
+                is_api_request_logger_line(line),
+                "exact API request logger line should be accepted: {line}"
+            );
+        }
+
+        for line in [
+            "The API server received a Post request on \"/actions\".",
+            "The API server received a get request on \"/\".",
+            "The API server received a Get request on \"/actions\".",
+            "The API server received a Put request on \"/version\".",
+            "The API server received a Put request on \"/drives/root\".",
+            "The API server received a Put request on \"/private\".",
+            "The API server received a Get request on \"/version?secret=value\".",
+            "The API server received a Get request on \"/version#secret\".",
+            "The API server received a Put request on \"/logger\". body=secret",
+            "The API server received a Put request on \"/logger\"",
+            "The API server received a Put request on /logger.",
+        ] {
+            assert!(
+                !is_api_request_logger_line(line),
+                "invented or value-bearing API request logger line should be rejected: {line}"
+            );
+        }
     }
 
     #[test]

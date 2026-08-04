@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
-    AuditMode, CAPABILITY_INVENTORY_PATH, Disposition, LOGGER_PRODUCER_AUDIT_PATH,
-    LOGGER_PRODUCER_MANIFEST_PATH, LoggerClassDisposition, LoggerCompiledEvent,
-    LoggerDeliveryPolicy, Reference, SOURCE_MANIFEST_PATH, logger_producer_audit_json,
-    logger_producer_manifest_json, read_capability_inventory, read_logger_producer_audit,
-    read_logger_producer_manifest, read_source_manifest, source_manifest_json, validate,
+    AuditMode, CAPABILITY_INVENTORY_PATH, Disposition, LOGGER_COMPATIBILITY_CAPABILITY_IDS,
+    LOGGER_PRODUCER_AUDIT_PATH, LOGGER_PRODUCER_MANIFEST_PATH, LoggerClassDisposition,
+    LoggerCompiledEvent, LoggerDeliveryPolicy, LoggerNonApplicableReason, Reference,
+    SOURCE_MANIFEST_PATH, logger_producer_audit_json, logger_producer_manifest_json,
+    read_capability_inventory, read_logger_producer_audit, read_logger_producer_manifest,
+    read_source_manifest, source_manifest_json, validate, validate_logger_compatibility,
     validate_logger_producers,
 };
 
@@ -248,6 +249,43 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         "corpus:logger",
         "semantic.observability:logger-delivery-filtering-loss-and-redaction",
     ];
+    const NON_APPLICABLE_POLICY: [(&str, LoggerNonApplicableReason, &str); 7] = [
+        (
+            "logger.nonapp.example",
+            LoggerNonApplicableReason::ExampleOnly,
+            "These calls exist only in upstream example programs and are not Firecracker VMM process producers.",
+        ),
+        (
+            "logger.nonapp.fuzzing",
+            LoggerNonApplicableReason::DeveloperInstrumentation,
+            "The producer exists only in an explicitly insecure developer fuzzing build and is not a production VMM outcome.",
+        ),
+        (
+            "logger.nonapp.gdb",
+            LoggerNonApplicableReason::DeveloperInstrumentation,
+            "These calls serve Firecracker's optional developer GDB server rather than the production VMM logger contract selected for Bangbang.",
+        ),
+        (
+            "logger.nonapp.linux-hardening",
+            LoggerNonApplicableReason::LinuxKvmOnly,
+            "The producer reports a Linux prctl mechanism that has no identity-preserving macOS/HVF operation; Bangbang documents its platform security boundary separately.",
+        ),
+        (
+            "logger.nonapp.tool",
+            LoggerNonApplicableReason::SeparateToolOwner,
+            "This producer belongs to the separately delivered CPU-template-helper command rather than the Bangbang VMM process logger.",
+        ),
+        (
+            "logger.nonapp.tracing",
+            LoggerNonApplicableReason::TracingOwned,
+            "The log-instrument crate implements developer tracing owned by #1791, not the Firecracker VMM logger compatibility surface.",
+        ),
+        (
+            "logger.nonapp.x86",
+            LoggerNonApplicableReason::X86Only,
+            "The mapped architecture, CPUID, xstate, interrupt, debug-register, and i8042 producers have no identity-preserving macOS arm64/HVF execution path. Firecracker's i8042 source module is shared, but its construction, PIO registration, API exposure, and runtime ownership are x86_64-only; Bangbang's arm64 platform instead exposes PL031 RTC without an i8042 controller.",
+        ),
+    ];
 
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -274,6 +312,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
     assert_eq!(manifest.counts.macro_template, 2);
     assert_eq!(audit.classes.len(), 31);
     assert_eq!(audit.mappings.len(), 468);
+    assert_eq!(LOGGER_CAPABILITIES, LOGGER_COMPATIBILITY_CAPABILITY_IDS);
 
     let classes = audit
         .classes
@@ -316,6 +355,13 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             row.ends_with(&format!("| {expected_mappings} |")),
             "contract mapping count drifted: {id}"
         );
+    }
+    for (id, reason, rationale) in NON_APPLICABLE_POLICY {
+        let class = classes
+            .get(id)
+            .unwrap_or_else(|| panic!("non-applicable logger class must exist: {id}"));
+        assert_eq!(class.non_applicable_reason, Some(reason));
+        assert_eq!(class.rationale, rationale);
     }
 
     assert_eq!(
@@ -428,24 +474,128 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         .map(|capability| (capability.id.as_str(), capability))
         .collect::<BTreeMap<_, _>>();
     for id in LOGGER_CAPABILITIES {
-        let aggregate = matches!(
-            id,
-            "corpus:logger" | "semantic.observability:logger-delivery-filtering-loss-and-redaction"
-        );
-        let expected = if aggregate {
-            Disposition::AuditRequired
-        } else {
-            Disposition::ImplementedAndVerified
-        };
         assert_eq!(
             capabilities
                 .get(id)
                 .unwrap_or_else(|| panic!("logger capability must exist: {id}"))
                 .disposition,
-            expected,
-            "#1807 capability disposition drifted: {id}"
+            Disposition::ImplementedAndVerified,
+            "#1810 capability disposition drifted: {id}"
         );
     }
+}
+
+#[test]
+fn checked_logger_compatibility_is_terminal_and_fail_closed() {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let manifest = read_source_manifest(&repository_root.join(SOURCE_MANIFEST_PATH))
+        .expect("checked source manifest must parse");
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let logger_manifest =
+        read_logger_producer_manifest(&repository_root.join(LOGGER_PRODUCER_MANIFEST_PATH))
+            .expect("checked logger producer manifest must parse");
+    let logger_audit =
+        read_logger_producer_audit(&repository_root.join(LOGGER_PRODUCER_AUDIT_PATH))
+            .expect("checked logger producer audit must parse");
+
+    assert!(
+        inventory
+            .capabilities
+            .iter()
+            .any(|capability| capability.disposition == Disposition::AuditRequired)
+    );
+    assert!(
+        inventory
+            .capabilities
+            .iter()
+            .any(|capability| { capability.disposition == Disposition::MissingPlatformFeasible })
+    );
+    validate_logger_compatibility(
+        &manifest,
+        &inventory,
+        &logger_manifest,
+        &logger_audit,
+        &repository_root,
+    )
+    .expect("checked logger compatibility scope must be terminal");
+
+    let mut nonterminal = inventory.clone();
+    let capability = nonterminal
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == "corpus:logger")
+        .expect("logger corpus capability must exist");
+    capability.disposition = Disposition::AuditRequired;
+    capability.implementation.clear();
+    capability.validation.clear();
+    let error = validate_logger_compatibility(
+        &manifest,
+        &nonterminal,
+        &logger_manifest,
+        &logger_audit,
+        &repository_root,
+    )
+    .expect_err("nonterminal logger aggregate must fail")
+    .to_string();
+    assert!(error.contains("logger certification requires implemented-and-verified capability"));
+
+    let mut missing = inventory.clone();
+    missing.capabilities.retain(|capability| {
+        capability.id != "semantic.observability:logger-delivery-filtering-loss-and-redaction"
+    });
+    let error = validate_logger_compatibility(
+        &manifest,
+        &missing,
+        &logger_manifest,
+        &logger_audit,
+        &repository_root,
+    )
+    .expect_err("missing logger aggregate must fail")
+    .to_string();
+    assert!(error.contains("logger certification capability is missing"));
+
+    let mut missing_evidence = inventory.clone();
+    missing_evidence
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == "corpus:logger")
+        .expect("logger corpus capability must exist")
+        .validation
+        .clear();
+    let error = validate_logger_compatibility(
+        &manifest,
+        &missing_evidence,
+        &logger_manifest,
+        &logger_audit,
+        &repository_root,
+    )
+    .expect_err("logger aggregate without validation evidence must fail")
+    .to_string();
+    assert!(error.contains("implemented-and-verified requires validation references"));
+
+    let mut planned = logger_audit.clone();
+    let class = planned
+        .classes
+        .iter_mut()
+        .find(|class| class.id == "logger.api.request")
+        .expect("API request class must exist");
+    class.disposition = LoggerClassDisposition::Planned;
+    class.delivery_issue = Some("#1810".to_string());
+    let error = validate_logger_compatibility(
+        &manifest,
+        &inventory,
+        &logger_manifest,
+        &planned,
+        &repository_root,
+    )
+    .expect_err("planned logger class must fail terminal certification")
+    .to_string();
+    assert!(error.contains("final logger validation forbids planned class"));
 }
 
 #[test]
@@ -884,7 +1034,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         "corpus:actions-api",
         "semantic.specification:api-availability-stability-and-failure-information",
     ];
-    const LOGGER_IMPLEMENTED: [&str; 9] = [
+    const LOGGER_IMPLEMENTED: [&str; 11] = [
         "api-operation:PUT /logger",
         "api-path:/logger",
         "api-property:FullVmConfiguration.logger",
@@ -894,6 +1044,8 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         "api-property:Logger.show_level",
         "api-property:Logger.show_log_origin",
         "api-schema:Logger",
+        "corpus:logger",
+        "semantic.observability:logger-delivery-filtering-loss-and-redaction",
     ];
     const X86_IMPOSSIBLE: [&str; 13] = [
         "api-property:CpuConfig.cpuid_modifiers",
@@ -943,7 +1095,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert_eq!(handoffs.len(), 9, "retained handoffs must be unique");
     assert!(owned.is_disjoint(&handoffs));
     assert_eq!(implemented.len(), 22);
-    assert_eq!(logger_implemented.len(), 9);
+    assert_eq!(logger_implemented.len(), 11);
     assert_eq!(impossible.len(), 13);
     assert!(implemented.is_disjoint(&impossible));
     assert!(logger_implemented.is_disjoint(&implemented));
@@ -1093,7 +1245,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
             .contains("numeric startup/resource/performance or telemetry outcomes (#1798)")
     );
     assert!(normalized_contract.contains("final cross-capability interactions (Wave 8)"));
-    assert!(normalized_contract.contains("327 implemented, 58 audit-required"));
+    assert!(normalized_contract.contains("329 implemented, 56 audit-required"));
     assert!(normalized_contract.contains("376/9/3/30"));
 }
 
@@ -1558,8 +1710,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 327);
-    assert_eq!(count(Disposition::AuditRequired), 58);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 329);
+    assert_eq!(count(Disposition::AuditRequired), 56);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -2288,8 +2440,8 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 327);
-    assert_eq!(count(Disposition::AuditRequired), 58);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 329);
+    assert_eq!(count(Disposition::AuditRequired), 56);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -2585,8 +2737,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 327);
-    assert_eq!(count(Disposition::AuditRequired), 58);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 329);
+    assert_eq!(count(Disposition::AuditRequired), 56);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -2734,8 +2886,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 327);
-    assert_eq!(count(Disposition::AuditRequired), 58);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 329);
+    assert_eq!(count(Disposition::AuditRequired), 56);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3004,8 +3156,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 327);
-    assert_eq!(count(Disposition::AuditRequired), 58);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 329);
+    assert_eq!(count(Disposition::AuditRequired), 56);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 

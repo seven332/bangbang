@@ -9,7 +9,7 @@ use bangbang_firecracker_capability_audit::{
     LOGGER_PRODUCER_MANIFEST_PATH, SOURCE_MANIFEST_PATH, derive_logger_producer_manifest,
     derive_source_manifest, logger_producer_manifest_json, read_capability_inventory,
     read_logger_producer_audit, read_logger_producer_manifest, read_source_manifest,
-    source_manifest_json, validate, validate_logger_producers,
+    source_manifest_json, validate, validate_logger_compatibility, validate_logger_producers,
 };
 
 fn main() -> ExitCode {
@@ -43,32 +43,64 @@ fn run(args: Vec<String>) -> Result<String, AuditError> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidateMode {
+    Delivery,
+    Final,
+    LoggerFinal,
+}
+
+fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
+    match args {
+        [] => Ok(ValidateMode::Delivery),
+        [flag] if flag == "--final" => Ok(ValidateMode::Final),
+        [flag] if flag == "--logger-final" => Ok(ValidateMode::LoggerFinal),
+        _ => Err(AuditError::new(
+            "validate accepts only one optional --final or --logger-final flag",
+        )),
+    }
+}
+
 fn run_validate(args: &[String]) -> Result<String, AuditError> {
-    let mode = match args {
-        [] => AuditMode::Delivery,
-        [flag] if flag == "--final" => AuditMode::Final,
-        _ => {
-            return Err(AuditError::new(
-                "validate accepts only the optional --final flag",
-            ));
-        }
-    };
+    let mode = parse_validate_mode(args)?;
     let root = repository_root()?;
     let manifest = read_source_manifest(&root.join(SOURCE_MANIFEST_PATH))?;
     let inventory = read_capability_inventory(&root.join(CAPABILITY_INVENTORY_PATH))?;
     let logger_manifest = read_logger_producer_manifest(&root.join(LOGGER_PRODUCER_MANIFEST_PATH))?;
     let logger_audit = read_logger_producer_audit(&root.join(LOGGER_PRODUCER_AUDIT_PATH))?;
+    let audit_mode = match mode {
+        ValidateMode::Delivery => AuditMode::Delivery,
+        ValidateMode::Final => AuditMode::Final,
+        ValidateMode::LoggerFinal => {
+            validate_logger_compatibility(
+                &manifest,
+                &inventory,
+                &logger_manifest,
+                &logger_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!("logger compatibility validation errors:\n{errors}"))
+            })?;
+            return Ok(
+                "Firecracker capability inventory and logger producer audit are valid for the terminal logger compatibility scope"
+                    .to_string(),
+            );
+        }
+    };
     let mut failures = Vec::new();
-    if let Err(errors) = validate(&manifest, &inventory, &root, mode) {
+    if let Err(errors) = validate(&manifest, &inventory, &root, audit_mode) {
         failures.push(format!("inventory validation errors:\n{errors}"));
     }
-    if let Err(errors) = validate_logger_producers(&logger_manifest, &logger_audit, &root, mode) {
+    if let Err(errors) =
+        validate_logger_producers(&logger_manifest, &logger_audit, &root, audit_mode)
+    {
         failures.push(format!("logger producer validation errors:\n{errors}"));
     }
     if !failures.is_empty() {
         return Err(AuditError::new(failures.join("\n")));
     }
-    let mode_name = match mode {
+    let mode_name = match audit_mode {
         AuditMode::Delivery => "delivery",
         AuditMode::Final => "final",
     };
@@ -322,7 +354,7 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bangbang-firecracker-capability-audit validate [--final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH"
+    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH"
 }
 
 #[cfg(test)]
@@ -336,6 +368,27 @@ mod tests {
                 .expect("help should work")
                 .contains("Usage:")
         );
+    }
+
+    #[test]
+    fn parses_exact_validate_modes() {
+        assert_eq!(parse_validate_mode(&[]).unwrap(), ValidateMode::Delivery);
+        assert_eq!(
+            parse_validate_mode(&["--final".to_string()]).unwrap(),
+            ValidateMode::Final
+        );
+        assert_eq!(
+            parse_validate_mode(&["--logger-final".to_string()]).unwrap(),
+            ValidateMode::LoggerFinal
+        );
+
+        for invalid in [
+            vec!["--unknown".to_string()],
+            vec!["--final".to_string(), "--logger-final".to_string()],
+        ] {
+            let error = parse_validate_mode(&invalid).expect_err("mode should be rejected");
+            assert!(error.to_string().contains("accepts only one optional"));
+        }
     }
 
     #[test]
