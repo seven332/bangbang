@@ -3005,6 +3005,18 @@ a worker can stall or fail after admission. Worker-only panic, panic during
 unwind, abort, fatal `_exit`, and uncatchable signals have no final metrics or
 record-persistence guarantee. Operators must not treat the presence or absence
 of these best-effort records as an audit log or security decision input.
+
+The terminal logger certification binds this security boundary to the exact
+pinned producer population. Its scoped validator permits no planned logger
+class, pins the seven example/developer/Linux/tool/tracing/x86 exclusions, and
+requires all eleven logger capability records plus tracked focused, process,
+signed direct, and ordinary-production/App Sandbox evidence. The signed output
+oracle admits only 41 fixed API method/route pairs and the closed non-API
+vocabulary; selector values, arbitrary paths, extra fields, and invented
+method/route ownership are rejected. This certification does not make logger
+output durable, grant a guest or worker sink authority, or implement the
+separately owned tracing surface.
+
 Current session-initial, periodic, explicit, and normal-terminal metrics lines
 can expose selected API request counters, startup timing fields, logger and
 serial counters, a terse boot run-loop status summary, and minimal device

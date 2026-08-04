@@ -323,6 +323,18 @@ Ordinary validation uses only checked files:
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 ```
 
+Terminal logger certification also uses only checked files:
+
+```text
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger-final
+```
+
+That scoped command validates the complete capability inventory in delivery
+mode, the complete logger producer overlay in final mode, and all eleven
+#1786 operation/path/schema/property/corpus/semantic rows as terminal. Global
+`validate --final` remains unchanged and is reserved for a repository snapshot
+with no unresolved capability family.
+
 Exact upstream comparison requires a clean checkout at the pinned commit:
 
 ```text
@@ -344,8 +356,14 @@ every missing/stale human mapping separately.
 
 Issue #1807 promotes the nine concrete `/logger` operation, path, schema,
 property, and full-configuration records in `capabilities.json`. Issue #1816
-closes the last producer classes and the logger overlay contains no planned
-work. The two aggregate `corpus:logger` and
-`semantic.observability:logger-delivery-filtering-loss-and-redaction` records
-remain `audit-required` until the #1786 final certification verifies and
-promotes the aggregate claims.
+closes the last producer classes, leaving 24 implemented and seven exact
+not-applicable classes, 402 implemented and 66 not-applicable mappings, and no
+planned work. Issue #1810 certifies that unchanged source closure together
+with focused runtime/API/panic tests, ordinary process tests, signed direct
+MMIO/PCI tests, and ordinary-production/App Sandbox grant tests. It therefore
+promotes `corpus:logger` and
+`semantic.observability:logger-delivery-filtering-loss-and-redaction`; all
+eleven #1786 rows are `implemented-and-verified`. The terminal claim remains
+best effort and process local: it does not promise durable sink delivery,
+implement developer tracing owned by #1791, or complete the unrelated metrics
+and tooling rows.

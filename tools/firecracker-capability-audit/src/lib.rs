@@ -1,5 +1,6 @@
 //! Firecracker capability inventory parsing, validation, and source comparison.
 
+mod logger_certify;
 mod logger_model;
 mod logger_upstream;
 mod logger_validate;
@@ -7,6 +8,7 @@ mod model;
 mod upstream;
 mod validate;
 
+pub use logger_certify::{LOGGER_COMPATIBILITY_CAPABILITY_IDS, validate_logger_compatibility};
 pub use logger_model::{
     LoggerClassDisposition, LoggerCompiledEvent, LoggerDeliveryPolicy, LoggerField,
     LoggerInvocation, LoggerInvocationSyntax, LoggerLevelPolicy, LoggerLimiterPolicy, LoggerMacro,

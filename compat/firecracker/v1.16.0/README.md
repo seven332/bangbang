@@ -64,7 +64,7 @@ reviewed delta.
 | [Snapshot editor state](snapshot-editor-contract.md) | Native-state version/vCPU/VM inspection, finite reviewed-register editing, no-clobber publication, signed Full/Diff product restore, and the exact twelve-row closure |
 | [Snapshot Wave 6](snapshot-wave6-contract.md) | Exact 70-row load, artifact, version, device, tool, time/identity, portability, and downstream-owner certification |
 | [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
-| [Logger producers](logger-contract.md) | Exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
+| [Logger producers](logger-contract.md) | Certified 11-row logger aggregate with exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
 
 ## Dispositions
 
@@ -102,6 +102,23 @@ Platform-impossible records additionally keep the upstream requirement,
 authoritative host-platform evidence, considered alternatives and rejection
 reasons, stable public behavior, focused tests, documentation, and the trusted
 Challenge decision together.
+
+## Scoped Logger Certification
+
+The terminal logger aggregate has its own checked gate because unrelated
+Firecracker capabilities remain under delivery:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger-final
+```
+
+This command validates the complete capability inventory in delivery mode,
+the complete logger producer audit in final mode, and the exact eleven #1786
+capability records as `implemented-and-verified`. It does not ignore a logger
+class or alter another capability's disposition. Repository-global
+`validate --final` remains the stronger all-capabilities completion gate and
+must continue to fail while any unrelated `audit-required` or
+`missing-platform-feasible` record remains.
 
 ## Contributor Update Rule
 
