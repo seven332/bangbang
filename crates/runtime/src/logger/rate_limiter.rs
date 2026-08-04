@@ -42,6 +42,10 @@ pub(super) enum LoggerRateLimitIdentity {
     ObservabilityWorker,
     BackendOutcome,
     TransportOutcome,
+    BlockOutcome,
+    PmemOutcome,
+    NetworkOutcome,
+    VsockOutcome,
 }
 
 impl LoggerRateLimitIdentity {
@@ -52,16 +56,24 @@ impl LoggerRateLimitIdentity {
             Self::ObservabilityWorker => 2,
             Self::BackendOutcome => 3,
             Self::TransportOutcome => 4,
+            Self::BlockOutcome => 5,
+            Self::PmemOutcome => 6,
+            Self::NetworkOutcome => 7,
+            Self::VsockOutcome => 8,
         }
     }
 }
 
-const LOGGER_RATE_LIMIT_IDENTITIES: [LoggerRateLimitIdentity; 5] = [
+const LOGGER_RATE_LIMIT_IDENTITIES: [LoggerRateLimitIdentity; 9] = [
     LoggerRateLimitIdentity::BootTimer,
     LoggerRateLimitIdentity::ApiRequest,
     LoggerRateLimitIdentity::ObservabilityWorker,
     LoggerRateLimitIdentity::BackendOutcome,
     LoggerRateLimitIdentity::TransportOutcome,
+    LoggerRateLimitIdentity::BlockOutcome,
+    LoggerRateLimitIdentity::PmemOutcome,
+    LoggerRateLimitIdentity::NetworkOutcome,
+    LoggerRateLimitIdentity::VsockOutcome,
 ];
 const LOGGER_RATE_LIMIT_IDENTITY_COUNT: usize = LOGGER_RATE_LIMIT_IDENTITIES.len();
 

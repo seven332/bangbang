@@ -224,6 +224,363 @@ impl LoggerDeviceKind {
     }
 }
 
+/// Fixed, value-free block data-plane outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerBlockOutcome {
+    RequestSucceeded,
+    RequestUnsupported,
+    RequestParseFailed,
+    RequestIoFailed,
+    StatusWriteFailed,
+    QueueDispatchFailed,
+    QueueNotificationInactive,
+    QueueNotificationUnsupported,
+    RateLimiterThrottled,
+    RateLimiterResumed,
+    AsyncEngineThrottled,
+    AsyncEngineFailed,
+    VhostUserNotificationSucceeded,
+    VhostUserNotificationFailed,
+    VhostUserDisconnected,
+    VhostUserTerminal,
+    VhostUserConfigSucceeded,
+    VhostUserConfigFailed,
+    InterruptDeliveryFailed,
+}
+
+impl LoggerBlockOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::RequestSucceeded | Self::RequestUnsupported => "request",
+            Self::RequestParseFailed => "request-parse",
+            Self::RequestIoFailed => "request-io",
+            Self::StatusWriteFailed => "status-write",
+            Self::QueueDispatchFailed => "queue-dispatch",
+            Self::QueueNotificationInactive | Self::QueueNotificationUnsupported => {
+                "queue-notification"
+            }
+            Self::RateLimiterThrottled | Self::RateLimiterResumed => "rate-limiter",
+            Self::AsyncEngineThrottled | Self::AsyncEngineFailed => "async-engine",
+            Self::VhostUserNotificationSucceeded
+            | Self::VhostUserNotificationFailed
+            | Self::VhostUserDisconnected
+            | Self::VhostUserTerminal => "vhost-user-notification",
+            Self::VhostUserConfigSucceeded | Self::VhostUserConfigFailed => "vhost-user-config",
+            Self::InterruptDeliveryFailed => "interrupt-delivery",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::RequestSucceeded
+            | Self::VhostUserNotificationSucceeded
+            | Self::VhostUserConfigSucceeded => "succeeded",
+            Self::RequestUnsupported | Self::QueueNotificationUnsupported => "unsupported",
+            Self::RequestParseFailed
+            | Self::RequestIoFailed
+            | Self::StatusWriteFailed
+            | Self::QueueDispatchFailed
+            | Self::AsyncEngineFailed
+            | Self::VhostUserNotificationFailed
+            | Self::VhostUserConfigFailed
+            | Self::InterruptDeliveryFailed => "failed",
+            Self::QueueNotificationInactive => "inactive",
+            Self::RateLimiterThrottled | Self::AsyncEngineThrottled => "throttled",
+            Self::RateLimiterResumed => "resumed",
+            Self::VhostUserDisconnected => "disconnected",
+            Self::VhostUserTerminal => "terminal",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::RateLimiterThrottled | Self::RateLimiterResumed | Self::AsyncEngineThrottled => {
+                LoggerLevel::Debug
+            }
+            Self::RequestSucceeded
+            | Self::VhostUserNotificationSucceeded
+            | Self::VhostUserConfigSucceeded => LoggerLevel::Info,
+            Self::RequestUnsupported
+            | Self::QueueNotificationUnsupported
+            | Self::VhostUserDisconnected => LoggerLevel::Warn,
+            Self::RequestParseFailed
+            | Self::RequestIoFailed
+            | Self::StatusWriteFailed
+            | Self::QueueDispatchFailed
+            | Self::QueueNotificationInactive
+            | Self::AsyncEngineFailed
+            | Self::VhostUserNotificationFailed
+            | Self::VhostUserTerminal
+            | Self::VhostUserConfigFailed
+            | Self::InterruptDeliveryFailed => LoggerLevel::Error,
+        }
+    }
+}
+
+/// Fixed, value-free persistent-memory data-plane outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerPmemOutcome {
+    FlushSucceeded,
+    FlushFailed,
+    RequestParseFailed,
+    StatusWriteFailed,
+    QueueDispatchFailed,
+    QueueNotificationInactive,
+    QueueNotificationUnsupported,
+    RateLimiterThrottled,
+    RateLimiterResumed,
+    InterruptDeliveryFailed,
+}
+
+impl LoggerPmemOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::FlushSucceeded | Self::FlushFailed => "flush",
+            Self::RequestParseFailed => "request-parse",
+            Self::StatusWriteFailed => "status-write",
+            Self::QueueDispatchFailed => "queue-dispatch",
+            Self::QueueNotificationInactive | Self::QueueNotificationUnsupported => {
+                "queue-notification"
+            }
+            Self::RateLimiterThrottled | Self::RateLimiterResumed => "rate-limiter",
+            Self::InterruptDeliveryFailed => "interrupt-delivery",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::FlushSucceeded => "succeeded",
+            Self::FlushFailed
+            | Self::RequestParseFailed
+            | Self::StatusWriteFailed
+            | Self::QueueDispatchFailed
+            | Self::InterruptDeliveryFailed => "failed",
+            Self::QueueNotificationInactive => "inactive",
+            Self::QueueNotificationUnsupported => "unsupported",
+            Self::RateLimiterThrottled => "throttled",
+            Self::RateLimiterResumed => "resumed",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::RateLimiterThrottled | Self::RateLimiterResumed => LoggerLevel::Debug,
+            Self::FlushSucceeded => LoggerLevel::Info,
+            Self::QueueNotificationUnsupported => LoggerLevel::Warn,
+            Self::FlushFailed
+            | Self::RequestParseFailed
+            | Self::StatusWriteFailed
+            | Self::QueueDispatchFailed
+            | Self::QueueNotificationInactive
+            | Self::InterruptDeliveryFailed => LoggerLevel::Error,
+        }
+    }
+}
+
+/// Fixed, value-free network and MMDS data-plane outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerNetworkOutcome {
+    RxSucceeded,
+    RxBufferMalformed,
+    RxBufferTooSmall,
+    RxBufferUnavailable,
+    RxProviderFailed,
+    TxSucceeded,
+    TxFrameMalformed,
+    TxSpoofRejected,
+    TxProviderFailed,
+    QueueDispatchFailed,
+    QueueNotificationInactive,
+    QueueNotificationUnsupported,
+    RateLimiterThrottled,
+    RateLimiterResumed,
+    PacketProviderFailed,
+    PacketProviderPartial,
+    MmdsRequestDetoured,
+    MmdsTokenKeyRotated,
+    MmdsTokenKeyRotationFailed,
+    InterruptDeliveryFailed,
+}
+
+impl LoggerNetworkOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::RxSucceeded => "rx",
+            Self::RxBufferMalformed | Self::RxBufferTooSmall | Self::RxBufferUnavailable => {
+                "rx-buffer"
+            }
+            Self::RxProviderFailed => "rx-provider",
+            Self::TxSucceeded => "tx",
+            Self::TxFrameMalformed | Self::TxSpoofRejected => "tx-frame",
+            Self::TxProviderFailed => "tx-provider",
+            Self::QueueDispatchFailed => "queue-dispatch",
+            Self::QueueNotificationInactive | Self::QueueNotificationUnsupported => {
+                "queue-notification"
+            }
+            Self::RateLimiterThrottled | Self::RateLimiterResumed => "rate-limiter",
+            Self::PacketProviderFailed | Self::PacketProviderPartial => "packet-provider",
+            Self::MmdsRequestDetoured => "mmds-request",
+            Self::MmdsTokenKeyRotated | Self::MmdsTokenKeyRotationFailed => "mmds-token-key",
+            Self::InterruptDeliveryFailed => "interrupt-delivery",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::RxSucceeded | Self::TxSucceeded => "succeeded",
+            Self::RxBufferMalformed | Self::TxFrameMalformed => "malformed",
+            Self::RxBufferTooSmall => "too-small",
+            Self::RxBufferUnavailable => "unavailable",
+            Self::RxProviderFailed
+            | Self::TxProviderFailed
+            | Self::QueueDispatchFailed
+            | Self::PacketProviderFailed
+            | Self::MmdsTokenKeyRotationFailed
+            | Self::InterruptDeliveryFailed => "failed",
+            Self::TxSpoofRejected => "spoof-rejected",
+            Self::QueueNotificationInactive => "inactive",
+            Self::QueueNotificationUnsupported => "unsupported",
+            Self::RateLimiterThrottled => "throttled",
+            Self::RateLimiterResumed => "resumed",
+            Self::PacketProviderPartial => "partial",
+            Self::MmdsRequestDetoured => "detoured",
+            Self::MmdsTokenKeyRotated => "rotated",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::RxBufferUnavailable | Self::RateLimiterThrottled | Self::RateLimiterResumed => {
+                LoggerLevel::Debug
+            }
+            Self::RxSucceeded
+            | Self::TxSucceeded
+            | Self::MmdsRequestDetoured
+            | Self::MmdsTokenKeyRotated => LoggerLevel::Info,
+            Self::RxBufferTooSmall
+            | Self::TxSpoofRejected
+            | Self::QueueNotificationUnsupported
+            | Self::PacketProviderPartial => LoggerLevel::Warn,
+            Self::RxBufferMalformed
+            | Self::RxProviderFailed
+            | Self::TxFrameMalformed
+            | Self::TxProviderFailed
+            | Self::QueueDispatchFailed
+            | Self::QueueNotificationInactive
+            | Self::PacketProviderFailed
+            | Self::MmdsTokenKeyRotationFailed
+            | Self::InterruptDeliveryFailed => LoggerLevel::Error,
+        }
+    }
+}
+
+/// Fixed, value-free vsock queue and connection outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerVsockOutcome {
+    RxSucceeded,
+    RxBufferMalformed,
+    RxBufferTooSmall,
+    TxSucceeded,
+    TxPacketMalformed,
+    QueueDispatchFailed,
+    QueueNotificationInactive,
+    QueueNotificationUnsupported,
+    HostConnectionAccepted,
+    HostConnectionCompleted,
+    HostConnectionPending,
+    HostConnectionDropped,
+    GuestConnectionRetained,
+    GuestConnectionForwarded,
+    GuestConnectionUpdated,
+    GuestConnectionClosed,
+    GuestConnectionIgnored,
+    GuestConnectionDropped,
+    ConnectionResetQueued,
+    ConnectionResetDropped,
+    TransportResetSucceeded,
+    TransportResetFailed,
+    InterruptDeliveryFailed,
+}
+
+impl LoggerVsockOutcome {
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::RxSucceeded => "rx",
+            Self::RxBufferMalformed | Self::RxBufferTooSmall => "rx-buffer",
+            Self::TxSucceeded => "tx",
+            Self::TxPacketMalformed => "tx-packet",
+            Self::QueueDispatchFailed => "queue-dispatch",
+            Self::QueueNotificationInactive | Self::QueueNotificationUnsupported => {
+                "queue-notification"
+            }
+            Self::HostConnectionAccepted
+            | Self::HostConnectionCompleted
+            | Self::HostConnectionPending
+            | Self::HostConnectionDropped => "host-connection",
+            Self::GuestConnectionRetained
+            | Self::GuestConnectionForwarded
+            | Self::GuestConnectionUpdated
+            | Self::GuestConnectionClosed
+            | Self::GuestConnectionIgnored
+            | Self::GuestConnectionDropped => "guest-connection",
+            Self::ConnectionResetQueued | Self::ConnectionResetDropped => "connection-reset",
+            Self::TransportResetSucceeded | Self::TransportResetFailed => "transport-reset",
+            Self::InterruptDeliveryFailed => "interrupt-delivery",
+        }
+    }
+
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            Self::RxSucceeded | Self::TxSucceeded | Self::TransportResetSucceeded => "succeeded",
+            Self::RxBufferMalformed | Self::TxPacketMalformed => "malformed",
+            Self::RxBufferTooSmall => "too-small",
+            Self::QueueDispatchFailed
+            | Self::TransportResetFailed
+            | Self::InterruptDeliveryFailed => "failed",
+            Self::QueueNotificationInactive => "inactive",
+            Self::QueueNotificationUnsupported => "unsupported",
+            Self::HostConnectionAccepted => "accepted",
+            Self::HostConnectionCompleted => "completed",
+            Self::HostConnectionPending => "pending",
+            Self::HostConnectionDropped | Self::GuestConnectionDropped => "dropped",
+            Self::GuestConnectionRetained => "retained",
+            Self::GuestConnectionForwarded => "forwarded",
+            Self::GuestConnectionUpdated => "updated",
+            Self::GuestConnectionClosed => "closed",
+            Self::GuestConnectionIgnored => "ignored",
+            Self::ConnectionResetQueued => "queued",
+            Self::ConnectionResetDropped => "dropped",
+        }
+    }
+
+    pub(super) const fn level(self) -> LoggerLevel {
+        match self {
+            Self::HostConnectionPending | Self::GuestConnectionIgnored => LoggerLevel::Debug,
+            Self::RxSucceeded
+            | Self::TxSucceeded
+            | Self::HostConnectionAccepted
+            | Self::HostConnectionCompleted
+            | Self::GuestConnectionRetained
+            | Self::GuestConnectionForwarded
+            | Self::GuestConnectionUpdated
+            | Self::GuestConnectionClosed
+            | Self::ConnectionResetQueued
+            | Self::TransportResetSucceeded => LoggerLevel::Info,
+            Self::RxBufferTooSmall
+            | Self::QueueNotificationUnsupported
+            | Self::HostConnectionDropped
+            | Self::GuestConnectionDropped
+            | Self::ConnectionResetDropped => LoggerLevel::Warn,
+            Self::RxBufferMalformed
+            | Self::TxPacketMalformed
+            | Self::QueueDispatchFailed
+            | Self::QueueNotificationInactive
+            | Self::TransportResetFailed
+            | Self::InterruptDeliveryFailed => LoggerLevel::Error,
+        }
+    }
+}
+
 /// Fixed, value-free backend outcomes observed before HVF errors are formatted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoggerBackendOutcome {
@@ -800,8 +1157,11 @@ pub(super) enum LoggerEvent {
         cpu_time_us: u64,
     },
     Backend(LoggerBackendOutcome),
+    Block(LoggerBlockOutcome),
     Lifecycle(LoggerLifecycleOutcome),
+    Network(LoggerNetworkOutcome),
     Observability(LoggerObservabilityOutcome),
+    Pmem(LoggerPmemOutcome),
     RateLimitRecovery {
         suppressed: u64,
     },
@@ -811,6 +1171,7 @@ pub(super) enum LoggerEvent {
     ProcessExit(ProcessTerminalCategory),
     Snapshot(LoggerSnapshotOutcome),
     Transport(LoggerTransportOutcome),
+    Vsock(LoggerVsockOutcome),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -921,6 +1282,14 @@ impl LogRecord {
                 encoder.push_str(" outcome=");
                 encoder.push_str(outcome.outcome());
             }
+            LoggerEvent::Block(outcome) => {
+                encode_fixed_device_outcome(
+                    &mut encoder,
+                    LoggerDeviceKind::Block,
+                    outcome.operation(),
+                    outcome.outcome(),
+                );
+            }
             LoggerEvent::Lifecycle(outcome) => {
                 if let Some(kind) = outcome.device_kind() {
                     encoder.push_str("device-kind=");
@@ -932,11 +1301,27 @@ impl LogRecord {
                 encoder.push_str(" outcome=");
                 encoder.push_str(outcome.outcome());
             }
+            LoggerEvent::Network(outcome) => {
+                encode_fixed_device_outcome(
+                    &mut encoder,
+                    LoggerDeviceKind::Network,
+                    outcome.operation(),
+                    outcome.outcome(),
+                );
+            }
             LoggerEvent::Observability(outcome) => {
                 encoder.push_str("operation=");
                 encoder.push_str(outcome.operation());
                 encoder.push_str(" outcome=");
                 encoder.push_str(outcome.outcome());
+            }
+            LoggerEvent::Pmem(outcome) => {
+                encode_fixed_device_outcome(
+                    &mut encoder,
+                    LoggerDeviceKind::Pmem,
+                    outcome.operation(),
+                    outcome.outcome(),
+                );
             }
             LoggerEvent::RateLimitRecovery { suppressed } => {
                 encoder.push_u64(suppressed);
@@ -974,6 +1359,14 @@ impl LogRecord {
                 encoder.push_str(" outcome=");
                 encoder.push_str(outcome.outcome());
             }
+            LoggerEvent::Vsock(outcome) => {
+                encode_fixed_device_outcome(
+                    &mut encoder,
+                    LoggerDeviceKind::Vsock,
+                    outcome.operation(),
+                    outcome.outcome(),
+                );
+            }
         }
 
         encoder.finish()
@@ -990,6 +1383,21 @@ impl LogRecord {
     pub(super) fn as_str(&self) -> &str {
         std::str::from_utf8(self.as_bytes()).unwrap_or("")
     }
+}
+
+fn encode_fixed_device_outcome(
+    encoder: &mut RecordEncoder,
+    kind: LoggerDeviceKind,
+    operation: &str,
+    outcome: &str,
+) {
+    encoder.push_str("device-kind=");
+    encoder.push_str(kind.as_str());
+    encoder.push_byte(b' ');
+    encoder.push_str("operation=");
+    encoder.push_str(operation);
+    encoder.push_str(" outcome=");
+    encoder.push_str(outcome);
 }
 
 /// Opaque, fixed panic records prepared before a panic hook can use them.
@@ -1068,33 +1476,74 @@ impl PanicLogRecords {
     }
 }
 
+const MAX_LOG_BATCH_RECORDS: usize = 11;
+
 #[derive(Debug)]
 pub(super) struct LogBatch {
-    first: LogRecord,
-    second: Option<LogRecord>,
+    records: [Option<LogRecord>; MAX_LOG_BATCH_RECORDS],
+    len: usize,
 }
 
 impl LogBatch {
-    pub(super) const fn one(record: LogRecord) -> Self {
+    pub(super) fn empty() -> Self {
         Self {
-            first: record,
-            second: None,
+            records: std::array::from_fn(|_| None),
+            len: 0,
         }
     }
 
-    pub(super) const fn two(first: LogRecord, second: LogRecord) -> Self {
-        Self {
-            first,
-            second: Some(second),
-        }
+    pub(super) fn one(record: LogRecord) -> Self {
+        let mut batch = Self::empty();
+        let inserted = batch.push(record);
+        debug_assert!(inserted);
+        batch
+    }
+
+    pub(super) fn two(first: LogRecord, second: LogRecord) -> Self {
+        let mut batch = Self::one(first);
+        let inserted = batch.push(second);
+        debug_assert!(inserted);
+        batch
+    }
+
+    pub(super) const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub(super) const fn len(&self) -> usize {
-        if self.second.is_some() { 2 } else { 1 }
+        self.len
+    }
+
+    pub(super) fn push(&mut self, record: LogRecord) -> bool {
+        let Some(slot) = self.records.get_mut(self.len) else {
+            return false;
+        };
+        *slot = Some(record);
+        self.len += 1;
+        true
+    }
+
+    pub(super) fn prepend(&mut self, record: LogRecord) -> bool {
+        if self.len == self.records.len() {
+            return false;
+        }
+        let Some(active) = self.records.get_mut(..=self.len) else {
+            return false;
+        };
+        active.rotate_right(1);
+        let Some(slot) = active.first_mut() else {
+            return false;
+        };
+        *slot = Some(record);
+        self.len += 1;
+        true
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &LogRecord> {
-        std::iter::once(&self.first).chain(self.second.as_ref())
+        self.records
+            .iter()
+            .take(self.len)
+            .filter_map(Option::as_ref)
     }
 }
 
@@ -1260,11 +1709,12 @@ fn utf8_prefix_len(value: &str, maximum: usize) -> usize {
 mod tests {
     use super::{
         LogOrigin, LogRecord, LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome,
-        LoggerApiRoute, LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerDeviceKind,
-        LoggerEvent, LoggerHttpMethod, LoggerLifecycleOutcome, LoggerObservabilityOutcome,
+        LoggerApiRoute, LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerBlockOutcome,
+        LoggerDeviceKind, LoggerEvent, LoggerHttpMethod, LoggerLifecycleOutcome,
+        LoggerNetworkOutcome, LoggerObservabilityOutcome, LoggerPmemOutcome,
         LoggerProcessSignalOutcome, LoggerSnapshotOutcome, LoggerTransportOutcome,
-        MAX_LOG_RECORD_BYTES, PanicLogRecords, ProcessStartupOutcome, ProcessTerminalCategory,
-        normalize_origin,
+        LoggerVsockOutcome, MAX_LOG_RECORD_BYTES, PanicLogRecords, ProcessStartupOutcome,
+        ProcessTerminalCategory, normalize_origin,
     };
     use crate::logger::LoggerLevel;
 
@@ -1696,6 +2146,494 @@ mod tests {
             ] {
                 assert!(!expected.contains(forbidden));
             }
+        }
+    }
+
+    #[test]
+    fn encodes_every_closed_block_outcome() {
+        let cases = [
+            (
+                LoggerBlockOutcome::RequestSucceeded,
+                LoggerLevel::Info,
+                "request",
+                "succeeded",
+            ),
+            (
+                LoggerBlockOutcome::RequestUnsupported,
+                LoggerLevel::Warn,
+                "request",
+                "unsupported",
+            ),
+            (
+                LoggerBlockOutcome::RequestParseFailed,
+                LoggerLevel::Error,
+                "request-parse",
+                "failed",
+            ),
+            (
+                LoggerBlockOutcome::RequestIoFailed,
+                LoggerLevel::Error,
+                "request-io",
+                "failed",
+            ),
+            (
+                LoggerBlockOutcome::StatusWriteFailed,
+                LoggerLevel::Error,
+                "status-write",
+                "failed",
+            ),
+            (
+                LoggerBlockOutcome::QueueDispatchFailed,
+                LoggerLevel::Error,
+                "queue-dispatch",
+                "failed",
+            ),
+            (
+                LoggerBlockOutcome::QueueNotificationInactive,
+                LoggerLevel::Error,
+                "queue-notification",
+                "inactive",
+            ),
+            (
+                LoggerBlockOutcome::QueueNotificationUnsupported,
+                LoggerLevel::Warn,
+                "queue-notification",
+                "unsupported",
+            ),
+            (
+                LoggerBlockOutcome::RateLimiterThrottled,
+                LoggerLevel::Debug,
+                "rate-limiter",
+                "throttled",
+            ),
+            (
+                LoggerBlockOutcome::RateLimiterResumed,
+                LoggerLevel::Debug,
+                "rate-limiter",
+                "resumed",
+            ),
+            (
+                LoggerBlockOutcome::AsyncEngineThrottled,
+                LoggerLevel::Debug,
+                "async-engine",
+                "throttled",
+            ),
+            (
+                LoggerBlockOutcome::AsyncEngineFailed,
+                LoggerLevel::Error,
+                "async-engine",
+                "failed",
+            ),
+            (
+                LoggerBlockOutcome::VhostUserNotificationSucceeded,
+                LoggerLevel::Info,
+                "vhost-user-notification",
+                "succeeded",
+            ),
+            (
+                LoggerBlockOutcome::VhostUserNotificationFailed,
+                LoggerLevel::Error,
+                "vhost-user-notification",
+                "failed",
+            ),
+            (
+                LoggerBlockOutcome::VhostUserDisconnected,
+                LoggerLevel::Warn,
+                "vhost-user-notification",
+                "disconnected",
+            ),
+            (
+                LoggerBlockOutcome::VhostUserTerminal,
+                LoggerLevel::Error,
+                "vhost-user-notification",
+                "terminal",
+            ),
+            (
+                LoggerBlockOutcome::VhostUserConfigSucceeded,
+                LoggerLevel::Info,
+                "vhost-user-config",
+                "succeeded",
+            ),
+            (
+                LoggerBlockOutcome::VhostUserConfigFailed,
+                LoggerLevel::Error,
+                "vhost-user-config",
+                "failed",
+            ),
+            (
+                LoggerBlockOutcome::InterruptDeliveryFailed,
+                LoggerLevel::Error,
+                "interrupt-delivery",
+                "failed",
+            ),
+        ];
+        for (outcome, level, operation, result) in cases {
+            assert_eq!(outcome.level(), level);
+            assert_closed_event(
+                LoggerEvent::Block(outcome),
+                level,
+                &format!("device-kind=block operation={operation} outcome={result}"),
+            );
+        }
+    }
+
+    #[test]
+    fn encodes_every_closed_pmem_outcome() {
+        let cases = [
+            (
+                LoggerPmemOutcome::FlushSucceeded,
+                LoggerLevel::Info,
+                "flush",
+                "succeeded",
+            ),
+            (
+                LoggerPmemOutcome::FlushFailed,
+                LoggerLevel::Error,
+                "flush",
+                "failed",
+            ),
+            (
+                LoggerPmemOutcome::RequestParseFailed,
+                LoggerLevel::Error,
+                "request-parse",
+                "failed",
+            ),
+            (
+                LoggerPmemOutcome::StatusWriteFailed,
+                LoggerLevel::Error,
+                "status-write",
+                "failed",
+            ),
+            (
+                LoggerPmemOutcome::QueueDispatchFailed,
+                LoggerLevel::Error,
+                "queue-dispatch",
+                "failed",
+            ),
+            (
+                LoggerPmemOutcome::QueueNotificationInactive,
+                LoggerLevel::Error,
+                "queue-notification",
+                "inactive",
+            ),
+            (
+                LoggerPmemOutcome::QueueNotificationUnsupported,
+                LoggerLevel::Warn,
+                "queue-notification",
+                "unsupported",
+            ),
+            (
+                LoggerPmemOutcome::RateLimiterThrottled,
+                LoggerLevel::Debug,
+                "rate-limiter",
+                "throttled",
+            ),
+            (
+                LoggerPmemOutcome::RateLimiterResumed,
+                LoggerLevel::Debug,
+                "rate-limiter",
+                "resumed",
+            ),
+            (
+                LoggerPmemOutcome::InterruptDeliveryFailed,
+                LoggerLevel::Error,
+                "interrupt-delivery",
+                "failed",
+            ),
+        ];
+        for (outcome, level, operation, result) in cases {
+            assert_eq!(outcome.level(), level);
+            assert_closed_event(
+                LoggerEvent::Pmem(outcome),
+                level,
+                &format!("device-kind=pmem operation={operation} outcome={result}"),
+            );
+        }
+    }
+
+    #[test]
+    fn encodes_every_closed_network_outcome() {
+        let cases = [
+            (
+                LoggerNetworkOutcome::RxSucceeded,
+                LoggerLevel::Info,
+                "rx",
+                "succeeded",
+            ),
+            (
+                LoggerNetworkOutcome::RxBufferMalformed,
+                LoggerLevel::Error,
+                "rx-buffer",
+                "malformed",
+            ),
+            (
+                LoggerNetworkOutcome::RxBufferTooSmall,
+                LoggerLevel::Warn,
+                "rx-buffer",
+                "too-small",
+            ),
+            (
+                LoggerNetworkOutcome::RxBufferUnavailable,
+                LoggerLevel::Debug,
+                "rx-buffer",
+                "unavailable",
+            ),
+            (
+                LoggerNetworkOutcome::RxProviderFailed,
+                LoggerLevel::Error,
+                "rx-provider",
+                "failed",
+            ),
+            (
+                LoggerNetworkOutcome::TxSucceeded,
+                LoggerLevel::Info,
+                "tx",
+                "succeeded",
+            ),
+            (
+                LoggerNetworkOutcome::TxFrameMalformed,
+                LoggerLevel::Error,
+                "tx-frame",
+                "malformed",
+            ),
+            (
+                LoggerNetworkOutcome::TxSpoofRejected,
+                LoggerLevel::Warn,
+                "tx-frame",
+                "spoof-rejected",
+            ),
+            (
+                LoggerNetworkOutcome::TxProviderFailed,
+                LoggerLevel::Error,
+                "tx-provider",
+                "failed",
+            ),
+            (
+                LoggerNetworkOutcome::QueueDispatchFailed,
+                LoggerLevel::Error,
+                "queue-dispatch",
+                "failed",
+            ),
+            (
+                LoggerNetworkOutcome::QueueNotificationInactive,
+                LoggerLevel::Error,
+                "queue-notification",
+                "inactive",
+            ),
+            (
+                LoggerNetworkOutcome::QueueNotificationUnsupported,
+                LoggerLevel::Warn,
+                "queue-notification",
+                "unsupported",
+            ),
+            (
+                LoggerNetworkOutcome::RateLimiterThrottled,
+                LoggerLevel::Debug,
+                "rate-limiter",
+                "throttled",
+            ),
+            (
+                LoggerNetworkOutcome::RateLimiterResumed,
+                LoggerLevel::Debug,
+                "rate-limiter",
+                "resumed",
+            ),
+            (
+                LoggerNetworkOutcome::PacketProviderFailed,
+                LoggerLevel::Error,
+                "packet-provider",
+                "failed",
+            ),
+            (
+                LoggerNetworkOutcome::PacketProviderPartial,
+                LoggerLevel::Warn,
+                "packet-provider",
+                "partial",
+            ),
+            (
+                LoggerNetworkOutcome::MmdsRequestDetoured,
+                LoggerLevel::Info,
+                "mmds-request",
+                "detoured",
+            ),
+            (
+                LoggerNetworkOutcome::MmdsTokenKeyRotated,
+                LoggerLevel::Info,
+                "mmds-token-key",
+                "rotated",
+            ),
+            (
+                LoggerNetworkOutcome::MmdsTokenKeyRotationFailed,
+                LoggerLevel::Error,
+                "mmds-token-key",
+                "failed",
+            ),
+            (
+                LoggerNetworkOutcome::InterruptDeliveryFailed,
+                LoggerLevel::Error,
+                "interrupt-delivery",
+                "failed",
+            ),
+        ];
+        for (outcome, level, operation, result) in cases {
+            assert_eq!(outcome.level(), level);
+            assert_closed_event(
+                LoggerEvent::Network(outcome),
+                level,
+                &format!("device-kind=network operation={operation} outcome={result}"),
+            );
+        }
+    }
+
+    #[test]
+    fn encodes_every_closed_vsock_outcome() {
+        let cases = [
+            (
+                LoggerVsockOutcome::RxSucceeded,
+                LoggerLevel::Info,
+                "rx",
+                "succeeded",
+            ),
+            (
+                LoggerVsockOutcome::RxBufferMalformed,
+                LoggerLevel::Error,
+                "rx-buffer",
+                "malformed",
+            ),
+            (
+                LoggerVsockOutcome::RxBufferTooSmall,
+                LoggerLevel::Warn,
+                "rx-buffer",
+                "too-small",
+            ),
+            (
+                LoggerVsockOutcome::TxSucceeded,
+                LoggerLevel::Info,
+                "tx",
+                "succeeded",
+            ),
+            (
+                LoggerVsockOutcome::TxPacketMalformed,
+                LoggerLevel::Error,
+                "tx-packet",
+                "malformed",
+            ),
+            (
+                LoggerVsockOutcome::QueueDispatchFailed,
+                LoggerLevel::Error,
+                "queue-dispatch",
+                "failed",
+            ),
+            (
+                LoggerVsockOutcome::QueueNotificationInactive,
+                LoggerLevel::Error,
+                "queue-notification",
+                "inactive",
+            ),
+            (
+                LoggerVsockOutcome::QueueNotificationUnsupported,
+                LoggerLevel::Warn,
+                "queue-notification",
+                "unsupported",
+            ),
+            (
+                LoggerVsockOutcome::HostConnectionAccepted,
+                LoggerLevel::Info,
+                "host-connection",
+                "accepted",
+            ),
+            (
+                LoggerVsockOutcome::HostConnectionCompleted,
+                LoggerLevel::Info,
+                "host-connection",
+                "completed",
+            ),
+            (
+                LoggerVsockOutcome::HostConnectionPending,
+                LoggerLevel::Debug,
+                "host-connection",
+                "pending",
+            ),
+            (
+                LoggerVsockOutcome::HostConnectionDropped,
+                LoggerLevel::Warn,
+                "host-connection",
+                "dropped",
+            ),
+            (
+                LoggerVsockOutcome::GuestConnectionRetained,
+                LoggerLevel::Info,
+                "guest-connection",
+                "retained",
+            ),
+            (
+                LoggerVsockOutcome::GuestConnectionForwarded,
+                LoggerLevel::Info,
+                "guest-connection",
+                "forwarded",
+            ),
+            (
+                LoggerVsockOutcome::GuestConnectionUpdated,
+                LoggerLevel::Info,
+                "guest-connection",
+                "updated",
+            ),
+            (
+                LoggerVsockOutcome::GuestConnectionClosed,
+                LoggerLevel::Info,
+                "guest-connection",
+                "closed",
+            ),
+            (
+                LoggerVsockOutcome::GuestConnectionIgnored,
+                LoggerLevel::Debug,
+                "guest-connection",
+                "ignored",
+            ),
+            (
+                LoggerVsockOutcome::GuestConnectionDropped,
+                LoggerLevel::Warn,
+                "guest-connection",
+                "dropped",
+            ),
+            (
+                LoggerVsockOutcome::ConnectionResetQueued,
+                LoggerLevel::Info,
+                "connection-reset",
+                "queued",
+            ),
+            (
+                LoggerVsockOutcome::ConnectionResetDropped,
+                LoggerLevel::Warn,
+                "connection-reset",
+                "dropped",
+            ),
+            (
+                LoggerVsockOutcome::TransportResetSucceeded,
+                LoggerLevel::Info,
+                "transport-reset",
+                "succeeded",
+            ),
+            (
+                LoggerVsockOutcome::TransportResetFailed,
+                LoggerLevel::Error,
+                "transport-reset",
+                "failed",
+            ),
+            (
+                LoggerVsockOutcome::InterruptDeliveryFailed,
+                LoggerLevel::Error,
+                "interrupt-delivery",
+                "failed",
+            ),
+        ];
+        for (outcome, level, operation, result) in cases {
+            assert_eq!(outcome.level(), level);
+            assert_closed_event(
+                LoggerEvent::Vsock(outcome),
+                level,
+                &format!("device-kind=vsock operation={operation} outcome={result}"),
+            );
         }
     }
 

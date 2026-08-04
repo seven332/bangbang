@@ -340,9 +340,65 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic block device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1809"
+      "disposition": "implemented",
+      "rationale": "All mapped upstream calls converge on one bounded block notification, request, async-engine, vhost-user, configuration, or interrupt outcome per nonzero summary category. The typed device owner emits a closed level and fixed fields after the complete queue batch while discarding raw errors, paths, identifiers, descriptors, addresses, byte counts, and guest values.",
+      "compiled_events": [
+        "block"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "MMIO interrupt-delivery supplement for completed block batches"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "device-owned block, async-engine, vhost-user, and PCI interrupt outcome convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "closed nonblocking GuestLogger block producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed block outcome encoding and level selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent block outcome limiter identity"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and product-PCI block outcome reachability"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "block interrupt result and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "contained product-PCI block outcome and output-grant redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "block queue, limiter, async, vhost-user, and unchanged-result tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "block filtering, limiting, delivery, and exact encoding tests"
+        }
+      ]
     },
     {
       "id": "logger.boot.time",
@@ -558,9 +614,80 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic network or MMDS outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1809"
+      "disposition": "implemented",
+      "rationale": "All mapped upstream calls converge on one bounded network queue, packet-provider, MMDS detour, token-key, or interrupt outcome per nonzero summary category. Device, provider, and token-authority owners emit closed levels only after typed results are known while discarding packets, tokens, keys, errors, paths, interface identifiers, MAC addresses, descriptors, byte counts, addresses, and guest values.",
+      "compiled_events": [
+        "network"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "packet-provider and MMIO interrupt outcome supplements"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "controller logger attachment to normal and restored MMDS state"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "closed nonblocking GuestLogger network producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed network and MMDS outcome encoding and level selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent network outcome limiter identity"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_token.rs",
+          "anchor": "transactional MMDS token-key rotation outcome owner"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "device-owned RX, TX, limiter, MMDS-detour, and PCI interrupt outcome convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "MMIO packet-provider acquisition failure owner"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "network provider, interrupt, partial-result, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "contained product-PCI MMDS detour and output-grant redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "network filtering, limiting, delivery, and exact encoding tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_token.rs",
+          "anchor": "successful and failed rotation logging with key and token redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "RX, TX, MMDS detour, limiter, and unchanged-result tests"
+        }
+      ]
     },
     {
       "id": "logger.nonapp.example",
@@ -738,9 +865,60 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic pmem device outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1809"
+      "disposition": "implemented",
+      "rationale": "All mapped upstream calls converge on one bounded pmem flush, request, queue, limiter, or interrupt outcome per nonzero summary category. The typed device owner observes the complete queue result, selects a closed level, and discards raw errors, paths, identifiers, descriptors, addresses, byte counts, and guest values.",
+      "compiled_events": [
+        "pmem"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "MMIO interrupt-delivery supplement for completed pmem batches"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "closed nonblocking GuestLogger pmem producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed pmem outcome encoding and level selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent pmem outcome limiter identity"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "device-owned flush, request, limiter, and PCI interrupt outcome convergence"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "pmem interrupt result and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "contained product-PCI pmem flush and output-grant redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "pmem filtering, limiting, delivery, and exact encoding tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "pmem flush, parse, limiter, and unchanged-result tests"
+        }
+      ]
     },
     {
       "id": "logger.process-signal.outcome",
@@ -1180,9 +1358,60 @@
         "operation",
         "outcome"
       ],
-      "disposition": "planned",
-      "rationale": "All mapped upstream calls report the same semantic vsock transport or connection outcome; the closed outcome selects level while Bangbang discards raw errors, paths, identifiers, descriptors, addresses, and guest values.",
-      "delivery_issue": "#1809"
+      "disposition": "implemented",
+      "rationale": "All mapped upstream calls converge on one bounded vsock queue, connection, reset, or interrupt outcome per nonzero notification-batch category. The device-owned observer covers MMIO and product PCI, emits failure categories before success categories, and discards sockets, paths, connection keys, ports, packet headers, payloads, errors, descriptors, addresses, byte counts, and guest values.",
+      "compiled_events": [
+        "vsock"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "MMIO queue and transport-reset interrupt outcome supplements"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "closed nonblocking GuestLogger vsock producer"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "closed vsock outcome encoding and level selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "independent vsock outcome limiter identity"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "device-owned queue, connection, reset, and PCI interrupt outcome convergence"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "vsock interrupt, partial-result, and reset tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "contained MMIO vsock traffic and output-grant redaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "vsock filtering, limiting, delivery, and exact encoding tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "vsock queue, connection, reset, and unchanged-result tests"
+        }
+      ]
     }
   ],
   "mappings": [

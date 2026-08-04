@@ -685,6 +685,7 @@ fn validate_compiled_event_set(classes: &[LoggerProducerClass], errors: &mut Vec
         (LoggerCompiledEvent::ApiRequest, "logger.api.request"),
         (LoggerCompiledEvent::ApiResult, "logger.api.result"),
         (LoggerCompiledEvent::Backend, "logger.backend.outcome"),
+        (LoggerCompiledEvent::Block, "logger.block.outcome"),
         (LoggerCompiledEvent::InstanceStart, "logger.api.result"),
         (LoggerCompiledEvent::FlushMetrics, "logger.api.result"),
         (LoggerCompiledEvent::BootTime, "logger.boot.time"),
@@ -693,6 +694,8 @@ fn validate_compiled_event_set(classes: &[LoggerProducerClass], errors: &mut Vec
             LoggerCompiledEvent::Observability,
             "logger.observability.outcome",
         ),
+        (LoggerCompiledEvent::Network, "logger.network.outcome"),
+        (LoggerCompiledEvent::Pmem, "logger.pmem.outcome"),
         (
             LoggerCompiledEvent::RateLimitRecovery,
             "logger.limiter.recovery",
@@ -709,6 +712,7 @@ fn validate_compiled_event_set(classes: &[LoggerProducerClass], errors: &mut Vec
         ),
         (LoggerCompiledEvent::Snapshot, "logger.snapshot.outcome"),
         (LoggerCompiledEvent::Transport, "logger.transport.outcome"),
+        (LoggerCompiledEvent::Vsock, "logger.vsock.outcome"),
     ]);
     let actual = classes
         .iter()

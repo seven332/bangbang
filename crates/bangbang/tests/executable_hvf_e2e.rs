@@ -17,6 +17,10 @@ mod vhost_user_block;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos_arm64 {
+    use super::{
+        closed_backend_outcome_logger_level, closed_device_data_outcome_logger_level,
+        closed_transport_outcome_logger_level,
+    };
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
     use std::net::Shutdown;
@@ -6986,6 +6990,24 @@ mod macos_arm64 {
             &socket_path,
             &format!("bangbang remaining-device {transport}"),
         );
+        let logger_output = fs::read_to_string(&logger_path)
+            .expect("remaining-device logger output should be readable after shutdown");
+        assert!(
+            logger_output
+                .lines()
+                .any(|record| record == "device-kind=block operation=request outcome=succeeded"),
+            "signed {transport} block activity should reach the closed block producer; output:\n{logger_output}"
+        );
+        for forbidden in [
+            path_text(&control_path),
+            instance_id.as_str(),
+            REMAINING_DEVICE_SUCCESS_MARKER,
+        ] {
+            assert!(
+                !logger_output.contains(forbidden),
+                "signed {transport} device logger output must redact dynamic identity or guest data {forbidden:?}; output:\n{logger_output}"
+            );
+        }
 
         reset_zeroed_block_backing(&control_path, 8);
         let reused = if enable_pci {
@@ -7027,6 +7049,7 @@ mod macos_arm64 {
         let data_backing_path = test_dir.path().join("data.img");
         let pmem_backing_path = test_dir.path().join("pmem.img");
         let serial_output_path = test_dir.path().join("serial.out");
+        let logger_path = test_dir.path().join("all-virtio-logger.out");
         let metrics_path = test_dir.path().join("metrics.out");
         let uds_path = test_dir.path().join("pci-vsock.sock");
         let host_port_path = vsock_port_path(&uds_path, DIRECT_ROOTFS_VSOCK_PORT);
@@ -7049,6 +7072,14 @@ mod macos_arm64 {
         let mut bangbang =
             BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"]);
 
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/logger",
+                &format!(r#"{{"log_path":{}}}"#, json_string(path_text(&logger_path))),
+            ),
+            "PUT /logger product PCI",
+        );
         assert_no_content_response(
             &http_put_json(
                 &socket_path,
@@ -7416,6 +7447,31 @@ mod macos_arm64 {
             &socket_path,
             "bangbang all-virtio product PCI",
         );
+        let logger_output = fs::read_to_string(&logger_path)
+            .expect("all-virtio product PCI logger output should be readable");
+        for record in [
+            "device-kind=block operation=request outcome=succeeded",
+            "device-kind=pmem operation=flush outcome=succeeded",
+            "device-kind=network operation=mmds-request outcome=detoured",
+            "device-kind=vsock operation=guest-connection outcome=retained",
+        ] {
+            assert!(
+                logger_output.lines().any(|line| line == record),
+                "all-virtio product PCI should reach {record}; output:\n{logger_output}"
+            );
+        }
+        for forbidden in [
+            path_text(&data_backing_path),
+            path_text(&pmem_backing_path),
+            path_text(&uds_path),
+            "06:00:00:00:00:01",
+            "BANGBANG_MMDS_GUEST_VALUE",
+        ] {
+            assert!(
+                !logger_output.contains(forbidden),
+                "all-virtio product PCI device records must redact {forbidden:?}; output:\n{logger_output}"
+            );
+        }
         assert!(
             !uds_path.exists(),
             "product PCI shutdown should remove the owned main vsock listener"
@@ -18205,6 +18261,9 @@ mod macos_arm64 {
             if record == "event=process-panic" || is_closed_control_logger_line(record) {
                 continue;
             }
+            if is_rate_limit_recovery_logger_line(record) {
+                continue;
+            }
             if is_closed_host_outcome_logger_line(record) {
                 continue;
             }
@@ -18292,6 +18351,7 @@ mod macos_arm64 {
             return Some(level);
         }
         match record {
+            record if is_rate_limit_recovery_logger_line(record) => Some("Warn"),
             "operation=server outcome=stopped" => Some("Debug"),
             "operation=connection outcome=failed"
             | "operation=request-parse outcome=bad-request"
@@ -18341,6 +18401,12 @@ mod macos_arm64 {
         )
     }
 
+    fn is_rate_limit_recovery_logger_line(line: &str) -> bool {
+        line.strip_suffix(" messages were suppressed due to rate limiting")
+            .and_then(|count| count.parse::<u64>().ok())
+            .is_some_and(|count| count != 0)
+    }
+
     fn is_closed_host_outcome_logger_line(line: &str) -> bool {
         closed_host_outcome_logger_level(line).is_some()
     }
@@ -18381,7 +18447,12 @@ mod macos_arm64 {
             | "operation=shutdown outcome=orderly"
             | "operation=snapshot-create outcome=succeeded"
             | "operation=snapshot-load outcome=succeeded" => "Info",
-            _ => return closed_live_device_outcome_logger_level(line),
+            _ => {
+                return closed_live_device_outcome_logger_level(line)
+                    .or_else(|| closed_device_data_outcome_logger_level(line))
+                    .or_else(|| closed_backend_outcome_logger_level(line))
+                    .or_else(|| closed_transport_outcome_logger_level(line));
+            }
         };
         Some(level)
     }
@@ -18426,20 +18497,52 @@ mod macos_arm64 {
             panic!("logger output {} should be readable: {err}", path.display())
         });
 
-        assert_eq!(
-            output,
-            concat!(
-                "operation=backend-startup outcome=succeeded\n",
-                "action=InstanceStart\n",
-                "operation=boot-worker outcome=running\n",
-                "operation=vm-start outcome=succeeded\n",
-                "operation=process-startup outcome=running\n",
-                "device-kind=block operation=device-reset outcome=succeeded\n",
-                "device-kind=vsock operation=device-reset outcome=succeeded\n",
-                "device-kind=block operation=device-activation outcome=succeeded\n",
-                "device-kind=vsock operation=device-activation outcome=succeeded\n",
-            ),
-            "no-api logger output should include the closed startup lifecycle"
+        const HOST_STARTUP: &[&str] = &[
+            "operation=backend-startup outcome=succeeded",
+            "action=InstanceStart",
+            "operation=boot-worker outcome=running",
+            "operation=vm-start outcome=succeeded",
+            "operation=process-startup outcome=running",
+        ];
+        let records = output.lines().collect::<Vec<_>>();
+        assert!(
+            records.starts_with(HOST_STARTUP),
+            "no-api logger output should start with the closed host startup lifecycle; output:\n{output}"
+        );
+        assert!(
+            records.iter().skip(HOST_STARTUP.len()).all(|record| {
+                closed_device_data_outcome_logger_level(record).is_some()
+                    || closed_transport_outcome_logger_level(record).is_some()
+                    || is_rate_limit_recovery_logger_line(record)
+            }),
+            "no-api logger output should contain only closed device or limiter records after startup; output:\n{output}"
+        );
+
+        let position = |record: &str| {
+            records
+                .iter()
+                .position(|candidate| *candidate == record)
+                .unwrap_or_else(|| {
+                    panic!("no-api logger output should contain {record}; output:\n{output}")
+                })
+        };
+        let block_reset = position("device-kind=block operation=device-reset outcome=succeeded");
+        let block_activation =
+            position("device-kind=block operation=device-activation outcome=succeeded");
+        let block_request = position("device-kind=block operation=request outcome=succeeded");
+        assert!(
+            block_reset < block_activation && block_activation < block_request,
+            "no-api block records should preserve reset, activation, then request order; output:\n{output}"
+        );
+
+        let vsock_reset = position("device-kind=vsock operation=device-reset outcome=succeeded");
+        let vsock_activation =
+            position("device-kind=vsock operation=device-activation outcome=succeeded");
+        let vsock_connection =
+            position("device-kind=vsock operation=host-connection outcome=accepted");
+        assert!(
+            vsock_reset < vsock_activation && vsock_activation < vsock_connection,
+            "no-api vsock records should preserve reset, activation, then accepted connection order; output:\n{output}"
         );
     }
 
@@ -18478,6 +18581,10 @@ mod macos_arm64 {
              level=Info origin=crates/runtime/src/logger.rs:2 action=request outcome=ok\n\
              level=Info origin=crates/runtime/src/logger.rs:3 action=InstanceStart\n\
              level=Warn origin=crates/runtime/src/logger.rs:4 operation=request outcome=deprecated\n\
+             level=Info origin=crates/runtime/src/block.rs:5 device-kind=block operation=request outcome=succeeded\n\
+             level=Error origin=crates/runtime/src/pmem.rs:6 device-kind=pmem operation=flush outcome=failed\n\
+             level=Warn origin=crates/runtime/src/network.rs:7 device-kind=network operation=packet-provider outcome=partial\n\
+             level=Debug origin=crates/runtime/src/vsock.rs:8 device-kind=vsock operation=host-connection outcome=pending\n\
              level=Info origin=crates/runtime/src/logger.rs:5 The API server received a Put request on \"/actions\".\n\
              level=Info origin=crates/runtime/src/logger.rs:6 action=FlushMetrics\n\
              level=Info origin=crates/runtime/src/logger.rs:7 action=request outcome=no-content\n",
@@ -18498,6 +18605,17 @@ mod macos_arm64 {
                 "device-kind=network operation=device-update outcome=rejected",
                 "Error",
             ),
+            ("operation=virtual-timer outcome=activated", "Debug"),
+            ("operation=vcpu-exit outcome=guest-shutdown", "Info"),
+            (
+                "device-kind=block operation=device-activation outcome=succeeded",
+                "Info",
+            ),
+            (
+                "device-kind=network operation=rate-limiter outcome=rejected",
+                "Debug",
+            ),
+            ("operation=mmio-registration outcome=failed", "Error"),
         ] {
             assert_eq!(closed_host_outcome_logger_level(record), Some(level));
         }
@@ -18505,8 +18623,89 @@ mod macos_arm64 {
             "operation=vm-start outcome=private-error",
             "device-kind=private operation=device-update outcome=failed",
             "device-kind=block operation=device-update outcome=failed id=secret",
+            "device-kind=block operation=pci-publication outcome=succeeded",
+            "operation=vcpu-exit outcome=private",
         ] {
             assert_eq!(closed_host_outcome_logger_level(malformed), None);
+        }
+    }
+
+    #[test]
+    fn logger_output_accepts_only_closed_device_data_outcomes_with_exact_levels() {
+        for (record, level) in [
+            (
+                "device-kind=block operation=rate-limiter outcome=throttled",
+                "Debug",
+            ),
+            (
+                "device-kind=block operation=request outcome=succeeded",
+                "Info",
+            ),
+            (
+                "device-kind=block operation=vhost-user-notification outcome=disconnected",
+                "Warn",
+            ),
+            (
+                "device-kind=block operation=interrupt-delivery outcome=failed",
+                "Error",
+            ),
+            (
+                "device-kind=pmem operation=rate-limiter outcome=resumed",
+                "Debug",
+            ),
+            ("device-kind=pmem operation=flush outcome=succeeded", "Info"),
+            (
+                "device-kind=pmem operation=queue-notification outcome=unsupported",
+                "Warn",
+            ),
+            (
+                "device-kind=pmem operation=status-write outcome=failed",
+                "Error",
+            ),
+            (
+                "device-kind=network operation=rx-buffer outcome=unavailable",
+                "Debug",
+            ),
+            (
+                "device-kind=network operation=mmds-request outcome=detoured",
+                "Info",
+            ),
+            (
+                "device-kind=network operation=tx-frame outcome=spoof-rejected",
+                "Warn",
+            ),
+            (
+                "device-kind=network operation=mmds-token-key outcome=failed",
+                "Error",
+            ),
+            (
+                "device-kind=vsock operation=guest-connection outcome=ignored",
+                "Debug",
+            ),
+            (
+                "device-kind=vsock operation=connection-reset outcome=queued",
+                "Info",
+            ),
+            (
+                "device-kind=vsock operation=host-connection outcome=dropped",
+                "Warn",
+            ),
+            (
+                "device-kind=vsock operation=transport-reset outcome=failed",
+                "Error",
+            ),
+        ] {
+            assert_eq!(closed_device_data_outcome_logger_level(record), Some(level));
+        }
+
+        for malformed in [
+            "device-kind=block operation=request outcome=private-error",
+            "device-kind=pmem operation=request outcome=succeeded",
+            "device-kind=network operation=host-connection outcome=accepted",
+            "device-kind=vsock operation=tx-frame outcome=spoof-rejected",
+            "device-kind=block operation=request outcome=succeeded id=secret",
+        ] {
+            assert_eq!(closed_device_data_outcome_logger_level(malformed), None);
         }
     }
 
@@ -19558,4 +19757,172 @@ mod macos_arm64 {
 
         Ok(libc::timespec { tv_sec, tv_nsec })
     }
+}
+
+fn closed_device_data_outcome_logger_level(line: &str) -> Option<&'static str> {
+    let mut fields = line.split(' ');
+    let kind = fields.next()?.strip_prefix("device-kind=")?;
+    let operation = fields.next()?.strip_prefix("operation=")?;
+    let outcome = fields.next()?.strip_prefix("outcome=")?;
+    if fields.next().is_some() {
+        return None;
+    }
+
+    match (kind, operation, outcome) {
+        ("block", "rate-limiter", "throttled" | "resumed")
+        | ("block", "async-engine", "throttled")
+        | ("pmem", "rate-limiter", "throttled" | "resumed")
+        | ("network", "rx-buffer", "unavailable")
+        | ("network", "rate-limiter", "throttled" | "resumed")
+        | ("vsock", "host-connection", "pending")
+        | ("vsock", "guest-connection", "ignored") => Some("Debug"),
+
+        ("block", "request", "succeeded")
+        | ("block", "vhost-user-notification", "succeeded")
+        | ("block", "vhost-user-config", "succeeded")
+        | ("pmem", "flush", "succeeded")
+        | ("network", "rx" | "tx", "succeeded")
+        | ("network", "mmds-request", "detoured")
+        | ("network", "mmds-token-key", "rotated")
+        | ("vsock", "rx" | "tx", "succeeded")
+        | ("vsock", "host-connection", "accepted" | "completed")
+        | ("vsock", "guest-connection", "retained" | "forwarded" | "updated" | "closed")
+        | ("vsock", "connection-reset", "queued")
+        | ("vsock", "transport-reset", "succeeded") => Some("Info"),
+
+        ("block", "request", "unsupported")
+        | ("block", "queue-notification", "unsupported")
+        | ("block", "vhost-user-notification", "disconnected")
+        | ("pmem", "queue-notification", "unsupported")
+        | ("network", "rx-buffer", "too-small")
+        | ("network", "tx-frame", "spoof-rejected")
+        | ("network", "queue-notification", "unsupported")
+        | ("network", "packet-provider", "partial")
+        | ("vsock", "rx-buffer", "too-small")
+        | ("vsock", "queue-notification", "unsupported")
+        | ("vsock", "host-connection", "dropped")
+        | ("vsock", "guest-connection", "dropped")
+        | ("vsock", "connection-reset", "dropped") => Some("Warn"),
+
+        ("block", "request-parse" | "request-io" | "status-write", "failed")
+        | ("block", "queue-dispatch", "failed")
+        | ("block", "queue-notification", "inactive")
+        | ("block", "async-engine", "failed")
+        | ("block", "vhost-user-notification", "failed" | "terminal")
+        | ("block", "vhost-user-config", "failed")
+        | ("block", "interrupt-delivery", "failed")
+        | ("pmem", "flush" | "request-parse" | "status-write", "failed")
+        | ("pmem", "queue-dispatch", "failed")
+        | ("pmem", "queue-notification", "inactive")
+        | ("pmem", "interrupt-delivery", "failed")
+        | ("network", "rx-buffer", "malformed")
+        | ("network", "rx-provider", "failed")
+        | ("network", "tx-frame", "malformed")
+        | ("network", "tx-provider", "failed")
+        | ("network", "queue-dispatch", "failed")
+        | ("network", "queue-notification", "inactive")
+        | ("network", "packet-provider", "failed")
+        | ("network", "mmds-token-key", "failed")
+        | ("network", "interrupt-delivery", "failed")
+        | ("vsock", "rx-buffer" | "tx-packet", "malformed")
+        | ("vsock", "queue-dispatch", "failed")
+        | ("vsock", "queue-notification", "inactive")
+        | ("vsock", "transport-reset" | "interrupt-delivery", "failed") => Some("Error"),
+        _ => None,
+    }
+}
+
+fn closed_backend_outcome_logger_level(line: &str) -> Option<&'static str> {
+    match line {
+        "operation=virtual-timer outcome=activated" => Some("Debug"),
+        "operation=vcpu-exit outcome=guest-shutdown"
+        | "operation=vcpu-exit outcome=guest-reset" => Some("Info"),
+        "operation=vcpu-exit outcome=unsupported" => Some("Warn"),
+        "operation=cache-configuration outcome=failed"
+        | "operation=memory-map outcome=failed"
+        | "operation=memory-discard outcome=failed"
+        | "operation=vm-create outcome=failed"
+        | "operation=vm-cleanup outcome=failed"
+        | "operation=vcpu-start outcome=failed"
+        | "operation=vcpu-run outcome=failed"
+        | "operation=mmio-dispatch outcome=failed"
+        | "operation=interrupt-delivery outcome=failed"
+        | "operation=virtual-timer outcome=failed" => Some("Error"),
+        _ => None,
+    }
+}
+
+fn closed_transport_outcome_logger_level(line: &str) -> Option<&'static str> {
+    if let Some((operation, outcome)) = parse_transport_outcome_without_device(line) {
+        return match (operation, outcome) {
+            ("mmio-registration" | "mmio-release", "succeeded") => Some("Debug"),
+            ("publication-rollback", "succeeded") | ("used-ring", "rejected") => Some("Warn"),
+            (
+                "mmio-registration" | "mmio-release" | "mmio-access" | "publication-rollback",
+                "failed",
+            ) => Some("Error"),
+            _ => None,
+        };
+    }
+
+    let mut fields = line.split(' ');
+    let kind = fields.next()?.strip_prefix("device-kind=")?;
+    let operation = fields.next()?.strip_prefix("operation=")?;
+    let outcome = fields.next()?.strip_prefix("outcome=")?;
+    if fields.next().is_some()
+        || !matches!(
+            kind,
+            "balloon"
+                | "block"
+                | "entropy"
+                | "memory-hotplug"
+                | "network"
+                | "pmem"
+                | "serial"
+                | "vsock"
+        )
+    {
+        return None;
+    }
+
+    match (operation, outcome) {
+        ("queue-notification", "succeeded")
+        | ("msi-configuration", "succeeded")
+        | ("interrupt-delivery", "delivered")
+        | ("rate-limiter", "rejected") => Some("Debug"),
+        ("device-activation" | "device-reset", "succeeded")
+        | ("pci-publication", "published")
+        | ("pci-removal", "removed") => Some("Info"),
+        (
+            "feature-negotiation"
+            | "device-config"
+            | "queue-configuration"
+            | "used-ring"
+            | "pci-config",
+            "rejected",
+        )
+        | ("device-reset", "unsupported")
+        | ("publication-rollback", "succeeded") => Some("Warn"),
+        (
+            "mmio-access"
+            | "device-config"
+            | "queue-notification"
+            | "device-activation"
+            | "device-reset"
+            | "pci-publication"
+            | "pci-removal"
+            | "msi-configuration"
+            | "interrupt-delivery"
+            | "publication-rollback",
+            "failed",
+        ) => Some("Error"),
+        _ => None,
+    }
+}
+
+fn parse_transport_outcome_without_device(line: &str) -> Option<(&str, &str)> {
+    let mut fields = line.split(' ');
+    let operation = fields.next()?.strip_prefix("operation=")?;
+    let outcome = fields.next()?.strip_prefix("outcome=")?;
+    (fields.next().is_none()).then_some((operation, outcome))
 }

@@ -8,6 +8,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use zeroize::Zeroizing;
 
+use crate::logger::{GuestLogger, LoggerNetworkOutcome};
+
 pub const MMDS_TOKEN_MIN_TTL_SECONDS: u32 = 1;
 pub const MMDS_TOKEN_MAX_TTL_SECONDS: u32 = 21_600;
 
@@ -125,6 +127,7 @@ pub struct MmdsTokenAuthority {
     current_key: Option<Zeroizing<[u8; MMDS_TOKEN_KEY_BYTES]>>,
     additional_authenticated_data: Zeroizing<Vec<u8>>,
     num_encrypted_tokens: u32,
+    guest_logger: Option<GuestLogger>,
     clock: MmdsTokenClock,
     entropy: MmdsTokenEntropy,
     #[cfg(test)]
@@ -139,6 +142,7 @@ impl fmt::Debug for MmdsTokenAuthority {
             .field("current_key", &"[REDACTED]")
             .field("additional_authenticated_data", &"[REDACTED]")
             .field("num_encrypted_tokens", &self.num_encrypted_tokens)
+            .field("guest_logger_attached", &self.guest_logger.is_some())
             .field("clock", &"[REDACTED]")
             .field("entropy", &"[REDACTED]")
             .finish()
@@ -164,6 +168,7 @@ impl MmdsTokenAuthority {
             current_key: None,
             additional_authenticated_data,
             num_encrypted_tokens: 0,
+            guest_logger: None,
             clock: MmdsTokenClock::default(),
             entropy: MmdsTokenEntropy::default(),
             #[cfg(test)]
@@ -173,9 +178,31 @@ impl MmdsTokenAuthority {
         }
     }
 
+    pub fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = Some(logger);
+    }
+
     pub fn generate_token(&mut self, ttl_seconds: u32) -> Result<String, MmdsTokenError> {
         validate_ttl(ttl_seconds)?;
         let now_millis = self.clock.now_millis()?;
+        let rotates_existing_key =
+            self.current_key.is_some() && self.num_encrypted_tokens == u32::MAX;
+        let result = self.generate_token_at(ttl_seconds, now_millis);
+        if rotates_existing_key && let Some(logger) = &self.guest_logger {
+            logger.log_network(if result.is_ok() {
+                LoggerNetworkOutcome::MmdsTokenKeyRotated
+            } else {
+                LoggerNetworkOutcome::MmdsTokenKeyRotationFailed
+            });
+        }
+        result
+    }
+
+    fn generate_token_at(
+        &mut self,
+        ttl_seconds: u32,
+        now_millis: u64,
+    ) -> Result<String, MmdsTokenError> {
         let expiry_millis = token_expiry_millis(now_millis, ttl_seconds);
         let needs_new_key = self.current_key.is_none() || self.num_encrypted_tokens == u32::MAX;
         let next_encrypted_tokens = if needs_new_key {
@@ -372,7 +399,28 @@ fn decode_token(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use crate::logger::LoggerState;
+
+    #[derive(Debug)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("MMDS logger output lock should succeed")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn authority(instance_id: &str) -> MmdsTokenAuthority {
         MmdsTokenAuthority::with_manual_clock(instance_id, 1_000)
@@ -531,6 +579,51 @@ mod tests {
         assert_eq!(authority.num_encrypted_tokens, 1);
         assert!(!authority.is_valid(&old_token));
         assert!(authority.is_valid(&new_token));
+    }
+
+    #[test]
+    fn rotation_outcomes_are_logged_once_without_token_or_key_values() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut logger_state = LoggerState::default();
+        logger_state.configure_test_writer(SharedWriter(output.clone()));
+        let logger = logger_state.guest_logger();
+
+        let mut succeeded = authority("logged-success");
+        succeeded
+            .generate_token(60)
+            .expect("initial success token should generate");
+        succeeded.num_encrypted_tokens = u32::MAX;
+        succeeded.attach_guest_logger(logger.clone());
+        succeeded
+            .generate_token(60)
+            .expect("logged key rotation should succeed");
+
+        let mut failed = authority("logged-failure");
+        failed
+            .generate_token(60)
+            .expect("initial failure token should generate");
+        failed.num_encrypted_tokens = u32::MAX;
+        set_entropy_failure(&mut failed, 0);
+        failed.attach_guest_logger(logger.clone());
+        assert_eq!(
+            failed.generate_token(60),
+            Err(MmdsTokenError::RandomnessUnavailable)
+        );
+        assert!(logger.wait_for_delivery_for_test());
+
+        assert_eq!(
+            String::from_utf8(
+                output
+                    .lock()
+                    .expect("MMDS logger output lock should succeed")
+                    .clone(),
+            )
+            .expect("MMDS logger output should be UTF-8"),
+            concat!(
+                "device-kind=network operation=mmds-token-key outcome=rotated\n",
+                "device-kind=network operation=mmds-token-key outcome=failed\n",
+            )
+        );
     }
 
     #[test]

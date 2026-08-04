@@ -50,7 +50,10 @@ use bangbang_runtime::fdt::{
 use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
-use bangbang_runtime::logger::{GuestLogger, LoggerBackendOutcome};
+use bangbang_runtime::logger::{
+    GuestLogger, LoggerBackendOutcome, LoggerBlockOutcome, LoggerNetworkOutcome, LoggerPmemOutcome,
+    LoggerVsockOutcome,
+};
 use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking, GuestMemoryLayout,
     GuestMemoryRange,
@@ -2170,6 +2173,7 @@ impl HvfArm64BootPciDataDevices {
         memory: &mut GuestMemory,
         mut packet_io: Option<&mut dyn Arm64BootNetworkPacketIoProvider>,
         metrics: &SharedNetworkInterfaceMetricsRegistry,
+        guest_logger: &GuestLogger,
     ) -> Option<Duration> {
         for device in &mut self.network {
             let mut retry_after = None;
@@ -2197,6 +2201,7 @@ impl HvfArm64BootPciDataDevices {
                         }
                         Err(_) => {
                             metrics.record_event_failure_for_interface(&device.iface_id);
+                            guest_logger.log_network(LoggerNetworkOutcome::PacketProviderFailed);
                             device.retry_deadline = None;
                             continue;
                         }
@@ -11396,6 +11401,8 @@ fn capture_ready_vsock_state_with_cancel(
         ));
     }
 
+    let guest_logger = owner.backend.guest_logger();
+
     let mmio = owner.runtime_resources.vsock_device.as_ref();
     let pci = owner
         .pci_data_devices
@@ -11549,6 +11556,7 @@ fn capture_ready_vsock_state_with_cancel(
                 });
                 if !delivered {
                     owner.session_metrics.record_event_queue_signal_failure();
+                    guest_logger.log_vsock(LoggerVsockOutcome::InterruptDeliveryFailed);
                     return Err(vsock_capture_error(
                         HvfArm64BootVsockCaptureErrorKind::InterruptDelivery,
                         HvfArm64BootVsockCaptureStage::InterruptDelivery,
@@ -16506,6 +16514,7 @@ impl HvfArm64BootSession<'_> {
             Ok(dispatches) => record_block_signal_metrics(&self.block_device_metrics, dispatches),
             Err(_) => self.block_device_metrics.record_event_failure(),
         }
+        observe_block_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -16570,6 +16579,7 @@ impl HvfArm64BootSession<'_> {
             }
             Err(_) => self.network_interface_metrics.record_event_failure(),
         }
+        observe_network_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -16616,6 +16626,7 @@ impl HvfArm64BootSession<'_> {
             }
             Err(_) => self.network_interface_metrics.record_event_failure(),
         }
+        observe_network_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -16653,11 +16664,16 @@ impl HvfArm64BootSession<'_> {
         };
 
         record_vsock_runtime_dispatch_metrics(&self.vsock_device_metrics, dispatches.as_slice());
-        let result = collect_or_signal_vsock_queue_interrupts(dispatches, &self.gic);
+        let result = collect_or_signal_vsock_queue_interrupts(
+            dispatches,
+            &self.gic,
+            &self.backend.guest_logger(),
+        );
         match &result {
             Ok(dispatches) => record_vsock_signal_metrics(&self.vsock_device_metrics, dispatches),
             Err(_) => self.vsock_device_metrics.record_muxer_event_failure(),
         }
+        observe_vsock_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -18445,6 +18461,7 @@ fn publish_snapshot_v2_vsock_pci(
     memory: &GuestMemory,
     input: HvfSnapshotV2VsockPciRestoreInput<'_>,
     failure_index: usize,
+    guest_logger: &GuestLogger,
 ) -> Result<RestoredHvfSnapshotV2VsockPciMetadata, HvfSnapshotV2NetworkPciBatchFailure> {
     let HvfSnapshotV2VsockPciRestoreInput {
         endpoint,
@@ -18492,13 +18509,17 @@ fn publish_snapshot_v2_vsock_pci(
     let sbdf = endpoint.sbdf();
     let bar_range = endpoint.bar_range();
     let bar_region_id = endpoint.bar_region_id();
-    let prepared = match endpoint.state().clone().into_pci_endpoint(
-        &config,
-        memory,
-        resource,
-        bar_region_id,
-        interrupts.registry(),
-    ) {
+    let prepared = match endpoint
+        .state()
+        .clone()
+        .into_pci_endpoint_with_guest_logger(
+            &config,
+            memory,
+            resource,
+            bar_region_id,
+            interrupts.registry(),
+            guest_logger.clone(),
+        ) {
         Ok(prepared) => prepared,
         Err(_) => {
             let cleanup_failed = release_snapshot_v2_network_pci_interrupts(&mut interrupts);
@@ -20112,11 +20133,20 @@ impl OwnedHvfArm64BootSession {
                     session, stage,
                 ));
             }
+            let guest_logger = session.backend.guest_logger();
             let reconstruction = session
                 .backend
                 .mapped_guest_memory()
                 .ok()
-                .and_then(|memory| capture.reconstruct_snapshot_handler(memory, resource).ok());
+                .and_then(|memory| {
+                    capture
+                        .reconstruct_snapshot_handler_with_guest_logger(
+                            memory,
+                            resource,
+                            guest_logger,
+                        )
+                        .ok()
+                });
             let Some(handler) = reconstruction else {
                 return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
                     session, stage,
@@ -20938,6 +20968,7 @@ impl OwnedHvfArm64BootSession {
                                 pci_data_devices,
                                 ..
                             } = &mut session;
+                            let guest_logger = backend.guest_logger();
                             let memory = backend.mapped_guest_memory();
                             match (memory, pci_data_devices.as_mut()) {
                                 (Ok(memory), Some(manager)) => publish_snapshot_v2_vsock_pci(
@@ -20945,6 +20976,7 @@ impl OwnedHvfArm64BootSession {
                                     memory,
                                     vsock,
                                     network_count,
+                                    &guest_logger,
                                 ),
                                 _ => Err(HvfSnapshotV2NetworkPciBatchFailure {
                                     index: network_count,
@@ -27045,6 +27077,7 @@ impl OwnedHvfArm64BootSession {
         }
 
         if let Some(vsock) = vsock_publication.take() {
+            let guest_logger = platform.backend().guest_logger();
             let memory = match platform.guest_memory() {
                 Ok(memory) => memory,
                 Err(_) => fail_after_platform!(
@@ -27059,7 +27092,13 @@ impl OwnedHvfArm64BootSession {
                     HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
                 ),
             };
-            match publish_snapshot_v2_vsock_pci(manager, memory, vsock, following_vsock_index) {
+            match publish_snapshot_v2_vsock_pci(
+                manager,
+                memory,
+                vsock,
+                following_vsock_index,
+                &guest_logger,
+            ) {
                 Ok(vsock) => match restored_network.as_mut() {
                     Some(network) if network.vsock.is_none() => network.vsock = Some(vsock),
                     _ => fail_after_platform!(
@@ -30433,6 +30472,7 @@ impl OwnedHvfArm64BootSession {
             Ok(dispatches) => record_block_signal_metrics(&self.block_device_metrics, dispatches),
             Err(_) => self.block_device_metrics.record_event_failure(),
         }
+        observe_block_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -30497,6 +30537,7 @@ impl OwnedHvfArm64BootSession {
             }
             Err(_) => self.network_interface_metrics.record_event_failure(),
         }
+        observe_network_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -30543,6 +30584,7 @@ impl OwnedHvfArm64BootSession {
             }
             Err(_) => self.network_interface_metrics.record_event_failure(),
         }
+        observe_network_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -30580,11 +30622,16 @@ impl OwnedHvfArm64BootSession {
         };
 
         record_vsock_runtime_dispatch_metrics(&self.vsock_device_metrics, dispatches.as_slice());
-        let result = collect_or_signal_vsock_queue_interrupts(dispatches, &self.gic);
+        let result = collect_or_signal_vsock_queue_interrupts(
+            dispatches,
+            &self.gic,
+            &self.backend.guest_logger(),
+        );
         match &result {
             Ok(dispatches) => record_vsock_signal_metrics(&self.vsock_device_metrics, dispatches),
             Err(_) => self.vsock_device_metrics.record_muxer_event_failure(),
         }
+        observe_vsock_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
 
@@ -33963,22 +34010,31 @@ fn collect_network_notification_dispatches(
     Ok(HvfArm64BootNetworkNotificationDispatches::new_with_retry_after(devices, retry_after))
 }
 
+#[cfg(test)]
 fn collect_vsock_notification_dispatches(
     dispatches: Arm64BootVsockNotificationDispatches,
 ) -> Result<HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockNotificationDispatchError> {
+    collect_vsock_notification_dispatches_with_logger(dispatches, None)
+}
+
+fn collect_vsock_notification_dispatches_with_logger(
+    dispatches: Arm64BootVsockNotificationDispatches,
+    logger: Option<&GuestLogger>,
+) -> Result<HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockNotificationDispatchError> {
     let runtime_dispatches = dispatches.into_vec();
     let mut devices = Vec::new();
-    devices
-        .try_reserve_exact(runtime_dispatches.len())
-        .map_err(
-            |source| HvfArm64BootVsockNotificationDispatchError::ResultAllocation { source },
-        )?;
+    if let Err(source) = devices.try_reserve_exact(runtime_dispatches.len()) {
+        observe_runtime_vsock_notification_dispatches(logger, &runtime_dispatches);
+        return Err(HvfArm64BootVsockNotificationDispatchError::ResultAllocation { source });
+    }
 
     for dispatch in runtime_dispatches {
         devices.push(HvfArm64BootVsockNotificationDispatch::new(dispatch, None));
     }
 
-    Ok(HvfArm64BootVsockNotificationDispatches::new(devices))
+    let dispatches = HvfArm64BootVsockNotificationDispatches::new(devices);
+    observe_hvf_vsock_notification_dispatches(logger, &dispatches);
+    Ok(dispatches)
 }
 
 fn collect_balloon_notification_dispatches(
@@ -34196,11 +34252,12 @@ fn dispatch_pci_network_notifications(
     metrics: &SharedNetworkInterfaceMetricsRegistry,
 ) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
 {
+    let guest_logger = backend.guest_logger();
     let memory = backend.mapped_guest_memory_mut().map_err(|source| {
         HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
     })?;
     Ok(HvfArm64BootNetworkNotificationDispatches::from_pci_retry(
-        devices.dispatch_network(memory, packet_io, metrics),
+        devices.dispatch_network(memory, packet_io, metrics, &guest_logger),
     ))
 }
 
@@ -34237,6 +34294,7 @@ fn dispatch_pmem_queue_notifications_and_signal_interrupts(
         Ok(dispatches) => record_pmem_signal_metrics(metrics, dispatches),
         Err(_) => metrics.record_event_failure(),
     }
+    observe_pmem_interrupt_delivery(&backend.guest_logger(), &result);
     result
 }
 
@@ -34581,6 +34639,78 @@ fn record_vsock_signal_metrics(
     }
 }
 
+fn observe_block_interrupt_delivery(
+    logger: &GuestLogger,
+    result: &Result<
+        HvfArm64BootBlockNotificationDispatches,
+        HvfArm64BootBlockNotificationDispatchError,
+    >,
+) {
+    if matches!(
+        result,
+        Ok(dispatches) if dispatches.has_signal_failure()
+    ) || matches!(
+        result,
+        Err(HvfArm64BootBlockNotificationDispatchError::CreateSignalSink { .. })
+    ) {
+        logger.log_block(LoggerBlockOutcome::InterruptDeliveryFailed);
+    }
+}
+
+fn observe_pmem_interrupt_delivery(
+    logger: &GuestLogger,
+    result: &Result<
+        HvfArm64BootPmemNotificationDispatches,
+        HvfArm64BootPmemNotificationDispatchError,
+    >,
+) {
+    if matches!(
+        result,
+        Ok(dispatches) if dispatches.has_signal_failure()
+    ) || matches!(
+        result,
+        Err(HvfArm64BootPmemNotificationDispatchError::CreateSignalSink { .. })
+    ) {
+        logger.log_pmem(LoggerPmemOutcome::InterruptDeliveryFailed);
+    }
+}
+
+fn observe_network_interrupt_delivery(
+    logger: &GuestLogger,
+    result: &Result<
+        HvfArm64BootNetworkNotificationDispatches,
+        HvfArm64BootNetworkNotificationDispatchError,
+    >,
+) {
+    if matches!(
+        result,
+        Ok(dispatches) if dispatches.has_signal_failure()
+    ) || matches!(
+        result,
+        Err(HvfArm64BootNetworkNotificationDispatchError::CreateSignalSink { .. })
+    ) {
+        logger.log_network(LoggerNetworkOutcome::InterruptDeliveryFailed);
+    }
+}
+
+fn observe_vsock_interrupt_delivery(
+    logger: &GuestLogger,
+    result: &Result<
+        HvfArm64BootVsockNotificationDispatches,
+        HvfArm64BootVsockNotificationDispatchError,
+    >,
+) {
+    if matches!(
+        result,
+        Ok(dispatches) if dispatches.has_signal_failure()
+    ) || matches!(
+        result,
+        Err(HvfArm64BootVsockNotificationDispatchError::CreateSignalSink { .. })
+    ) {
+        logger.log_vsock(LoggerVsockOutcome::InterruptDeliveryFailed);
+    }
+}
+
 #[cfg(test)]
 fn record_balloon_dispatch_metrics(
     metrics: &SharedBalloonDeviceMetrics,
@@ -34813,16 +34943,21 @@ fn collect_or_signal_network_queue_interrupts(
 fn collect_or_signal_vsock_queue_interrupts(
     dispatches: Arm64BootVsockNotificationDispatches,
     gic: &HvfGicMetadata,
+    logger: &GuestLogger,
 ) -> Result<HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockNotificationDispatchError> {
     if !dispatches.needs_queue_interrupt() {
-        return collect_vsock_notification_dispatches(dispatches);
+        return collect_vsock_notification_dispatches_with_logger(dispatches, Some(logger));
     }
 
-    let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
-        HvfArm64BootVsockNotificationDispatchError::CreateSignalSink { source }
-    })?;
+    let signaler = match HvfGicSpiSignaler::from_metadata(gic) {
+        Ok(signaler) => signaler,
+        Err(source) => {
+            observe_runtime_vsock_notification_dispatches(Some(logger), dispatches.as_slice());
+            return Err(HvfArm64BootVsockNotificationDispatchError::CreateSignalSink { source });
+        }
+    };
 
-    signal_vsock_queue_interrupts(dispatches, &signaler)
+    signal_vsock_queue_interrupts_with_logger(dispatches, &signaler, Some(logger))
 }
 
 fn collect_or_signal_balloon_queue_interrupts(
@@ -34904,17 +35039,25 @@ fn signal_network_queue_interrupts(
     Ok(HvfArm64BootNetworkNotificationDispatches::new_with_retry_after(devices, retry_after))
 }
 
+#[cfg(test)]
 fn signal_vsock_queue_interrupts(
     dispatches: Arm64BootVsockNotificationDispatches,
     signaler: &dyn InterruptSink,
 ) -> Result<HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockNotificationDispatchError> {
+    signal_vsock_queue_interrupts_with_logger(dispatches, signaler, None)
+}
+
+fn signal_vsock_queue_interrupts_with_logger(
+    dispatches: Arm64BootVsockNotificationDispatches,
+    signaler: &dyn InterruptSink,
+    logger: Option<&GuestLogger>,
+) -> Result<HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockNotificationDispatchError> {
     let runtime_dispatches = dispatches.into_vec();
     let mut devices = Vec::new();
-    devices
-        .try_reserve_exact(runtime_dispatches.len())
-        .map_err(
-            |source| HvfArm64BootVsockNotificationDispatchError::ResultAllocation { source },
-        )?;
+    if let Err(source) = devices.try_reserve_exact(runtime_dispatches.len()) {
+        observe_runtime_vsock_notification_dispatches(logger, &runtime_dispatches);
+        return Err(HvfArm64BootVsockNotificationDispatchError::ResultAllocation { source });
+    }
 
     for dispatch in runtime_dispatches {
         let signal_error = if dispatch.needs_queue_interrupt() {
@@ -34928,7 +35071,36 @@ fn signal_vsock_queue_interrupts(
         ));
     }
 
-    Ok(HvfArm64BootVsockNotificationDispatches::new(devices))
+    let dispatches = HvfArm64BootVsockNotificationDispatches::new(devices);
+    observe_hvf_vsock_notification_dispatches(logger, &dispatches);
+    Ok(dispatches)
+}
+
+fn observe_runtime_vsock_notification_dispatches(
+    logger: Option<&GuestLogger>,
+    dispatches: &[Arm64BootVsockNotificationDispatch],
+) {
+    let Some(logger) = logger else {
+        return;
+    };
+    for dispatch in dispatches {
+        dispatch.outcome().observe_with_guest_logger(logger);
+    }
+}
+
+fn observe_hvf_vsock_notification_dispatches(
+    logger: Option<&GuestLogger>,
+    dispatches: &HvfArm64BootVsockNotificationDispatches,
+) {
+    let Some(logger) = logger else {
+        return;
+    };
+    for dispatch in dispatches.as_slice() {
+        dispatch
+            .dispatch()
+            .outcome()
+            .observe_with_guest_logger(logger);
+    }
 }
 
 fn signal_balloon_queue_interrupts(
@@ -35992,6 +36164,9 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
 ) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
     let guest_logger = controller.guest_logger();
     backend.attach_guest_logger(guest_logger.clone());
+    let _ = controller
+        .mmds_state_handle()
+        .attach_guest_logger(guest_logger.clone());
     let pvtime_contention_probe = config.pvtime_contention_probe.clone();
     let serial_input = startup_resources
         .take_serial_input()

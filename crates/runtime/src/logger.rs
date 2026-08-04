@@ -25,10 +25,10 @@ use rate_limiter::{LogRateLimitDecision, LoggerRateLimitIdentity, LoggerRateLimi
 
 pub use event::{
     LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute,
-    LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerDeviceKind, LoggerHttpMethod,
-    LoggerLifecycleOutcome, LoggerObservabilityOutcome, LoggerProcessSignalOutcome,
-    LoggerSnapshotOutcome, LoggerTransportOutcome, PanicLogRecords, ProcessStartupOutcome,
-    ProcessTerminalCategory,
+    LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerBlockOutcome, LoggerDeviceKind,
+    LoggerHttpMethod, LoggerLifecycleOutcome, LoggerNetworkOutcome, LoggerObservabilityOutcome,
+    LoggerPmemOutcome, LoggerProcessSignalOutcome, LoggerSnapshotOutcome, LoggerTransportOutcome,
+    LoggerVsockOutcome, PanicLogRecords, ProcessStartupOutcome, ProcessTerminalCategory,
 };
 pub use process_stdout::{ProcessStdoutLogger, ProcessStdoutLoggerError};
 
@@ -493,6 +493,78 @@ impl TransportOutcomeLogRateLimiter {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct BlockOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl BlockOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner.check(LoggerRateLimitIdentity::BlockOutcome)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PmemOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl PmemOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner.check(LoggerRateLimitIdentity::PmemOutcome)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct NetworkOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl NetworkOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner.check(LoggerRateLimitIdentity::NetworkOutcome)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct VsockOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl VsockOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner.check(LoggerRateLimitIdentity::VsockOutcome)
+    }
+}
+
 impl ObservabilityWorkerLogRateLimiter {
     #[cfg(test)]
     fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
@@ -687,6 +759,10 @@ struct GuestLoggerInner {
     metrics: SharedLoggerMetrics,
     backend_rate_limiter: BackendOutcomeLogRateLimiter,
     transport_rate_limiter: TransportOutcomeLogRateLimiter,
+    block_rate_limiter: BlockOutcomeLogRateLimiter,
+    pmem_rate_limiter: PmemOutcomeLogRateLimiter,
+    network_rate_limiter: NetworkOutcomeLogRateLimiter,
+    vsock_rate_limiter: VsockOutcomeLogRateLimiter,
 }
 
 impl fmt::Debug for GuestLogger {
@@ -701,6 +777,10 @@ impl fmt::Debug for GuestLogger {
             .field("metrics", &self.inner.metrics)
             .field("backend_rate_limiter", &self.inner.backend_rate_limiter)
             .field("transport_rate_limiter", &self.inner.transport_rate_limiter)
+            .field("block_rate_limiter", &self.inner.block_rate_limiter)
+            .field("pmem_rate_limiter", &self.inner.pmem_rate_limiter)
+            .field("network_rate_limiter", &self.inner.network_rate_limiter)
+            .field("vsock_rate_limiter", &self.inner.vsock_rate_limiter)
             .finish()
     }
 }
@@ -734,6 +814,56 @@ impl GuestLogger {
             DEVICE_LOG_MODULE,
             LoggerEvent::Transport(outcome),
             || self.inner.transport_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub fn log_block(&self, outcome: LoggerBlockOutcome) {
+        self.log_limited(
+            outcome.level(),
+            DEVICE_LOG_MODULE,
+            LoggerEvent::Block(outcome),
+            || self.inner.block_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub fn log_pmem(&self, outcome: LoggerPmemOutcome) {
+        self.log_limited(
+            outcome.level(),
+            DEVICE_LOG_MODULE,
+            LoggerEvent::Pmem(outcome),
+            || self.inner.pmem_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub fn log_network(&self, outcome: LoggerNetworkOutcome) {
+        self.log_limited(
+            outcome.level(),
+            DEVICE_LOG_MODULE,
+            LoggerEvent::Network(outcome),
+            || self.inner.network_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub fn log_vsock(&self, outcome: LoggerVsockOutcome) {
+        self.log_limited(
+            outcome.level(),
+            DEVICE_LOG_MODULE,
+            LoggerEvent::Vsock(outcome),
+            || self.inner.vsock_rate_limiter.check(),
+        );
+    }
+
+    #[track_caller]
+    pub(crate) fn log_vsock_summary(&self, outcomes: impl IntoIterator<Item = LoggerVsockOutcome>) {
+        self.log_limited_summary(
+            outcomes
+                .into_iter()
+                .map(|outcome| (outcome.level(), LoggerEvent::Vsock(outcome))),
+            || self.inner.vsock_rate_limiter.check(),
         );
     }
 
@@ -789,6 +919,64 @@ impl GuestLogger {
         let _delivered = producer.deliver_nonblocking(batch);
     }
 
+    #[track_caller]
+    fn log_limited_summary(
+        &self,
+        events: impl IntoIterator<Item = (LoggerLevel, LoggerEvent)>,
+        mut check_limiter: impl FnMut() -> LogRateLimitDecision,
+    ) {
+        if !module_filter_allows(self.inner.module.as_deref(), DEVICE_LOG_MODULE) {
+            return;
+        }
+        let Some(producer) = &self.inner.producer else {
+            return;
+        };
+        let origin = LogOrigin::from(Location::caller());
+        let mut batch = LogBatch::empty();
+        let mut suppressed = 0_u64;
+        for (level, event) in events {
+            if !self.inner.level.allows(level) {
+                continue;
+            }
+            match check_limiter() {
+                LogRateLimitDecision::Admitted {
+                    suppressed: recovered,
+                } => {
+                    suppressed = suppressed.saturating_add(recovered);
+                    let record = LogRecord::encode(
+                        self.inner.show_level,
+                        self.inner.show_log_origin,
+                        origin,
+                        level,
+                        event,
+                    );
+                    if !batch.push(record) {
+                        self.inner.metrics.record_missed_logs(1);
+                    }
+                }
+                LogRateLimitDecision::Denied => {
+                    self.inner.metrics.record_rate_limited_log();
+                }
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
+        if suppressed != 0 {
+            let recovery = LogRecord::encode(
+                self.inner.show_level,
+                self.inner.show_log_origin,
+                origin,
+                LoggerLevel::Warn,
+                LoggerEvent::RateLimitRecovery { suppressed },
+            );
+            if !batch.prepend(recovery) {
+                self.inner.metrics.record_missed_logs(1);
+            }
+        }
+        let _delivered = producer.deliver_nonblocking(batch);
+    }
+
     #[cfg(test)]
     pub(crate) fn wait_for_delivery_for_test(&self) -> bool {
         self.inner
@@ -811,6 +999,10 @@ pub struct LoggerState {
     observability_rate_limiter: ObservabilityWorkerLogRateLimiter,
     backend_rate_limiter: BackendOutcomeLogRateLimiter,
     transport_rate_limiter: TransportOutcomeLogRateLimiter,
+    block_rate_limiter: BlockOutcomeLogRateLimiter,
+    pmem_rate_limiter: PmemOutcomeLogRateLimiter,
+    network_rate_limiter: NetworkOutcomeLogRateLimiter,
+    vsock_rate_limiter: VsockOutcomeLogRateLimiter,
     delivery_config: LoggerDeliveryConfig,
 }
 
@@ -831,6 +1023,10 @@ impl fmt::Debug for LoggerState {
             )
             .field("backend_rate_limiter", &self.backend_rate_limiter)
             .field("transport_rate_limiter", &self.transport_rate_limiter)
+            .field("block_rate_limiter", &self.block_rate_limiter)
+            .field("pmem_rate_limiter", &self.pmem_rate_limiter)
+            .field("network_rate_limiter", &self.network_rate_limiter)
+            .field("vsock_rate_limiter", &self.vsock_rate_limiter)
             .field("delivery_config", &self.delivery_config)
             .finish()
     }
@@ -875,6 +1071,10 @@ impl LoggerState {
             observability_rate_limiter: ObservabilityWorkerLogRateLimiter::default(),
             backend_rate_limiter: BackendOutcomeLogRateLimiter::default(),
             transport_rate_limiter: TransportOutcomeLogRateLimiter::default(),
+            block_rate_limiter: BlockOutcomeLogRateLimiter::default(),
+            pmem_rate_limiter: PmemOutcomeLogRateLimiter::default(),
+            network_rate_limiter: NetworkOutcomeLogRateLimiter::default(),
+            vsock_rate_limiter: VsockOutcomeLogRateLimiter::default(),
             delivery_config: LoggerDeliveryConfig::default(),
         }
     }
@@ -1176,6 +1376,10 @@ impl LoggerState {
                 metrics: self.metrics.clone(),
                 backend_rate_limiter: self.backend_rate_limiter.clone(),
                 transport_rate_limiter: self.transport_rate_limiter.clone(),
+                block_rate_limiter: self.block_rate_limiter.clone(),
+                pmem_rate_limiter: self.pmem_rate_limiter.clone(),
+                network_rate_limiter: self.network_rate_limiter.clone(),
+                vsock_rate_limiter: self.vsock_rate_limiter.clone(),
             }),
         }
     }
@@ -1269,6 +1473,47 @@ impl LoggerState {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LoggerTestCapture {
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+#[cfg(test)]
+impl LoggerTestCapture {
+    pub(crate) fn configured_guest_logger(&self) -> (LoggerState, GuestLogger) {
+        let mut state = LoggerState::default();
+        state.configure_test_writer(self.clone());
+        let logger = state.guest_logger();
+        (state, logger)
+    }
+
+    pub(crate) fn output(&self) -> String {
+        String::from_utf8(
+            self.output
+                .lock()
+                .expect("test logger output lock should succeed")
+                .clone(),
+        )
+        .expect("test logger output should be UTF-8")
+    }
+}
+
+#[cfg(test)]
+impl Write for LoggerTestCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.output
+            .lock()
+            .expect("test logger output lock should succeed")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn module_filter_allows(filter: Option<&str>, module_path: &str) -> bool {
     filter.is_none_or(|filter| module_path.starts_with(filter))
 }
@@ -1287,14 +1532,17 @@ mod tests {
 
     use super::delivery::WorkerObserver;
     use super::{
-        BackendOutcomeLogRateLimiter, BootTimerLogRateLimiter, GuestLogger, LogRateLimitDecision,
-        LogRateLimiterClock, LoggerAction, LoggerApiControlOutcome, LoggerApiResultOutcome,
-        LoggerApiRoute, LoggerApiWorkerOutcome, LoggerBackendOutcome, LoggerConfigError,
-        LoggerConfigInput, LoggerDeliveryConfig, LoggerDeviceKind, LoggerHttpMethod, LoggerLevel,
-        LoggerLifecycleOutcome, LoggerObservabilityOutcome, LoggerProcessSignalOutcome,
-        LoggerSnapshotOutcome, LoggerState, LoggerTransportOutcome,
-        ObservabilityWorkerLogRateLimiter, ProcessStartupOutcome, ProcessTerminalCategory,
-        SharedLoggerMetrics, TransportOutcomeLogRateLimiter,
+        BackendOutcomeLogRateLimiter, BlockOutcomeLogRateLimiter, BootTimerLogRateLimiter,
+        GuestLogger, LogRateLimitDecision, LogRateLimiterClock, LoggerAction,
+        LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute, LoggerApiWorkerOutcome,
+        LoggerBackendOutcome, LoggerBlockOutcome, LoggerConfigError, LoggerConfigInput,
+        LoggerDeliveryConfig, LoggerDeviceKind, LoggerHttpMethod, LoggerLevel,
+        LoggerLifecycleOutcome, LoggerNetworkOutcome, LoggerObservabilityOutcome,
+        LoggerPmemOutcome, LoggerProcessSignalOutcome, LoggerSnapshotOutcome, LoggerState,
+        LoggerTransportOutcome, LoggerVsockOutcome, NetworkOutcomeLogRateLimiter,
+        ObservabilityWorkerLogRateLimiter, PmemOutcomeLogRateLimiter, ProcessStartupOutcome,
+        ProcessTerminalCategory, SharedLoggerMetrics, TransportOutcomeLogRateLimiter,
+        VsockOutcomeLogRateLimiter,
     };
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
 
@@ -1641,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn guest_logger_uses_closed_backend_and_transport_shapes() {
+    fn guest_logger_uses_all_closed_guest_outcome_shapes() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let mut state = LoggerState::default();
         state.configure_test_writer(SharedWriter(output.clone()));
@@ -1660,6 +1908,10 @@ mod tests {
             LoggerDeviceKind::Block,
         ));
         logger.log_transport(LoggerTransportOutcome::MmioRegistrationSucceeded);
+        logger.log_block(LoggerBlockOutcome::RequestSucceeded);
+        logger.log_pmem(LoggerPmemOutcome::FlushFailed);
+        logger.log_network(LoggerNetworkOutcome::MmdsRequestDetoured);
+        logger.log_vsock(LoggerVsockOutcome::HostConnectionPending);
         assert!(logger.wait_for_delivery_for_test());
 
         assert_eq!(
@@ -1670,6 +1922,10 @@ mod tests {
                 "level=Debug operation=virtual-timer outcome=activated\n",
                 "level=Info device-kind=block operation=device-activation outcome=succeeded\n",
                 "level=Debug operation=mmio-registration outcome=succeeded\n",
+                "level=Info device-kind=block operation=request outcome=succeeded\n",
+                "level=Error device-kind=pmem operation=flush outcome=failed\n",
+                "level=Info device-kind=network operation=mmds-request outcome=detoured\n",
+                "level=Debug device-kind=vsock operation=host-connection outcome=pending\n",
             )
         );
     }
@@ -1721,6 +1977,10 @@ mod tests {
         let mut state = LoggerState::with_shared_metrics(metrics.clone());
         state.backend_rate_limiter = BackendOutcomeLogRateLimiter::with_clock(clock.clone());
         state.transport_rate_limiter = TransportOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.block_rate_limiter = BlockOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.pmem_rate_limiter = PmemOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.network_rate_limiter = NetworkOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.vsock_rate_limiter = VsockOutcomeLogRateLimiter::with_clock(clock.clone());
         state.configure_test_writer(SharedWriter(output.clone()));
         state
             .configure(LoggerConfigInput::new().with_module("bangbang_runtime::device"))
@@ -1765,6 +2025,108 @@ mod tests {
     }
 
     #[test]
+    fn four_device_limiters_are_independent_and_filter_before_admission() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let metrics = SharedLoggerMetrics::default();
+        let clock = Arc::new(TestClock::default());
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.block_rate_limiter = BlockOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.pmem_rate_limiter = PmemOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.network_rate_limiter = NetworkOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.vsock_rate_limiter = VsockOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.configure_test_writer(SharedWriter(output.clone()));
+        state
+            .configure(LoggerConfigInput::new().with_module("bangbang_hvf::backend"))
+            .expect("backend-only filter should configure");
+
+        let filtered = state.guest_logger();
+        for _ in 0..20 {
+            filtered.log_block(LoggerBlockOutcome::RequestSucceeded);
+            filtered.log_pmem(LoggerPmemOutcome::FlushSucceeded);
+            filtered.log_network(LoggerNetworkOutcome::RxSucceeded);
+            filtered.log_vsock(LoggerVsockOutcome::RxSucceeded);
+        }
+
+        state
+            .configure(LoggerConfigInput::new().with_module("bangbang_runtime::device"))
+            .expect("device filter should configure");
+        let active = state.guest_logger();
+        for _ in 0..10 {
+            active.log_block(LoggerBlockOutcome::RequestSucceeded);
+            active.log_pmem(LoggerPmemOutcome::FlushSucceeded);
+            active.log_network(LoggerNetworkOutcome::RxSucceeded);
+            active.log_vsock(LoggerVsockOutcome::RxSucceeded);
+        }
+        active.log_block(LoggerBlockOutcome::RequestSucceeded);
+        active.log_pmem(LoggerPmemOutcome::FlushSucceeded);
+        active.log_network(LoggerNetworkOutcome::RxSucceeded);
+        active.log_vsock(LoggerVsockOutcome::RxSucceeded);
+        assert_eq!(metrics.rate_limited_log_count(), 4);
+
+        clock.set(500);
+        active.log_block(LoggerBlockOutcome::RequestSucceeded);
+        active.log_pmem(LoggerPmemOutcome::FlushSucceeded);
+        active.log_network(LoggerNetworkOutcome::RxSucceeded);
+        active.log_vsock(LoggerVsockOutcome::RxSucceeded);
+        assert!(active.wait_for_delivery_for_test());
+
+        let output = String::from_utf8(output.lock().expect("output lock should succeed").clone())
+            .expect("device logger output should be UTF-8");
+        for record in [
+            "device-kind=block operation=request outcome=succeeded\n",
+            "device-kind=pmem operation=flush outcome=succeeded\n",
+            "device-kind=network operation=rx outcome=succeeded\n",
+            "device-kind=vsock operation=rx outcome=succeeded\n",
+        ] {
+            assert_eq!(output.matches(record).count(), 11);
+        }
+        assert_eq!(
+            output
+                .matches("1 messages were suppressed due to rate limiting\n")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn vsock_summary_uses_one_bounded_delivery_attempt() {
+        let gate = Arc::new(WriterGate::default());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let metrics = SharedLoggerMetrics::default();
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.set_delivery_config_for_test(LoggerDeliveryConfig::for_test(
+            1,
+            Duration::from_millis(100),
+        ));
+        state.configure_test_writer(HeldRecordingWriter {
+            gate: gate.clone(),
+            output: output.clone(),
+        });
+        let logger = state.guest_logger();
+
+        logger.log_vsock_summary([
+            LoggerVsockOutcome::GuestConnectionDropped,
+            LoggerVsockOutcome::TxSucceeded,
+            LoggerVsockOutcome::ConnectionResetQueued,
+        ]);
+        gate.wait_until_entered();
+        assert_eq!(
+            metrics.missed_log_count(),
+            0,
+            "one summary must occupy only one producer queue slot"
+        );
+
+        gate.release();
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(
+            *output.lock().expect("output lock should succeed"),
+            b"device-kind=vsock operation=guest-connection outcome=dropped\n\
+              device-kind=vsock operation=tx outcome=succeeded\n\
+              device-kind=vsock operation=connection-reset outcome=queued\n"
+        );
+    }
+
+    #[test]
     fn guest_logger_delivery_failure_is_observational_and_counted() {
         let metrics = SharedLoggerMetrics::default();
         let mut state = LoggerState::with_shared_metrics(metrics.clone());
@@ -1775,8 +2137,12 @@ mod tests {
         logger.log_transport(LoggerTransportOutcome::MmioAccessFailed(Some(
             LoggerDeviceKind::Vsock,
         )));
+        logger.log_block(LoggerBlockOutcome::RequestIoFailed);
+        logger.log_pmem(LoggerPmemOutcome::FlushFailed);
+        logger.log_network(LoggerNetworkOutcome::TxProviderFailed);
+        logger.log_vsock(LoggerVsockOutcome::TransportResetFailed);
         assert!(logger.wait_for_delivery_for_test());
-        assert_eq!(metrics.missed_log_count(), 2);
+        assert_eq!(metrics.missed_log_count(), 6);
     }
 
     #[test]
@@ -1846,7 +2212,11 @@ mod tests {
 
         logger.log_backend(LoggerBackendOutcome::VcpuRunFailed);
         logger.log_transport(LoggerTransportOutcome::MmioRegistrationFailed);
-        assert_eq!(metrics.missed_log_count(), 2);
+        logger.log_block(LoggerBlockOutcome::QueueDispatchFailed);
+        logger.log_pmem(LoggerPmemOutcome::QueueDispatchFailed);
+        logger.log_network(LoggerNetworkOutcome::QueueDispatchFailed);
+        logger.log_vsock(LoggerVsockOutcome::QueueDispatchFailed);
+        assert_eq!(metrics.missed_log_count(), 6);
     }
 
     #[test]
@@ -1854,6 +2224,10 @@ mod tests {
         let logger = GuestLogger::default();
         logger.log_backend(LoggerBackendOutcome::VcpuRunFailed);
         logger.log_transport(LoggerTransportOutcome::MmioRegistrationFailed);
+        logger.log_block(LoggerBlockOutcome::QueueDispatchFailed);
+        logger.log_pmem(LoggerPmemOutcome::QueueDispatchFailed);
+        logger.log_network(LoggerNetworkOutcome::QueueDispatchFailed);
+        logger.log_vsock(LoggerVsockOutcome::QueueDispatchFailed);
         assert!(logger.wait_for_delivery_for_test());
     }
 

@@ -1528,8 +1528,8 @@ command never creates, carries forward, or rewrites semantic classes in
 `logger-producer-audit.json`; missing or stale mappings require human review.
 The class policy and safe-field boundary are documented in the
 [logger producer contract](../compat/firecracker/v1.16.0/logger-contract.md).
-The current overlay has exactly 15 implemented, nine planned, and seven
-not-applicable classes, representing 182 implemented, 224 planned, and 62
+The current overlay has exactly 19 implemented, five planned, and seven
+not-applicable classes, representing 312 implemented, 94 planned, and 62
 not-applicable source mappings. The remaining planned classes are all owned by
 #1809.
 
@@ -1554,6 +1554,18 @@ throttling, and unchanged functional results. The signed production bundle
 asserts representative transport publication and HVF guest-exit records from a
 real Apple Silicon session, while the entropy snapshot continuation proves
 normal throttling cannot split the default logger/serial guest marker.
+
+Storage, network/MMDS, and vsock logger coverage exhaustively checks each
+closed event and level, independent class limiter identities, batch-level
+deduplication, deferred vsock publication after transport interrupt handling,
+partial queue results, provider and interrupt supplements, MMDS detours,
+transactional key-rotation success/failure, redaction, and unchanged
+functional results. Signed Apple Silicon coverage exercises block
+data-plane outcomes through both MMIO and product PCI. The contained production
+bundle reuses its product-PCI aggregate-storage and MMDS workloads plus its MMIO
+vsock workload to prove block, pmem, network, and vsock records reach an exact
+write-only logger grant without following pathname replacement or exposing
+backing paths, grant references, sockets, MAC addresses, or guest payloads.
 
 The final parent gate is:
 

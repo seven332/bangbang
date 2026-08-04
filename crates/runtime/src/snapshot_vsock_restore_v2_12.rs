@@ -10,6 +10,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::interrupt::GuestInterruptLine;
+use crate::logger::GuestLogger;
 use crate::memory::{GuestMemory, GuestMemoryRange};
 use crate::message_interrupt::GuestMessageInterruptRegistry;
 use crate::mmio::{MmioRegion, MmioRegionId};
@@ -212,6 +213,45 @@ impl PreparedSnapshotV2VsockPciState {
         region_id: MmioRegionId,
         messages: GuestMessageInterruptRegistry,
     ) -> Result<PreparedSnapshotV2VsockPciEndpoint, SnapshotV2VsockPciEndpointError> {
+        self.into_pci_endpoint_with_optional_guest_logger(
+            config,
+            destination_memory,
+            resource,
+            region_id,
+            messages,
+            None,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn into_pci_endpoint_with_guest_logger(
+        self,
+        config: &VsockConfig,
+        destination_memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+        region_id: MmioRegionId,
+        messages: GuestMessageInterruptRegistry,
+        guest_logger: GuestLogger,
+    ) -> Result<PreparedSnapshotV2VsockPciEndpoint, SnapshotV2VsockPciEndpointError> {
+        self.into_pci_endpoint_with_optional_guest_logger(
+            config,
+            destination_memory,
+            resource,
+            region_id,
+            messages,
+            Some(guest_logger),
+        )
+    }
+
+    fn into_pci_endpoint_with_optional_guest_logger(
+        self,
+        config: &VsockConfig,
+        destination_memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+        region_id: MmioRegionId,
+        messages: GuestMessageInterruptRegistry,
+        guest_logger: Option<GuestLogger>,
+    ) -> Result<PreparedSnapshotV2VsockPciEndpoint, SnapshotV2VsockPciEndpointError> {
         if resource.captured_selector() != self.capture.device().backend_selector()
             || resource.destination_selector().path() != config.uds_path()
             || self.capture.device().guest_cid() != u64::from(config.guest_cid())
@@ -228,9 +268,15 @@ impl PreparedSnapshotV2VsockPciState {
             capture,
         } = self;
         let retained = capture.transport().clone();
-        let prepared = capture
-            .reconstruct_snapshot_device(destination_memory, resource)
-            .map_err(SnapshotV2VsockPciEndpointError::Device)?;
+        let prepared = match guest_logger {
+            Some(guest_logger) => capture.reconstruct_snapshot_device_with_guest_logger(
+                destination_memory,
+                resource,
+                guest_logger,
+            ),
+            None => capture.reconstruct_snapshot_device(destination_memory, resource),
+        }
+        .map_err(SnapshotV2VsockPciEndpointError::Device)?;
         let activation_is_active = prepared.device().is_activated();
         let (guest_cid, uds_path, config_space, device) = prepared.into_parts();
         let device_type = VirtioDeviceType::new(VIRTIO_VSOCK_DEVICE_ID)

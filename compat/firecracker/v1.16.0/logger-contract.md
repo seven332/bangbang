@@ -68,14 +68,13 @@ source calls only when subsystem, observable outcome, target fields, delivery,
 module/origin behavior, limiter policy, disposition, and delivery owner agree.
 There are no path selectors and no `other`, `unknown`, or catch-all class.
 
-The 31 classes contain 15 implemented classes, 9 planned classes, and 7 exact
-not-applicable classes. Across source mappings this is 182 implemented, 224
+The 31 classes contain 19 implemented classes, 5 planned classes, and 7 exact
+not-applicable classes. Across source mappings this is 312 implemented, 94
 planned, and 62 not-applicable invocations.
 
 `planned` is an explicit intermediate delivery state. The remaining owner is:
 
-- #1809: storage, network/MMDS, vsock, memory-device, serial, entropy, and
-  time/identity outcomes.
+- #1809: balloon, memory-hotplug, serial, entropy, and time/identity outcomes.
 
 Delivery validation accepts those named planned classes. Final validation
 rejects every planned class.
@@ -107,6 +106,18 @@ the budget required by a later terminal vCPU outcome. Expected device
 rate-limiter rejection remains exact in metrics and is a debug record rather
 than a warning.
 
+Issue #1815 closes block, pmem, network/MMDS, and vsock outcomes. Device-owned
+observers consume the final typed queue result shared by MMIO and product PCI,
+then emit at most one record for each nonzero summary category rather than one
+record per request, packet, descriptor, connection, or byte. Failure and
+rejection categories are admitted before success categories. High-fanout vsock
+summaries use one fixed-capacity delivery batch after MMIO or product-PCI
+interrupt handling, so logging cannot extend the device-to-guest publication
+window. Narrow HVF supplements cover packet-provider acquisition and MMIO
+interrupt delivery; product-PCI endpoint owners cover MSI delivery. MMDS
+detours and transactional token-key rotation are fixed outcomes, and neither
+token nor key material can enter a record.
+
 ## Closed class ledger
 
 `Mappings` is the exact number of source identities assigned to the class.
@@ -120,13 +131,13 @@ Owners apply only to planned work.
 | `logger.api.result` | `implemented` | closed HTTP result plus retained actions | 5 |
 | `logger.backend.outcome` | `implemented` | typed HVF backend, vCPU, interrupt, and timer outcomes | 26 |
 | `logger.balloon.outcome` | `planned` | #1809 | 28 |
-| `logger.block.outcome` | `planned` | #1809 | 34 |
+| `logger.block.outcome` | `implemented` | fixed block request, queue, async, vhost-user, and interrupt outcomes | 34 |
 | `logger.boot.time` | `implemented` | bounded boot timing | 1 |
 | `logger.entropy.outcome` | `planned` | #1809 | 16 |
 | `logger.lifecycle.outcome` | `implemented` | fixed VM and live-device lifecycle | 24 |
 | `logger.limiter.recovery` | `implemented` | bounded suppressed count | 1 |
 | `logger.memory-hotplug.outcome` | `planned` | #1809 | 22 |
-| `logger.network.outcome` | `planned` | #1809 | 26 |
+| `logger.network.outcome` | `implemented` | fixed network, provider, MMDS, and interrupt outcomes | 26 |
 | `logger.nonapp.example` | `not-applicable` | `example-only` | 22 |
 | `logger.nonapp.fuzzing` | `not-applicable` | `developer-instrumentation` | 1 |
 | `logger.nonapp.gdb` | `not-applicable` | `developer-instrumentation` | 19 |
@@ -135,7 +146,7 @@ Owners apply only to planned work.
 | `logger.nonapp.tracing` | `not-applicable` | `tracing-owned` | 2 |
 | `logger.nonapp.x86` | `not-applicable` | `x86-only` | 15 |
 | `logger.observability.outcome` | `implemented` | rate-limited metrics-worker failure | 4 |
-| `logger.pmem.outcome` | `planned` | #1809 | 18 |
+| `logger.pmem.outcome` | `implemented` | fixed pmem flush, queue, limiter, and interrupt outcomes | 18 |
 | `logger.process-signal.outcome` | `implemented` | fixed signal and shutdown convergence | 5 |
 | `logger.process-startup.outcome` | `implemented` | fixed normal startup outcome | 5 |
 | `logger.process.exit` | `implemented` | fixed terminal category | 3 |
@@ -144,7 +155,7 @@ Owners apply only to planned work.
 | `logger.snapshot.outcome` | `implemented` | fixed create/load result | 18 |
 | `logger.time-identity.outcome` | `planned` | #1809 | 16 |
 | `logger.transport.outcome` | `implemented` | typed generic MMIO, virtio, PCI, queue, and interrupt outcomes | 74 |
-| `logger.vsock.outcome` | `planned` | #1809 | 52 |
+| `logger.vsock.outcome` | `implemented` | fixed vsock queue, connection, reset, and interrupt outcomes | 52 |
 
 The outcome classes are semantic, not raw-line mirrors. Their fixed
 `device-kind`, `operation`, and `outcome` values distinguish the public result;
@@ -170,6 +181,9 @@ The implemented host-owned records have exact fixed shapes:
   `device-kind=<balloon|block|entropy|memory-hotplug|network|pmem|serial|vsock>`
   plus `operation=<closed-transport-operation>
   outcome=<closed-transport-outcome>`;
+- block, pmem, network/MMDS, and vsock data planes:
+  `device-kind=<block|pmem|network|vsock>
+  operation=<closed-device-operation> outcome=<closed-device-outcome>`;
 - snapshots: `operation=<snapshot-create|snapshot-load>
   outcome=<succeeded|rejected|failed|cancelled>`;
 - worker and observability status:
@@ -223,9 +237,9 @@ including a host-only member of the same semantic class. This is deliberately
 conservative: it cannot grant a producer a blocking or unrestricted path.
 
 Every guest-capable class is rate-limited under its own fixed class identity.
-Backend and transport use `logger-rate.backend.outcome` and
-`logger-rate.transport.outcome`; the repeating asynchronous metrics-worker
-class independently uses `logger-rate.observability-worker`. The sole exception is
+Backend, transport, block, pmem, network, and vsock use their corresponding
+`logger-rate.<class>.outcome` identities; the repeating asynchronous
+metrics-worker class independently uses `logger-rate.observability-worker`. The sole exception is
 `logger.limiter.recovery`, which must be unrestricted to report a prior
 admitted recovery without recursively limiting itself. Queue,
 receipt, write, flush, and replacement loss never changes the request, VM,

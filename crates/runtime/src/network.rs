@@ -5,7 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerTransportOutcome};
+use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerNetworkOutcome, LoggerTransportOutcome};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
 };
@@ -3621,6 +3621,25 @@ impl VirtioNetworkDevice {
         rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
         now: Instant,
     ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
+        let result = self.dispatch_drained_queue_notifications_with_packet_io_at_unobserved(
+            memory,
+            drained_notifications,
+            tx_sink,
+            rx_source,
+            now,
+        );
+        self.observe_notification_result(&result);
+        result
+    }
+
+    fn dispatch_drained_queue_notifications_with_packet_io_at_unobserved(
+        &mut self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+        tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
+        rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
+        now: Instant,
+    ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
         let host_readiness = rx_source.host_readiness_hint();
         if drained_notifications.is_empty()
             && !self.has_pending_rate_limited_queue_work()
@@ -3770,6 +3789,149 @@ impl VirtioNetworkDevice {
             post_tx_rx_queue_dispatch,
         )
         .with_rate_limiter_events(rx_rate_limiter_event, tx_rate_limiter_event))
+    }
+
+    fn observe_notification_result(
+        &self,
+        result: &Result<
+            VirtioNetworkDeviceNotificationDispatch,
+            VirtioNetworkDeviceNotificationError,
+        >,
+    ) {
+        let Some(logger) = &self.guest_logger else {
+            return;
+        };
+        let mut observation = NetworkNotificationObservation::default();
+        match result {
+            Ok(dispatch) => observation.record_notification_dispatch(dispatch),
+            Err(VirtioNetworkDeviceNotificationError::Inactive { .. }) => {
+                observation.notification_inactive = true;
+            }
+            Err(VirtioNetworkDeviceNotificationError::UnsupportedQueue { .. }) => {
+                observation.notification_unsupported = true;
+            }
+            Err(source) => {
+                observation.queue_dispatch_failed = true;
+                if let Some(dispatch) = source.completed_initial_rx_dispatch() {
+                    observation.record_rx_dispatch(dispatch);
+                }
+                if let Some(dispatch) = source.completed_tx_dispatch() {
+                    observation.record_tx_dispatch(dispatch);
+                }
+                if let Some(dispatch) = source.completed_rx_dispatch() {
+                    observation.record_rx_dispatch(dispatch);
+                }
+            }
+        }
+        observation.log(logger);
+    }
+}
+
+#[derive(Debug, Default)]
+struct NetworkNotificationObservation {
+    rx_succeeded: bool,
+    rx_buffer_malformed: bool,
+    rx_buffer_too_small: bool,
+    rx_buffer_unavailable: bool,
+    rx_provider_failed: bool,
+    tx_succeeded: bool,
+    tx_frame_malformed: bool,
+    tx_spoof_rejected: bool,
+    tx_provider_failed: bool,
+    queue_dispatch_failed: bool,
+    notification_inactive: bool,
+    notification_unsupported: bool,
+    rate_limiter_throttled: bool,
+    rate_limiter_resumed: bool,
+    packet_provider_partial: bool,
+    mmds_request_detoured: bool,
+}
+
+impl NetworkNotificationObservation {
+    fn record_notification_dispatch(&mut self, dispatch: &VirtioNetworkDeviceNotificationDispatch) {
+        if let Some(rx) = dispatch.rx_queue_dispatch() {
+            self.record_rx_dispatch(rx);
+        }
+        if let Some(tx) = dispatch.tx_queue_dispatch() {
+            self.record_tx_dispatch(tx);
+        }
+        if let Some(rx) = dispatch.post_tx_rx_queue_dispatch() {
+            self.record_rx_dispatch(rx);
+        }
+        self.rate_limiter_resumed |=
+            dispatch.rx_rate_limiter_event() || dispatch.tx_rate_limiter_event();
+    }
+
+    fn record_rx_dispatch(&mut self, dispatch: &VirtioNetworkRxQueueDispatch) {
+        self.rx_succeeded |= dispatch.delivered_packets() != 0;
+        self.rx_buffer_malformed |= dispatch.buffer_parse_failures() != 0;
+        self.rx_buffer_too_small |= dispatch.buffer_too_small_failures() != 0;
+        self.rx_buffer_unavailable |= dispatch.no_available_buffers() != 0;
+        self.rx_provider_failed |= dispatch.source_failures() != 0;
+        self.rate_limiter_throttled |= dispatch.rate_limiter_throttled_packets() != 0;
+        self.record_backend_metrics(dispatch.backend_metrics());
+    }
+
+    fn record_tx_dispatch(&mut self, dispatch: &VirtioNetworkTxQueueDispatch) {
+        self.tx_succeeded |= dispatch.sink_successful_frames() != 0;
+        self.tx_frame_malformed |= dispatch.malformed_frames() != 0;
+        self.tx_provider_failed |= dispatch.sink_failures() != 0;
+        self.rate_limiter_throttled |= dispatch.rate_limiter_throttled_frames() != 0;
+        self.mmds_request_detoured |= dispatch.detoured_frames() != 0;
+        self.record_backend_metrics(dispatch.backend_metrics());
+    }
+
+    fn record_backend_metrics(&mut self, metrics: VirtioNetworkBackendMetrics) {
+        self.rx_provider_failed |= metrics.vmnet_read_fails() != 0;
+        self.tx_provider_failed |= metrics.vmnet_write_fails() != 0;
+        self.packet_provider_partial |=
+            metrics.vmnet_read_partial_batches() != 0 || metrics.vmnet_write_partial_batches() != 0;
+        self.tx_spoof_rejected |= metrics.tx_spoofed_mac_count() != 0;
+    }
+
+    fn outcomes(self) -> impl Iterator<Item = LoggerNetworkOutcome> {
+        [
+            self.queue_dispatch_failed
+                .then_some(LoggerNetworkOutcome::QueueDispatchFailed),
+            self.notification_inactive
+                .then_some(LoggerNetworkOutcome::QueueNotificationInactive),
+            self.notification_unsupported
+                .then_some(LoggerNetworkOutcome::QueueNotificationUnsupported),
+            self.rx_buffer_malformed
+                .then_some(LoggerNetworkOutcome::RxBufferMalformed),
+            self.rx_buffer_too_small
+                .then_some(LoggerNetworkOutcome::RxBufferTooSmall),
+            self.rx_provider_failed
+                .then_some(LoggerNetworkOutcome::RxProviderFailed),
+            self.tx_frame_malformed
+                .then_some(LoggerNetworkOutcome::TxFrameMalformed),
+            self.tx_spoof_rejected
+                .then_some(LoggerNetworkOutcome::TxSpoofRejected),
+            self.tx_provider_failed
+                .then_some(LoggerNetworkOutcome::TxProviderFailed),
+            self.packet_provider_partial
+                .then_some(LoggerNetworkOutcome::PacketProviderPartial),
+            self.rx_buffer_unavailable
+                .then_some(LoggerNetworkOutcome::RxBufferUnavailable),
+            self.rate_limiter_throttled
+                .then_some(LoggerNetworkOutcome::RateLimiterThrottled),
+            self.rate_limiter_resumed
+                .then_some(LoggerNetworkOutcome::RateLimiterResumed),
+            self.rx_succeeded
+                .then_some(LoggerNetworkOutcome::RxSucceeded),
+            self.tx_succeeded
+                .then_some(LoggerNetworkOutcome::TxSucceeded),
+            self.mmds_request_detoured
+                .then_some(LoggerNetworkOutcome::MmdsRequestDetoured),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    fn log(self, logger: &GuestLogger) {
+        for outcome in self.outcomes() {
+            logger.log_network(outcome);
+        }
     }
 }
 
@@ -5398,20 +5560,14 @@ impl VirtioNetworkTxQueue {
             };
             let outcome = match preparation {
                 VirtioNetworkTxFramePreparation::Ready { frame, packet } => {
-                    let sink_error = match tx_sink.transmit_prepared_frame(memory, &frame, &packet)
+                    let sink_result = tx_sink.transmit_prepared_frame(memory, &frame, &packet);
+                    if matches!(sink_result, Ok(VirtioNetworkTxPacketDisposition::Detoured))
+                        && let (Some(limiter), Some(reservation)) =
+                            (rate_limiter.as_deref_mut(), reservation)
                     {
-                        Ok(VirtioNetworkTxPacketDisposition::Detoured) => {
-                            if let (Some(limiter), Some(reservation)) =
-                                (rate_limiter.as_deref_mut(), reservation)
-                            {
-                                limiter.restore(reservation);
-                            }
-                            None
-                        }
-                        Ok(VirtioNetworkTxPacketDisposition::Forwarded) => None,
-                        Err(source) => Some(source),
-                    };
-                    VirtioNetworkTxQueueDispatchOutcome::Ok { frame, sink_error }
+                        limiter.restore(reservation);
+                    }
+                    VirtioNetworkTxQueueDispatchOutcome::Ok { frame, sink_result }
                 }
                 VirtioNetworkTxFramePreparation::PacketError(source) => {
                     VirtioNetworkTxQueueDispatchOutcome::PacketPrepareError(source)
@@ -5680,7 +5836,7 @@ impl VirtioNetworkTxQueue {
                 dispatch.record(
                     VirtioNetworkTxQueueDispatchOutcome::Ok {
                         frame,
-                        sink_error: Some(source),
+                        sink_result: Err(source),
                     },
                     publication,
                 );
@@ -5702,7 +5858,7 @@ impl VirtioNetworkTxQueue {
                     dispatch.record(
                         VirtioNetworkTxQueueDispatchOutcome::Ok {
                             frame,
-                            sink_error: result.err(),
+                            sink_result: result,
                         },
                         publication,
                     );
@@ -5795,6 +5951,7 @@ pub struct VirtioNetworkTxQueueDispatch {
     parse_failures: usize,
     packet_prepare_failures: usize,
     sink_successful_frames: usize,
+    detoured_frames: usize,
     sink_failures: usize,
     sink_successful_bytes: u64,
     rate_limiter_throttled_frames: usize,
@@ -5823,6 +5980,7 @@ impl VirtioNetworkTxQueueDispatch {
             parse_failures: 0,
             packet_prepare_failures: 0,
             sink_successful_frames: 0,
+            detoured_frames: 0,
             sink_failures: 0,
             sink_successful_bytes: 0,
             rate_limiter_throttled_frames: 0,
@@ -5860,6 +6018,10 @@ impl VirtioNetworkTxQueueDispatch {
 
     pub const fn sink_successful_frames(&self) -> usize {
         self.sink_successful_frames
+    }
+
+    pub const fn detoured_frames(&self) -> usize {
+        self.detoured_frames
     }
 
     pub const fn sink_failures(&self) -> usize {
@@ -5918,19 +6080,22 @@ impl VirtioNetworkTxQueueDispatch {
         self.processed_frames += 1;
         self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         match outcome {
-            VirtioNetworkTxQueueDispatchOutcome::Ok { frame, sink_error } => {
+            VirtioNetworkTxQueueDispatchOutcome::Ok { frame, sink_result } => {
                 self.successful_frames += 1;
-                match sink_error {
-                    Some(source) => {
+                match sink_result {
+                    Ok(disposition) => {
+                        self.sink_successful_frames += 1;
+                        if disposition == VirtioNetworkTxPacketDisposition::Detoured {
+                            self.detoured_frames += 1;
+                        }
+                        self.sink_successful_bytes =
+                            self.sink_successful_bytes.saturating_add(frame.frame_len());
+                    }
+                    Err(source) => {
                         self.sink_failures += 1;
                         if self.first_sink_failure.is_none() {
                             self.first_sink_failure = Some(source);
                         }
-                    }
-                    None => {
-                        self.sink_successful_frames += 1;
-                        self.sink_successful_bytes =
-                            self.sink_successful_bytes.saturating_add(frame.frame_len());
                     }
                 }
                 self.frames.push(frame);
@@ -5969,8 +6134,11 @@ impl VirtioNetworkTxQueueDispatch {
         result: Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>,
     ) {
         match result {
-            Ok(_) => {
+            Ok(disposition) => {
                 self.sink_successful_frames += 1;
+                if disposition == VirtioNetworkTxPacketDisposition::Detoured {
+                    self.detoured_frames += 1;
+                }
                 if let Some(frame) = self.frames.get(frame_index) {
                     self.sink_successful_bytes =
                         self.sink_successful_bytes.saturating_add(frame.frame_len());
@@ -6004,7 +6172,7 @@ impl VirtioNetworkTxQueueDispatch {
 enum VirtioNetworkTxQueueDispatchOutcome {
     Ok {
         frame: VirtioNetworkTxFrame,
-        sink_error: Option<VirtioNetworkTxPacketSinkError>,
+        sink_result: Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>,
     },
     ParseError(VirtioNetworkTxFrameParseError),
     PacketPrepareError(VirtioNetworkTxPacketPrepareError),
@@ -6410,6 +6578,13 @@ impl VirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice> {
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
         let endpoint = work.drain_interrupt_intents();
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_network(LoggerNetworkOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
         VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 
@@ -6453,6 +6628,13 @@ impl VirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice> {
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
         let endpoint = work.drain_interrupt_intents();
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_network(LoggerNetworkOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
         VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 }
@@ -8264,11 +8446,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
+    use crate::logger::{LoggerNetworkOutcome, LoggerTestCapture};
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
     use crate::metrics::{NetworkInterfaceMetrics, SharedNetworkInterfaceMetrics};
     use crate::mmio::{
-        MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
-        MmioRegion, MmioRegionId,
+        MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
+        MmioOperation, MmioRegion, MmioRegionId,
     };
     use crate::snapshot_device_v2::{SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind};
     use crate::snapshot_network_v2_11::{
@@ -13158,6 +13341,9 @@ mod tests {
         let mut memory = tx_frame_memory();
         let mut device = VirtioNetworkDevice::new();
         let mut sink = RecordingTxPacketSink::default();
+        let capture = LoggerTestCapture::default();
+        let (_logger_state, logger) = capture.configured_guest_logger();
+        VirtioMmioDeviceActivationHandler::attach_guest_logger(&mut device, logger.clone());
 
         let error = device
             .dispatch_drained_queue_notifications_with_tx_sink(
@@ -13179,6 +13365,55 @@ mod tests {
         assert!(error.completed_tx_dispatch().is_none());
         assert!(std::error::Error::source(&error).is_none());
         assert_eq!(sink.calls, 0);
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(
+            capture.output(),
+            "device-kind=network operation=queue-notification outcome=inactive\n"
+        );
+    }
+
+    #[test]
+    fn network_logger_summary_is_failure_first_and_deduplicated() {
+        let observation = super::NetworkNotificationObservation {
+            rx_succeeded: true,
+            rx_buffer_malformed: true,
+            rx_buffer_too_small: true,
+            rx_buffer_unavailable: true,
+            rx_provider_failed: true,
+            tx_succeeded: true,
+            tx_frame_malformed: true,
+            tx_spoof_rejected: true,
+            tx_provider_failed: true,
+            queue_dispatch_failed: true,
+            notification_inactive: true,
+            notification_unsupported: true,
+            rate_limiter_throttled: true,
+            rate_limiter_resumed: true,
+            packet_provider_partial: true,
+            mmds_request_detoured: true,
+        };
+
+        assert_eq!(
+            observation.outcomes().collect::<Vec<_>>(),
+            vec![
+                LoggerNetworkOutcome::QueueDispatchFailed,
+                LoggerNetworkOutcome::QueueNotificationInactive,
+                LoggerNetworkOutcome::QueueNotificationUnsupported,
+                LoggerNetworkOutcome::RxBufferMalformed,
+                LoggerNetworkOutcome::RxBufferTooSmall,
+                LoggerNetworkOutcome::RxProviderFailed,
+                LoggerNetworkOutcome::TxFrameMalformed,
+                LoggerNetworkOutcome::TxSpoofRejected,
+                LoggerNetworkOutcome::TxProviderFailed,
+                LoggerNetworkOutcome::PacketProviderPartial,
+                LoggerNetworkOutcome::RxBufferUnavailable,
+                LoggerNetworkOutcome::RateLimiterThrottled,
+                LoggerNetworkOutcome::RateLimiterResumed,
+                LoggerNetworkOutcome::RxSucceeded,
+                LoggerNetworkOutcome::TxSucceeded,
+                LoggerNetworkOutcome::MmdsRequestDetoured,
+            ]
+        );
     }
 
     #[test]
@@ -14800,6 +15035,9 @@ mod tests {
 
         configure_network_handler_queues(&mut handler);
         activate_network_handler(&mut handler);
+        let capture = LoggerTestCapture::default();
+        let (_logger_state, logger) = capture.configured_guest_logger();
+        handler.attach_guest_logger(logger.clone());
         write_two_tx_frames(&mut memory);
         let initial_limiter = handler
             .activation_handler()
@@ -14823,6 +15061,7 @@ mod tests {
             .expect("TX dispatch should be present");
         assert_eq!(dispatch.processed_frames(), 2);
         assert_eq!(dispatch.sink_successful_frames(), 2);
+        assert_eq!(dispatch.detoured_frames(), 2);
         assert_eq!(dispatch.rate_limiter_throttled_frames(), 0);
         assert_eq!(sink.calls, 2);
         assert_eq!(read_tx_used_index(&memory), 2);
@@ -14834,6 +15073,14 @@ mod tests {
             &initial_limiter
         );
         assert!(!handler.has_pending_network_queue_work());
+        assert!(logger.wait_for_delivery_for_test());
+        assert_eq!(
+            capture.output(),
+            concat!(
+                "device-kind=network operation=tx outcome=succeeded\n",
+                "device-kind=network operation=mmds-request outcome=detoured\n",
+            )
+        );
     }
 
     #[test]

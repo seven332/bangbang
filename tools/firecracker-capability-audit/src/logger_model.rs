@@ -265,11 +265,14 @@ pub enum LoggerCompiledEvent {
     ApiRequest,
     ApiResult,
     Backend,
+    Block,
     InstanceStart,
     FlushMetrics,
     BootTime,
     Lifecycle,
     Observability,
+    Network,
+    Pmem,
     RateLimitRecovery,
     ProcessStartup,
     ProcessPanic,
@@ -277,6 +280,7 @@ pub enum LoggerCompiledEvent {
     ProcessSignal,
     Snapshot,
     Transport,
+    Vsock,
 }
 
 /// Human-owned policy and evidence for one coherent semantic producer class.

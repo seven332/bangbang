@@ -2226,7 +2226,15 @@ fn run_certified_production_vsock_snapshot_restore(
     let source_fixture = SnapshotVsockSourceGrantFixture::new_with_read_only_root(&format!(
         "{transport}-vsock-certified-source"
     ));
-    let source_sensitive = source_fixture.sensitive_strings();
+    let source_logger = DeviceLoggerGrant::add_to_manifest(
+        &source_fixture.snapshot.manifest,
+        &format!("{transport}-vsock-certified-source"),
+    );
+    let source_sensitive = source_fixture
+        .sensitive_strings()
+        .into_iter()
+        .chain(source_logger.sensitive_strings())
+        .collect::<Vec<_>>();
     let source_guest_listeners = bind_certified_production_vsock_guest_listeners(
         &source_fixture,
         &SNAPSHOT_VSOCK_CERTIFY_SOURCE_GUEST_PORTS,
@@ -2239,6 +2247,7 @@ fn run_certified_production_vsock_snapshot_restore(
         enable_pci,
     );
     source_fixture.snapshot.replace_source_file_pathnames();
+    source_logger.replace_source_pathname();
     configure_and_start_certified_production_vsock_source(&source.socket, transport);
     assert_socket_mode(
         &source_fixture.socket(),
@@ -2351,6 +2360,13 @@ fn run_certified_production_vsock_snapshot_restore(
         .assert_replacement_pathnames_unused(&format!(
             "production {transport} certified vsock source"
         ));
+    source_logger.assert_records(
+        &[
+            "device-kind=vsock operation=rx outcome=succeeded",
+            "device-kind=vsock operation=tx outcome=succeeded",
+        ],
+        source_fixture.sensitive_strings(),
+    );
 
     if !enable_pci {
         run_certified_production_vsock_hostile_loads(bundle, &artifacts, baseline_sessions);
@@ -2886,6 +2902,11 @@ fn configure_and_start_certified_production_vsock_source(socket: &Path, context:
             "metrics",
         ),
         (
+            "/logger",
+            serde_json::json!({"log_path": OUTPUT_LOGGER_REF}),
+            "logger",
+        ),
+        (
             "/boot-source",
             serde_json::json!({
                 "kernel_image_path": SNAPSHOT_KERNEL_REF,
@@ -2964,7 +2985,12 @@ fn run_certified_production_vsock_destination(
         recapture,
         use_override,
     );
-    let sensitive = fixture.sensitive_strings();
+    let logger = DeviceLoggerGrant::add_to_manifest(&fixture.snapshot.manifest, case);
+    let sensitive = fixture
+        .sensitive_strings()
+        .into_iter()
+        .chain(logger.sensitive_strings())
+        .collect::<Vec<_>>();
     let guest_listeners = bind_certified_production_vsock_guest_listeners(
         &fixture,
         &SNAPSHOT_VSOCK_CERTIFY_FRESH_GUEST_PORTS,
@@ -2979,10 +3005,20 @@ fn run_certified_production_vsock_destination(
     );
     let worker = only_worker_pid(&running.child);
     let opened = fixture.snapshot.replace_source_pathnames();
+    logger.replace_source_pathname();
     let state_before =
         fs::read(&opened.state).expect("production certified destination state should read");
     let memory_before =
         fs::read(&opened.memory).expect("production certified destination memory should read");
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/logger",
+            &serde_json::json!({"log_path": OUTPUT_LOGGER_REF}).to_string(),
+        ),
+        204,
+        &format!("configure production {case} certified destination logger"),
+    );
     assert_http_status(
         &http_put(
             &running.socket,
@@ -3205,6 +3241,14 @@ fn run_certified_production_vsock_destination(
         .assert_replacement_pathnames_unused(&format!(
             "production {case} certified vsock destination"
         ));
+    logger.assert_records(
+        &[
+            "device-kind=vsock operation=transport-reset outcome=succeeded",
+            "device-kind=vsock operation=rx outcome=succeeded",
+            "device-kind=vsock operation=tx outcome=succeeded",
+        ],
+        fixture.sensitive_strings(),
+    );
     opened
 }
 
@@ -8116,6 +8160,7 @@ fn grant_test_bundle_recovers_recorded_snapshot_staging_after_worker_sigkill() {
 fn normal_bundle_routes_guest_vsock_through_launcher_broker_without_helpers() {
     let bundle = production_bundle();
     let fixture = SocketDirectoryGrantFixture::new("guest-vsock");
+    let logger = fixture.devices.add_logger_grant("guest-vsock");
     let mut listeners = Vec::new();
     for &(port, _, _) in GRANTED_VSOCK_EXCHANGES {
         let path = fixture.vsock_port_path(port);
@@ -8127,11 +8172,22 @@ fn normal_bundle_routes_guest_vsock_through_launcher_broker_without_helpers() {
     }
 
     let mut running = spawn_ready_socket_grant_api_launcher(&bundle, &fixture, "guest-vsock");
+    logger.replace_source_pathname();
     assert_socket_mode(&fixture.api_socket(), 0o600, "granted API socket");
     let worker = only_worker_pid(&running.child);
     assert!(
         child_pids(worker).is_empty(),
         "short-lived API binder must be reaped before readiness"
+    );
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/logger",
+            &serde_json::json!({"log_path": OUTPUT_LOGGER_REF}).to_string(),
+        ),
+        204,
+        "PUT granted-vsock logger grant",
     );
 
     assert_http_status(
@@ -8247,6 +8303,20 @@ fn normal_bundle_routes_guest_vsock_through_launcher_broker_without_helpers() {
     assert!(!fixture.api_socket().exists());
     assert!(!fixture.vsock_socket().exists());
     assert!(session_entries().is_empty());
+    let mut forbidden = fixture.sensitive_strings();
+    forbidden.push(
+        std::str::from_utf8(GRANTED_VSOCK_MARKER)
+            .expect("vsock marker should be UTF-8")
+            .to_owned(),
+    );
+    for (_, guest_payload, host_payload) in GRANTED_VSOCK_EXCHANGES {
+        forbidden.push(String::from_utf8_lossy(guest_payload).into_owned());
+        forbidden.push(String::from_utf8_lossy(host_payload).into_owned());
+    }
+    logger.assert_records(
+        &["device-kind=vsock operation=tx outcome=succeeded"],
+        forbidden,
+    );
 }
 
 #[test]
@@ -8503,6 +8573,7 @@ fn normal_bundle_brokers_multiple_contained_vhost_user_children_without_helpers(
 fn normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants() {
     let bundle = production_bundle();
     let fixture = SocketDirectoryGrantFixture::new_with_vhost_user("storage-certification");
+    let logger = fixture.devices.add_logger_grant("storage-certification");
     let vhost_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_ONE);
     let vhost_backing = fixture.vhost_user_backing("storage-certification-vhost.img");
 
@@ -8575,10 +8646,21 @@ fn normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants(
         &["--enable-pci"],
     );
     fixture.devices.replace_source_pathnames();
+    logger.replace_source_pathname();
     let worker = only_worker_pid(&running.child);
     assert!(
         child_pids(worker).is_empty(),
         "contained aggregate setup must not retain a broker helper",
+    );
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/logger",
+            &serde_json::json!({"log_path": OUTPUT_LOGGER_REF}).to_string(),
+        ),
+        204,
+        "PUT contained aggregate logger grant",
     );
 
     assert_http_status(
@@ -9131,6 +9213,21 @@ fn normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants(
     assert!(!vhost_socket.exists());
     assert!(!fixture.api_socket().exists());
     assert!(session_entries().is_empty());
+    logger.assert_records(
+        &[
+            "device-kind=block operation=request outcome=succeeded",
+            "device-kind=pmem operation=flush outcome=succeeded",
+        ],
+        fixture.sensitive_strings().into_iter().chain([
+            path_text(&vhost_backing).to_owned(),
+            std::str::from_utf8(STORAGE_CONTROL_GUEST_MARKER)
+                .expect("storage marker should be UTF-8")
+                .to_owned(),
+            std::str::from_utf8(STORAGE_PMEM_GUEST_MARKER)
+                .expect("pmem marker should be UTF-8")
+                .to_owned(),
+        ]),
+    );
     for (path, marker) in [
         (&fixture.devices.data, STORAGE_CONTROL_GUEST_MARKER),
         (&fixture.devices.replacement, STORAGE_ASYNC_GUEST_MARKER),
@@ -11676,6 +11773,7 @@ fn normal_bundle_hotplugs_contained_macos_block_special_media_over_pci() {
 fn normal_bundle_hotplugs_mmds_network_without_vmnet_authority() {
     let bundle = production_bundle();
     let fixture = GuestDeviceGrantFixture::new("runtime-network-hotplug");
+    let logger = fixture.add_logger_grant("runtime-network-hotplug");
     resize_and_write_file_marker_at(&fixture.data, 1536, 0, &[]);
     let mut running = spawn_ready_device_grant_api_launcher_with_extra_args(
         &bundle,
@@ -11684,6 +11782,17 @@ fn normal_bundle_hotplugs_mmds_network_without_vmnet_authority() {
         &["--enable-pci"],
     );
     fixture.replace_source_pathnames();
+    logger.replace_source_pathname();
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/logger",
+            &serde_json::json!({"log_path": OUTPUT_LOGGER_REF}).to_string(),
+        ),
+        204,
+        "PUT contained network-hotplug logger grant",
+    );
 
     assert_http_status(
         &http_put(
@@ -11888,6 +11997,16 @@ fn normal_bundle_hotplugs_mmds_network_without_vmnet_authority() {
     );
 
     stop_running_launcher(&mut running, "contained runtime network hotplug guest");
+    logger.assert_records(
+        &["device-kind=network operation=mmds-request outcome=detoured"],
+        fixture.sensitive_strings().into_iter().chain([
+            "06:00:00:00:00:42".to_owned(),
+            "BANGBANG_MMDS_GUEST_VALUE".to_owned(),
+            std::str::from_utf8(NETWORK_HOTPLUG_SUCCESS_MARKER)
+                .expect("network marker should be UTF-8")
+                .to_owned(),
+        ]),
+    );
 }
 
 #[test]
@@ -15852,6 +15971,94 @@ struct GuestDeviceGrantFixture {
     manifest: PathBuf,
 }
 
+#[derive(Debug)]
+struct DeviceLoggerGrant {
+    source: PathBuf,
+    opened: PathBuf,
+}
+
+impl DeviceLoggerGrant {
+    fn add_to_manifest(manifest_path: &Path, case: &str) -> Self {
+        let canonical_root = manifest_path
+            .parent()
+            .expect("device grant manifest should have a canonical parent");
+        let logger = Self {
+            source: canonical_root.join(format!("external-{case}-logger.out")),
+            opened: canonical_root.join(format!("opened-{case}-logger.out")),
+        };
+        fs::write(&logger.source, OUTPUT_LOGGER_SEED).expect("device logger fixture should write");
+
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(manifest_path).expect("device grant manifest should read"),
+        )
+        .expect("device grant manifest should parse");
+        manifest
+            .get_mut("grants")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("device grant manifest should contain grants")
+            .push(serde_json::json!({
+                "id": OUTPUT_LOGGER_ID,
+                "role": "logger-sink",
+                "access": "write-only",
+                "source": path_text(&logger.source),
+            }));
+        fs::write(
+            manifest_path,
+            serde_json::to_vec(&manifest).expect("device logger grant should serialize"),
+        )
+        .expect("device logger grant manifest should write");
+        logger
+    }
+
+    fn replace_source_pathname(&self) {
+        fs::rename(&self.source, &self.opened).expect("launcher-opened device logger should move");
+        fs::write(&self.source, OUTPUT_REPLACEMENT)
+            .expect("replacement device logger should write");
+    }
+
+    fn sensitive_strings(&self) -> impl Iterator<Item = String> + '_ {
+        [
+            path_text(&self.source),
+            path_text(&self.opened),
+            OUTPUT_LOGGER_ID,
+            OUTPUT_LOGGER_REF,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+    }
+
+    fn assert_records(&self, expected: &[&str], forbidden: impl IntoIterator<Item = String>) {
+        let output = fs::read_to_string(&self.opened)
+            .expect("launcher-opened device logger output should read");
+        assert!(
+            output.starts_with(std::str::from_utf8(OUTPUT_LOGGER_SEED).unwrap()),
+            "device logger should preserve its seeded output"
+        );
+        for record in expected {
+            assert!(
+                output.lines().any(|line| line == *record),
+                "production device logger should contain {record:?}; output:\n{output}"
+            );
+        }
+        for value in forbidden.into_iter().chain([
+            path_text(&self.source).to_owned(),
+            path_text(&self.opened).to_owned(),
+            OUTPUT_LOGGER_ID.to_owned(),
+            OUTPUT_LOGGER_REF.to_owned(),
+        ]) {
+            assert!(
+                !output.contains(&value),
+                "production device logger should redact {value:?}; output:\n{output}"
+            );
+        }
+        assert_eq!(
+            fs::read(&self.source).expect("replacement device logger should read"),
+            OUTPUT_REPLACEMENT,
+            "launcher-opened logger identity must not follow a pathname replacement"
+        );
+    }
+}
+
 impl GuestDeviceGrantFixture {
     fn new(case: &str) -> Self {
         let root = TestDir::new(&format!("device-grant-{case}"));
@@ -16012,6 +16219,10 @@ impl GuestDeviceGrantFixture {
         create_sized_file(&self.pmem_reuse, PMEM_BACKING_LEN);
         create_sized_file(&self.storage_pmem, PMEM_BACKING_LEN);
         create_sized_file(&self.read_only_data, 512);
+    }
+
+    fn add_logger_grant(&self, case: &str) -> DeviceLoggerGrant {
+        DeviceLoggerGrant::add_to_manifest(&self.manifest, case)
     }
 
     fn sensitive_strings(&self) -> Vec<String> {
