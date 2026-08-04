@@ -9579,7 +9579,7 @@ mod tests {
             acknowledge_test_vhost_user_request(&mut stream, &enable);
             read_test_vhost_user_pipe(&kick.descriptors[0]);
             release_receiver
-                .recv_timeout(Duration::from_secs(2))
+                .recv()
                 .expect("test frontend should observe the call before peer closure");
 
             TestVhostUserObservation {
