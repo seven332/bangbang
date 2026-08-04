@@ -4,6 +4,7 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::time::Instant;
 
+use crate::logger::{GuestLogger, LoggerMemoryHotplugOutcome};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange, aarch64,
 };
@@ -2219,6 +2220,7 @@ impl VirtioMemQueue {
             ) {
                 Ok(publication) => publication,
                 Err(source) => {
+                    let rollback_attempted = applied_mutation.is_some();
                     let rollback_error = applied_mutation.take().and_then(|applied| {
                         let rollback = mutation_executor.rollback(memory, applied);
                         metrics.record_rollbacks(1, u64::from(rollback.is_err()));
@@ -2236,19 +2238,23 @@ impl VirtioMemQueue {
                         completed_dispatch: Box::new(dispatch.clone()),
                         descriptor_head: completion.descriptor_head(),
                         bytes_written_to_guest: completion.bytes_written_to_guest(),
+                        rollback_attempted,
                         rollback_error,
                         source,
                     });
                 }
             };
-            if let Some(applied) = applied_mutation.as_ref() {
+            let commit = if let Some(applied) = applied_mutation.as_ref() {
                 let commit = mutation_executor.commit(memory, applied);
                 metrics.record_unplug_discard_failures(commit.discard_failures());
                 metrics.record_owner_cleanup(
                     commit.owner_cleanup_attempts(),
                     commit.owner_cleanup_failures(),
                 );
-            }
+                commit
+            } else {
+                VirtioMemMutationCommitOutcome::default()
+            };
             if let Some(mutation) = mutation {
                 mutation.commit(config_space, plugged_blocks);
             }
@@ -2265,6 +2271,7 @@ impl VirtioMemQueue {
                     elapsed_micros_saturating(started),
                 );
             }
+            dispatch.record_commit(commit);
             dispatch.record(outcome, publication);
         }
 
@@ -2312,6 +2319,7 @@ pub struct VirtioMemQueueDispatch {
     mutation_failures: usize,
     parse_failures: usize,
     response_write_failures: usize,
+    memory_discard_failures: u64,
     first_mutation_failure: Option<VirtioMemMutationError>,
     first_parse_failure: Option<VirtioMemRequestError>,
     needs_queue_interrupt: bool,
@@ -2354,6 +2362,10 @@ impl VirtioMemQueueDispatch {
         self.response_write_failures
     }
 
+    pub const fn memory_discard_failures(&self) -> u64 {
+        self.memory_discard_failures
+    }
+
     pub const fn needs_queue_interrupt(&self) -> bool {
         self.needs_queue_interrupt
     }
@@ -2392,6 +2404,12 @@ impl VirtioMemQueueDispatch {
                 self.response_write_failures += 1;
             }
         }
+    }
+
+    fn record_commit(&mut self, outcome: VirtioMemMutationCommitOutcome) {
+        self.memory_discard_failures = self
+            .memory_discard_failures
+            .saturating_add(outcome.discard_failures());
     }
 }
 
@@ -2437,6 +2455,7 @@ pub enum VirtioMemQueueDispatchError {
         completed_dispatch: Box<VirtioMemQueueDispatch>,
         descriptor_head: u16,
         bytes_written_to_guest: u32,
+        rollback_attempted: bool,
         rollback_error: Option<VirtioMemMutationRollbackError>,
         source: VirtqueueUsedRingError,
     },
@@ -2599,6 +2618,117 @@ impl std::error::Error for VirtioMemDeviceNotificationError {
             Self::QueueDispatch { source, .. } => Some(source),
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
         }
+    }
+}
+
+fn observe_memory_hotplug_notification_result(
+    logger: &GuestLogger,
+    result: &Result<VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError>,
+) {
+    let (outer, rollback, dispatch) = match result {
+        Ok(dispatch) => (None, None, dispatch.queue_dispatch()),
+        Err(VirtioMemDeviceNotificationError::Inactive { .. }) => (
+            Some(LoggerMemoryHotplugOutcome::QueueNotificationInactive),
+            None,
+            None,
+        ),
+        Err(VirtioMemDeviceNotificationError::UnsupportedQueue { .. }) => (
+            Some(LoggerMemoryHotplugOutcome::QueueNotificationUnsupported),
+            None,
+            None,
+        ),
+        Err(VirtioMemDeviceNotificationError::QueueDispatch { source, .. }) => (
+            Some(LoggerMemoryHotplugOutcome::QueueDispatchFailed),
+            memory_hotplug_rollback_outcome(source),
+            Some(source.completed_dispatch()),
+        ),
+    };
+
+    let rollback_from_summary = dispatch
+        .and_then(VirtioMemQueueDispatch::first_mutation_failure)
+        .and_then(|failure| {
+            let rollback = failure.rollback_outcome();
+            if rollback.failures() != 0 {
+                Some(LoggerMemoryHotplugOutcome::MutationRollbackFailed)
+            } else if rollback.attempts() != 0 {
+                Some(LoggerMemoryHotplugOutcome::MutationRollbackSucceeded)
+            } else {
+                None
+            }
+        });
+    let rollback_failed = [rollback, rollback_from_summary]
+        .into_iter()
+        .any(|outcome| outcome == Some(LoggerMemoryHotplugOutcome::MutationRollbackFailed));
+    let rollback_succeeded = [rollback, rollback_from_summary]
+        .into_iter()
+        .any(|outcome| outcome == Some(LoggerMemoryHotplugOutcome::MutationRollbackSucceeded));
+    let successful_requests = dispatch.is_some_and(|dispatch| {
+        dispatch
+            .processed_requests()
+            .saturating_sub(dispatch.state_requests())
+            .saturating_sub(dispatch.policy_errors())
+            .saturating_sub(dispatch.unsupported_requests())
+            .saturating_sub(dispatch.mutation_failures())
+            .saturating_sub(dispatch.parse_failures())
+            .saturating_sub(dispatch.response_write_failures())
+            != 0
+    });
+
+    logger.log_memory_hotplug_summary(
+        [
+            outer,
+            rollback_failed.then_some(LoggerMemoryHotplugOutcome::MutationRollbackFailed),
+            dispatch
+                .is_some_and(|dispatch| dispatch.memory_discard_failures() != 0)
+                .then_some(LoggerMemoryHotplugOutcome::MemoryDiscardFailed),
+            dispatch
+                .is_some_and(|dispatch| dispatch.mutation_failures() != 0)
+                .then_some(LoggerMemoryHotplugOutcome::MutationFailed),
+            dispatch
+                .is_some_and(|dispatch| dispatch.parse_failures() != 0)
+                .then_some(LoggerMemoryHotplugOutcome::RequestParseFailed),
+            dispatch
+                .is_some_and(|dispatch| dispatch.response_write_failures() != 0)
+                .then_some(LoggerMemoryHotplugOutcome::ResponseWriteFailed),
+            dispatch
+                .is_some_and(|dispatch| dispatch.policy_errors() != 0)
+                .then_some(LoggerMemoryHotplugOutcome::PolicyRejected),
+            dispatch
+                .is_some_and(|dispatch| dispatch.unsupported_requests() != 0)
+                .then_some(LoggerMemoryHotplugOutcome::RequestUnsupported),
+            rollback_succeeded.then_some(LoggerMemoryHotplugOutcome::MutationRollbackSucceeded),
+            successful_requests.then_some(LoggerMemoryHotplugOutcome::RequestSucceeded),
+            dispatch
+                .is_some_and(|dispatch| dispatch.state_requests() != 0)
+                .then_some(LoggerMemoryHotplugOutcome::StateQuerySucceeded),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+}
+
+fn memory_hotplug_rollback_outcome(
+    source: &VirtioMemQueueDispatchError,
+) -> Option<LoggerMemoryHotplugOutcome> {
+    match source {
+        VirtioMemQueueDispatchError::UsedRing {
+            rollback_attempted: true,
+            rollback_error: Some(_),
+            ..
+        }
+        | VirtioMemQueueDispatchError::MutationRollback { .. } => {
+            Some(LoggerMemoryHotplugOutcome::MutationRollbackFailed)
+        }
+        VirtioMemQueueDispatchError::UsedRing {
+            rollback_attempted: true,
+            rollback_error: None,
+            ..
+        } => Some(LoggerMemoryHotplugOutcome::MutationRollbackSucceeded),
+        VirtioMemQueueDispatchError::AvailableRing { .. }
+        | VirtioMemQueueDispatchError::UsedRing {
+            rollback_attempted: false,
+            ..
+        } => None,
     }
 }
 
@@ -2906,6 +3036,7 @@ pub struct VirtioMemDevice {
     active_queue: Option<VirtioMemQueue>,
     plugged_blocks: VirtioMemPluggedBlocks,
     metrics: SharedMemoryHotplugDeviceMetrics,
+    guest_logger: Option<GuestLogger>,
 }
 
 impl VirtioMemDevice {
@@ -2918,6 +3049,7 @@ impl VirtioMemDevice {
             active_queue: None,
             plugged_blocks: VirtioMemPluggedBlocks { ranges: Vec::new() },
             metrics,
+            guest_logger: None,
         }
     }
 
@@ -2947,6 +3079,7 @@ impl VirtioMemDevice {
             active_queue,
             plugged_blocks: VirtioMemPluggedBlocks { ranges },
             metrics: SharedMemoryHotplugDeviceMetrics::default(),
+            guest_logger: None,
         })
     }
 
@@ -3105,6 +3238,26 @@ impl VirtioMemDevice {
     }
 
     fn dispatch_drained_queue_notifications_with_executor(
+        &mut self,
+        memory: &mut GuestMemory,
+        config_space: &mut VirtioMemConfigSpace,
+        drained_notifications: Vec<usize>,
+        mutation_executor: &mut impl VirtioMemMutationExecutor,
+    ) -> Result<VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError> {
+        let logger = self.guest_logger.clone();
+        let result = self.dispatch_drained_queue_notifications_with_executor_inner(
+            memory,
+            config_space,
+            drained_notifications,
+            mutation_executor,
+        );
+        if let Some(logger) = logger {
+            observe_memory_hotplug_notification_result(&logger, &result);
+        }
+        result
+    }
+
+    fn dispatch_drained_queue_notifications_with_executor_inner(
         &mut self,
         memory: &mut GuestMemory,
         config_space: &mut VirtioMemConfigSpace,
@@ -3408,6 +3561,11 @@ impl VirtioPciEndpoint<VirtioMemConfigSpace, VirtioMemDevice> {
         let interrupt = work.drain_interrupt_intents();
         if interrupt.is_err() {
             metrics.record_interrupt_failure();
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_memory_hotplug(LoggerMemoryHotplugOutcome::InterruptDeliveryFailed);
+                }
+            });
         }
         VirtioPciDeviceOperationError::combine(dispatch, interrupt)
     }
@@ -3435,6 +3593,11 @@ impl VirtioPciEndpoint<VirtioMemConfigSpace, VirtioMemDevice> {
         let interrupt = work.drain_interrupt_intents();
         if interrupt.is_err() {
             metrics.record_interrupt_failure();
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_memory_hotplug(LoggerMemoryHotplugOutcome::InterruptDeliveryFailed);
+                }
+            });
         }
         VirtioPciDeviceOperationError::combine(result, interrupt)
     }
@@ -3455,6 +3618,10 @@ impl VirtioMmioDeviceActivationHandler for VirtioMemDevice {
 
     fn reset(&mut self) {
         VirtioMemDevice::reset(self);
+    }
+
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = Some(logger);
     }
 }
 
@@ -3996,8 +4163,10 @@ mod tests {
 
     use super::*;
     use crate::interrupt::DeviceInterruptKind;
+    use crate::logger::{LoggerConfigInput, LoggerTestCapture};
     use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange};
     use crate::mmio::{MmioAccess, MmioBus, MmioOperation, MmioRegionId};
+    use crate::virtio::VirtioDeviceType;
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
@@ -4006,6 +4175,7 @@ mod tests {
         VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
         decode_virtio_mmio_access,
     };
+    use crate::virtio_pci::{VirtioPciIdentity, test_support::endpoint_with_failing_interrupts};
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, read_descriptor_chain,
     };
@@ -5918,6 +6088,12 @@ mod tests {
     fn virtio_mem_handler_rejects_inactive_queue_notifications() {
         let mut memory = request_memory();
         let mut handler = mem_mmio_handler(virtio_mem_config_space());
+        let capture = LoggerTestCapture::default();
+        let (_state, logger) = capture.configured_guest_logger();
+        VirtioMmioDeviceActivationHandler::attach_guest_logger(
+            handler.activation_handler_mut(),
+            logger.clone(),
+        );
 
         advance_mem_mmio_handler_to_features_ok(&mut handler);
         handler
@@ -5949,6 +6125,188 @@ mod tests {
         assert_eq!(metrics.activate_fails(), 1);
         assert_eq!(metrics.queue_event_count(), 1);
         assert_eq!(metrics.queue_event_fails(), 1);
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        assert_eq!(
+            output
+                .matches("device-kind=memory-hotplug operation=queue-notification outcome=inactive")
+                .count(),
+            1
+        );
+        assert!(!output.contains("queue-index"));
+    }
+
+    #[test]
+    fn memory_hotplug_observer_deduplicates_and_orders_rollback_outcomes() {
+        let capture = LoggerTestCapture::default();
+        let (_state, logger) = capture.configured_guest_logger();
+        let rollback_result = |summary_failures| {
+            let completed_dispatch = VirtioMemQueueDispatch {
+                processed_requests: 1,
+                mutation_failures: 1,
+                first_mutation_failure: Some(
+                    VirtioMemMutationError::new("summary mutation failure").with_rollback_outcome(
+                        VirtioMemMutationRollbackOutcome::new(1, summary_failures),
+                    ),
+                ),
+                ..VirtioMemQueueDispatch::default()
+            };
+            Err(VirtioMemDeviceNotificationError::QueueDispatch {
+                drained_notifications: vec![0],
+                source: VirtioMemQueueDispatchError::UsedRing {
+                    completed_dispatch: Box::new(completed_dispatch),
+                    descriptor_head: 0,
+                    bytes_written_to_guest: 0,
+                    rollback_attempted: true,
+                    rollback_error: None,
+                    source: VirtqueueUsedRingError::InvalidQueueSize { queue_size: 0 },
+                },
+            })
+        };
+
+        let duplicate_success: Result<
+            VirtioMemDeviceNotificationDispatch,
+            VirtioMemDeviceNotificationError,
+        > = rollback_result(0);
+        observe_memory_hotplug_notification_result(&logger, &duplicate_success);
+        let mixed_outcomes: Result<
+            VirtioMemDeviceNotificationDispatch,
+            VirtioMemDeviceNotificationError,
+        > = rollback_result(1);
+        observe_memory_hotplug_notification_result(&logger, &mixed_outcomes);
+
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.contains("operation=mutation-rollback"))
+                .collect::<Vec<_>>(),
+            [
+                "device-kind=memory-hotplug operation=mutation-rollback outcome=succeeded",
+                "device-kind=memory-hotplug operation=mutation-rollback outcome=failed",
+                "device-kind=memory-hotplug operation=mutation-rollback outcome=succeeded",
+            ]
+        );
+        assert!(!output.contains("summary mutation failure"));
+        assert!(!output.contains("queue_size"));
+    }
+
+    #[test]
+    fn memory_hotplug_observer_projects_all_summary_outcomes_in_fixed_order() {
+        let capture = LoggerTestCapture::default();
+        let (_state, logger) = capture.configured_guest_logger();
+        let result = Ok(VirtioMemDeviceNotificationDispatch::new(
+            vec![0],
+            Some(VirtioMemQueueDispatch {
+                processed_requests: 7,
+                state_requests: 1,
+                policy_errors: 1,
+                unsupported_requests: 1,
+                mutation_failures: 1,
+                parse_failures: 1,
+                response_write_failures: 1,
+                memory_discard_failures: 1,
+                first_mutation_failure: Some(
+                    VirtioMemMutationError::new("private mutation context")
+                        .with_rollback_outcome(VirtioMemMutationRollbackOutcome::new(2, 1)),
+                ),
+                ..VirtioMemQueueDispatch::default()
+            }),
+        ));
+
+        observe_memory_hotplug_notification_result(&logger, &result);
+
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            [
+                "device-kind=memory-hotplug operation=mutation-rollback outcome=failed",
+                "device-kind=memory-hotplug operation=memory-discard outcome=failed",
+                "device-kind=memory-hotplug operation=mutation outcome=failed",
+                "device-kind=memory-hotplug operation=request-parse outcome=failed",
+                "device-kind=memory-hotplug operation=response-write outcome=failed",
+                "device-kind=memory-hotplug operation=policy outcome=rejected",
+                "device-kind=memory-hotplug operation=request outcome=unsupported",
+                "device-kind=memory-hotplug operation=request outcome=succeeded",
+                "device-kind=memory-hotplug operation=state-query outcome=succeeded",
+            ]
+        );
+        assert!(!output.contains("private mutation context"));
+    }
+
+    #[test]
+    fn memory_hotplug_product_pci_interrupt_failure_has_exact_transport_and_class_owners() {
+        let config = memory_hotplug_config();
+        let (config_space, device) = PreparedVirtioMemDevice::from_config(config)
+            .expect("virtio-mem device should prepare")
+            .into_parts();
+        let metrics = device.shared_metrics();
+        let capture = LoggerTestCapture::default();
+        let (mut logger_state, initial_logger) = capture.configured_guest_logger();
+        drop(initial_logger);
+        logger_state
+            .configure(LoggerConfigInput::new().with_show_log_origin(true))
+            .expect("origin-prefixed product PCI logger should configure");
+        let logger = logger_state.guest_logger();
+        let endpoint = endpoint_with_failing_interrupts(
+            VirtioPciIdentity::new(
+                VirtioDeviceType::new(VIRTIO_MEM_DEVICE_ID)
+                    .expect("virtio-mem device type should validate"),
+                config_space.available_features(),
+            ),
+            &VIRTIO_MEM_QUEUE_SIZES,
+            config_space,
+            device,
+            logger.clone(),
+        );
+        let update = config
+            .validate_size_update(MemoryHotplugSizeUpdateInput::new(2))
+            .expect("test requested-size update should validate");
+
+        let error = endpoint
+            .update_mem_requested_size(update)
+            .expect_err("product PCI configuration interrupt should fail");
+
+        assert!(matches!(
+            error,
+            VirtioPciDeviceOperationError::CompletedAndEndpoint { .. }
+        ));
+        let (requested_size, transport) = endpoint
+            .capture_transport_with(|_, _, config, _, _| config.requested_size())
+            .expect("updated product PCI virtio-mem state should remain capturable");
+        assert_eq!(requested_size, 2 * MIB);
+        assert_eq!(transport.device_registers().config_generation(), 1);
+        assert_eq!(metrics.snapshot().interrupt_fails(), 1);
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        let suffix = "device-kind=memory-hotplug operation=interrupt-delivery outcome=failed";
+        let records = output
+            .lines()
+            .filter(|line| line.ends_with(suffix))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records.len(),
+            2,
+            "generic transport and memory-hotplug class owners should each emit once; output:\n{output}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|line| line.contains("origin=crates/runtime/src/virtio_pci.rs:"))
+                .count(),
+            1,
+            "generic product PCI owner should emit once; output:\n{output}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|line| line.contains("origin=crates/runtime/src/memory_hotplug.rs:"))
+                .count(),
+            1,
+            "memory-hotplug class owner should emit once; output:\n{output}"
+        );
     }
 
     #[test]

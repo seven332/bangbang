@@ -1528,10 +1528,11 @@ command never creates, carries forward, or rewrites semantic classes in
 `logger-producer-audit.json`; missing or stale mappings require human review.
 The class policy and safe-field boundary are documented in the
 [logger producer contract](../compat/firecracker/v1.16.0/logger-contract.md).
-The current overlay has exactly 19 implemented, five planned, and seven
-not-applicable classes, representing 312 implemented, 94 planned, and 62
-not-applicable source mappings. The remaining planned classes are all owned by
-#1809.
+The current overlay has exactly 24 implemented, no planned, and seven
+not-applicable classes, representing 402 implemented and 66 not-applicable
+source mappings. Four i8042 mappings moved to the exact x86-only class because
+their upstream source module is shared but construction, PIO, API/runtime
+ownership, and observable execution remain x86_64-only.
 
 Host lifecycle logger coverage exercises backend and VM transitions, all three
 live device kinds, boot-worker observation, automatic metrics failures,
@@ -1566,6 +1567,24 @@ bundle reuses its product-PCI aggregate-storage and MMDS workloads plus its MMIO
 vsock workload to prove block, pmem, network, and vsock records reach an exact
 write-only logger grant without following pathname replacement or exposing
 backing paths, grant references, sockets, MAC addresses, or guest payloads.
+
+Balloon, virtio-mem, entropy, serial, and time/identity coverage checks every
+closed event encoding and level, independent limiter identities, summary-level
+deduplication, partial and rollback classifications, provider and interrupt
+supplements, committed product-PCI configuration plus endpoint-failure
+classification, serial input coalescing across normal and restored
+continuations, RTC rejection, and normal/native-v2 VMGenID, VMClock, PVTime,
+capture, publication, and ordered-restore outcomes.
+Runtime and HVF tests assert unchanged functional results and absence of raw
+errors, identifiers, descriptors, byte/page counts, timestamps, and guest
+values. The signed executable parser admits the complete fixed vocabulary and
+rejects extra fields or invented operation/outcome pairs.
+The aggregate remaining-device signed workload proves representative records
+over both MMIO and product PCI. Production-bundle cases separately adopt an
+exact write-only logger grant and require at least one balloon, virtio-mem,
+entropy, serial, and time/identity record after replacing the source pathname;
+they also reject fixture paths, grant identities, guest markers, serial or
+entropy payloads, and time/identity fingerprints.
 
 The final parent gate is:
 
@@ -2526,11 +2545,14 @@ reachability but intentionally impose no logger/serial cross-producer ordering;
 device tests that require an exact concurrent serial marker protocol configure
 an explicit logger file before guest startup. The production-bundle case
 repeats default stdin/stdout flow across the launcher/App Sandbox worker
-boundary and verifies socket/session cleanup. Signed device cases otherwise cover
-representative block, pmem, network/MMDS, vsock, entropy, RTC, balloon, UART,
-signal, latency, and startup producers. Guest poweroff/reset cases separately
-prove API and no-api terminal process paths. The two-process MMDS case proves
-that one process's flush and teardown cannot rewrite its peer's metrics file.
+boundary and verifies socket/session cleanup. Its granted logger cases also
+exercise representative balloon, virtio-mem, entropy, serial, and time/identity
+records without following a replaced source pathname. Signed device cases
+otherwise cover representative block, pmem, network/MMDS, vsock, entropy, RTC,
+balloon, UART, signal, latency, and startup producers. Guest poweroff/reset
+cases separately prove API and no-api terminal process paths. The two-process
+MMDS case proves that one process's flush and teardown cannot rewrite its
+peer's metrics file.
 None of these signed cases claims exact limiter timing, a synchronous footprint
 threshold, production telemetry policy, or Firecracker snapshot artifacts.
 

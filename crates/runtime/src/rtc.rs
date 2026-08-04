@@ -3,6 +3,7 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::logger::{GuestLogger, LoggerTimeIdentityOutcome};
 use crate::memory::GuestAddress;
 use crate::metrics::SharedRtcDeviceMetrics;
 use crate::mmio::{
@@ -65,6 +66,7 @@ impl RtcTimeSource for SystemRtcTimeSource {
 pub struct Pl031RtcDevice<T = SystemRtcTimeSource> {
     time_source: T,
     metrics: SharedRtcDeviceMetrics,
+    guest_logger: Option<GuestLogger>,
     load_value: u32,
     load_source_seconds: u32,
     match_value: u32,
@@ -92,6 +94,7 @@ impl<T: RtcTimeSource> Pl031RtcDevice<T> {
         Self {
             time_source,
             metrics,
+            guest_logger: None,
             load_value: now,
             load_source_seconds: now,
             match_value: 0,
@@ -182,6 +185,9 @@ impl<T: RtcTimeSource> MmioHandler for Pl031RtcDevice<T> {
     fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
         self.read_access(access).map_err(|err| {
             self.metrics.record_read_error();
+            if let Some(logger) = &self.guest_logger {
+                logger.log_time_identity(LoggerTimeIdentityOutcome::RtcReadRejected);
+            }
             MmioHandlerError::from(err)
         })
     }
@@ -189,8 +195,15 @@ impl<T: RtcTimeSource> MmioHandler for Pl031RtcDevice<T> {
     fn write(&mut self, access: MmioAccess, data: MmioAccessBytes) -> Result<(), MmioHandlerError> {
         self.write_access(access, data).map_err(|err| {
             self.metrics.record_write_error();
+            if let Some(logger) = &self.guest_logger {
+                logger.log_time_identity(LoggerTimeIdentityOutcome::RtcWriteRejected);
+            }
             MmioHandlerError::from(err)
         })
+    }
+
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = Some(logger);
     }
 }
 
@@ -335,6 +348,7 @@ mod tests {
         RTC_MATCH_REGISTER_OFFSET, RTC_MMIO_DEVICE_WINDOW_SIZE,
         RTC_RAW_INTERRUPT_STATUS_REGISTER_OFFSET, RtcTimeSource,
     };
+    use crate::logger::LoggerTestCapture;
     use crate::memory::GuestAddress;
     use crate::metrics::RtcDeviceMetrics;
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioDispatcher, MmioHandler, MmioRegionId};
@@ -594,5 +608,32 @@ mod tests {
                 .with_error_count(2)
                 .with_missed_write_count(2)
         );
+    }
+
+    #[test]
+    fn rejected_accesses_emit_fixed_time_identity_records() {
+        let capture = LoggerTestCapture::default();
+        let (_state, logger) = capture.configured_guest_logger();
+        let mut device = Pl031RtcDevice::new(FixedRtcTimeSource::new(100));
+        device.attach_guest_logger(logger.clone());
+
+        let _ = device
+            .read(access(RTC_DATA_REGISTER_OFFSET, 1))
+            .expect_err("byte read should fail");
+        let _ = device
+            .write(access(RTC_DATA_REGISTER_OFFSET, 4), bytes(123))
+            .expect_err("read-only write should fail");
+
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            [
+                "device-kind=time-identity operation=rtc-read outcome=rejected",
+                "device-kind=time-identity operation=rtc-write outcome=rejected",
+            ]
+        );
+        assert!(!output.contains("0x"));
+        assert!(!output.contains("100"));
     }
 }

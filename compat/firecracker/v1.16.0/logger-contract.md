@@ -68,16 +68,15 @@ source calls only when subsystem, observable outcome, target fields, delivery,
 module/origin behavior, limiter policy, disposition, and delivery owner agree.
 There are no path selectors and no `other`, `unknown`, or catch-all class.
 
-The 31 classes contain 19 implemented classes, 5 planned classes, and 7 exact
-not-applicable classes. Across source mappings this is 312 implemented, 94
-planned, and 62 not-applicable invocations.
+The 31 classes contain 24 implemented classes, no planned classes, and 7 exact
+not-applicable classes. Across source mappings this is 402 implemented and 66
+not-applicable invocations. The four additional not-applicable mappings are
+i8042 producers: the source module is shared upstream, but construction, PIO,
+API/runtime ownership, and observable behavior are x86_64-only.
 
-`planned` is an explicit intermediate delivery state. The remaining owner is:
-
-- #1809: balloon, memory-hotplug, serial, entropy, and time/identity outcomes.
-
-Delivery validation accepts those named planned classes. Final validation
-rejects every planned class.
+Delivery and final logger validation now accept the complete overlay. Any
+future `planned` class remains an intermediate state and final validation
+rejects it.
 
 Issue #1807 closes the configuration-owned classes. API control records cover
 server start/stop, discarded connection failure, deprecated requests,
@@ -118,10 +117,29 @@ interrupt delivery; product-PCI endpoint owners cover MSI delivery. MMDS
 detours and transactional token-key rotation are fixed outcomes, and neither
 token nor key material can enter a record.
 
+Issue #1816 closes balloon, virtio-mem, entropy, serial, and time/identity
+outcomes. Balloon, virtio-mem, and entropy observers consume complete typed
+queue summaries shared by MMIO and product PCI. Virtio-mem configuration
+commit and interrupt delivery remain separate outcomes when a committed PCI
+update is followed by endpoint failure. Serial input is coalesced once per
+run-loop dispatch or restored-continuation reconciliation while output and
+limiter failures stay at the owning wrapper. RTC, VMGenID, VMClock, PVTime,
+platform publication, capture, and
+ordered restore retain fixed component and aggregate commit classifications.
+Each class has an independent limiter identity. Raw errors, paths, device
+identities, descriptors, byte/page counts, time values, and guest data are
+discarded before encoding.
+The signed aggregate remaining-device workload reaches all five classes over
+MMIO and product PCI. Production-bundle logger-grant cases additionally require
+at least one fixed balloon, virtio-mem, entropy, serial, and time/identity
+record, retain opened-object authority after pathname replacement, and reject
+fixture, grant, guest-marker, and class-specific forbidden values.
+
 ## Closed class ledger
 
 `Mappings` is the exact number of source identities assigned to the class.
-Owners apply only to planned work.
+The owner/reason column records the implemented fixed boundary or exact
+not-applicable reason.
 
 | Class | Disposition | Owner/reason | Mappings |
 | --- | --- | --- | ---: |
@@ -130,13 +148,13 @@ Owners apply only to planned work.
 | `logger.api.request` | `implemented` | parsed method/template receipt | 1 |
 | `logger.api.result` | `implemented` | closed HTTP result plus retained actions | 5 |
 | `logger.backend.outcome` | `implemented` | typed HVF backend, vCPU, interrupt, and timer outcomes | 26 |
-| `logger.balloon.outcome` | `planned` | #1809 | 28 |
+| `logger.balloon.outcome` | `implemented` | fixed balloon queue, accounting, discard, and interrupt outcomes | 28 |
 | `logger.block.outcome` | `implemented` | fixed block request, queue, async, vhost-user, and interrupt outcomes | 34 |
 | `logger.boot.time` | `implemented` | bounded boot timing | 1 |
-| `logger.entropy.outcome` | `planned` | #1809 | 16 |
+| `logger.entropy.outcome` | `implemented` | fixed entropy queue, provider, limiter, and interrupt outcomes | 16 |
 | `logger.lifecycle.outcome` | `implemented` | fixed VM and live-device lifecycle | 24 |
 | `logger.limiter.recovery` | `implemented` | bounded suppressed count | 1 |
-| `logger.memory-hotplug.outcome` | `planned` | #1809 | 22 |
+| `logger.memory-hotplug.outcome` | `implemented` | fixed virtio-mem request, rollback, configuration, and interrupt outcomes | 22 |
 | `logger.network.outcome` | `implemented` | fixed network, provider, MMDS, and interrupt outcomes | 26 |
 | `logger.nonapp.example` | `not-applicable` | `example-only` | 22 |
 | `logger.nonapp.fuzzing` | `not-applicable` | `developer-instrumentation` | 1 |
@@ -144,16 +162,16 @@ Owners apply only to planned work.
 | `logger.nonapp.linux-hardening` | `not-applicable` | `linux-kvm-only` | 2 |
 | `logger.nonapp.tool` | `not-applicable` | `separate-tool-owner` | 1 |
 | `logger.nonapp.tracing` | `not-applicable` | `tracing-owned` | 2 |
-| `logger.nonapp.x86` | `not-applicable` | `x86-only` | 15 |
+| `logger.nonapp.x86` | `not-applicable` | `x86-only` | 19 |
 | `logger.observability.outcome` | `implemented` | rate-limited metrics-worker failure | 4 |
 | `logger.pmem.outcome` | `implemented` | fixed pmem flush, queue, limiter, and interrupt outcomes | 18 |
 | `logger.process-signal.outcome` | `implemented` | fixed signal and shutdown convergence | 5 |
 | `logger.process-startup.outcome` | `implemented` | fixed normal startup outcome | 5 |
 | `logger.process.exit` | `implemented` | fixed terminal category | 3 |
 | `logger.process.panic` | `implemented` | fixed emergency record | 3 |
-| `logger.serial.outcome` | `planned` | #1809 | 12 |
+| `logger.serial.outcome` | `implemented` | fixed serial input, output, limiter, and interrupt outcomes | 12 |
 | `logger.snapshot.outcome` | `implemented` | fixed create/load result | 18 |
-| `logger.time-identity.outcome` | `planned` | #1809 | 16 |
+| `logger.time-identity.outcome` | `implemented` | fixed RTC, VMGenID, VMClock, PVTime, and publication outcomes | 12 |
 | `logger.transport.outcome` | `implemented` | typed generic MMIO, virtio, PCI, queue, and interrupt outcomes | 74 |
 | `logger.vsock.outcome` | `implemented` | fixed vsock queue, connection, reset, and interrupt outcomes | 52 |
 
@@ -184,6 +202,10 @@ The implemented host-owned records have exact fixed shapes:
 - block, pmem, network/MMDS, and vsock data planes:
   `device-kind=<block|pmem|network|vsock>
   operation=<closed-device-operation> outcome=<closed-device-outcome>`;
+- remaining device data planes:
+  `device-kind=<balloon|entropy|memory-hotplug|serial|time-identity>
+  operation=<closed-device-or-time-operation>
+  outcome=<closed-device-or-commit-outcome>`;
 - snapshots: `operation=<snapshot-create|snapshot-load>
   outcome=<succeeded|rejected|failed|cancelled>`;
 - worker and observability status:
@@ -237,11 +259,12 @@ including a host-only member of the same semantic class. This is deliberately
 conservative: it cannot grant a producer a blocking or unrestricted path.
 
 Every guest-capable class is rate-limited under its own fixed class identity.
-Backend, transport, block, pmem, network, and vsock use their corresponding
+Backend, transport, balloon, block, entropy, memory-hotplug, network, pmem,
+serial, time-identity, and vsock use their corresponding
 `logger-rate.<class>.outcome` identities; the repeating asynchronous
-metrics-worker class independently uses `logger-rate.observability-worker`. The sole exception is
-`logger.limiter.recovery`, which must be unrestricted to report a prior
-admitted recovery without recursively limiting itself. Queue,
+metrics-worker class independently uses `logger-rate.observability-worker`.
+The sole exception is `logger.limiter.recovery`, which must be unrestricted to
+report a prior admitted recovery without recursively limiting itself. Queue,
 receipt, write, flush, and replacement loss never changes the request, VM,
 guest, worker, or process result and increments the exact existing loss counter
 once. That exact boundary ends at the writer configured in the logger worker.
@@ -320,8 +343,9 @@ fingerprint changes before deliberately updating the checked manifest. Resolve
 every missing/stale human mapping separately.
 
 Issue #1807 promotes the nine concrete `/logger` operation, path, schema,
-property, and full-configuration records in `capabilities.json`. The two
-aggregate `corpus:logger` and
+property, and full-configuration records in `capabilities.json`. Issue #1816
+closes the last producer classes and the logger overlay contains no planned
+work. The two aggregate `corpus:logger` and
 `semantic.observability:logger-delivery-filtering-loss-and-redaction` records
-remain `audit-required` until #1809 and final certification close every planned
-producer class and verify the aggregate claim.
+remain `audit-required` until the #1786 final certification verifies and
+promotes the aggregate claims.

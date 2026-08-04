@@ -1483,7 +1483,15 @@ fn normal_bundle_certifies_native_v2_serial_snapshot_continuation_and_containmen
 
 fn run_production_default_serial_snapshot_continuation(bundle: &Path) {
     let source_fixture = SerialSnapshotSourceGrantFixture::new("stdio", false, false);
-    let source_sensitive = source_fixture.sensitive_strings();
+    let source_logger = DeviceLoggerGrant::add_to_manifest(
+        &source_fixture.manifest,
+        "serial-snapshot-stdio-source",
+    );
+    let source_sensitive = source_fixture
+        .sensitive_strings()
+        .into_iter()
+        .chain(source_logger.sensitive_strings())
+        .collect::<Vec<_>>();
     let mut source = spawn_ready_serial_snapshot_grant_api_launcher(
         bundle,
         &source_fixture.manifest,
@@ -1491,11 +1499,14 @@ fn run_production_default_serial_snapshot_continuation(bundle: &Path) {
         false,
     );
     source_fixture.replace_source_pathnames();
+    source_logger.replace_source_pathname();
+    source_logger.configure(&source.socket, "production serial snapshot source");
     configure_and_start_serial_snapshot_grant_source(&source.socket, false, false);
     source
         .wait_for_stdout_marker(snapshot_serial::SOURCE_READY_MARKER, PROCESS_TIMEOUT)
         .unwrap_or_else(|error| panic!("production serial source should become ready: {error}"));
-    source.write_stdin(&snapshot_serial::source_input());
+    let source_input = snapshot_serial::source_input();
+    source.write_stdin(&source_input);
     wait_for_production_uart_metric(
         &source.socket,
         &source_fixture.opened_metrics,
@@ -1545,6 +1556,16 @@ fn run_production_default_serial_snapshot_continuation(bundle: &Path) {
         &source_stderr,
         &source_sensitive,
         "production serial source",
+    );
+    source_logger.assert_records(
+        &[
+            "device-kind=serial operation=input-read outcome=succeeded",
+            "device-kind=time-identity operation=platform-publication outcome=succeeded",
+        ],
+        source_fixture.sensitive_strings().into_iter().chain([
+            String::from_utf8_lossy(&source_input).into_owned(),
+            snapshot_serial::SOURCE_READY_MARKER.to_owned(),
+        ]),
     );
     assert!(!source.socket.exists());
 
@@ -4797,6 +4818,10 @@ fn run_production_memory_hotplug_snapshot_continuation(
     let transport = if enable_pci { "pci" } else { "mmio" };
     let source_fixture =
         SnapshotSourceGrantFixture::new(&format!("{transport}-memory-hotplug-source"));
+    let source_logger = DeviceLoggerGrant::add_to_manifest(
+        &source_fixture.manifest,
+        &format!("{transport}-memory-hotplug-source"),
+    );
     reset_zeroed_file(
         &source_fixture.data_backing,
         SNAPSHOT_MEMORY_HOTPLUG_SECTORS * 512,
@@ -4804,12 +4829,21 @@ fn run_production_memory_hotplug_snapshot_continuation(
     let mut source = spawn_ready_snapshot_grant_api_launcher(
         bundle,
         &source_fixture.manifest,
-        source_fixture.sensitive_strings(),
+        source_fixture
+            .sensitive_strings()
+            .into_iter()
+            .chain(source_logger.sensitive_strings())
+            .collect(),
         &format!("memory-hotplug-snapshot-{transport}-source"),
         false,
         enable_pci,
     );
     source_fixture.replace_source_file_pathnames();
+    source_logger.replace_source_pathname();
+    source_logger.configure(
+        &source.socket,
+        &format!("production {transport} memory-hotplug source"),
+    );
     configure_and_start_memory_hotplug_snapshot_source(&source.socket, transport);
     wait_for_memory_hotplug_snapshot_marker(
         &source_fixture.opened_data_backing,
@@ -4887,6 +4921,13 @@ fn run_production_memory_hotplug_snapshot_continuation(
     source_fixture.assert_replacement_pathnames_unused(&format!(
         "production {transport} memory-hotplug snapshot source"
     ));
+    source_logger.assert_records(
+        &["device-kind=memory-hotplug operation=configuration-update outcome=succeeded"],
+        source_fixture.sensitive_strings().into_iter().chain([
+            String::from_utf8_lossy(SNAPSHOT_MEMORY_HOTPLUG_READY_MARKER).into_owned(),
+            String::from_utf8_lossy(SNAPSHOT_MEMORY_HOTPLUG_CAPTURE_READY_MARKER).into_owned(),
+        ]),
+    );
 
     let mut current = artifacts;
     if !enable_pci {
@@ -5751,15 +5792,28 @@ fn run_production_balloon_snapshot_continuation(
 ) {
     let transport = if enable_pci { "pci" } else { "mmio" };
     let source_fixture = SnapshotSourceGrantFixture::new(&format!("{transport}-balloon-source"));
+    let source_logger = DeviceLoggerGrant::add_to_manifest(
+        &source_fixture.manifest,
+        &format!("{transport}-balloon-source"),
+    );
     let mut source = spawn_ready_snapshot_grant_api_launcher(
         bundle,
         &source_fixture.manifest,
-        source_fixture.sensitive_strings(),
+        source_fixture
+            .sensitive_strings()
+            .into_iter()
+            .chain(source_logger.sensitive_strings())
+            .collect(),
         &format!("balloon-snapshot-{transport}-source"),
         false,
         enable_pci,
     );
     source_fixture.replace_source_file_pathnames();
+    source_logger.replace_source_pathname();
+    source_logger.configure(
+        &source.socket,
+        &format!("production {transport} balloon source"),
+    );
     configure_and_start_balloon_snapshot_source(&source.socket, transport);
     wait_for_production_balloon_page_counts(
         &source.socket,
@@ -5844,6 +5898,13 @@ fn run_production_balloon_snapshot_continuation(
         &format!("production {transport} balloon snapshot source"),
     );
     assert_eq!(session_entries(), baseline_sessions);
+    source_logger.assert_records(
+        &["device-kind=balloon operation=inflate outcome=succeeded"],
+        source_fixture
+            .sensitive_strings()
+            .into_iter()
+            .chain([String::from_utf8_lossy(SNAPSHOT_BALLOON_MARKER).into_owned()]),
+    );
 
     let mut current = artifacts;
     if !enable_pci {
@@ -6454,7 +6515,15 @@ fn run_production_entropy_snapshot_continuation(
     };
     let case = format!("{transport}-{product}");
     let source_fixture = SerialSnapshotSourceGrantFixture::new_entropy(&case, with_storage);
-    let source_sensitive = source_fixture.sensitive_strings();
+    let source_logger = DeviceLoggerGrant::add_to_manifest(
+        &source_fixture.manifest,
+        &format!("{case}-entropy-source"),
+    );
+    let source_sensitive = source_fixture
+        .sensitive_strings()
+        .into_iter()
+        .chain(source_logger.sensitive_strings())
+        .collect::<Vec<_>>();
     let mut source = spawn_ready_serial_snapshot_grant_api_launcher_with_granted_socket(
         bundle,
         &source_fixture.manifest,
@@ -6463,6 +6532,8 @@ fn run_production_entropy_snapshot_continuation(
         enable_pci,
     );
     source_fixture.replace_source_pathnames();
+    source_logger.replace_source_pathname();
+    source_logger.configure(&source.socket, &format!("production {case} entropy source"));
     configure_and_start_entropy_snapshot_grant_source(&source.socket, with_storage, &case);
     source
         .wait_for_stdout_marker(SNAPSHOT_ENTROPY_READY_MARKER, PROCESS_TIMEOUT)
@@ -6516,6 +6587,13 @@ fn run_production_entropy_snapshot_continuation(
         &source_stderr,
         &source_sensitive,
         &format!("production {case} entropy source"),
+    );
+    source_logger.assert_records(
+        &["device-kind=entropy operation=fill outcome=succeeded"],
+        source_fixture
+            .sensitive_strings()
+            .into_iter()
+            .chain([SNAPSHOT_ENTROPY_READY_MARKER.to_owned()]),
     );
     assert!(!source.socket.exists());
     assert_eq!(session_entries(), baseline_sessions);
@@ -16014,6 +16092,18 @@ impl DeviceLoggerGrant {
         fs::rename(&self.source, &self.opened).expect("launcher-opened device logger should move");
         fs::write(&self.source, OUTPUT_REPLACEMENT)
             .expect("replacement device logger should write");
+    }
+
+    fn configure(&self, socket: &Path, context: &str) {
+        assert_http_status(
+            &http_put(
+                socket,
+                "/logger",
+                &serde_json::json!({"log_path": OUTPUT_LOGGER_REF}).to_string(),
+            ),
+            204,
+            &format!("configure {context} device logger"),
+        );
     }
 
     fn sensitive_strings(&self) -> impl Iterator<Item = String> + '_ {

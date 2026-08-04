@@ -3,6 +3,7 @@
 use std::collections::TryReserveError;
 use std::fmt;
 
+use crate::logger::{GuestLogger, LoggerBalloonOutcome};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryDiscardAdviser,
     GuestMemoryDiscardOutcome, GuestMemoryError, GuestMemoryRange, SystemGuestMemoryDiscardAdviser,
@@ -4584,6 +4585,7 @@ pub struct VirtioBalloonDevice {
     hinting_guest_cmd: Option<u32>,
     hinting_last_cmd: u32,
     hinting_acknowledge_on_stop: bool,
+    guest_logger: Option<GuestLogger>,
 }
 
 impl VirtioBalloonDevice {
@@ -4611,6 +4613,7 @@ impl VirtioBalloonDevice {
             hinting_guest_cmd: None,
             hinting_last_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
             hinting_acknowledge_on_stop: true,
+            guest_logger: None,
         }
     }
 
@@ -4677,6 +4680,7 @@ impl VirtioBalloonDevice {
             hinting_guest_cmd,
             hinting_last_cmd,
             hinting_acknowledge_on_stop,
+            guest_logger: None,
         })
     }
 
@@ -4911,6 +4915,19 @@ impl VirtioBalloonDevice {
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
     ) -> Result<VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError> {
+        let logger = self.guest_logger.clone();
+        let result = self.dispatch_drained_queue_notifications_inner(memory, drained_notifications);
+        if let Some(logger) = logger {
+            observe_balloon_notification_result(&logger, &result);
+        }
+        result
+    }
+
+    fn dispatch_drained_queue_notifications_inner(
+        &mut self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+    ) -> Result<VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError> {
         if drained_notifications.is_empty() {
             return Ok(VirtioBalloonDeviceNotificationDispatch {
                 drained_notifications,
@@ -5119,6 +5136,18 @@ impl VirtioBalloonDevice {
     }
 
     pub fn trigger_statistics_update(
+        &mut self,
+        memory: &mut GuestMemory,
+    ) -> Result<VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError> {
+        let logger = self.guest_logger.clone();
+        let result = self.trigger_statistics_update_inner(memory);
+        if let Some(logger) = logger {
+            observe_balloon_notification_result(&logger, &result);
+        }
+        result
+    }
+
+    fn trigger_statistics_update_inner(
         &mut self,
         memory: &mut GuestMemory,
     ) -> Result<VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError> {
@@ -5538,6 +5567,13 @@ impl VirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
         let endpoint = work.drain_interrupt_intents();
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_balloon(LoggerBalloonOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
         VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 
@@ -5576,6 +5612,13 @@ impl VirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
         let endpoint = work.drain_interrupt_intents();
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_balloon(LoggerBalloonOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
         VirtioPciDeviceOperationError::combine(dispatch, endpoint)
     }
 
@@ -5597,7 +5640,15 @@ impl VirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
             core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
         })
         .map_err(VirtioPciDeviceOperationError::Endpoint)?;
-        VirtioPciDeviceOperationError::combine(Ok(()), work.drain_interrupt_intents())
+        let endpoint = work.drain_interrupt_intents();
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_balloon(LoggerBalloonOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
+        VirtioPciDeviceOperationError::combine(Ok(()), endpoint)
     }
 
     pub fn update_balloon_statistics(
@@ -5642,7 +5693,15 @@ impl VirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
                 Ok(())
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
-        VirtioPciDeviceOperationError::combine(result, work.drain_interrupt_intents())
+        let endpoint = work.drain_interrupt_intents();
+        if endpoint.is_err() {
+            let _ = work.with_core_mut(|core| {
+                if let Some(logger) = &core.activation.guest_logger {
+                    logger.log_balloon(LoggerBalloonOutcome::InterruptDeliveryFailed);
+                }
+            });
+        }
+        VirtioPciDeviceOperationError::combine(result, endpoint)
     }
 
     pub fn balloon_stats(
@@ -5740,6 +5799,10 @@ impl VirtioMmioDeviceActivationHandler for VirtioBalloonDevice {
 
     fn reset(&mut self) {
         VirtioBalloonDevice::reset(self);
+    }
+
+    fn attach_guest_logger(&mut self, logger: GuestLogger) {
+        self.guest_logger = Some(logger);
     }
 }
 
@@ -6005,6 +6068,116 @@ impl std::error::Error for VirtioBalloonDeviceNotificationError {
             Self::Accounting { source, .. } => Some(source),
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
         }
+    }
+}
+
+fn observe_balloon_notification_result(
+    logger: &GuestLogger,
+    result: &Result<VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError>,
+) {
+    let (outer, specific, dispatch) = match result {
+        Ok(dispatch) => (None, None, Some(dispatch)),
+        Err(VirtioBalloonDeviceNotificationError::Inactive { .. }) => (
+            Some(LoggerBalloonOutcome::QueueNotificationInactive),
+            None,
+            None,
+        ),
+        Err(VirtioBalloonDeviceNotificationError::UnsupportedQueue { .. }) => (
+            Some(LoggerBalloonOutcome::QueueNotificationUnsupported),
+            None,
+            None,
+        ),
+        Err(VirtioBalloonDeviceNotificationError::QueueDispatch {
+            completed_dispatch,
+            source,
+        }) => (
+            Some(LoggerBalloonOutcome::QueueDispatchFailed),
+            balloon_specific_queue_failure(source),
+            Some(completed_dispatch.as_ref()),
+        ),
+        Err(VirtioBalloonDeviceNotificationError::Accounting {
+            completed_dispatch, ..
+        }) => (
+            Some(LoggerBalloonOutcome::AccountingFailed),
+            None,
+            Some(completed_dispatch.as_ref()),
+        ),
+    };
+
+    let inflate =
+        dispatch.and_then(VirtioBalloonDeviceNotificationDispatch::inflate_queue_dispatch);
+    let deflate =
+        dispatch.and_then(VirtioBalloonDeviceNotificationDispatch::deflate_queue_dispatch);
+    let statistics =
+        dispatch.and_then(VirtioBalloonDeviceNotificationDispatch::statistics_queue_dispatch);
+    let hinting =
+        dispatch.and_then(VirtioBalloonDeviceNotificationDispatch::hinting_queue_dispatch);
+    let reporting =
+        dispatch.and_then(VirtioBalloonDeviceNotificationDispatch::reporting_queue_dispatch);
+    let discard_failed = inflate.is_some_and(|queue| queue.inflate_discard().failures() != 0)
+        || hinting.is_some_and(|queue| queue.hinting_discard().failures() != 0)
+        || reporting.is_some_and(|queue| queue.reporting_discard().failures() != 0);
+
+    logger.log_balloon_summary(
+        [
+            outer,
+            specific,
+            discard_failed.then_some(LoggerBalloonOutcome::MemoryDiscardFailed),
+            statistics
+                .is_some_and(|queue| queue.statistics_oversized_reports() != 0)
+                .then_some(LoggerBalloonOutcome::StatisticsOversized),
+            inflate
+                .is_some_and(|queue| queue.completed_descriptors() != 0)
+                .then_some(LoggerBalloonOutcome::InflateSucceeded),
+            deflate
+                .is_some_and(|queue| queue.completed_descriptors() != 0)
+                .then_some(LoggerBalloonOutcome::DeflateSucceeded),
+            statistics
+                .is_some_and(|queue| queue.statistics_reports() != 0)
+                .then_some(LoggerBalloonOutcome::StatisticsUpdated),
+            hinting
+                .is_some_and(|queue| queue.completed_descriptors() != 0)
+                .then_some(LoggerBalloonOutcome::HintingSucceeded),
+            reporting
+                .is_some_and(|queue| queue.completed_descriptors() != 0)
+                .then_some(LoggerBalloonOutcome::ReportingSucceeded),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+}
+
+fn balloon_specific_queue_failure(
+    source: &VirtioBalloonQueueDispatchError,
+) -> Option<LoggerBalloonOutcome> {
+    match source {
+        VirtioBalloonQueueDispatchError::StatisticsDescriptorRead { .. } => {
+            Some(LoggerBalloonOutcome::StatisticsFailed)
+        }
+        VirtioBalloonQueueDispatchError::HintingRange { .. }
+        | VirtioBalloonQueueDispatchError::HintingRangeAllocation { .. }
+        | VirtioBalloonQueueDispatchError::HintingCommandRead { .. } => {
+            Some(LoggerBalloonOutcome::HintingFailed)
+        }
+        VirtioBalloonQueueDispatchError::AccountingPreparation { .. } => {
+            Some(LoggerBalloonOutcome::AccountingFailed)
+        }
+        VirtioBalloonQueueDispatchError::AvailableRing { queue, .. }
+        | VirtioBalloonQueueDispatchError::EmptyDescriptorChain { queue, .. }
+        | VirtioBalloonQueueDispatchError::UsedRing { queue, .. } => match queue {
+            VirtioBalloonQueueKind::Statistics => Some(LoggerBalloonOutcome::StatisticsFailed),
+            VirtioBalloonQueueKind::FreePageHinting => Some(LoggerBalloonOutcome::HintingFailed),
+            VirtioBalloonQueueKind::FreePageReporting => {
+                Some(LoggerBalloonOutcome::ReportingFailed)
+            }
+            VirtioBalloonQueueKind::Inflate | VirtioBalloonQueueKind::Deflate => None,
+        },
+        VirtioBalloonQueueDispatchError::PfnDescriptorRead { .. }
+        | VirtioBalloonQueueDispatchError::PfnPayloadParse { .. }
+        | VirtioBalloonQueueDispatchError::PfnRangeCompact { .. }
+        | VirtioBalloonQueueDispatchError::PfnRangeAccess { .. }
+        | VirtioBalloonQueueDispatchError::InflatedRangeAllocation { .. }
+        | VirtioBalloonQueueDispatchError::DeflatedRangeAllocation { .. } => None,
     }
 }
 
@@ -6480,6 +6653,7 @@ mod tests {
     use std::ptr::NonNull;
 
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
+    use crate::logger::{LoggerConfigInput, LoggerTestCapture};
     use crate::memory::{
         GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking,
         GuestMemoryDiscardFailureKind, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange,
@@ -6496,6 +6670,7 @@ mod tests {
         NATIVE_V2_BALLOON_STATE_MAX_ACCOUNTING_RANGES, SnapshotV2BalloonState,
         SnapshotV2BalloonStateCaptureError,
     };
+    use crate::virtio::VirtioDeviceType;
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
@@ -6503,6 +6678,7 @@ mod tests {
         VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioDeviceActivation, VirtioMmioDeviceRegisters,
         VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterHandlerError,
     };
+    use crate::virtio_pci::{VirtioPciIdentity, test_support::endpoint_with_failing_interrupts};
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
         VirtqueueAvailableRing, VirtqueueUsedRing, read_descriptor_chain,
@@ -11120,6 +11296,9 @@ mod tests {
         let mut device = VirtioBalloonDevice::new(
             prepared(balloon_config(64, false, 0, false, false)).queue_layout(),
         );
+        let capture = LoggerTestCapture::default();
+        let (_state, logger) = capture.configured_guest_logger();
+        VirtioMmioDeviceActivationHandler::attach_guest_logger(&mut device, logger.clone());
 
         let error = device
             .dispatch_drained_queue_notifications(
@@ -11139,6 +11318,147 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "virtio-balloon queue notification cannot be dispatched before activation"
+        );
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        assert_eq!(
+            output
+                .matches("device-kind=balloon operation=queue-notification outcome=inactive")
+                .count(),
+            1
+        );
+        assert!(!output.contains("queue-index"));
+    }
+
+    #[test]
+    fn balloon_observer_coalesces_five_queue_outcomes_in_fixed_order() {
+        let capture = LoggerTestCapture::default();
+        let (_state, logger) = capture.configured_guest_logger();
+        let failed_discard = VirtioBalloonDiscardOutcome {
+            failures: 1,
+            ..VirtioBalloonDiscardOutcome::default()
+        };
+        let result = Ok(VirtioBalloonDeviceNotificationDispatch {
+            drained_notifications: vec![
+                VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+                VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+                VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+                3,
+                4,
+            ],
+            inflate_notifications: 1,
+            deflate_notifications: 1,
+            statistics_notifications: 1,
+            hinting_notifications: 1,
+            reporting_notifications: 1,
+            inflate_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                completed_descriptors: 1,
+                inflate_discard: failed_discard,
+                ..VirtioBalloonQueueDispatch::default()
+            }),
+            deflate_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                completed_descriptors: 1,
+                ..VirtioBalloonQueueDispatch::default()
+            }),
+            statistics_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                statistics_reports: 1,
+                statistics_oversized_reports: 1,
+                ..VirtioBalloonQueueDispatch::default()
+            }),
+            hinting_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                completed_descriptors: 1,
+                hinting_discard: failed_discard,
+                ..VirtioBalloonQueueDispatch::default()
+            }),
+            reporting_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                completed_descriptors: 1,
+                reporting_discard: failed_discard,
+                ..VirtioBalloonQueueDispatch::default()
+            }),
+        });
+
+        observe_balloon_notification_result(&logger, &result);
+
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            [
+                "device-kind=balloon operation=memory-discard outcome=failed",
+                "device-kind=balloon operation=statistics outcome=oversized",
+                "device-kind=balloon operation=inflate outcome=succeeded",
+                "device-kind=balloon operation=deflate outcome=succeeded",
+                "device-kind=balloon operation=statistics outcome=updated",
+                "device-kind=balloon operation=hinting outcome=succeeded",
+                "device-kind=balloon operation=reporting outcome=succeeded",
+            ]
+        );
+        assert_eq!(output.matches("operation=memory-discard").count(), 1);
+    }
+
+    #[test]
+    fn balloon_product_pci_interrupt_failure_has_exact_transport_and_class_owners() {
+        let config = balloon_config(64, false, 0, false, false);
+        let (config_space, features, queue_sizes, device) = prepared(config).into_parts();
+        let capture = LoggerTestCapture::default();
+        let (mut logger_state, initial_logger) = capture.configured_guest_logger();
+        drop(initial_logger);
+        logger_state
+            .configure(LoggerConfigInput::new().with_show_log_origin(true))
+            .expect("origin-prefixed product PCI logger should configure");
+        let logger = logger_state.guest_logger();
+        let endpoint = endpoint_with_failing_interrupts(
+            VirtioPciIdentity::new(
+                VirtioDeviceType::new(VIRTIO_BALLOON_DEVICE_ID)
+                    .expect("balloon device type should validate"),
+                features,
+            ),
+            queue_sizes.as_slice(),
+            config_space,
+            device,
+            logger.clone(),
+        );
+
+        let error = endpoint
+            .update_balloon_config(balloon_config(32, false, 0, false, false))
+            .expect_err("product PCI configuration interrupt should fail");
+
+        assert!(matches!(
+            error,
+            VirtioPciDeviceOperationError::CompletedAndEndpoint { .. }
+        ));
+        let (num_pages, transport) = endpoint
+            .capture_transport_with(|_, _, config, _, _| config.num_pages())
+            .expect("updated product PCI balloon state should remain capturable");
+        assert_eq!(num_pages, 32 * VIRTIO_BALLOON_MIB_TO_4K_PAGES);
+        assert_eq!(transport.device_registers().config_generation(), 1);
+        assert!(logger.wait_for_delivery_for_test());
+        let output = capture.output();
+        let suffix = "device-kind=balloon operation=interrupt-delivery outcome=failed";
+        let records = output
+            .lines()
+            .filter(|line| line.ends_with(suffix))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records.len(),
+            2,
+            "generic transport and balloon class owners should each emit once; output:\n{output}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|line| line.contains("origin=crates/runtime/src/virtio_pci.rs:"))
+                .count(),
+            1,
+            "generic product PCI owner should emit once; output:\n{output}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|line| line.contains("origin=crates/runtime/src/balloon.rs:"))
+                .count(),
+            1,
+            "balloon class owner should emit once; output:\n{output}"
         );
     }
 

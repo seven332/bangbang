@@ -110,7 +110,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ),
         (
             "logger.balloon.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             28,
         ),
         (
@@ -121,7 +121,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ("logger.boot.time", LoggerClassDisposition::Implemented, 1),
         (
             "logger.entropy.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             16,
         ),
         (
@@ -136,7 +136,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ),
         (
             "logger.memory-hotplug.outcome",
-            LoggerClassDisposition::Planned,
+            LoggerClassDisposition::Implemented,
             22,
         ),
         (
@@ -177,7 +177,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         (
             "logger.nonapp.x86",
             LoggerClassDisposition::NotApplicable,
-            15,
+            19,
         ),
         (
             "logger.observability.outcome",
@@ -209,7 +209,11 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             LoggerClassDisposition::Implemented,
             3,
         ),
-        ("logger.serial.outcome", LoggerClassDisposition::Planned, 12),
+        (
+            "logger.serial.outcome",
+            LoggerClassDisposition::Implemented,
+            12,
+        ),
         (
             "logger.snapshot.outcome",
             LoggerClassDisposition::Implemented,
@@ -217,8 +221,8 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
         ),
         (
             "logger.time-identity.outcome",
-            LoggerClassDisposition::Planned,
-            16,
+            LoggerClassDisposition::Implemented,
+            12,
         ),
         (
             "logger.transport.outcome",
@@ -320,7 +324,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             .iter()
             .filter(|class| class.disposition == LoggerClassDisposition::Implemented)
             .count(),
-        19
+        24
     );
     assert_eq!(
         audit
@@ -328,7 +332,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             .iter()
             .filter(|class| class.disposition == LoggerClassDisposition::Planned)
             .count(),
-        5
+        0
     );
     assert_eq!(
         audit
@@ -354,9 +358,8 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
     assert_eq!(
         mapped_dispositions,
         BTreeMap::from([
-            (LoggerClassDisposition::Implemented, 312),
-            (LoggerClassDisposition::Planned, 94),
-            (LoggerClassDisposition::NotApplicable, 62),
+            (LoggerClassDisposition::Implemented, 402),
+            (LoggerClassDisposition::NotApplicable, 66),
         ])
     );
     let planned_owners = audit
@@ -371,7 +374,7 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             *counts.entry(issue).or_insert(0_usize) += 1;
             counts
         });
-    assert_eq!(planned_owners, BTreeMap::from([("#1809", 5)]));
+    assert_eq!(planned_owners, BTreeMap::new());
 
     let compiled_events = audit
         .classes
@@ -386,11 +389,14 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             LoggerCompiledEvent::ApiRequest,
             LoggerCompiledEvent::ApiResult,
             LoggerCompiledEvent::Backend,
+            LoggerCompiledEvent::Balloon,
             LoggerCompiledEvent::Block,
             LoggerCompiledEvent::InstanceStart,
             LoggerCompiledEvent::FlushMetrics,
             LoggerCompiledEvent::BootTime,
+            LoggerCompiledEvent::Entropy,
             LoggerCompiledEvent::Lifecycle,
+            LoggerCompiledEvent::MemoryHotplug,
             LoggerCompiledEvent::Network,
             LoggerCompiledEvent::Observability,
             LoggerCompiledEvent::Pmem,
@@ -399,7 +405,9 @@ fn checked_logger_producer_audit_is_complete_and_stable() {
             LoggerCompiledEvent::ProcessPanic,
             LoggerCompiledEvent::ProcessExit,
             LoggerCompiledEvent::ProcessSignal,
+            LoggerCompiledEvent::Serial,
             LoggerCompiledEvent::Snapshot,
+            LoggerCompiledEvent::TimeIdentity,
             LoggerCompiledEvent::Transport,
             LoggerCompiledEvent::Vsock,
         ])
@@ -453,9 +461,20 @@ fn logger_audit_mutations_fail_closed() {
     let audit = read_logger_producer_audit(&repository_root.join(LOGGER_PRODUCER_AUDIT_PATH))
         .expect("checked logger producer audit must parse");
 
+    validate_logger_producers(&manifest, &audit, &repository_root, AuditMode::Final)
+        .expect("terminal logger audit must pass final validation");
+
+    let mut planned = audit.clone();
+    let class = planned
+        .classes
+        .iter_mut()
+        .find(|class| class.id == "logger.balloon.outcome")
+        .expect("balloon class must exist");
+    class.disposition = LoggerClassDisposition::Planned;
+    class.delivery_issue = Some("#1809".to_string());
     let final_error =
-        validate_logger_producers(&manifest, &audit, &repository_root, AuditMode::Final)
-            .expect_err("final mode must reject planned classes")
+        validate_logger_producers(&manifest, &planned, &repository_root, AuditMode::Final)
+            .expect_err("final mode must reject reintroduced planned classes")
             .to_string();
     assert!(final_error.contains("final logger validation forbids planned class"));
 
