@@ -91,9 +91,10 @@ and ten successful outer/inner operation-latency fields, #1829 owns four logger
 fields plus SIGPIPE, and #1830 owns six fatal-signal fields plus panic and
 seccomp.
 Only a completed child may use a terminal disposition and carry resolvable
-production and validation evidence. #1827 through #1829 are complete, so 60
+production and validation evidence. #1827 through #1830 are complete, so 64
 records are `implemented`, `logger.metrics_fails` is the sole
-`source-neutral` record, and the eight #1830 records remain `planned`.
+`source-neutral` record, four Darwin/Linux boundary records are
+`platform-zero`, and no process record remains `planned`.
 `source-neutral` and `platform-zero` are terminal policy choices, not aliases
 for an undelivered feasible producer.
 
@@ -137,12 +138,13 @@ explicit `PATCH /vm` resume does. Both layers use the same injectable
 process-local monotonic clock, but no ordering relationship between the two
 reported durations is promised.
 
-For #1829, one controller-owned `SharedProcessMetrics` identity supplies narrow
-logger and SIGPIPE facades plus the collection authority. Missed-log,
-rate-limited-log, and SIGPIPE producers use monotonic saturating `SeqCst`
-atomics. They never reset or wait for collection; the SIGPIPE handler performs
-only its atomic value operation and returns. The collector reads the fixed
-three-value vector twice in the same order with a `SeqCst` fence between the
+For #1829 and #1830, one controller-owned `SharedProcessMetrics` identity
+supplies narrow logger, signal, and panic facades plus the collection authority.
+Missed-log, rate-limited-log, and SIGPIPE producers use monotonic saturating
+`SeqCst` atomics. SIGHUP, SIGXCPU, SIGXFSZ, and panic use persistent zero-or-one
+`SeqCst` stores. They never reset or wait for collection; the SIGPIPE handler
+performs only its atomic value operation and returns. The collector reads the
+fixed process vector twice in the same order with a `SeqCst` fence between the
 scans. If the vectors are equal, every first load precedes the fence and every
 second load follows it in the global order. Monotonicity therefore proves that
 the complete vector existed at the fence, which is the cut's linearization
@@ -157,6 +159,46 @@ snapshot. Pinned Firecracker has producers at logger loss, logger limiter
 denial, metrics-write failure, and SIGPIPE, but exact pinned-source search has
 no producer for `logger.metrics_fails`; Bangbang therefore never aliases a
 sink failure into that field.
+
+For #1830, a caught main-runtime panic stores `vmm.panic_count = 1` outside the
+panic hook and before the existing protected terminal-observability attempt.
+It first atomically disarms the fatal control interval; a claim that already won
+keeps its compatible exit and leaves the opaque payload undropped. Otherwise the
+hook remains fixed-output and payload-blind, and resuming the original payload,
+logger failure, metrics failure, and final-line idempotence are unchanged.
+`panic_count`, `signals.sighup`, `signals.sigxcpu`, and `signals.sigxfsz` are
+Firecracker Store fields and therefore remain one on later successful lines.
+SIGPIPE alone remains Incremental and is subtracted from the last completely
+flushed baseline. A failed output attempt advances neither baseline, so a retry
+retains every Store and all intervening SIGPIPE events.
+
+Darwin convergence is deliberately narrow. The public `sigaction` ABI, XNU
+`bsd/kern/kern_sig.c`, and arm64 `bsd/dev/arm/unix_signal.c` were checked against
+real subprocess probes. Parent-delivered SIGHUP, SIGXCPU, and SIGXFSZ retain
+`si_code == 0` and a positive sender PID different from the target. Self-raise,
+RLIMIT_CPU, and RLIMIT_FSIZE delivery retain the target PID. Arm64 Darwin
+rewrites both external and synchronous SIGILL, SIGBUS, and SIGSEGV into the
+same signal-specific fault code with sender zero, so those origins cannot be
+distinguished honestly.
+
+Only the three proven external deliveries may claim an armed control interval.
+The handler performs one atomic claim, one fixed metric store, one release
+publication of the exact exit code, and one `MSG_DONTWAIT` byte send on a
+dedicated retained socket, then returns. The API/no-API poll owner makes one
+ordinary best-effort terminal attempt and exits with the existing compatible
+code. A full socket is already readable, so notification coalescing cannot
+create a wait. Unarmed, malformed, self-originated, duplicate, unsupported-host,
+SIGSYS, SIGILL, SIGBUS, and SIGSEGV delivery takes minimal immediate `_exit`;
+the handler never allocates, locks, serializes, logs, unwinds, or performs VMM
+cleanup. Accordingly `signals.sigill`, `signals.sigbus`, and
+`signals.sigsegv` are terminal macOS platform-zero fields, with no crash-stop
+durability claim.
+
+`seccomp.num_faults` is also terminal platform-zero. Pinned Firecracker records
+Linux `SYS_SECCOMP` SIGSYS faults, but macOS exposes no Linux seccomp filter
+installation or fault producer and Bangbang rejects both runtime seccomp CLI
+forms. The generic SIGSYS handler preserves exit-code compatibility only and
+must never be aliased into `seccomp.num_faults`.
 
 ## Exact Arm64 Shape
 

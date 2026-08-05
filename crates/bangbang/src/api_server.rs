@@ -213,6 +213,7 @@ impl ApiServer {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn run_until(
         &self,
         vmm: &mut impl VmmRequestHandler,
@@ -225,6 +226,25 @@ impl ApiServer {
         )
     }
 
+    pub(crate) fn run_until_fatal_signal(
+        &self,
+        vmm: &mut impl VmmRequestHandler,
+        shutdown_wakeup: &mut UnixStream,
+        fatal_signal_wakeup_fd: RawFd,
+    ) -> Result<(), ApiServerError> {
+        self.run_until_with_periodic_schedulers_and_fatal_signal(
+            vmm,
+            shutdown_wakeup,
+            PeriodicMetricsScheduler::new(),
+            PeriodicBalloonStatisticsScheduler::new(
+                Instant::now(),
+                vmm.balloon_statistics_update_interval(),
+            ),
+            Some(fatal_signal_wakeup_fd),
+        )
+    }
+
+    #[cfg(test)]
     fn run_until_with_periodic_metrics_scheduler(
         &self,
         vmm: &mut impl VmmRequestHandler,
@@ -242,12 +262,30 @@ impl ApiServer {
         )
     }
 
+    #[cfg(test)]
     fn run_until_with_periodic_schedulers(
+        &self,
+        vmm: &mut impl VmmRequestHandler,
+        shutdown_wakeup: &mut UnixStream,
+        metrics_scheduler: PeriodicMetricsScheduler,
+        balloon_scheduler: PeriodicBalloonStatisticsScheduler,
+    ) -> Result<(), ApiServerError> {
+        self.run_until_with_periodic_schedulers_and_fatal_signal(
+            vmm,
+            shutdown_wakeup,
+            metrics_scheduler,
+            balloon_scheduler,
+            None,
+        )
+    }
+
+    fn run_until_with_periodic_schedulers_and_fatal_signal(
         &self,
         vmm: &mut impl VmmRequestHandler,
         shutdown_wakeup: &mut UnixStream,
         mut metrics_scheduler: PeriodicMetricsScheduler,
         mut balloon_scheduler: PeriodicBalloonStatisticsScheduler,
+        fatal_signal_wakeup_fd: Option<RawFd>,
     ) -> Result<(), ApiServerError> {
         self.listener
             .set_nonblocking(true)
@@ -269,9 +307,11 @@ impl ApiServer {
                 &self.listener,
                 shutdown_wakeup,
                 vmm.process_exit_wakeup_fd(),
+                fatal_signal_wakeup_fd,
                 min_poll_timeout_ms(metrics_timeout, balloon_timeout),
             )? {
                 ApiServerWaitResult::Ready => {}
+                ApiServerWaitResult::FatalSignal => return Ok(()),
                 ApiServerWaitResult::TimedOut => {}
             }
             if drain_shutdown_wakeup(shutdown_wakeup)? {
@@ -354,6 +394,7 @@ fn handle_due_periodic_schedulers(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApiServerWaitResult {
     Ready,
+    FatalSignal,
     TimedOut,
 }
 
@@ -370,6 +411,7 @@ fn wait_for_listener_or_shutdown(
     listener: &UnixListener,
     shutdown_wakeup: &UnixStream,
     process_exit_wakeup_fd: Option<RawFd>,
+    fatal_signal_wakeup_fd: Option<RawFd>,
     timeout_ms: Option<i32>,
 ) -> Result<ApiServerWaitResult, ApiServerError> {
     let mut poll_fds = [
@@ -388,15 +430,12 @@ fn wait_for_listener_or_shutdown(
             events: libc::POLLIN,
             revents: 0,
         },
+        libc::pollfd {
+            fd: fatal_signal_wakeup_fd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
-    let poll_fd_count = if process_exit_wakeup_fd.is_some() {
-        poll_fds.len()
-    } else {
-        poll_fds.len() - 1
-    };
-    let poll_fds = poll_fds
-        .get_mut(..poll_fd_count)
-        .ok_or(ApiServerError::Connection(std::io::ErrorKind::InvalidInput))?;
 
     loop {
         for poll_fd in poll_fds.iter_mut() {
@@ -413,6 +452,12 @@ fn wait_for_listener_or_shutdown(
             )
         };
         if result > 0 {
+            let Some(fatal_signal) = poll_fds.last() else {
+                return Err(ApiServerError::Connection(std::io::ErrorKind::InvalidInput));
+            };
+            if fatal_signal.revents != 0 {
+                return Ok(ApiServerWaitResult::FatalSignal);
+            }
             return Ok(ApiServerWaitResult::Ready);
         }
         if result == 0 {

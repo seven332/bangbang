@@ -10,7 +10,7 @@ use crate::{
 };
 
 const EXPECTED_PROCESS_FIELDS: usize = 69;
-const COMPLETED_DELIVERY_ISSUES: &[&str] = &["#1827", "#1828", "#1829"];
+const COMPLETED_DELIVERY_ISSUES: &[&str] = &["#1827", "#1828", "#1829", "#1830"];
 
 /// Validate exact process-producer authority against the resolved metrics schema.
 pub fn validate_metrics_process_producers(
@@ -205,6 +205,22 @@ fn validate_record(
             ));
         }
     }
+    if delivery_issue == "#1830" {
+        let expected = if matches!(
+            path,
+            "signals.sighup" | "signals.sigxcpu" | "signals.sigxfsz" | "vmm.panic_count"
+        ) {
+            MetricsProcessProducerDisposition::Implemented
+        } else {
+            MetricsProcessProducerDisposition::PlatformZero
+        };
+        if record.disposition != expected {
+            errors.push(format!(
+                "completed #1830 process metric has the wrong exact disposition: {}",
+                record.field_id
+            ));
+        }
+    }
 
     match record.disposition {
         MetricsProcessProducerDisposition::Planned => {
@@ -390,14 +406,22 @@ fn expected_rationale(
         ("#1829", MetricsProcessProducerBoundary::SignalLifecycle) => {
             "Pinned Firecracker increments SIGPIPE and returns from its handler; Bangbang performs one atomic-only saturating update and freezes it with logger totals in the shared process cut."
         }
+        ("#1830", MetricsProcessProducerBoundary::SignalLifecycle)
+            if matches!(
+                path,
+                "signals.sighup" | "signals.sigxcpu" | "signals.sigxfsz"
+            ) =>
+        {
+            "On macOS, a parent-delivered SIGHUP, SIGXCPU, or SIGXFSZ with code zero and a positive non-self sender PID atomically stores the corresponding field, release-publishes the exact exit code, and sends one bounded nonblocking wakeup before ordinary best-effort terminal observability."
+        }
         ("#1830", MetricsProcessProducerBoundary::SignalLifecycle) => {
-            "Delivery child #1830 owns fatal process-signal classification and remains unresolved in this audit slice."
+            "Darwin arm64 rewrites external and synchronous SIGILL, SIGBUS, and SIGSEGV origins to indistinguishable fault-style siginfo; Bangbang therefore preserves minimal immediate exact exit and keeps the corresponding field terminal platform-zero."
         }
         ("#1830", MetricsProcessProducerBoundary::PanicLifecycle) => {
-            "Delivery child #1830 owns panic capture and fatal convergence and remains unresolved in this audit slice."
+            "Bangbang records one caught main-runtime panic in the shared process snapshot outside the panic hook and before the existing single ordinary terminal observability attempt; panic payloads remain opaque."
         }
         ("#1830", MetricsProcessProducerBoundary::SeccompFault) => {
-            "Delivery child #1830 owns the platform seccomp-fault disposition and evidence and remains unresolved in this audit slice."
+            "macOS provides no Linux seccomp filter-fault producer; Bangbang rejects runtime seccomp controls, keeps SIGSYS as exit-code compatibility only, and emits this field as terminal platform-zero."
         }
         _ => return None,
     })

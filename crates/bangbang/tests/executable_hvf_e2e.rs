@@ -1320,14 +1320,25 @@ mod macos_arm64 {
             );
         }
 
-        let output = bangbang.terminate();
-        assert_clean_shutdown(output, &socket_path, "bangbang");
+        let output = bangbang.stop_with_signal(libc::SIGHUP, "SIGHUP");
+        assert_eq!(
+            output.status.code(),
+            Some(156),
+            "signed SIGHUP should preserve the Firecracker-compatible exit; stdout:\n{}\nstderr:\n{}",
+            output.stdout,
+            output.stderr
+        );
+        assert_eq!(output.stderr, "bangbang: fatal host signal received\n");
+        assert!(
+            !socket_path.exists(),
+            "converged SIGHUP should run ordinary API socket cleanup"
+        );
         assert_terminal_logger_output(
             &logger_path,
             LoggerPrefixExpectation::LevelOrigin,
-            "success",
+            "process-failure",
         );
-        assert_normal_terminal_metrics_output(&metrics_path);
+        assert_fatal_signal_terminal_metrics_output(&metrics_path, "sighup");
         assert!(
             !uds_path.exists(),
             "bangbang shutdown should remove its owned vsock listener path"
@@ -18131,6 +18142,35 @@ mod macos_arm64 {
         assert_eq!(terminal["vmm"]["panic_count"], 0);
         assert!(terminal["vmm"].get("metrics_flush_count").is_none());
         assert!(terminal["vmm"].get("boot_run_loop_status").is_none());
+    }
+
+    fn assert_fatal_signal_terminal_metrics_output(path: &Path, field: &str) {
+        let output = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!(
+                "fatal terminal metrics output {} should be readable: {err}",
+                path.display()
+            )
+        });
+        let lines = output
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|err| {
+                    panic!("fatal terminal metrics line should be valid JSON: {err}; line:\n{line}")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines.len(),
+            3,
+            "session initial, explicit, and fatal-terminal attempts should emit three metrics lines; output:\n{output}"
+        );
+        assert_eq!(lines[0]["signals"][field], 0);
+        assert_eq!(lines[1]["signals"][field], 0);
+        assert_eq!(lines[1]["signals"]["sigpipe"], 1);
+        assert_eq!(lines[2]["signals"][field], 1);
+        assert_eq!(lines[2]["vmm"]["panic_count"], 0);
+        assert_eq!(lines[2]["seccomp"]["num_faults"], 0);
     }
 
     fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str]) {

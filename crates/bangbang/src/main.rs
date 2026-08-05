@@ -8,6 +8,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
@@ -366,7 +368,8 @@ fn run(
                     if contained_shutdown_requested(contained)? {
                         return Ok(());
                     }
-                    fatal_signal_handlers = Some(FatalSignalHandlers::install()?);
+                    fatal_signal_handlers =
+                        Some(FatalSignalHandlers::install(signal_metrics.clone())?);
                     sigpipe_signal_handler = Some(SigpipeSignalHandler::install(signal_metrics)?);
                     if apply_startup_config_file_with_cancel(
                         &mut vmm,
@@ -385,18 +388,30 @@ fn run(
                             return Ok(());
                         }
                         if no_api {
-                            let _ = vmm.log_process_startup(ProcessStartupOutcome::Running);
-                            if let Some(session) = contained.as_mut() {
-                                session
-                                    .send_ready(bangbang_session::Readiness::NoApi)
-                                    .map_err(|_| ProcessError::ContainedSession)?;
-                            }
-                            write_process_stdout_line(
-                                format_args!("status: VM running without API"),
-                                vmm.process_stdout_writer(),
-                            );
-                            let result = wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm);
-                            return result.and_then(|()| contained_wakeup_result(contained));
+                            let fatal_signal_handlers = fatal_signal_handlers
+                                .as_ref()
+                                .ok_or(ProcessError::SignalHandler(std::io::ErrorKind::NotFound))?;
+                            fatal_signal_handlers.arm_control_interval()?;
+                            let result = (|| {
+                                let _ = vmm.log_process_startup(ProcessStartupOutcome::Running);
+                                if let Some(session) = contained.as_mut() {
+                                    session
+                                        .send_ready(bangbang_session::Readiness::NoApi)
+                                        .map_err(|_| ProcessError::ContainedSession)?;
+                                }
+                                write_process_stdout_line(
+                                    format_args!("status: VM running without API"),
+                                    vmm.process_stdout_writer(),
+                                );
+                                wait_for_no_api_shutdown_fatal_signal(
+                                    &mut shutdown_signal,
+                                    &mut vmm,
+                                    fatal_signal_handlers.wakeup_fd(),
+                                )
+                                .and_then(|()| contained_wakeup_result(contained))
+                            })();
+                            let result = fatal_signal_handlers.resolve_control_result(result);
+                            return result;
                         }
 
                         #[cfg(target_os = "macos")]
@@ -453,21 +468,32 @@ fn run(
                         if contained_shutdown_requested(contained)? {
                             return Ok(());
                         }
-                        let _ = vmm.log_api_control(LoggerApiControlOutcome::ServerRunning);
-                        let _ = vmm.log_process_startup(ProcessStartupOutcome::Running);
-                        if let Some(session) = contained.as_mut() {
-                            session
-                                .send_ready(bangbang_session::Readiness::Api)
-                                .map_err(|_| ProcessError::ContainedSession)?;
-                        }
-                        write_process_stdout_line(
-                            format_args!("status: API server listening"),
-                            vmm.process_stdout_writer(),
-                        );
-                        let shutdown_wakeup = shutdown_signal.wakeup_reader();
-                        let result = server
-                            .run_until(&mut vmm, shutdown_wakeup)
-                            .map_err(ProcessError::ApiServer);
+                        let fatal_signal_handlers = fatal_signal_handlers
+                            .as_ref()
+                            .ok_or(ProcessError::SignalHandler(std::io::ErrorKind::NotFound))?;
+                        fatal_signal_handlers.arm_control_interval()?;
+                        let result = (|| {
+                            let _ = vmm.log_api_control(LoggerApiControlOutcome::ServerRunning);
+                            let _ = vmm.log_process_startup(ProcessStartupOutcome::Running);
+                            if let Some(session) = contained.as_mut() {
+                                session
+                                    .send_ready(bangbang_session::Readiness::Api)
+                                    .map_err(|_| ProcessError::ContainedSession)?;
+                            }
+                            write_process_stdout_line(
+                                format_args!("status: API server listening"),
+                                vmm.process_stdout_writer(),
+                            );
+                            let shutdown_wakeup = shutdown_signal.wakeup_reader();
+                            server
+                                .run_until_fatal_signal(
+                                    &mut vmm,
+                                    shutdown_wakeup,
+                                    fatal_signal_handlers.wakeup_fd(),
+                                )
+                                .map_err(ProcessError::ApiServer)
+                        })();
+                        let result = fatal_signal_handlers.resolve_control_result(result);
                         if result.is_ok() {
                             let _ = vmm.log_api_control(LoggerApiControlOutcome::ServerStopped);
                         }
@@ -480,15 +506,40 @@ fn run(
             match execution {
                 Ok(result) => result,
                 Err(payload) => {
-                    panic_bridge::isolate_secondary_panic(|| {
-                        vmm.handle_terminal_observability(ProcessTerminalCategory::Panic);
-                        let _ = vmm.flush_process_stdout(PROCESS_STDOUT_DRAIN_TIMEOUT);
-                    });
-                    panic_bridge::resume_original(payload)
+                    finish_caught_runtime_panic(&mut vmm, fatal_signal_handlers.as_ref(), payload)
                 }
             }
         }
     }
+}
+
+fn finish_caught_runtime_panic<S>(
+    vmm: &mut ProcessVmm<S>,
+    fatal_signal_handlers: Option<&FatalSignalHandlers>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<(), ProcessError>
+where
+    S: vmm::InstanceStartExecutor,
+{
+    panic_bridge::isolate_secondary_panic(|| vmm.record_process_panic());
+    if let Some(handlers) = fatal_signal_handlers
+        && let Err(error) = handlers.resolve_control_result(Ok(()))
+    {
+        // A fatal claim that won before the panic escaped the control owner keeps
+        // its compatible exit. The original payload stays opaque and undropped
+        // until process exit, just as it would on the immediate `_exit` path.
+        std::mem::forget(payload);
+        panic_bridge::isolate_secondary_panic(|| {
+            vmm.handle_terminal_observability(ProcessTerminalCategory::ProcessFailure);
+            let _ = vmm.flush_process_stdout(PROCESS_STDOUT_DRAIN_TIMEOUT);
+        });
+        return Err(error);
+    }
+    panic_bridge::isolate_secondary_panic(|| {
+        vmm.handle_terminal_observability(ProcessTerminalCategory::Panic);
+        let _ = vmm.flush_process_stdout(PROCESS_STDOUT_DRAIN_TIMEOUT);
+    });
+    panic_bridge::resume_original(payload)
 }
 
 fn terminal_result(
@@ -559,6 +610,7 @@ where
     result
 }
 
+#[cfg(test)]
 fn wait_for_no_api_shutdown(
     shutdown_signal: &mut ShutdownSignal,
     vmm: &mut impl VmmRequestHandler,
@@ -570,6 +622,24 @@ fn wait_for_no_api_shutdown(
     )
 }
 
+fn wait_for_no_api_shutdown_fatal_signal(
+    shutdown_signal: &mut ShutdownSignal,
+    vmm: &mut impl VmmRequestHandler,
+    fatal_signal_wakeup_fd: RawFd,
+) -> Result<(), ProcessError> {
+    wait_for_no_api_shutdown_with_periodic_schedulers_and_fatal_signal(
+        shutdown_signal,
+        vmm,
+        PeriodicMetricsScheduler::new(),
+        PeriodicBalloonStatisticsScheduler::new(
+            Instant::now(),
+            vmm.balloon_statistics_update_interval(),
+        ),
+        Some(fatal_signal_wakeup_fd),
+    )
+}
+
+#[cfg(test)]
 fn wait_for_no_api_shutdown_with_periodic_metrics_scheduler(
     shutdown_signal: &mut ShutdownSignal,
     vmm: &mut impl VmmRequestHandler,
@@ -586,11 +656,28 @@ fn wait_for_no_api_shutdown_with_periodic_metrics_scheduler(
     )
 }
 
+#[cfg(test)]
 fn wait_for_no_api_shutdown_with_periodic_schedulers(
+    shutdown_signal: &mut ShutdownSignal,
+    vmm: &mut impl VmmRequestHandler,
+    metrics_scheduler: PeriodicMetricsScheduler,
+    balloon_scheduler: PeriodicBalloonStatisticsScheduler,
+) -> Result<(), ProcessError> {
+    wait_for_no_api_shutdown_with_periodic_schedulers_and_fatal_signal(
+        shutdown_signal,
+        vmm,
+        metrics_scheduler,
+        balloon_scheduler,
+        None,
+    )
+}
+
+fn wait_for_no_api_shutdown_with_periodic_schedulers_and_fatal_signal(
     shutdown_signal: &mut ShutdownSignal,
     vmm: &mut impl VmmRequestHandler,
     mut metrics_scheduler: PeriodicMetricsScheduler,
     mut balloon_scheduler: PeriodicBalloonStatisticsScheduler,
+    fatal_signal_wakeup_fd: Option<RawFd>,
 ) -> Result<(), ProcessError> {
     shutdown_signal.set_nonblocking()?;
 
@@ -599,12 +686,14 @@ fn wait_for_no_api_shutdown_with_periodic_schedulers(
         let metrics_timeout = metrics_scheduler.poll_timeout_ms(now, vmm.metrics_session_epoch());
         let balloon_timeout =
             balloon_scheduler.poll_timeout_ms(now, vmm.balloon_statistics_update_interval());
-        match wait_for_shutdown_or_process_exit(
+        match wait_for_shutdown_or_process_exit_with_fatal_signal(
             shutdown_signal.wakeup_fd(),
             vmm.process_exit_wakeup_fd(),
+            fatal_signal_wakeup_fd,
             min_poll_timeout_ms(metrics_timeout, balloon_timeout),
         )? {
             ProcessWaitResult::Ready => {}
+            ProcessWaitResult::FatalSignal => return Ok(()),
             ProcessWaitResult::TimedOut => {}
         }
         if shutdown_signal.drain_wakeup()? {
@@ -1379,6 +1468,7 @@ enum ProcessError {
     BadConfiguration(String),
     ConfigFile(ConfigFileError),
     ContainedSession,
+    FatalSignal(ProcessExitCode),
     FdTablePreallocation(FdTablePreallocationError),
     Metadata(MetadataFileError),
     PeriodicBalloonStatisticsUpdate(VmmActionError),
@@ -1398,6 +1488,7 @@ impl ProcessError {
             Self::BadConfiguration(_) => ProcessExitCode::BadConfiguration,
             Self::ConfigFile(_) => ProcessExitCode::BadConfiguration,
             Self::ContainedSession => ProcessExitCode::ProcessFailure,
+            Self::FatalSignal(exit_code) => *exit_code,
             Self::FdTablePreallocation(_) => ProcessExitCode::ProcessFailure,
             Self::Metadata(_) => ProcessExitCode::BadConfiguration,
             Self::PeriodicBalloonStatisticsUpdate(_) => ProcessExitCode::ProcessFailure,
@@ -1419,6 +1510,7 @@ impl fmt::Display for ProcessError {
             Self::BadConfiguration(message) => f.write_str(message),
             Self::ConfigFile(err) => write!(f, "config-file error: {err}"),
             Self::ContainedSession => f.write_str("private launcher session failed"),
+            Self::FatalSignal(_) => f.write_str("fatal host signal received"),
             Self::FdTablePreallocation(err) => {
                 write!(f, "file descriptor table preallocation failed: {err}")
             }
@@ -1581,27 +1673,92 @@ struct ShutdownSignal {
     signal_ids: Vec<SigId>,
 }
 
-const FATAL_SIGNAL_EXITS: &[(i32, ProcessExitCode)] = &[
-    (SIGSYS, ProcessExitCode::BadSyscall),
-    (SIGBUS, ProcessExitCode::SigBus),
-    (SIGSEGV, ProcessExitCode::SigSegv),
-    (SIGXFSZ, ProcessExitCode::SigXfsz),
-    (SIGXCPU, ProcessExitCode::SigXcpu),
-    (SIGHUP, ProcessExitCode::SigHup),
-    (SIGILL, ProcessExitCode::SigIll),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FatalSignalMetric {
+    Sigxfsz,
+    Sigxcpu,
+    Sighup,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalFatalSignalSpec {
+    signal: i32,
+    exit_code: ProcessExitCode,
+    metric: FatalSignalMetric,
+}
+
+impl FatalSignalMetric {
+    fn record(self, metrics: &SharedSignalMetrics) {
+        match self {
+            Self::Sigxfsz => metrics.record_sigxfsz(),
+            Self::Sigxcpu => metrics.record_sigxcpu(),
+            Self::Sighup => metrics.record_sighup(),
+        }
+    }
+}
+
+const FATAL_SIGNAL_EXITS: &[(i32, ProcessExitCode, Option<FatalSignalMetric>)] = &[
+    (SIGSYS, ProcessExitCode::BadSyscall, None),
+    (SIGBUS, ProcessExitCode::SigBus, None),
+    (SIGSEGV, ProcessExitCode::SigSegv, None),
+    (
+        SIGXFSZ,
+        ProcessExitCode::SigXfsz,
+        Some(FatalSignalMetric::Sigxfsz),
+    ),
+    (
+        SIGXCPU,
+        ProcessExitCode::SigXcpu,
+        Some(FatalSignalMetric::Sigxcpu),
+    ),
+    (
+        SIGHUP,
+        ProcessExitCode::SigHup,
+        Some(FatalSignalMetric::Sighup),
+    ),
+    (SIGILL, ProcessExitCode::SigIll, None),
 ];
+
+const FATAL_SIGNAL_STATE_DISARMED: u32 = 0;
+const FATAL_SIGNAL_STATE_ARMED: u32 = 1 << 16;
+const FATAL_SIGNAL_STATE_CLAIMED: u32 = 1 << 17;
+const FATAL_SIGNAL_STATE_PUBLISHED: u32 = 1 << 18;
+const FATAL_SIGNAL_EXIT_MASK: u32 = u8::MAX as u32;
+const FATAL_SIGNAL_PUBLISH_SPINS: usize = 64;
 
 #[derive(Debug)]
 struct FatalSignalHandlers {
     signal_ids: Vec<SigId>,
+    wakeup_reader: UnixStream,
+    // Immediate-only target handlers do not capture a writer clone, so the
+    // owner retains the original endpoint to keep the polled reader quiescent.
+    _wakeup_writer: UnixStream,
+    state: Arc<AtomicU32>,
 }
 
 impl FatalSignalHandlers {
-    fn install() -> Result<Self, ProcessError> {
+    fn install(signal_metrics: SharedSignalMetrics) -> Result<Self, ProcessError> {
+        let (wakeup_reader, wakeup_writer) =
+            UnixStream::pair().map_err(|err| ProcessError::SignalHandler(err.kind()))?;
+        wakeup_reader
+            .set_nonblocking(true)
+            .map_err(|err| ProcessError::SignalHandler(err.kind()))?;
+        let process_pid = i32::try_from(std::process::id())
+            .map_err(|_| ProcessError::SignalHandler(std::io::ErrorKind::InvalidInput))?;
+        let state = Arc::new(AtomicU32::new(FATAL_SIGNAL_STATE_DISARMED));
         let mut signal_ids = Vec::with_capacity(FATAL_SIGNAL_EXITS.len());
 
-        for &(signal, exit_code) in FATAL_SIGNAL_EXITS {
-            match register_fatal_signal_exit(signal, exit_code) {
+        for &(signal, exit_code, metric) in FATAL_SIGNAL_EXITS {
+            match register_fatal_signal_action(
+                signal,
+                exit_code,
+                metric,
+                &signal_metrics,
+                &wakeup_writer,
+                &state,
+                process_pid,
+            ) {
                 Ok(signal_id) => signal_ids.push(signal_id),
                 Err(err) => {
                     for signal_id in signal_ids {
@@ -1612,7 +1769,83 @@ impl FatalSignalHandlers {
             }
         }
 
-        Ok(Self { signal_ids })
+        Ok(Self {
+            signal_ids,
+            wakeup_reader,
+            _wakeup_writer: wakeup_writer,
+            state,
+        })
+    }
+
+    fn wakeup_fd(&self) -> RawFd {
+        self.wakeup_reader.as_raw_fd()
+    }
+
+    fn arm_control_interval(&self) -> Result<(), ProcessError> {
+        self.state
+            .compare_exchange(
+                FATAL_SIGNAL_STATE_DISARMED,
+                FATAL_SIGNAL_STATE_ARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| ProcessError::SignalHandler(std::io::ErrorKind::AlreadyExists))
+    }
+
+    fn resolve_control_result(&self, result: Result<(), ProcessError>) -> Result<(), ProcessError> {
+        match self.state.compare_exchange(
+            FATAL_SIGNAL_STATE_ARMED,
+            FATAL_SIGNAL_STATE_DISARMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => result,
+            Err(state) if fatal_signal_state_is_published(state) => {
+                Err(ProcessError::FatalSignal(fatal_signal_exit_code(state)))
+            }
+            Err(state) if fatal_signal_state_is_claimed(state) => {
+                for _ in 0..FATAL_SIGNAL_PUBLISH_SPINS {
+                    std::hint::spin_loop();
+                    let state = self.state.load(Ordering::Acquire);
+                    if fatal_signal_state_is_published(state) {
+                        return Err(ProcessError::FatalSignal(fatal_signal_exit_code(state)));
+                    }
+                }
+                low_level::exit(i32::from(fatal_signal_exit_code(state).value()));
+            }
+            Err(FATAL_SIGNAL_STATE_DISARMED) => result,
+            Err(_) => Err(ProcessError::SignalHandler(std::io::ErrorKind::InvalidData)),
+        }
+    }
+}
+
+const fn fatal_signal_claimed_state(exit_code: ProcessExitCode) -> u32 {
+    FATAL_SIGNAL_STATE_CLAIMED | exit_code.value() as u32
+}
+
+const fn fatal_signal_published_state(exit_code: ProcessExitCode) -> u32 {
+    FATAL_SIGNAL_STATE_PUBLISHED | exit_code.value() as u32
+}
+
+const fn fatal_signal_state_is_claimed(state: u32) -> bool {
+    state & FATAL_SIGNAL_STATE_CLAIMED != 0
+}
+
+const fn fatal_signal_state_is_published(state: u32) -> bool {
+    state & FATAL_SIGNAL_STATE_PUBLISHED != 0
+}
+
+fn fatal_signal_exit_code(state: u32) -> ProcessExitCode {
+    match (state & FATAL_SIGNAL_EXIT_MASK) as u8 {
+        148 => ProcessExitCode::BadSyscall,
+        149 => ProcessExitCode::SigBus,
+        150 => ProcessExitCode::SigSegv,
+        151 => ProcessExitCode::SigXfsz,
+        154 => ProcessExitCode::SigXcpu,
+        156 => ProcessExitCode::SigHup,
+        157 => ProcessExitCode::SigIll,
+        _ => ProcessExitCode::ProcessFailure,
     }
 }
 
@@ -1669,6 +1902,129 @@ fn register_fatal_signal_exit(
         })
     }
     .map_err(|err| ProcessError::SignalHandler(err.kind()))
+}
+
+fn register_fatal_signal_action(
+    signal: i32,
+    exit_code: ProcessExitCode,
+    metric: Option<FatalSignalMetric>,
+    signal_metrics: &SharedSignalMetrics,
+    wakeup_writer: &UnixStream,
+    state: &Arc<AtomicU32>,
+    process_pid: i32,
+) -> Result<SigId, ProcessError> {
+    #[cfg(target_os = "macos")]
+    if let Some(metric) = metric {
+        return register_external_fatal_signal(
+            signal,
+            exit_code,
+            metric,
+            signal_metrics.clone(),
+            wakeup_writer
+                .try_clone()
+                .map_err(|err| ProcessError::SignalHandler(err.kind()))?,
+            Arc::clone(state),
+            process_pid,
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (metric, signal_metrics, wakeup_writer, state, process_pid);
+
+    register_fatal_signal_exit(signal, exit_code)
+}
+
+#[cfg(target_os = "macos")]
+fn register_external_fatal_signal(
+    signal: i32,
+    exit_code: ProcessExitCode,
+    metric: FatalSignalMetric,
+    signal_metrics: SharedSignalMetrics,
+    wakeup_writer: UnixStream,
+    state: Arc<AtomicU32>,
+    process_pid: i32,
+) -> Result<SigId, ProcessError> {
+    let spec = ExternalFatalSignalSpec {
+        signal,
+        exit_code,
+        metric,
+    };
+    // SAFETY: The action reads the kernel-provided fixed `siginfo_t` fields,
+    // performs one lock-free claim and fixed metric store, publishes the code,
+    // and makes one bounded nonblocking send on a retained socket. Every
+    // unarmed, ambiguous, or duplicate delivery invokes async-signal-safe
+    // `_exit`. It never allocates, locks, serializes, logs, or unwinds.
+    unsafe {
+        signal_hook_registry::register_unchecked(signal, move |info| {
+            if !try_publish_external_fatal_signal(
+                spec,
+                info,
+                process_pid,
+                &signal_metrics,
+                &state,
+                wakeup_writer.as_raw_fd(),
+            ) {
+                low_level::exit(i32::from(exit_code.value()));
+            }
+        })
+    }
+    .map_err(|err| ProcessError::SignalHandler(err.kind()))
+}
+
+#[cfg(target_os = "macos")]
+fn try_publish_external_fatal_signal(
+    spec: ExternalFatalSignalSpec,
+    info: &libc::siginfo_t,
+    process_pid: i32,
+    signal_metrics: &SharedSignalMetrics,
+    state: &AtomicU32,
+    wakeup_fd: RawFd,
+) -> bool {
+    if !is_safe_darwin_external_fatal_signal(spec.signal, info, process_pid)
+        || state
+            .compare_exchange(
+                FATAL_SIGNAL_STATE_ARMED,
+                fatal_signal_claimed_state(spec.exit_code),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    {
+        return false;
+    }
+
+    spec.metric.record(signal_metrics);
+    state.store(
+        fatal_signal_published_state(spec.exit_code),
+        Ordering::Release,
+    );
+    let byte = b"X";
+    // SAFETY: `byte` is valid for its one-byte length and `wakeup_fd` is the
+    // retained write endpoint owned by the registered signal action. The call
+    // is nonblocking and its result is intentionally coalesced: a full socket
+    // is already readable by the control owner.
+    let _ = unsafe {
+        libc::send(
+            wakeup_fd,
+            byte.as_ptr().cast(),
+            byte.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn is_safe_darwin_external_fatal_signal(
+    signal: i32,
+    info: &libc::siginfo_t,
+    process_pid: i32,
+) -> bool {
+    matches!(signal, SIGHUP | SIGXCPU | SIGXFSZ)
+        && info.si_signo == signal
+        && info.si_code == 0
+        && info.si_pid > 0
+        && info.si_pid != process_pid
 }
 
 impl ShutdownSignal {
@@ -1733,9 +2089,24 @@ impl ShutdownSignal {
     }
 }
 
+#[cfg(test)]
 fn wait_for_shutdown_or_process_exit(
     shutdown_wakeup_fd: RawFd,
     process_exit_wakeup_fd: Option<RawFd>,
+    timeout_ms: Option<i32>,
+) -> Result<ProcessWaitResult, ProcessError> {
+    wait_for_shutdown_or_process_exit_with_fatal_signal(
+        shutdown_wakeup_fd,
+        process_exit_wakeup_fd,
+        None,
+        timeout_ms,
+    )
+}
+
+fn wait_for_shutdown_or_process_exit_with_fatal_signal(
+    shutdown_wakeup_fd: RawFd,
+    process_exit_wakeup_fd: Option<RawFd>,
+    fatal_signal_wakeup_fd: Option<RawFd>,
     timeout_ms: Option<i32>,
 ) -> Result<ProcessWaitResult, ProcessError> {
     let mut poll_fds = [
@@ -1749,17 +2120,12 @@ fn wait_for_shutdown_or_process_exit(
             events: libc::POLLIN,
             revents: 0,
         },
+        libc::pollfd {
+            fd: fatal_signal_wakeup_fd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
-    let poll_fd_count = if process_exit_wakeup_fd.is_some() {
-        poll_fds.len()
-    } else {
-        poll_fds.len() - 1
-    };
-    let poll_fds = poll_fds
-        .get_mut(..poll_fd_count)
-        .ok_or(ProcessError::SignalHandler(
-            std::io::ErrorKind::InvalidInput,
-        ))?;
 
     loop {
         for poll_fd in poll_fds.iter_mut() {
@@ -1776,6 +2142,14 @@ fn wait_for_shutdown_or_process_exit(
             )
         };
         if result > 0 {
+            let Some(fatal_signal) = poll_fds.last() else {
+                return Err(ProcessError::SignalHandler(
+                    std::io::ErrorKind::InvalidInput,
+                ));
+            };
+            if fatal_signal.revents != 0 {
+                return Ok(ProcessWaitResult::FatalSignal);
+            }
             return Ok(ProcessWaitResult::Ready);
         }
         if result == 0 {
@@ -1792,6 +2166,7 @@ fn wait_for_shutdown_or_process_exit(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessWaitResult {
     Ready,
+    FatalSignal,
     TimedOut,
 }
 
@@ -2695,6 +3070,7 @@ fn unsupported_flag_equals_syntax(arg: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
     use std::cell::{Cell, RefCell};
     use std::ffi::{CString, OsString};
     use std::fs;
@@ -2704,6 +3080,8 @@ mod tests {
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
+    use std::process::{Command as ProcessCommand, Output, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2723,7 +3101,7 @@ mod tests {
     use bangbang_runtime::memory_hotplug::MemoryHotplugConfigInput;
     use bangbang_runtime::metrics::{
         MetricsConfigError, MetricsConfigInput, MetricsDiagnostics, MetricsFlushError,
-        ProcessLatencyBoundary, ProcessLatencyOperation,
+        ProcessLatencyBoundary, ProcessLatencyOperation, SharedSignalMetrics,
     };
     use bangbang_runtime::mmds::MmdsDataStoreError;
     use bangbang_runtime::network::NetworkInterfaceConfigInput;
@@ -2757,6 +3135,11 @@ mod tests {
         ProcessExitCode, SnapshotInspectionPath, StartupConfig, StartupTimeClock,
         StartupTimeConfig, parse_process_args,
     };
+
+    const CAUGHT_RUNTIME_PANIC_CHILD_ENV: &str = "BANGBANG_CAUGHT_RUNTIME_PANIC_CHILD";
+    const FATAL_SIGNAL_CLAIMED_CHILD_ENV: &str = "BANGBANG_FATAL_SIGNAL_CLAIMED_CHILD";
+    const FATAL_SIGNAL_FALLBACK_CHILD_ENV: &str = "BANGBANG_FATAL_SIGNAL_FALLBACK_CHILD";
+    static NEXT_METRICS_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug, Clone)]
     struct TestInstanceStarter;
@@ -3193,8 +3576,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after unix epoch")
             .as_nanos();
+        let path_id = NEXT_METRICS_PATH_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "bangbang-main-test-{}-{nanos}-{name}.metrics",
+            "bangbang-main-test-{}-{nanos}-{path_id}-{name}.metrics",
             std::process::id()
         ))
     }
@@ -3341,6 +3725,440 @@ mod tests {
         });
         assert!(successful_ids.is_empty());
         assert_eq!(*unregistered.borrow(), [1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_siginfo(signal: i32, code: i32, sender_pid: i32) -> libc::siginfo_t {
+        // SAFETY: Darwin exposes `siginfo_t` as a plain C record. Zeroing the
+        // unused fields and assigning the three classifier inputs creates a
+        // valid synthetic record for this pure predicate test.
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        info.si_signo = signal;
+        info.si_code = code;
+        info.si_pid = sender_pid;
+        info
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_fatal_signal_classifier_admits_only_proven_external_deliveries() {
+        let process_pid = 500;
+        let sender_pid = 700;
+
+        for signal in [libc::SIGHUP, libc::SIGXCPU, libc::SIGXFSZ] {
+            assert!(super::is_safe_darwin_external_fatal_signal(
+                signal,
+                &test_siginfo(signal, 0, sender_pid),
+                process_pid,
+            ));
+            assert!(!super::is_safe_darwin_external_fatal_signal(
+                signal,
+                &test_siginfo(signal, 1, sender_pid),
+                process_pid,
+            ));
+            assert!(!super::is_safe_darwin_external_fatal_signal(
+                signal,
+                &test_siginfo(signal, 0, process_pid),
+                process_pid,
+            ));
+            assert!(!super::is_safe_darwin_external_fatal_signal(
+                signal,
+                &test_siginfo(signal, 0, 0),
+                process_pid,
+            ));
+            assert!(!super::is_safe_darwin_external_fatal_signal(
+                signal,
+                &test_siginfo(signal, 0, -1),
+                process_pid,
+            ));
+            assert!(!super::is_safe_darwin_external_fatal_signal(
+                signal,
+                &test_siginfo(libc::SIGTERM, 0, sender_pid),
+                process_pid,
+            ));
+        }
+
+        for signal in [libc::SIGILL, libc::SIGBUS, libc::SIGSEGV] {
+            assert!(!super::is_safe_darwin_external_fatal_signal(
+                signal,
+                &test_siginfo(signal, 0, sender_pid),
+                process_pid,
+            ));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fatal_signal_publication_is_single_fixed_and_wakes_the_owner() {
+        let (mut wakeup_reader, wakeup_writer) = UnixStream::pair().expect("socket pair");
+        wakeup_reader
+            .set_nonblocking(true)
+            .expect("reader should become nonblocking");
+        let state = AtomicU32::new(super::FATAL_SIGNAL_STATE_ARMED);
+        let metrics = SharedSignalMetrics::default();
+        let spec = super::ExternalFatalSignalSpec {
+            signal: libc::SIGHUP,
+            exit_code: ProcessExitCode::SigHup,
+            metric: super::FatalSignalMetric::Sighup,
+        };
+        let info = test_siginfo(libc::SIGHUP, 0, 700);
+
+        assert!(super::try_publish_external_fatal_signal(
+            spec,
+            &info,
+            500,
+            &metrics,
+            &state,
+            wakeup_writer.as_raw_fd(),
+        ));
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            super::fatal_signal_published_state(ProcessExitCode::SigHup)
+        );
+        assert_eq!(metrics.snapshot().sighup(), 1);
+        let mut byte = [0; 1];
+        assert_eq!(
+            wakeup_reader
+                .read(&mut byte)
+                .expect("fatal notification should be readable"),
+            1
+        );
+        assert_eq!(byte, *b"X");
+
+        assert!(!super::try_publish_external_fatal_signal(
+            spec,
+            &info,
+            500,
+            &metrics,
+            &state,
+            wakeup_writer.as_raw_fd(),
+        ));
+        assert_eq!(metrics.snapshot().sighup(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn saturated_fatal_signal_notifier_is_already_readable_and_never_retried() {
+        let (mut wakeup_reader, mut wakeup_writer) = UnixStream::pair().expect("socket pair");
+        wakeup_reader
+            .set_nonblocking(true)
+            .expect("reader should become nonblocking");
+        wakeup_writer
+            .set_nonblocking(true)
+            .expect("writer should become nonblocking");
+        let chunk = [b'x'; 4096];
+        loop {
+            match wakeup_writer.write(&chunk) {
+                Ok(0) => panic!("socket filler unexpectedly wrote zero bytes"),
+                Ok(_) => {}
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) => panic!("socket filler failed: {err}"),
+            }
+        }
+
+        let state = AtomicU32::new(super::FATAL_SIGNAL_STATE_ARMED);
+        let metrics = SharedSignalMetrics::default();
+        let spec = super::ExternalFatalSignalSpec {
+            signal: libc::SIGXCPU,
+            exit_code: ProcessExitCode::SigXcpu,
+            metric: super::FatalSignalMetric::Sigxcpu,
+        };
+        assert!(super::try_publish_external_fatal_signal(
+            spec,
+            &test_siginfo(libc::SIGXCPU, 0, 700),
+            500,
+            &metrics,
+            &state,
+            wakeup_writer.as_raw_fd(),
+        ));
+        assert_eq!(metrics.snapshot().sigxcpu(), 1);
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            super::fatal_signal_published_state(ProcessExitCode::SigXcpu)
+        );
+        let mut byte = [0; 1];
+        assert_eq!(
+            wakeup_reader
+                .read(&mut byte)
+                .expect("saturated notifier should remain readable"),
+            1
+        );
+    }
+
+    #[test]
+    fn fatal_signal_control_interval_disarms_or_prefers_a_published_claim() {
+        let (wakeup_reader, wakeup_writer) = UnixStream::pair().expect("socket pair");
+        let state = Arc::new(AtomicU32::new(super::FATAL_SIGNAL_STATE_DISARMED));
+        let handlers = super::FatalSignalHandlers {
+            signal_ids: Vec::new(),
+            wakeup_reader,
+            _wakeup_writer: wakeup_writer,
+            state: Arc::clone(&state),
+        };
+
+        handlers
+            .arm_control_interval()
+            .expect("fresh control interval should arm");
+        let ordinary = Err(ProcessError::ApiServer(ApiServerError::Accept(
+            ErrorKind::BrokenPipe,
+        )));
+        assert!(matches!(
+            handlers.resolve_control_result(ordinary),
+            Err(ProcessError::ApiServer(ApiServerError::Accept(
+                ErrorKind::BrokenPipe
+            )))
+        ));
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            super::FATAL_SIGNAL_STATE_DISARMED
+        );
+
+        state.store(
+            super::fatal_signal_published_state(ProcessExitCode::SigXfsz),
+            Ordering::Release,
+        );
+        assert!(matches!(
+            handlers.resolve_control_result(Err(ProcessError::ApiServer(ApiServerError::Accept(
+                ErrorKind::ConnectionReset
+            )))),
+            Err(ProcessError::FatalSignal(ProcessExitCode::SigXfsz))
+        ));
+    }
+
+    #[test]
+    fn fatal_signal_claimed_state_child() {
+        if std::env::var_os(FATAL_SIGNAL_CLAIMED_CHILD_ENV).is_none() {
+            return;
+        }
+        let (wakeup_reader, wakeup_writer) = UnixStream::pair().expect("socket pair");
+        let handlers = super::FatalSignalHandlers {
+            signal_ids: Vec::new(),
+            wakeup_reader,
+            _wakeup_writer: wakeup_writer,
+            state: Arc::new(AtomicU32::new(super::fatal_signal_claimed_state(
+                ProcessExitCode::SigXcpu,
+            ))),
+        };
+        let _ = handlers.resolve_control_result(Ok(()));
+        panic!("unpublished claim must terminate instead of returning");
+    }
+
+    #[test]
+    fn unpublished_fatal_signal_claim_uses_bounded_exact_exit_fallback() {
+        let output = ProcessCommand::new(
+            std::env::current_exe().expect("test executable should be discoverable"),
+        )
+        .args([
+            "--exact",
+            "tests::fatal_signal_claimed_state_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(FATAL_SIGNAL_CLAIMED_CHILD_ENV, "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("fatal-state child should run");
+
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(ProcessExitCode::SigXcpu.value()))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn unlinked_signal_fixture_fd(name: &str) -> RawFd {
+        let mut path = format!("/tmp/bangbang-{name}.XXXXXX\0").into_bytes();
+        // SAFETY: `path` is a writable, NUL-terminated mkstemp template and
+        // remains live across both C calls. A successful descriptor stays open
+        // after unlink and is reclaimed by the child process's exact `_exit`.
+        let fd = unsafe { libc::mkstemp(path.as_mut_ptr().cast()) };
+        assert!(fd >= 0, "signal fixture should open");
+        // SAFETY: `mkstemp` replaced the template with a live NUL-terminated
+        // path. Immediate unlink prevents a deliberate signal exit from leaving
+        // a filesystem artifact behind.
+        assert_eq!(unsafe { libc::unlink(path.as_ptr().cast()) }, 0);
+        fd
+    }
+
+    #[cfg(target_os = "macos")]
+    fn trigger_sigsegv_fault() {
+        // SAFETY: This runs only in a dedicated subprocess whose installed
+        // production handler must terminate it. The invalid volatile access is
+        // intentional test stimulus and cannot return to the test harness.
+        unsafe {
+            std::ptr::write_volatile(std::ptr::dangling_mut::<u8>(), 1);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn trigger_sigill_fault() {
+        // SAFETY: The undefined instruction is deliberate subprocess-only test
+        // stimulus for the installed minimal SIGILL handler.
+        unsafe {
+            core::arch::asm!(".word 0", options(noreturn));
+        }
+    }
+
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    fn trigger_sigill_fault() {
+        // SAFETY: The non-arm fallback still exercises the subprocess-only
+        // immediate SIGILL path on unsupported development architectures.
+        assert_eq!(unsafe { libc::raise(libc::SIGILL) }, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn trigger_sigbus_fault() {
+        let fd = unlinked_signal_fixture_fd("sigbus");
+        // SAFETY: The descriptor is valid, the mapping is checked, and the
+        // subsequent truncated-file read intentionally raises SIGBUS in this
+        // dedicated subprocess.
+        unsafe {
+            assert_eq!(libc::ftruncate(fd, 4096), 0);
+            let mapping = libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            assert_ne!(mapping, libc::MAP_FAILED);
+            assert_eq!(libc::ftruncate(fd, 0), 0);
+            let _ = std::ptr::read_volatile(mapping.cast::<u8>());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn trigger_sigxfsz_resource_limit() -> ! {
+        let fd = unlinked_signal_fixture_fd("sigxfsz");
+        let limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: The limit record and one-byte buffer are live for the calls.
+        // This dedicated child intentionally exceeds its zero file-size limit.
+        unsafe {
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+            let _ = libc::write(fd, b"X".as_ptr().cast(), 1);
+        }
+        loop {
+            // SAFETY: This subprocess has the production SIGXFSZ handler. Some
+            // Darwin runs return from the rejected write before dispatching the
+            // pending signal, so wait without active polling; the parent owns a
+            // fixed five-second kill deadline if delivery never occurs.
+            let _ = unsafe { libc::pause() };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn trigger_sigxcpu_resource_limit() -> ! {
+        let limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 1,
+        };
+        // SAFETY: The limit record is live for the call. The child then burns
+        // CPU until Darwin delivers its self-originated SIGXCPU.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CPU, &limit) }, 0);
+        loop {
+            std::hint::spin_loop();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fatal_signal_fallback_child() {
+        let Ok(case) = std::env::var(FATAL_SIGNAL_FALLBACK_CHILD_ENV) else {
+            return;
+        };
+        let handlers = super::FatalSignalHandlers::install(SharedSignalMetrics::default())
+            .expect("production fatal handlers should install");
+        handlers
+            .arm_control_interval()
+            .expect("fallback child should arm the control interval");
+
+        match case.as_str() {
+            "self-sighup" => {
+                // SAFETY: SIGHUP has the just-installed production handler.
+                assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+            }
+            "fault-sigill" => trigger_sigill_fault(),
+            "fault-sigbus" => trigger_sigbus_fault(),
+            "fault-sigsegv" => trigger_sigsegv_fault(),
+            "resource-sigxcpu" => trigger_sigxcpu_resource_limit(),
+            "resource-sigxfsz" => trigger_sigxfsz_resource_limit(),
+            _ => panic!("unknown fatal fallback child case"),
+        }
+        panic!("fatal fallback stimulus must not return");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_fatal_signal_fallback_child(case: &str) -> Output {
+        let mut child = ProcessCommand::new(
+            std::env::current_exe().expect("test executable should be discoverable"),
+        )
+        .args([
+            "--exact",
+            "tests::fatal_signal_fallback_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(FATAL_SIGNAL_FALLBACK_CHILD_ENV, case)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("fatal fallback child should spawn");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if child
+                .try_wait()
+                .expect("fatal fallback child status should be observable")
+                .is_some()
+            {
+                return child
+                    .wait_with_output()
+                    .expect("fatal fallback child output should be collected");
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("timed-out child should be killed");
+                let output = child
+                    .wait_with_output()
+                    .expect("timed-out child output should be collected");
+                panic!(
+                    "fatal fallback child {case} timed out: stdout={:?} stderr={:?}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn synchronous_faults_and_self_resource_signals_use_exact_immediate_exit() {
+        for (case, expected) in [
+            ("self-sighup", ProcessExitCode::SigHup),
+            ("fault-sigill", ProcessExitCode::SigIll),
+            ("fault-sigbus", ProcessExitCode::SigBus),
+            ("fault-sigsegv", ProcessExitCode::SigSegv),
+            ("resource-sigxcpu", ProcessExitCode::SigXcpu),
+            ("resource-sigxfsz", ProcessExitCode::SigXfsz),
+        ] {
+            let output = spawn_fatal_signal_fallback_child(case);
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(expected.value())),
+                "case {case}: stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for bytes in [&output.stdout, &output.stderr] {
+                let text = String::from_utf8_lossy(bytes);
+                assert!(!text.contains("operation=shutdown"), "case {case}: {text}");
+                assert!(!text.contains("event=process-exit"), "case {case}: {text}");
+            }
+        }
     }
 
     fn unique_serial_path(name: &str) -> PathBuf {
@@ -5250,6 +6068,203 @@ mod tests {
         assert_eq!(err, super::ConfigFileError::MissingSection("boot-source"));
     }
 
+    #[derive(Debug)]
+    struct CaughtRuntimePanicPayload(&'static str);
+
+    fn run_caught_runtime_panic_child(case: &str) {
+        const SECRET: &str = "caught-runtime-panic-secret";
+        let logger_path = unique_logger_path("caught-runtime-panic");
+        let mut metrics_fifo =
+            (case == "blocked-metrics").then(|| MetricsFifo::create("caught-runtime-panic"));
+        let metrics_path = metrics_fifo.as_ref().map_or_else(
+            || unique_metrics_path("caught-runtime-panic"),
+            |fifo| fifo.path.clone(),
+        );
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(&logger_path),
+        ))
+        .expect("logger should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+
+        if let Some(fifo) = metrics_fifo.as_mut() {
+            fifo.fill_to_capacity();
+            vmm.handle_initial_metrics_flush();
+            let failed_initial = fifo.drain_available();
+            assert!(failed_initial.iter().all(|byte| *byte == b'x'));
+            fifo.fill_to_capacity();
+        } else {
+            vmm.handle_initial_metrics_flush();
+        }
+
+        let bridge = crate::panic_bridge::PanicBridge::install();
+        assert!(bridge.attach(vmm.emergency_logger()));
+        let expected = Arc::new(CaughtRuntimePanicPayload(SECRET));
+        let thrown = Arc::clone(&expected);
+        let payload: Box<dyn Any + Send> = std::panic::catch_unwind(move || {
+            std::panic::panic_any(thrown);
+        })
+        .expect_err("runtime panic should be caught");
+        let (wakeup_reader, wakeup_writer) = UnixStream::pair().expect("socket pair");
+        let fatal_state = Arc::new(AtomicU32::new(super::FATAL_SIGNAL_STATE_DISARMED));
+        let fatal_signal_handlers = super::FatalSignalHandlers {
+            signal_ids: Vec::new(),
+            wakeup_reader,
+            _wakeup_writer: wakeup_writer,
+            state: Arc::clone(&fatal_state),
+        };
+        fatal_signal_handlers
+            .arm_control_interval()
+            .expect("caught-panic control interval should arm");
+        let resumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::finish_caught_runtime_panic(&mut vmm, Some(&fatal_signal_handlers), payload)
+        }))
+        .expect_err("the original payload should resume");
+        assert_eq!(
+            fatal_state.load(Ordering::Acquire),
+            super::FATAL_SIGNAL_STATE_DISARMED,
+            "panic unwind must not leave a return-capable fatal handler armed"
+        );
+        bridge.restore();
+        let resumed = resumed
+            .downcast::<Arc<CaughtRuntimePanicPayload>>()
+            .expect("the resumed payload should retain its type");
+        assert!(Arc::ptr_eq(&expected, &resumed));
+        assert_eq!(resumed.0, SECRET);
+        drop(vmm);
+
+        let logger = fs::read_to_string(&logger_path).expect("panic logger should be readable");
+        assert_eq!(logger.matches("event=process-panic\n").count(), 1);
+        assert_eq!(
+            logger
+                .matches("operation=shutdown outcome=abnormal\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            logger
+                .matches("event=process-exit category=panic\n")
+                .count(),
+            1
+        );
+        assert!(!logger.contains(SECRET));
+
+        if let Some(fifo) = metrics_fifo.as_mut() {
+            let failed_terminal = fifo.drain_available();
+            assert!(failed_terminal.iter().all(|byte| *byte == b'x'));
+        } else {
+            let metrics_text =
+                fs::read_to_string(&metrics_path).expect("panic metrics should remain readable");
+            let metrics = metrics_values_from_text(&metrics_text);
+            assert_eq!(metrics.len(), 2, "metrics output: {metrics_text}");
+            assert!(
+                metrics
+                    .iter()
+                    .all(|line| line["utc_timestamp_ms"].as_u64().is_some())
+            );
+            assert_eq!(metrics[0]["vmm"]["panic_count"], 0);
+            assert_eq!(metrics[1]["vmm"]["panic_count"], 1);
+            assert_eq!(metrics[1]["seccomp"]["num_faults"], 0);
+            assert!(!metrics_text.contains(SECRET));
+            fs::remove_file(&metrics_path).expect("metrics fixture should clean up");
+        }
+        fs::remove_file(logger_path).expect("logger fixture should clean up");
+    }
+
+    #[test]
+    fn caught_runtime_panic_child() {
+        let Ok(case) = std::env::var(CAUGHT_RUNTIME_PANIC_CHILD_ENV) else {
+            return;
+        };
+        run_caught_runtime_panic_child(&case);
+    }
+
+    #[test]
+    fn caught_runtime_panic_records_once_preserves_payload_and_bounds_sink_failure() {
+        for case in ["normal", "blocked-metrics"] {
+            let output = ProcessCommand::new(
+                std::env::current_exe().expect("test executable should be discoverable"),
+            )
+            .args([
+                "--exact",
+                "tests::caught_runtime_panic_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CAUGHT_RUNTIME_PANIC_CHILD_ENV, case)
+            .env("RUST_BACKTRACE", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("caught-runtime-panic child should run");
+
+            assert!(
+                output.status.success(),
+                "case {case} failed: stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for bytes in [&output.stdout, &output.stderr] {
+                assert!(!String::from_utf8_lossy(bytes).contains("caught-runtime-panic-secret"));
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicPayloadDropProbe(Arc<AtomicBool>);
+
+    impl Drop for PanicPayloadDropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn published_fatal_signal_supersedes_caught_panic_without_dropping_payload() {
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+        let (wakeup_reader, wakeup_writer) = UnixStream::pair().expect("socket pair");
+        let state = Arc::new(AtomicU32::new(super::fatal_signal_published_state(
+            ProcessExitCode::SigHup,
+        )));
+        let handlers = super::FatalSignalHandlers {
+            signal_ids: Vec::new(),
+            wakeup_reader,
+            _wakeup_writer: wakeup_writer,
+            state,
+        };
+        let payload_dropped = Arc::new(AtomicBool::new(false));
+        let payload: Box<dyn Any + Send> =
+            Box::new(PanicPayloadDropProbe(Arc::clone(&payload_dropped)));
+
+        assert_eq!(
+            super::finish_caught_runtime_panic(&mut vmm, Some(&handlers), payload),
+            Err(ProcessError::FatalSignal(ProcessExitCode::SigHup))
+        );
+        assert!(
+            !payload_dropped.load(Ordering::Acquire),
+            "the superseded opaque panic payload must not run arbitrary Drop code"
+        );
+    }
+
     #[test]
     fn terminal_observability_drains_initial_preserves_error_and_is_idempotent() {
         let metrics_path = unique_metrics_path("server-error-final");
@@ -5721,6 +6736,25 @@ mod tests {
         assert_eq!(
             super::wait_for_shutdown_or_process_exit(shutdown_signal.wakeup_fd(), None, Some(0)),
             Ok(super::ProcessWaitResult::TimedOut)
+        );
+    }
+
+    #[test]
+    fn no_api_wait_helper_prioritizes_fatal_signal_notification() {
+        let shutdown_signal = test_shutdown_signal();
+        let (fatal_reader, mut fatal_writer) = UnixStream::pair().expect("fatal socket pair");
+        fatal_writer
+            .write_all(b"X")
+            .expect("fatal notifier should accept one byte");
+
+        assert_eq!(
+            super::wait_for_shutdown_or_process_exit_with_fatal_signal(
+                shutdown_signal.wakeup_fd(),
+                None,
+                Some(fatal_reader.as_raw_fd()),
+                Some(0),
+            ),
+            Ok(super::ProcessWaitResult::FatalSignal)
         );
     }
 

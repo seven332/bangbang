@@ -237,6 +237,7 @@ impl From<firecracker::MetricsLineBuildError> for MetricsFlushError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MetricsSnapshot {
     generation: u64,
+    panic_count: u64,
     diagnostics: MetricsDiagnostics,
     deprecated_api: DeprecatedApiMetrics,
     get_api_requests: GetApiRequestMetrics,
@@ -250,6 +251,7 @@ impl MetricsSnapshot {
     fn delta_since(&self, previous: &Self) -> Self {
         Self {
             generation: self.generation,
+            panic_count: self.panic_count,
             diagnostics: self.diagnostics.delta_since(&previous.diagnostics),
             deprecated_api: self.deprecated_api.delta_since(previous.deprecated_api),
             get_api_requests: self.get_api_requests.delta_since(previous.get_api_requests),
@@ -324,6 +326,10 @@ impl MetricsState {
 
     pub(crate) fn signal_metrics(&self) -> SharedSignalMetrics {
         self.shared_process_metrics.signal_metrics()
+    }
+
+    pub(crate) fn record_process_panic(&self) {
+        self.shared_process_metrics.record_process_panic();
     }
 
     pub fn configure(&mut self, input: MetricsConfigInput) -> Result<(), MetricsConfigError> {
@@ -606,6 +612,7 @@ impl MetricsState {
         self.process_generation = generation;
         let current = MetricsSnapshot {
             generation,
+            panic_count: process_metrics.panic_count,
             diagnostics: diagnostics.clone().merged_with(
                 MetricsDiagnostics::new().with_signal_metrics(process_metrics.signal_metrics),
             ),
@@ -792,27 +799,57 @@ impl LatencyMetrics {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SignalMetrics {
+    sigxfsz: u64,
+    sigxcpu: u64,
     sigpipe: u64,
+    sighup: u64,
 }
-
-impl_incremental_delta!(SignalMetrics { sigpipe });
 
 impl SignalMetrics {
     pub const fn new(sigpipe: u64) -> Self {
-        Self { sigpipe }
+        Self {
+            sigxfsz: 0,
+            sigxcpu: 0,
+            sigpipe,
+            sighup: 0,
+        }
     }
 
     pub const fn is_empty(self) -> bool {
-        self.sigpipe == 0
+        self.sigxfsz == 0 && self.sigxcpu == 0 && self.sigpipe == 0 && self.sighup == 0
+    }
+
+    pub const fn sigxfsz(self) -> u64 {
+        self.sigxfsz
+    }
+
+    pub const fn sigxcpu(self) -> u64 {
+        self.sigxcpu
     }
 
     pub const fn sigpipe(self) -> u64 {
         self.sigpipe
     }
 
-    const fn merged_with(self, other: Self) -> Self {
+    pub const fn sighup(self) -> u64 {
+        self.sighup
+    }
+
+    fn delta_since(self, previous: Self) -> Self {
         Self {
+            sigxfsz: self.sigxfsz,
+            sigxcpu: self.sigxcpu,
+            sigpipe: self.sigpipe.saturating_sub(previous.sigpipe),
+            sighup: self.sighup,
+        }
+    }
+
+    fn merged_with(self, other: Self) -> Self {
+        Self {
+            sigxfsz: self.sigxfsz.max(other.sigxfsz),
+            sigxcpu: self.sigxcpu.max(other.sigxcpu),
             sigpipe: self.sigpipe.saturating_add(other.sigpipe),
+            sighup: self.sighup.max(other.sighup),
         }
     }
 }
@@ -823,12 +860,29 @@ pub struct SharedSignalMetrics {
 }
 
 impl SharedSignalMetrics {
+    pub fn record_sigxfsz(&self) {
+        self.inner.sigxfsz.store(1, Ordering::SeqCst);
+    }
+
+    pub fn record_sigxcpu(&self) {
+        self.inner.sigxcpu.store(1, Ordering::SeqCst);
+    }
+
     pub fn record_sigpipe(&self) {
         record_atomic_metric_seq_cst(&self.inner.sigpipe, 1);
     }
 
+    pub fn record_sighup(&self) {
+        self.inner.sighup.store(1, Ordering::SeqCst);
+    }
+
     pub fn snapshot(&self) -> SignalMetrics {
-        SignalMetrics::new(self.inner.sigpipe.load(Ordering::SeqCst))
+        SignalMetrics {
+            sigxfsz: self.inner.sigxfsz.load(Ordering::SeqCst),
+            sigxcpu: self.inner.sigxcpu.load(Ordering::SeqCst),
+            sigpipe: self.inner.sigpipe.load(Ordering::SeqCst),
+            sighup: self.inner.sighup.load(Ordering::SeqCst),
+        }
     }
 
     #[cfg(test)]
@@ -839,7 +893,10 @@ impl SharedSignalMetrics {
 
 #[derive(Debug, Default)]
 struct SharedSignalMetricsInner {
+    sigxfsz: AtomicU64,
+    sigxcpu: AtomicU64,
     sigpipe: AtomicU64,
+    sighup: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -847,6 +904,7 @@ struct SharedProcessMetricsSnapshot {
     missed_log_count: u64,
     rate_limited_log_count: u64,
     signal_metrics: SignalMetrics,
+    panic_count: u64,
 }
 
 #[cfg(test)]
@@ -856,6 +914,7 @@ type ProcessMetricsScanHook = Arc<dyn Fn(usize) + Send + Sync>;
 pub(crate) struct SharedProcessMetrics {
     logger_metrics: SharedLoggerMetrics,
     signal_metrics: SharedSignalMetrics,
+    panic_count: Arc<AtomicU64>,
     #[cfg(test)]
     scan_hook: Option<ProcessMetricsScanHook>,
 }
@@ -866,6 +925,7 @@ impl fmt::Debug for SharedProcessMetrics {
             .debug_struct("SharedProcessMetrics")
             .field("logger_metrics", &"<shared>")
             .field("signal_metrics", &"<shared>")
+            .field("panic_count", &"<shared>")
             .finish()
     }
 }
@@ -879,11 +939,16 @@ impl SharedProcessMetrics {
         self.signal_metrics.clone()
     }
 
+    fn record_process_panic(&self) {
+        self.panic_count.store(1, Ordering::SeqCst);
+    }
+
     fn read_snapshot(&self) -> SharedProcessMetricsSnapshot {
         SharedProcessMetricsSnapshot {
             missed_log_count: self.logger_metrics.missed_log_count(),
             rate_limited_log_count: self.logger_metrics.rate_limited_log_count(),
             signal_metrics: self.signal_metrics.snapshot(),
+            panic_count: self.panic_count.load(Ordering::SeqCst),
         }
     }
 
@@ -895,7 +960,7 @@ impl SharedProcessMetrics {
                 hook(_attempt);
             }
             // Every producer update and both fixed-order scans are SeqCst. Equal monotonic
-            // vectors therefore prove that all three values existed together at this fence.
+            // vectors therefore prove that every process value existed together at this fence.
             fence(Ordering::SeqCst);
             let second = self.read_snapshot();
             if first == second {
@@ -7889,6 +7954,20 @@ mod tests {
             .with_rate_limiter_dropped_bytes(10 * scale)
     }
 
+    const fn signal_metrics_with_stores(
+        sigxfsz: u64,
+        sigxcpu: u64,
+        sigpipe: u64,
+        sighup: u64,
+    ) -> SignalMetrics {
+        SignalMetrics {
+            sigxfsz,
+            sigxcpu,
+            sigpipe,
+            sighup,
+        }
+    }
+
     fn balloon_metrics_with_all_fields() -> BalloonDeviceMetrics {
         BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6)
             .with_discard_metrics(
@@ -8571,6 +8650,7 @@ mod tests {
         let signal_metrics = state.shared_process_metrics.signal_metrics();
         let hook_calls = Arc::new(AtomicUsize::new(0));
         state.shared_process_metrics.set_scan_hook({
+            let process_metrics = state.shared_process_metrics.clone();
             let logger_metrics = logger_metrics.clone();
             let signal_metrics = signal_metrics.clone();
             let hook_calls = Arc::clone(&hook_calls);
@@ -8579,7 +8659,11 @@ mod tests {
                 if attempt == 0 {
                     logger_metrics.record_missed_log();
                     logger_metrics.record_rate_limited_log();
+                    signal_metrics.record_sigxfsz();
+                    signal_metrics.record_sigxcpu();
                     signal_metrics.record_sigpipe();
+                    signal_metrics.record_sighup();
+                    process_metrics.record_process_panic();
                 }
             }
         });
@@ -8593,7 +8677,11 @@ mod tests {
         assert_eq!(value["logger"]["missed_log_count"], 1);
         assert_eq!(value["logger"]["rate_limited_log_count"], 1);
         assert_eq!(value["logger"]["metrics_fails"], 0);
+        assert_eq!(value["signals"]["sigxfsz"], 1);
+        assert_eq!(value["signals"]["sigxcpu"], 1);
         assert_eq!(value["signals"]["sigpipe"], 1);
+        assert_eq!(value["signals"]["sighup"], 1);
+        assert_eq!(value["vmm"]["panic_count"], 1);
     }
 
     #[test]
@@ -8878,11 +8966,20 @@ mod tests {
     fn writes_signal_metrics_when_recorded() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
-        let diagnostics = MetricsDiagnostics::new().with_signal_metrics(SignalMetrics::new(2));
+        let diagnostics =
+            MetricsDiagnostics::new().with_signal_metrics(signal_metrics_with_stores(1, 1, 2, 1));
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
-        assert_eq!(only_metrics_value(&output)["signals"]["sigpipe"], 2);
+        let value = only_metrics_value(&output);
+        assert_eq!(value["signals"]["sigxfsz"], 1);
+        assert_eq!(value["signals"]["sigxcpu"], 1);
+        assert_eq!(value["signals"]["sigpipe"], 2);
+        assert_eq!(value["signals"]["sighup"], 1);
+        assert_eq!(value["signals"]["sigbus"], 0);
+        assert_eq!(value["signals"]["sigsegv"], 0);
+        assert_eq!(value["signals"]["sigill"], 0);
+        assert_eq!(value["seccomp"]["num_faults"], 0);
     }
 
     #[test]
@@ -8897,13 +8994,84 @@ mod tests {
     }
 
     #[test]
-    fn shared_signal_metrics_snapshots_sigpipe_count() {
+    fn shared_signal_metrics_snapshot_fixed_stores_and_incremental_sigpipe() {
         let metrics = SharedSignalMetrics::default();
 
+        metrics.record_sigxfsz();
+        metrics.record_sigxfsz();
+        metrics.record_sigxcpu();
+        metrics.record_sigxcpu();
         metrics.record_sigpipe();
         metrics.record_sigpipe();
+        metrics.record_sighup();
+        metrics.record_sighup();
 
-        assert_eq!(metrics.snapshot(), SignalMetrics::new(2));
+        assert_eq!(metrics.snapshot(), signal_metrics_with_stores(1, 1, 2, 1));
+    }
+
+    #[test]
+    fn process_store_metrics_persist_while_sigpipe_uses_successful_intervals() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let signal_metrics = state.signal_metrics();
+
+        signal_metrics.record_sigxfsz();
+        signal_metrics.record_sigxcpu();
+        signal_metrics.record_sigpipe();
+        signal_metrics.record_sigpipe();
+        signal_metrics.record_sighup();
+        state.record_process_panic();
+        assert_eq!(state.flush(), Ok(true));
+
+        signal_metrics.record_sigpipe();
+        assert_eq!(state.flush(), Ok(true));
+
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        for value in &values {
+            assert_eq!(value["signals"]["sigxfsz"], 1);
+            assert_eq!(value["signals"]["sigxcpu"], 1);
+            assert_eq!(value["signals"]["sighup"], 1);
+            assert_eq!(value["vmm"]["panic_count"], 1);
+            assert_eq!(value["signals"]["sigbus"], 0);
+            assert_eq!(value["signals"]["sigsegv"], 0);
+            assert_eq!(value["signals"]["sigill"], 0);
+            assert_eq!(value["seccomp"]["num_faults"], 0);
+        }
+        assert_eq!(values[0]["signals"]["sigpipe"], 2);
+        assert_eq!(values[1]["signals"]["sigpipe"], 1);
+    }
+
+    #[test]
+    fn failed_output_retries_fixed_stores_and_sigpipe_from_last_success() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        assert_eq!(state.flush(), Ok(true));
+        let signal_metrics = state.signal_metrics();
+
+        signal_metrics.record_sigxfsz();
+        signal_metrics.record_sigxcpu();
+        signal_metrics.record_sigpipe();
+        signal_metrics.record_sighup();
+        state.record_process_panic();
+        output.fail_next_write();
+        assert_eq!(
+            state.flush(),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+
+        signal_metrics.record_sigpipe();
+        assert_eq!(state.flush(), Ok(true));
+
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        let retry = &values[1];
+        assert_eq!(retry["signals"]["sigxfsz"], 1);
+        assert_eq!(retry["signals"]["sigxcpu"], 1);
+        assert_eq!(retry["signals"]["sigpipe"], 2);
+        assert_eq!(retry["signals"]["sighup"], 1);
+        assert_eq!(retry["vmm"]["panic_count"], 1);
+        assert_eq!(retry["logger"]["missed_metrics_count"], 1);
     }
 
     #[test]
@@ -11332,12 +11500,18 @@ mod tests {
 
     #[test]
     fn signal_diagnostics_merge_saturates() {
-        let base = MetricsDiagnostics::new().with_signal_metrics(SignalMetrics::new(u64::MAX - 1));
-        let additional = MetricsDiagnostics::new().with_signal_metrics(SignalMetrics::new(2));
+        let base = MetricsDiagnostics::new().with_signal_metrics(signal_metrics_with_stores(
+            0,
+            1,
+            u64::MAX - 1,
+            0,
+        ));
+        let additional =
+            MetricsDiagnostics::new().with_signal_metrics(signal_metrics_with_stores(1, 0, 2, 1));
 
         assert_eq!(
             base.merged_with(additional).signal_metrics(),
-            Some(SignalMetrics::new(u64::MAX))
+            Some(signal_metrics_with_stores(1, 1, u64::MAX, 1))
         );
     }
 

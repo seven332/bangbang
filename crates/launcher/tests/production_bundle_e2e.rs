@@ -10604,6 +10604,91 @@ fn normal_bundle_keeps_concurrent_output_grant_sessions_isolated() {
 }
 
 #[test]
+fn normal_bundle_preserves_worker_fatal_exit_and_granted_terminal_metrics() {
+    let bundle = production_bundle();
+    let baseline_sessions = session_entries();
+    let fixture = OutputGrantFixture::new("fatal-signal");
+    let mut running = spawn_ready_output_grant_api_launcher(&bundle, &fixture, "fatal-signal");
+    fixture.replace_source_pathnames();
+    configure_output_grant_session(&bundle, &running, "bangbang::");
+
+    let resources = worker_bundle(&bundle).join("Contents/Resources");
+    let waiting_boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&resources.join("guest-kernel")),
+        "initrd_path": path_text(&resources.join("guest-initrd")),
+        "boot_args": GUEST_SERIAL_RX_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&waiting_boot_source)
+                .expect("waiting boot source should serialize"),
+        ),
+        204,
+        "replace fatal-signal boot source",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start fatal-signal production guest",
+    );
+    let initial = wait_for_canonical_output_metrics_lines(
+        &fixture.opened_metrics,
+        1,
+        PROCESS_TIMEOUT,
+        "fatal-signal initial",
+    );
+    assert_eq!(initial[0]["signals"]["sighup"], 0);
+
+    let worker = only_worker_pid(&running.child);
+    assert!(
+        child_pids(worker).is_empty(),
+        "fatal-signal worker must not retain a binder helper"
+    );
+    // SAFETY: `worker` is the sole live child of the retained launcher, and
+    // SIGHUP is the production convergence stimulus under test.
+    assert_eq!(unsafe { libc::kill(worker, libc::SIGHUP) }, 0);
+    let status = running.wait("production worker SIGHUP convergence");
+    assert_eq!(
+        status.code(),
+        Some(156),
+        "the outer supervisor must preserve the worker's exact compatible exit"
+    );
+    assert!(!running.socket.exists());
+    assert_eq!(session_entries(), baseline_sessions);
+
+    let metrics = wait_for_canonical_output_metrics_lines(
+        &fixture.opened_metrics,
+        2,
+        PROCESS_TIMEOUT,
+        "fatal-signal terminal",
+    );
+    assert_eq!(metrics[0]["signals"]["sighup"], 0);
+    assert_eq!(metrics[1]["signals"]["sighup"], 1);
+    assert_eq!(metrics[1]["seccomp"]["num_faults"], 0);
+    let logger = fs::read_to_string(&fixture.opened_logger)
+        .expect("fatal-signal granted logger should read");
+    assert_eq!(
+        logger
+            .matches("operation=shutdown outcome=abnormal\n")
+            .count(),
+        1
+    );
+    assert_eq!(
+        logger
+            .matches("event=process-exit category=process-failure\n")
+            .count(),
+        1
+    );
+    fixture.assert_replacement_outputs_unchanged();
+}
+
+#[test]
 fn normal_bundle_rejects_wrong_and_missing_boot_claims_without_consuming_pair() {
     let bundle = production_bundle();
     let fixture = StartupGrantFixture::new(&bundle, "api-mismatch");

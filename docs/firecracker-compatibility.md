@@ -621,17 +621,22 @@ mutex is initialized before installation and only `try_lock` is used; each
 destination publication is one compare-exchange attempt. Enabled attachment
 contention, poison, or an occupied/closed logger ingress latches one deferred
 miss which the minimal finalizer settles outside the hook. A catchable
-main-runtime panic then attempts the panic terminal record and final metrics
-under a second catch, isolates contained cleanup, restores the prior hook, and
-resumes the original payload. All fixed panic and terminal variants are valid
-UTF-8 and at most 512 bytes.
+main-runtime panic stores `vmm.panic_count = 1` outside the hook, then attempts
+the panic terminal record and final metrics under a second catch, isolates
+contained cleanup, restores the prior hook, and resumes the original payload.
+Before its finalizer it atomically disarms any live fatal-control interval; an
+already published fatal claim instead retains its compatible exit without
+inspecting or dropping the opaque panic payload.
+All fixed panic and terminal variants are valid UTF-8 and at most 512 bytes.
 
 This is best-effort observability, not persistence. A logger or fallback worker
 can be stalled or lose a write after admission, and process exit can race its
 poll. A worker-thread-only panic has at most the fixed hook attempt and no main
 finalizer. A second hook invocation is silent; double panic, `panic=abort`, an
-explicit abort, fatal `_exit`, and uncatchable signals have no terminal metrics
-or delivery guarantee.
+explicit abort, immediate fatal `_exit`, and uncatchable signals have no
+terminal metrics or delivery guarantee. The separately classified external
+fatal-signal path below may rejoin ordinary best-effort convergence, but it
+does not make signal-context output durable.
 
 The pinned logger aggregate is certified by
 `bangbang-firecracker-capability-audit validate --logger-final`. That gate
@@ -735,9 +740,12 @@ failure to its caller. While the process still owns the retained session and
 live diagnostics, every normal API or no-api convergence path makes one
 best-effort terminal attempt and then returns the original success or error.
 This includes handled shutdown, guest terminal outcomes, worker terminal
-errors, and ordinary bind/wait/server errors; it adds no fatal-signal
-durability. A catchable main-runtime panic uses only the protected
-minimal convergence described above and does not continue VMM/API execution.
+errors, and ordinary bind/wait/server errors. On macOS, parent-delivered SIGHUP,
+SIGXCPU, and SIGXFSZ may also rejoin this owner after the narrow `siginfo_t`
+classification described under Process Exit Status. This adds one ordinary
+attempt, not fatal-signal durability. A catchable main-runtime panic uses only
+the protected minimal convergence described above and does not continue
+VMM/API execution.
 
 ### Serial output, input, and native snapshots
 
@@ -794,8 +802,9 @@ broad cross-host portability.
 The ordinary CLI has no production rotation, syslog, journald, tracing, remote
 telemetry, or resource-broker policy. Logger and metrics state remains
 per-controller; only the executable's bounded ownership interval uses the
-process-global panic hook. It carries no worker/double-panic/abort/fatal-signal
-durability claim. These named product and architecture boundaries, the strict
+process-global panic hook. It carries no worker/double-panic/abort or crash-stop
+durability claim; classified external fatal signals receive only one ordinary
+best-effort attempt. These named product and architecture boundaries, the strict
 pinned metrics schema, and the exact native-v1 plus 2.7-or-newer serial limits replace
 an open-ended “full logging and metrics” placeholder.
 
@@ -1380,9 +1389,11 @@ The config-file path does not load MMDS data; use Firecracker's separate
 CLI values are untrusted input. Current validation rejects invalid IDs, empty
 socket paths, and socket paths containing control characters. API startup also
 fails if the configured socket path already exists. Socket cleanup removes the
-socket inode created by the current process during normal shutdown and handled
-`SIGINT`/`SIGTERM` shutdown; fatal signal exits use `_exit`, and uncatchable
-forced termination such as `SIGKILL` can still leave a stale socket path behind.
+socket inode created by the current process during normal shutdown, handled
+`SIGINT`/`SIGTERM`, and classified external SIGHUP/SIGXCPU/SIGXFSZ
+convergence. Immediate fatal paths use `_exit`, and ambiguous faults or
+uncatchable forced termination such as `SIGKILL` can still leave a stale socket
+path behind.
 The API socket is unauthenticated;
 bangbang restricts the published socket inode to owner-only permissions, and
 the parent directory remains part of the access-control boundary. Operators
@@ -1400,19 +1411,31 @@ The current executable uses a small process exit status contract:
 | `148` | The process intercepted `SIGSYS`. | Matches Firecracker's `BadSyscall` exit code for an explicitly delivered signal. Linux seccomp bad-syscall enforcement remains platform-limited on macOS. |
 | `149` | The process intercepted `SIGBUS`. | Matches Firecracker's fatal signal exit code. |
 | `150` | The process intercepted `SIGSEGV`. | Matches Firecracker's fatal signal exit code. |
-| `151` | The process intercepted `SIGXFSZ`. | Matches Firecracker's fatal signal exit code. |
+| `151` | The process intercepted `SIGXFSZ`. | Matches Firecracker's fatal signal exit code. A proven external Darwin delivery records the Store and makes one ordinary terminal attempt; self/RLIMIT delivery exits immediately. |
 | `152` | Startup configuration failed before the process entered runtime, including config-file, metadata, logger-sink, and metrics-sink configuration failures. | Matches Firecracker's `BadConfiguration` exit code for clearly startup configuration failures. |
 | `153` | Startup argument parsing failed before process configuration began. | Matches Firecracker's `ArgParsing` exit code. |
-| `154` | The process intercepted `SIGXCPU`. | Matches Firecracker's fatal signal exit code. |
-| `156` | The process intercepted `SIGHUP`. | Matches Firecracker's fatal signal exit code. |
+| `154` | The process intercepted `SIGXCPU`. | Matches Firecracker's fatal signal exit code. A proven external Darwin delivery records the Store and makes one ordinary terminal attempt; self/RLIMIT delivery exits immediately. |
+| `156` | The process intercepted `SIGHUP`. | Matches Firecracker's fatal signal exit code. A proven external Darwin delivery records the Store and makes one ordinary terminal attempt; self delivery exits immediately. |
 | `157` | The process intercepted `SIGILL`. | Matches Firecracker's fatal signal exit code. |
 | `1` | Process failure, including API socket bind, signal handler registration, no-api signal wait failure, API accept failure, startup time accounting failure, periodic runtime work failure, or a process-owned boot worker non-success terminal state. | Used for non-configuration process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
 
-Fatal signal exits call `_exit`, so normal Rust destructors and API socket
-cleanup do not run on those paths. `SIGPIPE` remains non-terminating in
-Firecracker and is not exposed as a process-exit status by bangbang; runtime
-metrics can report handled occurrences as `signals.sigpipe`. `SIGINT` and
-`SIGTERM` remain graceful successful shutdown signals.
+On arm64 Darwin, only matching SIGHUP/SIGXCPU/SIGXFSZ with `si_code == 0` and
+a positive sender PID different from the process PID may return from the
+handler. The first armed delivery stores its fixed signal metric, publishes the
+exact code, and sends one nonblocking byte to the API/no-API poll owner. That
+owner performs one ordinary best-effort terminal metrics/logger attempt and
+cleanup before returning the same code. Self-generated resource signals,
+unarmed or duplicate delivery, SIGSYS, and all SIGILL/SIGBUS/SIGSEGV origins
+call `_exit` immediately. XNU rewrites external and synchronous instances of
+those three fault signals into indistinguishable `siginfo_t`, so their metrics
+remain platform-zero rather than making an unsafe durability claim.
+
+`SIGPIPE` remains non-terminating in Firecracker and is not exposed as a
+process-exit status by bangbang; runtime metrics report it incrementally while
+the three classified fatal fields and `vmm.panic_count` are persistent Stores.
+`seccomp.num_faults` is always zero on macOS; explicit SIGSYS retains status
+148 but is not a Linux seccomp-fault producer. `SIGINT` and `SIGTERM` remain
+graceful successful shutdown signals.
 
 ## Compatibility Baseline
 

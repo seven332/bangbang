@@ -928,12 +928,26 @@ pub(super) fn build_metrics_line(
         },
         seccomp: SeccompMetrics::default(),
         vcpu: VcpuMetrics::default(),
-        vmm: VmmMetrics::default(),
+        vmm: VmmMetrics {
+            panic_count: current.panic_count,
+        },
         signals: SignalMetrics {
+            sigxfsz: current_diagnostics
+                .signal_metrics
+                .unwrap_or_default()
+                .sigxfsz(),
+            sigxcpu: current_diagnostics
+                .signal_metrics
+                .unwrap_or_default()
+                .sigxcpu(),
             sigpipe: interval_diagnostics
                 .signal_metrics
                 .unwrap_or_default()
-                .sigpipe,
+                .sigpipe(),
+            sighup: current_diagnostics
+                .signal_metrics
+                .unwrap_or_default()
+                .sighup(),
             ..SignalMetrics::default()
         },
         vsock: VsockMetrics {
