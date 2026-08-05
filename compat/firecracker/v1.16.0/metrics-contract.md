@@ -86,9 +86,10 @@ delivery, remote telemetry, or a versioned extension format.
 The process audit is an exact, sorted bijection over the 69 static fields whose
 schema policy owner is `process`. Missing, duplicate, extra, stale, reordered,
 or differently owned records fail closed. Its delivery partition is also
-fixed: #1827 owns 44 API request and deprecation fields, #1828 owns 12 startup,
-logger, panic, signal, and seccomp fields, #1829 owns five successful inner-VMM
-operation fields, and #1830 owns eight successful outer API-operation fields.
+fixed: #1827 owns 44 API request and deprecation fields, #1828 owns two startup
+and ten successful outer/inner operation-latency fields, #1829 owns four logger
+fields plus SIGPIPE, and #1830 owns six fatal-signal fields plus panic and
+seccomp.
 Only a completed child may use the `implemented` disposition and carry
 resolvable production and validation evidence. #1827 is the sole completed
 child in this slice; the remaining 25 records stay `planned` until their owning
