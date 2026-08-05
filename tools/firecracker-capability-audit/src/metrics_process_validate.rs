@@ -157,7 +157,14 @@ fn validate_record(
             record.field_id
         ));
     }
-    if record.rationale != expected_rationale(path, delivery_issue, boundary) {
+    let Some(rationale) = expected_rationale(path, delivery_issue, boundary) else {
+        errors.push(format!(
+            "metrics process producer field has no closed rationale: {}",
+            record.field_id
+        ));
+        return;
+    };
+    if record.rationale != rationale {
         errors.push(format!(
             "metrics process producer has a stale rationale: {}",
             record.field_id
@@ -317,14 +324,18 @@ fn expected_rationale(
     path: &str,
     delivery_issue: &str,
     boundary: MetricsProcessProducerBoundary,
-) -> &'static str {
+) -> Option<&'static str> {
     if path == "patch_api_requests.network_count" {
-        return "Pinned Firecracker increments this count at parser entry and again for a missing or mismatched interface ID; Bangbang applies the bounded typed effect once.";
+        return Some(
+            "Pinned Firecracker increments this count at parser entry and again for a missing or mismatched interface ID; Bangbang applies the bounded typed effect once.",
+        );
     }
     if path == "patch_api_requests.network_fails" {
-        return "Pinned Firecracker increments this failure only for typed PATCH body conversion or validation, not for missing or mismatched interface IDs or later action errors.";
+        return Some(
+            "Pinned Firecracker increments this failure only for typed PATCH body conversion or validation, not for missing or mismatched interface IDs or later action errors.",
+        );
     }
-    match (delivery_issue, boundary) {
+    Some(match (delivery_issue, boundary) {
         ("#1827", MetricsProcessProducerBoundary::RequestParserEntry) => {
             "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch."
         }
@@ -358,8 +369,8 @@ fn expected_rationale(
         ("#1830", MetricsProcessProducerBoundary::SeccompFault) => {
             "Delivery child #1830 owns the platform seccomp-fault disposition and evidence and remains unresolved in this audit slice."
         }
-        _ => "No reviewed rationale exists for this process producer boundary.",
-    }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -379,5 +390,13 @@ mod tests {
         assert_eq!(expected_delivery_issue("signals.sigpipe"), Some("#1829"));
         assert_eq!(expected_delivery_issue("signals.sigsegv"), Some("#1830"));
         assert_eq!(expected_delivery_issue("block.read_count"), None);
+        assert_eq!(
+            expected_rationale(
+                "future.field",
+                "#9999",
+                MetricsProcessProducerBoundary::PanicLifecycle,
+            ),
+            None
+        );
     }
 }
