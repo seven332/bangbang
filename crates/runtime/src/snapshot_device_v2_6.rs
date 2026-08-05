@@ -346,8 +346,8 @@ impl SnapshotV2PmemState {
     }
 
     /// Returns the exact guest-visible pmem config space.
-    pub const fn config_space(&self) -> VirtioPmemConfigSpace {
-        self.config_space
+    pub fn config_space(&self) -> VirtioPmemConfigSpace {
+        self.config_space.clone()
     }
 
     /// Returns the optional active queue cursors.

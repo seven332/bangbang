@@ -184,7 +184,11 @@ impl<T: RtcTimeSource> Pl031RtcDevice<T> {
 impl<T: RtcTimeSource> MmioHandler for Pl031RtcDevice<T> {
     fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
         self.read_access(access).map_err(|err| {
-            self.metrics.record_read_error();
+            if matches!(&err, Pl031RtcError::InvalidRegisterOffset { .. }) {
+                self.metrics.record_read_error();
+            } else {
+                self.metrics.record_access_error();
+            }
             if let Some(logger) = &self.guest_logger {
                 logger.log_time_identity(LoggerTimeIdentityOutcome::RtcReadRejected);
             }
@@ -194,7 +198,15 @@ impl<T: RtcTimeSource> MmioHandler for Pl031RtcDevice<T> {
 
     fn write(&mut self, access: MmioAccess, data: MmioAccessBytes) -> Result<(), MmioHandlerError> {
         self.write_access(access, data).map_err(|err| {
-            self.metrics.record_write_error();
+            if matches!(
+                &err,
+                Pl031RtcError::InvalidRegisterOffset { .. }
+                    | Pl031RtcError::ReadOnlyRegisterWrite { .. }
+            ) {
+                self.metrics.record_write_error();
+            } else {
+                self.metrics.record_access_error();
+            }
             if let Some(logger) = &self.guest_logger {
                 logger.log_time_identity(LoggerTimeIdentityOutcome::RtcWriteRejected);
             }
@@ -570,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn read_errors_record_missed_read_and_error_counts() {
+    fn read_errors_distinguish_bus_failures_from_missed_registers() {
         let mut device = Pl031RtcDevice::new(FixedRtcTimeSource::new(100));
         let metrics = device.shared_metrics();
 
@@ -585,12 +597,12 @@ mod tests {
             metrics.snapshot(),
             RtcDeviceMetrics::default()
                 .with_error_count(2)
-                .with_missed_read_count(2)
+                .with_missed_read_count(1)
         );
     }
 
     #[test]
-    fn write_errors_record_missed_write_and_error_counts() {
+    fn write_errors_distinguish_bus_failures_from_missed_registers() {
         let mut device = Pl031RtcDevice::new(FixedRtcTimeSource::new(100));
         let metrics = device.shared_metrics();
         let short_data = MmioAccessBytes::new(&[1, 2]).expect("test bytes should be valid");
@@ -606,7 +618,7 @@ mod tests {
             metrics.snapshot(),
             RtcDeviceMetrics::default()
                 .with_error_count(2)
-                .with_missed_write_count(2)
+                .with_missed_write_count(1)
         );
     }
 

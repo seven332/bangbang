@@ -4,8 +4,10 @@ use std::time::{Duration, Instant};
 
 use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerEntropyOutcome, LoggerTransportOutcome};
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError};
+use crate::metrics::SharedEntropyDeviceMetrics;
 use crate::mmio::{
-    MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId,
+    MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioHandlerLookupError,
+    MmioRegion, MmioRegionId,
 };
 use crate::token_bucket::{
     PersistedTokenBucketState, PersistedTokenBucketStateError, TokenBucket, TokenBucketConfig,
@@ -193,6 +195,10 @@ impl PreparedEntropyDevice {
         Self {
             device: VirtioRngDevice::from_config(config),
         }
+    }
+
+    pub fn attach_metrics(&mut self, metrics: SharedEntropyDeviceMetrics) {
+        self.device.attach_metrics(metrics);
     }
 
     pub const fn device(&self) -> &VirtioRngDevice {
@@ -1281,6 +1287,7 @@ impl VirtioRngQueue {
                 });
             }
         } {
+            dispatch.record_attempted_request();
             let descriptor_head = match descriptor_chain_head(&chain) {
                 Some(descriptor_head) => descriptor_head,
                 None => {
@@ -1594,6 +1601,7 @@ pub struct VirtioRngDevice {
     active_queue: Option<VirtioRngQueue>,
     rate_limiter: Option<VirtioRngRateLimiter>,
     pending_rate_limited_queue: bool,
+    metrics: Option<SharedEntropyDeviceMetrics>,
     guest_logger: Option<GuestLogger>,
 }
 
@@ -1603,6 +1611,7 @@ impl VirtioRngDevice {
             active_queue: None,
             rate_limiter: None,
             pending_rate_limited_queue: false,
+            metrics: None,
             guest_logger: None,
         }
     }
@@ -1618,6 +1627,7 @@ impl VirtioRngDevice {
                 .rate_limiter()
                 .and_then(|rate_limiter| VirtioRngRateLimiter::new_at(rate_limiter, now)),
             pending_rate_limited_queue: false,
+            metrics: None,
             guest_logger: None,
         }
     }
@@ -1631,8 +1641,13 @@ impl VirtioRngDevice {
             active_queue,
             rate_limiter,
             pending_rate_limited_queue,
+            metrics: None,
             guest_logger: None,
         }
+    }
+
+    pub fn attach_metrics(&mut self, metrics: SharedEntropyDeviceMetrics) {
+        self.metrics = Some(metrics);
     }
 
     pub fn is_activated(&self) -> bool {
@@ -1856,6 +1871,10 @@ impl VirtioRngDevice {
 }
 
 impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevice> {
+    pub fn attach_entropy_metrics(&mut self, metrics: SharedEntropyDeviceMetrics) {
+        self.activation_handler_mut().attach_metrics(metrics);
+    }
+
     pub fn capture_entropy_state_at(
         &self,
         config: EntropyConfig,
@@ -1921,6 +1940,17 @@ impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevic
 
         dispatch
     }
+}
+
+pub fn attach_entropy_metrics_to_mmio_handler(
+    dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    metrics: SharedEntropyDeviceMetrics,
+) -> Result<(), MmioHandlerLookupError> {
+    dispatcher
+        .handler_mut::<VirtioRngMmioHandler>(region_id)?
+        .attach_entropy_metrics(metrics);
+    Ok(())
 }
 
 impl VirtioPciEndpoint<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevice> {
@@ -2013,7 +2043,13 @@ impl VirtioMmioDeviceActivationHandler for VirtioRngDevice {
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
     ) -> Result<(), VirtioMmioDeviceActivationError> {
-        self.activate_rng(activation).map_err(Into::into)
+        let result = self.activate_rng(activation);
+        if result.is_err()
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.record_activation_failure();
+        }
+        result.map_err(Into::into)
     }
 
     fn reset(&mut self) {
@@ -2251,6 +2287,7 @@ fn observe_entropy_notification_result(
 
 #[derive(Debug, Default)]
 pub struct VirtioRngQueueDispatch {
+    attempted_requests: usize,
     processed_requests: usize,
     successful_requests: usize,
     buffer_parse_failures: usize,
@@ -2265,6 +2302,11 @@ pub struct VirtioRngQueueDispatch {
 }
 
 impl VirtioRngQueueDispatch {
+    /// Descriptor chains popped before parsing, limiter admission, or publication.
+    pub const fn attempted_requests(&self) -> usize {
+        self.attempted_requests
+    }
+
     pub const fn processed_requests(&self) -> usize {
         self.processed_requests
     }
@@ -2307,6 +2349,10 @@ impl VirtioRngQueueDispatch {
 
     pub const fn needs_queue_interrupt(&self) -> bool {
         self.needs_queue_interrupt
+    }
+
+    fn record_attempted_request(&mut self) {
+        self.attempted_requests += 1;
     }
 
     fn record(
@@ -3692,6 +3738,33 @@ mod tests {
     }
 
     #[test]
+    fn entropy_activation_metrics_follow_the_attached_transport_owner() {
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
+        let device_registers = rng_device_registers();
+        let metrics = SharedEntropyDeviceMetrics::default();
+        let other = SharedEntropyDeviceMetrics::default();
+        let mut device = VirtioRngDevice::new();
+        device.attach_metrics(metrics.clone());
+
+        VirtioMmioDeviceActivationHandler::activate(
+            &mut device,
+            rng_device_activation(&device_registers, &queues),
+        )
+        .expect("first transport activation should succeed");
+        VirtioMmioDeviceActivationHandler::activate(
+            &mut device,
+            rng_device_activation(&device_registers, &queues),
+        )
+        .expect_err("duplicate transport activation should fail");
+
+        assert_eq!(
+            metrics.snapshot(),
+            EntropyDeviceMetrics::default().with_activate_fails(1)
+        );
+        assert_eq!(other.snapshot(), EntropyDeviceMetrics::default());
+    }
+
+    #[test]
     fn rng_device_notification_without_pending_queues_is_noop() {
         let mut memory = memory();
         let mut source = TestEntropySource::default();
@@ -4176,6 +4249,13 @@ mod tests {
             first
                 .queue_dispatch()
                 .expect("first queue dispatch should be present")
+                .attempted_requests(),
+            2
+        );
+        assert_eq!(
+            first
+                .queue_dispatch()
+                .expect("first queue dispatch should be present")
                 .rate_limiter_throttled_requests(),
             1
         );
@@ -4183,6 +4263,7 @@ mod tests {
             .queue_dispatch()
             .expect("retry queue dispatch should be present");
         assert_eq!(retry_dispatch.processed_requests(), 1);
+        assert_eq!(retry_dispatch.attempted_requests(), 1);
         assert_eq!(retry_dispatch.rate_limiter_events(), 1);
         assert_eq!(retry_dispatch.rate_limiter_throttled_requests(), 0);
         let metrics = SharedEntropyDeviceMetrics::default();
@@ -4191,7 +4272,7 @@ mod tests {
         assert_eq!(
             metrics.snapshot(),
             EntropyDeviceMetrics::default()
-                .with_entropy_event_count(2)
+                .with_entropy_event_count(3)
                 .with_entropy_bytes(8)
                 .with_entropy_rate_limiter_throttled(1)
                 .with_rate_limiter_event_count(1)
@@ -4574,6 +4655,7 @@ mod tests {
             .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should succeed");
 
+        assert_eq!(dispatch.attempted_requests(), 1);
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 1);
         assert_eq!(dispatch.buffer_parse_failures(), 0);
@@ -4600,6 +4682,7 @@ mod tests {
             .dispatch_with_source(&mut memory, &mut source, None)
             .expect("empty rng queue dispatch should succeed");
 
+        assert_eq!(dispatch.attempted_requests(), 0);
         assert_eq!(dispatch.processed_requests(), 0);
         assert_eq!(dispatch.successful_requests(), 0);
         assert_eq!(dispatch.bytes_written_to_guest(), 0);
@@ -4633,6 +4716,7 @@ mod tests {
             .dispatch_with_source_at(&mut memory, &mut source, Some(&mut limiter), now)
             .expect("throttled rng queue dispatch should succeed");
 
+        assert_eq!(dispatch.attempted_requests(), 2);
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 1);
         assert_eq!(dispatch.rate_limiter_throttled_requests(), 1);
@@ -4856,6 +4940,7 @@ mod tests {
             .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should succeed");
 
+        assert_eq!(dispatch.attempted_requests(), 1);
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 1);
         assert_eq!(dispatch.bytes_written_to_guest(), 8);
@@ -5249,6 +5334,7 @@ mod tests {
             }
             other => panic!("expected used ring error, got {other:?}"),
         }
+        assert_eq!(error.completed_dispatch().attempted_requests(), 1);
         assert_eq!(error.completed_dispatch().processed_requests(), 0);
         assert_eq!(source.calls(), &[8]);
         assert_eq!(limiter.snapshot(), before);

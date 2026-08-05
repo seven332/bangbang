@@ -2164,6 +2164,11 @@ mod macos_arm64 {
             Some(&serde_json::json!(0)),
             "serial stdin EOF must detach without recording an input error"
         );
+        assert_eq!(
+            metrics.pointer("/uart/flush_count"),
+            Some(&serde_json::json!(0)),
+            "receive FIFO lifecycle must not invent a pinned UART flush producer"
+        );
 
         let output = bangbang.terminate();
         assert!(output.stdout.contains(GUEST_SERIAL_RX_READY_MARKER));
@@ -2329,12 +2334,24 @@ mod macos_arm64 {
                 .expect("rate-limited serial metrics should contain a generation"),
         )
         .expect("rate-limited serial metrics generation should be JSON");
+        let dropped = metrics
+            .pointer("/uart/rate_limiter_dropped_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .expect("serial limiter dropped-byte metric should be numeric");
+        assert!(
+            dropped > 0,
+            "serial stdout limiter must account for dropped guest bytes: {metrics}"
+        );
         assert!(
             metrics
-                .pointer("/uart/rate_limiter_dropped_bytes")
+                .pointer("/uart/write_count")
                 .and_then(serde_json::Value::as_u64)
-                .is_some_and(|dropped| dropped > 0),
-            "serial stdout limiter must account for dropped guest bytes: {metrics}"
+                .is_some_and(|writes| writes >= dropped),
+            "every limiter-dropped byte must also count as an attempted UART write: {metrics}"
+        );
+        assert_eq!(
+            metrics.pointer("/uart/flush_count"),
+            Some(&serde_json::json!(0))
         );
         assert_eq!(
             metrics.pointer("/uart/error_count"),
@@ -7055,6 +7072,10 @@ mod macos_arm64 {
         }
         assert_eq!(
             final_metrics.pointer("/uart/error_count"),
+            Some(&serde_json::json!(0)),
+        );
+        assert_eq!(
+            final_metrics.pointer("/uart/flush_count"),
             Some(&serde_json::json!(0)),
         );
         assert_clean_shutdown(

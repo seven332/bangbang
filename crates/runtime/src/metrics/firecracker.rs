@@ -830,7 +830,8 @@ pub(super) fn build_metrics_line(
         },
         uart: UartMetrics {
             error_count: serial.error_count(),
-            flush_count: serial.flush_count(),
+            // Firecracker v1.16.0 declares this field but has no UART producer.
+            flush_count: 0,
             missed_read_count: serial.missed_read_count(),
             missed_write_count: serial.missed_write_count(),
             read_count: serial.read_count(),

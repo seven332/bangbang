@@ -1565,7 +1565,7 @@ mod tests {
             .output_mut()
             .write_byte(b'B')
             .expect("over-budget byte should be dropped without an endpoint error");
-        assert_eq!(serial.metrics().write_count(), 1);
+        assert_eq!(serial.metrics().write_count(), 2);
         assert_eq!(serial.metrics().rate_limiter_dropped_bytes(), 1);
         let mut byte = [0];
         output_reader

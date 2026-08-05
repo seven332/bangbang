@@ -41,7 +41,7 @@ use bangbang_runtime::entropy::{
     VIRTIO_RNG_QUEUE_SIZES, VirtioRngDevice, VirtioRngDeviceNotificationError,
     VirtioRngEntropySource, VirtioRngEntropySourceError, VirtioRngMmioCaptureState,
     VirtioRngOsEntropySource, VirtioRngPciCaptureError, VirtioRngPciCaptureState,
-    VirtioRngRetryCaptureState,
+    VirtioRngRetryCaptureState, attach_entropy_metrics_to_mmio_handler,
 };
 use bangbang_runtime::fdt::{
     Arm64FdtCacheHierarchy, Arm64FdtError, Arm64FdtGuestMemoryWrite, Arm64FdtPciHost,
@@ -98,7 +98,7 @@ use bangbang_runtime::pmem::{
     PmemConfig, PmemFileBacking, PmemMmioDeviceRegistration, PmemMmioLayout,
     PmemRuntimeMutationError, PmemSnapshotPersistenceBinding, PmemUpdate, PmemUpdateError,
     PreparedPmemDevice, VIRTIO_PMEM_DEVICE_ID, VIRTIO_PMEM_QUEUE_SIZES, VirtioPmemConfigSpace,
-    VirtioPmemDevice, VirtioPmemFlushStatus,
+    VirtioPmemDevice, VirtioPmemFlushStatus, attach_pmem_metrics_to_mmio_handler,
 };
 use bangbang_runtime::pvtime::{
     ARM64_PVTIME_STOLEN_TIME_OFFSET, ARM64_PVTIME_STRUCTURE_SIZE, Arm64PvTimeLayout,
@@ -1731,16 +1731,19 @@ impl HvfArm64BootPciDataDevices {
         })?;
         let pmem_id = prepared.id().to_string();
         let guest_range = prepared.guest_range();
-        let config_space = prepared.config_space();
-        let device = VirtioPmemDevice::with_rate_limiter(
-            prepared.mapping().file_len(),
-            prepared.rate_limiter(),
-        );
         let prepared_metrics = metrics.prepare_device(pmem_id.clone()).map_err(|source| {
             PmemRuntimeMutationError::PrepareDevice {
                 message: source.to_string(),
             }
         })?;
+        let device_metrics = prepared_metrics.metrics();
+        let mut config_space = prepared.config_space();
+        config_space.attach_metrics(device_metrics.clone(), metrics.aggregate());
+        let mut device = VirtioPmemDevice::with_rate_limiter(
+            prepared.mapping().file_len(),
+            prepared.rate_limiter(),
+        );
+        device.attach_metrics(device_metrics, metrics.aggregate());
         let interrupts = self.shared_msi_registry().map_err(|source| {
             PmemRuntimeMutationError::TerminalInsertion {
                 message: source.to_string(),
@@ -19305,6 +19308,7 @@ impl OwnedHvfArm64BootSession {
                 block_device_metrics,
                 pmem_device_metrics,
                 network_interface_metrics,
+                entropy_device_metrics,
                 ..
             } = &mut session;
             prepare_pci_data_devices(
@@ -19314,6 +19318,7 @@ impl OwnedHvfArm64BootSession {
                 block_device_metrics,
                 network_interface_metrics,
                 pmem_device_metrics,
+                entropy_device_metrics,
             )
         };
         let pci_data_devices = match pci_data_devices {
@@ -23880,11 +23885,13 @@ impl OwnedHvfArm64BootSession {
 
     fn attach_snapshot_v2_entropy_mmio(
         mut session: OwnedHvfArm64BootSession,
-        entropy: PreparedSnapshotV2EntropyMmioHandler,
+        mut entropy: PreparedSnapshotV2EntropyMmioHandler,
         storage_configs: Option<CaptureReadyStorageConfigs>,
         inject_scheduler_failure: bool,
         source_factory: impl FnOnce() -> VirtioRngOsEntropySource,
     ) -> Result<RestoredHvfSnapshotV2EntropyMmioOwners, HvfSnapshotV2EntropyMmioRestoreError> {
+        let entropy_device_metrics = SharedEntropyDeviceMetrics::default();
+        entropy.attach_metrics(entropy_device_metrics.clone());
         let (config, _queue_ranges, _retry, retry_deadline, region, interrupt_line, handler) =
             entropy.into_parts();
         let owner_is_vacant = session.runtime_resources.entropy_device.is_none()
@@ -24023,7 +24030,7 @@ impl OwnedHvfArm64BootSession {
         });
         session.entropy_interrupt_line = Some(interrupt_line);
         session.entropy_source = source_factory();
-        session.entropy_device_metrics = SharedEntropyDeviceMetrics::default();
+        session.entropy_device_metrics = entropy_device_metrics;
         session.entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
 
         if inject_scheduler_failure {
@@ -24214,7 +24221,7 @@ impl OwnedHvfArm64BootSession {
     fn attach_snapshot_v2_entropy_pci(
         mut session: OwnedHvfArm64BootSession,
         endpoint_plan: HvfSnapshotV2EntropyPciEndpointPlan,
-        entropy: SnapshotV2EntropyRestorePlan,
+        mut entropy: SnapshotV2EntropyRestorePlan,
         storage_configs: Option<CaptureReadyStorageConfigs>,
         inject_scheduler_failure: bool,
         source_factory: impl FnOnce() -> VirtioRngOsEntropySource,
@@ -24255,6 +24262,9 @@ impl OwnedHvfArm64BootSession {
                 HvfSnapshotV2EntropyPciRestoreFailure::ResourcePlan,
             ));
         }
+
+        let entropy_device_metrics = SharedEntropyDeviceMetrics::default();
+        entropy.attach_metrics(entropy_device_metrics.clone());
 
         let mut interrupts = match session.pci_data_devices.as_ref() {
             Some(manager) => match manager.shared_msi_registry() {
@@ -24366,7 +24376,7 @@ impl OwnedHvfArm64BootSession {
         }
 
         session.entropy_source = source_factory();
-        session.entropy_device_metrics = SharedEntropyDeviceMetrics::default();
+        session.entropy_device_metrics = entropy_device_metrics;
         session.entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
         if inject_scheduler_failure {
             return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
@@ -25598,7 +25608,7 @@ impl OwnedHvfArm64BootSession {
                 block_interrupt_lines.push(interrupt_line);
             }
 
-            for (pmem_index, (record, planned)) in pmem_records
+            for (pmem_index, (mut record, planned)) in pmem_records
                 .into_iter()
                 .zip(planned_pmem_records)
                 .enumerate()
@@ -25606,6 +25616,11 @@ impl OwnedHvfArm64BootSession {
                 let registration_index = balloon_count
                     .saturating_add(block_count)
                     .saturating_add(pmem_index);
+                let device_metrics = pmem_device_metrics.per_device(record.pmem_id()).ok_or((
+                    HvfSnapshotV2StorageMmioRestoreStage::ResourcePlan,
+                    HvfSnapshotV2StorageMmioRestoreFailure::ResourcePlan,
+                ))?;
+                record.attach_metrics(device_metrics, pmem_device_metrics.aggregate());
                 let (
                     _key,
                     _is_root_device,
@@ -26529,7 +26544,7 @@ impl OwnedHvfArm64BootSession {
                 metrics_lease,
             }));
         }
-        for (pmem_index, (record, planned)) in pmem_records
+        for (pmem_index, (mut record, planned)) in pmem_records
             .into_iter()
             .zip(pci_plan.pmem_records())
             .enumerate()
@@ -26549,6 +26564,14 @@ impl OwnedHvfArm64BootSession {
                     HvfSnapshotV2StoragePciRestoreFailure::PciData(source)
                 ),
             };
+            let device_metrics = match pmem_device_metrics.per_device(record.pmem_id()) {
+                Some(metrics) => metrics,
+                None => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::EndpointPreparation { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                ),
+            };
+            record.attach_metrics(device_metrics, pmem_device_metrics.aggregate());
             let endpoint =
                 match record.prepare_endpoint(planned.bar_region_id(), interrupts.registry()) {
                     Ok(endpoint) => endpoint,
@@ -35774,7 +35797,8 @@ pub enum HvfArm64BootSessionError {
     PciData {
         source: HvfArm64BootPciDataError,
     },
-    NetworkMetricsBinding {
+    DeviceMetricsBinding {
+        kind: &'static str,
         message: String,
     },
     MapGuestMemory {
@@ -35905,8 +35929,8 @@ impl fmt::Display for HvfArm64BootSessionError {
             Self::PciData { source } => {
                 write!(f, "failed to prepare PCI data devices: {source}")
             }
-            Self::NetworkMetricsBinding { message } => {
-                write!(f, "failed to bind network transport metrics: {message}")
+            Self::DeviceMetricsBinding { kind, message } => {
+                write!(f, "failed to bind {kind} transport metrics: {message}")
             }
             Self::MapGuestMemory { source } => {
                 write!(
@@ -35975,7 +35999,7 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::BackendAlreadyInitialized
             | Self::SerialInputWithoutDevice
             | Self::UnsupportedVcpuCount { .. }
-            | Self::NetworkMetricsBinding { .. }
+            | Self::DeviceMetricsBinding { .. }
             | Self::PvTimeAddressOverflow { .. }
             | Self::PowerTopology
             | Self::MissingPciValidationMsiSignaler
@@ -36790,6 +36814,9 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     } else {
         SharedNetworkInterfaceMetricsRegistry::from_interface_ids(network_interface_ids)
     };
+    let entropy_device_metrics = SharedEntropyDeviceMetrics::default();
+    bind_mmio_entropy_transport_metrics(&runtime, &mmio_dispatcher, &entropy_device_metrics)?;
+    bind_mmio_pmem_transport_metrics(&runtime, &mmio_dispatcher, &pmem_device_metrics)?;
     bind_mmio_network_transport_metrics(&runtime, &mmio_dispatcher, &network_interface_metrics)?;
     let has_block_devices =
         !runtime.block_devices.is_empty() || !runtime.pci_block_devices.is_empty();
@@ -36802,6 +36829,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         &block_device_metrics,
         &network_interface_metrics,
         &pmem_device_metrics,
+        &entropy_device_metrics,
     )
     .map_err(|source| HvfArm64BootSessionError::PciData { source })?;
     let memory_hotplug_device_metrics = runtime
@@ -36894,7 +36922,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         memory_hotplug_device_metrics,
         network_interface_metrics,
         vsock_device_metrics: SharedVsockDeviceMetrics::default(),
-        entropy_device_metrics: SharedEntropyDeviceMetrics::default(),
+        entropy_device_metrics,
         gic,
         block_interrupt_lines: interrupt_lines.block,
         pmem_interrupt_lines: interrupt_lines.pmem,
@@ -37278,6 +37306,66 @@ fn preflight_pci_data_dispatcher(
     Ok(())
 }
 
+fn bind_mmio_entropy_transport_metrics(
+    runtime: &Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    metrics: &SharedEntropyDeviceMetrics,
+) -> Result<(), HvfArm64BootSessionError> {
+    let Some(device) = &runtime.entropy_device else {
+        return Ok(());
+    };
+    let mut dispatcher =
+        dispatcher
+            .lock()
+            .map_err(|_| HvfArm64BootSessionError::DeviceMetricsBinding {
+                kind: "entropy",
+                message: "MMIO dispatcher is unavailable".to_string(),
+            })?;
+    attach_entropy_metrics_to_mmio_handler(
+        &mut dispatcher,
+        device.registration.region_id(),
+        metrics.clone(),
+    )
+    .map_err(|source| HvfArm64BootSessionError::DeviceMetricsBinding {
+        kind: "entropy",
+        message: format!("failed to resolve MMIO entropy device: {source}"),
+    })
+}
+
+fn bind_mmio_pmem_transport_metrics(
+    runtime: &Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    metrics: &SharedPmemDeviceMetricsRegistry,
+) -> Result<(), HvfArm64BootSessionError> {
+    let mut dispatcher =
+        dispatcher
+            .lock()
+            .map_err(|_| HvfArm64BootSessionError::DeviceMetricsBinding {
+                kind: "pmem",
+                message: "MMIO dispatcher is unavailable".to_string(),
+            })?;
+    for device in &runtime.pmem_mmio_devices {
+        let pmem_id = device.registration.pmem_id();
+        let device_metrics = metrics.per_device(pmem_id).ok_or_else(|| {
+            HvfArm64BootSessionError::DeviceMetricsBinding {
+                kind: "pmem",
+                message: format!("missing metrics generation for MMIO pmem device {pmem_id}"),
+            }
+        })?;
+        attach_pmem_metrics_to_mmio_handler(
+            &mut dispatcher,
+            device.registration.region_id(),
+            device_metrics,
+            metrics.aggregate(),
+        )
+        .map_err(|source| HvfArm64BootSessionError::DeviceMetricsBinding {
+            kind: "pmem",
+            message: format!("failed to resolve MMIO pmem device {pmem_id}: {source}"),
+        })?;
+    }
+    Ok(())
+}
+
 fn bind_mmio_network_transport_metrics(
     runtime: &Arm64BootRuntimeResources,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
@@ -37286,13 +37374,15 @@ fn bind_mmio_network_transport_metrics(
     let mut dispatcher =
         dispatcher
             .lock()
-            .map_err(|_| HvfArm64BootSessionError::NetworkMetricsBinding {
+            .map_err(|_| HvfArm64BootSessionError::DeviceMetricsBinding {
+                kind: "network",
                 message: "MMIO dispatcher is unavailable".to_string(),
             })?;
     for device in &runtime.network_devices {
         let iface_id = device.registration.iface_id();
         let interface_metrics = metrics.per_interface(iface_id).ok_or_else(|| {
-            HvfArm64BootSessionError::NetworkMetricsBinding {
+            HvfArm64BootSessionError::DeviceMetricsBinding {
+                kind: "network",
                 message: format!("missing metrics generation for MMIO interface {iface_id}"),
             }
         })?;
@@ -37302,7 +37392,8 @@ fn bind_mmio_network_transport_metrics(
             interface_metrics,
             metrics.aggregate(),
         )
-        .map_err(|source| HvfArm64BootSessionError::NetworkMetricsBinding {
+        .map_err(|source| HvfArm64BootSessionError::DeviceMetricsBinding {
+            kind: "network",
             message: format!("failed to resolve MMIO interface {iface_id}: {source}"),
         })?;
     }
@@ -37316,6 +37407,7 @@ fn prepare_pci_data_devices(
     block_device_metrics: &SharedBlockDeviceMetricsRegistry,
     network_interface_metrics: &SharedNetworkInterfaceMetricsRegistry,
     pmem_device_metrics: &SharedPmemDeviceMetricsRegistry,
+    entropy_device_metrics: &SharedEntropyDeviceMetrics,
 ) -> Result<Option<HvfArm64BootPciDataDevices>, HvfArm64BootPciDataError> {
     let Some(validation) = runtime.pci_validation.as_ref() else {
         return Ok(None);
@@ -37676,6 +37768,11 @@ fn prepare_pci_data_devices(
 
         for prepared in &runtime.pmem_devices {
             let pmem_id = prepared.id().to_string();
+            let device_metrics = pmem_device_metrics.per_device(&pmem_id).ok_or_else(|| {
+                HvfArm64BootPciDataError::new(format!(
+                    "missing PCI pmem metrics generation for {pmem_id}"
+                ))
+            })?;
             let metrics_lease = if all_virtio {
                 Some(
                     pmem_device_metrics
@@ -37690,11 +37787,13 @@ fn prepare_pci_data_devices(
                 None
             };
             let guest_range = prepared.guest_range();
-            let config_space = prepared.config_space();
-            let device = VirtioPmemDevice::with_rate_limiter(
+            let mut config_space = prepared.config_space();
+            config_space.attach_metrics(device_metrics.clone(), pmem_device_metrics.aggregate());
+            let mut device = VirtioPmemDevice::with_rate_limiter(
                 prepared.mapping().file_len(),
                 prepared.rate_limiter(),
             );
+            device.attach_metrics(device_metrics, pmem_device_metrics.aggregate());
             let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
             let published = {
@@ -37770,7 +37869,8 @@ fn prepare_pci_data_devices(
             endpoint_index += 1;
         }
 
-        if let Some(prepared) = entropy {
+        if let Some(mut prepared) = entropy {
+            prepared.attach_metrics(entropy_device_metrics.clone());
             let (config_space, device) = prepared.into_parts();
             let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
@@ -42376,16 +42476,14 @@ mod tests {
 
         assert!(dispatch.detached);
         assert!(serial_input.is_none());
-        assert_eq!(
-            runtime
-                .serial_device
-                .as_ref()
-                .expect("serial device should exist")
-                .output
-                .metrics()
-                .error_count(),
-            1
-        );
+        let metrics = runtime
+            .serial_device
+            .as_ref()
+            .expect("serial device should exist")
+            .output
+            .metrics();
+        assert_eq!(metrics.error_count(), 0);
+        assert_eq!(metrics.host_input_fails(), 1);
     }
 
     #[test]
@@ -45569,6 +45667,90 @@ mod tests {
                 .with_entropy_event_fails(1)
                 .with_entropy_event_count(1)
                 .with_entropy_bytes(16)
+        );
+    }
+
+    #[test]
+    fn mmio_entropy_transport_metrics_bind_activation_at_source() {
+        let (_memory, mut runtime, dispatcher) = boot_runtime_with_entropy();
+        let metrics = SharedEntropyDeviceMetrics::default();
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+        super::bind_mmio_entropy_transport_metrics(&runtime, &dispatcher, &metrics)
+            .expect("MMIO entropy metrics should bind");
+
+        let mut dispatcher = dispatcher
+            .lock()
+            .expect("MMIO entropy dispatcher should remain available");
+        for status in [
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            QUEUE_CONFIG_STATUS,
+        ] {
+            write_boot_entropy_mmio_u32(
+                &mut runtime,
+                &mut dispatcher,
+                VirtioMmioRegister::Status,
+                status,
+            );
+        }
+        let address = runtime
+            .entropy_device
+            .as_ref()
+            .expect("entropy device should exist")
+            .registration
+            .address()
+            .checked_add(VirtioMmioRegister::Status.offset())
+            .expect("entropy status address should not overflow");
+        let access = dispatcher
+            .lookup(address, 4)
+            .expect("entropy status access should resolve");
+        let data = MmioAccessBytes::new(&DRIVER_OK_STATUS.to_le_bytes())
+            .expect("entropy status bytes should build");
+        assert!(
+            dispatcher
+                .dispatch(MmioOperation::write(access, data).expect("status write should build"))
+                .is_err(),
+            "an entropy queue that is not ready should reject activation"
+        );
+
+        assert_eq!(
+            metrics.snapshot(),
+            EntropyDeviceMetrics::default().with_activate_fails(1)
+        );
+    }
+
+    #[test]
+    fn mmio_pmem_transport_metrics_bind_aggregate_and_device_at_source() {
+        let (_memory, runtime, dispatcher) = boot_runtime_with_pmem(&["pmem0", "pmem1"]);
+        let metrics = SharedPmemDeviceMetricsRegistry::from_device_ids(["pmem0", "pmem1"]);
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+        super::bind_mmio_pmem_transport_metrics(&runtime, &dispatcher, &metrics)
+            .expect("MMIO pmem metrics should bind");
+
+        let address = runtime.pmem_mmio_devices[1]
+            .registration
+            .address()
+            .checked_add(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + 17)
+            .expect("pmem config address should not overflow");
+        let mut dispatcher = dispatcher
+            .lock()
+            .expect("MMIO pmem dispatcher should remain available");
+        let access = dispatcher
+            .lookup(address, 1)
+            .expect("pmem config access should resolve");
+        assert!(
+            dispatcher
+                .dispatch(MmioOperation::read(access).expect("config read should build"))
+                .is_err(),
+            "a pmem config read starting after the pinned 16-byte source should fail"
+        );
+        drop(dispatcher);
+
+        let expected = PmemDeviceMetrics::default().with_cfg_fails(1);
+        assert_eq!(metrics.aggregate_snapshot(), expected);
+        assert_eq!(
+            metrics.per_device_snapshot(),
+            PmemDeviceMetricsByDevice::new().with_device_metrics("pmem1", expected)
         );
     }
 
