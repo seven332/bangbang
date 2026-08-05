@@ -4443,7 +4443,7 @@
         {
           "kind": "local",
           "path": "crates/runtime/src/vsock.rs",
-          "anchor": "fn vsock_host_read_poll_distinguishes_clean_eof_and_terminal_error_after_queued_data()"
+          "anchor": "fn virtio_vsock_notifications_deliver_guest_connection_host_rw_payload_to_guest()"
         },
         {
           "kind": "local",
@@ -4607,7 +4607,7 @@
         {
           "kind": "local",
           "path": "crates/runtime/src/vsock.rs",
-          "anchor": "fn vsock_host_read_poll_distinguishes_clean_eof_and_terminal_error_after_queued_data()"
+          "anchor": "fn vsock_host_read_metrics_preserve_bytes_and_terminal_failure()"
         },
         {
           "kind": "local",
@@ -4853,7 +4853,7 @@
         {
           "kind": "local",
           "path": "crates/runtime/src/vsock.rs",
-          "anchor": "fn virtio_vsock_notifications_forward_guest_rw_payload_to_host_stream()"
+          "anchor": "fn vsock_guest_connection_records_terminal_rw_write_failure()"
         },
         {
           "kind": "local",
