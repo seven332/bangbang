@@ -6,6 +6,7 @@ mod logger_upstream;
 mod logger_validate;
 mod metrics_certify;
 mod metrics_model;
+mod metrics_process_certify;
 mod metrics_process_model;
 mod metrics_process_validate;
 mod metrics_upstream;
@@ -36,6 +37,7 @@ pub use metrics_model::{
     MetricsSchemaSourceCandidate, MetricsSourceAnchor, MetricsSourceField, MetricsStaticRoot,
     MetricsUnit, MetricsValueKind,
 };
+pub use metrics_process_certify::validate_metrics_process_compatibility;
 pub use metrics_process_model::{
     MetricsProcessProducerAudit, MetricsProcessProducerBoundary, MetricsProcessProducerDisposition,
     MetricsProcessProducerRecord,

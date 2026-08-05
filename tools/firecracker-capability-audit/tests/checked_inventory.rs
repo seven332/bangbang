@@ -5,13 +5,14 @@ use bangbang_firecracker_capability_audit::{
     AuditMode, CAPABILITY_INVENTORY_PATH, Disposition, LOGGER_COMPATIBILITY_CAPABILITY_IDS,
     LOGGER_PRODUCER_AUDIT_PATH, LOGGER_PRODUCER_MANIFEST_PATH, LoggerClassDisposition,
     LoggerCompiledEvent, LoggerDeliveryPolicy, LoggerNonApplicableReason,
-    METRICS_SCHEMA_AUTHORITY_PATH, METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS,
+    METRICS_PROCESS_PRODUCER_AUDIT_PATH, METRICS_SCHEMA_AUTHORITY_PATH,
+    METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS, MetricsProcessProducerDisposition,
     MetricsProducerDisposition, MetricsProducerOwner, RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS,
     Reference, SOURCE_MANIFEST_PATH, logger_producer_audit_json, logger_producer_manifest_json,
     read_capability_inventory, read_logger_producer_audit, read_logger_producer_manifest,
-    read_metrics_schema_authority, read_source_manifest, source_manifest_json, validate,
-    validate_logger_compatibility, validate_logger_producers,
-    validate_metrics_schema_compatibility,
+    read_metrics_process_producer_audit, read_metrics_schema_authority, read_source_manifest,
+    source_manifest_json, validate, validate_logger_compatibility, validate_logger_producers,
+    validate_metrics_process_compatibility, validate_metrics_schema_compatibility,
 };
 
 #[test]
@@ -763,7 +764,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
     )
     .expect_err("stale #1822 schema-runtime handoff must fail")
     .to_string();
-    assert!(error.contains("outside the exact #1788/#1789 handoff"));
+    assert!(error.contains("outside the exact completed-process/#1789 handoff"));
     assert!(error.contains("exactly 1 implemented schema-runtime"));
 
     let mut wrong_handoff = authority.clone();
@@ -781,7 +782,93 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
     )
     .expect_err("wrong later-owner handoff must fail")
     .to_string();
-    assert!(error.contains("outside the exact #1788/#1789 handoff"));
+    assert!(error.contains("outside the exact completed-process/#1789 handoff"));
+}
+
+#[test]
+fn checked_metrics_process_compatibility_is_terminal_and_fail_closed() {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let manifest = read_source_manifest(&repository_root.join(SOURCE_MANIFEST_PATH))
+        .expect("checked source manifest must parse");
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let authority =
+        read_metrics_schema_authority(&repository_root.join(METRICS_SCHEMA_AUTHORITY_PATH))
+            .expect("checked metrics schema authority must parse");
+    let audit = read_metrics_process_producer_audit(
+        &repository_root.join(METRICS_PROCESS_PRODUCER_AUDIT_PATH),
+    )
+    .expect("checked process producer audit must parse");
+
+    validate_metrics_process_compatibility(
+        &manifest,
+        &inventory,
+        &authority,
+        &audit,
+        &repository_root,
+    )
+    .expect("checked process metrics compatibility scope must be terminal");
+
+    let mut unresolved = audit.clone();
+    let record = unresolved
+        .records
+        .iter_mut()
+        .find(|record| record.delivery_issue == "#1827")
+        .expect("completed API process record must exist");
+    record.disposition = MetricsProcessProducerDisposition::Planned;
+    record.implementation.clear();
+    record.validation.clear();
+    let error = validate_metrics_process_compatibility(
+        &manifest,
+        &inventory,
+        &authority,
+        &unresolved,
+        &repository_root,
+    )
+    .expect_err("unresolved process record must fail final certification")
+    .to_string();
+    assert!(error.contains("completed metrics process producer slice must be terminal"));
+    assert!(error.contains("final metrics process producer validation rejects planned record"));
+
+    let mut regressed_authority = authority.clone();
+    let profile = regressed_authority
+        .policy_profiles
+        .iter_mut()
+        .find(|profile| {
+            profile.producer_owner == MetricsProducerOwner::ProcessLifecycle
+                && profile.unit == bangbang_firecracker_capability_audit::MetricsUnit::Count
+        })
+        .expect("implemented process count profile must exist");
+    let implemented_id = profile.id.clone();
+    let planned_id = "count-none-process-lifecycle-planned";
+    profile.id = planned_id.to_string();
+    profile.producer_disposition = MetricsProducerDisposition::Planned;
+    profile.delivery_issue = Some("#1788".to_string());
+    profile.rationale =
+        "#1788 owns the exact API, process, logger, signal, boot, and lifecycle producer boundary."
+            .to_string();
+    profile.implementation.clear();
+    profile.validation.clear();
+    regressed_authority
+        .field_policies
+        .iter_mut()
+        .filter(|policy| policy.profile_id == implemented_id)
+        .for_each(|policy| policy.profile_id = planned_id.to_string());
+    let error = validate_metrics_process_compatibility(
+        &manifest,
+        &inventory,
+        &regressed_authority,
+        &audit,
+        &repository_root,
+    )
+    .expect_err("regressed process profile must fail final certification")
+    .to_string();
+    assert!(error.contains("outside the exact completed-process/#1789 handoff"));
+    assert!(error.contains("exactly 2 implemented process-lifecycle"));
 }
 
 #[test]

@@ -3060,16 +3060,20 @@ and reject disclosure of the path, grant ID/reference, adopted descriptor,
 private error, or metrics section. The signed HVF lifecycle oracle additionally
 observes canonical initial, real 60-second Paused and Running periodic,
 explicit, and terminal records through one adopted write-only sink. This does
-not grant new authority, promote #1788/#1789 producer policies, close either
-#1790 aggregate, or turn best-effort metrics into a durable audit channel.
+not grant new authority; it observes the completed #1788 profile handoff
+without promoting #1789, closing either #1790 aggregate, or turning
+best-effort metrics into a durable audit channel.
 
 The separate #1788 process-producer audit is now terminal for all 69 fields:
-64 implemented, one source-neutral, and four platform-zero. Its signal/panic
-slice proves persistent SIGHUP/SIGXCPU/SIGXFSZ/panic Stores in the stable
-process cut, immediate platform-zero SIGILL/SIGBUS/SIGSEGV, and macOS
+64 implemented, one source-neutral, and four platform-zero. Its two aggregate
+schema profiles are implemented, while the dedicated
+`validate --metrics-process-final` gate applies final mode to every exact field
+record without promoting #1789 device profiles or #1790 aggregates. Its
+signal/panic slice proves persistent SIGHUP/SIGXCPU/SIGXFSZ/panic Stores in the
+stable process cut, immediate platform-zero SIGILL/SIGBUS/SIGSEGV, and macOS
 platform-zero `seccomp.num_faults`. Explicit SIGSYS remains an exit-code path,
-not an invented seccomp producer. Disposition mutations and fabricated
-SIGSYS/seccomp equivalence fail the checked audit.
+not an invented seccomp producer. Profile, disposition, and fabricated
+SIGSYS/seccomp equivalence mutations fail the checked certification.
 
 Current session-initial, periodic, explicit, normal-terminal, and classified
 external-fatal terminal metrics lines

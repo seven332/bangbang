@@ -7294,15 +7294,82 @@
       "validation": []
     },
     {
-      "id": "count-none-process-lifecycle-planned",
+      "id": "count-none-process-lifecycle-implemented",
       "unit": "count",
       "aggregation": "none",
       "producer_owner": "process-lifecycle",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1788",
-      "rationale": "#1788 owns the exact API, process, logger, signal, boot, and lifecycle producer boundary.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed request and deprecation count producer effects"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup panic and fatal signal count producer boundaries"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "typed process metric effects and panic bridge"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "logger loss and rate-limit producer facades"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "process counters stable cut and publication transaction"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact Firecracker request effect tables and boundary tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup panic signal and terminal failure tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/app_sandbox_process_e2e.rs",
+          "anchor": "signed process signal and terminal metrics boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed live process metrics and fatal convergence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "portable process metrics lifecycle and exact exit tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "real periodic lifecycle and contained worker metrics coverage"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "process cut retry saturation Store and Incremental tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact process producer authority and mutation tests"
+        }
+      ]
     },
     {
       "id": "count-sum-across-configured-devices-device-planned",
@@ -7371,15 +7438,67 @@
       "validation": []
     },
     {
-      "id": "microseconds-none-process-lifecycle-planned",
+      "id": "microseconds-none-process-lifecycle-implemented",
       "unit": "microseconds",
       "aggregation": "none",
       "producer_owner": "process-lifecycle",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1788",
-      "rationale": "#1788 owns the exact API, process, logger, signal, boot, and lifecycle producer boundary.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "successful outer API latency producers"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "process startup wall and CPU metric producers"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "successful inner VMM latency producers"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "typed startup and latency Store serialization"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "controlled outer latency success and failure tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup clock saturation and parent CPU tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "controlled inner latency and automatic-resume tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "real periodic and terminal metrics lifecycle"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "startup and latency persistence serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact process timing authority and mutation tests"
+        }
+      ]
     },
     {
       "id": "microseconds-sum-across-configured-devices-device-planned",
@@ -7689,11 +7808,11 @@
     },
     {
       "field_id": "static:api_server.process_startup_time_cpu_us",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:api_server.process_startup_time_us",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:balloon.activate_fails",
@@ -7841,7 +7960,7 @@
     },
     {
       "field_id": "static:deprecated_api.deprecated_http_api_calls",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:entropy.activate_fails",
@@ -7873,23 +7992,23 @@
     },
     {
       "field_id": "static:get_api_requests.hotplug_memory_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:get_api_requests.instance_info_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:get_api_requests.machine_cfg_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:get_api_requests.mmds_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:get_api_requests.vmm_version_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:i8042.error_count",
@@ -7925,59 +8044,59 @@
     },
     {
       "field_id": "static:latencies_us.diff_create_snapshot",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:latencies_us.full_create_snapshot",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:latencies_us.load_snapshot",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:latencies_us.pause_vm",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:latencies_us.resume_vm",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:latencies_us.vmm_diff_create_snapshot",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:latencies_us.vmm_full_create_snapshot",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:latencies_us.vmm_load_snapshot",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:latencies_us.vmm_pause_vm",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:latencies_us.vmm_resume_vm",
-      "profile_id": "microseconds-none-process-lifecycle-planned"
+      "profile_id": "microseconds-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:logger.metrics_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:logger.missed_log_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:logger.missed_metrics_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:logger.rate_limited_log_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:memory_hotplug.activate_fails",
@@ -8253,51 +8372,51 @@
     },
     {
       "field_id": "static:patch_api_requests.drive_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:patch_api_requests.drive_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:patch_api_requests.hotplug_memory_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:patch_api_requests.hotplug_memory_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:patch_api_requests.machine_cfg_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:patch_api_requests.machine_cfg_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:patch_api_requests.mmds_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:patch_api_requests.mmds_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:patch_api_requests.network_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:patch_api_requests.network_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:patch_api_requests.pmem_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:patch_api_requests.pmem_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:pmem.activate_fails",
@@ -8325,107 +8444,107 @@
     },
     {
       "field_id": "static:put_api_requests.actions_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.actions_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.boot_source_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.boot_source_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.cpu_cfg_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.cpu_cfg_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.drive_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.drive_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.hotplug_memory_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.hotplug_memory_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.logger_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.logger_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.machine_cfg_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.machine_cfg_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.metrics_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.metrics_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.mmds_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.mmds_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.network_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.network_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.pmem_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.pmem_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.serial_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.serial_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.vsock_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:put_api_requests.vsock_fails",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:rtc.error_count",
@@ -8441,35 +8560,35 @@
     },
     {
       "field_id": "static:seccomp.num_faults",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:signals.sigbus",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:signals.sighup",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:signals.sigill",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:signals.sigpipe",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:signals.sigsegv",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:signals.sigxcpu",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:signals.sigxfsz",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:uart.error_count",
@@ -8577,7 +8696,7 @@
     },
     {
       "field_id": "static:vmm.panic_count",
-      "profile_id": "count-none-process-lifecycle-planned"
+      "profile_id": "count-none-process-lifecycle-implemented"
     },
     {
       "field_id": "static:vsock.activate_fails",

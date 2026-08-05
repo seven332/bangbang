@@ -342,7 +342,7 @@ fn process_producer_audit_rejects_neutral_aliases_and_bad_evidence() {
 }
 
 #[test]
-fn checked_metrics_authority_has_exact_schema_runtime_and_later_owner_partition() {
+fn checked_metrics_authority_has_exact_completed_process_and_later_owner_partition() {
     let authority = checked_authority();
     let count = |owner, disposition| {
         authority
@@ -363,7 +363,7 @@ fn checked_metrics_authority_has_exact_schema_runtime_and_later_owner_partition(
     assert_eq!(
         count(
             MetricsProducerOwner::ProcessLifecycle,
-            MetricsProducerDisposition::Planned,
+            MetricsProducerDisposition::Implemented,
         ),
         2
     );
@@ -386,7 +386,7 @@ fn checked_metrics_authority_has_exact_schema_runtime_and_later_owner_partition(
     let manifest = read_source_manifest(&root.join(SOURCE_MANIFEST_PATH))
         .expect("checked source manifest must parse");
     let error = validate_metrics_schema(&authority, &manifest, &root, AuditMode::Final)
-        .expect_err("planned metrics producers must fail final mode");
+        .expect_err("unfinished device metrics producers must fail final mode");
     assert!(error.to_string().contains("nonterminal producer policy"));
 }
 
