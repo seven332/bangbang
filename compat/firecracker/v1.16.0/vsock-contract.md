@@ -102,8 +102,13 @@ The immutable upstream baseline is Firecracker commit
 - The live device has three 256-entry queues, one shared 1023 active budget,
   bounded incomplete-host and packet queues, round-robin host-local ports,
   wrapping credit, both initiation directions, shutdown/reset, `EVENT_IDX`,
-  aggregate metrics, and exact teardown. Indirect descriptors are a supported
-  Bangbang extension.
+  aggregate metrics, and exact teardown. Its 20 pinned metrics share one
+  coherent saturating owner across configuration, device, MMIO/PCI, HVF
+  readiness, and restore; queue counts follow admitted source work, packet and
+  byte counts follow actual connection delivery, and readiness failures retain
+  muxer-versus-connection attribution. The 128-entry deadline queue rejects
+  stale entries, rebuilds until synchronized after overflow, and expires at the
+  exact deadline. Indirect descriptors are a supported Bangbang extension.
 - Full/File native-v2 2.12 captures exactly one optional kind-13 device with
   CID, selector, host-local cursor, features, queues, interrupts, and coherent
   MMIO/PCI placement. Connections, accepts, packets, wakeups, deadlines,

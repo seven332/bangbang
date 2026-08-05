@@ -1553,14 +1553,14 @@ cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --lock
 
 The adjacent human-owned `metrics-device-producer-audit.json` maps all 231
 device-owned fields to closed operation boundaries and the nine concrete #1789
-children. After #1839 it contains 60 implemented
-entropy/pmem/RTC/UART/balloon/memory-hotplug fields, one source-neutral
-`uart.flush_count`, 155 planned fields, and 15
+children. After #1840 it contains 80 implemented
+entropy/pmem/RTC/UART/balloon/memory-hotplug/vsock fields, one source-neutral
+`uart.flush_count`, 135 planned fields, and 15
 provisional-platform-zero fields. Only the latter two groups are nonterminal
 and evidence-free. The same focused test checks canonical bytes, exact
 membership and partition, completed-child regression, future-child premature
 promotion, the UART-flush disposition, suffix routing, provisional state,
-anchored-evidence rules, and final-mode rejection of the remaining 170 records.
+anchored-evidence rules, and final-mode rejection of the remaining 150 records.
 
 Focused #1838 producer coverage lives with the owning runtime modules. It
 checks entropy popped-descriptor accounting and owner attachment, exact pmem
@@ -1578,6 +1578,20 @@ coherent compound snapshots. It also pins memory-hotplug request/failure/byte
 and latency aggregation, persistent interval minima/maxima, and coherent
 operation tuples. Signed direct and production continuation tests exercise the
 fresh per-process owner through both MMIO and PCI restore paths.
+
+Focused #1840 coverage pins all 20 vsock fields at their source boundaries:
+configuration and activation failures, admitted queue invocations versus
+queue infrastructure failures, delivered packets and bytes, host read/write
+failures, connection lifecycle, readiness classification, and exact deadline
+expiry. Capacity, stale-cancellation, and repeated kill-queue resynchronization
+tests cover both connection directions. Publication tests assert the exact
+20-field object, coherent racing snapshots, zero and later intervals, failed
+middle writes, and ambiguous acceptance. Signed direct and production
+snapshot-vsock tests assert the exact object shape and fresh MMIO/PCI restored
+owners. They require delivered RX/TX packets and bytes plus admitted TX queue
+work; a restored queue may consume guest-posted RX buffers without a fresh RX
+notification, so the focused source-admission tests—not an unconditional
+positive signed counter—pin `rx_queue_event_count`.
 
 The ordinary `compare` command rederives the source projection together with
 the general and logger manifests. To create a metrics source-only candidate:
@@ -1640,7 +1654,7 @@ logger and device-audit validation in delivery mode. It requires the two
 implemented process profiles and all 69 field records to remain terminal at
 exactly 64 implemented, one source-neutral, and four platform-zero. Ten planned
 and four platform-zero device profiles remain #1789-owned; within the 231-field
-device audit, #1838 and #1839 contribute 61 terminal records and the other 170
+device audit, #1838–#1840 contribute 81 terminal records and the other 150
 remain nonterminal. The two aggregates remain #1790-owned.
 The composed test mutates both a field record and an aggregate process profile;
 the lower-level suite separately exercises every membership, ordering,

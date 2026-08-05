@@ -695,16 +695,21 @@ fields, newer balloon API/device fields, extra UART fields, and the ordinary
 block configuration-change value remain internal or are discarded at the
 public boundary. Adding an extension requires a separately versioned schema.
 
-The checked device-producer audit now terminally certifies all 23 #1838 fields:
-22 entropy, pmem, RTC, and UART fields are implemented, while
-`uart.flush_count` is source-neutral zero because pinned Firecracker has no
-producer for it. Each device owner publishes an immutable compound counter
-snapshot. Entropy counts popped requests before parse or throttling; pmem binds
-configuration and activation failures to both the exact current generation and
-the aggregate; RTC records missed counters only for invalid/read-only register
-accesses; UART limiter drops count an attempted write while FIFO clears and
-host-input/state failures stay internal. Later #1839–#1846 records remain
-nonterminal and repository-final certification remains gated on their delivery.
+The checked device-producer audit now terminally certifies all 81 #1838–#1840
+fields: 80 entropy, pmem, RTC, UART, balloon, memory-hotplug, and vsock fields
+are implemented, while `uart.flush_count` is source-neutral zero because pinned
+Firecracker has no producer for it. Each device owner publishes an immutable
+compound counter snapshot. Entropy counts popped requests before parse or
+throttling; pmem binds configuration and activation failures to both the exact
+current generation and aggregate; RTC records missed counters only for
+invalid/read-only register accesses; UART limiter drops count an attempted
+write while FIFO clears and host-input/state failures stay internal. Balloon
+and memory-hotplug retain coherent operation tuples. Vsock binds configuration,
+device, MMIO/PCI, HVF readiness, and restored sessions to one fresh owner;
+records queue, packet, byte, connection, and I/O failure semantics at their
+source boundaries; and uses a stale-safe bounded deadline queue. Later
+#1841–#1846 records remain nonterminal and repository-final certification
+remains gated on their delivery.
 
 One flush first freezes missed-log, rate-limited-log, and SIGPIPE totals through
 two fixed-order `SeqCst` scans separated by a `SeqCst` fence. Equal monotonic

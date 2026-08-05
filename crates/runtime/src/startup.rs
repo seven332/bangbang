@@ -62,9 +62,7 @@ use crate::memory_hotplug::{
     VirtioMemMmioLayout, VirtioMemMmioRegistrationError, VirtioMemMutationExecutor,
     VirtioMemPrepareError,
 };
-use crate::metrics::{
-    SharedMemoryHotplugDeviceMetrics, SharedRtcDeviceMetrics, SharedVsockDeviceMetrics,
-};
+use crate::metrics::{SharedMemoryHotplugDeviceMetrics, SharedRtcDeviceMetrics};
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerLookupError, MmioRegion,
     MmioRegionId, MmioRegistrationError, MmioRegistrationLease, MmioRegistrationOwner,
@@ -4312,7 +4310,6 @@ pub fn prepare_vsock_transport_reset_for_device(
     device: &Arm64BootVsockDevice,
     mmio_dispatcher: &mut MmioDispatcher,
     memory: &mut GuestMemory,
-    metrics: &SharedVsockDeviceMetrics,
 ) -> Result<
     (
         VirtioVsockTransportResetAttempt,
@@ -4326,7 +4323,7 @@ pub fn prepare_vsock_transport_reset_for_device(
     let identity =
         Arm64BootVsockMmioHandlerIdentity(handler.activation_handler().capture_owner_identity());
     let attempt = handler
-        .prepare_vsock_transport_reset(memory, metrics)
+        .prepare_vsock_transport_reset(memory)
         .map_err(Arm64BootVsockTransportResetError::Device)?;
     Ok((attempt, identity))
 }

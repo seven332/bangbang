@@ -43,10 +43,11 @@ including the schema-runtime timestamp producer. #1788 certifies the exact
 API, process, logger, signal, boot, and lifecycle producers through two
 implemented aggregate profiles and the field-level process audit. The checked
 device audit now assigns every #1789 field to one concrete delivery child and
-terminally certifies the 61 records delivered by #1838 and #1839; later child
-records remain nonterminal. `corpus:metrics` and the cross-producer aggregate semantic remain
-#1790-owned. A required zero therefore proves wire-shape completeness only,
-never producer completion unless its field audit is terminal.
+terminally certifies the 81 records delivered by #1838–#1840; later child
+records remain nonterminal. `corpus:metrics` and the cross-producer aggregate
+semantic remain #1790-owned. A required zero therefore proves wire-shape
+completeness only, never producer completion unless its field audit is
+terminal.
 
 ## Terminal API and Schema Certification
 
@@ -218,10 +219,10 @@ Static and configured identities remain distinct; exact suffix routing splits
 mapped network fields from tap-oriented gaps and applicable vCPU exits from
 retained PIO/KVM-clock fields.
 
-After #1839, the audit contains 155 `planned`, 15
-`provisional-platform-zero`, 60 `implemented`, and one `source-neutral`
-record. The 61 terminal records cover the complete pinned entropy, pmem, RTC,
-UART, balloon, and memory-hotplug roots. `uart.flush_count` is the
+After #1840, the audit contains 135 `planned`, 15
+`provisional-platform-zero`, 80 `implemented`, and one `source-neutral`
+record. The 81 terminal records cover the complete pinned entropy, pmem, RTC,
+UART, balloon, memory-hotplug, and vsock roots. `uart.flush_count` is the
 source-neutral record because pinned Firecracker declares the field but has no
 producer; receive-FIFO clearing and other Bangbang-only serial diagnostics do
 not feed it. The remaining planned and provisional records are nonterminal,
@@ -229,6 +230,18 @@ carry empty implementation and validation arrays, and have no platform
 exclusion. The provisional records are the six retained i8042 fields plus nine
 vCPU PIO/KVM-clock fields; this label does not claim that the terminal platform
 evidence required by #1846 already exists.
+
+Vsock uses one coherent saturating owner from configuration and activation
+through MMIO/PCI dispatch, HVF readiness, snapshot normalization, restore, and
+publication. Queue counters are recorded at source admission boundaries;
+packet and byte counters follow actual connection delivery; poll and stale-fd
+failures remain distinct from connection readiness failures. The bounded
+128-entry deadline queue validates stale entries and records each required
+resynchronization while exact-boundary expiry records one kill and removal.
+Every metrics flush snapshots all 20 fields atomically and advances its
+success baseline only after the full JSON line is accepted, so first-zero,
+later-delta, failed-middle, and ambiguously accepted writes retain the same
+at-least-once contract as the other device roots.
 
 Entropy, pmem, RTC, and UART counters use one narrow owner-local value lock per
 immutable snapshot. A compound producer update and a snapshot therefore cannot

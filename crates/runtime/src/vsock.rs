@@ -25,10 +25,10 @@ use crate::logger::{GuestLogger, LoggerVsockOutcome};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
 };
-use crate::metrics::SharedVsockDeviceMetrics;
+use crate::metrics::{SharedVsockDeviceMetrics, VsockDeviceMetrics};
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
-    MmioHandlerError, MmioRegion, MmioRegionId,
+    MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
 };
 use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
@@ -106,12 +106,62 @@ const VSOCK_CONNECTION_BUFFER_SIZE_USIZE: usize = VIRTIO_VSOCK_CONNECTION_BUFFER
 const VSOCK_CREDIT_UPDATE_THRESHOLD: u32 = 4 * 1024;
 const VSOCK_CONNECTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const VSOCK_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const VSOCK_KILL_QUEUE_CAPACITY: usize = 128;
 const VSOCK_HOST_CONNECT_COMMAND: &str = "connect";
 
 pub type VirtioVsockMmioHandler =
     VirtioMmioRegisterHandler<VirtioVsockConfigSpace, VirtioVsockDevice>;
 /// Host file descriptors and deadline that should wake a running vsock device.
 pub type VsockHostWakeup = (Vec<RawFd>, Vec<RawFd>, Option<Instant>);
+
+/// One host descriptor readiness observation retained by the VMM run loop.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsockHostReadiness {
+    descriptor: RawFd,
+    readable: bool,
+    writable: bool,
+    error: bool,
+    hangup: bool,
+    invalid: bool,
+}
+
+impl VsockHostReadiness {
+    pub const fn from_poll_revents(descriptor: RawFd, revents: libc::c_short) -> Self {
+        Self {
+            descriptor,
+            readable: revents & libc::POLLIN != 0,
+            writable: revents & libc::POLLOUT != 0,
+            error: revents & libc::POLLERR != 0,
+            hangup: revents & libc::POLLHUP != 0,
+            invalid: revents & libc::POLLNVAL != 0,
+        }
+    }
+
+    pub const fn descriptor(self) -> RawFd {
+        self.descriptor
+    }
+
+    pub const fn readable(self) -> bool {
+        self.readable
+    }
+
+    pub const fn writable(self) -> bool {
+        self.writable
+    }
+
+    pub const fn error(self) -> bool {
+        self.error
+    }
+
+    pub const fn hangup(self) -> bool {
+        self.hangup
+    }
+
+    pub const fn invalid(self) -> bool {
+        self.invalid
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VsockConfigInput {
@@ -1173,6 +1223,79 @@ struct VsockConnectionDeadline {
     at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum VsockConnectionDeadlineKey {
+    Host(VsockHostConnectionKey),
+    Guest(VsockGuestConnectionKey),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VsockConnectionKillQueueEntry {
+    key: VsockConnectionDeadlineKey,
+    deadline: VsockConnectionDeadline,
+}
+
+#[derive(Debug)]
+struct VsockConnectionKillQueue {
+    entries: VecDeque<VsockConnectionKillQueueEntry>,
+    synchronized: bool,
+}
+
+impl VsockConnectionKillQueue {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(VSOCK_KILL_QUEUE_CAPACITY),
+            synchronized: true,
+        }
+    }
+
+    fn from_deadlines(deadlines: impl IntoIterator<Item = VsockConnectionKillQueueEntry>) -> Self {
+        let mut deadlines = deadlines.into_iter().collect::<Vec<_>>();
+        deadlines.sort_unstable_by_key(|entry| entry.deadline.at);
+        let synchronized = deadlines.len() <= VSOCK_KILL_QUEUE_CAPACITY;
+        deadlines.truncate(VSOCK_KILL_QUEUE_CAPACITY);
+        Self {
+            entries: deadlines.into(),
+            synchronized,
+        }
+    }
+
+    fn push(&mut self, entry: VsockConnectionKillQueueEntry) {
+        if !self.synchronized || self.entries.len() >= VSOCK_KILL_QUEUE_CAPACITY {
+            self.synchronized = false;
+            return;
+        }
+        let index = self
+            .entries
+            .iter()
+            .position(|existing| entry.deadline.at < existing.deadline.at)
+            .unwrap_or(self.entries.len());
+        self.entries.insert(index, entry);
+    }
+
+    fn pop_expired(&mut self, now: Instant) -> Option<VsockConnectionKillQueueEntry> {
+        self.entries
+            .front()
+            .is_some_and(|entry| entry.deadline.at <= now)
+            .then(|| self.entries.pop_front())
+            .flatten()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    const fn is_synchronized(&self) -> bool {
+        self.synchronized
+    }
+}
+
+impl Default for VsockConnectionKillQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VsockConnectionLifecycle {
     phase: VsockConnectionPhase,
@@ -1263,6 +1386,7 @@ impl VsockConnectionLifecycle {
         true
     }
 
+    #[cfg(test)]
     fn has_expired(self, now: Instant) -> bool {
         !self.local_shutdown_packet_pending
             && self.deadline.is_some_and(|deadline| deadline.at <= now)
@@ -1277,6 +1401,10 @@ impl Default for VsockConnectionLifecycle {
 
 fn vsock_deadline_after(now: Instant, timeout: Duration) -> Instant {
     now.checked_add(timeout).unwrap_or(now)
+}
+
+fn vsock_metric_count(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1523,10 +1651,6 @@ impl VsockHostConnection {
         self.lifecycle.deadline()
     }
 
-    fn has_expired(&self, now: Instant) -> bool {
-        self.lifecycle.has_expired(now)
-    }
-
     fn mark_local_closed(&mut self, now: Instant) -> bool {
         self.lifecycle.mark_local_closed(now)
     }
@@ -1595,9 +1719,17 @@ impl VsockHostConnection {
         })
     }
 
-    fn write_guest_rw_payload(&mut self, payload: Vec<u8>) -> Result<(), VsockGuestRwForwardError> {
+    fn write_guest_rw_payload(
+        &mut self,
+        payload: Vec<u8>,
+    ) -> Result<usize, VsockGuestRwForwardFailure> {
         self.credit
-            .accept_guest_bytes(payload_len_u32(payload.len()))?;
+            .accept_guest_bytes(payload_len_u32(payload.len()))
+            .map_err(|source| VsockGuestRwForwardFailure {
+                forwarded_bytes: 0,
+                source,
+                during_flush: false,
+            })?;
         let mut stream = self.accepted.stream();
         match self
             .pending_guest_rw_writes
@@ -1610,17 +1742,17 @@ impl VsockHostConnection {
                     self.credit.local_outstanding_bytes() as usize,
                     self.pending_guest_rw_writes.pending_bytes()
                 );
-                Ok(())
+                Ok(forwarded_bytes)
             }
             Err(failure) => {
                 self.credit
                     .record_forwarded_bytes(forwarded_byte_count_u32(failure.forwarded_bytes));
-                Err(failure.source)
+                Err(failure)
             }
         }
     }
 
-    fn flush_pending_guest_rw_writes(&mut self) -> Result<(), VsockGuestRwForwardError> {
+    fn flush_pending_guest_rw_writes(&mut self) -> Result<usize, VsockGuestRwForwardFailure> {
         let mut stream = self.accepted.stream();
         match self.pending_guest_rw_writes.flush(&mut stream) {
             Ok(forwarded_bytes) => {
@@ -1630,12 +1762,12 @@ impl VsockHostConnection {
                     self.credit.local_outstanding_bytes() as usize,
                     self.pending_guest_rw_writes.pending_bytes()
                 );
-                Ok(())
+                Ok(forwarded_bytes)
             }
             Err(failure) => {
                 self.credit
                     .record_forwarded_bytes(forwarded_byte_count_u32(failure.forwarded_bytes));
-                Err(failure.source)
+                Err(failure)
             }
         }
     }
@@ -1770,17 +1902,30 @@ impl VsockHostConnection {
         Some(header)
     }
 
-    fn poll_host_rw_payloads(&mut self, scratch: &mut [u8]) -> VsockHostRwPollOutcome {
+    fn poll_host_rw_payloads(&mut self, scratch: &mut [u8]) -> (VsockHostRwPollOutcome, usize) {
         if !self.can_poll_host_rw_payload() {
-            return VsockHostRwPollOutcome::NoData;
+            return (VsockHostRwPollOutcome::NoData, 0);
         }
 
-        let mut stream = self.accepted.stream();
-        poll_host_rw_payloads_from_stream(
-            &mut stream,
+        let pending_bytes_before = self
+            .pending_host_rw_payloads
+            .iter()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        let outcome = poll_host_rw_payloads_from_stream(
+            &mut self.accepted.stream(),
             &mut self.pending_host_rw_payloads,
             &mut self.credit,
             scratch,
+        );
+        let pending_bytes_after = self
+            .pending_host_rw_payloads
+            .iter()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        (
+            outcome,
+            pending_bytes_after.saturating_sub(pending_bytes_before),
         )
     }
 }
@@ -1791,6 +1936,19 @@ enum VsockHostRwPollOutcome {
     Queued,
     Closed,
     ReadError,
+}
+
+fn vsock_host_rw_poll_observation(
+    outcome: VsockHostRwPollOutcome,
+    read_bytes: usize,
+) -> VsockDeviceMetrics {
+    let observation =
+        VsockDeviceMetrics::default().with_rx_bytes_count(vsock_metric_count(read_bytes));
+    if outcome == VsockHostRwPollOutcome::ReadError {
+        observation.with_rx_read_fails(1).with_conns_killed(1)
+    } else {
+        observation
+    }
 }
 
 fn poll_host_rw_payloads_from_stream(
@@ -2281,6 +2439,7 @@ fn guest_reset_packet_header_for_tx_header(
 pub struct VsockHostConnectionTable {
     local_ports: VsockHostLocalPortAllocator,
     connections: HashMap<VsockHostConnectionKey, VsockHostConnection>,
+    metrics: SharedVsockDeviceMetrics,
 }
 
 impl VsockHostConnectionTable {
@@ -2297,7 +2456,12 @@ impl VsockHostConnectionTable {
         Self {
             local_ports,
             connections: HashMap::new(),
+            metrics: SharedVsockDeviceMetrics::default(),
         }
+    }
+
+    fn attach_metrics(&mut self, metrics: SharedVsockDeviceMetrics) {
+        self.metrics = metrics;
     }
 
     #[cfg(test)]
@@ -2357,6 +2521,8 @@ impl VsockHostConnectionTable {
             Entry::Occupied(_) => Err(VsockHostConnectionTableError::DuplicateKey { key }),
             Entry::Vacant(entry) => {
                 entry.insert(connection);
+                self.metrics
+                    .record_observation(VsockDeviceMetrics::default().with_conns_added(1));
                 Ok(())
             }
         }
@@ -2372,13 +2538,38 @@ impl VsockHostConnectionTable {
     }
 
     pub fn remove(&mut self, key: VsockHostConnectionKey) -> bool {
+        self.remove_with_observation(key, VsockDeviceMetrics::default())
+    }
+
+    fn remove_with_observation(
+        &mut self,
+        key: VsockHostConnectionKey,
+        observation: VsockDeviceMetrics,
+    ) -> bool {
         if self.connections.remove(&key).is_none() {
             return false;
         }
 
         let freed = self.local_ports.free(key.local_port());
         debug_assert!(freed);
+        self.metrics
+            .record_observation(observation.with_conns_removed(1));
         true
+    }
+
+    fn deadline(&self, key: VsockHostConnectionKey) -> Option<VsockConnectionDeadline> {
+        self.connections.get(&key)?.deadline()
+    }
+
+    fn deadline_entries(&self) -> impl Iterator<Item = VsockConnectionKillQueueEntry> + '_ {
+        self.connections.iter().filter_map(|(key, connection)| {
+            connection
+                .deadline()
+                .map(|deadline| VsockConnectionKillQueueEntry {
+                    key: VsockConnectionDeadlineKey::Host(*key),
+                    deadline,
+                })
+        })
     }
 
     pub fn get(&self, key: VsockHostConnectionKey) -> Option<&VsockHostConnection> {
@@ -2435,6 +2626,8 @@ impl VsockHostConnectionTable {
         let Some(connection) = self.connections.get_mut(&key) else {
             return Err(VsockGuestCreditError::MissingConnection);
         };
+        self.metrics
+            .record_observation(VsockDeviceMetrics::default().with_tx_packets_count(1));
         if !connection.is_established() {
             return Err(VsockGuestCreditError::ConnectionNotEstablished);
         }
@@ -2452,6 +2645,8 @@ impl VsockHostConnectionTable {
         let Some(connection) = self.connections.get_mut(&key) else {
             return Err(VsockGuestCreditError::MissingConnection);
         };
+        self.metrics
+            .record_observation(VsockDeviceMetrics::default().with_tx_packets_count(1));
         if !connection.is_established() {
             return Err(VsockGuestCreditError::ConnectionNotEstablished);
         }
@@ -2580,27 +2775,6 @@ impl VsockHostConnectionTable {
         })
     }
 
-    fn expire_connections(&mut self, now: Instant, guest_cid: u32) -> Vec<VirtioVsockPacketHeader> {
-        let keys = self
-            .connections
-            .iter()
-            .filter_map(|(key, connection)| connection.has_expired(now).then_some(*key))
-            .collect::<Vec<_>>();
-        let mut reset_headers = Vec::new();
-
-        for key in keys {
-            let Some(connection) = self.connections.get(&key) else {
-                continue;
-            };
-            let header = connection.reset_packet_header(key, guest_cid);
-            let removed = self.remove(key);
-            debug_assert!(removed);
-            reset_headers.push(header);
-        }
-
-        reset_headers
-    }
-
     fn has_pollable_host_rw_payloads(&self) -> bool {
         self.connections
             .values()
@@ -2621,6 +2795,25 @@ impl VsockHostConnectionTable {
                 .filter(|connection| connection.can_poll_host_rw_payload())
                 .map(|connection| connection.stream().as_raw_fd()),
         );
+    }
+
+    fn owns_stream_fd(&self, descriptor: RawFd) -> bool {
+        self.connections
+            .values()
+            .any(|connection| connection.stream().as_raw_fd() == descriptor)
+    }
+
+    fn expects_readable_fd(&self, descriptor: RawFd) -> bool {
+        self.connections.values().any(|connection| {
+            connection.can_poll_host_rw_payload() && connection.stream().as_raw_fd() == descriptor
+        })
+    }
+
+    fn expects_writable_fd(&self, descriptor: RawFd) -> bool {
+        self.connections.values().any(|connection| {
+            connection.has_pending_guest_rw_writes()
+                && connection.stream().as_raw_fd() == descriptor
+        })
     }
 
     fn pending_guest_rw_write_fd_count(&self) -> usize {
@@ -2669,15 +2862,20 @@ impl VsockHostConnectionTable {
                 continue;
             };
 
-            match connection.poll_host_rw_payloads(scratch) {
-                VsockHostRwPollOutcome::NoData | VsockHostRwPollOutcome::Queued => {}
+            let (outcome, read_bytes) = connection.poll_host_rw_payloads(scratch);
+            let observation = vsock_host_rw_poll_observation(outcome, read_bytes);
+            match outcome {
+                VsockHostRwPollOutcome::NoData | VsockHostRwPollOutcome::Queued => {
+                    self.metrics.record_observation(observation);
+                }
                 VsockHostRwPollOutcome::Closed => {
+                    self.metrics.record_observation(observation);
                     let transitioned = connection.mark_local_closed(now);
                     debug_assert!(transitioned);
                 }
                 VsockHostRwPollOutcome::ReadError => {
                     let header = connection.reset_packet_header(key, guest_cid);
-                    let removed = self.remove(key);
+                    let removed = self.remove_with_observation(key, observation);
                     debug_assert!(removed);
                     reset_headers.push(header);
                 }
@@ -2699,15 +2897,31 @@ impl VsockHostConnectionTable {
                 continue;
             }
 
-            let flush_failed = connection.flush_pending_guest_rw_writes().is_err();
+            let flush_result = connection.flush_pending_guest_rw_writes();
+            let (flush_failed, observation) = match flush_result {
+                Ok(forwarded_bytes) => (
+                    false,
+                    VsockDeviceMetrics::default()
+                        .with_tx_bytes_count(vsock_metric_count(forwarded_bytes)),
+                ),
+                Err(failure) => {
+                    let observation = VsockDeviceMetrics::default()
+                        .with_tx_bytes_count(vsock_metric_count(failure.forwarded_bytes))
+                        .with_conns_killed(1)
+                        .with_tx_flush_fails(1);
+                    (true, observation)
+                }
+            };
             let shutdown_drained = connection.shutdown.fully_closed()
                 && !connection.has_pending_guest_rw_writes()
                 && !connection.has_pending_local_shutdown_packet();
             if flush_failed || shutdown_drained {
                 let header = connection.reset_packet_header(key, guest_cid);
-                let removed = self.remove(key);
+                let removed = self.remove_with_observation(key, observation);
                 debug_assert!(removed);
                 reset_headers.push(header);
+            } else {
+                self.metrics.record_observation(observation);
             }
         }
 
@@ -2745,9 +2959,11 @@ impl VsockHostConnectionTable {
         };
         let key = VsockHostConnectionKey::new(local_port, header.src_port());
         let connection = self.connections.get_mut(&key)?;
+        let packet_observation = VsockDeviceMetrics::default().with_tx_packets_count(1);
         if !connection.is_established() {
             let reset_header = connection.reset_packet_header(key, guest_cid);
-            let removed = self.remove(key);
+            let removed =
+                self.remove_with_observation(key, packet_observation.with_conns_killed(1));
             debug_assert!(removed);
             return Some(VsockGuestRwOutcome::Dropped {
                 key: VsockGuestRwConnectionKey::Host(key),
@@ -2756,6 +2972,7 @@ impl VsockHostConnectionTable {
             });
         }
         if connection.guest_send_shutdown() {
+            self.metrics.record_observation(packet_observation);
             return Some(VsockGuestRwOutcome::Suppressed {
                 key: VsockGuestRwConnectionKey::Host(key),
                 reason: VsockGuestRwSuppressReason::GuestSendShutdown,
@@ -2764,7 +2981,8 @@ impl VsockHostConnectionTable {
         connection.refresh_peer_credit(header);
         if let Err(source) = connection.check_guest_rw_credit(header.payload_len()) {
             let reset_header = connection.reset_packet_header(key, guest_cid);
-            let removed = self.remove(key);
+            let removed =
+                self.remove_with_observation(key, packet_observation.with_conns_killed(1));
             debug_assert!(removed);
             return Some(VsockGuestRwOutcome::Dropped {
                 key: VsockGuestRwConnectionKey::Host(key),
@@ -2780,7 +2998,8 @@ impl VsockHostConnectionTable {
                     .connections
                     .get(&key)
                     .map(|connection| connection.reset_packet_header(key, guest_cid));
-                let removed = self.remove(key);
+                let removed =
+                    self.remove_with_observation(key, packet_observation.with_conns_killed(1));
                 debug_assert!(removed);
                 return Some(VsockGuestRwOutcome::Dropped {
                     key: VsockGuestRwConnectionKey::Host(key),
@@ -2800,17 +3019,30 @@ impl VsockHostConnectionTable {
         let payload_len = payload.len();
         let result = connection.write_guest_rw_payload(payload);
         match result {
-            Ok(()) => Some(VsockGuestRwOutcome::Forwarded {
-                key: VsockGuestRwConnectionKey::Host(key),
-                bytes: payload_len,
-            }),
-            Err(source) => {
+            Ok(forwarded_bytes) => {
+                self.metrics.record_observation(
+                    packet_observation.with_tx_bytes_count(vsock_metric_count(forwarded_bytes)),
+                );
+                Some(VsockGuestRwOutcome::Forwarded {
+                    key: VsockGuestRwConnectionKey::Host(key),
+                    bytes: payload_len,
+                })
+            }
+            Err(failure) => {
                 let reset_header = connection.reset_packet_header(key, guest_cid);
-                let removed = self.remove(key);
+                let mut observation = packet_observation
+                    .with_tx_bytes_count(vsock_metric_count(failure.forwarded_bytes))
+                    .with_conns_killed(1);
+                if failure.during_flush {
+                    observation = observation.with_tx_flush_fails(1);
+                } else if failure.source.is_stream_write_failure() {
+                    observation = observation.with_tx_write_fails(1);
+                }
+                let removed = self.remove_with_observation(key, observation);
                 debug_assert!(removed);
                 Some(VsockGuestRwOutcome::Dropped {
                     key: VsockGuestRwConnectionKey::Host(key),
-                    source,
+                    source: failure.source,
                     reset_header: Some(reset_header),
                 })
             }
@@ -2859,7 +3091,9 @@ impl VsockHostConnectionTable {
                 reason: VsockHostGuestResponseIgnoreReason::MissingConnection,
             });
         };
+        let packet_observation = VsockDeviceMetrics::default().with_tx_packets_count(1);
         if connection.has_pending_request_packet() {
+            self.metrics.record_observation(packet_observation);
             return Some(VsockHostGuestResponseOutcome::Ignored {
                 reason: VsockHostGuestResponseIgnoreReason::RequestStillPending,
             });
@@ -2867,15 +3101,20 @@ impl VsockHostConnectionTable {
         connection.refresh_peer_credit(header);
 
         match connection.acknowledge_guest_response(key) {
-            Ok(()) => Some(VsockHostGuestResponseOutcome::Acknowledged { key }),
+            Ok(()) => {
+                self.metrics.record_observation(packet_observation);
+                Some(VsockHostGuestResponseOutcome::Acknowledged { key })
+            }
             Err(VsockHostConnectionAcknowledgeError::AlreadyAcknowledged) => {
+                self.metrics.record_observation(packet_observation);
                 Some(VsockHostGuestResponseOutcome::Ignored {
                     reason: VsockHostGuestResponseIgnoreReason::AlreadyAcknowledged,
                 })
             }
             Err(source) => {
                 let reset_header = connection.reset_packet_header(key, guest_cid);
-                let removed = self.remove(key);
+                let removed =
+                    self.remove_with_observation(key, packet_observation.with_conns_killed(1));
                 debug_assert!(removed);
                 Some(VsockHostGuestResponseOutcome::Dropped {
                     key,
@@ -3295,6 +3534,15 @@ impl std::error::Error for VsockGuestRwForwardError {
     }
 }
 
+impl VsockGuestRwForwardError {
+    const fn is_stream_write_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidWriteCount { .. } | Self::StreamWrite(_) | Self::WriteZero { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VsockGuestRwWriteOutcome {
     Complete { written: usize },
@@ -3305,6 +3553,7 @@ enum VsockGuestRwWriteOutcome {
 struct VsockGuestRwForwardFailure {
     forwarded_bytes: usize,
     source: VsockGuestRwForwardError,
+    during_flush: bool,
 }
 
 fn write_guest_rw_payload_to_stream(
@@ -3322,6 +3571,7 @@ fn write_guest_rw_payload_to_stream(
                     source: VsockGuestRwForwardError::WriteZero {
                         expected: remaining.len(),
                     },
+                    during_flush: false,
                 });
             }
             Ok(written) => {
@@ -3332,6 +3582,7 @@ fn write_guest_rw_payload_to_stream(
                             attempted: remaining.len(),
                             actual: written,
                         },
+                        during_flush: false,
                     });
                 };
 
@@ -3352,6 +3603,7 @@ fn write_guest_rw_payload_to_stream(
                 return Err(VsockGuestRwForwardFailure {
                     forwarded_bytes: total_written,
                     source: VsockGuestRwForwardError::StreamWrite(error.kind()),
+                    during_flush: false,
                 });
             }
         }
@@ -3400,7 +3652,10 @@ impl VsockGuestRwPendingWrites {
             return Ok(0);
         }
 
-        let forwarded_bytes = self.flush(stream)?;
+        let forwarded_bytes = self.flush(stream).map_err(|mut failure| {
+            failure.during_flush = true;
+            failure
+        })?;
         if !self.is_empty() {
             return self
                 .push_payload(&payload)
@@ -3408,6 +3663,7 @@ impl VsockGuestRwPendingWrites {
                 .map_err(|source| VsockGuestRwForwardFailure {
                     forwarded_bytes,
                     source,
+                    during_flush: false,
                 });
         }
 
@@ -3421,6 +3677,7 @@ impl VsockGuestRwPendingWrites {
                 .map_err(|source| VsockGuestRwForwardFailure {
                     forwarded_bytes: forwarded_bytes.saturating_add(written),
                     source,
+                    during_flush: false,
                 }),
             Err(mut failure) => {
                 failure.forwarded_bytes = failure.forwarded_bytes.saturating_add(forwarded_bytes);
@@ -3439,6 +3696,7 @@ impl VsockGuestRwPendingWrites {
                         offset: self.front_offset,
                         len: payload.len(),
                     },
+                    during_flush: false,
                 });
             };
 
@@ -3454,6 +3712,7 @@ impl VsockGuestRwPendingWrites {
                         .map_err(|source| VsockGuestRwForwardFailure {
                             forwarded_bytes,
                             source,
+                            during_flush: false,
                         })?;
                     forwarded_bytes = forwarded_bytes.saturating_add(written);
                 }
@@ -3462,6 +3721,7 @@ impl VsockGuestRwPendingWrites {
                         .map_err(|source| VsockGuestRwForwardFailure {
                             forwarded_bytes,
                             source,
+                            during_flush: false,
                         })?;
                     forwarded_bytes = forwarded_bytes.saturating_add(written);
                     return Ok(forwarded_bytes);
@@ -3471,6 +3731,7 @@ impl VsockGuestRwPendingWrites {
                         .map_err(|source| VsockGuestRwForwardFailure {
                             forwarded_bytes,
                             source,
+                            during_flush: false,
                         })?;
                     failure.forwarded_bytes =
                         failure.forwarded_bytes.saturating_add(forwarded_bytes);
@@ -3632,10 +3893,6 @@ impl VsockGuestConnection {
         self.lifecycle.deadline()
     }
 
-    fn has_expired(&self, now: Instant) -> bool {
-        self.lifecycle.has_expired(now)
-    }
-
     fn mark_local_closed(&mut self, now: Instant) -> bool {
         self.lifecycle.mark_local_closed(now)
     }
@@ -3706,9 +3963,17 @@ impl VsockGuestConnection {
         })
     }
 
-    fn write_guest_rw_payload(&mut self, payload: Vec<u8>) -> Result<(), VsockGuestRwForwardError> {
+    fn write_guest_rw_payload(
+        &mut self,
+        payload: Vec<u8>,
+    ) -> Result<usize, VsockGuestRwForwardFailure> {
         self.credit
-            .accept_guest_bytes(payload_len_u32(payload.len()))?;
+            .accept_guest_bytes(payload_len_u32(payload.len()))
+            .map_err(|source| VsockGuestRwForwardFailure {
+                forwarded_bytes: 0,
+                source,
+                during_flush: false,
+            })?;
         match self
             .pending_guest_rw_writes
             .write_or_queue(&mut self.stream, payload)
@@ -3720,17 +3985,17 @@ impl VsockGuestConnection {
                     self.credit.local_outstanding_bytes() as usize,
                     self.pending_guest_rw_writes.pending_bytes()
                 );
-                Ok(())
+                Ok(forwarded_bytes)
             }
             Err(failure) => {
                 self.credit
                     .record_forwarded_bytes(forwarded_byte_count_u32(failure.forwarded_bytes));
-                Err(failure.source)
+                Err(failure)
             }
         }
     }
 
-    fn flush_pending_guest_rw_writes(&mut self) -> Result<(), VsockGuestRwForwardError> {
+    fn flush_pending_guest_rw_writes(&mut self) -> Result<usize, VsockGuestRwForwardFailure> {
         match self.pending_guest_rw_writes.flush(&mut self.stream) {
             Ok(forwarded_bytes) => {
                 self.credit
@@ -3739,12 +4004,12 @@ impl VsockGuestConnection {
                     self.credit.local_outstanding_bytes() as usize,
                     self.pending_guest_rw_writes.pending_bytes()
                 );
-                Ok(())
+                Ok(forwarded_bytes)
             }
             Err(failure) => {
                 self.credit
                     .record_forwarded_bytes(forwarded_byte_count_u32(failure.forwarded_bytes));
-                Err(failure.source)
+                Err(failure)
             }
         }
     }
@@ -3869,16 +4134,30 @@ impl VsockGuestConnection {
         Some(header)
     }
 
-    fn poll_host_rw_payloads(&mut self, scratch: &mut [u8]) -> VsockHostRwPollOutcome {
+    fn poll_host_rw_payloads(&mut self, scratch: &mut [u8]) -> (VsockHostRwPollOutcome, usize) {
         if !self.can_poll_host_rw_payload() {
-            return VsockHostRwPollOutcome::NoData;
+            return (VsockHostRwPollOutcome::NoData, 0);
         }
 
-        poll_host_rw_payloads_from_stream(
+        let pending_bytes_before = self
+            .pending_host_rw_payloads
+            .iter()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        let outcome = poll_host_rw_payloads_from_stream(
             &mut self.stream,
             &mut self.pending_host_rw_payloads,
             &mut self.credit,
             scratch,
+        );
+        let pending_bytes_after = self
+            .pending_host_rw_payloads
+            .iter()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        (
+            outcome,
+            pending_bytes_after.saturating_sub(pending_bytes_before),
         )
     }
 }
@@ -3887,6 +4166,7 @@ impl VsockGuestConnection {
 pub struct VsockGuestConnectionTable {
     limit: usize,
     connections: HashMap<VsockGuestConnectionKey, VsockGuestConnection>,
+    metrics: SharedVsockDeviceMetrics,
 }
 
 impl VsockGuestConnectionTable {
@@ -3898,7 +4178,12 @@ impl VsockGuestConnectionTable {
         Self {
             limit,
             connections: HashMap::new(),
+            metrics: SharedVsockDeviceMetrics::default(),
         }
+    }
+
+    fn attach_metrics(&mut self, metrics: SharedVsockDeviceMetrics) {
+        self.metrics = metrics;
     }
 
     fn check_insert(
@@ -3956,6 +4241,8 @@ impl VsockGuestConnectionTable {
             VsockGuestConnection::from_stream(stream, request_header),
         );
         debug_assert!(replaced.is_none());
+        self.metrics
+            .record_observation(VsockDeviceMetrics::default().with_conns_added(1));
         Ok(())
     }
 
@@ -4028,6 +4315,8 @@ impl VsockGuestConnectionTable {
         let Some(connection) = self.connections.get_mut(&key) else {
             return Err(VsockGuestCreditError::MissingConnection);
         };
+        self.metrics
+            .record_observation(VsockDeviceMetrics::default().with_tx_packets_count(1));
         if !connection.is_established() {
             return Err(VsockGuestCreditError::ConnectionNotEstablished);
         }
@@ -4045,6 +4334,8 @@ impl VsockGuestConnectionTable {
         let Some(connection) = self.connections.get_mut(&key) else {
             return Err(VsockGuestCreditError::MissingConnection);
         };
+        self.metrics
+            .record_observation(VsockDeviceMetrics::default().with_tx_packets_count(1));
         if !connection.is_established() {
             return Err(VsockGuestCreditError::ConnectionNotEstablished);
         }
@@ -4173,27 +4464,6 @@ impl VsockGuestConnectionTable {
         })
     }
 
-    fn expire_connections(&mut self, now: Instant, guest_cid: u32) -> Vec<VirtioVsockPacketHeader> {
-        let keys = self
-            .connections
-            .iter()
-            .filter_map(|(key, connection)| connection.has_expired(now).then_some(*key))
-            .collect::<Vec<_>>();
-        let mut reset_headers = Vec::new();
-
-        for key in keys {
-            let Some(connection) = self.connections.get(&key) else {
-                continue;
-            };
-            let header = connection.reset_packet_header(key, guest_cid);
-            let removed = self.remove(key);
-            debug_assert!(removed);
-            reset_headers.push(header);
-        }
-
-        reset_headers
-    }
-
     fn has_pollable_host_rw_payloads(&self) -> bool {
         self.connections
             .values()
@@ -4214,6 +4484,25 @@ impl VsockGuestConnectionTable {
                 .filter(|connection| connection.can_poll_host_rw_payload())
                 .map(|connection| connection.stream().as_raw_fd()),
         );
+    }
+
+    fn owns_stream_fd(&self, descriptor: RawFd) -> bool {
+        self.connections
+            .values()
+            .any(|connection| connection.stream().as_raw_fd() == descriptor)
+    }
+
+    fn expects_readable_fd(&self, descriptor: RawFd) -> bool {
+        self.connections.values().any(|connection| {
+            connection.can_poll_host_rw_payload() && connection.stream().as_raw_fd() == descriptor
+        })
+    }
+
+    fn expects_writable_fd(&self, descriptor: RawFd) -> bool {
+        self.connections.values().any(|connection| {
+            connection.has_pending_guest_rw_writes()
+                && connection.stream().as_raw_fd() == descriptor
+        })
     }
 
     fn pending_guest_rw_write_fd_count(&self) -> usize {
@@ -4262,15 +4551,20 @@ impl VsockGuestConnectionTable {
                 continue;
             };
 
-            match connection.poll_host_rw_payloads(scratch) {
-                VsockHostRwPollOutcome::NoData | VsockHostRwPollOutcome::Queued => {}
+            let (outcome, read_bytes) = connection.poll_host_rw_payloads(scratch);
+            let observation = vsock_host_rw_poll_observation(outcome, read_bytes);
+            match outcome {
+                VsockHostRwPollOutcome::NoData | VsockHostRwPollOutcome::Queued => {
+                    self.metrics.record_observation(observation);
+                }
                 VsockHostRwPollOutcome::Closed => {
+                    self.metrics.record_observation(observation);
                     let transitioned = connection.mark_local_closed(now);
                     debug_assert!(transitioned);
                 }
                 VsockHostRwPollOutcome::ReadError => {
                     let header = connection.reset_packet_header(key, guest_cid);
-                    let removed = self.remove(key);
+                    let removed = self.remove_with_observation(key, observation);
                     debug_assert!(removed);
                     reset_headers.push(header);
                 }
@@ -4292,15 +4586,31 @@ impl VsockGuestConnectionTable {
                 continue;
             }
 
-            let flush_failed = connection.flush_pending_guest_rw_writes().is_err();
+            let flush_result = connection.flush_pending_guest_rw_writes();
+            let (flush_failed, observation) = match flush_result {
+                Ok(forwarded_bytes) => (
+                    false,
+                    VsockDeviceMetrics::default()
+                        .with_tx_bytes_count(vsock_metric_count(forwarded_bytes)),
+                ),
+                Err(failure) => {
+                    let observation = VsockDeviceMetrics::default()
+                        .with_tx_bytes_count(vsock_metric_count(failure.forwarded_bytes))
+                        .with_conns_killed(1)
+                        .with_tx_flush_fails(1);
+                    (true, observation)
+                }
+            };
             let shutdown_drained = connection.shutdown.fully_closed()
                 && !connection.has_pending_guest_rw_writes()
                 && !connection.has_pending_local_shutdown_packet();
             if flush_failed || shutdown_drained {
                 let header = connection.reset_packet_header(key, guest_cid);
-                let removed = self.remove(key);
+                let removed = self.remove_with_observation(key, observation);
                 debug_assert!(removed);
                 reset_headers.push(header);
+            } else {
+                self.metrics.record_observation(observation);
             }
         }
 
@@ -4342,9 +4652,11 @@ impl VsockGuestConnectionTable {
                 reset_header: None,
             });
         };
+        let packet_observation = VsockDeviceMetrics::default().with_tx_packets_count(1);
         if connection.has_pending_response_packet() {
             let reset_header = connection.reset_packet_header(key, guest_cid);
-            let removed = self.remove(key);
+            let removed =
+                self.remove_with_observation(key, packet_observation.with_conns_killed(1));
             debug_assert!(removed);
             return Some(VsockGuestRwOutcome::Dropped {
                 key: VsockGuestRwConnectionKey::Guest(key),
@@ -4353,6 +4665,7 @@ impl VsockGuestConnectionTable {
             });
         }
         if connection.guest_send_shutdown() {
+            self.metrics.record_observation(packet_observation);
             return Some(VsockGuestRwOutcome::Suppressed {
                 key: VsockGuestRwConnectionKey::Guest(key),
                 reason: VsockGuestRwSuppressReason::GuestSendShutdown,
@@ -4361,7 +4674,8 @@ impl VsockGuestConnectionTable {
         connection.refresh_peer_credit(header);
         if let Err(source) = connection.check_guest_rw_credit(header.payload_len()) {
             let reset_header = connection.reset_packet_header(key, guest_cid);
-            let removed = self.remove(key);
+            let removed =
+                self.remove_with_observation(key, packet_observation.with_conns_killed(1));
             debug_assert!(removed);
             return Some(VsockGuestRwOutcome::Dropped {
                 key: VsockGuestRwConnectionKey::Guest(key),
@@ -4377,7 +4691,8 @@ impl VsockGuestConnectionTable {
                     .connections
                     .get(&key)
                     .map(|connection| connection.reset_packet_header(key, guest_cid));
-                let removed = self.remove(key);
+                let removed =
+                    self.remove_with_observation(key, packet_observation.with_conns_killed(1));
                 debug_assert!(removed);
                 return Some(VsockGuestRwOutcome::Dropped {
                     key: VsockGuestRwConnectionKey::Guest(key),
@@ -4397,25 +4712,67 @@ impl VsockGuestConnectionTable {
         let payload_len = payload.len();
         let result = connection.write_guest_rw_payload(payload);
         match result {
-            Ok(()) => Some(VsockGuestRwOutcome::Forwarded {
-                key: VsockGuestRwConnectionKey::Guest(key),
-                bytes: payload_len,
-            }),
-            Err(source) => {
+            Ok(forwarded_bytes) => {
+                self.metrics.record_observation(
+                    packet_observation.with_tx_bytes_count(vsock_metric_count(forwarded_bytes)),
+                );
+                Some(VsockGuestRwOutcome::Forwarded {
+                    key: VsockGuestRwConnectionKey::Guest(key),
+                    bytes: payload_len,
+                })
+            }
+            Err(failure) => {
                 let reset_header = connection.reset_packet_header(key, guest_cid);
-                let removed = self.remove(key);
+                let mut observation = packet_observation
+                    .with_tx_bytes_count(vsock_metric_count(failure.forwarded_bytes))
+                    .with_conns_killed(1);
+                if failure.during_flush {
+                    observation = observation.with_tx_flush_fails(1);
+                } else if failure.source.is_stream_write_failure() {
+                    observation = observation.with_tx_write_fails(1);
+                }
+                let removed = self.remove_with_observation(key, observation);
                 debug_assert!(removed);
                 Some(VsockGuestRwOutcome::Dropped {
                     key: VsockGuestRwConnectionKey::Guest(key),
-                    source,
+                    source: failure.source,
                     reset_header: Some(reset_header),
                 })
             }
         }
     }
 
+    #[cfg(test)]
     fn remove(&mut self, key: VsockGuestConnectionKey) -> bool {
-        self.connections.remove(&key).is_some()
+        self.remove_with_observation(key, VsockDeviceMetrics::default())
+    }
+
+    fn remove_with_observation(
+        &mut self,
+        key: VsockGuestConnectionKey,
+        observation: VsockDeviceMetrics,
+    ) -> bool {
+        let removed = self.connections.remove(&key).is_some();
+        if removed {
+            self.metrics
+                .record_observation(observation.with_conns_removed(1));
+        }
+        removed
+    }
+
+    fn deadline(&self, key: VsockGuestConnectionKey) -> Option<VsockConnectionDeadline> {
+        self.connections.get(&key)?.deadline()
+    }
+
+    fn deadline_entries(&self) -> impl Iterator<Item = VsockConnectionKillQueueEntry> + '_ {
+        self.connections.iter().filter_map(|(key, connection)| {
+            connection
+                .deadline()
+                .map(|deadline| VsockConnectionKillQueueEntry {
+                    key: VsockConnectionDeadlineKey::Guest(*key),
+                    deadline,
+                })
+        })
     }
 
     fn first_pending_response_packet_key(&self) -> Option<VsockGuestConnectionKey> {
@@ -5409,31 +5766,48 @@ fn vsock_tx_payload_segments(
     Ok(segments)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct VirtioVsockConfigSpace {
     guest_cid: u64,
+    metrics: SharedVsockDeviceMetrics,
 }
 
 impl VirtioVsockConfigSpace {
-    pub const fn new(guest_cid: u64) -> Self {
-        Self { guest_cid }
+    pub fn new(guest_cid: u64) -> Self {
+        Self::with_metrics(guest_cid, SharedVsockDeviceMetrics::default())
     }
 
-    pub const fn guest_cid(self) -> u64 {
+    fn with_metrics(guest_cid: u64, metrics: SharedVsockDeviceMetrics) -> Self {
+        Self { guest_cid, metrics }
+    }
+
+    pub const fn guest_cid(&self) -> u64 {
         self.guest_cid
     }
 
-    pub const fn available_features(self) -> u64 {
+    pub const fn available_features(&self) -> u64 {
         virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
             | virtio_feature_bit(VIRTIO_FEATURE_IN_ORDER)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
     }
 
-    const fn guest_cid_bytes(self) -> [u8; VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE] {
+    fn attach_metrics(&mut self, metrics: SharedVsockDeviceMetrics) {
+        self.metrics = metrics;
+    }
+
+    const fn guest_cid_bytes(&self) -> [u8; VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE] {
         self.guest_cid.to_le_bytes()
     }
 }
+
+impl PartialEq for VirtioVsockConfigSpace {
+    fn eq(&self, other: &Self) -> bool {
+        self.guest_cid == other.guest_cid
+    }
+}
+
+impl Eq for VirtioVsockConfigSpace {}
 
 impl VirtioMmioDeviceConfigHandler for VirtioVsockConfigSpace {
     fn read_device_config(
@@ -5447,6 +5821,7 @@ impl VirtioMmioDeviceConfigHandler for VirtioVsockConfigSpace {
             (0, 4) => MmioAccessBytes::new(&[b0, b1, b2, b3]),
             (4, 4) => MmioAccessBytes::new(&[b4, b5, b6, b7]),
             _ => {
+                self.metrics.record_config_failure();
                 return Err(VirtioMmioDeviceConfigError::UnsupportedRead {
                     offset: access.offset(),
                     len: access.len(),
@@ -5461,6 +5836,7 @@ impl VirtioMmioDeviceConfigHandler for VirtioVsockConfigSpace {
         access: VirtioMmioDeviceConfigAccess,
         _data: MmioAccessBytes,
     ) -> Result<(), VirtioMmioDeviceConfigError> {
+        self.metrics.record_config_failure();
         Err(VirtioMmioDeviceConfigError::UnsupportedWrite {
             offset: access.offset(),
             len: access.len(),
@@ -6067,6 +6443,15 @@ impl VirtioVsockRxQueueDispatchError {
             } => Some(completed_dispatch),
             Self::PacketMetadataAllocation { .. } => None,
         }
+    }
+
+    const fn is_queue_event_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::PacketMetadataAllocation { .. }
+                | Self::AvailableRing { .. }
+                | Self::UsedRing { .. }
+        )
     }
 }
 
@@ -6837,6 +7222,15 @@ impl VirtioVsockTxQueueDispatchError {
             } => Some(completed_dispatch),
             Self::PacketMetadataAllocation { .. } => None,
         }
+    }
+
+    const fn is_queue_event_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::PacketMetadataAllocation { .. }
+                | Self::AvailableRing { .. }
+                | Self::UsedRing { .. }
+        )
     }
 }
 
@@ -8366,6 +8760,9 @@ fn reconstruct_vsock_snapshot_device(
     device.guest_connector = guest_connector;
     device.host_connections =
         VsockHostConnectionTable::from_local_port_cursor(state.host_local_port_cursor());
+    device
+        .host_connections
+        .attach_metrics(device.metrics.clone());
     if let Some((rx, tx, event)) = active_queues {
         device.active_rx_queue = Some(rx);
         device.active_tx_queue = Some(tx);
@@ -8373,7 +8770,8 @@ fn reconstruct_vsock_snapshot_device(
         let signal = device.signal_restored_transport_reset();
         debug_assert_eq!(signal, VirtioVsockRestoredTransportResetSignal::Signaled);
     }
-    let config_space = VirtioVsockConfigSpace::new(state.guest_cid());
+    let config_space =
+        VirtioVsockConfigSpace::with_metrics(state.guest_cid(), device.metrics.clone());
     Ok(PreparedVsockDevice {
         guest_cid,
         uds_path,
@@ -8495,6 +8893,7 @@ impl VirtioVsockPendingRxPacket {
 #[derive(Debug)]
 pub struct VirtioVsockDevice {
     capture_owner_identity: Arc<()>,
+    metrics: SharedVsockDeviceMetrics,
     guest_logger: Option<GuestLogger>,
     guest_cid: u32,
     active_rx_queue: Option<VirtioVsockRxQueue>,
@@ -8509,6 +8908,7 @@ pub struct VirtioVsockDevice {
     pending_host_connection_limit: usize,
     host_connections: VsockHostConnectionTable,
     guest_connections: VsockGuestConnectionTable,
+    kill_queue: VsockConnectionKillQueue,
     pending_guest_reset_packets: VecDeque<VirtioVsockPacketHeader>,
 }
 
@@ -8518,8 +8918,17 @@ impl VirtioVsockDevice {
     }
 
     fn with_guest_cid(guest_cid: u32) -> Self {
+        Self::with_guest_cid_and_metrics(guest_cid, SharedVsockDeviceMetrics::default())
+    }
+
+    fn with_guest_cid_and_metrics(guest_cid: u32, metrics: SharedVsockDeviceMetrics) -> Self {
+        let mut host_connections = VsockHostConnectionTable::new();
+        host_connections.attach_metrics(metrics.clone());
+        let mut guest_connections = VsockGuestConnectionTable::new();
+        guest_connections.attach_metrics(metrics.clone());
         Self {
             capture_owner_identity: Arc::new(()),
+            metrics,
             guest_logger: None,
             guest_cid,
             active_rx_queue: None,
@@ -8532,8 +8941,9 @@ impl VirtioVsockDevice {
             pending_host_connections: VecDeque::new(),
             active_connection_limit: VSOCK_CONNECTION_LIMIT,
             pending_host_connection_limit: VSOCK_PENDING_HOST_CONNECTION_LIMIT,
-            host_connections: VsockHostConnectionTable::new(),
-            guest_connections: VsockGuestConnectionTable::new(),
+            host_connections,
+            guest_connections,
+            kill_queue: VsockConnectionKillQueue::new(),
             pending_guest_reset_packets: VecDeque::new(),
         }
     }
@@ -8558,6 +8968,16 @@ impl VirtioVsockDevice {
 
     pub const fn guest_cid(&self) -> u32 {
         self.guest_cid
+    }
+
+    fn attach_metrics(&mut self, metrics: SharedVsockDeviceMetrics) {
+        self.host_connections.attach_metrics(metrics.clone());
+        self.guest_connections.attach_metrics(metrics.clone());
+        self.metrics = metrics;
+    }
+
+    fn shared_metrics(&self) -> SharedVsockDeviceMetrics {
+        self.metrics.clone()
     }
 
     pub(crate) fn capture_owner_identity(&self) -> Arc<()> {
@@ -8655,17 +9075,118 @@ impl VirtioVsockDevice {
         Ok((read_fds, write_fds, self.earliest_deadline()))
     }
 
+    fn observe_host_readiness(&self, readiness: &[VsockHostReadiness], poll_failed: bool) {
+        let listener_fd = self
+            .host_socket_owner
+            .as_ref()
+            .map(|owner| owner.listener.as_raw_fd());
+        let listener_readable = listener_fd.is_some()
+            && self.pending_host_connections.len() < self.pending_host_connection_limit;
+        let mut muxer_failures = usize::from(poll_failed);
+        let mut connection_failures = 0usize;
+
+        for event in readiness.iter().copied() {
+            let descriptor = event.descriptor();
+            let pending_connection = self
+                .pending_host_connections
+                .iter()
+                .any(|connection| connection.stream().as_raw_fd() == descriptor);
+            let host_connection = self.host_connections.owns_stream_fd(descriptor);
+            let guest_connection = self.guest_connections.owns_stream_fd(descriptor);
+            let owned = listener_fd == Some(descriptor)
+                || pending_connection
+                || host_connection
+                || guest_connection;
+            if event.invalid() || !owned {
+                muxer_failures = muxer_failures.saturating_add(1);
+                continue;
+            }
+
+            let readable_expected = (listener_readable && listener_fd == Some(descriptor))
+                || pending_connection
+                || self.host_connections.expects_readable_fd(descriptor)
+                || self.guest_connections.expects_readable_fd(descriptor);
+            if event.readable() && !readable_expected {
+                muxer_failures = muxer_failures.saturating_add(1);
+                continue;
+            }
+
+            if event.writable()
+                && !self.host_connections.expects_writable_fd(descriptor)
+                && !self.guest_connections.expects_writable_fd(descriptor)
+            {
+                if host_connection || guest_connection {
+                    connection_failures = connection_failures.saturating_add(1);
+                } else {
+                    muxer_failures = muxer_failures.saturating_add(1);
+                }
+            }
+        }
+
+        self.metrics.record_observation(
+            VsockDeviceMetrics::default()
+                .with_muxer_event_fails(vsock_metric_count(muxer_failures))
+                .with_conn_event_fails(vsock_metric_count(connection_failures)),
+        );
+    }
+
     #[cfg(test)]
     fn host_read_wakeup_fds(&self) -> Result<Vec<RawFd>, TryReserveError> {
         self.host_wakeup().map(|(read_fds, _, _)| read_fds)
     }
 
     fn earliest_deadline(&self) -> Option<Instant> {
-        self.host_connections
-            .earliest_deadline()
+        let queued = self
+            .kill_queue
+            .entries
+            .iter()
+            .filter(|entry| self.connection_deadline(entry.key) == Some(entry.deadline))
+            .map(|entry| entry.deadline.at)
+            .min();
+        if self.kill_queue.is_synchronized() {
+            return queued;
+        }
+
+        // Overflow can leave a live deadline out of the bounded queue until its
+        // retained entries drain and trigger a rebuild.
+        queued
             .into_iter()
+            .chain(self.host_connections.earliest_deadline())
             .chain(self.guest_connections.earliest_deadline())
             .min()
+    }
+
+    fn connection_deadline(
+        &self,
+        key: VsockConnectionDeadlineKey,
+    ) -> Option<VsockConnectionDeadline> {
+        match key {
+            VsockConnectionDeadlineKey::Host(key) => self.host_connections.deadline(key),
+            VsockConnectionDeadlineKey::Guest(key) => self.guest_connections.deadline(key),
+        }
+    }
+
+    fn push_connection_deadline(
+        &mut self,
+        key: VsockConnectionDeadlineKey,
+        deadline: Option<VsockConnectionDeadline>,
+    ) {
+        if let Some(deadline) = deadline {
+            self.kill_queue
+                .push(VsockConnectionKillQueueEntry { key, deadline });
+        }
+    }
+
+    fn rebuild_kill_queue(&mut self, record_resync: bool) {
+        self.kill_queue = VsockConnectionKillQueue::from_deadlines(
+            self.host_connections
+                .deadline_entries()
+                .chain(self.guest_connections.deadline_entries()),
+        );
+        if record_resync {
+            self.metrics
+                .record_observation(VsockDeviceMetrics::default().with_killq_resync(1));
+        }
     }
 
     /// Accepts one pending host connection from the owned listener.
@@ -8935,9 +9456,19 @@ impl VirtioVsockDevice {
 
     fn normalize_source_work(&mut self) {
         self.pending_host_connections.clear();
+        let removed_connections = self
+            .host_connections
+            .len()
+            .saturating_add(self.guest_connections.len());
         self.host_connections.connections.clear();
         self.guest_connections.connections.clear();
+        self.kill_queue = VsockConnectionKillQueue::new();
         self.pending_guest_reset_packets.clear();
+        self.metrics.record_observation(
+            VsockDeviceMetrics::default()
+                .with_conns_killed(vsock_metric_count(removed_connections))
+                .with_conns_removed(vsock_metric_count(removed_connections)),
+        );
     }
 
     #[cfg(test)]
@@ -8983,6 +9514,7 @@ impl VirtioVsockDevice {
     #[cfg(test)]
     fn set_guest_connection_limit(&mut self, limit: usize) {
         self.guest_connections = VsockGuestConnectionTable::with_limit(limit);
+        self.guest_connections.attach_metrics(self.metrics.clone());
     }
 
     pub fn activate_vsock(
@@ -8994,6 +9526,7 @@ impl VirtioVsockDevice {
         }
 
         if activation.queue_count() != VIRTIO_VSOCK_QUEUE_COUNT {
+            self.metrics.record_activation_failure();
             return Err(VirtioVsockDeviceActivationError::QueueCountMismatch {
                 expected: VIRTIO_VSOCK_QUEUE_COUNT,
                 got: activation.queue_count(),
@@ -9058,6 +9591,13 @@ impl VirtioVsockDevice {
         memory: &mut GuestMemory,
     ) -> Result<VirtioVsockTransportResetAttempt, VirtioVsockTransportResetError> {
         let result = self.prepare_transport_reset_unobserved(memory);
+        if matches!(
+            &result,
+            Ok(VirtioVsockTransportResetAttempt::QueueEmpty) | Err(_)
+        ) {
+            self.metrics
+                .record_observation(VsockDeviceMetrics::default().with_ev_queue_event_fails(1));
+        }
         if let Some(logger) = &self.guest_logger {
             match &result {
                 Ok(VirtioVsockTransportResetAttempt::Published(_)) => {
@@ -9114,14 +9654,26 @@ impl VirtioVsockDevice {
     }
 
     pub fn reset(&mut self) {
+        let removed_connections = self
+            .host_connections
+            .len()
+            .saturating_add(self.guest_connections.len());
         self.active_rx_queue = None;
         self.active_tx_queue = None;
         self.active_event_queue = None;
         self.pending_event_ack = false;
         self.pending_host_connections.clear();
         self.host_connections = VsockHostConnectionTable::new();
+        self.host_connections.attach_metrics(self.metrics.clone());
         self.guest_connections = VsockGuestConnectionTable::new();
+        self.guest_connections.attach_metrics(self.metrics.clone());
+        self.kill_queue = VsockConnectionKillQueue::new();
         self.pending_guest_reset_packets.clear();
+        self.metrics.record_observation(
+            VsockDeviceMetrics::default()
+                .with_conns_killed(vsock_metric_count(removed_connections))
+                .with_conns_removed(vsock_metric_count(removed_connections)),
+        );
     }
 
     fn first_pending_rx_packet(&self) -> Option<VirtioVsockPendingRxPacket> {
@@ -9245,6 +9797,8 @@ impl VirtioVsockDevice {
     }
 
     fn consume_pending_rx_packet(&mut self, packet: VirtioVsockPendingRxPacket, now: Instant) {
+        self.metrics
+            .record_observation(VsockDeviceMetrics::default().with_rx_packets_count(1));
         match packet {
             VirtioVsockPendingRxPacket::GuestReset { header } => {
                 let removed = self.pending_guest_reset_packets.pop_front();
@@ -9263,18 +9817,24 @@ impl VirtioVsockDevice {
                     now,
                 );
                 debug_assert_eq!(consumed, Some(header));
+                let deadline = self.host_connections.deadline(key);
+                self.push_connection_deadline(VsockConnectionDeadlineKey::Host(key), deadline);
             }
             VirtioVsockPendingRxPacket::GuestConnectionShutdown { key, header } => {
                 let consumed = self
                     .guest_connections
                     .take_pending_local_shutdown_packet_header(key, self.guest_cid, now);
                 debug_assert_eq!(consumed, Some(header));
+                let deadline = self.guest_connections.deadline(key);
+                self.push_connection_deadline(VsockConnectionDeadlineKey::Guest(key), deadline);
             }
             VirtioVsockPendingRxPacket::HostConnectionShutdown { key, header } => {
                 let consumed = self
                     .host_connections
                     .take_pending_local_shutdown_packet_header(key, self.guest_cid, now);
                 debug_assert_eq!(consumed, Some(header));
+                let deadline = self.host_connections.deadline(key);
+                self.push_connection_deadline(VsockConnectionDeadlineKey::Host(key), deadline);
             }
             VirtioVsockPendingRxPacket::GuestConnectionCreditUpdate { key, header } => {
                 let consumed = self
@@ -9406,16 +9966,55 @@ impl VirtioVsockDevice {
     }
 
     fn expire_connections(&mut self, now: Instant) {
-        let mut reset_headers = self
-            .guest_connections
-            .expire_connections(now, self.guest_cid);
-        reset_headers.extend(
-            self.host_connections
-                .expire_connections(now, self.guest_cid),
-        );
+        if self.kill_queue.is_empty()
+            && self.kill_queue.is_synchronized()
+            && (self.host_connections.earliest_deadline().is_some()
+                || self.guest_connections.earliest_deadline().is_some())
+        {
+            self.rebuild_kill_queue(false);
+        }
 
-        for header in reset_headers {
-            let _ = self.queue_guest_reset_packet(header);
+        loop {
+            while let Some(entry) = self.kill_queue.pop_expired(now) {
+                if self.connection_deadline(entry.key) != Some(entry.deadline) {
+                    continue;
+                }
+                let observation = VsockDeviceMetrics::default().with_conns_killed(1);
+                let reset_header = match entry.key {
+                    VsockConnectionDeadlineKey::Host(key) => {
+                        let header = self
+                            .host_connections
+                            .connections
+                            .get(&key)
+                            .map(|connection| connection.reset_packet_header(key, self.guest_cid));
+                        let removed = self
+                            .host_connections
+                            .remove_with_observation(key, observation);
+                        debug_assert!(removed);
+                        header
+                    }
+                    VsockConnectionDeadlineKey::Guest(key) => {
+                        let header = self
+                            .guest_connections
+                            .connections
+                            .get(&key)
+                            .map(|connection| connection.reset_packet_header(key, self.guest_cid));
+                        let removed = self
+                            .guest_connections
+                            .remove_with_observation(key, observation);
+                        debug_assert!(removed);
+                        header
+                    }
+                };
+                if let Some(header) = reset_header {
+                    let _ = self.queue_guest_reset_packet(header);
+                }
+            }
+
+            if !self.kill_queue.is_empty() || self.kill_queue.is_synchronized() {
+                break;
+            }
+            self.rebuild_kill_queue(true);
         }
     }
 
@@ -9562,7 +10161,11 @@ impl VirtioVsockDevice {
                 self.host_connections.len(),
                 self.active_connection_limit,
             ) {
-            Ok(()) => Some(VsockGuestConnectionRequestOutcome::Retained { key }),
+            Ok(()) => {
+                self.metrics
+                    .record_observation(VsockDeviceMetrics::default().with_tx_packets_count(1));
+                Some(VsockGuestConnectionRequestOutcome::Retained { key })
+            }
             Err(source) => Some(VsockGuestConnectionRequestOutcome::Dropped {
                 key,
                 source: VsockGuestConnectionRequestError::Table(source),
@@ -9577,13 +10180,19 @@ impl VirtioVsockDevice {
                 if let Some(connection) = self.host_connections.connections.get_mut(&key) {
                     connection.refresh_peer_credit(header);
                 }
-                self.host_connections.remove(key)
+                self.host_connections.remove_with_observation(
+                    key,
+                    VsockDeviceMetrics::default().with_tx_packets_count(1),
+                )
             });
         let guest_key = VsockGuestConnectionKey::new(header.dst_port(), header.src_port());
         if let Some(connection) = self.guest_connections.connections.get_mut(&guest_key) {
             connection.refresh_peer_credit(header);
         }
-        let guest_connection_closed = self.guest_connections.remove(guest_key);
+        let guest_connection_closed = self.guest_connections.remove_with_observation(
+            guest_key,
+            VsockDeviceMetrics::default().with_tx_packets_count(1),
+        );
 
         (host_connection_closed, guest_connection_closed)
     }
@@ -9759,6 +10368,8 @@ impl VirtioVsockDevice {
         let mut host_connection_closed = false;
         let mut connection_reset_header = None;
         let mut local_closed_connection_ignored = false;
+        let mut host_deadline = None;
+        let mut host_connection_seen = false;
         if let Ok(local_port) = VsockHostLocalPort::try_from_raw(header.dst_port()) {
             let key = VsockHostConnectionKey::new(local_port, header.src_port());
             let transition =
@@ -9766,6 +10377,7 @@ impl VirtioVsockDevice {
                     .connections
                     .get_mut(&key)
                     .and_then(|connection| {
+                        host_connection_seen = true;
                         connection.refresh_peer_credit(header);
                         if connection.lifecycle.is_local_closed() {
                             local_closed_connection_ignored = true;
@@ -9779,7 +10391,12 @@ impl VirtioVsockDevice {
                             && connection.has_pending_guest_rw_writes();
                         let local_shutdown_pending = connection.has_pending_local_shutdown_packet();
                         if drain_pending {
+                            let previous_deadline = connection.deadline();
                             connection.arm_shutdown_deadline(now);
+                            let next_deadline = connection.deadline();
+                            if next_deadline != previous_deadline {
+                                host_deadline = next_deadline;
+                            }
                         }
                         Some((transition, drain_pending, local_shutdown_pending))
                     });
@@ -9788,22 +10405,35 @@ impl VirtioVsockDevice {
                 | Some((VsockConnectionShutdownTransition::FullyClosed, true, _))
                 | Some((VsockConnectionShutdownTransition::FullyClosed, false, true)) => {
                     host_connection_updated = true;
+                    self.metrics
+                        .record_observation(VsockDeviceMetrics::default().with_tx_packets_count(1));
                 }
                 Some((VsockConnectionShutdownTransition::FullyClosed, false, false)) => {
-                    host_connection_closed = self.host_connections.remove(key);
+                    host_connection_closed = self.host_connections.remove_with_observation(
+                        key,
+                        VsockDeviceMetrics::default().with_tx_packets_count(1),
+                    );
+                }
+                None if host_connection_seen => {
+                    self.metrics
+                        .record_observation(VsockDeviceMetrics::default().with_tx_packets_count(1));
                 }
                 None => {}
             }
+            self.push_connection_deadline(VsockConnectionDeadlineKey::Host(key), host_deadline);
         }
 
         let mut guest_connection_updated = false;
         let mut guest_connection_closed = false;
         let guest_key = VsockGuestConnectionKey::new(header.dst_port(), header.src_port());
+        let mut guest_deadline = None;
+        let mut guest_connection_seen = false;
         let transition = self
             .guest_connections
             .connections
             .get_mut(&guest_key)
             .and_then(|connection| {
+                guest_connection_seen = true;
                 connection.refresh_peer_credit(header);
                 if connection.lifecycle.is_local_closed() {
                     local_closed_connection_ignored = true;
@@ -9818,7 +10448,12 @@ impl VirtioVsockDevice {
                     && connection.has_pending_guest_rw_writes();
                 let local_shutdown_pending = connection.has_pending_local_shutdown_packet();
                 if drain_pending {
+                    let previous_deadline = connection.deadline();
                     connection.arm_shutdown_deadline(now);
+                    let next_deadline = connection.deadline();
+                    if next_deadline != previous_deadline {
+                        guest_deadline = next_deadline;
+                    }
                 }
                 Some((transition, drain_pending, local_shutdown_pending))
             });
@@ -9827,12 +10462,22 @@ impl VirtioVsockDevice {
             | Some((VsockConnectionShutdownTransition::FullyClosed, true, _))
             | Some((VsockConnectionShutdownTransition::FullyClosed, false, true)) => {
                 guest_connection_updated = true;
+                self.metrics
+                    .record_observation(VsockDeviceMetrics::default().with_tx_packets_count(1));
             }
             Some((VsockConnectionShutdownTransition::FullyClosed, false, false)) => {
-                guest_connection_closed = self.guest_connections.remove(guest_key);
+                guest_connection_closed = self.guest_connections.remove_with_observation(
+                    guest_key,
+                    VsockDeviceMetrics::default().with_tx_packets_count(1),
+                );
+            }
+            None if guest_connection_seen => {
+                self.metrics
+                    .record_observation(VsockDeviceMetrics::default().with_tx_packets_count(1));
             }
             None => {}
         }
+        self.push_connection_deadline(VsockConnectionDeadlineKey::Guest(guest_key), guest_deadline);
 
         if host_connection_closed || guest_connection_closed {
             let reset_header = connection_reset_header
@@ -9988,6 +10633,9 @@ impl VirtioVsockDevice {
         drained_notifications: Vec<usize>,
         now: Instant,
     ) -> Result<VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError> {
+        let rx_notified = drained_notifications.contains(&VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        let tx_notified = drained_notifications.contains(&VIRTIO_VSOCK_TX_QUEUE_INDEX);
+        let event_notified = drained_notifications.contains(&VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
         if !self.is_activated() {
             if drained_notifications.is_empty() {
                 return Ok(VirtioVsockDeviceNotificationDispatch::new(
@@ -9998,6 +10646,18 @@ impl VirtioVsockDevice {
                     None,
                 ));
             }
+            let observation = VsockDeviceMetrics::default()
+                .with_rx_queue_event_fails(u64::from(rx_notified))
+                .with_tx_queue_event_fails(u64::from(tx_notified))
+                .with_ev_queue_event_fails(u64::from(event_notified))
+                .with_muxer_event_fails(u64::from(drained_notifications.iter().any(
+                    |queue_index| {
+                        *queue_index != VIRTIO_VSOCK_RX_QUEUE_INDEX
+                            && *queue_index != VIRTIO_VSOCK_TX_QUEUE_INDEX
+                            && *queue_index != VIRTIO_VSOCK_EVENT_QUEUE_INDEX
+                    },
+                )));
+            self.metrics.record_observation(observation);
             return Err(VirtioVsockDeviceNotificationError::Inactive {
                 drained_notifications,
             });
@@ -10008,6 +10668,8 @@ impl VirtioVsockDevice {
                 && *queue_index != VIRTIO_VSOCK_TX_QUEUE_INDEX
                 && *queue_index != VIRTIO_VSOCK_EVENT_QUEUE_INDEX
         }) {
+            self.metrics
+                .record_observation(VsockDeviceMetrics::default().with_muxer_event_fails(1));
             return Err(VirtioVsockDeviceNotificationError::UnsupportedQueue {
                 drained_notifications,
                 queue_index,
@@ -10022,16 +10684,10 @@ impl VirtioVsockDevice {
         self.expire_connections(now);
         let host_request_dispatch = self.poll_host_request_connections();
         self.poll_host_rw_payloads(now);
-        let dispatch_tx = drained_notifications
-            .iter()
-            .copied()
-            .any(|queue_index| queue_index == VIRTIO_VSOCK_TX_QUEUE_INDEX);
+        let rx_notification_admitted = rx_notified && self.first_pending_rx_packet().is_some();
+        let dispatch_tx = tx_notified;
 
-        let dispatch_rx = drained_notifications
-            .iter()
-            .copied()
-            .any(|queue_index| queue_index == VIRTIO_VSOCK_RX_QUEUE_INDEX)
-            || self.first_pending_rx_packet().is_some();
+        let dispatch_rx = rx_notified || self.first_pending_rx_packet().is_some();
 
         if !dispatch_rx && !dispatch_tx {
             return Ok(VirtioVsockDeviceNotificationDispatch::new(
@@ -10045,6 +10701,8 @@ impl VirtioVsockDevice {
 
         let (tx_queue_dispatch, guest_tx_control_dispatch) = if dispatch_tx {
             let Some(queue) = self.active_tx_queue.as_mut() else {
+                self.metrics
+                    .record_observation(VsockDeviceMetrics::default().with_tx_queue_event_fails(1));
                 return Err(VirtioVsockDeviceNotificationError::Inactive {
                     drained_notifications,
                 });
@@ -10052,12 +10710,21 @@ impl VirtioVsockDevice {
 
             match queue.dispatch(memory) {
                 Ok(dispatch) => {
+                    self.metrics.record_observation(
+                        VsockDeviceMetrics::default().with_tx_queue_event_count(1),
+                    );
                     let guest_tx_control_dispatch =
                         self.dispatch_guest_tx_control_packets(memory, &dispatch, now);
                     self.poll_host_rw_payloads(now);
                     (Some(dispatch), guest_tx_control_dispatch)
                 }
                 Err(source) => {
+                    let observation = if source.is_queue_event_failure() {
+                        VsockDeviceMetrics::default().with_tx_queue_event_fails(1)
+                    } else {
+                        VsockDeviceMetrics::default().with_tx_queue_event_count(1)
+                    };
+                    self.metrics.record_observation(observation);
                     let partial_dispatch = VirtioVsockDeviceNotificationDispatch::new(
                         drained_notifications,
                         host_request_dispatch,
@@ -10078,8 +10745,23 @@ impl VirtioVsockDevice {
         let dispatch_rx = dispatch_rx || self.first_pending_rx_packet().is_some();
         let rx_queue_dispatch = if dispatch_rx {
             match self.dispatch_pending_rx_packets(memory, now) {
-                Ok(dispatch) => Some(dispatch),
+                Ok(dispatch) => {
+                    if rx_notification_admitted {
+                        self.metrics.record_observation(
+                            VsockDeviceMetrics::default().with_rx_queue_event_count(1),
+                        );
+                    }
+                    Some(dispatch)
+                }
                 Err(source) => {
+                    if rx_notification_admitted {
+                        let observation = if source.is_queue_event_failure() {
+                            VsockDeviceMetrics::default().with_rx_queue_event_fails(1)
+                        } else {
+                            VsockDeviceMetrics::default().with_rx_queue_event_count(1)
+                        };
+                        self.metrics.record_observation(observation);
+                    }
                     let partial_dispatch = VirtioVsockDeviceNotificationDispatch::new(
                         drained_notifications,
                         host_request_dispatch,
@@ -11147,6 +11829,22 @@ impl std::error::Error for VirtioVsockDeviceNotificationError {
 }
 
 impl VirtioVsockMmioHandler {
+    pub fn attach_vsock_metrics(&mut self, metrics: SharedVsockDeviceMetrics) {
+        self.device_config_handler_mut()
+            .attach_metrics(metrics.clone());
+        self.activation_handler_mut().attach_metrics(metrics);
+    }
+
+    #[doc(hidden)]
+    pub fn observe_vsock_host_readiness(
+        &mut self,
+        readiness: &[VsockHostReadiness],
+        poll_failed: bool,
+    ) {
+        self.activation_handler()
+            .observe_host_readiness(readiness, poll_failed);
+    }
+
     /// Captures device and canonical MMIO transport state from one immutable
     /// handler observation after the caller's reset attempt.
     pub fn capture_vsock_state(
@@ -11184,7 +11882,7 @@ impl VirtioVsockMmioHandler {
         VirtioVsockDeviceCaptureError,
     > {
         let transport = self.transport_state();
-        let config_space = *self.device_config_handler();
+        let config_space = self.device_config_handler().clone();
         let (device, validation) = self.activation_handler_mut().capture_and_normalize_state(
             config,
             &config_space,
@@ -11199,17 +11897,39 @@ impl VirtioVsockMmioHandler {
     }
 }
 
+pub fn attach_vsock_metrics_to_mmio_handler(
+    dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    metrics: SharedVsockDeviceMetrics,
+) -> Result<(), MmioHandlerLookupError> {
+    dispatcher
+        .handler_mut::<VirtioVsockMmioHandler>(region_id)?
+        .attach_vsock_metrics(metrics);
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn observe_vsock_host_readiness_for_mmio_handler(
+    dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    readiness: &[VsockHostReadiness],
+    poll_failed: bool,
+) -> Result<(), MmioHandlerLookupError> {
+    dispatcher
+        .handler_mut::<VirtioVsockMmioHandler>(region_id)?
+        .observe_vsock_host_readiness(readiness, poll_failed);
+    Ok(())
+}
+
 impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioVsockDevice> {
     /// Publishes one source-side transport reset before snapshot capture.
     pub fn prepare_vsock_transport_reset(
         &mut self,
         memory: &mut GuestMemory,
-        metrics: &SharedVsockDeviceMetrics,
     ) -> Result<VirtioVsockTransportResetAttempt, VirtioVsockTransportResetError> {
         let attempt = self
             .activation_handler_mut()
             .prepare_transport_reset(memory);
-        metrics.record_transport_reset_attempt(&attempt);
         if attempt
             .as_ref()
             .is_ok_and(|attempt| attempt.needs_queue_interrupt())
@@ -11311,6 +12031,30 @@ impl VirtioMmioDeviceActivationHandler for VirtioVsockDevice {
 }
 
 impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
+    pub fn attach_vsock_metrics(
+        &self,
+        metrics: SharedVsockDeviceMetrics,
+    ) -> Result<(), VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| {
+            core.device_config.attach_metrics(metrics.clone());
+            core.activation.attach_metrics(metrics);
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn observe_vsock_host_readiness(
+        &self,
+        readiness: &[VsockHostReadiness],
+        poll_failed: bool,
+    ) -> Result<(), VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| {
+            core.activation
+                .observe_host_readiness(readiness, poll_failed);
+        })
+    }
+
     /// Captures device and canonical PCI transport state under one endpoint lock.
     pub fn capture_vsock_state(
         &self,
@@ -11376,7 +12120,6 @@ impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
     pub fn prepare_vsock_transport_reset(
         &self,
         memory: &mut GuestMemory,
-        metrics: &SharedVsockDeviceMetrics,
     ) -> Result<
         VirtioVsockTransportResetAttempt,
         VirtioPciDeviceOperationError<
@@ -11401,13 +12144,11 @@ impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
                 attempt
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
-        metrics.record_transport_reset_attempt(&attempt);
         let signal_required = attempt
             .as_ref()
             .is_ok_and(|attempt| attempt.needs_queue_interrupt());
         let endpoint = work.drain_interrupt_intents();
         if signal_required && endpoint.is_err() {
-            metrics.record_event_queue_signal_failure();
             let _ = work.with_core_mut(|core| {
                 if let Some(logger) = &core.activation.guest_logger {
                     logger.log_vsock(LoggerVsockOutcome::InterruptDeliveryFailed);
@@ -11420,7 +12161,6 @@ impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
     /// Re-signals a reconstructed snapshot-origin device without mutating its event queue.
     pub fn signal_restored_vsock_transport_reset(
         &self,
-        metrics: &SharedVsockDeviceMetrics,
     ) -> Result<
         VirtioVsockRestoredTransportResetSignal,
         VirtioPciDeviceOperationError<
@@ -11444,7 +12184,6 @@ impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
         let endpoint = work.drain_interrupt_intents();
         if signal.needs_queue_interrupt() && endpoint.is_err() {
-            metrics.record_event_queue_signal_failure();
             let _ = work.with_core_mut(|core| {
                 if let Some(logger) = &core.activation.guest_logger {
                     logger.log_vsock(LoggerVsockOutcome::InterruptDeliveryFailed);
@@ -11584,10 +12323,14 @@ impl PreparedVsockDevice {
 
     fn from_config_with_device(config: &VsockConfig, mut device: VirtioVsockDevice) -> Self {
         device.set_host_socket_path(config.uds_path());
+        let metrics = device.shared_metrics();
         Self {
             guest_cid: config.guest_cid(),
             uds_path: config.uds_path().to_path_buf(),
-            config_space: VirtioVsockConfigSpace::new(u64::from(config.guest_cid())),
+            config_space: VirtioVsockConfigSpace::with_metrics(
+                u64::from(config.guest_cid()),
+                metrics,
+            ),
             device,
         }
     }
@@ -11600,12 +12343,21 @@ impl PreparedVsockDevice {
         &self.uds_path
     }
 
-    pub const fn config_space(&self) -> VirtioVsockConfigSpace {
-        self.config_space
+    pub fn config_space(&self) -> VirtioVsockConfigSpace {
+        self.config_space.clone()
     }
 
     pub const fn device(&self) -> &VirtioVsockDevice {
         &self.device
+    }
+
+    pub fn attach_metrics(&mut self, metrics: SharedVsockDeviceMetrics) {
+        self.config_space.attach_metrics(metrics.clone());
+        self.device.attach_metrics(metrics);
+    }
+
+    pub fn shared_metrics(&self) -> SharedVsockDeviceMetrics {
+        self.device.shared_metrics()
     }
 
     pub fn into_parts(self) -> (u32, PathBuf, VirtioVsockConfigSpace, VirtioVsockDevice) {
@@ -11900,13 +12652,14 @@ impl std::error::Error for VsockMmioRegistrationError {
 pub fn virtio_vsock_mmio_handler(
     guest_cid: u32,
 ) -> Result<VirtioVsockMmioHandler, VirtioMmioRegisterHandlerError> {
-    let config = VirtioVsockConfigSpace::new(u64::from(guest_cid));
+    let metrics = SharedVsockDeviceMetrics::default();
+    let config = VirtioVsockConfigSpace::with_metrics(u64::from(guest_cid), metrics.clone());
     VirtioMmioRegisterHandler::with_device_config_and_activation(
         VIRTIO_VSOCK_DEVICE_ID,
         config.available_features(),
         &VIRTIO_VSOCK_QUEUE_SIZES,
         config,
-        VirtioVsockDevice::with_guest_cid(guest_cid),
+        VirtioVsockDevice::with_guest_cid_and_metrics(guest_cid, metrics),
     )
 }
 
@@ -12125,13 +12878,10 @@ mod tests {
         input.validate()
     }
 
-    fn assert_vsock_metrics_for_notification(
-        notification: &super::VirtioVsockDeviceNotificationDispatch,
+    fn assert_vsock_source_metrics(
+        metrics: &SharedVsockDeviceMetrics,
         expected: VsockDeviceMetrics,
     ) {
-        let metrics = SharedVsockDeviceMetrics::default();
-        metrics.record_notification_dispatch(notification);
-
         assert_eq!(metrics.snapshot(), expected);
     }
 
@@ -12227,14 +12977,17 @@ mod tests {
         guest_cid: u32,
         path: &Path,
     ) -> VirtioVsockMmioHandler {
-        let config = VirtioVsockConfigSpace::new(u64::from(guest_cid));
+        let metrics = SharedVsockDeviceMetrics::default();
+        let config = VirtioVsockConfigSpace::with_metrics(u64::from(guest_cid), metrics.clone());
         let owner = VsockHostSocketOwner::bind(path).expect("host socket should bind");
+        let mut device = VirtioVsockDevice::with_host_socket_owner(guest_cid, owner);
+        device.attach_metrics(metrics);
         VirtioMmioRegisterHandler::with_device_config_and_activation(
             VIRTIO_VSOCK_DEVICE_ID,
             config.available_features(),
             &VIRTIO_VSOCK_QUEUE_SIZES,
             config,
-            VirtioVsockDevice::with_host_socket_owner(guest_cid, owner),
+            device,
         )
         .expect("vsock handler with host socket should build")
     }
@@ -12717,6 +13470,51 @@ mod tests {
         assert_eq!(read_vsock_tx_used_index(&memory), 1);
 
         (memory, handler, listener.accept())
+    }
+
+    fn guest_connections_with_deadlines(
+        device: &mut VirtioVsockDevice,
+        deadlines: &[Instant],
+    ) -> Vec<(VsockGuestConnectionKey, UnixStream)> {
+        deadlines
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, at)| {
+                let offset = u32::try_from(index).expect("test connection index should fit u32");
+                let key = VsockGuestConnectionKey::new(10_000 + offset, 20_000 + offset);
+                let (stream, peer) = UnixStream::pair().expect("test stream pair should build");
+                stream
+                    .set_nonblocking(true)
+                    .expect("test stream should switch to nonblocking mode");
+                peer.set_nonblocking(true)
+                    .expect("test peer should switch to nonblocking mode");
+                device
+                    .guest_connections
+                    .insert_connected_guest_connection(
+                        key,
+                        stream,
+                        guest_request_tx_packet(42, key.host_port(), key.guest_port()).header(),
+                    )
+                    .expect("test guest connection should insert");
+                let deadline = super::VsockConnectionDeadline {
+                    kind: super::VsockConnectionDeadlineKind::Request,
+                    at,
+                };
+                device
+                    .guest_connections
+                    .connections
+                    .get_mut(&key)
+                    .expect("inserted guest connection should remain")
+                    .lifecycle
+                    .deadline = Some(deadline);
+                device.push_connection_deadline(
+                    super::VsockConnectionDeadlineKey::Guest(key),
+                    Some(deadline),
+                );
+                (key, peer)
+            })
+            .collect()
     }
 
     fn established_host_connection_for_test(
@@ -15101,6 +15899,21 @@ mod tests {
     }
 
     #[test]
+    fn vsock_host_read_metrics_preserve_bytes_and_terminal_failure() {
+        assert_eq!(
+            super::vsock_host_rw_poll_observation(super::VsockHostRwPollOutcome::Queued, 6),
+            VsockDeviceMetrics::default().with_rx_bytes_count(6)
+        );
+        assert_eq!(
+            super::vsock_host_rw_poll_observation(super::VsockHostRwPollOutcome::ReadError, 6),
+            VsockDeviceMetrics::default()
+                .with_rx_bytes_count(6)
+                .with_conns_killed(1)
+                .with_rx_read_fails(1)
+        );
+    }
+
+    #[test]
     fn guest_rw_pending_writes_enforce_aggregate_byte_limit() {
         let mut pending = super::VsockGuestRwPendingWrites::new();
         let full_window = vec![0; VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE as usize];
@@ -16354,6 +17167,8 @@ mod tests {
         let active_key = device
             .insert_accepted_host_connection(active, request)
             .expect("active host connection should insert");
+        let metrics = SharedVsockDeviceMetrics::default();
+        device.attach_metrics(metrics.clone());
         let mut first_client = UnixStream::connect(&path).expect("first client should connect");
         let mut second_client = UnixStream::connect(&path).expect("second client should connect");
 
@@ -16368,17 +17183,7 @@ mod tests {
             device.host_local_port_cursor().last_used(),
             active_key.local_port().raw()
         );
-        let first_notification = super::VirtioVsockDeviceNotificationDispatch::new(
-            Vec::new(),
-            first,
-            super::VirtioVsockGuestTxControlDispatch::empty(),
-            None,
-            None,
-        );
-        assert_vsock_metrics_for_notification(
-            &first_notification,
-            VsockDeviceMetrics::default().with_conn_event_fails(1),
-        );
+        assert_vsock_source_metrics(&metrics, VsockDeviceMetrics::default());
 
         let second = device.poll_host_request_connections();
 
@@ -16528,11 +17333,19 @@ mod tests {
     fn prepared_vsock_device_preserves_config_and_inactive_device() {
         let config = valid_vsock_config(u32::MAX, "./relative-vsock.sock");
         let prepared = PreparedVsockDevice::from_config(&config);
+        let metrics = prepared.shared_metrics();
 
         assert_eq!(prepared.guest_cid(), u32::MAX);
         assert_eq!(prepared.uds_path(), Path::new("./relative-vsock.sock"));
         assert_eq!(prepared.config_space().guest_cid(), u64::from(u32::MAX));
         assert!(!prepared.device().is_activated());
+        assert!(prepared.config_space.metrics.shares_state_with(&metrics));
+        assert!(
+            prepared
+                .device()
+                .shared_metrics()
+                .shares_state_with(&metrics)
+        );
     }
 
     #[test]
@@ -16541,11 +17354,13 @@ mod tests {
         let prepared = PreparedVsockDevice::from_config(&config);
 
         let (guest_cid, uds_path, config_space, device) = prepared.into_parts();
+        let metrics = device.shared_metrics();
 
         assert_eq!(guest_cid, 7);
         assert_eq!(uds_path.as_path(), Path::new("relative-vsock.sock"));
         assert_eq!(config_space.guest_cid(), 7);
         assert!(!device.is_activated());
+        assert!(config_space.metrics.shares_state_with(&metrics));
     }
 
     #[test]
@@ -18145,7 +18960,8 @@ mod tests {
 
     #[test]
     fn virtio_vsock_config_space_rejects_unsupported_reads() {
-        let config = VirtioVsockConfigSpace::new(3);
+        let metrics = SharedVsockDeviceMetrics::default();
+        let config = VirtioVsockConfigSpace::with_metrics(3, metrics.clone());
         let handler = vsock_handler_for_config(config);
 
         let err = handler
@@ -18174,11 +18990,14 @@ mod tests {
             err,
             VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 4, len: 8 }
         ));
+        assert_eq!(metrics.snapshot().cfg_fails(), 3);
     }
 
     #[test]
     fn virtio_vsock_config_space_rejects_writes() {
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
         handler
             .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
             .expect("status should accept ACKNOWLEDGE");
@@ -18200,6 +19019,7 @@ mod tests {
             err,
             VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigWrite { offset: 0, len: 4 }
         ));
+        assert_eq!(metrics.snapshot().cfg_fails(), 1);
     }
 
     #[test]
@@ -18504,6 +19324,10 @@ mod tests {
                 now + Duration::from_secs(1),
             )
             .expect("host request should arm deadline");
+        device.push_connection_deadline(
+            super::VsockConnectionDeadlineKey::Host(host_key),
+            device.host_connections.deadline(host_key),
+        );
 
         let guest_key = VsockGuestConnectionKey::new(52, 4000);
         let (guest_stream, _guest_peer) =
@@ -18523,6 +19347,10 @@ mod tests {
             .expect("guest connection should exist");
         guest_connection.lifecycle.mark_established();
         guest_connection.lifecycle.arm_shutdown_deadline(now);
+        device.push_connection_deadline(
+            super::VsockConnectionDeadlineKey::Guest(guest_key),
+            device.guest_connections.deadline(guest_key),
+        );
 
         let (_, _, earliest) = device
             .host_wakeup()
@@ -18642,7 +19470,7 @@ mod tests {
         write_vsock_event_available_used_event(&mut memory, 1);
 
         let attempt = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect("transport reset should publish");
         let publication = attempt
             .publication()
@@ -18692,9 +19520,10 @@ mod tests {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
         let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
 
         let inactive = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect("inactive reset should be a typed no-op");
         assert_eq!(inactive, VirtioVsockTransportResetAttempt::Inactive);
         assert_eq!(metrics.snapshot(), VsockDeviceMetrics::default());
@@ -18702,7 +19531,7 @@ mod tests {
 
         activate_vsock_handler(&mut handler);
         let attempt = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect("empty event queue should be nonfatal");
 
         assert_eq!(attempt, VirtioVsockTransportResetAttempt::QueueEmpty);
@@ -18717,6 +19546,7 @@ mod tests {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
         let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
 
         activate_vsock_handler(&mut handler);
         write_vsock_event_available_heads(&mut memory, &[0]);
@@ -18727,7 +19557,7 @@ mod tests {
         );
 
         let read_only = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect_err("read-only reset descriptor should fail");
         assert!(matches!(
             read_only,
@@ -18751,7 +19581,7 @@ mod tests {
             TestDescriptor::writable(TEST_VSOCK_EVENT_PAYLOAD, 3, None),
         );
         let too_small = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect_err("short reset descriptor should fail");
         assert!(matches!(
             too_small,
@@ -18769,7 +19599,7 @@ mod tests {
             TestDescriptor::writable(overflowing_address, 4, None),
         );
         let overflow = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect_err("overflowing reset payload should fail");
         assert!(matches!(
             overflow,
@@ -18786,7 +19616,7 @@ mod tests {
             TestDescriptor::writable(TEST_VSOCK_EVENT_PAYLOAD, 4, None),
         );
         let retry = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect("corrected reset descriptor should retry");
 
         assert!(matches!(
@@ -18828,7 +19658,7 @@ mod tests {
         );
 
         let first = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect("first transport reset should publish");
         let publication = first
             .publication()
@@ -18842,7 +19672,7 @@ mod tests {
         );
 
         let repeated = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect("pending repeated reset should remain nonfatal");
 
         assert_eq!(repeated, VirtioVsockTransportResetAttempt::AlreadyPending);
@@ -18870,6 +19700,7 @@ mod tests {
         );
         let mut device = VirtioVsockDevice::new();
         let metrics = SharedVsockDeviceMetrics::default();
+        device.attach_metrics(metrics.clone());
 
         device
             .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &queues))
@@ -18882,7 +19713,6 @@ mod tests {
         write_vsock_event_available_heads(&mut memory, &[0]);
 
         let used_ring = device.prepare_transport_reset(&mut memory);
-        metrics.record_transport_reset_attempt(&used_ring);
         assert!(matches!(
             used_ring,
             Err(VirtioVsockTransportResetError::UsedRing { .. })
@@ -18898,6 +19728,7 @@ mod tests {
         assert_eq!(metrics.snapshot().ev_queue_event_fails(), 1);
 
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+        handler.attach_vsock_metrics(metrics.clone());
         activate_vsock_handler(&mut handler);
         write_vsock_event_descriptor(
             &mut memory,
@@ -18905,7 +19736,7 @@ mod tests {
             TestDescriptor::writable(TEST_VSOCK_EVENT_UNMAPPED_PAYLOAD, 4, None),
         );
         let payload = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect_err("unmapped payload should fail");
         assert!(matches!(
             payload,
@@ -18925,12 +19756,13 @@ mod tests {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
         let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
 
         activate_vsock_handler(&mut handler);
         write_vsock_event_available_heads(&mut memory, &[VIRTIO_VSOCK_QUEUE_SIZE]);
 
         let error = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect_err("invalid event head should fail");
 
         assert!(matches!(
@@ -18945,7 +19777,6 @@ mod tests {
     fn virtio_vsock_transport_reset_supports_negotiated_indirect_descriptor() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
-        let metrics = SharedVsockDeviceMetrics::default();
 
         activate_vsock_handler_with_event_idx_and_indirect(&mut handler);
         write_vsock_event_indirect_descriptor(
@@ -18956,7 +19787,7 @@ mod tests {
         write_vsock_event_available_heads(&mut memory, &[5]);
 
         let publication = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect("indirect reset should publish")
             .publication()
             .expect("publication should be present");
@@ -19582,6 +20413,8 @@ mod tests {
         );
         write_vsock_rx_available_heads(&mut memory, &[0]);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
 
         let first = handler
             .dispatch_vsock_queue_notifications(&mut memory)
@@ -19599,6 +20432,7 @@ mod tests {
         assert_eq!(first_rx.delivered_requests(), 0);
         assert_eq!(read_vsock_rx_used_index(&memory), 0);
         assert!(handler.pending_queue_notifications().is_empty());
+        assert_eq!(metrics.snapshot(), VsockDeviceMetrics::default());
 
         let mut client = UnixStream::connect(&path).expect("host client should connect");
         client
@@ -19631,8 +20465,8 @@ mod tests {
             read_vsock_rx_used_element(&memory, 0),
             (0, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
         );
-        assert_vsock_metrics_for_notification(
-            &second,
+        assert_vsock_source_metrics(
+            &metrics,
             VsockDeviceMetrics::default()
                 .with_rx_packets_count(1)
                 .with_conns_added(1),
@@ -20001,6 +20835,8 @@ mod tests {
             .activation_handler_mut()
             .insert_accepted_host_connection(accepted, request)
             .expect("host connection should insert");
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
         write_vsock_rx_descriptor(
             &mut memory,
             0,
@@ -20039,6 +20875,10 @@ mod tests {
         );
         assert_eq!(read_vsock_rx_used_index(&memory), 1);
         assert_eq!(read_vsock_rx_used_element(&memory, 0), (0, 0));
+        assert_eq!(
+            metrics.snapshot(),
+            VsockDeviceMetrics::default().with_rx_queue_event_count(1)
+        );
     }
 
     #[test]
@@ -20057,6 +20897,8 @@ mod tests {
         let key = device
             .insert_accepted_host_connection(accepted, request)
             .expect("host connection should insert");
+        let metrics = SharedVsockDeviceMetrics::default();
+        device.attach_metrics(metrics.clone());
         write_vsock_rx_descriptor(
             &mut memory,
             0,
@@ -20090,6 +20932,10 @@ mod tests {
         assert!(device.has_pending_host_request_packet(key));
         assert_eq!(device.earliest_deadline(), None);
         assert_eq!(read_vsock_rx_used_index(&memory), 0);
+        assert_eq!(
+            metrics.snapshot(),
+            VsockDeviceMetrics::default().with_rx_queue_event_fails(1)
+        );
     }
 
     #[test]
@@ -20601,6 +21447,8 @@ mod tests {
             .with_buffer_allocation(1234);
 
         activate_vsock_handler(&mut handler);
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
         write_vsock_rx_descriptor(
             &mut memory,
             0,
@@ -20663,8 +21511,8 @@ mod tests {
         assert_eq!(tx.successful_packets(), 1);
         assert_eq!(read_vsock_tx_used_index(&memory), 1);
         assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
-        assert_vsock_metrics_for_notification(
-            &notification,
+        assert_vsock_source_metrics(
+            &metrics,
             VsockDeviceMetrics::default()
                 .with_tx_queue_event_count(1)
                 .with_rx_packets_count(1)
@@ -20821,6 +21669,8 @@ mod tests {
             connection.credit.sent_count = std::num::Wrapping(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE);
             connection.credit.ensure_credit_request_if_exhausted();
         }
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
         write_vsock_rx_descriptor(
             &mut memory,
             1,
@@ -20862,8 +21712,8 @@ mod tests {
             .credit;
         assert!(!credit.has_pending_credit_request_packet());
         assert!(credit.credit_request_outstanding);
-        assert_vsock_metrics_for_notification(
-            &notification,
+        assert_vsock_source_metrics(
+            &metrics,
             VsockDeviceMetrics::default()
                 .with_rx_queue_event_count(1)
                 .with_rx_packets_count(1),
@@ -21301,6 +22151,8 @@ mod tests {
         let packet = guest_rw_tx_packet(42, 52, 4000)
             .header()
             .with_buffer_allocation(123);
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
 
         write_vsock_tx_packet_with_payload(
             &mut memory,
@@ -21331,8 +22183,8 @@ mod tests {
         assert_eq!(read_vsock_tx_used_index(&memory), 2);
         assert_eq!(read_vsock_tx_used_element(&memory, 1), (1, 0));
         assert_host_payload(&mut accepted, payload);
-        assert_vsock_metrics_for_notification(
-            &notification,
+        assert_vsock_source_metrics(
+            &metrics,
             VsockDeviceMetrics::default()
                 .with_tx_queue_event_count(1)
                 .with_tx_bytes_count(test_len_as_u64(payload.len()))
@@ -21357,6 +22209,61 @@ mod tests {
         assert_stream_closed(
             &mut accepted,
             "dropping handler should close forwarded guest stream",
+        );
+    }
+
+    #[test]
+    fn vsock_guest_connection_records_terminal_rw_write_failure() {
+        let (mut memory, mut handler, accepted) =
+            established_guest_connection_for_test("guest-rw-write-fail", 52, 4000);
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
+        let packet = guest_rw_tx_packet(42, 52, 4000)
+            .header()
+            .with_payload_len(7);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, packet);
+        write_guest_bytes(&mut memory, TEST_VSOCK_SECOND_PAYLOAD, b"payload");
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(
+                    TEST_VSOCK_SECOND_HEADER,
+                    VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                    Some(1),
+                ),
+                TestDescriptor::readable(TEST_VSOCK_SECOND_PAYLOAD, 7, None),
+            ],
+        );
+        let packet = parse_vsock_tx_packet(&memory, &chain)
+            .expect("terminal write test packet should parse");
+        drop(accepted);
+
+        let outcome = handler
+            .activation_handler_mut()
+            .guest_connections
+            .forward_guest_rw_packet(&memory, &packet, 42)
+            .expect("guest RW packet should reach its retained connection");
+
+        assert!(matches!(
+            outcome,
+            super::VsockGuestRwOutcome::Dropped {
+                source: super::VsockGuestRwForwardError::StreamWrite(_),
+                reset_header: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            !handler
+                .activation_handler()
+                .has_guest_connection(VsockGuestConnectionKey::new(52, 4000))
+        );
+        assert_vsock_source_metrics(
+            &metrics,
+            VsockDeviceMetrics::default()
+                .with_tx_packets_count(1)
+                .with_conns_killed(1)
+                .with_conns_removed(1)
+                .with_tx_write_fails(1),
         );
     }
 
@@ -21510,6 +22417,8 @@ mod tests {
         let (mut memory, mut handler, accepted) =
             established_guest_connection_for_test("guest-rw-flush-fail", 52, 4000);
         let key = VsockGuestConnectionKey::new(52, 4000);
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
 
         handler
             .activation_handler_mut()
@@ -21541,6 +22450,13 @@ mod tests {
                 .activation_handler()
                 .pending_guest_reset_packet_count(),
             1
+        );
+        assert_vsock_source_metrics(
+            &metrics,
+            VsockDeviceMetrics::default()
+                .with_conns_killed(1)
+                .with_conns_removed(1)
+                .with_tx_flush_fails(1),
         );
     }
 
@@ -21839,6 +22755,8 @@ mod tests {
         let (mut memory, mut handler, mut accepted) =
             established_guest_connection_for_test("host-rw-guest", 52, 4000);
         let payload = b"host-payload";
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
         accepted
             .write_all(payload)
             .expect("host payload should write");
@@ -21910,8 +22828,8 @@ mod tests {
             read_vsock_rx_used_element(&memory, 1),
             (1, vsock_packet_len_with_payload(payload))
         );
-        assert_vsock_metrics_for_notification(
-            &notification,
+        assert_vsock_source_metrics(
+            &metrics,
             VsockDeviceMetrics::default()
                 .with_rx_queue_event_count(1)
                 .with_rx_bytes_count(test_len_as_u64(payload.len()))
@@ -24212,6 +25130,8 @@ mod tests {
     fn local_host_shutdown_ignores_peer_shutdown_until_delivery_timeout() {
         let (_memory, mut handler, mut client, key) =
             established_host_connection_for_test("local-before-peer-shutdown", 4000);
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
         let now = Instant::now();
         let device = handler.activation_handler_mut();
         let connection = device
@@ -24265,6 +25185,10 @@ mod tests {
             .host_connections
             .take_pending_local_shutdown_packet_header(key, guest_cid, delivered_at)
             .expect("local shutdown should be delivered before reset");
+        device.push_connection_deadline(
+            super::VsockConnectionDeadlineKey::Host(key),
+            device.host_connections.deadline(key),
+        );
         assert_eq!(delivered.operation(), VIRTIO_VSOCK_OP_SHUTDOWN);
         assert!(device.has_host_connection(key));
         assert_eq!(device.pending_guest_reset_packet_count(), 0);
@@ -24277,15 +25201,197 @@ mod tests {
         device.expire_connections(deadline - Duration::from_nanos(1));
         assert!(device.has_host_connection(key));
         assert_eq!(device.pending_guest_reset_packet_count(), 0);
+        assert_vsock_source_metrics(
+            &metrics,
+            VsockDeviceMetrics::default().with_tx_packets_count(1),
+        );
 
         device.expire_connections(deadline);
 
         assert!(!device.has_host_connection(key));
         assert_eq!(device.pending_guest_reset_packet_count(), 1);
+        assert_vsock_source_metrics(
+            &metrics,
+            VsockDeviceMetrics::default()
+                .with_tx_packets_count(1)
+                .with_conns_killed(1)
+                .with_conns_removed(1),
+        );
         assert_stream_closed(
             &mut client,
             "expired local-closed host connection should close stream",
         );
+    }
+
+    #[test]
+    fn kill_queue_orders_guest_deadlines_and_expires_at_the_exact_boundary() {
+        let now = Instant::now();
+        let first = now + Duration::from_secs(1);
+        let second = now + Duration::from_secs(2);
+        let third = now + Duration::from_secs(3);
+        let mut device = VirtioVsockDevice::with_guest_cid(42);
+        let connections = guest_connections_with_deadlines(&mut device, &[third, first, second]);
+        let metrics = SharedVsockDeviceMetrics::default();
+        device.attach_metrics(metrics.clone());
+
+        assert_eq!(device.earliest_deadline(), Some(first));
+        device.expire_connections(first - Duration::from_nanos(1));
+        assert_eq!(device.guest_connections.len(), 3);
+        assert_vsock_source_metrics(&metrics, VsockDeviceMetrics::default());
+
+        device.expire_connections(first);
+
+        assert_eq!(device.guest_connections.len(), 2);
+        assert!(!device.guest_connections.contains(connections[1].0));
+        assert!(device.guest_connections.contains(connections[0].0));
+        assert!(device.guest_connections.contains(connections[2].0));
+        assert_eq!(device.earliest_deadline(), Some(second));
+        assert_vsock_source_metrics(
+            &metrics,
+            VsockDeviceMetrics::default()
+                .with_conns_killed(1)
+                .with_conns_removed(1),
+        );
+    }
+
+    #[test]
+    fn kill_queue_ignores_a_stale_cancelled_guest_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut device = VirtioVsockDevice::with_guest_cid(42);
+        let connections = guest_connections_with_deadlines(&mut device, &[deadline]);
+        let key = connections[0].0;
+        device
+            .guest_connections
+            .connections
+            .get_mut(&key)
+            .expect("guest connection should remain")
+            .lifecycle
+            .deadline = None;
+        let metrics = SharedVsockDeviceMetrics::default();
+        device.attach_metrics(metrics.clone());
+
+        assert_eq!(device.earliest_deadline(), None);
+        device.expire_connections(deadline);
+
+        assert!(device.guest_connections.contains(key));
+        assert_eq!(device.pending_guest_reset_packet_count(), 0);
+        assert_vsock_source_metrics(&metrics, VsockDeviceMetrics::default());
+    }
+
+    #[test]
+    fn kill_queue_rebuilds_more_than_once_after_capacity_overflow() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let connection_count = super::VSOCK_KILL_QUEUE_CAPACITY * 2 + 2;
+        let deadlines = vec![deadline; connection_count];
+        let mut device = VirtioVsockDevice::with_guest_cid(42);
+        let connections = guest_connections_with_deadlines(&mut device, &deadlines);
+        let metrics = SharedVsockDeviceMetrics::default();
+        device.attach_metrics(metrics.clone());
+
+        assert_eq!(connections.len(), connection_count);
+        assert_eq!(
+            device.kill_queue.entries.len(),
+            super::VSOCK_KILL_QUEUE_CAPACITY
+        );
+        assert!(!device.kill_queue.is_synchronized());
+        device.expire_connections(deadline - Duration::from_nanos(1));
+        assert_eq!(device.guest_connections.len(), connection_count);
+
+        device.expire_connections(deadline);
+
+        assert_eq!(device.guest_connections.len(), 0);
+        assert!(device.kill_queue.is_empty());
+        assert!(device.kill_queue.is_synchronized());
+        assert_eq!(
+            device.pending_guest_reset_packet_count(),
+            usize::from(VIRTIO_VSOCK_QUEUE_SIZE)
+        );
+        let connection_count = test_len_as_u64(connection_count);
+        assert_vsock_source_metrics(
+            &metrics,
+            VsockDeviceMetrics::default()
+                .with_conns_killed(connection_count)
+                .with_conns_removed(connection_count)
+                .with_killq_resync(2),
+        );
+    }
+
+    #[test]
+    fn kill_queue_falls_back_to_live_deadlines_after_capacity_overflow() {
+        let now = Instant::now();
+        let queued_deadline = now + Duration::from_secs(2);
+        let dropped_deadline = now + Duration::from_secs(1);
+        let mut deadlines = vec![queued_deadline; super::VSOCK_KILL_QUEUE_CAPACITY];
+        deadlines.push(dropped_deadline);
+        let mut device = VirtioVsockDevice::with_guest_cid(42);
+        let connections = guest_connections_with_deadlines(&mut device, &deadlines);
+
+        assert_eq!(connections.len(), super::VSOCK_KILL_QUEUE_CAPACITY + 1);
+        assert!(!device.kill_queue.is_synchronized());
+        assert_eq!(device.earliest_deadline(), Some(dropped_deadline));
+    }
+
+    #[test]
+    fn mmio_host_readiness_classifies_poll_muxer_and_connection_failures() {
+        let (_memory, mut handler, _peer) =
+            established_guest_connection_for_test("readiness-errors", 7000, 8000);
+        let key = VsockGuestConnectionKey::new(7000, 8000);
+        let descriptor = handler
+            .activation_handler()
+            .guest_connections
+            .get(key)
+            .expect("established guest connection should remain")
+            .stream()
+            .as_raw_fd();
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
+        let readiness = [
+            super::VsockHostReadiness::from_poll_revents(-1, libc::POLLIN),
+            super::VsockHostReadiness::from_poll_revents(descriptor, libc::POLLNVAL),
+            super::VsockHostReadiness::from_poll_revents(descriptor, libc::POLLIN),
+            super::VsockHostReadiness::from_poll_revents(descriptor, libc::POLLOUT),
+            super::VsockHostReadiness::from_poll_revents(descriptor, libc::POLLERR | libc::POLLHUP),
+        ];
+
+        handler.observe_vsock_host_readiness(&readiness, true);
+
+        assert_vsock_source_metrics(
+            &metrics,
+            VsockDeviceMetrics::default()
+                .with_muxer_event_fails(3)
+                .with_conn_event_fails(1),
+        );
+    }
+
+    #[test]
+    fn mmio_expected_writable_host_readiness_is_not_a_failure() {
+        let (_memory, mut handler, _peer) =
+            established_guest_connection_for_test("readiness-write", 7001, 8001);
+        let key = VsockGuestConnectionKey::new(7001, 8001);
+        handler
+            .activation_handler_mut()
+            .guest_connections
+            .queue_pending_guest_rw_payload_for_test(key, b"queued")
+            .expect("guest payload should queue for retry");
+        let descriptor = handler
+            .activation_handler()
+            .guest_connections
+            .get(key)
+            .expect("established guest connection should remain")
+            .stream()
+            .as_raw_fd();
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
+
+        handler.observe_vsock_host_readiness(
+            &[super::VsockHostReadiness::from_poll_revents(
+                descriptor,
+                libc::POLLOUT,
+            )],
+            false,
+        );
+
+        assert_vsock_source_metrics(&metrics, VsockDeviceMetrics::default());
     }
 
     #[test]
@@ -26064,6 +27170,8 @@ mod tests {
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
 
         activate_vsock_handler(&mut handler);
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
 
         let notification = handler
@@ -26091,6 +27199,10 @@ mod tests {
         assert_eq!(active_tx_queue.available_ring().next_avail(), 0);
         assert_eq!(active_tx_queue.used_ring().next_used(), 0);
         assert_eq!(read_vsock_tx_used_index(&memory), 0);
+        assert_eq!(
+            metrics.snapshot(),
+            VsockDeviceMetrics::default().with_tx_queue_event_count(1)
+        );
     }
 
     #[test]
@@ -26099,6 +27211,8 @@ mod tests {
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
 
         activate_vsock_handler(&mut handler);
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
         write_vsock_tx_descriptor(
             &mut memory,
             0,
@@ -26136,6 +27250,10 @@ mod tests {
         );
         assert_eq!(read_vsock_tx_used_index(&memory), 1);
         assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
+        assert_eq!(
+            metrics.snapshot(),
+            VsockDeviceMetrics::default().with_tx_queue_event_count(1)
+        );
     }
 
     #[test]
@@ -26145,6 +27263,8 @@ mod tests {
         let header = test_vsock_packet_header().with_payload_len(0);
 
         activate_vsock_handler(&mut handler);
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
         write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
         write_vsock_tx_descriptor(
             &mut memory,
@@ -26189,6 +27309,10 @@ mod tests {
         assert_eq!(active_tx_queue.used_ring().next_used(), 1);
         assert_eq!(read_vsock_tx_used_index(&memory), 1);
         assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
+        assert_eq!(
+            metrics.snapshot(),
+            VsockDeviceMetrics::default().with_tx_queue_event_fails(1)
+        );
     }
 
     #[test]
@@ -26334,6 +27458,8 @@ mod tests {
     #[test]
     fn virtio_vsock_device_rejects_driver_ok_before_queues_are_ready() {
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
+        let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
         advance_handler_to_features_ok(&mut handler);
 
         let err = handler
@@ -26346,6 +27472,7 @@ mod tests {
         ));
         assert!(!handler.is_device_activated());
         assert!(!handler.activation_handler().is_activated());
+        assert_eq!(metrics.snapshot().activate_fails(), 0);
     }
 
     #[test]
@@ -26356,6 +27483,8 @@ mod tests {
             let queues = vsock_queue_registers_with_count(queue_count);
             let activation = VirtioMmioDeviceActivation::new(&registers, &queues);
             let mut device = VirtioVsockDevice::new();
+            let metrics = SharedVsockDeviceMetrics::default();
+            device.attach_metrics(metrics.clone());
 
             let err = device
                 .activate_vsock(activation)
@@ -26373,6 +27502,7 @@ mod tests {
                 } if got == queue_count
             ));
             assert!(!device.is_activated());
+            assert_eq!(metrics.snapshot().activate_fails(), 1);
         }
     }
 
@@ -26471,6 +27601,7 @@ mod tests {
         let mut handler = virtio_vsock_mmio_handler_with_host_socket(42, &path);
         let mut memory = vsock_tx_memory();
         let metrics = SharedVsockDeviceMetrics::default();
+        handler.attach_vsock_metrics(metrics.clone());
         activate_vsock_handler_with_event_idx_and_size(&mut handler, TEST_VSOCK_QUEUE_SIZE);
 
         {
@@ -26546,6 +27677,10 @@ mod tests {
                 .take_pending_request_packet_header(key, 42)
                 .expect("source request should start its deadline");
             assert_eq!(request.operation(), VIRTIO_VSOCK_OP_REQUEST);
+            device.push_connection_deadline(
+                super::VsockConnectionDeadlineKey::Host(key),
+                device.host_connections.deadline(key),
+            );
             device
                 .host_connections
                 .connections
@@ -26565,7 +27700,7 @@ mod tests {
         );
         write_vsock_event_available_heads(&mut memory, &[0]);
         let reset_attempt = handler
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect("active reset should publish before capture");
 
         let (first, first_validation) = handler
@@ -26669,6 +27804,15 @@ mod tests {
             !recaptured_validation
                 .source_work()
                 .dropped_any_source_work()
+        );
+        assert_eq!(
+            metrics.snapshot(),
+            VsockDeviceMetrics::default()
+                .with_tx_packets_count(1)
+                .with_conns_added(2)
+                .with_conns_killed(2)
+                .with_conns_removed(2),
+            "capture cleanup must remain on the source owner"
         );
 
         drop(handler);
@@ -27090,10 +28234,7 @@ mod tests {
         );
         write_vsock_event_available_heads(&mut publisher_memory, &[0]);
         let published = publisher
-            .prepare_vsock_transport_reset(
-                &mut publisher_memory,
-                &SharedVsockDeviceMetrics::default(),
-            )
+            .prepare_vsock_transport_reset(&mut publisher_memory)
             .expect("publisher should create a typed reset result");
         assert!(matches!(
             handler.capture_vsock_state(&config, &memory, published),
@@ -27127,6 +28268,7 @@ mod tests {
         let path = unique_socket_path("restore-idle");
         let config = valid_vsock_config(42, path.to_string_lossy());
         let source = virtio_vsock_mmio_handler_with_host_socket(42, &path);
+        let source_metrics = source.activation_handler().shared_metrics();
         let memory = vsock_tx_memory();
         let (captured, _) = source
             .capture_vsock_state(&config, &memory, VirtioVsockTransportResetAttempt::Inactive)
@@ -27182,6 +28324,17 @@ mod tests {
         assert!(resource.is_consumed());
         assert!(!reconstructed.is_device_activated());
         assert!(!reconstructed.activation_handler().is_activated());
+        let reconstructed_metrics = reconstructed.activation_handler().shared_metrics();
+        assert!(
+            reconstructed
+                .device_config_handler()
+                .metrics
+                .shares_state_with(&reconstructed_metrics)
+        );
+        assert!(
+            !reconstructed_metrics.shares_state_with(&source_metrics),
+            "snapshot reconstruction must start a fresh metrics generation"
+        );
         assert!(!reconstructed.activation_handler().pending_event_ack());
         assert_eq!(
             reconstructed
