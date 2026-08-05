@@ -552,7 +552,7 @@ fn forbid_delivery_and_exclusion(capability: &Capability, errors: &mut Vec<Strin
     }
 }
 
-fn validate_exclusion(
+pub(crate) fn validate_exclusion(
     id: &str,
     exclusion: &PlatformExclusion,
     repository_root: &Path,

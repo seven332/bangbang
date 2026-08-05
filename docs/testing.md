@@ -1551,6 +1551,13 @@ schema and process-audit focused local mutations with:
 cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --locked
 ```
 
+The adjacent human-owned `metrics-device-producer-audit.json` maps all 231
+device-owned fields to closed operation boundaries and the nine concrete #1789
+children. Its 216 planned and 15 provisional-platform-zero records are
+intentionally nonterminal and contain no evidence. The same focused test checks
+canonical bytes, exact membership and partition, suffix routing, provisional
+state, anchored-evidence rules, and final-mode rejection.
+
 The ordinary `compare` command rederives the source projection together with
 the general and logger manifests. To create a metrics source-only candidate:
 
@@ -1561,14 +1568,15 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- \
   --output codex-work/tmp/metrics-schema-source.candidate.json
 ```
 
-The command never emits or carries forward policy or a process-producer audit.
+The command never emits or carries forward policy or either producer audit.
 Review source identities,
 root/field order, Rust and fixture anchors, types/reset classes, dynamic
 grammar, architecture, reconciliations, and fingerprints before manually
 updating `metrics-schema.json`. Then review every affected unit, aggregation,
 producer owner/disposition, delivery issue, rationale, and evidence mapping.
-If process-profile membership changes, manually reconcile the exact audit
-membership and its boundary/child/evidence policy in the same pull request.
+If producer-profile membership changes, manually reconcile the exact process
+or device audit membership and its boundary/child/evidence policy in the same
+pull request.
 The destination must be a new non-alias of every checked JSON file. The exact
 shape and publication boundary are documented in the
 [metrics schema contract](../compat/firecracker/v1.16.0/metrics-contract.md).
@@ -1607,10 +1615,11 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 
 Metrics-process-final composes metrics-schema-final's authority and downstream
 partition with final-mode validation of the exact process audit, while retaining
-logger validation in delivery mode. It requires the two implemented process
-profiles and all 69 field records to remain terminal at exactly 64 implemented,
-one source-neutral, and four platform-zero. Ten planned and four platform-zero
-device profiles remain #1789-owned, and the two aggregates remain #1790-owned.
+logger and device-audit validation in delivery mode. It requires the two
+implemented process profiles and all 69 field records to remain terminal at
+exactly 64 implemented, one source-neutral, and four platform-zero. Ten planned
+and four platform-zero device profiles and all 231 device audit records remain
+#1789-owned and nonterminal, and the two aggregates remain #1790-owned.
 The composed test mutates both a field record and an aggregate process profile;
 the lower-level suite separately exercises every membership, ordering,
 ownership, boundary, child, rationale, disposition, evidence, path, and baseline

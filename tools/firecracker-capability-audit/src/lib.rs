@@ -5,6 +5,8 @@ mod logger_model;
 mod logger_upstream;
 mod logger_validate;
 mod metrics_certify;
+mod metrics_device_model;
+mod metrics_device_validate;
 mod metrics_model;
 mod metrics_process_certify;
 mod metrics_process_model;
@@ -29,6 +31,11 @@ pub use metrics_certify::{
     METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS, RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS,
     validate_metrics_schema_compatibility,
 };
+pub use metrics_device_model::{
+    MetricsDeviceProducerAudit, MetricsDeviceProducerBoundary, MetricsDeviceProducerDisposition,
+    MetricsDeviceProducerRecord,
+};
+pub use metrics_device_validate::validate_metrics_device_producers;
 pub use metrics_model::{
     MetricsAggregation, MetricsArchitecture, MetricsCardinality, MetricsDynamicFamily,
     MetricsFieldPolicy, MetricsJsonType, MetricsPolicyProfile, MetricsProducerDisposition,
@@ -75,6 +82,8 @@ pub const METRICS_SCHEMA_VERSION: u32 = 1;
 pub const METRICS_SCHEMA_GENERATOR_VERSION: u32 = 1;
 /// Current checked-in process-producer audit format.
 pub const METRICS_PROCESS_PRODUCER_AUDIT_SCHEMA_VERSION: u32 = 1;
+/// Current checked-in device-producer audit format.
+pub const METRICS_DEVICE_PRODUCER_AUDIT_SCHEMA_VERSION: u32 = 1;
 /// Repository-relative generated source manifest path.
 pub const SOURCE_MANIFEST_PATH: &str = "compat/firecracker/v1.16.0/source-manifest.json";
 /// Repository-relative human capability overlay path.
@@ -90,6 +99,9 @@ pub const METRICS_SCHEMA_AUTHORITY_PATH: &str = "compat/firecracker/v1.16.0/metr
 /// Repository-relative exact process-producer audit path.
 pub const METRICS_PROCESS_PRODUCER_AUDIT_PATH: &str =
     "compat/firecracker/v1.16.0/metrics-process-producer-audit.json";
+/// Repository-relative exact device-producer audit path.
+pub const METRICS_DEVICE_PRODUCER_AUDIT_PATH: &str =
+    "compat/firecracker/v1.16.0/metrics-device-producer-audit.json";
 
 /// Error produced while reading, parsing, or deriving an inventory.
 #[derive(Debug)]
@@ -172,6 +184,22 @@ pub fn read_metrics_process_producer_audit(
     })
 }
 
+/// Read and parse the checked device-producer audit.
+pub fn read_metrics_device_producer_audit(
+    path: &Path,
+) -> Result<MetricsDeviceProducerAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!(
+            "failed to read metrics device producer audit: {error}"
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!(
+            "failed to parse metrics device producer audit: {error}"
+        ))
+    })
+}
+
 /// Serialize a generated source manifest using canonical pretty JSON.
 pub fn source_manifest_json(manifest: &SourceManifest) -> Result<Vec<u8>, AuditError> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -224,6 +252,13 @@ pub fn metrics_process_producer_audit_json(
     audit: &MetricsProcessProducerAudit,
 ) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "metrics process producer audit")
+}
+
+/// Serialize the human device-producer audit using canonical pretty JSON.
+pub fn metrics_device_producer_audit_json(
+    audit: &MetricsDeviceProducerAudit,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "metrics device producer audit")
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>, AuditError> {

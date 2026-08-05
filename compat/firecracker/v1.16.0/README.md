@@ -35,6 +35,11 @@ For commands and test-layer selection, see the
   process producer profile. It records one closed producer boundary, delivery
   child, disposition, rationale, and evidence set per field without duplicating
   the schema or shared field policy.
+- [`metrics-device-producer-audit.json`](metrics-device-producer-audit.json) is
+  the human-owned delivery audit for the exact 231 fields assigned to device
+  producer profiles. It records a closed operation boundary and one of the nine
+  #1789 delivery children per field. Its 216 planned and 15 provisional
+  platform-zero records are intentionally nonterminal and carry no evidence.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
@@ -75,7 +80,7 @@ reviewed delta.
 | [Snapshot Wave 6](snapshot-wave6-contract.md) | Exact 70-row load, artifact, version, device, tool, time/identity, portability, and downstream-owner certification |
 | [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
 | [Logger producers](logger-contract.md) | Certified 11-row logger aggregate with exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
-| [Metrics schema and process producers](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, and a terminal 69-field #1788 process audit with 64 implemented, one source-neutral, and four platform-zero records |
+| [Metrics schema and producer audits](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, a terminal 69-field #1788 process audit, and an exact nonterminal 231-field #1789 device audit |
 
 ## Dispositions
 
@@ -129,7 +134,7 @@ capability records as `implemented-and-verified`. It does not ignore a logger
 class or alter another capability's disposition. Repository-global
 `validate --final` remains the stronger all-capabilities completion gate and
 must continue to fail while any unrelated `audit-required` or
-`missing-platform-feasible` record remains.
+`missing-platform-feasible` record or device producer remains nonterminal.
 
 ## Scoped Metrics Schema Certification
 
@@ -169,6 +174,11 @@ platform-zero device profiles remain #1789-owned, while both aggregate rows
 remain `audit-required` for #1790; neither downstream scope is promoted by this
 gate.
 
+All existing scoped final commands also parse and validate the exact device
+audit in delivery mode. This prevents malformed membership, child routing, or
+provisional state from being ignored without treating any device producer as
+complete. The future device-final composition remains owned by #1847.
+
 ## Contributor Update Rule
 
 Every pull request that changes a Firecracker-facing capability must update all
@@ -183,4 +193,5 @@ normal repository checks using
 Review candidate identity changes before updating a machine-owned projection.
 Never use regeneration to alter `capabilities.json`,
 `logger-producer-audit.json`, `metrics-process-producer-audit.json`, or the
-human policy projections in `metrics-schema.json`.
+human policy projections in `metrics-schema.json`. The human-owned
+`metrics-device-producer-audit.json` likewise has no regeneration command.
