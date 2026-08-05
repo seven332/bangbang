@@ -2708,6 +2708,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use bangbang_api::http::ApiRequestMetricEffect;
     use bangbang_runtime::balloon::BalloonConfigInput;
     use bangbang_runtime::block::{DriveConfig, DriveConfigInput};
     use bangbang_runtime::boot::BootSourceConfigInput;
@@ -2744,7 +2745,7 @@ mod tests {
 
     use crate::test_support::minimal_arm64_boot_resource_config;
     use crate::vmm::{
-        ApiRequestMetricParseFailure, GetApiRequest, InstanceStartError, InstanceStartExecutor,
+        GetApiRequest, InstanceStartError, InstanceStartExecutor,
         NativeV1SnapshotCaptureCancellation, NativeV1SnapshotLoadError,
         NativeV1SnapshotPublicationError, PatchApiRequest, ProcessSessionDiagnostics,
         ProcessSessionExitStatus, ProcessVmm, PutApiRequest, SnapshotV1LoadSuccess,
@@ -3083,12 +3084,8 @@ mod tests {
             self.inner.handle_put_request(request)
         }
 
-        fn record_api_request_parse_failure(&mut self, request: ApiRequestMetricParseFailure) {
-            self.inner.record_api_request_parse_failure(request);
-        }
-
-        fn record_put_actions_request(&mut self) {
-            self.inner.record_put_actions_request();
+        fn record_api_request_metric_effect(&mut self, effect: ApiRequestMetricEffect) {
+            self.inner.record_api_request_metric_effect(effect);
         }
 
         fn handle_put_action_request(
@@ -3096,10 +3093,6 @@ mod tests {
             action: VmmAction,
         ) -> Result<VmmData, VmmActionError> {
             self.inner.handle_put_action_request(action)
-        }
-
-        fn record_deprecated_api_call(&mut self) {
-            self.inner.record_deprecated_api_call();
         }
 
         #[track_caller]

@@ -2,22 +2,30 @@
 
 This contract defines the checked public metrics-line authority used by
 Bangbang for the pinned Firecracker v1.16.0 arm64 target. It separates schema
-presence from producer completion. The machine-readable authority is
-[`metrics-schema.json`](metrics-schema.json); this document explains how to
-interpret and update it.
+presence, shared producer policy, and incremental producer completion. The
+machine-readable artifacts are [`metrics-schema.json`](metrics-schema.json)
+and
+[`metrics-process-producer-audit.json`](metrics-process-producer-audit.json);
+this document explains how to interpret and update them.
 
 ## Authority Boundary
 
-`metrics-schema.json` is one strict envelope with two ownership domains:
+The checked contract has three layers:
 
-- `source` is machine-derived from the pinned Rust serializers and
+- `metrics-schema.json.source` is machine-derived from the pinned Rust serializers and
   `tests/host_tools/fcmetrics.py`. It owns inputs and Git blobs, exact roots,
   scalar paths, JSON type, reset primitive, architecture, configured-root
   grammar, source anchors, and normalized SHA-256 fingerprints.
-- `policy_profiles` and `field_policies` are reviewed Bangbang policy. Together
+- `metrics-schema.json.policy_profiles` and `field_policies` are reviewed
+  shared Bangbang policy. Together
   they attach one closed unit, aggregation rule, producer owner/disposition,
   delivery issue, rationale, and eventual implementation/validation evidence
   to every source field.
+- `metrics-process-producer-audit.json` is the human-owned incremental audit of
+  the exact fields selected by the process producer profile. It records each
+  field's closed production boundary, delivery child, current disposition,
+  rationale, and evidence without copying source shape, unit, reset, or
+  aggregation policy.
 
 The policy mapping is an exact bijection over the source fields. Policy cannot
 create or remove schema identities, and source regeneration cannot manufacture
@@ -72,6 +80,47 @@ Bangbang-only fields.
 This certification is deliberately narrower than producer or corpus closure.
 It does not complete #1788, #1789, either #1790 aggregate, tracing, durable
 delivery, remote telemetry, or a versioned extension format.
+
+## Incremental Process Producer Audit
+
+The process audit is an exact, sorted bijection over the 69 static fields whose
+schema policy owner is `process`. Missing, duplicate, extra, stale, reordered,
+or differently owned records fail closed. Its delivery partition is also
+fixed: #1827 owns 44 API request and deprecation fields, #1828 owns 12 startup,
+logger, panic, signal, and seccomp fields, #1829 owns five successful inner-VMM
+operation fields, and #1830 owns eight successful outer API-operation fields.
+Only a completed child may use the `implemented` disposition and carry
+resolvable production and validation evidence. #1827 is the sole completed
+child in this slice; the remaining 25 records stay `planned` until their owning
+pull requests land. `source-neutral` and `platform-zero` are terminal policy
+choices, not aliases for an undelivered feasible producer.
+
+For #1827, request metrics are created as a typed, value-free effect only after
+the HTTP request passes admission. The effect is applied exactly once before
+dispatch, so parser results—not later lifecycle, configuration, or backend
+action results—control request failure counters. Exact GET routes increment
+their count only. Exact PUT and PATCH routes increment once and add a failure
+only when their endpoint parser rejects the request, with these pinned
+exceptions:
+
+- arm64 `SendCtrlAltDel` increments `actions_count` without incrementing
+  `actions_fails`;
+- an empty machine-config PATCH object increments `machine_cfg_count` without
+  incrementing `machine_cfg_fails`;
+- a missing or mismatched network PATCH identifier contributes the pinned
+  count delta of two and no failure, while malformed JSON contributes one count
+  and one failure;
+- an invalid nonempty resource identifier contributes one count and no
+  failure, while a missing identifier contributes one count and one failure
+  except for the network PATCH rule above;
+- one unrecognized nonempty `/mmds/<token>` route contributes one MMDS count
+  and one failure; strict extra segments and unrelated routes have no effect.
+
+Bodies rejected during HTTP admission are never parsed for metrics. Deprecated
+API accounting is emitted only for an accepted typed deprecated value and
+contains no request value. Saturating counters, canonical JSON shape, omission
+of newer balloon request fields, redaction, and the initial successful
+`PUT /metrics` self-count remain unchanged.
 
 ## Exact Arm64 Shape
 
@@ -261,9 +310,11 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 
 `validate --metrics-schema-final` runs repository delivery validation, the
 metrics authority delivery gate, the exact twelve-row #1787 certification, and
-the logger producer delivery gate needed by metrics collection. It permits only
-the explicit #1788/#1789 producer handoffs and retained #1790 aggregate rows;
-repository-global `validate --final` remains the stronger all-capability gate.
+the logger producer delivery gate needed by metrics collection. It validates
+the exact 69-field process audit and accepts only its recorded completed-child
+set. It permits only the explicit #1788/#1789 producer handoffs and retained
+#1790 aggregate rows; repository-global `validate --final` remains the stronger
+all-capability gate.
 
 With an explicit clean sibling at the pinned commit, compare every source
 identity, Git blob, root/path/template, type/reset fact, architecture rule, and
@@ -285,6 +336,8 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- \
 
 The destination must not exist and cannot directly, lexically, or through a
 symlink alias any checked inventory file. Review exact source changes, then
-manually reconcile them with human policy. Never copy old policy onto a changed
-identity without reviewing its unit, reset, aggregation, architecture,
-cardinality, producer owner, disposition, rationale, and evidence.
+manually reconcile them with human policy and, when process-profile membership
+changes, the process audit. Regeneration never writes either human-owned layer.
+Never copy old policy onto a changed identity without reviewing its unit,
+reset, aggregation, architecture, cardinality, producer owner, disposition,
+rationale, boundary, delivery child, and evidence.

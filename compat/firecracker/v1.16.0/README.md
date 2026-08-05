@@ -30,6 +30,11 @@ For commands and test-layer selection, see the
   Its `source` projection is machine-derived from the pinned Rust serializers
   and Python fixture; its policy profiles and exact field mappings are
   human-owned and never regenerated.
+- [`metrics-process-producer-audit.json`](metrics-process-producer-audit.json)
+  is the human-owned incremental audit for the exact 69 fields assigned to the
+  process producer profile. It records one closed producer boundary, delivery
+  child, disposition, rationale, and evidence set per field without duplicating
+  the schema or shared field policy.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
@@ -70,7 +75,7 @@ reviewed delta.
 | [Snapshot Wave 6](snapshot-wave6-contract.md) | Exact 70-row load, artifact, version, device, tool, time/identity, portability, and downstream-owner certification |
 | [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
 | [Logger producers](logger-contract.md) | Certified 11-row logger aggregate with exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
-| [Metrics schema](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, and truthful #1788/#1789 producer handoffs |
+| [Metrics schema and process producers](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, and the incremental 69-field #1788 process audit with 44 #1827 request/deprecation producers implemented |
 
 ## Dispositions
 
@@ -137,8 +142,9 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 This command validates the complete capability inventory and metrics authority
 in delivery mode, requires the exact twelve #1787 capability and contract rows
 as `implemented-and-verified`, pins the one implemented schema-runtime profile
-and exact #1788/#1789 producer partition, and requires both #1790 aggregate rows
-to remain `audit-required`. Focused parser, direct-process privacy, signed
+and exact #1788/#1789 producer partition, validates the 69-field process audit
+with only completed child #1827 promoted, and requires both #1790 aggregate
+rows to remain `audit-required`. Focused parser, direct-process privacy, signed
 ordinary-production/App Sandbox privacy, and real Paused/Running 60-second
 lifecycle evidence support the terminal claim. It does not promote later
 producer, corpus, or cross-producer work; repository-global `validate --final`
@@ -157,5 +163,5 @@ normal repository checks using
 [Testing Guide](../../../docs/testing.md#firecracker-capability-inventory).
 Review candidate identity changes before updating a machine-owned projection.
 Never use regeneration to alter `capabilities.json`,
-`logger-producer-audit.json`, or the human policy projections in
-`metrics-schema.json`.
+`logger-producer-audit.json`, `metrics-process-producer-audit.json`, or the
+human policy projections in `metrics-schema.json`.

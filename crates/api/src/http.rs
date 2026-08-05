@@ -115,16 +115,28 @@ impl fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
+/// Firecracker v1.16.0 request-metric family selected by an admitted API request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiRequestMetricEndpoint {
+    Get(ApiRequestMetricGetEndpoint),
     Patch(ApiRequestMetricPatchEndpoint),
     Put(ApiRequestMetricPutEndpoint),
 }
 
+/// GET endpoint with a canonical Firecracker v1.16.0 request counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiRequestMetricGetEndpoint {
+    HotplugMemory,
+    InstanceInfo,
+    MachineConfig,
+    Mmds,
+    VmmVersion,
+}
+
+/// PUT endpoint with canonical Firecracker v1.16.0 count and failure counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiRequestMetricPutEndpoint {
     Actions,
-    Balloon,
     BootSource,
     CpuConfig,
     Drive,
@@ -139,9 +151,9 @@ pub enum ApiRequestMetricPutEndpoint {
     Vsock,
 }
 
+/// PATCH endpoint with canonical Firecracker v1.16.0 count and failure counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiRequestMetricPatchEndpoint {
-    Balloon,
     Drive,
     HotplugMemory,
     MachineConfig,
@@ -150,62 +162,63 @@ pub enum ApiRequestMetricPatchEndpoint {
     Pmem,
 }
 
-pub fn api_request_metric_endpoint(bytes: &[u8]) -> Option<ApiRequestMetricEndpoint> {
-    let (method, path, _, _) = parse_request_head(bytes).ok()?;
+/// Value-free request counter delta established by one admitted endpoint parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApiRequestMetricDelta {
+    endpoint: ApiRequestMetricEndpoint,
+    count: u8,
+    failures: u8,
+}
 
-    match method {
-        "PATCH" => patch_api_request_metric_endpoint(path).map(ApiRequestMetricEndpoint::Patch),
-        "PUT" => put_api_request_metric_endpoint(path).map(ApiRequestMetricEndpoint::Put),
-        _ => None,
+impl ApiRequestMetricDelta {
+    pub const fn endpoint(self) -> ApiRequestMetricEndpoint {
+        self.endpoint
+    }
+
+    pub const fn count(self) -> u8 {
+        self.count
+    }
+
+    pub const fn failures(self) -> u8 {
+        self.failures
     }
 }
 
-fn put_api_request_metric_endpoint(path: &str) -> Option<ApiRequestMetricPutEndpoint> {
-    if drive_path_id(path).is_some() {
-        return Some(ApiRequestMetricPutEndpoint::Drive);
-    }
-    if network_interface_path_id(path).is_some() {
-        return Some(ApiRequestMetricPutEndpoint::Network);
-    }
-    if pmem_path_id(path).is_some() {
-        return Some(ApiRequestMetricPutEndpoint::Pmem);
+/// Complete value-free metrics effect of parsing one HTTP request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApiRequestMetricEffect {
+    request: Option<ApiRequestMetricDelta>,
+    deprecated_api_calls: u8,
+}
+
+impl ApiRequestMetricEffect {
+    pub const fn request(self) -> Option<ApiRequestMetricDelta> {
+        self.request
     }
 
-    match path {
-        "/actions" => Some(ApiRequestMetricPutEndpoint::Actions),
-        "/balloon" => Some(ApiRequestMetricPutEndpoint::Balloon),
-        "/boot-source" => Some(ApiRequestMetricPutEndpoint::BootSource),
-        "/cpu-config" => Some(ApiRequestMetricPutEndpoint::CpuConfig),
-        "/hotplug/memory" => Some(ApiRequestMetricPutEndpoint::HotplugMemory),
-        "/logger" => Some(ApiRequestMetricPutEndpoint::Logger),
-        "/machine-config" => Some(ApiRequestMetricPutEndpoint::MachineConfig),
-        "/metrics" => Some(ApiRequestMetricPutEndpoint::Metrics),
-        "/mmds" | "/mmds/config" => Some(ApiRequestMetricPutEndpoint::Mmds),
-        "/serial" => Some(ApiRequestMetricPutEndpoint::Serial),
-        "/vsock" => Some(ApiRequestMetricPutEndpoint::Vsock),
-        _ => None,
+    pub const fn deprecated_api_calls(self) -> u8 {
+        self.deprecated_api_calls
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.request.is_none() && self.deprecated_api_calls == 0
     }
 }
 
-fn patch_api_request_metric_endpoint(path: &str) -> Option<ApiRequestMetricPatchEndpoint> {
-    if drive_path_id(path).is_some() {
-        return Some(ApiRequestMetricPatchEndpoint::Drive);
-    }
-    if network_interface_path_id(path).is_some() {
-        return Some(ApiRequestMetricPatchEndpoint::Network);
-    }
-    if pmem_path_id(path).is_some() {
-        return Some(ApiRequestMetricPatchEndpoint::Pmem);
+/// Existing parse result paired with the exact metrics effect for its parser boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiRequestParseOutcome {
+    request: Result<ApiRequest, RequestError>,
+    metric_effect: ApiRequestMetricEffect,
+}
+
+impl ApiRequestParseOutcome {
+    pub fn into_parts(self) -> (Result<ApiRequest, RequestError>, ApiRequestMetricEffect) {
+        (self.request, self.metric_effect)
     }
 
-    match path {
-        "/balloon" | "/balloon/statistics" | "/balloon/hinting/start" | "/balloon/hinting/stop" => {
-            Some(ApiRequestMetricPatchEndpoint::Balloon)
-        }
-        "/hotplug/memory" => Some(ApiRequestMetricPatchEndpoint::HotplugMemory),
-        "/machine-config" => Some(ApiRequestMetricPatchEndpoint::MachineConfig),
-        "/mmds" => Some(ApiRequestMetricPatchEndpoint::Mmds),
-        _ => None,
+    pub const fn metric_effect(&self) -> ApiRequestMetricEffect {
+        self.metric_effect
     }
 }
 
@@ -3141,35 +3154,74 @@ pub fn parse_request_with_limit(
     bytes: &[u8],
     max_payload_size: usize,
 ) -> Result<ApiRequest, RequestError> {
-    let (method, path, header_len, request_body) = parse_request_head(bytes)?;
-    checked_request_head_len(header_len)?;
-    let body = bytes
-        .get(header_len..)
-        .ok_or(RequestError::MalformedRequest)?;
+    parse_request_outcome_with_limit(bytes, max_payload_size)
+        .into_parts()
+        .0
+}
 
-    if request_body.has_unsupported_encoding() {
-        return Err(RequestError::MalformedRequest);
-    }
+pub fn parse_request_outcome(bytes: &[u8]) -> ApiRequestParseOutcome {
+    parse_request_outcome_with_limit(bytes, HTTP_MAX_PAYLOAD_SIZE)
+}
 
-    checked_payload_len(request_body.content_length(), max_payload_size)?;
+pub fn parse_request_outcome_with_limit(
+    bytes: &[u8],
+    max_payload_size: usize,
+) -> ApiRequestParseOutcome {
+    let admitted = (|| {
+        let (method, path, header_len, request_body) = parse_request_head(bytes)?;
+        checked_request_head_len(header_len)?;
+        let body = bytes
+            .get(header_len..)
+            .ok_or(RequestError::MalformedRequest)?;
 
-    if body.len() != request_body.content_length() {
-        return Err(RequestError::MalformedRequest);
-    }
+        if request_body.has_unsupported_encoding() {
+            return Err(RequestError::MalformedRequest);
+        }
 
-    if method == "GET" && request_body.has_content() {
-        return Err(RequestError::GetRequestBody);
-    }
-    if method == "DELETE" && request_body.has_content() {
-        return Err(RequestError::EmptyDeleteRequest);
-    }
-    if method == "PUT" && body.is_empty() {
-        return Err(RequestError::EmptyPutRequest);
-    }
-    if method == "PATCH" && body.is_empty() && !patch_request_path_accepts_empty_body(path) {
-        return Err(RequestError::EmptyPatchRequest);
-    }
+        checked_payload_len(request_body.content_length(), max_payload_size)?;
 
+        if body.len() != request_body.content_length() {
+            return Err(RequestError::MalformedRequest);
+        }
+
+        if method == "GET" && request_body.has_content() {
+            return Err(RequestError::GetRequestBody);
+        }
+        if method == "DELETE" && request_body.has_content() {
+            return Err(RequestError::EmptyDeleteRequest);
+        }
+        if method == "PUT" && body.is_empty() {
+            return Err(RequestError::EmptyPutRequest);
+        }
+        if method == "PATCH" && body.is_empty() && !patch_request_path_accepts_empty_body(path) {
+            return Err(RequestError::EmptyPatchRequest);
+        }
+
+        Ok((method, path, body))
+    })();
+
+    let (method, path, body) = match admitted {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            return ApiRequestParseOutcome {
+                request: Err(error),
+                metric_effect: ApiRequestMetricEffect::default(),
+            };
+        }
+    };
+    let request = parse_admitted_request(method, path, body);
+    let metric_effect = api_request_metric_effect(method, path, &request);
+    ApiRequestParseOutcome {
+        request,
+        metric_effect,
+    }
+}
+
+fn parse_admitted_request(
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<ApiRequest, RequestError> {
     if let Some(request) = balloon_request_without_body_parsing(method, path) {
         return Ok(request);
     }
@@ -3305,6 +3357,233 @@ pub fn parse_request_with_limit(
         ("GET", "/vm/config") => Ok(ApiRequest::GetVmConfig),
         ("GET", "/version") => Ok(ApiRequest::GetVersion),
         _ => Err(RequestError::InvalidPathMethod),
+    }
+}
+
+fn api_request_metric_effect(
+    method: &str,
+    path: &str,
+    parse_result: &Result<ApiRequest, RequestError>,
+) -> ApiRequestMetricEffect {
+    let request = match method {
+        "GET" => get_api_request_metric_delta(path),
+        "PATCH" => patch_api_request_metric_delta(path, parse_result),
+        "PUT" => put_api_request_metric_delta(path, parse_result),
+        _ => None,
+    };
+    let deprecated_api_calls = parse_result.as_ref().is_ok_and(request_uses_deprecated_api);
+
+    ApiRequestMetricEffect {
+        request,
+        deprecated_api_calls: u8::from(deprecated_api_calls),
+    }
+}
+
+fn get_api_request_metric_delta(path: &str) -> Option<ApiRequestMetricDelta> {
+    let endpoint = match path {
+        "/" => ApiRequestMetricGetEndpoint::InstanceInfo,
+        "/hotplug/memory" => ApiRequestMetricGetEndpoint::HotplugMemory,
+        "/machine-config" => ApiRequestMetricGetEndpoint::MachineConfig,
+        "/mmds" => ApiRequestMetricGetEndpoint::Mmds,
+        "/version" => ApiRequestMetricGetEndpoint::VmmVersion,
+        _ => return None,
+    };
+    metric_delta(ApiRequestMetricEndpoint::Get(endpoint), 1, 0)
+}
+
+fn put_api_request_metric_delta(
+    path: &str,
+    parse_result: &Result<ApiRequest, RequestError>,
+) -> Option<ApiRequestMetricDelta> {
+    for (root, endpoint) in [
+        ("/drives", ApiRequestMetricPutEndpoint::Drive),
+        ("/network-interfaces", ApiRequestMetricPutEndpoint::Network),
+        ("/pmem", ApiRequestMetricPutEndpoint::Pmem),
+    ] {
+        if let Some(shape) = resource_path_shape(path, root) {
+            return resource_metric_delta(
+                ApiRequestMetricEndpoint::Put(endpoint),
+                shape,
+                parse_result,
+                false,
+            );
+        }
+    }
+
+    let endpoint = match path {
+        "/actions" => ApiRequestMetricPutEndpoint::Actions,
+        "/boot-source" => ApiRequestMetricPutEndpoint::BootSource,
+        "/cpu-config" => ApiRequestMetricPutEndpoint::CpuConfig,
+        "/hotplug/memory" => ApiRequestMetricPutEndpoint::HotplugMemory,
+        "/logger" => ApiRequestMetricPutEndpoint::Logger,
+        "/machine-config" => ApiRequestMetricPutEndpoint::MachineConfig,
+        "/metrics" => ApiRequestMetricPutEndpoint::Metrics,
+        "/mmds" | "/mmds/config" => ApiRequestMetricPutEndpoint::Mmds,
+        "/serial" => ApiRequestMetricPutEndpoint::Serial,
+        "/vsock" => ApiRequestMetricPutEndpoint::Vsock,
+        _ if is_unrecognized_mmds_path(path) => {
+            return metric_delta(
+                ApiRequestMetricEndpoint::Put(ApiRequestMetricPutEndpoint::Mmds),
+                1,
+                1,
+            );
+        }
+        _ => return None,
+    };
+    let failures = if endpoint == ApiRequestMetricPutEndpoint::Actions
+        && matches!(parse_result, Err(RequestError::SendCtrlAltDelUnsupported))
+    {
+        0
+    } else {
+        u8::from(parse_result.is_err())
+    };
+    metric_delta(ApiRequestMetricEndpoint::Put(endpoint), 1, failures)
+}
+
+fn patch_api_request_metric_delta(
+    path: &str,
+    parse_result: &Result<ApiRequest, RequestError>,
+) -> Option<ApiRequestMetricDelta> {
+    for (root, endpoint, network_patch) in [
+        ("/drives", ApiRequestMetricPatchEndpoint::Drive, false),
+        (
+            "/network-interfaces",
+            ApiRequestMetricPatchEndpoint::Network,
+            true,
+        ),
+        ("/pmem", ApiRequestMetricPatchEndpoint::Pmem, false),
+    ] {
+        if let Some(shape) = resource_path_shape(path, root) {
+            return resource_metric_delta(
+                ApiRequestMetricEndpoint::Patch(endpoint),
+                shape,
+                parse_result,
+                network_patch,
+            );
+        }
+    }
+
+    let endpoint = match path {
+        "/hotplug/memory" => ApiRequestMetricPatchEndpoint::HotplugMemory,
+        "/machine-config" => ApiRequestMetricPatchEndpoint::MachineConfig,
+        "/mmds" => ApiRequestMetricPatchEndpoint::Mmds,
+        _ => return None,
+    };
+    let failures = if endpoint == ApiRequestMetricPatchEndpoint::MachineConfig
+        && matches!(parse_result, Err(RequestError::EmptyPatchRequest))
+    {
+        0
+    } else {
+        u8::from(parse_result.is_err())
+    };
+    metric_delta(ApiRequestMetricEndpoint::Patch(endpoint), 1, failures)
+}
+
+fn metric_delta(
+    endpoint: ApiRequestMetricEndpoint,
+    count: u8,
+    failures: u8,
+) -> Option<ApiRequestMetricDelta> {
+    debug_assert!((1..=2).contains(&count));
+    debug_assert!(failures <= 1);
+    Some(ApiRequestMetricDelta {
+        endpoint,
+        count,
+        failures,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourcePathShape {
+    Missing,
+    Valid,
+    Invalid,
+    Extra,
+}
+
+fn resource_path_shape(path: &str, root: &str) -> Option<ResourcePathShape> {
+    let rest = path.strip_prefix(root)?;
+    if rest.is_empty() || rest == "/" {
+        return Some(ResourcePathShape::Missing);
+    }
+    let rest = rest.strip_prefix('/')?;
+    if rest.contains('/') || rest.contains('?') || rest.contains('#') {
+        return Some(ResourcePathShape::Extra);
+    }
+    if single_segment_id(rest).is_some() {
+        Some(ResourcePathShape::Valid)
+    } else {
+        Some(ResourcePathShape::Invalid)
+    }
+}
+
+fn resource_metric_delta(
+    endpoint: ApiRequestMetricEndpoint,
+    shape: ResourcePathShape,
+    parse_result: &Result<ApiRequest, RequestError>,
+    network_patch: bool,
+) -> Option<ApiRequestMetricDelta> {
+    match shape {
+        ResourcePathShape::Missing if network_patch => metric_delta(endpoint, 2, 0),
+        ResourcePathShape::Missing => metric_delta(endpoint, 1, 1),
+        ResourcePathShape::Invalid => metric_delta(endpoint, 1, 0),
+        ResourcePathShape::Extra => None,
+        ResourcePathShape::Valid
+            if network_patch
+                && matches!(parse_result, Err(RequestError::MismatchedInterfaceId)) =>
+        {
+            metric_delta(endpoint, 2, 0)
+        }
+        ResourcePathShape::Valid => metric_delta(endpoint, 1, u8::from(parse_result.is_err())),
+    }
+}
+
+fn is_unrecognized_mmds_path(path: &str) -> bool {
+    path.strip_prefix("/mmds/")
+        .is_some_and(|token| !token.is_empty() && !token.contains('/') && token != "config")
+}
+
+fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
+    match request {
+        ApiRequest::PutMachineConfig(config) => config.cpu_template().is_some(),
+        ApiRequest::PatchMachineConfig(config) => config.cpu_template().is_some(),
+        ApiRequest::PutMmdsConfig(config) => config.version() == MmdsVersion::V1,
+        ApiRequest::PutSnapshotLoad(config) => config.deprecated_fields_used(),
+        ApiRequest::PutVsock(config) => config.vsock_id().is_some(),
+        ApiRequest::GetInstanceInfo
+        | ApiRequest::GetBalloon
+        | ApiRequest::GetBalloonStats
+        | ApiRequest::GetBalloonHintingStatus
+        | ApiRequest::GetMemoryHotplug
+        | ApiRequest::GetMachineConfig
+        | ApiRequest::GetMmds
+        | ApiRequest::GetVmConfig
+        | ApiRequest::GetVersion
+        | ApiRequest::PutAction(_)
+        | ApiRequest::PutBalloon(_)
+        | ApiRequest::PutBootSource(_)
+        | ApiRequest::PutCpuConfig(_)
+        | ApiRequest::PutDrive(_)
+        | ApiRequest::PutEntropy(_)
+        | ApiRequest::PutMemoryHotplug(_)
+        | ApiRequest::PatchBalloon(_)
+        | ApiRequest::PatchBalloonStats(_)
+        | ApiRequest::PatchBalloonHintingStart(_)
+        | ApiRequest::PatchBalloonHintingStop
+        | ApiRequest::PatchMemoryHotplug(_)
+        | ApiRequest::PatchDrive(_)
+        | ApiRequest::PatchVmState(_)
+        | ApiRequest::PutLogger(_)
+        | ApiRequest::PutMetrics(_)
+        | ApiRequest::PutMmds(_)
+        | ApiRequest::PutNetworkInterface(_)
+        | ApiRequest::PatchNetworkInterface(_)
+        | ApiRequest::HotUnplugDevice(_)
+        | ApiRequest::PutPmem(_)
+        | ApiRequest::PatchPmem(_)
+        | ApiRequest::PutSerial(_)
+        | ApiRequest::PutSnapshotCreate(_)
+        | ApiRequest::PatchMmds(_) => false,
     }
 }
 
@@ -4357,6 +4636,23 @@ mod tests {
         format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").into_bytes()
     }
 
+    fn assert_request_metric_delta(
+        request: &[u8],
+        endpoint: ApiRequestMetricEndpoint,
+        count: u8,
+        failures: u8,
+    ) {
+        let outcome = parse_request_outcome(request);
+        let delta = outcome
+            .metric_effect()
+            .request()
+            .expect("request must return a metric delta");
+
+        assert_eq!(delta.endpoint(), endpoint);
+        assert_eq!(delta.count(), count);
+        assert_eq!(delta.failures(), failures);
+    }
+
     fn rate_limited_drive_body(bucket: &str, field: &str, value: &str) -> String {
         let size = if field == "size" { value } else { "1" };
         let one_time_burst = if field == "one_time_burst" {
@@ -4424,10 +4720,9 @@ mod tests {
     }
 
     #[test]
-    fn identifies_put_api_request_metric_endpoints_from_request_head() {
+    fn admitted_put_parsers_return_closed_metric_endpoints() {
         for (path, endpoint) in [
             ("/actions", ApiRequestMetricPutEndpoint::Actions),
-            ("/balloon", ApiRequestMetricPutEndpoint::Balloon),
             ("/boot-source", ApiRequestMetricPutEndpoint::BootSource),
             ("/cpu-config", ApiRequestMetricPutEndpoint::CpuConfig),
             ("/drives/rootfs", ApiRequestMetricPutEndpoint::Drive),
@@ -4451,30 +4746,24 @@ mod tests {
             ("/serial", ApiRequestMetricPutEndpoint::Serial),
             ("/vsock", ApiRequestMetricPutEndpoint::Vsock),
         ] {
+            let outcome = parse_request_outcome(&request_with_body("PUT", path, "{"));
+            let delta = outcome
+                .metric_effect()
+                .request()
+                .expect("known PUT parser must return a request delta");
             assert_eq!(
-                api_request_metric_endpoint(&request_with_body("PUT", path, "{")),
-                Some(ApiRequestMetricEndpoint::Put(endpoint)),
+                delta.endpoint(),
+                ApiRequestMetricEndpoint::Put(endpoint),
                 "PUT {path}"
             );
+            assert_eq!(delta.count(), 1, "PUT {path}");
+            assert_eq!(delta.failures(), 1, "PUT {path}");
         }
     }
 
     #[test]
-    fn identifies_patch_api_request_metric_endpoints_from_request_head() {
+    fn admitted_patch_parsers_return_closed_metric_endpoints() {
         for (path, endpoint) in [
-            ("/balloon", ApiRequestMetricPatchEndpoint::Balloon),
-            (
-                "/balloon/statistics",
-                ApiRequestMetricPatchEndpoint::Balloon,
-            ),
-            (
-                "/balloon/hinting/start",
-                ApiRequestMetricPatchEndpoint::Balloon,
-            ),
-            (
-                "/balloon/hinting/stop",
-                ApiRequestMetricPatchEndpoint::Balloon,
-            ),
             ("/drives/rootfs", ApiRequestMetricPatchEndpoint::Drive),
             (
                 "/hotplug/memory",
@@ -4491,31 +4780,166 @@ mod tests {
             ),
             ("/pmem/pmem0", ApiRequestMetricPatchEndpoint::Pmem),
         ] {
+            let outcome = parse_request_outcome(&request_with_body("PATCH", path, "{"));
+            let delta = outcome
+                .metric_effect()
+                .request()
+                .expect("known PATCH parser must return a request delta");
             assert_eq!(
-                api_request_metric_endpoint(&request_with_body("PATCH", path, "{")),
-                Some(ApiRequestMetricEndpoint::Patch(endpoint)),
+                delta.endpoint(),
+                ApiRequestMetricEndpoint::Patch(endpoint),
                 "PATCH {path}"
+            );
+            assert_eq!(delta.count(), 1, "PATCH {path}");
+            assert_eq!(delta.failures(), 1, "PATCH {path}");
+        }
+    }
+
+    #[test]
+    fn exact_get_routes_return_their_firecracker_metric_deltas() {
+        for (path, endpoint) in [
+            ("/", ApiRequestMetricGetEndpoint::InstanceInfo),
+            (
+                "/hotplug/memory",
+                ApiRequestMetricGetEndpoint::HotplugMemory,
+            ),
+            (
+                "/machine-config",
+                ApiRequestMetricGetEndpoint::MachineConfig,
+            ),
+            ("/mmds", ApiRequestMetricGetEndpoint::Mmds),
+            ("/version", ApiRequestMetricGetEndpoint::VmmVersion),
+        ] {
+            assert_request_metric_delta(
+                &request_without_body("GET", path),
+                ApiRequestMetricEndpoint::Get(endpoint),
+                1,
+                0,
             );
         }
     }
 
     #[test]
-    fn ignores_requests_without_matching_api_request_metric_endpoint() {
+    fn parser_metric_special_cases_match_firecracker_v1_16() {
+        for (request, endpoint, count, failures) in [
+            (
+                request_with_body("PUT", "/actions", r#"{"action_type":"SendCtrlAltDel"}"#),
+                ApiRequestMetricEndpoint::Put(ApiRequestMetricPutEndpoint::Actions),
+                1,
+                0,
+            ),
+            (
+                request_with_body("PATCH", "/machine-config", "{}"),
+                ApiRequestMetricEndpoint::Patch(ApiRequestMetricPatchEndpoint::MachineConfig),
+                1,
+                0,
+            ),
+            (
+                request_with_body("PUT", "/mmds/unrecognized", "{}"),
+                ApiRequestMetricEndpoint::Put(ApiRequestMetricPutEndpoint::Mmds),
+                1,
+                1,
+            ),
+            (
+                request_with_body("PUT", "/drives", "{}"),
+                ApiRequestMetricEndpoint::Put(ApiRequestMetricPutEndpoint::Drive),
+                1,
+                1,
+            ),
+            (
+                request_with_body("PATCH", "/pmem", "{}"),
+                ApiRequestMetricEndpoint::Patch(ApiRequestMetricPatchEndpoint::Pmem),
+                1,
+                1,
+            ),
+            (
+                request_with_body("PATCH", "/network-interfaces", "{}"),
+                ApiRequestMetricEndpoint::Patch(ApiRequestMetricPatchEndpoint::Network),
+                2,
+                0,
+            ),
+            (
+                request_with_body("PUT", "/drives/bad-id", "{}"),
+                ApiRequestMetricEndpoint::Put(ApiRequestMetricPutEndpoint::Drive),
+                1,
+                0,
+            ),
+            (
+                request_with_body("PATCH", "/pmem/bad-id", "{}"),
+                ApiRequestMetricEndpoint::Patch(ApiRequestMetricPatchEndpoint::Pmem),
+                1,
+                0,
+            ),
+            (
+                request_with_body(
+                    "PATCH",
+                    "/network-interfaces/eth0",
+                    r#"{"iface_id":"eth1"}"#,
+                ),
+                ApiRequestMetricEndpoint::Patch(ApiRequestMetricPatchEndpoint::Network),
+                2,
+                0,
+            ),
+        ] {
+            assert_request_metric_delta(&request, endpoint, count, failures);
+        }
+    }
+
+    #[test]
+    fn parser_effect_tracks_each_deprecated_request_category_without_values() {
         for request in [
-            request_with_body("GET", "/metrics", "{}"),
-            request_with_body("GET", "/balloon", "{}"),
+            request_with_body(
+                "PUT",
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":"None"}"#,
+            ),
+            request_with_body("PATCH", "/machine-config", r#"{"cpu_template":"T2A"}"#),
+            request_with_body("PUT", "/mmds/config", r#"{"network_interfaces":[]}"#),
+            request_with_body(
+                "PUT",
+                "/vsock",
+                r#"{"vsock_id":"deprecated","guest_cid":3,"uds_path":"./v.sock"}"#,
+            ),
+            request_with_body(
+                "PUT",
+                "/snapshot/load",
+                r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+            ),
+        ] {
+            let effect = parse_request_outcome(&request).metric_effect();
+            assert_eq!(effect.deprecated_api_calls(), 1);
+        }
+    }
+
+    #[test]
+    fn parser_effect_omits_noncanonical_and_strict_extra_routes() {
+        for request in [
+            request_without_body("GET", "/vm/config"),
+            request_without_body("GET", "/balloon"),
             request_with_body("DELETE", "/drives/rootfs", "{}"),
             request_with_body("PUT", "/entropy", "{}"),
+            request_with_body("PUT", "/balloon", "{}"),
             request_with_body("PATCH", "/vm", "{}"),
-            request_with_body("PUT", "/balloon/extra", "{}"),
+            request_with_body("PATCH", "/balloon", "{}"),
             request_with_body("PATCH", "/balloon/hinting/status", "{}"),
             request_with_body("PATCH", "/balloon/hinting/start/extra", "{}"),
             request_with_body("PUT", "/metrics/extra", "{}"),
             request_with_body("PUT", "/drives/rootfs/extra", "{}"),
             request_with_body("PUT", "/drives/rootfs?debug=true", "{}"),
+        ] {
+            assert!(parse_request_outcome(&request).metric_effect().is_empty());
+        }
+    }
+
+    #[test]
+    fn pre_admission_errors_have_no_metric_effect() {
+        for request in [
+            request_without_body("PUT", "/metrics"),
+            request_without_body("PATCH", "/machine-config"),
+            request_with_body("GET", "/", "{}"),
             b"PUT /metrics HTTP/1.1\r\nHost: localhost\r\n".to_vec(),
         ] {
-            assert_eq!(api_request_metric_endpoint(&request), None);
+            assert!(parse_request_outcome(&request).metric_effect().is_empty());
         }
     }
 

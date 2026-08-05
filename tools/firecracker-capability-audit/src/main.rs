@@ -6,12 +6,14 @@ use std::process::{Command, ExitCode};
 
 use bangbang_firecracker_capability_audit::{
     AuditError, AuditMode, CAPABILITY_INVENTORY_PATH, LOGGER_PRODUCER_AUDIT_PATH,
-    LOGGER_PRODUCER_MANIFEST_PATH, METRICS_SCHEMA_AUTHORITY_PATH, SOURCE_MANIFEST_PATH,
-    derive_logger_producer_manifest, derive_metrics_schema_source, derive_source_manifest,
-    logger_producer_manifest_json, metrics_schema_source_candidate_json, read_capability_inventory,
-    read_logger_producer_audit, read_logger_producer_manifest, read_metrics_schema_authority,
-    read_source_manifest, source_manifest_json, validate, validate_logger_compatibility,
-    validate_logger_producers, validate_metrics_schema, validate_metrics_schema_compatibility,
+    LOGGER_PRODUCER_MANIFEST_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
+    METRICS_SCHEMA_AUTHORITY_PATH, SOURCE_MANIFEST_PATH, derive_logger_producer_manifest,
+    derive_metrics_schema_source, derive_source_manifest, logger_producer_manifest_json,
+    metrics_schema_source_candidate_json, read_capability_inventory, read_logger_producer_audit,
+    read_logger_producer_manifest, read_metrics_process_producer_audit,
+    read_metrics_schema_authority, read_source_manifest, source_manifest_json, validate,
+    validate_logger_compatibility, validate_logger_producers, validate_metrics_process_producers,
+    validate_metrics_schema, validate_metrics_schema_compatibility,
 };
 
 fn main() -> ExitCode {
@@ -75,6 +77,8 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     let logger_audit = read_logger_producer_audit(&root.join(LOGGER_PRODUCER_AUDIT_PATH))?;
     let metrics_authority =
         read_metrics_schema_authority(&root.join(METRICS_SCHEMA_AUTHORITY_PATH))?;
+    let metrics_process_audit =
+        read_metrics_process_producer_audit(&root.join(METRICS_PROCESS_PRODUCER_AUDIT_PATH))?;
     let audit_mode = match mode {
         ValidateMode::Delivery => AuditMode::Delivery,
         ValidateMode::Final => AuditMode::Final,
@@ -93,8 +97,19 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
                 .map_err(|errors| {
                     AuditError::new(format!("metrics schema validation errors:\n{errors}"))
                 })?;
+            validate_metrics_process_producers(
+                &metrics_process_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics process producer validation errors:\n{errors}"
+                ))
+            })?;
             return Ok(
-                "Firecracker capability inventory, logger producer audit, and metrics schema authority are valid for the terminal logger compatibility scope"
+                "Firecracker capability inventory, logger producer audit, metrics schema authority, and process producer audit are valid for the terminal logger compatibility scope"
                     .to_string(),
             );
         }
@@ -109,8 +124,19 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
                 .map_err(|errors| {
                     AuditError::new(format!("logger producer validation errors:\n{errors}"))
                 })?;
+            validate_metrics_process_producers(
+                &metrics_process_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics process producer validation errors:\n{errors}"
+                ))
+            })?;
             return Ok(
-                "Firecracker capability inventory, logger producer audit, and metrics schema authority are valid for the terminal metrics API/schema compatibility scope"
+                "Firecracker capability inventory, logger producer audit, metrics schema authority, and process producer audit are valid for the terminal metrics API/schema compatibility scope"
                     .to_string(),
             );
         }
@@ -127,6 +153,16 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     if let Err(errors) = validate_metrics_schema(&metrics_authority, &manifest, &root, audit_mode) {
         failures.push(format!("metrics schema validation errors:\n{errors}"));
     }
+    if let Err(errors) = validate_metrics_process_producers(
+        &metrics_process_audit,
+        &metrics_authority,
+        &root,
+        audit_mode,
+    ) {
+        failures.push(format!(
+            "metrics process producer validation errors:\n{errors}"
+        ));
+    }
     if !failures.is_empty() {
         return Err(AuditError::new(failures.join("\n")));
     }
@@ -135,7 +171,7 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
         AuditMode::Final => "final",
     };
     Ok(format!(
-        "Firecracker capability inventory, logger producer audit, and metrics schema authority are valid in {mode_name} mode"
+        "Firecracker capability inventory, logger producer audit, metrics schema authority, and process producer audit are valid in {mode_name} mode"
     ))
 }
 
@@ -301,6 +337,7 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
     let logger_manifest_path = root.join(LOGGER_PRODUCER_MANIFEST_PATH);
     let logger_audit_path = root.join(LOGGER_PRODUCER_AUDIT_PATH);
     let metrics_schema_path = root.join(METRICS_SCHEMA_AUTHORITY_PATH);
+    let metrics_process_audit_path = root.join(METRICS_PROCESS_PRODUCER_AUDIT_PATH);
     let normalized_output = normalize_lexically(&output_path);
     let checked_paths = [
         &source_path,
@@ -308,6 +345,7 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
         &logger_manifest_path,
         &logger_audit_path,
         &metrics_schema_path,
+        &metrics_process_audit_path,
     ];
     if checked_paths
         .iter()
@@ -512,6 +550,7 @@ mod tests {
             LOGGER_PRODUCER_MANIFEST_PATH,
             LOGGER_PRODUCER_AUDIT_PATH,
             METRICS_SCHEMA_AUTHORITY_PATH,
+            METRICS_PROCESS_PRODUCER_AUDIT_PATH,
         ] {
             let error = candidate_output_path(root, Path::new(path))
                 .expect_err("checked inventory path should be refused");
@@ -528,6 +567,7 @@ mod tests {
             "compat/firecracker/v1.16.0/./logger-producer-manifest.json",
             "compat/firecracker/v1.16.0/../v1.16.0/logger-producer-audit.json",
             "compat/firecracker/v1.16.0/./metrics-schema.json",
+            "compat/firecracker/v1.16.0/./metrics-process-producer-audit.json",
         ] {
             let error = candidate_output_path(root, Path::new(path))
                 .expect_err("checked inventory alias should be refused");

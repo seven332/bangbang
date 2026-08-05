@@ -1,0 +1,1819 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "records": [
+    {
+      "field_id": "static:api_server.process_startup_time_cpu_us",
+      "boundary": "process-startup",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the exact process startup clock boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:api_server.process_startup_time_us",
+      "boundary": "process-startup",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the exact process startup clock boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:deprecated_api.deprecated_http_api_calls",
+      "boundary": "accepted-deprecated-api-value",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this counter only after typed parsing accepts a deprecated API value; Bangbang records the redacted parse effect once.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:get_api_requests.hotplug_memory_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:get_api_requests.instance_info_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:get_api_requests.machine_cfg_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:get_api_requests.mmds_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:get_api_requests.vmm_version_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:latencies_us.diff_create_snapshot",
+      "boundary": "successful-outer-api-operation",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the successful outer API operation latency boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:latencies_us.full_create_snapshot",
+      "boundary": "successful-outer-api-operation",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the successful outer API operation latency boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:latencies_us.load_snapshot",
+      "boundary": "successful-outer-api-operation",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the successful outer API operation latency boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:latencies_us.pause_vm",
+      "boundary": "successful-outer-api-operation",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the successful outer API operation latency boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:latencies_us.resume_vm",
+      "boundary": "successful-outer-api-operation",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the successful outer API operation latency boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:latencies_us.vmm_diff_create_snapshot",
+      "boundary": "successful-inner-vmm-operation",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the successful inner VMM operation latency boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:latencies_us.vmm_full_create_snapshot",
+      "boundary": "successful-inner-vmm-operation",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the successful inner VMM operation latency boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:latencies_us.vmm_load_snapshot",
+      "boundary": "successful-inner-vmm-operation",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the successful inner VMM operation latency boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:latencies_us.vmm_pause_vm",
+      "boundary": "successful-inner-vmm-operation",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the successful inner VMM operation latency boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:latencies_us.vmm_resume_vm",
+      "boundary": "successful-inner-vmm-operation",
+      "disposition": "planned",
+      "delivery_issue": "#1828",
+      "rationale": "Delivery child #1828 owns the successful inner VMM operation latency boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:logger.metrics_fails",
+      "boundary": "logger-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1829",
+      "rationale": "Delivery child #1829 owns generation-consistent logger lifecycle capture and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:logger.missed_log_count",
+      "boundary": "logger-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1829",
+      "rationale": "Delivery child #1829 owns generation-consistent logger lifecycle capture and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:logger.missed_metrics_count",
+      "boundary": "logger-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1829",
+      "rationale": "Delivery child #1829 owns generation-consistent logger lifecycle capture and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:logger.rate_limited_log_count",
+      "boundary": "logger-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1829",
+      "rationale": "Delivery child #1829 owns generation-consistent logger lifecycle capture and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:patch_api_requests.drive_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:patch_api_requests.drive_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:patch_api_requests.hotplug_memory_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:patch_api_requests.hotplug_memory_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:patch_api_requests.machine_cfg_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:patch_api_requests.machine_cfg_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:patch_api_requests.mmds_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:patch_api_requests.mmds_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:patch_api_requests.network_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this count at parser entry and again for a missing or mismatched interface ID; Bangbang applies the bounded typed effect once.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:patch_api_requests.network_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only for typed PATCH body conversion or validation, not for missing or mismatched interface IDs or later action errors.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:patch_api_requests.pmem_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:patch_api_requests.pmem_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.actions_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.actions_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.boot_source_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.boot_source_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.cpu_cfg_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.cpu_cfg_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.drive_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.drive_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.hotplug_memory_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.hotplug_memory_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.logger_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.logger_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.machine_cfg_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.machine_cfg_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.metrics_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.metrics_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.mmds_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.mmds_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.network_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.network_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.pmem_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.pmem_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.serial_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.serial_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.vsock_count",
+      "boundary": "request-parser-entry",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this request count at endpoint parser entry; Bangbang applies the value-free typed parser effect once before dispatch.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:put_api_requests.vsock_fails",
+      "boundary": "request-parser-failure",
+      "disposition": "implemented",
+      "delivery_issue": "#1827",
+      "rationale": "Pinned Firecracker increments this failure only on endpoint conversion or validation failure; later VMM action errors do not change it.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "typed admitted parser metric effect"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "single saturating API metric effect application"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Firecracker v1.16.0 metric effect tables"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "parser versus action metric compatibility tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
+    },
+    {
+      "field_id": "static:seccomp.num_faults",
+      "boundary": "seccomp-fault",
+      "disposition": "planned",
+      "delivery_issue": "#1830",
+      "rationale": "Delivery child #1830 owns the platform seccomp-fault disposition and evidence and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:signals.sigbus",
+      "boundary": "signal-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1830",
+      "rationale": "Delivery child #1830 owns fatal process-signal classification and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:signals.sighup",
+      "boundary": "signal-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1830",
+      "rationale": "Delivery child #1830 owns fatal process-signal classification and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:signals.sigill",
+      "boundary": "signal-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1830",
+      "rationale": "Delivery child #1830 owns fatal process-signal classification and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:signals.sigpipe",
+      "boundary": "signal-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1829",
+      "rationale": "Delivery child #1829 owns the generation-consistent SIGPIPE capture boundary and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:signals.sigsegv",
+      "boundary": "signal-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1830",
+      "rationale": "Delivery child #1830 owns fatal process-signal classification and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:signals.sigxcpu",
+      "boundary": "signal-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1830",
+      "rationale": "Delivery child #1830 owns fatal process-signal classification and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:signals.sigxfsz",
+      "boundary": "signal-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1830",
+      "rationale": "Delivery child #1830 owns fatal process-signal classification and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "field_id": "static:vmm.panic_count",
+      "boundary": "panic-lifecycle",
+      "disposition": "planned",
+      "delivery_issue": "#1830",
+      "rationale": "Delivery child #1830 owns panic capture and fatal convergence and remains unresolved in this audit slice.",
+      "implementation": [],
+      "validation": []
+    }
+  ]
+}

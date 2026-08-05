@@ -3,10 +3,13 @@
 use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
-    AuditMode, METRICS_SCHEMA_AUTHORITY_PATH, MetricsAggregation, MetricsArchitecture,
-    MetricsProducerDisposition, MetricsProducerOwner, MetricsSchemaAuthority, MetricsUnit,
-    MetricsValueKind, Reference, SOURCE_MANIFEST_PATH, metrics_schema_authority_json,
-    read_metrics_schema_authority, read_source_manifest, validate_metrics_schema,
+    AuditMode, METRICS_PROCESS_PRODUCER_AUDIT_PATH, METRICS_SCHEMA_AUTHORITY_PATH,
+    MetricsAggregation, MetricsArchitecture, MetricsProcessProducerAudit,
+    MetricsProcessProducerBoundary, MetricsProcessProducerDisposition, MetricsProducerDisposition,
+    MetricsProducerOwner, MetricsSchemaAuthority, MetricsUnit, MetricsValueKind, Reference,
+    SOURCE_MANIFEST_PATH, metrics_process_producer_audit_json, metrics_schema_authority_json,
+    read_metrics_process_producer_audit, read_metrics_schema_authority, read_source_manifest,
+    validate_metrics_process_producers, validate_metrics_schema,
 };
 
 fn repository_root() -> PathBuf {
@@ -22,12 +25,25 @@ fn checked_authority() -> MetricsSchemaAuthority {
         .expect("checked metrics authority must parse")
 }
 
+fn checked_process_audit() -> MetricsProcessProducerAudit {
+    let root = repository_root();
+    read_metrics_process_producer_audit(&root.join(METRICS_PROCESS_PRODUCER_AUDIT_PATH))
+        .expect("checked metrics process producer audit must parse")
+}
+
 fn validation_error(authority: &MetricsSchemaAuthority) -> String {
     let root = repository_root();
     let manifest = read_source_manifest(&root.join(SOURCE_MANIFEST_PATH))
         .expect("checked source manifest must parse");
     validate_metrics_schema(authority, &manifest, &root, AuditMode::Delivery)
         .expect_err("mutated metrics authority must fail")
+        .to_string()
+}
+
+fn process_validation_error(audit: &MetricsProcessProducerAudit) -> String {
+    let root = repository_root();
+    validate_metrics_process_producers(audit, &checked_authority(), &root, AuditMode::Delivery)
+        .expect_err("mutated metrics process producer audit must fail")
         .to_string()
 }
 
@@ -50,6 +66,173 @@ fn checked_metrics_authority_is_canonical_and_valid_without_a_sibling() {
     assert_eq!(authority.source.dynamic_families[0].field_ids.len(), 24);
     assert_eq!(authority.source.dynamic_families[1].field_ids.len(), 29);
     assert_eq!(authority.source.dynamic_families[2].field_ids.len(), 5);
+}
+
+#[test]
+fn checked_process_producer_audit_is_canonical_and_exact() {
+    let root = repository_root();
+    let path = root.join(METRICS_PROCESS_PRODUCER_AUDIT_PATH);
+    let authority = checked_authority();
+    let audit = checked_process_audit();
+    validate_metrics_process_producers(&audit, &authority, &root, AuditMode::Delivery)
+        .expect("checked process producer audit must validate locally");
+    assert_eq!(
+        std::fs::read(path).expect("checked process producer audit must be readable"),
+        metrics_process_producer_audit_json(&audit)
+            .expect("process producer audit must serialize canonically")
+    );
+    assert_eq!(audit.records.len(), 69);
+    for (issue, count) in [("#1827", 44), ("#1828", 12), ("#1829", 5), ("#1830", 8)] {
+        assert_eq!(
+            audit
+                .records
+                .iter()
+                .filter(|record| record.delivery_issue == issue)
+                .count(),
+            count,
+            "{issue}"
+        );
+    }
+    assert_eq!(
+        audit
+            .records
+            .iter()
+            .filter(|record| {
+                record.disposition == MetricsProcessProducerDisposition::Implemented
+            })
+            .count(),
+        44
+    );
+    assert_eq!(
+        audit
+            .records
+            .iter()
+            .filter(|record| record.disposition == MetricsProcessProducerDisposition::Planned)
+            .count(),
+        25
+    );
+
+    let error = validate_metrics_process_producers(&audit, &authority, &root, AuditMode::Final)
+        .expect_err("planned downstream process producers must fail global final mode")
+        .to_string();
+    assert!(error.contains("rejects planned record"));
+}
+
+#[test]
+fn process_producer_audit_rejects_membership_and_order_drift() {
+    let mut missing = checked_process_audit();
+    let removed = missing.records.remove(0);
+    let error = process_validation_error(&missing);
+    assert!(error.contains("must contain 69 records"));
+    assert!(error.contains(&format!(
+        "missing metrics process producer record: {}",
+        removed.field_id
+    )));
+
+    let mut duplicate = checked_process_audit();
+    duplicate.records.push(duplicate.records[0].clone());
+    let error = process_validation_error(&duplicate);
+    assert!(error.contains("sorted and unique"));
+    assert!(error.contains("duplicate metrics process producer record"));
+
+    let mut stale = checked_process_audit();
+    stale.records[0].field_id = "static:not.process_owned".to_string();
+    let error = process_validation_error(&stale);
+    assert!(error.contains("stale or unowned"));
+    assert!(error.contains("missing metrics process producer record"));
+
+    let mut order = checked_process_audit();
+    order.records.swap(0, 1);
+    assert!(process_validation_error(&order).contains("sorted and unique"));
+}
+
+#[test]
+fn process_producer_audit_rejects_boundary_child_and_completion_drift() {
+    let mut boundary = checked_process_audit();
+    boundary.records[0].boundary = MetricsProcessProducerBoundary::PanicLifecycle;
+    assert!(process_validation_error(&boundary).contains("wrong boundary"));
+
+    let mut child = checked_process_audit();
+    child.records[0].delivery_issue = "#1830".to_string();
+    assert!(process_validation_error(&child).contains("wrong delivery issue"));
+
+    let mut completed = checked_process_audit();
+    let api = completed
+        .records
+        .iter_mut()
+        .find(|record| record.delivery_issue == "#1827")
+        .expect("API record must exist");
+    api.disposition = MetricsProcessProducerDisposition::Planned;
+    api.implementation.clear();
+    api.validation.clear();
+    let error = process_validation_error(&completed);
+    assert!(error.contains("completed metrics process producer slice must be terminal"));
+    assert!(error.contains("API metrics producer must be implemented"));
+
+    let mut premature = checked_process_audit();
+    let downstream = premature
+        .records
+        .iter_mut()
+        .find(|record| record.delivery_issue == "#1828")
+        .expect("downstream record must exist");
+    downstream.disposition = MetricsProcessProducerDisposition::Implemented;
+    downstream.implementation.push(Reference::Local {
+        path: "crates/api/src/http.rs".to_string(),
+        anchor: Some("test".to_string()),
+    });
+    downstream.validation.push(Reference::Local {
+        path: "crates/api/src/http.rs".to_string(),
+        anchor: Some("test".to_string()),
+    });
+    assert!(process_validation_error(&premature).contains("must remain planned"));
+}
+
+#[test]
+fn process_producer_audit_rejects_neutral_aliases_and_bad_evidence() {
+    let mut neutral = checked_process_audit();
+    let api = neutral
+        .records
+        .iter_mut()
+        .find(|record| record.delivery_issue == "#1827")
+        .expect("API record must exist");
+    api.disposition = MetricsProcessProducerDisposition::SourceNeutral;
+    assert!(
+        process_validation_error(&neutral).contains("must be implemented, not neutral or zero")
+    );
+
+    let mut missing = checked_process_audit();
+    missing
+        .records
+        .iter_mut()
+        .find(|record| record.disposition == MetricsProcessProducerDisposition::Implemented)
+        .expect("implemented record must exist")
+        .implementation
+        .clear();
+    assert!(
+        process_validation_error(&missing).contains("needs implementation and validation evidence")
+    );
+
+    let mut unsafe_reference = checked_process_audit();
+    let implemented = unsafe_reference
+        .records
+        .iter_mut()
+        .find(|record| record.disposition == MetricsProcessProducerDisposition::Implemented)
+        .expect("implemented record must exist");
+    implemented.implementation[0] = Reference::Local {
+        path: "../escape".to_string(),
+        anchor: None,
+    };
+    assert!(process_validation_error(&unsafe_reference).contains("path escapes repository"));
+
+    let mut rationale = checked_process_audit();
+    rationale.records[0].rationale.clear();
+    assert!(process_validation_error(&rationale).contains("stale rationale"));
+
+    let mut baseline = checked_process_audit();
+    baseline.baseline.commit = "0".repeat(40);
+    let error = process_validation_error(&baseline);
+    assert!(error.contains("baselines differ"));
+    assert!(error.contains("not the pinned release"));
 }
 
 #[test]

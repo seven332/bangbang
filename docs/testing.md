@@ -1538,7 +1538,11 @@ ownership, and observable execution remain x86_64-only.
 The checked metrics authority uses one envelope with a machine-owned `source`
 projection and human-owned policy profiles/mappings. It records exactly 24
 arm64 static roots and 243 static scalar paths, plus configured block/network/
-vhost-user field populations of 24/29/5. Run its focused local mutations with:
+vhost-user field populations of 24/29/5. The separate human-owned
+`metrics-process-producer-audit.json` is an exact incremental mapping of the 69
+fields assigned to the process profile; it records 44 implemented #1827
+request/deprecation fields and 25 planned fields owned by #1828–#1830. Run the
+schema and process-audit focused local mutations with:
 
 ```sh
 cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --locked
@@ -1554,11 +1558,14 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- \
   --output codex-work/tmp/metrics-schema-source.candidate.json
 ```
 
-The command never emits or carries forward policy. Review source identities,
+The command never emits or carries forward policy or a process-producer audit.
+Review source identities,
 root/field order, Rust and fixture anchors, types/reset classes, dynamic
 grammar, architecture, reconciliations, and fingerprints before manually
 updating `metrics-schema.json`. Then review every affected unit, aggregation,
 producer owner/disposition, delivery issue, rationale, and evidence mapping.
+If process-profile membership changes, manually reconcile the exact audit
+membership and its boundary/child/evidence policy in the same pull request.
 The destination must be a new non-alias of every checked JSON file. The exact
 shape and publication boundary are documented in the
 [metrics schema contract](../compat/firecracker/v1.16.0/metrics-contract.md).
@@ -1578,9 +1585,11 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 Metrics-schema-final mode requires the exact twelve #1787 rows to be terminal,
 the schema-runtime timestamp profile to be implemented, both #1790 aggregates
 to remain nonterminal, and the remaining policy profiles to retain their exact
-#1788/#1789 owner/disposition partition. Focused tests inject missing, extra,
-promoted, stale, and wrongly handed-off records; API tests cover duplicate keys
-and the full unsigned token-bucket boundary; direct and contained process tests
+#1788/#1789 owner/disposition partition. It also validates the exact 69-field
+process audit and its completed-child set. Focused tests inject missing, extra,
+promoted, stale, wrongly handed-off, invalid-evidence, and boundary-drift
+records; API tests cover duplicate keys, the full unsigned token-bucket
+boundary, and the exact parser-metric table; direct and contained process tests
 cover `/vm/config` privacy. The signed product oracle
 `normal_bundle_certifies_metrics_schema_across_real_periodic_and_terminal_lifecycle`
 uses the unmodified 60-second scheduler and observes initial,
