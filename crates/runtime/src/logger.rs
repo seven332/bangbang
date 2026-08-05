@@ -281,13 +281,13 @@ pub(crate) struct SharedLoggerMetrics {
 impl SharedLoggerMetrics {
     fn record_saturating_by(counter: &AtomicU64, amount: usize) {
         let amount = u64::try_from(amount).unwrap_or(u64::MAX);
-        let mut current = counter.load(Ordering::Relaxed);
+        let mut current = counter.load(Ordering::SeqCst);
         while current != u64::MAX {
             match counter.compare_exchange_weak(
                 current,
                 current.saturating_add(amount),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             ) {
                 Ok(_) => return,
                 Err(actual) => current = actual,
@@ -311,11 +311,21 @@ impl SharedLoggerMetrics {
     }
 
     pub(crate) fn missed_log_count(&self) -> u64 {
-        self.inner.missed_log_count.load(Ordering::Relaxed)
+        self.inner.missed_log_count.load(Ordering::SeqCst)
     }
 
     pub(crate) fn rate_limited_log_count(&self) -> u64 {
-        self.inner.rate_limited_log_count.load(Ordering::Relaxed)
+        self.inner.rate_limited_log_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_counts_for_test(&self, missed_log_count: u64, rate_limited_log_count: u64) {
+        self.inner
+            .missed_log_count
+            .store(missed_log_count, Ordering::SeqCst);
+        self.inner
+            .rate_limited_log_count
+            .store(rate_limited_log_count, Ordering::SeqCst);
     }
 }
 

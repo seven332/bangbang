@@ -2546,6 +2546,19 @@ failure increments `missed_metrics_count`; ambiguous accepted prefixes replay
 at least once. Tests also require closed Display/Debug errors to omit paths,
 configured IDs, fragments, and values.
 
+Process-cut tests place missed-log, rate-limited-log, and SIGPIPE events between
+two `SeqCst` scans without sleeps, force all 64 busy retries, then require a
+later stable generation to contain every event plus one missed attempt. They
+also inject events after a frozen cut, combine that race with accepted-prefix,
+write, newline, flush, and serialization failures, exercise exact sums under
+multi-threaded contention and `u64::MAX` saturation, and prove checked
+generation exhaustion cannot alias a cut. Every failure-stage retry keeps
+`logger.metrics_fails` source-neutral zero. Process/VMM and signed executable
+coverage obtain the SIGPIPE facade from the same controller as metrics,
+and publish one live signal in the first following generation while the handler
+remains atomic-only. Deterministic Process/VMM coverage additionally publishes
+a zero SIGPIPE interval in the next successful generation.
+
 Process-lifecycle tests cover configuration-origin-independent initial output,
 preboot scheduler dormancy, a session-epoch deadline, Running and Paused
 periodic output, due work that is not starved by ready API clients, periodic

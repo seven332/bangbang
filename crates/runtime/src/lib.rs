@@ -625,7 +625,7 @@ impl VmmController {
         mmds_data_store_limit_bytes: usize,
     ) -> Self {
         let instance_id = instance_id.into();
-        let shared_logger_metrics = logger::SharedLoggerMetrics::default();
+        let shared_process_metrics = metrics::SharedProcessMetrics::default();
         Self {
             instance_info: InstanceInfo::new(
                 instance_id.clone(),
@@ -645,8 +645,12 @@ impl VmmController {
             balloon_config: None,
             pmem_configs: pmem::PmemConfigs::new(),
             serial_config: serial::SerialConfig::default(),
-            logger_state: logger::LoggerState::with_shared_metrics(shared_logger_metrics.clone()),
-            metrics_state: metrics::MetricsState::with_shared_logger_metrics(shared_logger_metrics),
+            logger_state: logger::LoggerState::with_shared_metrics(
+                shared_process_metrics.logger_metrics(),
+            ),
+            metrics_state: metrics::MetricsState::with_shared_process_metrics(
+                shared_process_metrics,
+            ),
             mmds_state: mmds::MmdsStateHandle::new(mmds::MmdsState::with_instance_id(
                 mmds_data_store_limit_bytes,
                 instance_id,
@@ -657,6 +661,11 @@ impl VmmController {
 
     pub fn instance_info(&self) -> &InstanceInfo {
         &self.instance_info
+    }
+
+    /// Returns the atomic-only SIGPIPE metrics facade owned by this controller.
+    pub fn process_signal_metrics(&self) -> metrics::SharedSignalMetrics {
+        self.metrics_state.signal_metrics()
     }
 
     pub fn drive_configs(&self) -> &[block::DriveConfig] {
