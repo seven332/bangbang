@@ -1541,7 +1541,8 @@ arm64 static roots and 243 static scalar paths, plus configured block/network/
 vhost-user field populations of 24/29/5. The separate human-owned
 `metrics-process-producer-audit.json` is an exact incremental mapping of the 69
 fields assigned to the process profile; it records 44 implemented #1827
-request/deprecation fields and 25 planned fields owned by #1828–#1830. Run the
+request/deprecation fields, 12 implemented #1828 startup/latency fields, and 13
+planned fields owned by #1829–#1830. Run the
 schema and process-audit focused local mutations with:
 
 ```sh

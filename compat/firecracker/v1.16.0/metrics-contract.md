@@ -91,10 +91,10 @@ and ten successful outer/inner operation-latency fields, #1829 owns four logger
 fields plus SIGPIPE, and #1830 owns six fatal-signal fields plus panic and
 seccomp.
 Only a completed child may use the `implemented` disposition and carry
-resolvable production and validation evidence. #1827 is the sole completed
-child in this slice; the remaining 25 records stay `planned` until their owning
-pull requests land. `source-neutral` and `platform-zero` are terminal policy
-choices, not aliases for an undelivered feasible producer.
+resolvable production and validation evidence. #1827 and #1828 are complete,
+so 56 records are `implemented`; the remaining 13 records stay `planned` until
+their #1829 or #1830 pull requests land. `source-neutral` and `platform-zero`
+are terminal policy choices, not aliases for an undelivered feasible producer.
 
 For #1827, request metrics are created as a typed, value-free effect only after
 the HTTP request passes admission. The effect is applied exactly once before
@@ -122,6 +122,19 @@ API accounting is emitted only for an accepted typed deprecated value and
 contains no request value. Saturating counters, canonical JSON shape, omission
 of newer balloon request fields, redaction, and the initial successful
 `PUT /metrics` self-count remain unchanged.
+
+For #1828, the two startup stores retain one process-local monotonic/CPU clock
+sample, saturating elapsed arithmetic, and optional parent CPU accounting. The
+five outer API latency stores start after the bounded socket read at typed
+request handling entry and commit only after the VMM action, successful control
+log attempt, and response construction succeed. The matching five `vmm_*`
+stores cover only their functional pause, resume, Full create, Diff create, or
+load action and commit before lifecycle/snapshot outcome logging. Failures do
+not replace the previous successful store. Snapshot load's optional automatic
+resume is part of `vmm_load_snapshot` and does not write `vmm_resume_vm`;
+explicit `PATCH /vm` resume does. Both layers use the same injectable
+process-local monotonic clock, but no ordering relationship between the two
+reported durations is promised.
 
 ## Exact Arm64 Shape
 

@@ -2724,7 +2724,7 @@ mod tests {
     use bangbang_runtime::memory_hotplug::MemoryHotplugConfigInput;
     use bangbang_runtime::metrics::{
         MetricsConfigError, MetricsConfigInput, MetricsDiagnostics, MetricsFlushError,
-        SharedSignalMetrics,
+        ProcessLatencyBoundary, ProcessLatencyOperation, SharedSignalMetrics,
     };
     use bangbang_runtime::mmds::MmdsDataStoreError;
     use bangbang_runtime::network::NetworkInterfaceConfigInput;
@@ -2747,9 +2747,9 @@ mod tests {
     use crate::vmm::{
         GetApiRequest, InstanceStartError, InstanceStartExecutor,
         NativeV1SnapshotCaptureCancellation, NativeV1SnapshotLoadError,
-        NativeV1SnapshotPublicationError, PatchApiRequest, ProcessSessionDiagnostics,
-        ProcessSessionExitStatus, ProcessVmm, PutApiRequest, SnapshotV1LoadSuccess,
-        VmmRequestHandler,
+        NativeV1SnapshotPublicationError, PatchApiRequest, ProcessLatencyTimestamp,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, PutApiRequest,
+        SnapshotV1LoadSuccess, VmmRequestHandler,
     };
 
     use super::{
@@ -3115,26 +3115,18 @@ mod tests {
             self.inner.log_process_startup(outcome)
         }
 
-        fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
-            self.inner.record_pause_vm_latency_us(duration_us);
+        fn process_latency_timestamp(&mut self) -> ProcessLatencyTimestamp {
+            self.inner.process_latency_timestamp()
         }
 
-        fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
-            self.inner.record_resume_vm_latency_us(duration_us);
-        }
-
-        fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64) {
+        fn record_process_latency_us(
+            &mut self,
+            operation: ProcessLatencyOperation,
+            boundary: ProcessLatencyBoundary,
+            duration_us: u64,
+        ) {
             self.inner
-                .record_full_create_snapshot_latency_us(duration_us);
-        }
-
-        fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64) {
-            self.inner
-                .record_diff_create_snapshot_latency_us(duration_us);
-        }
-
-        fn record_load_snapshot_latency_us(&mut self, duration_us: u64) {
-            self.inner.record_load_snapshot_latency_us(duration_us);
+                .record_process_latency_us(operation, boundary, duration_us);
         }
 
         fn metrics_session_epoch(&self) -> Option<Instant> {

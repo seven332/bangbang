@@ -66,7 +66,9 @@ use bangbang_runtime::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
     MemoryHotplugStatus,
 };
-use bangbang_runtime::metrics::MetricsConfigInput;
+use bangbang_runtime::metrics::{
+    MetricsConfigInput, ProcessLatencyBoundary, ProcessLatencyOperation,
+};
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsVersion as RuntimeMmdsVersion,
 };
@@ -99,8 +101,8 @@ use crate::periodic_metrics::{
     PeriodicBalloonStatisticsScheduler, PeriodicMetricsScheduler, min_poll_timeout_ms,
 };
 use crate::vmm::{
-    GetApiRequest, PatchApiRequest, ProcessSessionExitDecision, ProcessSessionExitStatus,
-    PutApiRequest, VmmRequestHandler,
+    GetApiRequest, PatchApiRequest, ProcessLatencyTimestamp, ProcessSessionExitDecision,
+    ProcessSessionExitStatus, PutApiRequest, VmmRequestHandler,
 };
 
 const READ_CHUNK_SIZE: usize = 4096;
@@ -668,6 +670,7 @@ fn handle_request_bytes_with_limit(
     vmm: &mut impl VmmRequestHandler,
     http_api_max_payload_size: usize,
 ) -> HttpResponse {
+    let request_started = vmm.process_latency_timestamp();
     let (request, metric_effect) =
         parse_request_outcome_with_limit(bytes, http_api_max_payload_size).into_parts();
     let deprecated_api_call = metric_effect.deprecated_api_calls() != 0;
@@ -679,7 +682,7 @@ fn handle_request_bytes_with_limit(
             if deprecated_api_call {
                 let _ = vmm.log_api_control(LoggerApiControlOutcome::RequestDeprecated);
             }
-            let response = handle_api_request(request, vmm);
+            let response = handle_api_request(request, request_started, vmm);
             let _ = vmm.log_api_result(api_result_outcome(response.status()));
             vmm.handle_initial_metrics_flush();
             response
@@ -829,7 +832,11 @@ fn log_api_request(request: &ApiRequest, vmm: &mut impl VmmRequestHandler) -> bo
     }
 }
 
-fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> HttpResponse {
+fn handle_api_request(
+    request: ApiRequest,
+    request_started: ProcessLatencyTimestamp,
+    vmm: &mut impl VmmRequestHandler,
+) -> HttpResponse {
     match request {
         ApiRequest::GetInstanceInfo => {
             handle_instance_info(vmm.handle_get_request(GetApiRequest::InstanceInfo))
@@ -882,12 +889,12 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         )),
         ApiRequest::PatchVmState(update) => {
             let state = update.state();
-            let started = Instant::now();
-            let result = vmm.handle_action(vm_state_action_from_request(update.as_ref()));
-            if result.is_ok() {
-                record_vm_state_latency(state, duration_as_micros_u64(started.elapsed()), vmm);
-            }
-            handle_empty(result)
+            handle_timed_process_action(
+                vm_state_latency_operation(state),
+                request_started,
+                vm_state_action_from_request(update.as_ref()),
+                vmm,
+            )
         }
         ApiRequest::PutNetworkInterface(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::network(network_interface_config_input_from_request(config.as_ref())),
@@ -943,8 +950,12 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PatchPmem(config) => handle_empty(vmm.handle_patch_request(
             PatchApiRequest::pmem(pmem_update_input_from_request(config.as_ref())),
         )),
-        ApiRequest::PutSnapshotCreate(config) => handle_snapshot_create_request(config, vmm),
-        ApiRequest::PutSnapshotLoad(config) => handle_snapshot_load_request(config, vmm),
+        ApiRequest::PutSnapshotCreate(config) => {
+            handle_snapshot_create_request(config, request_started, vmm)
+        }
+        ApiRequest::PutSnapshotLoad(config) => {
+            handle_snapshot_load_request(config, request_started, vmm)
+        }
         ApiRequest::PutVsock(config) => handle_empty(vmm.handle_put_request(PutApiRequest::vsock(
             vsock_config_input_from_request(config.as_ref()),
         ))),
@@ -965,16 +976,11 @@ fn vm_state_action_from_request(update: &VmStateUpdateRequest) -> VmmAction {
     }
 }
 
-fn record_vm_state_latency(
-    state: VmStateUpdate,
-    duration_us: u64,
-    vmm: &mut impl VmmRequestHandler,
-) {
+const fn vm_state_latency_operation(state: VmStateUpdate) -> ProcessLatencyOperation {
     match state {
-        VmStateUpdate::Paused => vmm.record_pause_vm_latency_us(duration_us),
-        VmStateUpdate::Resumed => vmm.record_resume_vm_latency_us(duration_us),
+        VmStateUpdate::Paused => ProcessLatencyOperation::PauseVm,
+        VmStateUpdate::Resumed => ProcessLatencyOperation::ResumeVm,
     }
-    let _ = vmm.log_api_control(LoggerApiControlOutcome::RequestCompleted);
 }
 
 fn snapshot_type_from_request(snapshot_type: ApiSnapshotType) -> RuntimeSnapshotType {
@@ -1035,62 +1041,53 @@ fn snapshot_load_input_from_request(request: &SnapshotLoadRequest) -> SnapshotLo
 
 fn handle_snapshot_create_request(
     request: SnapshotCreateRequest,
+    request_started: ProcessLatencyTimestamp,
     vmm: &mut impl VmmRequestHandler,
 ) -> HttpResponse {
-    let snapshot_type = request.snapshot_type();
-    let started = Instant::now();
-    let result = vmm.handle_action(VmmAction::CreateSnapshot(
-        snapshot_create_input_from_request(&request),
-    ));
-    if matches!(
-        &result,
-        Ok(_) | Err(VmmActionError::SnapshotUnsupported | VmmActionError::SnapshotCreate(_))
-    ) {
-        record_snapshot_create_latency(
-            snapshot_type,
-            duration_as_micros_u64(started.elapsed()),
-            vmm,
-        );
-    }
-    if result.is_ok() {
-        let _ = vmm.log_api_control(LoggerApiControlOutcome::RequestCompleted);
-    }
-    handle_empty(result)
+    let operation = match request.snapshot_type() {
+        ApiSnapshotType::Full => ProcessLatencyOperation::FullCreateSnapshot,
+        ApiSnapshotType::Diff => ProcessLatencyOperation::DiffCreateSnapshot,
+    };
+    handle_timed_process_action(
+        operation,
+        request_started,
+        VmmAction::CreateSnapshot(snapshot_create_input_from_request(&request)),
+        vmm,
+    )
 }
 
 fn handle_snapshot_load_request(
     request: SnapshotLoadRequest,
+    request_started: ProcessLatencyTimestamp,
     vmm: &mut impl VmmRequestHandler,
 ) -> HttpResponse {
-    let started = Instant::now();
-    let result = vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input_from_request(
-        &request,
-    )));
-    if matches!(
-        &result,
-        Ok(_) | Err(VmmActionError::SnapshotUnsupported | VmmActionError::SnapshotLoad(_))
-    ) {
-        vmm.record_load_snapshot_latency_us(duration_as_micros_u64(started.elapsed()));
-    }
-    if result.is_ok() {
+    handle_timed_process_action(
+        ProcessLatencyOperation::LoadSnapshot,
+        request_started,
+        VmmAction::LoadSnapshot(snapshot_load_input_from_request(&request)),
+        vmm,
+    )
+}
+
+fn handle_timed_process_action(
+    operation: ProcessLatencyOperation,
+    request_started: ProcessLatencyTimestamp,
+    action: VmmAction,
+    vmm: &mut impl VmmRequestHandler,
+) -> HttpResponse {
+    let result = vmm.handle_action(action);
+    let succeeded = matches!(&result, Ok(VmmData::Empty));
+    if succeeded {
         let _ = vmm.log_api_control(LoggerApiControlOutcome::RequestCompleted);
     }
-    handle_empty(result)
-}
-
-fn record_snapshot_create_latency(
-    snapshot_type: ApiSnapshotType,
-    duration_us: u64,
-    vmm: &mut impl VmmRequestHandler,
-) {
-    match snapshot_type {
-        ApiSnapshotType::Full => vmm.record_full_create_snapshot_latency_us(duration_us),
-        ApiSnapshotType::Diff => vmm.record_diff_create_snapshot_latency_us(duration_us),
+    let response = handle_empty(result);
+    if succeeded {
+        let duration_us = vmm
+            .process_latency_timestamp()
+            .elapsed_us_since(request_started);
+        vmm.record_process_latency_us(operation, ProcessLatencyBoundary::OuterApi, duration_us);
     }
-}
-
-fn duration_as_micros_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+    response
 }
 
 fn hot_unplug_action_from_request(request: &HotUnplugDeviceRequest) -> VmmAction {
@@ -2212,6 +2209,7 @@ fn read_request_until_with_limit(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::env;
     use std::io::{Read, Write};
     use std::os::unix::io::{AsRawFd, RawFd};
@@ -4264,6 +4262,259 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LatencyProbeEvent {
+        Timestamp,
+        Action(&'static str),
+        Control(LoggerApiControlOutcome),
+        Record(ProcessLatencyOperation, ProcessLatencyBoundary, u64),
+    }
+
+    #[derive(Debug)]
+    struct LatencyProbeVmm {
+        timestamps: VecDeque<ProcessLatencyTimestamp>,
+        results: VecDeque<Result<VmmData, VmmActionError>>,
+        events: Vec<LatencyProbeEvent>,
+    }
+
+    impl LatencyProbeVmm {
+        fn new(
+            timestamps_us: impl IntoIterator<Item = u64>,
+            results: impl IntoIterator<Item = Result<VmmData, VmmActionError>>,
+        ) -> Self {
+            Self {
+                timestamps: timestamps_us
+                    .into_iter()
+                    .map(Duration::from_micros)
+                    .map(ProcessLatencyTimestamp::from_duration)
+                    .collect(),
+                results: results.into_iter().collect(),
+                events: Vec::new(),
+            }
+        }
+
+        fn unsupported() -> Result<VmmData, VmmActionError> {
+            Err(VmmActionError::UnsupportedAction("latency probe"))
+        }
+    }
+
+    impl VmmRequestHandler for LatencyProbeVmm {
+        fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
+            self.events.push(LatencyProbeEvent::Action(action.name()));
+            self.results
+                .pop_front()
+                .expect("scripted VMM result should be available")
+        }
+
+        fn handle_get_request(
+            &mut self,
+            _request: GetApiRequest,
+        ) -> Result<VmmData, VmmActionError> {
+            Self::unsupported()
+        }
+
+        fn handle_patch_request(
+            &mut self,
+            _request: PatchApiRequest,
+        ) -> Result<VmmData, VmmActionError> {
+            Self::unsupported()
+        }
+
+        fn handle_put_request(
+            &mut self,
+            _request: PutApiRequest,
+        ) -> Result<VmmData, VmmActionError> {
+            Self::unsupported()
+        }
+
+        fn record_api_request_metric_effect(&mut self, _effect: ApiRequestMetricEffect) {}
+
+        fn handle_put_action_request(
+            &mut self,
+            _action: VmmAction,
+        ) -> Result<VmmData, VmmActionError> {
+            Self::unsupported()
+        }
+
+        fn log_api_request(&mut self, _method: LoggerHttpMethod, _route: LoggerApiRoute) -> bool {
+            true
+        }
+
+        fn log_api_control(&mut self, outcome: LoggerApiControlOutcome) -> bool {
+            self.events.push(LatencyProbeEvent::Control(outcome));
+            true
+        }
+
+        fn log_api_result(&mut self, _outcome: LoggerApiResultOutcome) -> bool {
+            true
+        }
+
+        fn log_process_startup(&mut self, _outcome: ProcessStartupOutcome) -> bool {
+            true
+        }
+
+        fn process_latency_timestamp(&mut self) -> ProcessLatencyTimestamp {
+            self.events.push(LatencyProbeEvent::Timestamp);
+            self.timestamps
+                .pop_front()
+                .expect("scripted process latency timestamp should be available")
+        }
+
+        fn record_process_latency_us(
+            &mut self,
+            operation: ProcessLatencyOperation,
+            boundary: ProcessLatencyBoundary,
+            duration_us: u64,
+        ) {
+            self.events
+                .push(LatencyProbeEvent::Record(operation, boundary, duration_us));
+        }
+    }
+
+    #[test]
+    fn controlled_outer_process_latencies_cover_all_operations_and_ignore_failures() {
+        let mut vmm = LatencyProbeVmm::new(
+            [
+                10, 110, 200, 260, 300, 360, 400, 470, 500, 580, 900, 1_000, 1_100,
+            ],
+            [
+                Ok(VmmData::Empty),
+                Ok(VmmData::Empty),
+                Ok(VmmData::Empty),
+                Ok(VmmData::Empty),
+                Ok(VmmData::Empty),
+                Err(VmmActionError::SnapshotUnsupported),
+                Ok(VmmData::VmmVersion("unexpected".to_owned())),
+            ],
+        );
+        let requests = [
+            request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#),
+            request_with_body("PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            request_with_body(
+                "PUT",
+                "/snapshot/create",
+                r#"{"snapshot_path":"private-full-state","mem_file_path":"private-full-memory"}"#,
+            ),
+            request_with_body(
+                "PUT",
+                "/snapshot/create",
+                r#"{"snapshot_type":"Diff","snapshot_path":"private-diff-state","mem_file_path":"private-diff-memory"}"#,
+            ),
+            request_with_body(
+                "PUT",
+                "/snapshot/load",
+                r#"{"snapshot_path":"private-load-state","mem_backend":{"backend_path":"private-load-memory","backend_type":"File"}}"#,
+            ),
+        ];
+        for request in requests {
+            assert_eq!(
+                handle_request_bytes(request.as_bytes(), &mut vmm).status(),
+                StatusCode::NoContent
+            );
+        }
+
+        let recorded = vmm
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                LatencyProbeEvent::Record(operation, boundary, duration_us) => {
+                    Some((*operation, *boundary, *duration_us))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recorded,
+            [
+                (
+                    ProcessLatencyOperation::PauseVm,
+                    ProcessLatencyBoundary::OuterApi,
+                    100,
+                ),
+                (
+                    ProcessLatencyOperation::ResumeVm,
+                    ProcessLatencyBoundary::OuterApi,
+                    60,
+                ),
+                (
+                    ProcessLatencyOperation::FullCreateSnapshot,
+                    ProcessLatencyBoundary::OuterApi,
+                    60,
+                ),
+                (
+                    ProcessLatencyOperation::DiffCreateSnapshot,
+                    ProcessLatencyBoundary::OuterApi,
+                    70,
+                ),
+                (
+                    ProcessLatencyOperation::LoadSnapshot,
+                    ProcessLatencyBoundary::OuterApi,
+                    80,
+                ),
+            ]
+        );
+
+        let failed = request_with_body(
+            "PUT",
+            "/snapshot/create",
+            r#"{"snapshot_path":"private-failed-state","mem_file_path":"private-failed-memory"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(failed.as_bytes(), &mut vmm).status(),
+            StatusCode::BadRequest
+        );
+        let unexpected = request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#);
+        assert_eq!(
+            handle_request_bytes(unexpected.as_bytes(), &mut vmm).status(),
+            StatusCode::BadRequest
+        );
+        let malformed = request_with_body("PATCH", "/vm", r#"{"state":"Running"}"#);
+        assert_eq!(
+            handle_request_bytes(malformed.as_bytes(), &mut vmm).status(),
+            StatusCode::BadRequest
+        );
+        assert_eq!(
+            vmm.events
+                .iter()
+                .filter(|event| matches!(event, LatencyProbeEvent::Record(..)))
+                .count(),
+            5,
+            "action, response, and parser failures must retain the five successful stores"
+        );
+        assert!(vmm.timestamps.is_empty());
+        assert!(vmm.results.is_empty());
+
+        let event_text = format!("{:?}", vmm.events);
+        for private_value in [
+            "private-full-state",
+            "private-full-memory",
+            "private-diff-state",
+            "private-diff-memory",
+            "private-load-state",
+            "private-load-memory",
+            "private-failed-state",
+            "private-failed-memory",
+        ] {
+            assert!(!event_text.contains(private_value));
+        }
+        for record_index in [4_usize, 9, 14, 19, 24] {
+            assert!(matches!(
+                vmm.events.get(record_index.wrapping_sub(2)),
+                Some(LatencyProbeEvent::Control(
+                    LoggerApiControlOutcome::RequestCompleted
+                ))
+            ));
+            assert!(matches!(
+                vmm.events.get(record_index.wrapping_sub(1)),
+                Some(LatencyProbeEvent::Timestamp)
+            ));
+            assert!(matches!(
+                vmm.events.get(record_index),
+                Some(LatencyProbeEvent::Record(..))
+            ));
+        }
+    }
+
     fn put_action_over_socket(
         vmm: &mut impl VmmRequestHandler,
         socket_name: &str,
@@ -4360,26 +4611,18 @@ mod tests {
             self.inner.log_process_startup(outcome)
         }
 
-        fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
-            self.inner.record_pause_vm_latency_us(duration_us);
+        fn process_latency_timestamp(&mut self) -> ProcessLatencyTimestamp {
+            self.inner.process_latency_timestamp()
         }
 
-        fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
-            self.inner.record_resume_vm_latency_us(duration_us);
-        }
-
-        fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64) {
+        fn record_process_latency_us(
+            &mut self,
+            operation: ProcessLatencyOperation,
+            boundary: ProcessLatencyBoundary,
+            duration_us: u64,
+        ) {
             self.inner
-                .record_full_create_snapshot_latency_us(duration_us);
-        }
-
-        fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64) {
-            self.inner
-                .record_diff_create_snapshot_latency_us(duration_us);
-        }
-
-        fn record_load_snapshot_latency_us(&mut self, duration_us: u64) {
-            self.inner.record_load_snapshot_latency_us(duration_us);
+                .record_process_latency_us(operation, boundary, duration_us);
         }
 
         fn metrics_session_epoch(&self) -> Option<Instant> {
@@ -9066,6 +9309,7 @@ mod tests {
         assert!(flush.starts_with("HTTP/1.1 204 No Content\r\n"));
         let metrics = read_metrics_json(&metrics_path);
         assert_latency_metric_present(&metrics, "full_create_snapshot");
+        assert_latency_metric_present(&metrics, "vmm_full_create_snapshot");
         let raw_metrics =
             fs::read_to_string(&metrics_path).expect("metrics should remain readable");
         assert!(!raw_metrics.contains(state_path.to_string_lossy().as_ref()));
@@ -9080,6 +9324,7 @@ mod tests {
         assert!(fault_flush.starts_with("HTTP/1.1 204 No Content\r\n"));
         let fault_metrics = read_metrics_json(&metrics_path);
         assert_latency_metric_present(&fault_metrics, "full_create_snapshot");
+        assert_latency_metric_present(&fault_metrics, "vmm_full_create_snapshot");
         assert_eq!(
             fs::read(&state_path).expect("state should remain readable"),
             state_before
@@ -9203,6 +9448,7 @@ mod tests {
             .collect::<Vec<serde_json::Value>>();
         assert_eq!(metrics_lines.len(), 2);
         assert_latency_metric_present(&metrics_lines[0], "load_snapshot");
+        assert_latency_metric_present(&metrics_lines[0], "vmm_load_snapshot");
         assert!(!raw_metrics.contains(resumed_state.to_string_lossy().as_ref()));
         assert!(!raw_metrics.contains(resumed_memory.to_string_lossy().as_ref()));
 
@@ -10449,6 +10695,20 @@ mod tests {
                 .is_some(),
             "resume_vm latency should be present"
         );
+        assert!(
+            latencies
+                .get("vmm_pause_vm")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "vmm_pause_vm latency should be present"
+        );
+        assert!(
+            latencies
+                .get("vmm_resume_vm")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "vmm_resume_vm latency should be present"
+        );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
@@ -10497,6 +10757,7 @@ mod tests {
         );
         let resumed_metrics = read_metrics_json(&metrics_path);
         assert_latency_metric_present(&resumed_metrics, "resume_vm");
+        assert_latency_metric_present(&resumed_metrics, "vmm_resume_vm");
         let resumed_latency = resumed_metrics
             .get("latencies_us")
             .and_then(|latencies| latencies.get("resume_vm"))
@@ -10525,6 +10786,7 @@ mod tests {
         );
         let paused_metrics = read_metrics_json(&metrics_path);
         assert_latency_metric_present(&paused_metrics, "pause_vm");
+        assert_latency_metric_present(&paused_metrics, "vmm_pause_vm");
         assert_eq!(
             paused_metrics
                 .get("latencies_us")
@@ -10584,12 +10846,14 @@ mod tests {
         let metrics = read_metrics_json(&metrics_path);
         assert_eq!(metrics["latencies_us"]["pause_vm"], 0);
         assert_eq!(metrics["latencies_us"]["resume_vm"], 0);
+        assert_eq!(metrics["latencies_us"]["vmm_pause_vm"], 0);
+        assert_eq!(metrics["latencies_us"]["vmm_resume_vm"], 0);
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
     #[test]
-    fn configured_metrics_records_snapshot_create_latencies_on_snapshot_fault() {
+    fn configured_metrics_do_not_record_snapshot_create_latencies_on_snapshot_fault() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let metrics_path = unique_socket_path("scl").with_extension("metrics");
         let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
@@ -10656,8 +10920,10 @@ mod tests {
             "{flush_response}"
         );
         let metrics = read_metrics_json(&metrics_path);
-        assert_latency_metric_present(&metrics, "full_create_snapshot");
-        assert_latency_metric_present(&metrics, "diff_create_snapshot");
+        assert_eq!(metrics["latencies_us"]["full_create_snapshot"], 0);
+        assert_eq!(metrics["latencies_us"]["diff_create_snapshot"], 0);
+        assert_eq!(metrics["latencies_us"]["vmm_full_create_snapshot"], 0);
+        assert_eq!(metrics["latencies_us"]["vmm_diff_create_snapshot"], 0);
         assert!(
             metrics
                 .get("latencies_us")
@@ -10685,7 +10951,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn configured_metrics_records_snapshot_load_latency_on_execution_fault() {
+    fn configured_metrics_do_not_record_snapshot_load_latency_on_execution_fault() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let (state_path, memory_path) = native_v2_snapshot_fixture("metrics-load-fault");
         let state_text = state_path.to_string_lossy().into_owned();
@@ -10742,7 +11008,8 @@ mod tests {
             "{flush_response}"
         );
         let metrics = read_metrics_json(&metrics_path);
-        assert_latency_metric_present(&metrics, "load_snapshot");
+        assert_eq!(metrics["latencies_us"]["load_snapshot"], 0);
+        assert_eq!(metrics["latencies_us"]["vmm_load_snapshot"], 0);
         assert!(
             metrics
                 .get("latencies_us")

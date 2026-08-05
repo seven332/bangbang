@@ -149,10 +149,11 @@ use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, MmdsMetrics,
     NetworkInterfaceMetrics, NetworkInterfaceMetricsCaptureError,
     NetworkInterfaceMetricsCaptureState, NetworkInterfaceMetricsLease,
-    NetworkInterfaceMetricsRegistryError, SharedBalloonDeviceMetrics,
-    SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics,
-    SharedMmdsMetrics, SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
-    SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVsockDeviceMetrics,
+    NetworkInterfaceMetricsRegistryError, ProcessLatencyBoundary, ProcessLatencyOperation,
+    SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+    SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics, SharedNetworkInterfaceMetricsRegistry,
+    SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedSignalMetrics,
+    SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigError, MmdsConfigInput, MmdsContentInput, MmdsState, MmdsStateHandle,
@@ -5445,6 +5446,44 @@ fn record_api_request_failure(controller: &mut VmmController, endpoint: ApiReque
     }
 }
 
+/// One value-only process-local monotonic timestamp used by latency producers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessLatencyTimestamp(Duration);
+
+impl ProcessLatencyTimestamp {
+    #[cfg(test)]
+    pub(crate) const fn from_duration(timestamp: Duration) -> Self {
+        Self(timestamp)
+    }
+
+    pub(crate) fn elapsed_us_since(self, started: Self) -> u64 {
+        u64::try_from(self.0.saturating_sub(started.0).as_micros()).unwrap_or(u64::MAX)
+    }
+}
+
+pub(crate) trait ProcessLatencyClock: fmt::Debug + Send {
+    fn timestamp(&mut self) -> ProcessLatencyTimestamp;
+}
+
+#[derive(Debug)]
+struct SystemProcessLatencyClock {
+    origin: Instant,
+}
+
+impl Default for SystemProcessLatencyClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl ProcessLatencyClock for SystemProcessLatencyClock {
+    fn timestamp(&mut self) -> ProcessLatencyTimestamp {
+        ProcessLatencyTimestamp(self.origin.elapsed())
+    }
+}
+
 pub(crate) trait VmmRequestHandler {
     fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 
@@ -5471,15 +5510,14 @@ pub(crate) trait VmmRequestHandler {
     #[track_caller]
     fn log_process_startup(&mut self, outcome: ProcessStartupOutcome) -> bool;
 
-    fn record_pause_vm_latency_us(&mut self, duration_us: u64);
+    fn process_latency_timestamp(&mut self) -> ProcessLatencyTimestamp;
 
-    fn record_resume_vm_latency_us(&mut self, duration_us: u64);
-
-    fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64);
-
-    fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64);
-
-    fn record_load_snapshot_latency_us(&mut self, duration_us: u64);
+    fn record_process_latency_us(
+        &mut self,
+        operation: ProcessLatencyOperation,
+        boundary: ProcessLatencyBoundary,
+        duration_us: u64,
+    );
 
     fn metrics_session_epoch(&self) -> Option<Instant> {
         None
@@ -5686,6 +5724,7 @@ where
     terminal_logger_attempted: bool,
     terminal_metrics_attempted: bool,
     process_metrics_diagnostics: MetricsDiagnostics,
+    process_latency_clock: Box<dyn ProcessLatencyClock>,
     process_signal_metrics: Option<SharedSignalMetrics>,
     process_stdout: Option<ProcessStdoutLogger>,
     snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation,
@@ -5802,6 +5841,7 @@ where
             terminal_logger_attempted: false,
             terminal_metrics_attempted: false,
             process_metrics_diagnostics: MetricsDiagnostics::default(),
+            process_latency_clock: Box::<SystemProcessLatencyClock>::default(),
             process_signal_metrics: None,
             process_stdout: None,
             snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation::default(),
@@ -5843,6 +5883,15 @@ where
         diagnostics: MetricsDiagnostics,
     ) -> Self {
         self.process_metrics_diagnostics = diagnostics;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_process_latency_clock(
+        mut self,
+        clock: impl ProcessLatencyClock + 'static,
+    ) -> Self {
+        self.process_latency_clock = Box::new(clock);
         self
     }
 
@@ -6149,26 +6198,27 @@ where
         self.controller.log_process_startup(outcome)
     }
 
-    fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
-        self.controller.record_pause_vm_latency_us(duration_us);
+    fn process_latency_timestamp(&mut self) -> ProcessLatencyTimestamp {
+        self.process_latency_clock.timestamp()
     }
 
-    fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
-        self.controller.record_resume_vm_latency_us(duration_us);
-    }
-
-    fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64) {
+    fn record_process_latency_us(
+        &mut self,
+        operation: ProcessLatencyOperation,
+        boundary: ProcessLatencyBoundary,
+        duration_us: u64,
+    ) {
         self.controller
-            .record_full_create_snapshot_latency_us(duration_us);
+            .record_process_latency_us(operation, boundary, duration_us);
     }
 
-    fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64) {
-        self.controller
-            .record_diff_create_snapshot_latency_us(duration_us);
-    }
-
-    fn record_load_snapshot_latency_us(&mut self, duration_us: u64) {
-        self.controller.record_load_snapshot_latency_us(duration_us);
+    fn record_inner_process_latency_since(
+        &mut self,
+        operation: ProcessLatencyOperation,
+        started: ProcessLatencyTimestamp,
+    ) {
+        let elapsed_us = self.process_latency_timestamp().elapsed_us_since(started);
+        self.record_process_latency_us(operation, ProcessLatencyBoundary::InnerVmm, elapsed_us);
     }
 
     #[cfg(target_os = "macos")]
@@ -7181,6 +7231,7 @@ where
     }
 
     fn pause_instance(&mut self) -> Result<VmmData, VmmActionError> {
+        let latency_started = self.process_latency_timestamp();
         let transition = match self.controller.preflight_pause_instance() {
             Ok(transition) => transition,
             Err(error) => {
@@ -7200,6 +7251,10 @@ where
         };
 
         if transition == VmStateTransition::AlreadyInTargetState {
+            self.record_inner_process_latency_since(
+                ProcessLatencyOperation::PauseVm,
+                latency_started,
+            );
             let _ = self
                 .controller
                 .log_lifecycle(LoggerLifecycleOutcome::VmPauseUnchanged);
@@ -7212,6 +7267,12 @@ where
             return Err(VmmActionError::Lifecycle(error));
         }
         let result = self.controller.pause_instance();
+        if result.is_ok() {
+            self.record_inner_process_latency_since(
+                ProcessLatencyOperation::PauseVm,
+                latency_started,
+            );
+        }
         let outcome = if result.is_ok() {
             LoggerLifecycleOutcome::VmPauseSucceeded
         } else {
@@ -7222,12 +7283,14 @@ where
     }
 
     fn resume_instance(&mut self) -> Result<VmmData, VmmActionError> {
-        self.resume_instance_with_lifecycle_log(true)
+        let latency_started = self.process_latency_timestamp();
+        self.resume_instance_with_lifecycle_log(true, Some(latency_started))
     }
 
     fn resume_instance_with_lifecycle_log(
         &mut self,
         log_lifecycle: bool,
+        latency_started: Option<ProcessLatencyTimestamp>,
     ) -> Result<VmmData, VmmActionError> {
         let transition = match self.controller.preflight_resume_instance() {
             Ok(transition) => transition,
@@ -7252,6 +7315,12 @@ where
         };
 
         if transition == VmStateTransition::AlreadyInTargetState {
+            if let Some(latency_started) = latency_started {
+                self.record_inner_process_latency_since(
+                    ProcessLatencyOperation::ResumeVm,
+                    latency_started,
+                );
+            }
             if log_lifecycle {
                 let _ = self
                     .controller
@@ -7268,6 +7337,14 @@ where
             return Err(VmmActionError::Lifecycle(error));
         }
         let result = self.controller.resume_instance();
+        if result.is_ok()
+            && let Some(latency_started) = latency_started
+        {
+            self.record_inner_process_latency_since(
+                ProcessLatencyOperation::ResumeVm,
+                latency_started,
+            );
+        }
         if log_lifecycle {
             let outcome = if result.is_ok() {
                 LoggerLifecycleOutcome::VmResumeSucceeded
@@ -7280,6 +7357,11 @@ where
     }
 
     fn create_snapshot(&mut self, input: SnapshotCreateInput) -> Result<VmmData, VmmActionError> {
+        let latency_started = self.process_latency_timestamp();
+        let latency_operation = match input.snapshot_type() {
+            SnapshotType::Full => ProcessLatencyOperation::FullCreateSnapshot,
+            SnapshotType::Diff => ProcessLatencyOperation::DiffCreateSnapshot,
+        };
         let publication = match input.snapshot_type() {
             SnapshotType::Full => self.publish_native_v2_snapshot(&input),
             SnapshotType::Diff => self.publish_native_v2_diff_snapshot(&input),
@@ -7292,11 +7374,15 @@ where
         let result = publication
             .map_err(native_v2_snapshot_publication_action_error)
             .map(|_| VmmData::Empty);
+        if result.is_ok() {
+            self.record_inner_process_latency_since(latency_operation, latency_started);
+        }
         let _ = self.controller.log_snapshot(outcome);
         result
     }
 
     fn load_snapshot(&mut self, input: SnapshotLoadInput) -> Result<VmmData, VmmActionError> {
+        let latency_started = self.process_latency_timestamp();
         let resume_requested = match self.restore_native_snapshot(&input) {
             Ok(resume_requested) => resume_requested,
             Err(error) => {
@@ -7306,13 +7392,18 @@ where
                 return Err(error);
             }
         };
-        if resume_requested && let Err(error) = self.resume_instance_with_lifecycle_log(false) {
+        if resume_requested && let Err(error) = self.resume_instance_with_lifecycle_log(false, None)
+        {
             let error = native_v1_snapshot_resume_action_error(error);
             let _ = self
                 .controller
                 .log_snapshot(LoggerSnapshotOutcome::LoadFailed);
             return Err(error);
         }
+        self.record_inner_process_latency_since(
+            ProcessLatencyOperation::LoadSnapshot,
+            latency_started,
+        );
         let _ = self
             .controller
             .log_snapshot(LoggerSnapshotOutcome::LoadSucceeded);
@@ -7856,7 +7947,7 @@ where
         if !resume_requested {
             return Ok(false);
         }
-        self.resume_instance_with_lifecycle_log(false)
+        self.resume_instance_with_lifecycle_log(false, None)
             .map_err(|error| {
                 let source = match error {
                     VmmActionError::Lifecycle(source) => source,
@@ -10765,24 +10856,17 @@ where
         ProcessVmm::log_process_startup(self, outcome)
     }
 
-    fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
-        ProcessVmm::record_pause_vm_latency_us(self, duration_us);
+    fn process_latency_timestamp(&mut self) -> ProcessLatencyTimestamp {
+        ProcessVmm::process_latency_timestamp(self)
     }
 
-    fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
-        ProcessVmm::record_resume_vm_latency_us(self, duration_us);
-    }
-
-    fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64) {
-        ProcessVmm::record_full_create_snapshot_latency_us(self, duration_us);
-    }
-
-    fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64) {
-        ProcessVmm::record_diff_create_snapshot_latency_us(self, duration_us);
-    }
-
-    fn record_load_snapshot_latency_us(&mut self, duration_us: u64) {
-        ProcessVmm::record_load_snapshot_latency_us(self, duration_us);
+    fn record_process_latency_us(
+        &mut self,
+        operation: ProcessLatencyOperation,
+        boundary: ProcessLatencyBoundary,
+        duration_us: u64,
+    ) {
+        ProcessVmm::record_process_latency_us(self, operation, boundary, duration_us);
     }
 
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
@@ -36999,23 +37083,24 @@ mod tests {
         NativeV2SnapshotPublicationRequest, NativeV2SnapshotRootCaptureError,
         NativeV2SnapshotStorageCaptureError, NativeV2SnapshotVsockCaptureError,
         NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, PreparedNativeSnapshotLoad,
-        ProcessCaptureReadyNetworkError, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
-        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
-        ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
-        ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessSessionShutdownStatus,
-        ProcessSnapshotV2BalloonLoadRequest, ProcessSnapshotV2DiffLoadRequest,
-        ProcessSnapshotV2EntropyLoadRequest, ProcessSnapshotV2MemoryHotplugLoadRequest,
-        ProcessSnapshotV2MultiBlockLoadRequest, ProcessSnapshotV2MultiBlockLoadSuccess,
-        ProcessSnapshotV2NetworkLoadRequest, ProcessSnapshotV2NetworkRestorePlanError,
-        ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
-        ProcessSnapshotV2RootLoadSuccess, ProcessSnapshotV2SerialLoadRequest,
-        ProcessSnapshotV2StorageLoadRequest, ProcessSnapshotV2StorageLoadSuccess,
-        ProcessSnapshotV2VsockLoadRequest, ProcessVmm, ProcessVmnetAuthority,
-        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
-        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, native_snapshot_load_logger_outcome,
-        native_v2_platform_capture_is_terminal, prepare_process_snapshot_v2_network_restore_plan,
+        ProcessCaptureReadyNetworkError, ProcessHvfBootSession, ProcessLatencyClock,
+        ProcessLatencyTimestamp, ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
+        ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
+        ProcessNetworkPacketIoRegistryError, ProcessNetworkPacketIoStopError,
+        ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
+        ProcessSessionShutdownStatus, ProcessSnapshotV2BalloonLoadRequest,
+        ProcessSnapshotV2DiffLoadRequest, ProcessSnapshotV2EntropyLoadRequest,
+        ProcessSnapshotV2MemoryHotplugLoadRequest, ProcessSnapshotV2MultiBlockLoadRequest,
+        ProcessSnapshotV2MultiBlockLoadSuccess, ProcessSnapshotV2NetworkLoadRequest,
+        ProcessSnapshotV2NetworkRestorePlanError, ProcessSnapshotV2RootLoadCompletion,
+        ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess,
+        ProcessSnapshotV2SerialLoadRequest, ProcessSnapshotV2StorageLoadRequest,
+        ProcessSnapshotV2StorageLoadSuccess, ProcessSnapshotV2VsockLoadRequest, ProcessVmm,
+        ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
+        SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
+        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        native_snapshot_load_logger_outcome, native_v2_platform_capture_is_terminal,
+        prepare_process_snapshot_v2_network_restore_plan,
         prepare_process_snapshot_v2_vsock_candidate, require_native_v1_composite_record,
         snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
@@ -37027,6 +37112,62 @@ mod tests {
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct ScriptedProcessLatencyClock {
+        timestamps: VecDeque<ProcessLatencyTimestamp>,
+    }
+
+    impl ScriptedProcessLatencyClock {
+        fn new(timestamps: impl IntoIterator<Item = Duration>) -> Self {
+            Self {
+                timestamps: timestamps
+                    .into_iter()
+                    .map(ProcessLatencyTimestamp::from_duration)
+                    .collect(),
+            }
+        }
+    }
+
+    impl ProcessLatencyClock for ScriptedProcessLatencyClock {
+        fn timestamp(&mut self) -> ProcessLatencyTimestamp {
+            self.timestamps
+                .pop_front()
+                .expect("scripted process latency timestamp should be available")
+        }
+    }
+
+    #[test]
+    fn process_latency_timestamps_convert_monotonically_and_saturate() {
+        let start = ProcessLatencyTimestamp::from_duration(Duration::from_micros(10));
+        assert_eq!(
+            ProcessLatencyTimestamp::from_duration(Duration::from_micros(52))
+                .elapsed_us_since(start),
+            42
+        );
+        assert_eq!(
+            ProcessLatencyTimestamp::from_duration(Duration::from_micros(9))
+                .elapsed_us_since(start),
+            0
+        );
+        assert_eq!(
+            ProcessLatencyTimestamp::from_duration(Duration::MAX)
+                .elapsed_us_since(ProcessLatencyTimestamp::from_duration(Duration::ZERO)),
+            u64::MAX
+        );
+
+        let mut vmm = ProcessVmm::with_starter(
+            "latency-clock",
+            "0.1.0",
+            "bangbang",
+            FakeStarter::success(1),
+        )
+        .with_process_latency_clock(ScriptedProcessLatencyClock::new([Duration::from_micros(7)]));
+        assert_eq!(
+            vmm.process_latency_timestamp(),
+            ProcessLatencyTimestamp::from_duration(Duration::from_micros(7))
+        );
+    }
 
     fn contained_vmnet_authority(authority: VmnetAuthority) -> ProcessVmnetAuthority {
         contained_vmnet_authority_for_session(0x5a, authority)
@@ -65454,6 +65595,144 @@ mod tests {
             values[0]["api_server"]["process_startup_time_cpu_us"],
             3_000
         );
+    }
+
+    #[test]
+    fn controlled_inner_vm_state_latencies_record_success_and_ignore_failure() {
+        let metrics = TempFilePath::create("controlled-inner-vm-state-latencies");
+        let mut vmm = configured_vmm(FakeStarter::success(201)).with_process_latency_clock(
+            ScriptedProcessLatencyClock::new([
+                Duration::from_micros(10),
+                Duration::from_micros(40),
+                Duration::from_micros(50),
+                Duration::from_micros(90),
+                Duration::from_micros(100),
+            ]),
+        );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("instance should pause");
+        vmm.handle_action(VmmAction::Resume)
+            .expect("instance should resume");
+
+        vmm.started_session = None;
+        assert_eq!(
+            vmm.handle_action(VmmAction::Pause),
+            Err(VmmActionError::Lifecycle(BackendError::InvalidState(
+                "active session unavailable"
+            )))
+        );
+        vmm.handle_action(VmmAction::FlushMetrics)
+            .expect("metrics should flush after the failed action");
+
+        let values = read_canonical_metrics_lines(metrics.path(), 1);
+        let latencies = &values[0]["latencies_us"];
+        assert_eq!(latencies["vmm_pause_vm"], 30);
+        assert_eq!(latencies["vmm_resume_vm"], 40);
+        assert_eq!(latencies["pause_vm"], 0);
+        assert_eq!(latencies["resume_vm"], 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn controlled_inner_snapshot_latencies_cover_create_and_auto_resumed_load() {
+        let create_metrics = TempFilePath::create("controlled-inner-create-latencies");
+        let full_directory = TempSnapshotDirectory::new("controlled-inner-full-create");
+        let full_paths = full_directory.paths();
+        let diff_directory = TempSnapshotDirectory::new("controlled-inner-diff-create");
+        let diff_paths = diff_directory.paths();
+        let mut source = snapshot_profile_vmm(FakeStarter::success(202))
+            .with_process_latency_clock(ScriptedProcessLatencyClock::new([
+                Duration::from_micros(10),
+                Duration::from_micros(20),
+                Duration::from_micros(100),
+                Duration::from_micros(140),
+                Duration::from_micros(200),
+                Duration::from_micros(270),
+                Duration::from_micros(300),
+            ]));
+        source
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                create_metrics.path(),
+            )))
+            .expect("create metrics should configure");
+        source
+            .handle_action(VmmAction::InstanceStart)
+            .expect("snapshot source should start");
+        source
+            .handle_action(VmmAction::Pause)
+            .expect("snapshot source should pause");
+        source
+            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                full_paths.state(),
+                full_paths.memory(),
+            )))
+            .expect("full snapshot should publish");
+        source
+            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Diff,
+                diff_paths.state(),
+                diff_paths.memory(),
+            )))
+            .expect("diff snapshot should publish");
+        assert!(
+            source
+                .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                    SnapshotType::Full,
+                    full_paths.state(),
+                    full_paths.memory(),
+                )))
+                .is_err(),
+            "publication collision should fail"
+        );
+        source
+            .handle_action(VmmAction::FlushMetrics)
+            .expect("create metrics should flush");
+
+        let create_values = read_canonical_metrics_lines(create_metrics.path(), 1);
+        let create_latencies = &create_values[0]["latencies_us"];
+        assert_eq!(create_latencies["vmm_full_create_snapshot"], 40);
+        assert_eq!(create_latencies["vmm_diff_create_snapshot"], 70);
+        assert_eq!(create_latencies["full_create_snapshot"], 0);
+        assert_eq!(create_latencies["diff_create_snapshot"], 0);
+
+        let load_metrics = TempFilePath::create("controlled-inner-load-latency");
+        let (_snapshot, load) =
+            native_v2_snapshot_load_fixture("controlled-inner-auto-resumed-load", true);
+        let mut destination = ProcessVmm::with_starter(
+            "controlled-inner-load",
+            "0.1.0",
+            "bangbang",
+            FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success),
+        )
+        .with_process_latency_clock(ScriptedProcessLatencyClock::new([
+            Duration::from_micros(400),
+            Duration::from_micros(490),
+        ]));
+        destination
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                load_metrics.path(),
+            )))
+            .expect("load metrics should configure");
+        destination
+            .handle_action(VmmAction::LoadSnapshot(load))
+            .expect("snapshot should load and resume");
+        destination
+            .handle_action(VmmAction::FlushMetrics)
+            .expect("load metrics should flush");
+
+        let load_values = read_canonical_metrics_lines(load_metrics.path(), 1);
+        let load_latencies = &load_values[0]["latencies_us"];
+        assert_eq!(load_latencies["vmm_load_snapshot"], 90);
+        assert_eq!(load_latencies["load_snapshot"], 0);
+        assert_eq!(load_latencies["vmm_resume_vm"], 0);
+        assert_eq!(destination.instance_info().state, InstanceState::Running);
     }
 
     #[test]
