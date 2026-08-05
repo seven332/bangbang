@@ -9146,6 +9146,12 @@ impl VirtioVsockDevice {
             .filter(|entry| self.connection_deadline(entry.key) == Some(entry.deadline))
             .map(|entry| entry.deadline.at)
             .min();
+        if self.kill_queue.is_synchronized() {
+            return queued;
+        }
+
+        // Overflow can leave a live deadline out of the bounded queue until its
+        // retained entries drain and trigger a rebuild.
         queued
             .into_iter()
             .chain(self.host_connections.earliest_deadline())
@@ -25220,6 +25226,21 @@ mod tests {
                 .with_conns_removed(connection_count)
                 .with_killq_resync(2),
         );
+    }
+
+    #[test]
+    fn kill_queue_falls_back_to_live_deadlines_after_capacity_overflow() {
+        let now = Instant::now();
+        let queued_deadline = now + Duration::from_secs(2);
+        let dropped_deadline = now + Duration::from_secs(1);
+        let mut deadlines = vec![queued_deadline; super::VSOCK_KILL_QUEUE_CAPACITY];
+        deadlines.push(dropped_deadline);
+        let mut device = VirtioVsockDevice::with_guest_cid(42);
+        let connections = guest_connections_with_deadlines(&mut device, &deadlines);
+
+        assert_eq!(connections.len(), super::VSOCK_KILL_QUEUE_CAPACITY + 1);
+        assert!(!device.kill_queue.is_synchronized());
+        assert_eq!(device.earliest_deadline(), Some(dropped_deadline));
     }
 
     #[test]
