@@ -2986,7 +2986,8 @@ boot-worker and guest poweroff/reset status, VM-stop cleanup, and orderly or
 abnormal shutdown before `event=process-exit category=<fixed-category>` under
 the `bangbang::process` filter. A catchable main-runtime panic can first emit
 `event=process-panic` under `bangbang::panic` and then the fixed `panic`
-terminal category. The closed operations/outcomes, five terminal categories,
+terminal category while storing only `vmm.panic_count = 1` outside the hook.
+The closed operations/outcomes, five terminal categories,
 levels, optional level/origin prefixes, 512-byte ceiling, and callsites are
 compiled in. These records never incorporate `PanicHookInfo`, panic payloads,
 error strings, paths, selectors, descriptors, credentials, guest/register
@@ -3012,12 +3013,27 @@ the protected main finalizer before final metrics sampling. Normal terminal
 delivery uses the bounded host receipt before final metrics, so its confirmed
 failure or timeout is included without replacing the original process result.
 
+Fatal-signal convergence uses a separate, retained socket pair and one atomic
+state word; it never reuses graceful-shutdown meaning. Before publishing the
+process readiness notification the API/no-API owner arms one interval. On arm64 Darwin, only
+matching SIGHUP/SIGXCPU/SIGXFSZ with code zero and a positive non-self sender
+may claim it. The handler performs one compare-exchange, one fixed Store,
+release-publishes the compatible exit code, attempts one nonblocking one-byte
+send, and returns. It allocates nothing, takes no lock, formats and serializes
+nothing, logs nothing, never unwinds, and never enters VMM cleanup. A full
+socket is already readable; every other origin, a duplicate, or an unarmed
+delivery immediately `_exit`s. Darwin makes external and synchronous
+SIGILL/SIGBUS/SIGSEGV indistinguishable, so returning from those fault handlers
+merely to publish metrics is forbidden.
+
 This boundary protects confidentiality and bounds work on a catchable main
 panic; it is not a durability mechanism. Admission can race process exit, and
 a worker can stall or fail after admission. Worker-only panic, panic during
-unwind, abort, fatal `_exit`, and uncatchable signals have no final metrics or
-record-persistence guarantee. Operators must not treat the presence or absence
-of these best-effort records as an audit log or security decision input.
+unwind, abort, immediate fatal `_exit`, and uncatchable signals have no final
+metrics or record-persistence guarantee. Classified external signals receive
+only the same single ordinary best-effort attempt. Operators must not treat the
+presence or absence of these records as an audit log or security decision
+input.
 
 The terminal logger certification binds this security boundary to the exact
 pinned producer population. Its scoped validator permits no planned logger
@@ -3043,7 +3059,16 @@ explicit, and terminal records through one adopted write-only sink. This does
 not grant new authority, promote #1788/#1789 producer policies, close either
 #1790 aggregate, or turn best-effort metrics into a durable audit channel.
 
-Current session-initial, periodic, explicit, and normal-terminal metrics lines
+The separate #1788 process-producer audit is now terminal for all 69 fields:
+64 implemented, one source-neutral, and four platform-zero. Its signal/panic
+slice proves persistent SIGHUP/SIGXCPU/SIGXFSZ/panic Stores in the stable
+process cut, immediate platform-zero SIGILL/SIGBUS/SIGSEGV, and macOS
+platform-zero `seccomp.num_faults`. Explicit SIGSYS remains an exit-code path,
+not an invented seccomp producer. Disposition mutations and fabricated
+SIGSYS/seccomp equivalence fail the checked audit.
+
+Current session-initial, periodic, explicit, normal-terminal, and classified
+external-fatal terminal metrics lines
 always expose the complete pinned numeric schema. Implemented matching
 producers populate API, startup, logger, signal, UART, block, pmem aggregate,
 network, MMDS, vsock, entropy, RTC, balloon, interrupt, and memory-hotplug

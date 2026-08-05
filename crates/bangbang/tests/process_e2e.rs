@@ -1251,19 +1251,30 @@ fn executable_handles_sigpipe_without_shutdown() {
 
 #[test]
 fn executable_maps_firecracker_fatal_signals_to_exit_codes() {
-    for (signal_name, signal, expected_exit_code) in [
-        ("SIGSYS", libc::SIGSYS, BAD_SYSCALL_EXIT_CODE),
-        ("SIGBUS", libc::SIGBUS, SIGBUS_EXIT_CODE),
-        ("SIGSEGV", libc::SIGSEGV, SIGSEGV_EXIT_CODE),
-        ("SIGXFSZ", libc::SIGXFSZ, SIGXFSZ_EXIT_CODE),
-        ("SIGXCPU", libc::SIGXCPU, SIGXCPU_EXIT_CODE),
-        ("SIGHUP", libc::SIGHUP, SIGHUP_EXIT_CODE),
-        ("SIGILL", libc::SIGILL, SIGILL_EXIT_CODE),
+    for (signal_name, signal, expected_exit_code, converges_on_macos) in [
+        ("SIGSYS", libc::SIGSYS, BAD_SYSCALL_EXIT_CODE, false),
+        ("SIGBUS", libc::SIGBUS, SIGBUS_EXIT_CODE, false),
+        ("SIGSEGV", libc::SIGSEGV, SIGSEGV_EXIT_CODE, false),
+        ("SIGXFSZ", libc::SIGXFSZ, SIGXFSZ_EXIT_CODE, true),
+        ("SIGXCPU", libc::SIGXCPU, SIGXCPU_EXIT_CODE, true),
+        ("SIGHUP", libc::SIGHUP, SIGHUP_EXIT_CODE, true),
+        ("SIGILL", libc::SIGILL, SIGILL_EXIT_CODE, false),
     ] {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join(format!("{signal_name}.socket"));
+        let logger_path = test_dir.path().join(format!("{signal_name}.log"));
+        let metrics_path = test_dir.path().join(format!("{signal_name}.metrics"));
         let instance_id = test_dir.instance_id();
-        let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+        let bangbang = BangbangProcess::start_with_extra_args(
+            &socket_path,
+            &instance_id,
+            &[
+                "--log-path",
+                path_text(&logger_path),
+                "--metrics-path",
+                path_text(&metrics_path),
+            ],
+        );
 
         assert!(
             socket_path.exists(),
@@ -1279,6 +1290,35 @@ fn executable_maps_firecracker_fatal_signals_to_exit_codes() {
             output.stdout,
             output.stderr
         );
+
+        let logger = fs::read_to_string(&logger_path)
+            .unwrap_or_else(|err| panic!("{signal_name} logger should be readable: {err}"));
+        let converged = cfg!(target_os = "macos") && converges_on_macos;
+        let shutdown_count = logger
+            .matches("operation=shutdown outcome=abnormal\n")
+            .count();
+        let terminal_count = logger
+            .matches("event=process-exit category=process-failure\n")
+            .count();
+        assert_eq!(
+            shutdown_count,
+            usize::from(converged),
+            "{signal_name}: {logger}"
+        );
+        assert_eq!(
+            terminal_count,
+            usize::from(converged),
+            "{signal_name}: {logger}"
+        );
+        assert_eq!(
+            fs::read_to_string(&metrics_path)
+                .unwrap_or_else(|err| panic!("{signal_name} metrics should be readable: {err}")),
+            "",
+            "a pre-session {signal_name} exit must not invent a terminal metrics line"
+        );
+        if converged {
+            assert_eq!(output.stderr, "bangbang: fatal host signal received\n");
+        }
     }
 }
 

@@ -663,9 +663,14 @@ impl VmmController {
         &self.instance_info
     }
 
-    /// Returns the atomic-only SIGPIPE metrics facade owned by this controller.
+    /// Returns the atomic-only process signal metrics facade owned by this controller.
     pub fn process_signal_metrics(&self) -> metrics::SharedSignalMetrics {
         self.metrics_state.signal_metrics()
+    }
+
+    /// Records one caught main-runtime panic in the controller-owned process snapshot.
+    pub fn record_process_panic(&self) {
+        self.metrics_state.record_process_panic();
     }
 
     pub fn drive_configs(&self) -> &[block::DriveConfig] {

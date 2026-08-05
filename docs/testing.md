@@ -1541,8 +1541,10 @@ arm64 static roots and 243 static scalar paths, plus configured block/network/
 vhost-user field populations of 24/29/5. The separate human-owned
 `metrics-process-producer-audit.json` is an exact incremental mapping of the 69
 fields assigned to the process profile; it records 44 implemented #1827
-request/deprecation fields, 12 implemented #1828 startup/latency fields, and 13
-planned fields owned by #1829–#1830. Run the
+request/deprecation fields, 12 implemented #1828 startup/latency fields, four
+implemented plus one source-neutral #1829 fields, and four implemented plus four
+platform-zero #1830 fields. The process audit therefore has 64 implemented,
+one source-neutral, four platform-zero, and no planned records. Run the
 schema and process-audit focused local mutations with:
 
 ```sh
@@ -1716,8 +1718,9 @@ complete lifecycle suite inside App Sandbox, then runs the disabled-by-default
 `app_sandbox_process_e2e` target. The process target proves help execution,
 path-redacted denial of the default `/tmp` API socket and a config file outside
 the app container, HTTP service through a unique container socket, graceful
-`SIGINT`, and owned-socket cleanup. Readiness channels and bounded child
-deadlines are used instead of fixed sleeps.
+`SIGINT`, all six fatal-signal exit classes, classified-signal convergence,
+immediate-fault behavior, and owned-socket cleanup. Readiness channels and
+bounded child deadlines are used instead of fixed sleeps.
 
 The target deliberately excludes vmnet, guest fixture files, production app
 distribution, security-scoped bookmarks, and launcher/resource-broker
@@ -1772,6 +1775,9 @@ may skip execution. On supported Apple Silicon it proves:
   config file;
 - `SIGINT` and `SIGTERM` as one graceful session cancellation with successful
   worker/launcher exit and owned-socket cleanup;
+- parent-delivered `SIGHUP` to the actual contained worker as exact exit `156`,
+  one granted terminal Store, ordinary worker cleanup, and unchanged supervisor
+  forwarding;
 - worker-first and launcher-first death cleanup, empty both-killed stale
   namespace recovery, and preservation of the concurrent peer namespace;
 - two simultaneous API sessions remaining independent when one worker is
@@ -2522,6 +2528,30 @@ and failed fallback outcomes without mutating a hook. The double-panic case
 requires only bounded non-success and absence of both secrets; it deliberately
 makes no persistence claim.
 
+Fatal-signal tests keep handler safety and ordinary convergence separate.
+Pure Darwin `siginfo_t` matrices admit only matching SIGHUP/SIGXCPU/SIGXFSZ
+records with code zero and a positive non-self sender. Atomic-state tests cover
+arm, first claim, release publication, duplicate rejection, normal disarm,
+fatal precedence, a deliberately full notifier, and the bounded exact-exit
+fallback for a claim that never publishes. Dedicated subprocesses generate
+real illegal-instruction, truncated-mapping SIGBUS, invalid-address SIGSEGV,
+RLIMIT_CPU, RLIMIT_FSIZE, and self-SIGHUP delivery; each must use immediate
+compatible `_exit` without terminal records. Portable process tests send all
+seven compatible fatal signals from the parent, check every exact status,
+require ordinary fixed terminal records only for the three classified
+deliveries, and prove a pre-session metrics sink stays empty. A self-spawned
+caught-panic test proves
+payload identity/redaction, `panic_count` transition from zero to one, one final
+line, and bounded behavior with a full metrics FIFO.
+
+Signed coverage then crosses each product boundary: the direct HVF test sends
+SIGHUP to a live VM after a recorded SIGPIPE and checks the earlier Incremental
+line plus the final persistent Store; App Sandbox sends all six metric-bearing
+fatal signals and distinguishes ordinary socket cleanup from immediate exit;
+production signals the actual contained worker, requires the outer supervisor
+to preserve exit 156, restores the session namespace, and reads the final line
+through the launcher-granted metrics descriptor.
+
 Metrics construction tests require the complete 24-root/243-leaf static shape,
 the three configured dynamic families, exact root/field byte order, and numeric
 zeroes for required fields without producer values. A reviewable maximum recipe
@@ -2583,8 +2613,15 @@ cargo test -p bangbang-runtime metrics::firecracker::tests --all-features --lock
 cargo test -p bangbang-runtime metrics::tests --all-features --locked
 cargo test -p bangbang-runtime logger --all-features --locked
 cargo test -p bangbang --bin bangbang panic_bridge::tests --all-features --locked -- --test-threads=1
+cargo test -p bangbang --bin bangbang fatal_signal --all-features --locked -- --test-threads=1
+cargo test -p bangbang --bin bangbang synchronous_faults_and_self_resource_signals_use_exact_immediate_exit --all-features --locked -- --test-threads=1
+cargo test -p bangbang --bin bangbang caught_runtime_panic_records_once_preserves_payload_and_bounds_sink_failure --all-features --locked -- --test-threads=1
 cargo test -p bangbang --bin bangbang terminal_observability --all-features --locked
 cargo test -p bangbang --test process_e2e terminal_record --all-features --locked
+cargo test -p bangbang --test process_e2e executable_maps_firecracker_fatal_signals_to_exit_codes --all-features --locked
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- macos_arm64::signed_executable_runs_async_block_over_mmio_with_live_patch --exact
+scripts/run-integration-tests.sh --test app_sandbox -- sandboxed_fatal_signals_preserve_convergence_and_immediate_exit_classes --exact
+scripts/run-integration-tests.sh --test production_bundle -- normal_bundle_preserves_worker_fatal_exit_and_granted_terminal_metrics --exact
 ```
 
 Serial unit tests cover nullable output, the bounded 64-KiB internal TX buffer,

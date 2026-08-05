@@ -5897,6 +5897,10 @@ where
         self.controller.process_signal_metrics()
     }
 
+    pub(crate) fn record_process_panic(&self) {
+        self.controller.record_process_panic();
+    }
+
     pub(crate) fn install_process_stdout_logger(
         &mut self,
         output: ProcessStdoutLogger,

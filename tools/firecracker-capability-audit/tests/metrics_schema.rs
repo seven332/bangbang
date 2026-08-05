@@ -101,7 +101,7 @@ fn checked_process_producer_audit_is_canonical_and_exact() {
                 record.disposition == MetricsProcessProducerDisposition::Implemented
             })
             .count(),
-        60
+        64
     );
     assert_eq!(
         audit
@@ -117,9 +117,11 @@ fn checked_process_producer_audit_is_canonical_and_exact() {
         audit
             .records
             .iter()
-            .filter(|record| record.disposition == MetricsProcessProducerDisposition::Planned)
+            .filter(|record| {
+                record.disposition == MetricsProcessProducerDisposition::PlatformZero
+            })
             .count(),
-        8
+        4
     );
     for record in audit
         .records
@@ -133,11 +135,27 @@ fn checked_process_producer_audit_is_canonical_and_exact() {
         };
         assert_eq!(record.disposition, expected, "{}", record.field_id);
     }
+    for record in audit
+        .records
+        .iter()
+        .filter(|record| record.delivery_issue == "#1830")
+    {
+        let expected = if matches!(
+            record.field_id.as_str(),
+            "static:signals.sighup"
+                | "static:signals.sigxcpu"
+                | "static:signals.sigxfsz"
+                | "static:vmm.panic_count"
+        ) {
+            MetricsProcessProducerDisposition::Implemented
+        } else {
+            MetricsProcessProducerDisposition::PlatformZero
+        };
+        assert_eq!(record.disposition, expected, "{}", record.field_id);
+    }
 
-    let error = validate_metrics_process_producers(&audit, &authority, &root, AuditMode::Final)
-        .expect_err("planned downstream process producers must fail global final mode")
-        .to_string();
-    assert!(error.contains("rejects planned record"));
+    validate_metrics_process_producers(&audit, &authority, &root, AuditMode::Final)
+        .expect("all process producer records should now be terminal");
 }
 
 #[test]
@@ -204,22 +222,18 @@ fn process_producer_audit_rejects_boundary_child_and_completion_drift() {
     assert!(error.contains("completed metrics process producer slice must be terminal"));
     assert!(error.contains("completed process metrics producer must be implemented"));
 
-    let mut premature = checked_process_audit();
-    let downstream = premature
+    let mut incomplete = checked_process_audit();
+    let downstream = incomplete
         .records
         .iter_mut()
         .find(|record| record.delivery_issue == "#1830")
         .expect("downstream record must exist");
-    downstream.disposition = MetricsProcessProducerDisposition::Implemented;
-    downstream.implementation.push(Reference::Local {
-        path: "crates/api/src/http.rs".to_string(),
-        anchor: Some("test".to_string()),
-    });
-    downstream.validation.push(Reference::Local {
-        path: "crates/api/src/http.rs".to_string(),
-        anchor: Some("test".to_string()),
-    });
-    assert!(process_validation_error(&premature).contains("must remain planned"));
+    downstream.disposition = MetricsProcessProducerDisposition::Planned;
+    downstream.implementation.clear();
+    downstream.validation.clear();
+    let error = process_validation_error(&incomplete);
+    assert!(error.contains("completed metrics process producer slice must be terminal"));
+    assert!(error.contains("completed #1830 process metric has the wrong exact disposition"));
 }
 
 #[test]
@@ -259,6 +273,38 @@ fn process_producer_audit_rejects_neutral_aliases_and_bad_evidence() {
         process_validation_error(&neutral_missed_log)
             .contains("completed #1829 process metric has the wrong exact disposition")
     );
+
+    for field_id in [
+        "static:seccomp.num_faults",
+        "static:signals.sigbus",
+        "static:signals.sighup",
+        "static:signals.sigill",
+        "static:signals.sigsegv",
+        "static:signals.sigxcpu",
+        "static:signals.sigxfsz",
+        "static:vmm.panic_count",
+    ] {
+        let mut swapped = checked_process_audit();
+        let record = swapped
+            .records
+            .iter_mut()
+            .find(|record| record.field_id == field_id)
+            .expect("#1830 record must exist");
+        record.disposition = match record.disposition {
+            MetricsProcessProducerDisposition::Implemented => {
+                MetricsProcessProducerDisposition::PlatformZero
+            }
+            MetricsProcessProducerDisposition::PlatformZero => {
+                MetricsProcessProducerDisposition::Implemented
+            }
+            _ => panic!("#1830 records must have an exact terminal disposition"),
+        };
+        assert!(
+            process_validation_error(&swapped)
+                .contains("completed #1830 process metric has the wrong exact disposition"),
+            "{field_id}"
+        );
+    }
 
     let mut missing = checked_process_audit();
     missing

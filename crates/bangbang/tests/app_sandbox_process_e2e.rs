@@ -19,13 +19,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use support::{
     BangbangProcess, CompletedProcess, assert_clean_shutdown, assert_ok_response,
-    assert_response_contains, http_get,
+    assert_response_contains, http_get, path_text,
 };
 
 const BANGBANG_PROCESS_E2E_BIN_ENV: &str = "BANGBANG_PROCESS_E2E_BIN";
 const BUNDLE_IDENTIFIER: &str = "dev.bangbang.sandbox";
 const BAD_CONFIGURATION_EXIT_CODE: i32 = 152;
 const PROCESS_FAILURE_EXIT_CODE: i32 = 1;
+const SIGBUS_EXIT_CODE: i32 = 149;
+const SIGSEGV_EXIT_CODE: i32 = 150;
+const SIGXFSZ_EXIT_CODE: i32 = 151;
+const SIGXCPU_EXIT_CODE: i32 = 154;
+const SIGHUP_EXIT_CODE: i32 = 156;
+const SIGILL_EXIT_CODE: i32 = 157;
 static INITIALIZE_CONTAINER: Once = Once::new();
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -176,6 +182,65 @@ fn sandbox_serves_and_cleans_container_api_socket() {
         &socket_path,
         "sandboxed bangbang SIGINT",
     );
+}
+
+#[test]
+fn sandboxed_fatal_signals_preserve_convergence_and_immediate_exit_classes() {
+    for (name, signal, expected_exit, converged) in [
+        ("sigbus", libc::SIGBUS, SIGBUS_EXIT_CODE, false),
+        ("sigsegv", libc::SIGSEGV, SIGSEGV_EXIT_CODE, false),
+        ("sigxfsz", libc::SIGXFSZ, SIGXFSZ_EXIT_CODE, true),
+        ("sigxcpu", libc::SIGXCPU, SIGXCPU_EXIT_CODE, true),
+        ("sighup", libc::SIGHUP, SIGHUP_EXIT_CODE, true),
+        ("sigill", libc::SIGILL, SIGILL_EXIT_CODE, false),
+    ] {
+        let socket_path = unique_socket_path(name);
+        let logger_path = socket_path.with_extension("log");
+        let instance_id = format!("sandbox-{name}-{}", std::process::id());
+        let bangbang = BangbangProcess::start_with_extra_args(
+            &socket_path,
+            &instance_id,
+            &["--log-path", path_text(&logger_path)],
+        );
+
+        let output = bangbang.stop_with_signal(signal, name);
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "sandboxed {name}: stdout:\n{}\nstderr:\n{}",
+            output.stdout,
+            output.stderr
+        );
+        let logger = fs::read_to_string(&logger_path)
+            .unwrap_or_else(|error| panic!("sandboxed {name} logger should read: {error}"));
+        assert_eq!(
+            logger
+                .matches("operation=shutdown outcome=abnormal\n")
+                .count(),
+            usize::from(converged),
+            "sandboxed {name}: {logger}"
+        );
+        assert_eq!(
+            logger
+                .matches("event=process-exit category=process-failure\n")
+                .count(),
+            usize::from(converged),
+            "sandboxed {name}: {logger}"
+        );
+        assert_eq!(
+            socket_path.exists(),
+            !converged,
+            "sandboxed {name} socket cleanup must distinguish ordinary convergence from immediate exit"
+        );
+        if converged {
+            assert_eq!(output.stderr, "bangbang: fatal host signal received\n");
+        } else {
+            fs::remove_file(&socket_path)
+                .unwrap_or_else(|error| panic!("sandboxed {name} stale socket cleanup: {error}"));
+        }
+        fs::remove_file(&logger_path)
+            .unwrap_or_else(|error| panic!("sandboxed {name} logger cleanup: {error}"));
+    }
 }
 
 #[test]
