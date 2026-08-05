@@ -18302,14 +18302,17 @@ mod macos_arm64 {
                 path.display()
             )
         });
-        assert!(
-            output.lines().any(|line| {
-                serde_json::from_str::<serde_json::Value>(line)
-                    .ok()
-                    .and_then(|value| value.pointer("/signals/sigpipe")?.as_u64())
-                    .is_some_and(|count| count > 0)
-            }),
-            "metrics output should include SIGPIPE signal metrics; output:\n{output}"
+        let latest = output
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .unwrap_or_else(|| panic!("metrics output should end in canonical JSON: {output}"));
+        assert_eq!(
+            latest
+                .pointer("/signals/sigpipe")
+                .and_then(|value| value.as_u64()),
+            Some(1),
+            "the first generation after SIGPIPE should report it exactly once; output:\n{output}"
         );
     }
 

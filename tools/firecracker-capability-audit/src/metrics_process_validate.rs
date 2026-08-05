@@ -10,7 +10,7 @@ use crate::{
 };
 
 const EXPECTED_PROCESS_FIELDS: usize = 69;
-const COMPLETED_DELIVERY_ISSUES: &[&str] = &["#1827", "#1828"];
+const COMPLETED_DELIVERY_ISSUES: &[&str] = &["#1827", "#1828", "#1829"];
 
 /// Validate exact process-producer authority against the resolved metrics schema.
 pub fn validate_metrics_process_producers(
@@ -192,6 +192,19 @@ fn validate_record(
             record.field_id
         ));
     }
+    if delivery_issue == "#1829" {
+        let expected = if path == "logger.metrics_fails" {
+            MetricsProcessProducerDisposition::SourceNeutral
+        } else {
+            MetricsProcessProducerDisposition::Implemented
+        };
+        if record.disposition != expected {
+            errors.push(format!(
+                "completed #1829 process metric has the wrong exact disposition: {}",
+                record.field_id
+            ));
+        }
+    }
 
     match record.disposition {
         MetricsProcessProducerDisposition::Planned => {
@@ -354,11 +367,28 @@ fn expected_rationale(
         ("#1828", MetricsProcessProducerBoundary::SuccessfulInnerVmmOperation) => {
             "Pinned Firecracker stores this latency only after the corresponding VMM operation succeeds; Bangbang commits at the functional action boundary before outcome logging and folds automatic snapshot-load resume into load."
         }
-        ("#1829", MetricsProcessProducerBoundary::LoggerLifecycle) => {
-            "Delivery child #1829 owns generation-consistent logger lifecycle capture and remains unresolved in this audit slice."
+        ("#1829", MetricsProcessProducerBoundary::LoggerLifecycle)
+            if path == "logger.metrics_fails" =>
+        {
+            "Pinned Firecracker v1.16.0 defines logger.metrics_fails but has no producer; Bangbang keeps the canonical field source-neutral at zero and records every metrics publication failure only in missed_metrics_count."
+        }
+        ("#1829", MetricsProcessProducerBoundary::LoggerLifecycle)
+            if path == "logger.missed_log_count" =>
+        {
+            "Pinned Firecracker increments this counter when logger delivery fails; Bangbang records actual bounded-queue, timeout, writer, emergency, and batch-loss stages and freezes the monotonic total in the shared process cut."
+        }
+        ("#1829", MetricsProcessProducerBoundary::LoggerLifecycle)
+            if path == "logger.missed_metrics_count" =>
+        {
+            "Pinned Firecracker increments this counter when metrics publication fails; Bangbang records each failed stable-cut, build, or output attempt and advances its prior successful baseline only after complete line flush."
+        }
+        ("#1829", MetricsProcessProducerBoundary::LoggerLifecycle)
+            if path == "logger.rate_limited_log_count" =>
+        {
+            "Pinned Firecracker increments this counter when logger rate limiting rejects a record; Bangbang records limiter denial or contention fallback and freezes the monotonic total in the shared process cut."
         }
         ("#1829", MetricsProcessProducerBoundary::SignalLifecycle) => {
-            "Delivery child #1829 owns the generation-consistent SIGPIPE capture boundary and remains unresolved in this audit slice."
+            "Pinned Firecracker increments SIGPIPE and returns from its handler; Bangbang performs one atomic-only saturating update and freezes it with logger totals in the shared process cut."
         }
         ("#1830", MetricsProcessProducerBoundary::SignalLifecycle) => {
             "Delivery child #1830 owns fatal process-signal classification and remains unresolved in this audit slice."

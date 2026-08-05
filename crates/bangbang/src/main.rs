@@ -305,7 +305,6 @@ fn run(
                 .metrics_diagnostics()
                 .map_err(ProcessError::StartupTime)?;
 
-            let signal_metrics = SharedSignalMetrics::default();
             let vmm = ProcessVmm::new(
                 id,
                 env!("CARGO_PKG_VERSION"),
@@ -316,10 +315,10 @@ fn run(
             .with_pci_enabled(enable_pci)
             .with_process_serial_stdio()
             .with_process_metrics_diagnostics(process_metrics_diagnostics)
-            .with_process_signal_metrics(signal_metrics.clone())
             .with_snapshot_capture_cancellation(snapshot_cancellation.clone())
             .with_grant_authority(grant_authority.clone())
             .with_vmnet_authority(vmnet_authority);
+            let signal_metrics = vmm.process_signal_metrics();
             #[cfg(target_os = "macos")]
             let mut vmm = vmm
                 .with_pager_grant_authority(pager_grant_authority)
@@ -2724,7 +2723,7 @@ mod tests {
     use bangbang_runtime::memory_hotplug::MemoryHotplugConfigInput;
     use bangbang_runtime::metrics::{
         MetricsConfigError, MetricsConfigInput, MetricsDiagnostics, MetricsFlushError,
-        ProcessLatencyBoundary, ProcessLatencyOperation, SharedSignalMetrics,
+        ProcessLatencyBoundary, ProcessLatencyOperation,
     };
     use bangbang_runtime::mmds::MmdsDataStoreError;
     use bangbang_runtime::network::NetworkInterfaceConfigInput;
@@ -5536,14 +5535,13 @@ mod tests {
     fn no_api_periodic_metrics_failure_reschedules_and_retries_delta() {
         let mut metrics_fifo = MetricsFifo::create("periodic-retry");
         let logger_path = unique_logger_path("periodic-retry");
-        let signal_metrics = SharedSignalMetrics::default();
         let mut vmm = ProcessVmm::with_starter(
             "demo-1",
             env!("CARGO_PKG_VERSION"),
             "bangbang",
             TestInstanceStarter,
-        )
-        .with_process_signal_metrics(signal_metrics.clone());
+        );
+        let signal_metrics = vmm.process_signal_metrics();
         vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
             metrics_fifo.path(),
         )))

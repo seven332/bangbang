@@ -647,38 +647,136 @@
     {
       "field_id": "static:logger.metrics_fails",
       "boundary": "logger-lifecycle",
-      "disposition": "planned",
+      "disposition": "source-neutral",
       "delivery_issue": "#1829",
-      "rationale": "Delivery child #1829 owns generation-consistent logger lifecycle capture and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker v1.16.0 defines logger.metrics_fails but has no producer; Bangbang keeps the canonical field source-neutral at zero and records every metrics publication failure only in missed_metrics_count.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+          "anchor": "pinned source-neutral logger metrics evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "canonical source-neutral logger metrics mapping"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "all metrics failure stages preserve source-neutral metrics_fails"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1829 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:logger.missed_log_count",
       "boundary": "logger-lifecycle",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1829",
-      "rationale": "Delivery child #1829 owns generation-consistent logger lifecycle capture and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker increments this counter when logger delivery fails; Bangbang records actual bounded-queue, timeout, writer, emergency, and batch-loss stages and freezes the monotonic total in the shared process cut.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "saturating missed-log producer facade"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "generation-consistent shared process cut"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "actual logger loss-stage tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "process cut race contention and retry tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1829 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:logger.missed_metrics_count",
       "boundary": "logger-lifecycle",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1829",
-      "rationale": "Delivery child #1829 owns generation-consistent logger lifecycle capture and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker increments this counter when metrics publication fails; Bangbang records each failed stable-cut, build, or output attempt and advances its prior successful baseline only after complete line flush.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "success-only process metrics publication transaction"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "stable-cut and output failure replay tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1829 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:logger.rate_limited_log_count",
       "boundary": "logger-lifecycle",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1829",
-      "rationale": "Delivery child #1829 owns generation-consistent logger lifecycle capture and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker increments this counter when logger rate limiting rejects a record; Bangbang records limiter denial or contention fallback and freezes the monotonic total in the shared process cut.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "saturating rate-limited-log producer facade"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/rate_limiter.rs",
+          "anchor": "closed limiter denial and contention outcomes"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "generation-consistent shared process cut"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger.rs",
+          "anchor": "rate limiter denial and contention tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "process cut race contention and retry tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1829 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:patch_api_requests.drive_count",
@@ -2087,11 +2185,38 @@
     {
       "field_id": "static:signals.sigpipe",
       "boundary": "signal-lifecycle",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1829",
-      "rationale": "Delivery child #1829 owns the generation-consistent SIGPIPE capture boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker increments SIGPIPE and returns from its handler; Bangbang performs one atomic-only saturating update and freezes it with logger totals in the shared process cut.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "atomic-only returning SIGPIPE handler"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "generation-consistent shared process cut"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed live SIGPIPE generation validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "SIGPIPE race saturation and retry tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1829 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:signals.sigsegv",

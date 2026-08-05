@@ -90,11 +90,12 @@ fixed: #1827 owns 44 API request and deprecation fields, #1828 owns two startup
 and ten successful outer/inner operation-latency fields, #1829 owns four logger
 fields plus SIGPIPE, and #1830 owns six fatal-signal fields plus panic and
 seccomp.
-Only a completed child may use the `implemented` disposition and carry
-resolvable production and validation evidence. #1827 and #1828 are complete,
-so 56 records are `implemented`; the remaining 13 records stay `planned` until
-their #1829 or #1830 pull requests land. `source-neutral` and `platform-zero`
-are terminal policy choices, not aliases for an undelivered feasible producer.
+Only a completed child may use a terminal disposition and carry resolvable
+production and validation evidence. #1827 through #1829 are complete, so 60
+records are `implemented`, `logger.metrics_fails` is the sole
+`source-neutral` record, and the eight #1830 records remain `planned`.
+`source-neutral` and `platform-zero` are terminal policy choices, not aliases
+for an undelivered feasible producer.
 
 For #1827, request metrics are created as a typed, value-free effect only after
 the HTTP request passes admission. The effect is applied exactly once before
@@ -135,6 +136,27 @@ resume is part of `vmm_load_snapshot` and does not write `vmm_resume_vm`;
 explicit `PATCH /vm` resume does. Both layers use the same injectable
 process-local monotonic clock, but no ordering relationship between the two
 reported durations is promised.
+
+For #1829, one controller-owned `SharedProcessMetrics` identity supplies narrow
+logger and SIGPIPE facades plus the collection authority. Missed-log,
+rate-limited-log, and SIGPIPE producers use monotonic saturating `SeqCst`
+atomics. They never reset or wait for collection; the SIGPIPE handler performs
+only its atomic value operation and returns. The collector reads the fixed
+three-value vector twice in the same order with a `SeqCst` fence between the
+scans. If the vectors are equal, every first load precedes the fence and every
+second load follows it in the global order. Monotonicity therefore proves that
+the complete vector existed at the fence, which is the cut's linearization
+point. An update that is already saturated at `u64::MAX` is fully represented.
+
+A changed vector retries. Sixty-four changed vectors fail closed as a redacted
+busy attempt without advancing a generation or consuming an event. Every
+stable cut receives the next checked owner-local generation; exhaustion fails
+closed rather than aliasing two cuts. Control-owned `missed_metrics_count` and
+constant source-neutral `logger.metrics_fails = 0` then join that immutable
+snapshot. Pinned Firecracker has producers at logger loss, logger limiter
+denial, metrics-write failure, and SIGPIPE, but exact pinned-source search has
+no producer for `logger.metrics_fails`; Bangbang therefore never aliases a
+sink failure into that field.
 
 ## Exact Arm64 Shape
 
@@ -279,13 +301,16 @@ path redaction remain governed by the existing direct/contained process
 contract.
 
 Bangbang uses a stronger publication transaction than pinned Firecracker. One
-flush attempt must snapshot all producers before serialization. Interval values
-are computed from the last completely successful publication, and that
-baseline advances only after the entire newline-terminated line is accepted.
-A failed write retains the baseline and replays the interval. If a writer
-exposed a prefix before returning failure, observers may see an ambiguous
-partial attempt followed by an at-least-once replay; the contract does not
-claim durable or exactly-once output.
+flush attempt must snapshot all producers before serialization. The shared
+process cut above is frozen first; events ordered before its successful fence
+belong to that generation, while later events remain in monotonic totals for a
+later attempt. Interval values are computed from the last completely successful
+publication, and that baseline advances only after the entire
+newline-terminated line is accepted. A busy cut, exhausted generation, failed
+build, or failed output records one missed metrics attempt and retains the
+baseline. If a writer exposed a prefix before returning failure, observers may
+see an ambiguous partial attempt followed by an at-least-once replay; the
+contract does not claim durable or exactly-once output.
 
 Initial, periodic, explicit, and terminal flush paths must share that immutable
 attempt transaction. Producer events arriving after the snapshot belong to a

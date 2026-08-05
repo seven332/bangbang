@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, LineWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::balloon::{VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDiscardOutcome};
@@ -45,6 +45,9 @@ pub const FIRECRACKER_METRICS_MAX_IDENTITY_BYTES: usize =
 /// Maximum byte length of one complete newline-terminated Firecracker metrics record.
 pub const FIRECRACKER_METRICS_MAX_LINE_BYTES: usize =
     firecracker::FIRECRACKER_METRICS_MAX_LINE_BYTES;
+
+/// Bounds collection work without making a producer wait for the collector.
+const PROCESS_METRICS_SNAPSHOT_ATTEMPTS: usize = 64;
 
 /// A Firecracker operation with distinct outer API and inner VMM latency stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +180,8 @@ impl std::error::Error for MetricsConfigError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricsFlushError {
+    ProcessSnapshotBusy,
+    ProcessGenerationExhausted,
     Clock,
     ConfiguredDevices,
     Allocation,
@@ -190,6 +195,12 @@ pub enum MetricsFlushError {
 impl fmt::Display for MetricsFlushError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProcessSnapshotBusy => {
+                f.write_str("failed to flush metrics: process snapshot remained busy")
+            }
+            Self::ProcessGenerationExhausted => {
+                f.write_str("failed to flush metrics: process generation exhausted")
+            }
             Self::Clock => f.write_str("failed to flush metrics: clock unavailable"),
             Self::ConfiguredDevices => {
                 f.write_str("failed to flush metrics: configured device inventory is invalid")
@@ -225,6 +236,7 @@ impl From<firecracker::MetricsLineBuildError> for MetricsFlushError {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MetricsSnapshot {
+    generation: u64,
     diagnostics: MetricsDiagnostics,
     deprecated_api: DeprecatedApiMetrics,
     get_api_requests: GetApiRequestMetrics,
@@ -237,6 +249,7 @@ struct MetricsSnapshot {
 impl MetricsSnapshot {
     fn delta_since(&self, previous: &Self) -> Self {
         Self {
+            generation: self.generation,
             diagnostics: self.diagnostics.delta_since(&previous.diagnostics),
             deprecated_api: self.deprecated_api.delta_since(previous.deprecated_api),
             get_api_requests: self.get_api_requests.delta_since(previous.get_api_requests),
@@ -258,9 +271,10 @@ pub struct MetricsState {
     get_api_requests: GetApiRequestMetrics,
     latencies_us: LatencyMetrics,
     logger_metrics: LoggerMetrics,
+    process_generation: u64,
     previous_successful: MetricsSnapshot,
     serializer: Box<dyn firecracker::MetricsLineSerializer>,
-    shared_logger_metrics: SharedLoggerMetrics,
+    shared_process_metrics: SharedProcessMetrics,
     patch_api_requests: PatchApiRequestMetrics,
     put_api_requests: PutApiRequestMetrics,
 }
@@ -274,9 +288,10 @@ impl Default for MetricsState {
             get_api_requests: GetApiRequestMetrics::default(),
             latencies_us: LatencyMetrics::default(),
             logger_metrics: LoggerMetrics::default(),
+            process_generation: 0,
             previous_successful: MetricsSnapshot::default(),
             serializer: Box::<firecracker::SystemMetricsLineSerializer>::default(),
-            shared_logger_metrics: SharedLoggerMetrics::default(),
+            shared_process_metrics: SharedProcessMetrics::default(),
             patch_api_requests: PatchApiRequestMetrics::default(),
             put_api_requests: PutApiRequestMetrics::default(),
         }
@@ -298,11 +313,17 @@ impl fmt::Debug for PreparedMetricsConfig {
 }
 
 impl MetricsState {
-    pub(crate) fn with_shared_logger_metrics(shared_logger_metrics: SharedLoggerMetrics) -> Self {
+    pub(crate) fn with_shared_process_metrics(
+        shared_process_metrics: SharedProcessMetrics,
+    ) -> Self {
         Self {
-            shared_logger_metrics,
+            shared_process_metrics,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn signal_metrics(&self) -> SharedSignalMetrics {
+        self.shared_process_metrics.signal_metrics()
     }
 
     pub fn configure(&mut self, input: MetricsConfigInput) -> Result<(), MetricsConfigError> {
@@ -571,14 +592,29 @@ impl MetricsState {
         if self.sink.is_none() {
             return Ok(false);
         }
+        let Some(generation) = self.process_generation.checked_add(1) else {
+            self.logger_metrics.record_missed_metrics();
+            return Err(MetricsFlushError::ProcessGenerationExhausted);
+        };
+        let process_metrics = match self.shared_process_metrics.stable_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.logger_metrics.record_missed_metrics();
+                return Err(error);
+            }
+        };
+        self.process_generation = generation;
         let current = MetricsSnapshot {
-            diagnostics: diagnostics.clone(),
+            generation,
+            diagnostics: diagnostics.clone().merged_with(
+                MetricsDiagnostics::new().with_signal_metrics(process_metrics.signal_metrics),
+            ),
             deprecated_api: self.deprecated_api,
             get_api_requests: self.get_api_requests,
             latencies_us: self.latencies_us,
             logger_metrics: self.logger_metrics.with_log_counts(
-                self.shared_logger_metrics.missed_log_count(),
-                self.shared_logger_metrics.rate_limited_log_count(),
+                process_metrics.missed_log_count,
+                process_metrics.rate_limited_log_count,
             ),
             patch_api_requests: self.patch_api_requests,
             put_api_requests: self.put_api_requests,
@@ -788,17 +824,97 @@ pub struct SharedSignalMetrics {
 
 impl SharedSignalMetrics {
     pub fn record_sigpipe(&self) {
-        record_atomic_metric(&self.inner.sigpipe, 1);
+        record_atomic_metric_seq_cst(&self.inner.sigpipe, 1);
     }
 
     pub fn snapshot(&self) -> SignalMetrics {
-        SignalMetrics::new(self.inner.sigpipe.load(Ordering::Relaxed))
+        SignalMetrics::new(self.inner.sigpipe.load(Ordering::SeqCst))
+    }
+
+    #[cfg(test)]
+    fn set_sigpipe_for_test(&self, sigpipe: u64) {
+        self.inner.sigpipe.store(sigpipe, Ordering::SeqCst);
     }
 }
 
 #[derive(Debug, Default)]
 struct SharedSignalMetricsInner {
     sigpipe: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedProcessMetricsSnapshot {
+    missed_log_count: u64,
+    rate_limited_log_count: u64,
+    signal_metrics: SignalMetrics,
+}
+
+#[cfg(test)]
+type ProcessMetricsScanHook = Arc<dyn Fn(usize) + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub(crate) struct SharedProcessMetrics {
+    logger_metrics: SharedLoggerMetrics,
+    signal_metrics: SharedSignalMetrics,
+    #[cfg(test)]
+    scan_hook: Option<ProcessMetricsScanHook>,
+}
+
+impl fmt::Debug for SharedProcessMetrics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SharedProcessMetrics")
+            .field("logger_metrics", &"<shared>")
+            .field("signal_metrics", &"<shared>")
+            .finish()
+    }
+}
+
+impl SharedProcessMetrics {
+    pub(crate) fn logger_metrics(&self) -> SharedLoggerMetrics {
+        self.logger_metrics.clone()
+    }
+
+    pub(crate) fn signal_metrics(&self) -> SharedSignalMetrics {
+        self.signal_metrics.clone()
+    }
+
+    fn read_snapshot(&self) -> SharedProcessMetricsSnapshot {
+        SharedProcessMetricsSnapshot {
+            missed_log_count: self.logger_metrics.missed_log_count(),
+            rate_limited_log_count: self.logger_metrics.rate_limited_log_count(),
+            signal_metrics: self.signal_metrics.snapshot(),
+        }
+    }
+
+    fn stable_snapshot(&self) -> Result<SharedProcessMetricsSnapshot, MetricsFlushError> {
+        for _attempt in 0..PROCESS_METRICS_SNAPSHOT_ATTEMPTS {
+            let first = self.read_snapshot();
+            #[cfg(test)]
+            if let Some(hook) = &self.scan_hook {
+                hook(_attempt);
+            }
+            // Every producer update and both fixed-order scans are SeqCst. Equal monotonic
+            // vectors therefore prove that all three values existed together at this fence.
+            fence(Ordering::SeqCst);
+            let second = self.read_snapshot();
+            if first == second {
+                return Ok(second);
+            }
+        }
+
+        Err(MetricsFlushError::ProcessSnapshotBusy)
+    }
+
+    #[cfg(test)]
+    fn set_scan_hook(&mut self, hook: impl Fn(usize) + Send + Sync + 'static) {
+        self.scan_hook = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn clear_scan_hook(&mut self) {
+        self.scan_hook = None;
+    }
 }
 
 impl GetApiRequestMetrics {
@@ -6701,6 +6817,21 @@ fn record_atomic_metric(metric: &AtomicU64, increment: u64) {
     record_atomic_metric_with_ordering(metric, increment, Ordering::Relaxed);
 }
 
+fn record_atomic_metric_seq_cst(metric: &AtomicU64, increment: u64) {
+    let mut current = metric.load(Ordering::SeqCst);
+    while current != u64::MAX {
+        match metric.compare_exchange_weak(
+            current,
+            current.saturating_add(increment),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn record_atomic_metric_release(metric: &AtomicU64, increment: u64) {
     record_atomic_metric_with_ordering(metric, increment, Ordering::Release);
 }
@@ -7298,8 +7429,8 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::{self, ErrorKind};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -7318,11 +7449,11 @@ mod tests {
         SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics,
         SharedMemoryHotplugLatencyMetricsInner, SharedMmdsMetrics, SharedNetworkInterfaceMetrics,
         SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetrics,
-        SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedSignalMetrics,
-        SharedVsockDeviceMetrics, SignalMetrics, VirtioNetworkLatencyAggregate, VsockDeviceMetrics,
+        SharedPmemDeviceMetricsRegistry, SharedProcessMetrics, SharedRtcDeviceMetrics,
+        SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics,
+        VirtioNetworkLatencyAggregate, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
-    use crate::logger::SharedLoggerMetrics;
     use crate::network::NetworkInterfaceConfigInput;
     use crate::network::VirtioNetworkBackendMetrics;
     use crate::serial::SerialOutputMetrics;
@@ -7591,6 +7722,25 @@ mod tests {
     impl super::firecracker::MetricsClock for CountingFixedClock {
         fn now(&self) -> SystemTime {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            self.now
+        }
+    }
+
+    #[derive(Debug)]
+    struct ProcessEventClock {
+        now: SystemTime,
+        fired: Arc<AtomicBool>,
+        logger_metrics: crate::logger::SharedLoggerMetrics,
+        signal_metrics: SharedSignalMetrics,
+    }
+
+    impl super::firecracker::MetricsClock for ProcessEventClock {
+        fn now(&self) -> SystemTime {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                self.logger_metrics.record_missed_log();
+                self.logger_metrics.record_rate_limited_log();
+                self.signal_metrics.record_sigpipe();
+            }
             self.now
         }
     }
@@ -7909,6 +8059,7 @@ mod tests {
 
         assert_eq!(state.flush(), Ok(false));
         assert!(!state.is_configured());
+        assert_eq!(state.process_generation, 0);
 
         let output = TestMetricsOutput::default();
         state.sink = Some(super::MetricsSink::new(Box::new(output.clone())));
@@ -7947,8 +8098,7 @@ mod tests {
     fn repeated_flushes_emit_all_increment_fields_and_preserve_stores() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
-        let shared_logger_metrics = SharedLoggerMetrics::default();
-        state.shared_logger_metrics = shared_logger_metrics.clone();
+        let shared_logger_metrics = state.shared_process_metrics.logger_metrics();
         let first = diagnostics_with_all_fields();
         let next = first
             .clone()
@@ -8105,11 +8255,12 @@ mod tests {
     fn independent_metrics_states_do_not_consume_each_others_deltas() {
         let first_output = TestMetricsOutput::default();
         let second_output = TestMetricsOutput::default();
-        let shared_logger_metrics = SharedLoggerMetrics::default();
+        let shared_process_metrics = SharedProcessMetrics::default();
+        let shared_logger_metrics = shared_process_metrics.logger_metrics();
         let mut first = MetricsState::with_test_output(first_output.clone());
         let mut second = MetricsState::with_test_output(second_output.clone());
-        first.shared_logger_metrics = shared_logger_metrics.clone();
-        second.shared_logger_metrics = shared_logger_metrics.clone();
+        first.shared_process_metrics = shared_process_metrics.clone();
+        second.shared_process_metrics = shared_process_metrics;
 
         shared_logger_metrics.record_missed_log();
         assert_eq!(first.flush(), Ok(true));
@@ -8413,11 +8564,300 @@ mod tests {
     }
 
     #[test]
+    fn stable_process_snapshot_retries_a_racing_event_into_one_generation() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let logger_metrics = state.shared_process_metrics.logger_metrics();
+        let signal_metrics = state.shared_process_metrics.signal_metrics();
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        state.shared_process_metrics.set_scan_hook({
+            let logger_metrics = logger_metrics.clone();
+            let signal_metrics = signal_metrics.clone();
+            let hook_calls = Arc::clone(&hook_calls);
+            move |attempt| {
+                hook_calls.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    logger_metrics.record_missed_log();
+                    logger_metrics.record_rate_limited_log();
+                    signal_metrics.record_sigpipe();
+                }
+            }
+        });
+
+        assert_eq!(state.flush(), Ok(true));
+
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.process_generation, 1);
+        assert_eq!(state.previous_successful.generation, 1);
+        let value = only_metrics_value(&output);
+        assert_eq!(value["logger"]["missed_log_count"], 1);
+        assert_eq!(value["logger"]["rate_limited_log_count"], 1);
+        assert_eq!(value["logger"]["metrics_fails"], 0);
+        assert_eq!(value["signals"]["sigpipe"], 1);
+    }
+
+    #[test]
+    fn process_snapshot_preserves_exact_totals_under_producer_contention() {
+        const PRODUCERS: usize = 4;
+        const EVENTS_PER_PRODUCER: usize = 5_000;
+
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let logger_metrics = state.shared_process_metrics.logger_metrics();
+        let signal_metrics = state.shared_process_metrics.signal_metrics();
+        let release = Arc::new(Barrier::new(PRODUCERS + 1));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let handles = (0..PRODUCERS)
+            .map(|_| {
+                let logger_metrics = logger_metrics.clone();
+                let signal_metrics = signal_metrics.clone();
+                let release = Arc::clone(&release);
+                let finished = Arc::clone(&finished);
+                thread::spawn(move || {
+                    release.wait();
+                    for _ in 0..EVENTS_PER_PRODUCER {
+                        logger_metrics.record_missed_log();
+                        logger_metrics.record_rate_limited_log();
+                        signal_metrics.record_sigpipe();
+                    }
+                    finished.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        state.shared_process_metrics.set_scan_hook({
+            let release = Arc::clone(&release);
+            let finished = Arc::clone(&finished);
+            let hook_calls = Arc::clone(&hook_calls);
+            move |attempt| {
+                hook_calls.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    release.wait();
+                    while finished.load(Ordering::SeqCst) != PRODUCERS {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        });
+
+        assert_eq!(state.flush(), Ok(true));
+        for handle in handles {
+            handle.join().expect("metrics producer should finish");
+        }
+
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+        let expected = u64::try_from(PRODUCERS * EVENTS_PER_PRODUCER)
+            .expect("test event count should fit u64");
+        let value = only_metrics_value(&output);
+        assert_eq!(value["logger"]["missed_log_count"], expected);
+        assert_eq!(value["logger"]["rate_limited_log_count"], expected);
+        assert_eq!(value["signals"]["sigpipe"], expected);
+    }
+
+    #[test]
+    fn saturated_process_events_are_already_represented_by_a_stable_cut() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let logger_metrics = state.shared_process_metrics.logger_metrics();
+        let signal_metrics = state.shared_process_metrics.signal_metrics();
+        logger_metrics.set_counts_for_test(u64::MAX, u64::MAX);
+        signal_metrics.set_sigpipe_for_test(u64::MAX);
+        state.shared_process_metrics.set_scan_hook({
+            let logger_metrics = logger_metrics.clone();
+            let signal_metrics = signal_metrics.clone();
+            move |_| {
+                logger_metrics.record_missed_log();
+                logger_metrics.record_rate_limited_log();
+                signal_metrics.record_sigpipe();
+            }
+        });
+
+        assert_eq!(state.flush(), Ok(true));
+
+        let value = only_metrics_value(&output);
+        assert_eq!(value["logger"]["missed_log_count"], u64::MAX);
+        assert_eq!(value["logger"]["rate_limited_log_count"], u64::MAX);
+        assert_eq!(value["signals"]["sigpipe"], u64::MAX);
+        assert_eq!(state.process_generation, 1);
+    }
+
+    #[test]
+    fn busy_process_snapshot_retains_events_and_successful_baseline_for_retry() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let logger_metrics = state.shared_process_metrics.logger_metrics();
+        let signal_metrics = state.shared_process_metrics.signal_metrics();
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        state.shared_process_metrics.set_scan_hook({
+            let logger_metrics = logger_metrics.clone();
+            let signal_metrics = signal_metrics.clone();
+            let hook_calls = Arc::clone(&hook_calls);
+            move |_| {
+                hook_calls.fetch_add(1, Ordering::SeqCst);
+                logger_metrics.record_missed_log();
+                logger_metrics.record_rate_limited_log();
+                signal_metrics.record_sigpipe();
+            }
+        });
+
+        let error = state
+            .flush()
+            .expect_err("continuous process changes must exhaust the bounded scan");
+        assert_eq!(error, MetricsFlushError::ProcessSnapshotBusy);
+        assert_eq!(
+            error.to_string(),
+            "failed to flush metrics: process snapshot remained busy"
+        );
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 64);
+        assert!(output.lines().is_empty());
+        assert_eq!(state.process_generation, 0);
+        assert_eq!(state.previous_successful.generation, 0);
+        assert_eq!(state.logger_metrics.missed_metrics_count, 1);
+
+        state.shared_process_metrics.clear_scan_hook();
+        assert_eq!(state.flush(), Ok(true));
+
+        assert_eq!(state.process_generation, 1);
+        assert_eq!(state.previous_successful.generation, 1);
+        let value = only_metrics_value(&output);
+        assert_eq!(value["logger"]["missed_log_count"], 64);
+        assert_eq!(value["logger"]["missed_metrics_count"], 1);
+        assert_eq!(value["logger"]["rate_limited_log_count"], 64);
+        assert_eq!(value["logger"]["metrics_fails"], 0);
+        assert_eq!(value["signals"]["sigpipe"], 64);
+    }
+
+    #[test]
+    fn exhausted_process_generation_fails_closed_without_aliasing_a_cut() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        state.process_generation = u64::MAX;
+
+        let error = state
+            .flush()
+            .expect_err("an exhausted generation must fail closed");
+
+        assert_eq!(error, MetricsFlushError::ProcessGenerationExhausted);
+        assert_eq!(
+            error.to_string(),
+            "failed to flush metrics: process generation exhausted"
+        );
+        assert!(output.lines().is_empty());
+        assert_eq!(state.process_generation, u64::MAX);
+        assert_eq!(state.previous_successful.generation, 0);
+        assert_eq!(state.logger_metrics.missed_metrics_count, 1);
+    }
+
+    #[test]
+    fn events_after_a_frozen_process_cut_enter_the_next_generation() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let logger_metrics = state.shared_process_metrics.logger_metrics();
+        let signal_metrics = state.shared_process_metrics.signal_metrics();
+        state.clock = Box::new(ProcessEventClock {
+            now: UNIX_EPOCH + Duration::from_millis(1),
+            fired: Arc::new(AtomicBool::new(false)),
+            logger_metrics,
+            signal_metrics,
+        });
+
+        assert_eq!(state.flush(), Ok(true));
+        assert_eq!(state.flush(), Ok(true));
+
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["logger"]["missed_log_count"], 0);
+        assert_eq!(values[0]["logger"]["rate_limited_log_count"], 0);
+        assert_eq!(values[0]["signals"]["sigpipe"], 0);
+        assert_eq!(values[1]["logger"]["missed_log_count"], 1);
+        assert_eq!(values[1]["logger"]["rate_limited_log_count"], 1);
+        assert_eq!(values[1]["signals"]["sigpipe"], 1);
+        assert_eq!(state.process_generation, 2);
+        assert_eq!(state.previous_successful.generation, 2);
+    }
+
+    #[test]
+    fn failed_output_retries_post_cut_events_from_the_prior_successful_generation() {
+        let output = TestMetricsOutput::default();
+        output.fail_next_write();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let logger_metrics = state.shared_process_metrics.logger_metrics();
+        let signal_metrics = state.shared_process_metrics.signal_metrics();
+        state.clock = Box::new(ProcessEventClock {
+            now: UNIX_EPOCH + Duration::from_millis(1),
+            fired: Arc::new(AtomicBool::new(false)),
+            logger_metrics,
+            signal_metrics,
+        });
+
+        assert_eq!(
+            state.flush(),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(state.process_generation, 1);
+        assert_eq!(state.previous_successful.generation, 0);
+        assert_eq!(state.flush(), Ok(true));
+
+        let value = only_metrics_value(&output);
+        assert_eq!(value["logger"]["missed_log_count"], 1);
+        assert_eq!(value["logger"]["missed_metrics_count"], 1);
+        assert_eq!(value["logger"]["rate_limited_log_count"], 1);
+        assert_eq!(value["logger"]["metrics_fails"], 0);
+        assert_eq!(value["signals"]["sigpipe"], 1);
+        assert_eq!(state.process_generation, 2);
+        assert_eq!(state.previous_successful.generation, 2);
+    }
+
+    #[test]
+    fn every_metrics_failure_stage_keeps_logger_metrics_fails_source_neutral() {
+        enum FailureStage {
+            Serialization,
+            Write,
+            AcceptedWrite,
+            Newline,
+            Flush,
+        }
+
+        for stage in [
+            FailureStage::Serialization,
+            FailureStage::Write,
+            FailureStage::AcceptedWrite,
+            FailureStage::Newline,
+            FailureStage::Flush,
+        ] {
+            let output = TestMetricsOutput::default();
+            let mut state = MetricsState::with_test_output(output.clone());
+            match stage {
+                FailureStage::Serialization => {
+                    state.serializer = Box::new(FailingMetricsLineSerializer(
+                        super::firecracker::MetricsLineBuildError::Serialization,
+                    ));
+                }
+                FailureStage::Write => output.fail_next_write(),
+                FailureStage::AcceptedWrite => output.accept_next_write_then_fail(),
+                FailureStage::Newline => output.fail_next_newline(),
+                FailureStage::Flush => output.fail_next_flush(),
+            }
+
+            assert!(state.flush().is_err());
+            state.serializer = Box::<super::firecracker::SystemMetricsLineSerializer>::default();
+            assert_eq!(state.flush(), Ok(true));
+
+            let values = metrics_values(&output);
+            let value = values
+                .last()
+                .expect("successful retry should publish a metrics line");
+            assert_eq!(value["logger"]["missed_metrics_count"], 1);
+            assert_eq!(value["logger"]["metrics_fails"], 0);
+        }
+    }
+
+    #[test]
     fn logger_metrics_include_delivery_and_rate_limit_counts() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
-        let shared_logger_metrics = SharedLoggerMetrics::default();
-        state.shared_logger_metrics = shared_logger_metrics.clone();
+        let shared_logger_metrics = state.shared_process_metrics.logger_metrics();
 
         shared_logger_metrics.record_missed_log();
         shared_logger_metrics.record_rate_limited_log();

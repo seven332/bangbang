@@ -690,23 +690,33 @@ fields, newer balloon API/device fields, extra UART fields, and the ordinary
 block configuration-change value remain internal or are discarded at the
 public boundary. Adding an extension requires a separately versioned schema.
 
-One flush snapshots all producers and captures the Unix-millisecond clock once.
-It serializes that immutable value first into a counting writer and then into
+One flush first freezes missed-log, rate-limited-log, and SIGPIPE totals through
+two fixed-order `SeqCst` scans separated by a `SeqCst` fence. Equal monotonic
+vectors establish that fence as a common process cut; a racing update forces a
+retry, and 64 mismatches fail closed without resetting or consuming producer
+state. A stable cut receives a checked internal generation, joins
+control-owned missed-metrics state, and captures the Unix-millisecond clock
+once. Logger and SIGPIPE producers remain lock-free, collector-independent,
+and saturating; the signal handler performs no allocation, lock, I/O,
+collection, or unwind.
+
+The immutable value is serialized first into a counting writer and then into
 an exactly reserved fixed-capacity buffer. A complete JSON-plus-newline record
-may be at most 64 MiB. Count, allocation, serialization, or size failure occurs
-before sink access. Publication then writes all JSON bytes, exactly one newline,
-and flushes. The typed previous-successful baseline advances only after all
-three stages succeed; every failure increments `logger.missed_metrics_count`
-and retains the old baseline. A sink may accept a prefix before reporting an
-error, so a later success intentionally replays the interval with at-least-once,
-not exactly-once or durable, semantics.
+may be at most 64 MiB. Busy/generation, count, allocation, serialization, or
+size failure occurs before sink access. Publication then writes all JSON bytes,
+exactly one newline, and flushes. The typed previous-successful baseline
+advances only after all three stages succeed; every failed attempt increments
+`logger.missed_metrics_count` and retains the old baseline. A sink may accept a
+prefix before reporting an error, so a later success intentionally replays the
+interval with at-least-once, not exactly-once or durable, semantics.
 
 Issue #717 remains `NOT_PLANNED` because Firecracker exposes no
 `GET /vm/config` request metric field, so its absence from the schema is not
 filled with a Bangbang extension. Issue #738 remains `NOT_PLANNED` because
 Firecracker's write-failure path increments `missed_metrics_count`, not
-`logger.metrics_fails`; the required `logger.metrics_fails` field is emitted as
-zero until an exact producer exists.
+`logger.metrics_fails`; exact pinned v1.16.0 source has no producer for the
+latter, so Bangbang terminally classifies the required field as source-neutral
+zero rather than inventing a duplicate sink-failure counter.
 
 ### Metrics triggers and errors
 

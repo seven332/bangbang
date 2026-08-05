@@ -5725,7 +5725,6 @@ where
     terminal_metrics_attempted: bool,
     process_metrics_diagnostics: MetricsDiagnostics,
     process_latency_clock: Box<dyn ProcessLatencyClock>,
-    process_signal_metrics: Option<SharedSignalMetrics>,
     process_stdout: Option<ProcessStdoutLogger>,
     snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation,
     terminal_snapshot_load_failure: bool,
@@ -5842,7 +5841,6 @@ where
             terminal_metrics_attempted: false,
             process_metrics_diagnostics: MetricsDiagnostics::default(),
             process_latency_clock: Box::<SystemProcessLatencyClock>::default(),
-            process_signal_metrics: None,
             process_stdout: None,
             snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation::default(),
             terminal_snapshot_load_failure: false,
@@ -5895,9 +5893,8 @@ where
         self
     }
 
-    pub(crate) fn with_process_signal_metrics(mut self, metrics: SharedSignalMetrics) -> Self {
-        self.process_signal_metrics = Some(metrics);
-        self
+    pub(crate) fn process_signal_metrics(&self) -> SharedSignalMetrics {
+        self.controller.process_signal_metrics()
     }
 
     pub(crate) fn install_process_stdout_logger(
@@ -7872,14 +7869,8 @@ where
             .map(ProcessSessionDiagnostics::metrics_diagnostics)
             .or_else(|| self.terminal_session_metrics.clone())
             .unwrap_or_default();
-        let signal_diagnostics = self
-            .process_signal_metrics
-            .as_ref()
-            .map(|metrics| MetricsDiagnostics::new().with_signal_metrics(metrics.snapshot()))
-            .unwrap_or_default();
         self.process_metrics_diagnostics
             .clone()
-            .merged_with(signal_diagnostics)
             .merged_with(self.starter.metrics_diagnostics())
             .merged_with(session_diagnostics)
     }
@@ -36875,8 +36866,8 @@ mod tests {
         PmemDeviceMetrics, PmemDeviceMetricsByDevice, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
         SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
         SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics, SharedNetworkInterfaceMetricsRegistry,
-        SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedSignalMetrics,
-        SharedVsockDeviceMetrics, VsockDeviceMetrics,
+        SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedVsockDeviceMetrics,
+        VsockDeviceMetrics,
     };
     use bangbang_runtime::mmds::{
         DEFAULT_MMDS_IPV4_ADDRESS, DEFAULT_MMDS_MAC_ADDRESS, MMDS_GUEST_TCP_PORT, MmdsConfig,
@@ -65786,14 +65777,13 @@ mod tests {
     #[test]
     fn flush_metrics_includes_process_signal_metrics() {
         let metrics = TempFilePath::create("metrics");
-        let signal_metrics = SharedSignalMetrics::default();
         let mut vmm = ProcessVmm::with_starter(
             "demo-1",
             "0.1.0",
             "bangbang",
             DiagnosticStarter::new(BootRunLoopMetricStatus::Running),
-        )
-        .with_process_signal_metrics(signal_metrics.clone());
+        );
+        let signal_metrics = vmm.process_signal_metrics();
         vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
             metrics.path(),
         )))
@@ -65808,9 +65798,12 @@ mod tests {
         signal_metrics.record_sigpipe();
         vmm.handle_action(VmmAction::FlushMetrics)
             .expect("metrics should flush");
+        vmm.handle_action(VmmAction::FlushMetrics)
+            .expect("the next metrics generation should flush");
 
-        let values = read_canonical_metrics_lines(metrics.path(), 1);
+        let values = read_canonical_metrics_lines(metrics.path(), 2);
         assert_eq!(values[0]["signals"]["sigpipe"], 1);
+        assert_eq!(values[1]["signals"]["sigpipe"], 0);
     }
 
     #[test]

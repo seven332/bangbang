@@ -101,7 +101,17 @@ fn checked_process_producer_audit_is_canonical_and_exact() {
                 record.disposition == MetricsProcessProducerDisposition::Implemented
             })
             .count(),
-        56
+        60
+    );
+    assert_eq!(
+        audit
+            .records
+            .iter()
+            .filter(|record| {
+                record.disposition == MetricsProcessProducerDisposition::SourceNeutral
+            })
+            .count(),
+        1
     );
     assert_eq!(
         audit
@@ -109,8 +119,20 @@ fn checked_process_producer_audit_is_canonical_and_exact() {
             .iter()
             .filter(|record| record.disposition == MetricsProcessProducerDisposition::Planned)
             .count(),
-        13
+        8
     );
+    for record in audit
+        .records
+        .iter()
+        .filter(|record| record.delivery_issue == "#1829")
+    {
+        let expected = if record.field_id == "static:logger.metrics_fails" {
+            MetricsProcessProducerDisposition::SourceNeutral
+        } else {
+            MetricsProcessProducerDisposition::Implemented
+        };
+        assert_eq!(record.disposition, expected, "{}", record.field_id);
+    }
 
     let error = validate_metrics_process_producers(&audit, &authority, &root, AuditMode::Final)
         .expect_err("planned downstream process producers must fail global final mode")
@@ -186,7 +208,7 @@ fn process_producer_audit_rejects_boundary_child_and_completion_drift() {
     let downstream = premature
         .records
         .iter_mut()
-        .find(|record| record.delivery_issue == "#1829")
+        .find(|record| record.delivery_issue == "#1830")
         .expect("downstream record must exist");
     downstream.disposition = MetricsProcessProducerDisposition::Implemented;
     downstream.implementation.push(Reference::Local {
@@ -212,6 +234,30 @@ fn process_producer_audit_rejects_neutral_aliases_and_bad_evidence() {
     assert!(
         process_validation_error(&neutral)
             .contains("completed process metrics producer must be implemented")
+    );
+
+    let mut fabricated_metrics_fails_producer = checked_process_audit();
+    fabricated_metrics_fails_producer
+        .records
+        .iter_mut()
+        .find(|record| record.field_id == "static:logger.metrics_fails")
+        .expect("logger metrics_fails record must exist")
+        .disposition = MetricsProcessProducerDisposition::Implemented;
+    assert!(
+        process_validation_error(&fabricated_metrics_fails_producer)
+            .contains("completed #1829 process metric has the wrong exact disposition")
+    );
+
+    let mut neutral_missed_log = checked_process_audit();
+    neutral_missed_log
+        .records
+        .iter_mut()
+        .find(|record| record.field_id == "static:logger.missed_log_count")
+        .expect("missed log record must exist")
+        .disposition = MetricsProcessProducerDisposition::SourceNeutral;
+    assert!(
+        process_validation_error(&neutral_missed_log)
+            .contains("completed #1829 process metric has the wrong exact disposition")
     );
 
     let mut missing = checked_process_audit();
