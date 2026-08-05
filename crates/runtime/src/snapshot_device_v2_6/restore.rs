@@ -10,6 +10,7 @@ use crate::block::{BlockFileBacking, DriveConfigs};
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestMemory, GuestMemoryRange};
 use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::metrics::SharedPmemDeviceMetrics;
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::PciSbdf;
 use crate::pmem::{
@@ -528,6 +529,16 @@ impl PreparedSnapshotV2PmemRecord {
         &self.device
     }
 
+    pub fn attach_metrics(
+        &mut self,
+        device: SharedPmemDeviceMetrics,
+        aggregate: SharedPmemDeviceMetrics,
+    ) {
+        self.prepared_device
+            .attach_metrics(device.clone(), aggregate.clone());
+        self.device.attach_metrics(device, aggregate);
+    }
+
     /// Consumes the complete detached pmem owner.
     pub fn into_parts(self) -> PreparedSnapshotV2PmemRecordParts {
         (
@@ -617,6 +628,16 @@ impl PreparedSnapshotV2StorageMmioPmemRecord {
         &self.handler
     }
 
+    pub fn attach_metrics(
+        &mut self,
+        device: SharedPmemDeviceMetrics,
+        aggregate: SharedPmemDeviceMetrics,
+    ) {
+        self.prepared_device
+            .attach_metrics(device.clone(), aggregate.clone());
+        self.handler.attach_pmem_metrics(device, aggregate);
+    }
+
     /// Consumes the unpublished handler and authoritative mapping owner.
     pub fn into_parts(self) -> PreparedSnapshotV2StorageMmioPmemRecordParts {
         (
@@ -692,6 +713,18 @@ impl PreparedSnapshotV2StoragePciPmemRecord {
 
     pub const fn prepared_device(&self) -> &PreparedPmemDevice {
         &self.prepared_device
+    }
+
+    pub fn attach_metrics(
+        &mut self,
+        device: SharedPmemDeviceMetrics,
+        aggregate: SharedPmemDeviceMetrics,
+    ) {
+        self.prepared_device
+            .attach_metrics(device.clone(), aggregate.clone());
+        self.config_space
+            .attach_metrics(device.clone(), aggregate.clone());
+        self.device.attach_metrics(device, aggregate);
     }
 
     /// Completes retained endpoint preparation against the destination's

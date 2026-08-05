@@ -42,10 +42,11 @@ descriptor-equality test. #1823 certifies the bounded #1787 API/schema slice,
 including the schema-runtime timestamp producer. #1788 certifies the exact
 API, process, logger, signal, boot, and lifecycle producers through two
 implemented aggregate profiles and the field-level process audit. The checked
-device audit now assigns every #1789 field to one concrete delivery child, but
-all records remain nonterminal. `corpus:metrics` and the cross-producer
-aggregate semantic remain #1790-owned. A required zero therefore proves
-wire-shape completeness only, never producer completion.
+device audit now assigns every #1789 field to one concrete delivery child and
+terminally certifies the 23 #1838 records; later child records remain
+nonterminal. `corpus:metrics` and the cross-producer aggregate semantic remain
+#1790-owned. A required zero therefore proves wire-shape completeness only,
+never producer completion unless its field audit is terminal.
 
 ## Terminal API and Schema Certification
 
@@ -206,7 +207,7 @@ installation or fault producer and Bangbang rejects both runtime seccomp CLI
 forms. The generic SIGSYS handler preserves exit-code compatibility only and
 must never be aliased into `seccomp.num_faults`.
 
-## Nonterminal Device Producer Audit
+## Incremental Device Producer Audit
 
 The device audit is an exact, lexicographically sorted bijection over all 231
 schema fields owned by device producer profiles. Missing, duplicate, stale,
@@ -217,12 +218,27 @@ Static and configured identities remain distinct; exact suffix routing splits
 mapped network fields from tap-oriented gaps and applicable vCPU exits from
 retained PIO/KVM-clock fields.
 
-The initial audit contains 216 `planned` records and 15
-`provisional-platform-zero` records. Both dispositions are nonterminal, carry
-empty implementation and validation arrays, and have no platform exclusion.
-The provisional records are the six retained i8042 fields plus nine vCPU
-PIO/KVM-clock fields; this label does not claim that the terminal platform
-evidence required by #1846 already exists.
+After #1838, the audit contains 193 `planned`, 15
+`provisional-platform-zero`, 22 `implemented`, and one `source-neutral`
+record. The 23 terminal records cover the complete pinned entropy, pmem, RTC,
+and UART roots. `uart.flush_count` is the source-neutral record because pinned
+Firecracker declares the field but has no producer; receive-FIFO clearing and
+other Bangbang-only serial diagnostics do not feed it. The remaining planned
+and provisional records are nonterminal, carry empty implementation and
+validation arrays, and have no platform exclusion. The provisional records
+are the six retained i8042 fields plus nine vCPU PIO/KVM-clock fields; this
+label does not claim that the terminal platform evidence required by #1846
+already exists.
+
+Entropy, pmem, RTC, and UART counters use one narrow owner-local value lock per
+immutable snapshot. A compound producer update and a snapshot therefore cannot
+expose a partially applied tuple. Pmem's aggregate and each current device
+generation are separate coherent owners; no cross-owner atomic cut is claimed.
+Entropy counts a request when its descriptor is popped, including parse,
+limiter, source, and publication failures, while a pre-dispatch host-source
+provider acquisition failure remains internal. RTC distinguishes missed
+register accesses from width/data bus failures. UART limiter drops count both
+the attempted write and the dropped byte.
 
 Later producer children may replace only their exact records with terminal
 `implemented`, `source-neutral`, or `platform-zero` dispositions. Terminal

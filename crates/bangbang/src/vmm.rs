@@ -54000,8 +54000,8 @@ mod tests {
             supervisor.metrics_diagnostics().entropy_device_metrics(),
             Some(
                 EntropyDeviceMetrics::default()
-                    .with_entropy_event_fails(2)
-                    .with_host_rng_fails(1)
+                    .with_entropy_event_fails(1)
+                    .with_source_provider_fails(1)
             )
         );
 

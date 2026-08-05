@@ -131,9 +131,10 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo check --workspace --all-targets --all-features --locked
 ```
 
-The ordinary audit also validates the exact nonterminal 231-field device
-producer authority for #1789: 216 planned records and 15 provisional
-platform-zero records partitioned across its nine delivery children.
+The ordinary audit also validates the exact 231-field device producer
+authority for #1789. The completed #1838 slice contributes 22 implemented
+entropy/pmem/RTC/UART records and one source-neutral UART record; 193 planned
+and 15 provisional platform-zero records remain across the later children.
 
 The terminal 69-field API/process metrics producer scope has a separate
 fail-closed certification gate:

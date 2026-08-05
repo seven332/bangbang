@@ -695,6 +695,17 @@ fields, newer balloon API/device fields, extra UART fields, and the ordinary
 block configuration-change value remain internal or are discarded at the
 public boundary. Adding an extension requires a separately versioned schema.
 
+The checked device-producer audit now terminally certifies all 23 #1838 fields:
+22 entropy, pmem, RTC, and UART fields are implemented, while
+`uart.flush_count` is source-neutral zero because pinned Firecracker has no
+producer for it. Each device owner publishes an immutable compound counter
+snapshot. Entropy counts popped requests before parse or throttling; pmem binds
+configuration and activation failures to both the exact current generation and
+the aggregate; RTC records missed counters only for invalid/read-only register
+accesses; UART limiter drops count an attempted write while FIFO clears and
+host-input/state failures stay internal. Later #1839–#1846 records remain
+nonterminal and repository-final certification remains gated on their delivery.
+
 One flush first freezes missed-log, rate-limited-log, and SIGPIPE totals through
 two fixed-order `SeqCst` scans separated by a `SeqCst` fence. Equal monotonic
 vectors establish that fence as a common process cut; a racing update forces a

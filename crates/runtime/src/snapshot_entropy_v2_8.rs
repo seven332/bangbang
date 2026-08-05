@@ -18,6 +18,7 @@ use crate::entropy::{
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestMemory, GuestMemoryRange};
 use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::metrics::SharedEntropyDeviceMetrics;
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::PciSbdf;
 use crate::snapshot_device_v2::{
@@ -470,6 +471,18 @@ pub struct SnapshotV2EntropyRestorePlan {
 }
 
 impl SnapshotV2EntropyRestorePlan {
+    /// Binds one fresh destination-local metrics owner before transport materialization.
+    pub fn attach_metrics(&mut self, metrics: SharedEntropyDeviceMetrics) {
+        match &mut self.transport {
+            PreparedSnapshotV2EntropyTransport::Mmio(mmio) => {
+                mmio.device.attach_metrics(metrics);
+            }
+            PreparedSnapshotV2EntropyTransport::Pci(pci) => {
+                pci.device.attach_metrics(metrics);
+            }
+        }
+    }
+
     /// Validates and reconstructs one decoded entropy continuation at a
     /// destination-local monotonic-time sample.
     pub fn prepare(
@@ -860,6 +873,10 @@ impl PreparedSnapshotV2EntropyMmioHandler {
     /// Returns the fully restored, still-unpublished handler.
     pub const fn handler(&self) -> &VirtioRngMmioHandler {
         &self.handler
+    }
+
+    pub fn attach_metrics(&mut self, metrics: SharedEntropyDeviceMetrics) {
+        self.handler.attach_entropy_metrics(metrics);
     }
 
     /// Consumes the value into continuation, placement, and inert handler.

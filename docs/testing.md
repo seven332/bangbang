@@ -1553,10 +1553,23 @@ cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --lock
 
 The adjacent human-owned `metrics-device-producer-audit.json` maps all 231
 device-owned fields to closed operation boundaries and the nine concrete #1789
-children. Its 216 planned and 15 provisional-platform-zero records are
-intentionally nonterminal and contain no evidence. The same focused test checks
-canonical bytes, exact membership and partition, suffix routing, provisional
-state, anchored-evidence rules, and final-mode rejection.
+children. After #1838 it contains 22 implemented entropy/pmem/RTC/UART fields,
+one source-neutral `uart.flush_count`, 193 planned fields, and 15
+provisional-platform-zero fields. Only the latter two groups are nonterminal
+and evidence-free. The same focused test checks canonical bytes, exact
+membership and partition, completed-child regression, future-child premature
+promotion, the UART-flush disposition, suffix routing, provisional state,
+anchored-evidence rules, and final-mode rejection of the remaining 208 records.
+
+Focused #1838 producer coverage lives with the owning runtime modules. It
+checks entropy popped-descriptor accounting and owner attachment, exact pmem
+config reads/no-op writes plus aggregate/per-generation attachment, RTC bus
+versus missed-register classification, UART output/drop/FIFO boundaries, and
+owner-local compound snapshot coherence. The HVF library tests additionally
+drive registered MMIO entropy activation and pmem configuration failures into
+the bound session owners. The full signed wrapper remains required before a PR
+is submitted so the same MMIO/PCI startup, restore, and production boundaries
+are exercised on Apple Silicon.
 
 The ordinary `compare` command rederives the source projection together with
 the general and logger manifests. To create a metrics source-only candidate:
@@ -1618,8 +1631,9 @@ partition with final-mode validation of the exact process audit, while retaining
 logger and device-audit validation in delivery mode. It requires the two
 implemented process profiles and all 69 field records to remain terminal at
 exactly 64 implemented, one source-neutral, and four platform-zero. Ten planned
-and four platform-zero device profiles and all 231 device audit records remain
-#1789-owned and nonterminal, and the two aggregates remain #1790-owned.
+and four platform-zero device profiles remain #1789-owned; within the 231-field
+device audit, #1838's 23 records are terminal and the other 208 remain
+nonterminal. The two aggregates remain #1790-owned.
 The composed test mutates both a field record and an aggregate process profile;
 the lower-level suite separately exercises every membership, ordering,
 ownership, boundary, child, rationale, disposition, evidence, path, and baseline

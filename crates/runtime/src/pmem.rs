@@ -22,9 +22,10 @@ use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryLayout,
     GuestMemoryRange, aarch64,
 };
+use crate::metrics::SharedPmemDeviceMetrics;
 use crate::mmio::{
-    MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
-    MmioHandlerError, MmioRegion, MmioRegionId,
+    MAX_MMIO_ACCESS_BYTES, MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError,
+    MmioDispatcher, MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
 };
 use crate::token_bucket::{
     PersistedTokenBucketState, PersistedTokenBucketStateError, TokenBucket, TokenBucketConfig,
@@ -75,26 +76,57 @@ pub const fn aligned_pmem_mapping_len(len: u64) -> Option<u64> {
 pub type VirtioPmemMmioHandler = VirtioMmioRegisterHandler<VirtioPmemConfigSpace, VirtioPmemDevice>;
 pub type VirtioPmemPciEndpoint = VirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice>;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+struct VirtioPmemTransportMetrics {
+    device: SharedPmemDeviceMetrics,
+    aggregate: SharedPmemDeviceMetrics,
+}
+
+impl VirtioPmemTransportMetrics {
+    fn record_activation_failure(&self) {
+        self.device.record_activation_failure();
+        self.aggregate.record_activation_failure();
+    }
+
+    fn record_config_failure(&self) {
+        self.device.record_config_failure();
+        self.aggregate.record_config_failure();
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct VirtioPmemConfigSpace {
     start: u64,
     size: u64,
+    metrics: Option<VirtioPmemTransportMetrics>,
 }
+
+impl PartialEq for VirtioPmemConfigSpace {
+    fn eq(&self, other: &Self) -> bool {
+        self.start == other.start && self.size == other.size
+    }
+}
+
+impl Eq for VirtioPmemConfigSpace {}
 
 impl VirtioPmemConfigSpace {
     pub const fn new(start: u64, size: u64) -> Self {
-        Self { start, size }
+        Self {
+            start,
+            size,
+            metrics: None,
+        }
     }
 
-    pub const fn start(self) -> u64 {
+    pub const fn start(&self) -> u64 {
         self.start
     }
 
-    pub const fn size(self) -> u64 {
+    pub const fn size(&self) -> u64 {
         self.size
     }
 
-    pub const fn available_features(self) -> u64 {
+    pub const fn available_features(&self) -> u64 {
         virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
     }
 
@@ -122,10 +154,11 @@ impl VirtioPmemConfigSpace {
                 start0, start1, start2, start3, start4, start5, start6, start7,
             ]),
             size: u64::from_le_bytes([size0, size1, size2, size3, size4, size5, size6, size7]),
+            metrics: None,
         }
     }
 
-    pub fn to_le_bytes(self) -> [u8; VIRTIO_PMEM_CONFIG_SPACE_SIZE] {
+    pub fn to_le_bytes(&self) -> [u8; VIRTIO_PMEM_CONFIG_SPACE_SIZE] {
         let [
             start0,
             start1,
@@ -143,6 +176,14 @@ impl VirtioPmemConfigSpace {
             size3, size4, size5, size6, size7,
         ]
     }
+
+    pub fn attach_metrics(
+        &mut self,
+        device: SharedPmemDeviceMetrics,
+        aggregate: SharedPmemDeviceMetrics,
+    ) {
+        self.metrics = Some(VirtioPmemTransportMetrics { device, aggregate });
+    }
 }
 
 impl VirtioMmioDeviceConfigHandler for VirtioPmemConfigSpace {
@@ -151,19 +192,21 @@ impl VirtioMmioDeviceConfigHandler for VirtioPmemConfigSpace {
         access: VirtioMmioDeviceConfigAccess,
     ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
         let bytes = self.to_le_bytes();
-        let bytes = read_virtio_pmem_config_bytes(&bytes, access)?;
-        MmioAccessBytes::new(bytes).map_err(config_bytes_error)
+        let result = read_virtio_pmem_config_bytes(&bytes, access);
+        if result.is_err()
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.record_config_failure();
+        }
+        result
     }
 
     fn write_device_config(
         &mut self,
-        access: VirtioMmioDeviceConfigAccess,
+        _access: VirtioMmioDeviceConfigAccess,
         _data: MmioAccessBytes,
     ) -> Result<(), VirtioMmioDeviceConfigError> {
-        Err(VirtioMmioDeviceConfigError::UnsupportedWrite {
-            offset: access.offset(),
-            len: access.len(),
-        })
+        Ok(())
     }
 }
 
@@ -1172,8 +1215,8 @@ pub struct VirtioPmemDeviceCaptureState {
 }
 
 impl VirtioPmemDeviceCaptureState {
-    pub const fn config_space(&self) -> VirtioPmemConfigSpace {
-        self.config_space
+    pub fn config_space(&self) -> VirtioPmemConfigSpace {
+        self.config_space.clone()
     }
 
     pub const fn active_queue(&self) -> Option<VirtioPmemQueueState> {
@@ -1280,6 +1323,7 @@ pub struct VirtioPmemDevice {
     file_len: u64,
     rate_limiter: Option<VirtioPmemRateLimiter>,
     pending_rate_limited_queue: bool,
+    metrics: Option<VirtioPmemTransportMetrics>,
     guest_logger: Option<GuestLogger>,
 }
 
@@ -1290,6 +1334,7 @@ impl VirtioPmemDevice {
             file_len: 0,
             rate_limiter: None,
             pending_rate_limited_queue: false,
+            metrics: None,
             guest_logger: None,
         }
     }
@@ -1309,6 +1354,7 @@ impl VirtioPmemDevice {
             rate_limiter: rate_limiter
                 .and_then(|rate_limiter| VirtioPmemRateLimiter::new_at(rate_limiter, now)),
             pending_rate_limited_queue: false,
+            metrics: None,
             guest_logger: None,
         }
     }
@@ -1342,8 +1388,17 @@ impl VirtioPmemDevice {
             file_len,
             rate_limiter,
             pending_rate_limited_queue,
+            metrics: None,
             guest_logger: None,
         })
+    }
+
+    pub fn attach_metrics(
+        &mut self,
+        device: SharedPmemDeviceMetrics,
+        aggregate: SharedPmemDeviceMetrics,
+    ) {
+        self.metrics = Some(VirtioPmemTransportMetrics { device, aggregate });
     }
 
     pub fn is_activated(&self) -> bool {
@@ -1679,6 +1734,17 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioPmemDe
 }
 
 impl VirtioPmemMmioHandler {
+    pub fn attach_pmem_metrics(
+        &mut self,
+        device: SharedPmemDeviceMetrics,
+        aggregate: SharedPmemDeviceMetrics,
+    ) {
+        self.device_config_handler_mut()
+            .attach_metrics(device.clone(), aggregate.clone());
+        self.activation_handler_mut()
+            .attach_metrics(device, aggregate);
+    }
+
     pub fn has_pending_pmem_rate_limited_queue(&self) -> bool {
         self.activation_handler().has_pending_rate_limited_queue()
     }
@@ -1690,7 +1756,7 @@ impl VirtioPmemMmioHandler {
         now: Instant,
     ) -> Result<VirtioPmemDeviceCaptureState, VirtioPmemDeviceCaptureError> {
         self.activation_handler().capture_state_at(
-            *self.device_config_handler(),
+            self.device_config_handler().clone(),
             expected_file_len,
             rate_limiter_config,
             now,
@@ -1712,7 +1778,7 @@ impl VirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice> {
         let device = work
             .with_core_mut(|core| {
                 core.activation.capture_state_at(
-                    core.device_config,
+                    core.device_config.clone(),
                     expected_file_len,
                     rate_limiter_config,
                     now,
@@ -1796,6 +1862,18 @@ impl VirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice> {
     }
 }
 
+pub fn attach_pmem_metrics_to_mmio_handler(
+    dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    device: SharedPmemDeviceMetrics,
+    aggregate: SharedPmemDeviceMetrics,
+) -> Result<(), MmioHandlerLookupError> {
+    dispatcher
+        .handler_mut::<VirtioPmemMmioHandler>(region_id)?
+        .attach_pmem_metrics(device, aggregate);
+    Ok(())
+}
+
 impl VirtioMmioDeviceActivationHandler for VirtioPmemDevice {
     fn attach_guest_logger(&mut self, logger: GuestLogger) {
         self.guest_logger = Some(logger);
@@ -1805,7 +1883,13 @@ impl VirtioMmioDeviceActivationHandler for VirtioPmemDevice {
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
     ) -> Result<(), VirtioMmioDeviceActivationError> {
-        self.activate_pmem(activation).map_err(Into::into)
+        let result = self.activate_pmem(activation);
+        if result.is_err()
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.record_activation_failure();
+        }
+        result.map_err(Into::into)
     }
 
     fn reset(&mut self) {
@@ -3809,6 +3893,14 @@ pub struct PreparedPmemDevice {
 }
 
 impl PreparedPmemDevice {
+    pub fn attach_metrics(
+        &mut self,
+        device: SharedPmemDeviceMetrics,
+        aggregate: SharedPmemDeviceMetrics,
+    ) {
+        self.config_space.attach_metrics(device, aggregate);
+    }
+
     pub(crate) fn from_snapshot_parts(
         parts: PreparedSnapshotPmemDeviceParts,
     ) -> Result<Self, PreparedSnapshotPmemDeviceError> {
@@ -3954,8 +4046,8 @@ impl PreparedPmemDevice {
         self.guest_range
     }
 
-    pub const fn config_space(&self) -> VirtioPmemConfigSpace {
-        self.config_space
+    pub fn config_space(&self) -> VirtioPmemConfigSpace {
+        self.config_space.clone()
     }
 
     pub const fn rate_limiter(&self) -> Option<PmemRateLimiterConfig> {
@@ -4457,8 +4549,8 @@ impl PmemMmioDeviceRegistration {
         self.region.range().start()
     }
 
-    pub const fn config_space(&self) -> VirtioPmemConfigSpace {
-        self.config_space
+    pub fn config_space(&self) -> VirtioPmemConfigSpace {
+        self.config_space.clone()
     }
 }
 
@@ -4507,7 +4599,7 @@ impl PmemMmioDevices {
                 VIRTIO_PMEM_DEVICE_ID,
                 config_space.available_features(),
                 &VIRTIO_PMEM_QUEUE_SIZES,
-                config_space,
+                config_space.clone(),
                 VirtioPmemDevice::with_rate_limiter(file_len, rate_limiter),
             )
             .map_err(|source| PmemMmioRegistrationError::BuildHandler {
@@ -5127,26 +5219,50 @@ const fn virtio_feature_bit(feature: u32) -> u64 {
 fn read_virtio_pmem_config_bytes(
     bytes: &[u8; VIRTIO_PMEM_CONFIG_SPACE_SIZE],
     access: VirtioMmioDeviceConfigAccess,
-) -> Result<&[u8], VirtioMmioDeviceConfigError> {
+) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
     let offset = usize::try_from(access.offset()).map_err(|_| {
         VirtioMmioDeviceConfigError::UnsupportedRead {
             offset: access.offset(),
             len: access.len(),
         }
     })?;
-    let Some(end) = offset.checked_add(access.len()) else {
+    if offset > bytes.len() {
         return Err(VirtioMmioDeviceConfigError::UnsupportedRead {
             offset: access.offset(),
             len: access.len(),
         });
-    };
+    }
 
-    bytes
+    let mut result = [0_u8; MAX_MMIO_ACCESS_BYTES];
+    let available = bytes.len().saturating_sub(offset).min(access.len());
+    let end =
+        offset
+            .checked_add(available)
+            .ok_or(VirtioMmioDeviceConfigError::UnsupportedRead {
+                offset: access.offset(),
+                len: access.len(),
+            })?;
+    let source = bytes
         .get(offset..end)
         .ok_or(VirtioMmioDeviceConfigError::UnsupportedRead {
             offset: access.offset(),
             len: access.len(),
+        })?;
+    let destination = result.get_mut(..available).ok_or_else(|| {
+        config_bytes_error(MmioAccessBytesError::TooLarge {
+            len: access.len(),
+            max: MAX_MMIO_ACCESS_BYTES,
         })
+    })?;
+    destination.copy_from_slice(source);
+
+    let requested = result.get(..access.len()).ok_or_else(|| {
+        config_bytes_error(MmioAccessBytesError::TooLarge {
+            len: access.len(),
+            max: MAX_MMIO_ACCESS_BYTES,
+        })
+    })?;
+    MmioAccessBytes::new(requested).map_err(config_bytes_error)
 }
 
 fn config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceConfigError {
@@ -5180,8 +5296,8 @@ mod tests {
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioOperation, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_MAGIC_VALUE,
-        VirtioMmioAccess, VirtioMmioDeviceConfigError, VirtioMmioRegister,
-        decode_virtio_mmio_access,
+        VirtioMmioAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceRegisters,
+        VirtioMmioQueueRegisters, VirtioMmioRegister, decode_virtio_mmio_access,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
@@ -5831,28 +5947,87 @@ mod tests {
     }
 
     #[test]
-    fn virtio_pmem_config_space_rejects_out_of_bounds_reads() {
-        let config = VirtioPmemConfigSpace::new(0, 0);
+    fn virtio_pmem_config_space_zero_fills_trailing_and_end_reads() {
+        let config = VirtioPmemConfigSpace::new(0, 0x1100_0000_0000_0000);
 
         assert_eq!(
-            read_pmem_config(&config, 16, 1),
-            Err(VirtioMmioDeviceConfigError::UnsupportedRead { offset: 16, len: 1 })
+            read_pmem_config(&config, 16, 1)
+                .expect("read at config end should succeed")
+                .as_slice(),
+            &[0]
         );
         assert_eq!(
-            read_pmem_config(&config, 15, 2),
-            Err(VirtioMmioDeviceConfigError::UnsupportedRead { offset: 15, len: 2 })
+            read_pmem_config(&config, 15, 2)
+                .expect("cross-boundary read should succeed")
+                .as_slice(),
+            &[0x11, 0]
+        );
+        assert_eq!(
+            read_pmem_config(&config, 17, 1),
+            Err(VirtioMmioDeviceConfigError::UnsupportedRead { offset: 17, len: 1 })
         );
     }
 
     #[test]
-    fn virtio_pmem_config_space_rejects_guest_writes() {
+    fn virtio_pmem_config_space_ignores_guest_writes() {
         let mut config = VirtioPmemConfigSpace::new(0, 0);
 
-        assert_eq!(
-            write_pmem_config(&mut config, 0, &[1, 2, 3, 4]),
-            Err(VirtioMmioDeviceConfigError::UnsupportedWrite { offset: 0, len: 4 })
-        );
+        assert_eq!(write_pmem_config(&mut config, 0, &[1, 2, 3, 4]), Ok(()));
         assert_eq!(config, VirtioPmemConfigSpace::new(0, 0));
+    }
+
+    #[test]
+    fn pmem_config_metrics_record_only_pinned_out_of_bounds_reads() {
+        let device_metrics = SharedPmemDeviceMetrics::default();
+        let aggregate_metrics = SharedPmemDeviceMetrics::default();
+        let mut config = VirtioPmemConfigSpace::new(0, 0x1100_0000_0000_0000);
+        config.attach_metrics(device_metrics.clone(), aggregate_metrics.clone());
+
+        assert_eq!(
+            read_pmem_config(&config, 15, 2)
+                .expect("cross-boundary read should zero-fill")
+                .as_slice(),
+            &[0x11, 0]
+        );
+        assert_eq!(
+            read_pmem_config(&config, 16, 1)
+                .expect("read at config end should zero-fill")
+                .as_slice(),
+            &[0]
+        );
+        write_pmem_config(&mut config, 0, &[1, 2, 3, 4])
+            .expect("pinned pmem config write should be ignored");
+        assert_eq!(device_metrics.snapshot(), PmemDeviceMetrics::default());
+        assert_eq!(aggregate_metrics.snapshot(), PmemDeviceMetrics::default());
+
+        assert!(matches!(
+            read_pmem_config(&config, 17, 1),
+            Err(VirtioMmioDeviceConfigError::UnsupportedRead { offset: 17, len: 1 })
+        ));
+        let expected = PmemDeviceMetrics::default().with_cfg_fails(1);
+        assert_eq!(device_metrics.snapshot(), expected);
+        assert_eq!(aggregate_metrics.snapshot(), expected);
+    }
+
+    #[test]
+    fn pmem_activation_metrics_follow_device_and_aggregate_owners() {
+        let device_metrics = SharedPmemDeviceMetrics::default();
+        let aggregate_metrics = SharedPmemDeviceMetrics::default();
+        let mut device = VirtioPmemDevice::new();
+        device.attach_metrics(device_metrics.clone(), aggregate_metrics.clone());
+        let registers = VirtioMmioDeviceRegisters::new(VIRTIO_PMEM_DEVICE_ID, 0);
+        let queues = VirtioMmioQueueRegisters::new(&VIRTIO_PMEM_QUEUE_SIZES)
+            .expect("pmem queue registers should build");
+
+        VirtioMmioDeviceActivationHandler::activate(
+            &mut device,
+            VirtioMmioDeviceActivation::new(&registers, &queues),
+        )
+        .expect_err("not-ready pmem queue should reject activation");
+
+        let expected = PmemDeviceMetrics::default().with_activate_fails(1);
+        assert_eq!(device_metrics.snapshot(), expected);
+        assert_eq!(aggregate_metrics.snapshot(), expected);
     }
 
     #[test]
@@ -6280,7 +6455,7 @@ mod tests {
 
         let captured = device
             .capture_state_at(
-                config_space,
+                config_space.clone(),
                 VIRTIO_PMEM_ALIGNMENT,
                 Some(rate_limiter),
                 now + Duration::from_millis(5),
@@ -6318,7 +6493,7 @@ mod tests {
         );
         assert_eq!(
             device.capture_state_at(
-                config_space,
+                config_space.clone(),
                 VIRTIO_PMEM_ALIGNMENT + 1,
                 Some(rate_limiter),
                 now,

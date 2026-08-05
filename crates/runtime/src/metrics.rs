@@ -2545,100 +2545,85 @@ impl PmemDeviceMetricsByDevice {
 
 #[derive(Debug, Clone, Default)]
 pub struct SharedPmemDeviceMetrics {
-    inner: Arc<SharedPmemDeviceMetricsInner>,
+    inner: Arc<Mutex<PmemDeviceMetrics>>,
 }
 
 impl SharedPmemDeviceMetrics {
     pub fn record_activation_failure(&self) {
-        record_atomic_metric(&self.inner.activate_fails, 1);
+        self.record(PmemDeviceMetrics::default().with_activate_fails(1));
     }
 
     pub fn record_config_failure(&self) {
-        record_atomic_metric(&self.inner.cfg_fails, 1);
+        self.record(PmemDeviceMetrics::default().with_cfg_fails(1));
     }
 
     pub fn record_notification_dispatch(&self, dispatch: &VirtioPmemDeviceNotificationDispatch) {
-        self.record_queue_events(usize_to_u64_saturating(
-            dispatch.drained_notifications().len(),
-        ));
+        let mut observation = PmemDeviceMetrics::default().with_queue_event_count(
+            usize_to_u64_saturating(dispatch.drained_notifications().len()),
+        );
         if let Some(queue_dispatch) = dispatch.queue_dispatch() {
-            self.record_queue_dispatch(queue_dispatch);
+            observation = observation.merged_with(pmem_queue_dispatch_metrics(queue_dispatch));
         }
+        self.record(observation);
     }
 
     pub fn record_notification_error(&self, source: &VirtioPmemDeviceNotificationError) {
-        self.record_queue_events(usize_to_u64_saturating(
-            source.drained_notifications().len(),
-        ));
-        self.record_event_failure();
+        let mut observation = PmemDeviceMetrics::default()
+            .with_queue_event_count(usize_to_u64_saturating(
+                source.drained_notifications().len(),
+            ))
+            .with_event_fails(1);
         if let Some(completed) = source.completed_dispatch() {
-            self.record_queue_dispatch(completed);
+            observation = observation.merged_with(pmem_queue_dispatch_metrics(completed));
         }
+        self.record(observation);
     }
 
     pub fn record_queue_dispatch(&self, dispatch: &VirtioPmemQueueDispatch) {
-        self.record_event_failures(usize_to_u64_saturating(
-            dispatch
-                .parse_failures()
-                .saturating_add(dispatch.status_write_failures()),
-        ));
-        self.record_rate_limiter_throttled_events(usize_to_u64_saturating(
-            dispatch.rate_limiter_throttled_events(),
-        ));
-        self.record_rate_limiter_events(usize_to_u64_saturating(dispatch.rate_limiter_events()));
+        self.record(pmem_queue_dispatch_metrics(dispatch));
     }
 
     pub fn record_queue_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.queue_event_count, count);
-        }
+        self.record(PmemDeviceMetrics::default().with_queue_event_count(count));
     }
 
     pub fn record_event_failure(&self) {
-        record_atomic_metric(&self.inner.event_fails, 1);
+        self.record(PmemDeviceMetrics::default().with_event_fails(1));
     }
 
     pub fn snapshot(&self) -> PmemDeviceMetrics {
-        PmemDeviceMetrics {
-            activate_fails: self.inner.activate_fails.load(Ordering::Relaxed),
-            cfg_fails: self.inner.cfg_fails.load(Ordering::Relaxed),
-            event_fails: self.inner.event_fails.load(Ordering::Relaxed),
-            queue_event_count: self.inner.queue_event_count.load(Ordering::Relaxed),
-            rate_limiter_throttled_events: self
-                .inner
-                .rate_limiter_throttled_events
-                .load(Ordering::Relaxed),
-            rate_limiter_event_count: self.inner.rate_limiter_event_count.load(Ordering::Relaxed),
-        }
+        *lock_pmem_device_metrics(&self.inner)
     }
 
-    fn record_event_failures(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.event_fails, count);
+    fn record(&self, observation: PmemDeviceMetrics) {
+        if observation.is_empty() {
+            return;
         }
-    }
-
-    fn record_rate_limiter_throttled_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.rate_limiter_throttled_events, count);
-        }
-    }
-
-    fn record_rate_limiter_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.rate_limiter_event_count, count);
-        }
+        let mut metrics = lock_pmem_device_metrics(&self.inner);
+        *metrics = metrics.merged_with(observation);
     }
 }
 
-#[derive(Debug, Default)]
-struct SharedPmemDeviceMetricsInner {
-    activate_fails: AtomicU64,
-    cfg_fails: AtomicU64,
-    event_fails: AtomicU64,
-    queue_event_count: AtomicU64,
-    rate_limiter_throttled_events: AtomicU64,
-    rate_limiter_event_count: AtomicU64,
+fn pmem_queue_dispatch_metrics(dispatch: &VirtioPmemQueueDispatch) -> PmemDeviceMetrics {
+    PmemDeviceMetrics::default()
+        .with_event_fails(usize_to_u64_saturating(
+            dispatch
+                .parse_failures()
+                .saturating_add(dispatch.status_write_failures()),
+        ))
+        .with_rate_limiter_throttled_events(usize_to_u64_saturating(
+            dispatch.rate_limiter_throttled_events(),
+        ))
+        .with_rate_limiter_event_count(usize_to_u64_saturating(dispatch.rate_limiter_events()))
+}
+
+fn lock_pmem_device_metrics(
+    metrics: &Mutex<PmemDeviceMetrics>,
+) -> MutexGuard<'_, PmemDeviceMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2707,6 +2692,10 @@ impl fmt::Debug for PmemDeviceMetricsLease {
 }
 
 impl PreparedPmemDeviceMetrics {
+    pub fn metrics(&self) -> SharedPmemDeviceMetrics {
+        self.metrics.clone()
+    }
+
     pub fn publish(mut self) -> PmemDeviceMetricsLease {
         let mut state = lock_pmem_metrics_registry(&self.registry.per_device);
         let reservation_count = state.reservations.len();
@@ -5541,6 +5530,7 @@ pub struct EntropyDeviceMetrics {
     host_rng_fails: u64,
     entropy_rate_limiter_throttled: u64,
     rate_limiter_event_count: u64,
+    source_provider_fails: u64,
 }
 
 impl_incremental_delta!(EntropyDeviceMetrics {
@@ -5551,6 +5541,7 @@ impl_incremental_delta!(EntropyDeviceMetrics {
     host_rng_fails,
     entropy_rate_limiter_throttled,
     rate_limiter_event_count,
+    source_provider_fails,
 });
 
 impl EntropyDeviceMetrics {
@@ -5562,6 +5553,7 @@ impl EntropyDeviceMetrics {
             && self.host_rng_fails == 0
             && self.entropy_rate_limiter_throttled == 0
             && self.rate_limiter_event_count == 0
+            && self.source_provider_fails == 0
     }
 
     pub const fn activate_fails(self) -> u64 {
@@ -5590,6 +5582,11 @@ impl EntropyDeviceMetrics {
 
     pub const fn rate_limiter_event_count(self) -> u64 {
         self.rate_limiter_event_count
+    }
+
+    /// Bangbang-only failures while acquiring a source before a descriptor is popped.
+    pub const fn source_provider_fails(self) -> u64 {
+        self.source_provider_fails
     }
 
     pub const fn with_activate_fails(mut self, activate_fails: u64) -> Self {
@@ -5630,6 +5627,11 @@ impl EntropyDeviceMetrics {
         self
     }
 
+    pub const fn with_source_provider_fails(mut self, source_provider_fails: u64) -> Self {
+        self.source_provider_fails = source_provider_fails;
+        self
+    }
+
     const fn merged_with(self, other: Self) -> Self {
         Self {
             activate_fails: self.activate_fails.saturating_add(other.activate_fails),
@@ -5647,122 +5649,89 @@ impl EntropyDeviceMetrics {
             rate_limiter_event_count: self
                 .rate_limiter_event_count
                 .saturating_add(other.rate_limiter_event_count),
+            source_provider_fails: self
+                .source_provider_fails
+                .saturating_add(other.source_provider_fails),
         }
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct SharedEntropyDeviceMetrics {
-    inner: Arc<SharedEntropyDeviceMetricsInner>,
+    inner: Arc<Mutex<EntropyDeviceMetrics>>,
 }
 
 impl SharedEntropyDeviceMetrics {
     pub fn record_activation_failure(&self) {
-        record_atomic_metric(&self.inner.activate_fails, 1);
+        self.record(EntropyDeviceMetrics::default().with_activate_fails(1));
     }
 
     pub fn record_notification_dispatch(&self, dispatch: &VirtioRngDeviceNotificationDispatch) {
         if let Some(queue_dispatch) = dispatch.queue_dispatch() {
-            self.record_queue_dispatch(queue_dispatch);
+            self.record(entropy_queue_dispatch_metrics(queue_dispatch));
         }
     }
 
     pub fn record_notification_error(&self, source: &VirtioRngDeviceNotificationError) {
+        let mut observation = EntropyDeviceMetrics::default().with_entropy_event_fails(1);
         if let Some(completed) = source.completed_dispatch() {
-            self.record_queue_dispatch(completed);
+            observation = observation.merged_with(entropy_queue_dispatch_metrics(completed));
         }
-        self.record_event_failure();
+        self.record(observation);
     }
 
     pub fn record_entropy_source_provider_failure(&self) {
-        self.record_host_rng_failure();
-        self.record_event_failure();
+        self.record(EntropyDeviceMetrics::default().with_source_provider_fails(1));
     }
 
     pub fn record_event_failure(&self) {
-        record_atomic_metric(&self.inner.entropy_event_fails, 1);
+        self.record(EntropyDeviceMetrics::default().with_entropy_event_fails(1));
     }
 
     pub fn record_host_rng_failure(&self) {
-        record_atomic_metric(&self.inner.host_rng_fails, 1);
+        self.record(EntropyDeviceMetrics::default().with_host_rng_fails(1));
     }
 
     pub fn snapshot(&self) -> EntropyDeviceMetrics {
-        EntropyDeviceMetrics {
-            activate_fails: self.inner.activate_fails.load(Ordering::Relaxed),
-            entropy_event_fails: self.inner.entropy_event_fails.load(Ordering::Relaxed),
-            entropy_event_count: self.inner.entropy_event_count.load(Ordering::Relaxed),
-            entropy_bytes: self.inner.entropy_bytes.load(Ordering::Relaxed),
-            host_rng_fails: self.inner.host_rng_fails.load(Ordering::Relaxed),
-            entropy_rate_limiter_throttled: self
-                .inner
-                .entropy_rate_limiter_throttled
-                .load(Ordering::Relaxed),
-            rate_limiter_event_count: self.inner.rate_limiter_event_count.load(Ordering::Relaxed),
-        }
+        *lock_entropy_device_metrics(&self.inner)
     }
 
     pub fn record_queue_dispatch(&self, dispatch: &VirtioRngQueueDispatch) {
-        self.record_entropy_events(usize_to_u64_saturating(dispatch.processed_requests()));
-        self.record_entropy_bytes(dispatch.bytes_written_to_guest());
-        self.record_event_failures(usize_to_u64_saturating(
-            dispatch
-                .buffer_parse_failures()
-                .saturating_add(dispatch.source_failures()),
-        ));
-        self.record_host_rng_failures(usize_to_u64_saturating(dispatch.source_failures()));
-        self.record_rate_limiter_throttled(usize_to_u64_saturating(
-            dispatch.rate_limiter_throttled_requests(),
-        ));
-        self.record_rate_limiter_events(usize_to_u64_saturating(dispatch.rate_limiter_events()));
+        self.record(entropy_queue_dispatch_metrics(dispatch));
     }
 
-    fn record_entropy_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.entropy_event_count, count);
+    fn record(&self, observation: EntropyDeviceMetrics) {
+        if observation.is_empty() {
+            return;
         }
-    }
-
-    fn record_entropy_bytes(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.entropy_bytes, count);
-        }
-    }
-
-    fn record_event_failures(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.entropy_event_fails, count);
-        }
-    }
-
-    fn record_host_rng_failures(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.host_rng_fails, count);
-        }
-    }
-
-    fn record_rate_limiter_throttled(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.entropy_rate_limiter_throttled, count);
-        }
-    }
-
-    fn record_rate_limiter_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.rate_limiter_event_count, count);
-        }
+        let mut metrics = lock_entropy_device_metrics(&self.inner);
+        *metrics = metrics.merged_with(observation);
     }
 }
 
-#[derive(Debug, Default)]
-struct SharedEntropyDeviceMetricsInner {
-    activate_fails: AtomicU64,
-    entropy_event_fails: AtomicU64,
-    entropy_event_count: AtomicU64,
-    entropy_bytes: AtomicU64,
-    host_rng_fails: AtomicU64,
-    entropy_rate_limiter_throttled: AtomicU64,
-    rate_limiter_event_count: AtomicU64,
+fn entropy_queue_dispatch_metrics(dispatch: &VirtioRngQueueDispatch) -> EntropyDeviceMetrics {
+    EntropyDeviceMetrics::default()
+        .with_entropy_event_count(usize_to_u64_saturating(dispatch.attempted_requests()))
+        .with_entropy_bytes(dispatch.bytes_written_to_guest())
+        .with_entropy_event_fails(usize_to_u64_saturating(
+            dispatch
+                .buffer_parse_failures()
+                .saturating_add(dispatch.source_failures()),
+        ))
+        .with_host_rng_fails(usize_to_u64_saturating(dispatch.source_failures()))
+        .with_entropy_rate_limiter_throttled(usize_to_u64_saturating(
+            dispatch.rate_limiter_throttled_requests(),
+        ))
+        .with_rate_limiter_event_count(usize_to_u64_saturating(dispatch.rate_limiter_events()))
+}
+
+fn lock_entropy_device_metrics(
+    metrics: &Mutex<EntropyDeviceMetrics>,
+) -> MutexGuard<'_, EntropyDeviceMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -5833,34 +5802,45 @@ impl RtcDeviceMetrics {
 
 #[derive(Debug, Clone, Default)]
 pub struct SharedRtcDeviceMetrics {
-    inner: Arc<SharedRtcDeviceMetricsInner>,
+    inner: Arc<Mutex<RtcDeviceMetrics>>,
 }
 
 impl SharedRtcDeviceMetrics {
+    pub fn record_access_error(&self) {
+        self.record(RtcDeviceMetrics::default().with_error_count(1));
+    }
+
     pub fn record_read_error(&self) {
-        record_atomic_metric(&self.inner.missed_read_count, 1);
-        record_atomic_metric(&self.inner.error_count, 1);
+        self.record(
+            RtcDeviceMetrics::default()
+                .with_error_count(1)
+                .with_missed_read_count(1),
+        );
     }
 
     pub fn record_write_error(&self) {
-        record_atomic_metric(&self.inner.missed_write_count, 1);
-        record_atomic_metric(&self.inner.error_count, 1);
+        self.record(
+            RtcDeviceMetrics::default()
+                .with_error_count(1)
+                .with_missed_write_count(1),
+        );
     }
 
     pub fn snapshot(&self) -> RtcDeviceMetrics {
-        RtcDeviceMetrics::new(
-            self.inner.error_count.load(Ordering::Relaxed),
-            self.inner.missed_read_count.load(Ordering::Relaxed),
-            self.inner.missed_write_count.load(Ordering::Relaxed),
-        )
+        *lock_rtc_device_metrics(&self.inner)
+    }
+
+    fn record(&self, observation: RtcDeviceMetrics) {
+        let mut metrics = lock_rtc_device_metrics(&self.inner);
+        *metrics = metrics.merged_with(observation);
     }
 }
 
-#[derive(Debug, Default)]
-struct SharedRtcDeviceMetricsInner {
-    error_count: AtomicU64,
-    missed_read_count: AtomicU64,
-    missed_write_count: AtomicU64,
+fn lock_rtc_device_metrics(metrics: &Mutex<RtcDeviceMetrics>) -> MutexGuard<'_, RtcDeviceMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Observable counters for one balloon host-discard source.
@@ -7938,6 +7918,7 @@ mod tests {
             .with_host_rng_fails(5)
             .with_entropy_rate_limiter_throttled(6)
             .with_rate_limiter_event_count(7)
+            .with_source_provider_fails(8)
     }
 
     fn serial_metrics_with_scale(scale: u64) -> SerialOutputMetrics {
@@ -9119,7 +9100,11 @@ mod tests {
         let diagnostics = MetricsDiagnostics::new().with_serial_output_metrics(
             SerialOutputMetrics::default()
                 .with_error_count(1)
+                .with_flush_count(99)
+                .with_host_input_fails(5)
                 .with_missed_write_count(2)
+                .with_receive_fifo_flush_count(6)
+                .with_state_fails(7)
                 .with_write_count(3)
                 .with_rate_limiter_dropped_bytes(4),
         );
@@ -9128,10 +9113,14 @@ mod tests {
 
         let value = only_metrics_value(&output);
         assert_eq!(value["uart"]["error_count"], 1);
+        assert_eq!(value["uart"]["flush_count"], 0);
         assert_eq!(value["uart"]["missed_write_count"], 2);
         assert_eq!(value["uart"]["rate_limiter_dropped_bytes"], 4);
         assert_eq!(value["uart"]["write_count"], 3);
         assert!(value["uart"].get("input_count").is_none());
+        assert!(value["uart"].get("host_input_fails").is_none());
+        assert!(value["uart"].get("receive_fifo_flush_count").is_none());
+        assert!(value["uart"].get("state_fails").is_none());
     }
 
     #[test]
@@ -9748,10 +9737,7 @@ mod tests {
     #[test]
     fn shared_pmem_metric_increment_saturates() {
         let metrics = SharedPmemDeviceMetrics::default();
-        metrics
-            .inner
-            .queue_event_count
-            .store(u64::MAX - 1, Ordering::Relaxed);
+        metrics.record(PmemDeviceMetrics::default().with_queue_event_count(u64::MAX - 1));
 
         metrics.record_queue_events(3);
 
@@ -10474,6 +10460,7 @@ mod tests {
         let value = only_metrics_value(&output);
         assert_eq!(value["entropy"]["activate_fails"], 1);
         assert_eq!(value["entropy"]["rate_limiter_event_count"], 7);
+        assert!(value["entropy"].get("source_provider_fails").is_none());
     }
 
     #[test]
@@ -10501,8 +10488,8 @@ mod tests {
             first.snapshot(),
             EntropyDeviceMetrics::default()
                 .with_activate_fails(1)
-                .with_entropy_event_fails(2)
-                .with_host_rng_fails(1)
+                .with_entropy_event_fails(1)
+                .with_source_provider_fails(1)
         );
         assert_eq!(second.snapshot(), EntropyDeviceMetrics::default());
     }
@@ -10510,12 +10497,8 @@ mod tests {
     #[test]
     fn entropy_metric_increment_saturates() {
         let metrics = SharedEntropyDeviceMetrics::default();
-        metrics
-            .inner
-            .entropy_event_count
-            .store(u64::MAX - 1, Ordering::Relaxed);
-
-        metrics.record_entropy_events(3);
+        metrics.record(EntropyDeviceMetrics::default().with_entropy_event_count(u64::MAX - 1));
+        metrics.record(EntropyDeviceMetrics::default().with_entropy_event_count(3));
 
         assert_eq!(metrics.snapshot().entropy_event_count(), u64::MAX);
     }
@@ -10546,6 +10529,7 @@ mod tests {
                     .with_host_rng_fails(u64::MAX)
                     .with_entropy_rate_limiter_throttled(u64::MAX)
                     .with_rate_limiter_event_count(u64::MAX)
+                    .with_source_provider_fails(8)
             )
         );
     }
@@ -10606,15 +10590,69 @@ mod tests {
     #[test]
     fn rtc_metric_increment_saturates() {
         let metrics = SharedRtcDeviceMetrics::default();
-        metrics
-            .inner
-            .error_count
-            .store(u64::MAX - 1, Ordering::Relaxed);
+        metrics.record(RtcDeviceMetrics::default().with_error_count(u64::MAX - 1));
 
         metrics.record_read_error();
         metrics.record_write_error();
 
         assert_eq!(metrics.snapshot().error_count(), u64::MAX);
+    }
+
+    #[test]
+    fn owner_local_device_snapshots_never_expose_partial_compound_updates() {
+        const WRITERS: usize = 4;
+        const UPDATES: usize = 2_000;
+
+        let entropy = SharedEntropyDeviceMetrics::default();
+        let pmem = SharedPmemDeviceMetrics::default();
+        let rtc = SharedRtcDeviceMetrics::default();
+        let remaining = Arc::new(AtomicUsize::new(WRITERS));
+
+        thread::scope(|scope| {
+            for _ in 0..WRITERS {
+                let entropy = entropy.clone();
+                let pmem = pmem.clone();
+                let rtc = rtc.clone();
+                let remaining = Arc::clone(&remaining);
+                scope.spawn(move || {
+                    for _ in 0..UPDATES {
+                        entropy.record(
+                            EntropyDeviceMetrics::default()
+                                .with_entropy_event_count(1)
+                                .with_entropy_event_fails(1)
+                                .with_host_rng_fails(1),
+                        );
+                        pmem.record(
+                            PmemDeviceMetrics::default()
+                                .with_event_fails(1)
+                                .with_queue_event_count(1)
+                                .with_rate_limiter_event_count(1),
+                        );
+                        rtc.record_read_error();
+                    }
+                    remaining.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+
+            while remaining.load(Ordering::SeqCst) != 0 {
+                let entropy = entropy.snapshot();
+                assert_eq!(entropy.entropy_event_count(), entropy.entropy_event_fails());
+                assert_eq!(entropy.entropy_event_fails(), entropy.host_rng_fails());
+
+                let pmem = pmem.snapshot();
+                assert_eq!(pmem.event_fails(), pmem.queue_event_count());
+                assert_eq!(pmem.queue_event_count(), pmem.rate_limiter_event_count());
+
+                let rtc = rtc.snapshot();
+                assert_eq!(rtc.error_count(), rtc.missed_read_count());
+                assert_eq!(rtc.missed_write_count(), 0);
+            }
+        });
+
+        let expected = u64::try_from(WRITERS * UPDATES).expect("test count should fit u64");
+        assert_eq!(entropy.snapshot().entropy_event_count(), expected);
+        assert_eq!(pmem.snapshot().queue_event_count(), expected);
+        assert_eq!(rtc.snapshot().error_count(), expected);
     }
 
     #[test]

@@ -236,7 +236,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .iter()
             .filter(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
             .count(),
-        216
+        193
     );
     assert_eq!(
         audit
@@ -248,22 +248,97 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .count(),
         15
     );
-    assert!(audit.records.iter().all(|record| {
-        record.implementation.is_empty()
-            && record.validation.is_empty()
-            && record.platform_exclusion.is_none()
-    }));
+    assert_eq!(
+        audit
+            .records
+            .iter()
+            .filter(|record| record.disposition == MetricsDeviceProducerDisposition::Implemented)
+            .count(),
+        22
+    );
+    assert_eq!(
+        audit
+            .records
+            .iter()
+            .filter(|record| {
+                record.disposition == MetricsDeviceProducerDisposition::SourceNeutral
+            })
+            .count(),
+        1
+    );
+    for record in audit
+        .records
+        .iter()
+        .filter(|record| record.delivery_issue == "#1838")
+    {
+        let expected = if record.field_id == "static:uart.flush_count" {
+            MetricsDeviceProducerDisposition::SourceNeutral
+        } else {
+            MetricsDeviceProducerDisposition::Implemented
+        };
+        assert_eq!(record.disposition, expected, "{}", record.field_id);
+        assert!(!record.implementation.is_empty(), "{}", record.field_id);
+        assert!(!record.validation.is_empty(), "{}", record.field_id);
+        assert!(record.platform_exclusion.is_none(), "{}", record.field_id);
+    }
+    assert!(
+        audit
+            .records
+            .iter()
+            .filter(|record| record.delivery_issue != "#1838")
+            .all(|record| {
+                record.implementation.is_empty()
+                    && record.validation.is_empty()
+                    && record.platform_exclusion.is_none()
+            })
+    );
 
     let error = validate_metrics_device_producers(&audit, &authority, &root, AuditMode::Final)
-        .expect_err("all device producer records must remain nonterminal")
+        .expect_err("later device producer records must remain nonterminal")
         .to_string();
     assert_eq!(
         error
             .lines()
             .filter(|line| line.contains("final metrics device producer validation rejects"))
             .count(),
-        231
+        208
     );
+}
+
+// exact #1838 disposition mutation tests
+#[test]
+fn device_producer_audit_rejects_completed_child_regression_and_future_promotion() {
+    let mut implemented_regression = checked_device_audit();
+    implemented_regression
+        .records
+        .iter_mut()
+        .find(|record| {
+            record.delivery_issue == "#1838"
+                && record.disposition == MetricsDeviceProducerDisposition::Implemented
+        })
+        .expect("implemented #1838 record must exist")
+        .disposition = MetricsDeviceProducerDisposition::Planned;
+    assert!(device_validation_error(&implemented_regression).contains("wrong current disposition"));
+
+    let mut source_neutral_drift = checked_device_audit();
+    source_neutral_drift
+        .records
+        .iter_mut()
+        .find(|record| record.field_id == "static:uart.flush_count")
+        .expect("UART flush record must exist")
+        .disposition = MetricsDeviceProducerDisposition::Implemented;
+    assert!(device_validation_error(&source_neutral_drift).contains("wrong current disposition"));
+
+    let mut future_promotion = checked_device_audit();
+    let record = future_promotion
+        .records
+        .iter_mut()
+        .find(|record| record.delivery_issue == "#1839")
+        .expect("future child record must exist");
+    record.disposition = MetricsDeviceProducerDisposition::Implemented;
+    record.implementation.push(anchored_local_reference());
+    record.validation.push(anchored_local_reference());
+    assert!(device_validation_error(&future_promotion).contains("wrong current disposition"));
 }
 
 #[test]

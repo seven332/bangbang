@@ -8,7 +8,6 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::logger::{GuestLogger, LoggerDeviceKind, LoggerSerialOutcome, LoggerTransportOutcome};
@@ -53,12 +52,15 @@ pub trait SerialOutput: fmt::Debug + Send {
 pub struct SerialOutputMetrics {
     error_count: u64,
     flush_count: u64,
+    host_input_fails: u64,
     input_count: u64,
     interrupt_count: u64,
     missed_read_count: u64,
     missed_write_count: u64,
     overrun_count: u64,
     read_count: u64,
+    receive_fifo_flush_count: u64,
+    state_fails: u64,
     write_count: u64,
     rate_limiter_dropped_bytes: u64,
 }
@@ -76,6 +78,10 @@ impl SerialOutputMetrics {
         Self {
             error_count: Self::incremental_delta(self.error_count, previous.error_count),
             flush_count: Self::incremental_delta(self.flush_count, previous.flush_count),
+            host_input_fails: Self::incremental_delta(
+                self.host_input_fails,
+                previous.host_input_fails,
+            ),
             input_count: Self::incremental_delta(self.input_count, previous.input_count),
             interrupt_count: Self::incremental_delta(
                 self.interrupt_count,
@@ -91,6 +97,11 @@ impl SerialOutputMetrics {
             ),
             overrun_count: Self::incremental_delta(self.overrun_count, previous.overrun_count),
             read_count: Self::incremental_delta(self.read_count, previous.read_count),
+            receive_fifo_flush_count: Self::incremental_delta(
+                self.receive_fifo_flush_count,
+                previous.receive_fifo_flush_count,
+            ),
+            state_fails: Self::incremental_delta(self.state_fails, previous.state_fails),
             write_count: Self::incremental_delta(self.write_count, previous.write_count),
             rate_limiter_dropped_bytes: Self::incremental_delta(
                 self.rate_limiter_dropped_bytes,
@@ -105,6 +116,11 @@ impl SerialOutputMetrics {
 
     pub const fn flush_count(self) -> u64 {
         self.flush_count
+    }
+
+    /// Bangbang-only failures before host input reaches the UART receive buffer.
+    pub const fn host_input_fails(self) -> u64 {
+        self.host_input_fails
     }
 
     pub const fn input_count(self) -> u64 {
@@ -131,6 +147,16 @@ impl SerialOutputMetrics {
         self.read_count
     }
 
+    /// Bangbang-only receive FIFO clears; pinned UART `flush_count` has no producer.
+    pub const fn receive_fifo_flush_count(self) -> u64 {
+        self.receive_fifo_flush_count
+    }
+
+    /// Bangbang-only capture or receive-state preparation failures.
+    pub const fn state_fails(self) -> u64 {
+        self.state_fails
+    }
+
     pub const fn write_count(self) -> u64 {
         self.write_count
     }
@@ -146,6 +172,11 @@ impl SerialOutputMetrics {
 
     pub const fn with_flush_count(mut self, flush_count: u64) -> Self {
         self.flush_count = flush_count;
+        self
+    }
+
+    pub const fn with_host_input_fails(mut self, host_input_fails: u64) -> Self {
+        self.host_input_fails = host_input_fails;
         self
     }
 
@@ -179,6 +210,16 @@ impl SerialOutputMetrics {
         self
     }
 
+    pub const fn with_receive_fifo_flush_count(mut self, receive_fifo_flush_count: u64) -> Self {
+        self.receive_fifo_flush_count = receive_fifo_flush_count;
+        self
+    }
+
+    pub const fn with_state_fails(mut self, state_fails: u64) -> Self {
+        self.state_fails = state_fails;
+        self
+    }
+
     pub const fn with_write_count(mut self, write_count: u64) -> Self {
         self.write_count = write_count;
         self
@@ -195,12 +236,15 @@ impl SerialOutputMetrics {
     pub const fn is_empty(self) -> bool {
         self.error_count == 0
             && self.flush_count == 0
+            && self.host_input_fails == 0
             && self.input_count == 0
             && self.interrupt_count == 0
             && self.missed_read_count == 0
             && self.missed_write_count == 0
             && self.overrun_count == 0
             && self.read_count == 0
+            && self.receive_fifo_flush_count == 0
+            && self.state_fails == 0
             && self.write_count == 0
             && self.rate_limiter_dropped_bytes == 0
     }
@@ -208,95 +252,97 @@ impl SerialOutputMetrics {
 
 #[derive(Debug, Clone, Default)]
 struct SharedSerialOutputMetrics {
-    inner: Arc<SharedSerialOutputMetricsInner>,
+    inner: Arc<Mutex<SerialOutputMetrics>>,
 }
 
 impl SharedSerialOutputMetrics {
-    fn record_error(&self) {
-        record_serial_metric(&self.inner.error_count, 1);
+    fn record_receive_fifo_flush(&self) {
+        self.mutate(|metrics| {
+            metrics.receive_fifo_flush_count = metrics.receive_fifo_flush_count.saturating_add(1);
+        });
     }
 
-    fn record_flush(&self) {
-        record_serial_metric(&self.inner.flush_count, 1);
+    fn record_host_input_failure(&self) {
+        self.mutate(|metrics| {
+            metrics.host_input_fails = metrics.host_input_fails.saturating_add(1);
+        });
     }
 
-    fn record_input(&self, bytes: u64) {
-        record_serial_metric(&self.inner.input_count, bytes);
-    }
-
-    fn record_interrupt(&self) {
-        record_serial_metric(&self.inner.interrupt_count, 1);
+    fn record_state_failure(&self) {
+        self.mutate(|metrics| {
+            metrics.state_fails = metrics.state_fails.saturating_add(1);
+        });
     }
 
     fn record_missed_read(&self) {
-        record_serial_metric(&self.inner.missed_read_count, 1);
+        self.mutate(|metrics| {
+            metrics.missed_read_count = metrics.missed_read_count.saturating_add(1);
+        });
     }
 
     fn record_missed_write(&self) {
-        record_serial_metric(&self.inner.missed_write_count, 1);
-    }
-
-    fn record_overrun(&self, bytes: u64) {
-        record_serial_metric(&self.inner.overrun_count, bytes);
+        self.mutate(|metrics| {
+            metrics.missed_write_count = metrics.missed_write_count.saturating_add(1);
+        });
     }
 
     fn record_read(&self) {
-        record_serial_metric(&self.inner.read_count, 1);
+        self.mutate(|metrics| {
+            metrics.read_count = metrics.read_count.saturating_add(1);
+        });
     }
 
     fn record_write(&self) {
-        record_serial_metric(&self.inner.write_count, 1);
+        self.mutate(|metrics| {
+            metrics.write_count = metrics.write_count.saturating_add(1);
+        });
     }
 
-    fn record_rate_limiter_dropped_bytes(&self, bytes: u64) {
-        record_serial_metric(&self.inner.rate_limiter_dropped_bytes, bytes);
+    fn record_output_failure(&self) {
+        self.mutate(|metrics| {
+            metrics.missed_write_count = metrics.missed_write_count.saturating_add(1);
+            metrics.error_count = metrics.error_count.saturating_add(1);
+        });
+    }
+
+    fn record_rate_limiter_drop(&self, bytes: u64) {
+        self.mutate(|metrics| {
+            metrics.write_count = metrics.write_count.saturating_add(bytes);
+            metrics.rate_limiter_dropped_bytes =
+                metrics.rate_limiter_dropped_bytes.saturating_add(bytes);
+        });
+    }
+
+    fn record_receive_injection(
+        &self,
+        accepted_bytes: u64,
+        rejected_bytes: u64,
+        published_interrupt: bool,
+    ) {
+        self.mutate(|metrics| {
+            metrics.input_count = metrics.input_count.saturating_add(accepted_bytes);
+            metrics.overrun_count = metrics.overrun_count.saturating_add(rejected_bytes);
+            if published_interrupt {
+                metrics.interrupt_count = metrics.interrupt_count.saturating_add(1);
+            }
+        });
     }
 
     fn snapshot(&self) -> SerialOutputMetrics {
-        SerialOutputMetrics {
-            error_count: self.inner.error_count.load(Ordering::Relaxed),
-            flush_count: self.inner.flush_count.load(Ordering::Relaxed),
-            input_count: self.inner.input_count.load(Ordering::Relaxed),
-            interrupt_count: self.inner.interrupt_count.load(Ordering::Relaxed),
-            missed_read_count: self.inner.missed_read_count.load(Ordering::Relaxed),
-            missed_write_count: self.inner.missed_write_count.load(Ordering::Relaxed),
-            overrun_count: self.inner.overrun_count.load(Ordering::Relaxed),
-            read_count: self.inner.read_count.load(Ordering::Relaxed),
-            write_count: self.inner.write_count.load(Ordering::Relaxed),
-            rate_limiter_dropped_bytes: self
-                .inner
-                .rate_limiter_dropped_bytes
-                .load(Ordering::Relaxed),
-        }
+        *lock_serial_metrics(&self.inner)
+    }
+
+    fn mutate(&self, mutate: impl FnOnce(&mut SerialOutputMetrics)) {
+        mutate(&mut lock_serial_metrics(&self.inner));
     }
 }
 
-#[derive(Debug, Default)]
-struct SharedSerialOutputMetricsInner {
-    error_count: AtomicU64,
-    flush_count: AtomicU64,
-    input_count: AtomicU64,
-    interrupt_count: AtomicU64,
-    missed_read_count: AtomicU64,
-    missed_write_count: AtomicU64,
-    overrun_count: AtomicU64,
-    read_count: AtomicU64,
-    write_count: AtomicU64,
-    rate_limiter_dropped_bytes: AtomicU64,
-}
-
-fn record_serial_metric(counter: &AtomicU64, value: u64) {
-    if value == 0 {
-        return;
-    }
-
-    let mut current = counter.load(Ordering::Relaxed);
-    loop {
-        let next = current.saturating_add(value);
-        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(observed) => current = observed,
-        }
+fn lock_serial_metrics(
+    metrics: &Mutex<SerialOutputMetrics>,
+) -> std::sync::MutexGuard<'_, SerialOutputMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -589,8 +635,7 @@ impl<O: SerialOutput> SerialOutput for MeteredSerialOutput<O> {
                 Ok(())
             }
             Err(err) => {
-                self.metrics.record_missed_write();
-                self.metrics.record_error();
+                self.metrics.record_output_failure();
                 if let Some(logger) = &self.guest_logger {
                     logger.log_serial(LoggerSerialOutcome::OutputFailed);
                 }
@@ -648,7 +693,7 @@ impl SharedSerialOutput {
 
     /// Record one host-input lifecycle failure without changing UART state.
     pub fn record_host_input_error(&self) {
-        self.metrics.record_error();
+        self.metrics.record_host_input_failure();
     }
 }
 
@@ -668,8 +713,7 @@ impl SerialOutput for SharedSerialOutput {
 
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
         let mut output = self.output.lock().map_err(|_| {
-            self.metrics.record_missed_write();
-            self.metrics.record_error();
+            self.metrics.record_output_failure();
             if let Some(logger) = &self.guest_logger {
                 logger.log_serial(LoggerSerialOutcome::OutputFailed);
             }
@@ -725,7 +769,7 @@ impl<O: SerialOutput> SerialOutput for RateLimitedSerialOutput<O> {
         if self.bucket.reduce(1) {
             self.output.write_byte(byte)
         } else {
-            self.metrics.record_rate_limiter_dropped_bytes(1);
+            self.metrics.record_rate_limiter_drop(1);
             if let Some(logger) = &self.guest_logger {
                 logger.log_transport(LoggerTransportOutcome::RateLimiterRejected(
                     LoggerDeviceKind::Serial,
@@ -2178,7 +2222,7 @@ impl<O> SerialMmioDevice<O> {
     ) -> Result<SerialMmioCaptureState, SerialMmioCaptureError> {
         let mut receive_bytes = Vec::new();
         if let Err(source) = reserve(&mut receive_bytes, self.receive_fifo.len()) {
-            self.metrics.record_error();
+            self.metrics.record_state_failure();
             return Err(SerialMmioCaptureError::BufferAllocation { source });
         }
         receive_bytes.extend(self.receive_fifo.iter().copied());
@@ -2311,7 +2355,7 @@ impl<O> SerialMmioDevice<O> {
         if accepted_bytes != 0
             && let Err(source) = reserve(&mut self.receive_fifo, accepted_bytes)
         {
-            self.metrics.record_error();
+            self.metrics.record_state_failure();
             return Err(SerialReceiveInjectionError::BufferAllocation { source });
         }
 
@@ -2333,13 +2377,13 @@ impl<O> SerialMmioDevice<O> {
             self.interrupt_identification = SERIAL_INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE;
         }
 
-        self.metrics
-            .record_input(saturating_usize_to_u64(accepted_bytes));
-        self.metrics
-            .record_overrun(saturating_usize_to_u64(rejected_bytes));
-        if should_publish_interrupt {
-            self.publish_receive_interrupt_intent();
-        }
+        let published_interrupt =
+            should_publish_interrupt && self.publish_receive_interrupt_intent();
+        self.metrics.record_receive_injection(
+            saturating_usize_to_u64(accepted_bytes),
+            saturating_usize_to_u64(rejected_bytes),
+            published_interrupt,
+        );
 
         Ok(SerialReceiveInjectionOutcome::new(
             accepted_bytes,
@@ -2348,10 +2392,12 @@ impl<O> SerialMmioDevice<O> {
         ))
     }
 
-    fn publish_receive_interrupt_intent(&mut self) {
+    fn publish_receive_interrupt_intent(&mut self) -> bool {
         if !self.receive_interrupt_intent_pending {
             self.receive_interrupt_intent_pending = true;
-            self.metrics.record_interrupt();
+            true
+        } else {
+            false
         }
     }
 
@@ -2398,7 +2444,7 @@ impl<O> SerialMmioDevice<O> {
         self.receive_fifo.clear();
         self.line_status &= !(SERIAL_LINE_STATUS_DATA_READY | SERIAL_LINE_STATUS_OVERRUN_ERROR);
         self.acknowledge_receive_interrupt();
-        self.metrics.record_flush();
+        self.metrics.record_receive_fifo_flush();
         if had_receive_data {
             self.publish_input_ready_intent();
         }
@@ -2694,8 +2740,9 @@ mod tests {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -3387,7 +3434,8 @@ mod tests {
             device.take_input_ready_intent(),
             Some(SerialInputReadyIntent::ReceiveBufferEmpty)
         );
-        assert_eq!(device.metrics().flush_count(), 1);
+        assert_eq!(device.metrics().flush_count(), 0);
+        assert_eq!(device.metrics().receive_fifo_flush_count(), 1);
         assert_receive_invariants(&device);
     }
 
@@ -3579,7 +3627,8 @@ mod tests {
                 .expect("state should remain capturable"),
             before
         );
-        assert_eq!(device.metrics().error_count(), 2);
+        assert_eq!(device.metrics().error_count(), 0);
+        assert_eq!(device.metrics().state_fails(), 2);
     }
 
     #[test]
@@ -3799,7 +3848,7 @@ mod tests {
             .expect_err("read-only write should fail");
 
         let expected = SerialOutputMetrics::default()
-            .with_flush_count(1)
+            .with_receive_fifo_flush_count(1)
             .with_input_count(SERIAL_RECEIVE_FIFO_CAPACITY as u64)
             .with_interrupt_count(1)
             .with_missed_read_count(1)
@@ -4075,7 +4124,7 @@ mod tests {
         assert_eq!(
             output.metrics(),
             SerialOutputMetrics::default()
-                .with_write_count(1)
+                .with_write_count(3)
                 .with_rate_limiter_dropped_bytes(2)
         );
     }
@@ -4084,17 +4133,46 @@ mod tests {
     fn shared_serial_output_metrics_saturates_counters() {
         let metrics = SharedSerialOutputMetrics::default();
 
-        metrics.record_rate_limiter_dropped_bytes(u64::MAX - 1);
-        metrics.record_rate_limiter_dropped_bytes(2);
-        metrics.record_write();
+        metrics.record_rate_limiter_drop(u64::MAX - 1);
+        metrics.record_rate_limiter_drop(2);
         metrics.record_write();
 
         assert_eq!(
             metrics.snapshot(),
             SerialOutputMetrics::default()
-                .with_write_count(2)
+                .with_write_count(u64::MAX)
                 .with_rate_limiter_dropped_bytes(u64::MAX)
         );
+    }
+
+    #[test]
+    fn serial_owner_snapshot_never_exposes_partial_output_failure() {
+        const WRITERS: usize = 4;
+        const UPDATES: usize = 2_000;
+
+        let metrics = SharedSerialOutputMetrics::default();
+        let remaining = Arc::new(AtomicUsize::new(WRITERS));
+        thread::scope(|scope| {
+            for _ in 0..WRITERS {
+                let metrics = metrics.clone();
+                let remaining = Arc::clone(&remaining);
+                scope.spawn(move || {
+                    for _ in 0..UPDATES {
+                        metrics.record_output_failure();
+                    }
+                    remaining.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+
+            while remaining.load(Ordering::SeqCst) != 0 {
+                let snapshot = metrics.snapshot();
+                assert_eq!(snapshot.error_count(), snapshot.missed_write_count());
+            }
+        });
+
+        let expected = u64::try_from(WRITERS * UPDATES).expect("test count should fit u64");
+        assert_eq!(metrics.snapshot().error_count(), expected);
+        assert_eq!(metrics.snapshot().missed_write_count(), expected);
     }
 
     #[test]

@@ -855,65 +855,289 @@
     {
       "field_id": "static:entropy.activate_fails",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `entropy.activate_fails` is assigned to #1838 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `entropy.activate_fails` is completed by #1838 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_entropy_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "pub struct VirtioRngQueueDispatch {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn entropy_queue_dispatch_metrics("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_entropy_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "fn entropy_metrics_record_notification_dispatch()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:entropy.entropy_bytes",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `entropy.entropy_bytes` is assigned to #1838 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `entropy.entropy_bytes` is completed by #1838 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_entropy_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "pub struct VirtioRngQueueDispatch {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn entropy_queue_dispatch_metrics("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_entropy_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "fn entropy_metrics_record_notification_dispatch()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:entropy.entropy_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `entropy.entropy_event_count` is assigned to #1838 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `entropy.entropy_event_count` is completed by #1838 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_entropy_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "pub struct VirtioRngQueueDispatch {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn entropy_queue_dispatch_metrics("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_entropy_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "fn entropy_metrics_record_notification_dispatch()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:entropy.entropy_event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `entropy.entropy_event_fails` is assigned to #1838 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `entropy.entropy_event_fails` is completed by #1838 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_entropy_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "pub struct VirtioRngQueueDispatch {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn entropy_queue_dispatch_metrics("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_entropy_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "fn entropy_metrics_record_notification_dispatch()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:entropy.entropy_rate_limiter_throttled",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `entropy.entropy_rate_limiter_throttled` is assigned to #1838 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `entropy.entropy_rate_limiter_throttled` is completed by #1838 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_entropy_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "pub struct VirtioRngQueueDispatch {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn entropy_queue_dispatch_metrics("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_entropy_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "fn entropy_metrics_record_notification_dispatch()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:entropy.host_rng_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `entropy.host_rng_fails` is assigned to #1838 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `entropy.host_rng_fails` is completed by #1838 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_entropy_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "pub struct VirtioRngQueueDispatch {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn entropy_queue_dispatch_metrics("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_entropy_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "fn entropy_metrics_record_notification_dispatch()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:entropy.rate_limiter_event_count",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `entropy.rate_limiter_event_count` is assigned to #1838 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `entropy.rate_limiter_event_count` is completed by #1838 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_entropy_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "pub struct VirtioRngQueueDispatch {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn entropy_queue_dispatch_metrics("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_entropy_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "fn entropy_metrics_record_notification_dispatch()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:i8042.error_count",
@@ -1602,146 +1826,593 @@
     {
       "field_id": "static:pmem.activate_fails",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `pmem.activate_fails` is assigned to #1838 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `pmem.activate_fails` is completed by #1838 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_pmem_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedPmemDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "struct VirtioPmemTransportMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_pmem_transport_metrics_bind_aggregate_and_device_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "fn pmem_config_metrics_record_only_pinned_out_of_bounds_reads()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:pmem.cfg_fails",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `pmem.cfg_fails` is assigned to #1838 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `pmem.cfg_fails` is completed by #1838 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_pmem_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedPmemDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "struct VirtioPmemTransportMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_pmem_transport_metrics_bind_aggregate_and_device_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "fn pmem_config_metrics_record_only_pinned_out_of_bounds_reads()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:pmem.event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `pmem.event_fails` is assigned to #1838 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `pmem.event_fails` is completed by #1838 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_pmem_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedPmemDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "struct VirtioPmemTransportMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_pmem_transport_metrics_bind_aggregate_and_device_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "fn pmem_config_metrics_record_only_pinned_out_of_bounds_reads()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:pmem.queue_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `pmem.queue_event_count` is assigned to #1838 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `pmem.queue_event_count` is completed by #1838 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_pmem_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedPmemDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "struct VirtioPmemTransportMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_pmem_transport_metrics_bind_aggregate_and_device_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "fn pmem_config_metrics_record_only_pinned_out_of_bounds_reads()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:pmem.rate_limiter_event_count",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `pmem.rate_limiter_event_count` is assigned to #1838 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `pmem.rate_limiter_event_count` is completed by #1838 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_pmem_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedPmemDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "struct VirtioPmemTransportMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_pmem_transport_metrics_bind_aggregate_and_device_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "fn pmem_config_metrics_record_only_pinned_out_of_bounds_reads()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:pmem.rate_limiter_throttled_events",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `pmem.rate_limiter_throttled_events` is assigned to #1838 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `pmem.rate_limiter_throttled_events` is completed by #1838 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_pmem_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedPmemDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "struct VirtioPmemTransportMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_pmem_transport_metrics_bind_aggregate_and_device_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "fn pmem_config_metrics_record_only_pinned_out_of_bounds_reads()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:rtc.error_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `rtc.error_count` is assigned to #1838 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `rtc.error_count` is completed by #1838 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedRtcDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/rtc.rs",
+          "anchor": "impl<T: RtcTimeSource> MmioHandler for Pl031RtcDevice<T> {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/rtc.rs",
+          "anchor": "fn read_errors_distinguish_bus_failures_from_missed_registers()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:rtc.missed_read_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `rtc.missed_read_count` is assigned to #1838 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `rtc.missed_read_count` is completed by #1838 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedRtcDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/rtc.rs",
+          "anchor": "impl<T: RtcTimeSource> MmioHandler for Pl031RtcDevice<T> {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/rtc.rs",
+          "anchor": "fn read_errors_distinguish_bus_failures_from_missed_registers()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:rtc.missed_write_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `rtc.missed_write_count` is assigned to #1838 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `rtc.missed_write_count` is completed by #1838 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedRtcDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/rtc.rs",
+          "anchor": "impl<T: RtcTimeSource> MmioHandler for Pl031RtcDevice<T> {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/rtc.rs",
+          "anchor": "fn write_errors_distinguish_bus_failures_from_missed_registers()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:uart.error_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `uart.error_count` is assigned to #1838 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `uart.error_count` is completed by #1838 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "Firecracker v1.16.0 declares this field but has no UART producer."
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "impl SharedSerialOutputMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_serial_output_diagnostics_when_uart_metrics_are_nonzero()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "fn shared_output_and_uart_core_publish_one_coherent_metric_generation()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:uart.flush_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "source-neutral",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `uart.flush_count` is assigned to #1838 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `uart.flush_count` is completed by #1838 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "Firecracker v1.16.0 declares this field but has no UART producer."
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "impl SharedSerialOutputMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_serial_output_diagnostics_when_uart_metrics_are_nonzero()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "fn shared_output_and_uart_core_publish_one_coherent_metric_generation()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:uart.missed_read_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `uart.missed_read_count` is assigned to #1838 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `uart.missed_read_count` is completed by #1838 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "Firecracker v1.16.0 declares this field but has no UART producer."
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "impl SharedSerialOutputMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_serial_output_diagnostics_when_uart_metrics_are_nonzero()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "fn shared_output_and_uart_core_publish_one_coherent_metric_generation()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:uart.missed_write_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `uart.missed_write_count` is assigned to #1838 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `uart.missed_write_count` is completed by #1838 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "Firecracker v1.16.0 declares this field but has no UART producer."
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "impl SharedSerialOutputMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_serial_output_diagnostics_when_uart_metrics_are_nonzero()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "fn shared_output_and_uart_core_publish_one_coherent_metric_generation()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:uart.rate_limiter_dropped_bytes",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `uart.rate_limiter_dropped_bytes` is assigned to #1838 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `uart.rate_limiter_dropped_bytes` is completed by #1838 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "Firecracker v1.16.0 declares this field but has no UART producer."
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "impl SharedSerialOutputMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_serial_output_diagnostics_when_uart_metrics_are_nonzero()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "fn shared_output_and_uart_core_publish_one_coherent_metric_generation()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:uart.read_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `uart.read_count` is assigned to #1838 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `uart.read_count` is completed by #1838 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "Firecracker v1.16.0 declares this field but has no UART producer."
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "impl SharedSerialOutputMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_serial_output_diagnostics_when_uart_metrics_are_nonzero()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "fn shared_output_and_uart_core_publish_one_coherent_metric_generation()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:uart.write_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1838",
-      "rationale": "Pinned Firecracker field `uart.write_count` is assigned to #1838 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `uart.write_count` is completed by #1838 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "Firecracker v1.16.0 declares this field but has no UART producer."
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "impl SharedSerialOutputMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_serial_output_diagnostics_when_uart_metrics_are_nonzero()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "fn shared_output_and_uart_core_publish_one_coherent_metric_generation()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:vcpu.exit_io_in",

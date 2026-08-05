@@ -63,8 +63,15 @@ native-v2 2.8 snapshot continuation and containment.
   zero-length host-source failure remains a consumed request.
 - The `entropy` metrics object exposes `activate_fails`, `entropy_event_fails`,
   `entropy_event_count`, `entropy_bytes`, `host_rng_fails`,
-  `entropy_rate_limiter_throttled`, and `rate_limiter_event_count`. Counts are
-  per device, saturating, and reported through the ordinary metrics pipeline.
+  `entropy_rate_limiter_throttled`, and `rate_limiter_event_count`. Event count
+  advances when a descriptor is popped, before parsing or limiter admission,
+  and is retained across throttle undo and later queue errors. Host RNG and its
+  paired event failure advance only when filling that popped request fails; a
+  pre-dispatch source-provider acquisition failure remains an internal
+  diagnostic. Counts are per device, saturating, owner-snapshot coherent, and
+  reported through the ordinary metrics pipeline. MMIO, PCI, and restored
+  devices attach the fresh session owner before publication, so activation
+  failures never leak between source, destination, or reused device owners.
 - Detached state contains external configuration, available and negotiated
   features, activation, exact one-queue geometry/ranges/cursors, limiter
   configuration and redacted budget/burst/refill-age state, the single pending
