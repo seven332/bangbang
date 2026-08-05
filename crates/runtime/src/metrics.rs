@@ -46,6 +46,30 @@ pub const FIRECRACKER_METRICS_MAX_IDENTITY_BYTES: usize =
 pub const FIRECRACKER_METRICS_MAX_LINE_BYTES: usize =
     firecracker::FIRECRACKER_METRICS_MAX_LINE_BYTES;
 
+/// A Firecracker operation with distinct outer API and inner VMM latency stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessLatencyOperation {
+    /// Create a full snapshot.
+    FullCreateSnapshot,
+    /// Create a differential snapshot.
+    DiffCreateSnapshot,
+    /// Load a snapshot.
+    LoadSnapshot,
+    /// Pause the VM.
+    PauseVm,
+    /// Resume the VM.
+    ResumeVm,
+}
+
+/// The semantic owner of one process-operation latency measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessLatencyBoundary {
+    /// The complete successful API operation before response publication.
+    OuterApi,
+    /// The corresponding successful VMM action before outcome logging.
+    InnerVmm,
+}
+
 const fn incremental_delta(current: u64, previous: u64) -> u64 {
     if current >= previous {
         current - previous
@@ -328,24 +352,13 @@ impl MetricsState {
         self.deprecated_api.record_deprecated_http_api_call();
     }
 
-    pub(crate) fn record_pause_vm_latency_us(&mut self, duration_us: u64) {
-        self.latencies_us.record_pause_vm(duration_us);
-    }
-
-    pub(crate) fn record_resume_vm_latency_us(&mut self, duration_us: u64) {
-        self.latencies_us.record_resume_vm(duration_us);
-    }
-
-    pub(crate) fn record_full_create_snapshot_latency_us(&mut self, duration_us: u64) {
-        self.latencies_us.record_full_create_snapshot(duration_us);
-    }
-
-    pub(crate) fn record_diff_create_snapshot_latency_us(&mut self, duration_us: u64) {
-        self.latencies_us.record_diff_create_snapshot(duration_us);
-    }
-
-    pub(crate) fn record_load_snapshot_latency_us(&mut self, duration_us: u64) {
-        self.latencies_us.record_load_snapshot(duration_us);
+    pub(crate) fn record_process_latency_us(
+        &mut self,
+        operation: ProcessLatencyOperation,
+        boundary: ProcessLatencyBoundary,
+        duration_us: u64,
+    ) {
+        self.latencies_us.record(operation, boundary, duration_us);
     }
 
     pub(crate) fn record_put_actions_request(&mut self) {
@@ -691,27 +704,53 @@ struct LatencyMetrics {
     load_snapshot: Option<u64>,
     pause_vm: Option<u64>,
     resume_vm: Option<u64>,
+    vmm_full_create_snapshot: Option<u64>,
+    vmm_diff_create_snapshot: Option<u64>,
+    vmm_load_snapshot: Option<u64>,
+    vmm_pause_vm: Option<u64>,
+    vmm_resume_vm: Option<u64>,
 }
 
 impl LatencyMetrics {
-    fn record_full_create_snapshot(&mut self, duration_us: u64) {
-        self.full_create_snapshot = Some(duration_us);
-    }
-
-    fn record_diff_create_snapshot(&mut self, duration_us: u64) {
-        self.diff_create_snapshot = Some(duration_us);
-    }
-
-    fn record_load_snapshot(&mut self, duration_us: u64) {
-        self.load_snapshot = Some(duration_us);
-    }
-
-    fn record_pause_vm(&mut self, duration_us: u64) {
-        self.pause_vm = Some(duration_us);
-    }
-
-    fn record_resume_vm(&mut self, duration_us: u64) {
-        self.resume_vm = Some(duration_us);
+    fn record(
+        &mut self,
+        operation: ProcessLatencyOperation,
+        boundary: ProcessLatencyBoundary,
+        duration_us: u64,
+    ) {
+        let destination = match (operation, boundary) {
+            (ProcessLatencyOperation::FullCreateSnapshot, ProcessLatencyBoundary::OuterApi) => {
+                &mut self.full_create_snapshot
+            }
+            (ProcessLatencyOperation::DiffCreateSnapshot, ProcessLatencyBoundary::OuterApi) => {
+                &mut self.diff_create_snapshot
+            }
+            (ProcessLatencyOperation::LoadSnapshot, ProcessLatencyBoundary::OuterApi) => {
+                &mut self.load_snapshot
+            }
+            (ProcessLatencyOperation::PauseVm, ProcessLatencyBoundary::OuterApi) => {
+                &mut self.pause_vm
+            }
+            (ProcessLatencyOperation::ResumeVm, ProcessLatencyBoundary::OuterApi) => {
+                &mut self.resume_vm
+            }
+            (ProcessLatencyOperation::FullCreateSnapshot, ProcessLatencyBoundary::InnerVmm) => {
+                &mut self.vmm_full_create_snapshot
+            }
+            (ProcessLatencyOperation::DiffCreateSnapshot, ProcessLatencyBoundary::InnerVmm) => {
+                &mut self.vmm_diff_create_snapshot
+            }
+            (ProcessLatencyOperation::LoadSnapshot, ProcessLatencyBoundary::InnerVmm) => {
+                &mut self.vmm_load_snapshot
+            }
+            (ProcessLatencyOperation::PauseVm, ProcessLatencyBoundary::InnerVmm) => {
+                &mut self.vmm_pause_vm
+            }
+            (ProcessLatencyOperation::ResumeVm, ProcessLatencyBoundary::InnerVmm) => {
+                &mut self.vmm_resume_vm
+            }
+        };
+        *destination = Some(duration_us);
     }
 }
 
@@ -7273,14 +7312,14 @@ mod tests {
         MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics, NetworkInterfaceMetrics,
         NetworkInterfaceMetricsByInterface, NetworkInterfaceMetricsCaptureError,
         NetworkInterfaceMetricsRegistryError, PatchApiRequestMetrics, PmemDeviceMetrics,
-        PmemDeviceMetricsByDevice, PmemDeviceMetricsRegistryError, PutApiRequestMetrics,
-        RtcDeviceMetrics, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-        SharedMemoryHotplugDeviceMetrics, SharedMemoryHotplugLatencyMetricsInner,
-        SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
-        SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
-        SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics,
-        VirtioNetworkLatencyAggregate, VsockDeviceMetrics,
+        PmemDeviceMetricsByDevice, PmemDeviceMetricsRegistryError, ProcessLatencyBoundary,
+        ProcessLatencyOperation, PutApiRequestMetrics, RtcDeviceMetrics,
+        SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+        SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics,
+        SharedMemoryHotplugLatencyMetricsInner, SharedMmdsMetrics, SharedNetworkInterfaceMetrics,
+        SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetrics,
+        SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedSignalMetrics,
+        SharedVsockDeviceMetrics, SignalMetrics, VirtioNetworkLatencyAggregate, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::logger::SharedLoggerMetrics;
@@ -7742,11 +7781,60 @@ mod tests {
 
     fn record_all_process_metrics(state: &mut MetricsState) {
         state.record_deprecated_api_call();
-        state.record_pause_vm_latency_us(101);
-        state.record_resume_vm_latency_us(102);
-        state.record_full_create_snapshot_latency_us(103);
-        state.record_diff_create_snapshot_latency_us(104);
-        state.record_load_snapshot_latency_us(105);
+        for (operation, boundary, value) in [
+            (
+                ProcessLatencyOperation::PauseVm,
+                ProcessLatencyBoundary::OuterApi,
+                101,
+            ),
+            (
+                ProcessLatencyOperation::ResumeVm,
+                ProcessLatencyBoundary::OuterApi,
+                102,
+            ),
+            (
+                ProcessLatencyOperation::FullCreateSnapshot,
+                ProcessLatencyBoundary::OuterApi,
+                103,
+            ),
+            (
+                ProcessLatencyOperation::DiffCreateSnapshot,
+                ProcessLatencyBoundary::OuterApi,
+                104,
+            ),
+            (
+                ProcessLatencyOperation::LoadSnapshot,
+                ProcessLatencyBoundary::OuterApi,
+                105,
+            ),
+            (
+                ProcessLatencyOperation::PauseVm,
+                ProcessLatencyBoundary::InnerVmm,
+                106,
+            ),
+            (
+                ProcessLatencyOperation::ResumeVm,
+                ProcessLatencyBoundary::InnerVmm,
+                107,
+            ),
+            (
+                ProcessLatencyOperation::FullCreateSnapshot,
+                ProcessLatencyBoundary::InnerVmm,
+                108,
+            ),
+            (
+                ProcessLatencyOperation::DiffCreateSnapshot,
+                ProcessLatencyBoundary::InnerVmm,
+                109,
+            ),
+            (
+                ProcessLatencyOperation::LoadSnapshot,
+                ProcessLatencyBoundary::InnerVmm,
+                110,
+            ),
+        ] {
+            state.record_process_latency_us(operation, boundary, value);
+        }
         state.record_put_actions_request();
         state.record_put_actions_failure();
         state.record_put_balloon_request();
@@ -10646,32 +10734,64 @@ mod tests {
     }
 
     #[test]
-    fn writes_pause_resume_latency_metrics_when_recorded() {
-        let path = unique_metrics_path("latencies-us");
+    fn writes_every_outer_and_inner_process_latency_when_recorded() {
+        let path = unique_metrics_path("process-latencies-us");
         let mut state = MetricsState::default();
 
-        state.record_pause_vm_latency_us(0);
-        state.record_resume_vm_latency_us(42);
-        state
-            .configure(MetricsConfigInput::new(&path))
-            .expect("metrics should configure");
-        assert_eq!(state.flush(), Ok(true));
-
-        let value = only_metrics_value_from_file(&path);
-        assert_eq!(value["latencies_us"]["pause_vm"], 0);
-        assert_eq!(value["latencies_us"]["resume_vm"], 42);
-
-        fs::remove_file(path).expect("fixture should clean up");
-    }
-
-    #[test]
-    fn writes_snapshot_latency_metrics_when_recorded() {
-        let path = unique_metrics_path("snapshot-latencies-us");
-        let mut state = MetricsState::default();
-
-        state.record_full_create_snapshot_latency_us(1);
-        state.record_diff_create_snapshot_latency_us(2);
-        state.record_load_snapshot_latency_us(3);
+        for (operation, boundary, value) in [
+            (
+                ProcessLatencyOperation::FullCreateSnapshot,
+                ProcessLatencyBoundary::OuterApi,
+                1,
+            ),
+            (
+                ProcessLatencyOperation::DiffCreateSnapshot,
+                ProcessLatencyBoundary::OuterApi,
+                2,
+            ),
+            (
+                ProcessLatencyOperation::LoadSnapshot,
+                ProcessLatencyBoundary::OuterApi,
+                3,
+            ),
+            (
+                ProcessLatencyOperation::PauseVm,
+                ProcessLatencyBoundary::OuterApi,
+                4,
+            ),
+            (
+                ProcessLatencyOperation::ResumeVm,
+                ProcessLatencyBoundary::OuterApi,
+                5,
+            ),
+            (
+                ProcessLatencyOperation::FullCreateSnapshot,
+                ProcessLatencyBoundary::InnerVmm,
+                6,
+            ),
+            (
+                ProcessLatencyOperation::DiffCreateSnapshot,
+                ProcessLatencyBoundary::InnerVmm,
+                7,
+            ),
+            (
+                ProcessLatencyOperation::LoadSnapshot,
+                ProcessLatencyBoundary::InnerVmm,
+                8,
+            ),
+            (
+                ProcessLatencyOperation::PauseVm,
+                ProcessLatencyBoundary::InnerVmm,
+                9,
+            ),
+            (
+                ProcessLatencyOperation::ResumeVm,
+                ProcessLatencyBoundary::InnerVmm,
+                10,
+            ),
+        ] {
+            state.record_process_latency_us(operation, boundary, value);
+        }
         state
             .configure(MetricsConfigInput::new(&path))
             .expect("metrics should configure");
@@ -10681,6 +10801,13 @@ mod tests {
         assert_eq!(value["latencies_us"]["full_create_snapshot"], 1);
         assert_eq!(value["latencies_us"]["diff_create_snapshot"], 2);
         assert_eq!(value["latencies_us"]["load_snapshot"], 3);
+        assert_eq!(value["latencies_us"]["pause_vm"], 4);
+        assert_eq!(value["latencies_us"]["resume_vm"], 5);
+        assert_eq!(value["latencies_us"]["vmm_full_create_snapshot"], 6);
+        assert_eq!(value["latencies_us"]["vmm_diff_create_snapshot"], 7);
+        assert_eq!(value["latencies_us"]["vmm_load_snapshot"], 8);
+        assert_eq!(value["latencies_us"]["vmm_pause_vm"], 9);
+        assert_eq!(value["latencies_us"]["vmm_resume_vm"], 10);
 
         fs::remove_file(path).expect("fixture should clean up");
     }

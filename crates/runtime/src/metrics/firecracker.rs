@@ -849,7 +849,17 @@ pub(super) fn build_metrics_line(
             load_snapshot: interval.latencies_us.load_snapshot.unwrap_or_default(),
             pause_vm: interval.latencies_us.pause_vm.unwrap_or_default(),
             resume_vm: interval.latencies_us.resume_vm.unwrap_or_default(),
-            ..LatencyMetrics::default()
+            vmm_full_create_snapshot: interval
+                .latencies_us
+                .vmm_full_create_snapshot
+                .unwrap_or_default(),
+            vmm_diff_create_snapshot: interval
+                .latencies_us
+                .vmm_diff_create_snapshot
+                .unwrap_or_default(),
+            vmm_load_snapshot: interval.latencies_us.vmm_load_snapshot.unwrap_or_default(),
+            vmm_pause_vm: interval.latencies_us.vmm_pause_vm.unwrap_or_default(),
+            vmm_resume_vm: interval.latencies_us.vmm_resume_vm.unwrap_or_default(),
         },
         logger: LoggerMetrics {
             missed_metrics_count: interval.logger_metrics.missed_metrics_count,

@@ -671,6 +671,19 @@ summed while aggregate `min_us` and `max_us` remain zero, matching the pinned
 construction. `*_bytes` fields are bytes, `*_us` fields are microseconds, and
 count/failure/event fields count the named events.
 
+The five process operation latencies have paired outer API and `vmm_*` stores
+for pause, resume, Full snapshot create, Diff snapshot create, and snapshot
+load. A single injectable process-local monotonic clock supplies both layers.
+The outer boundary begins at typed request handling entry after the bounded
+socket read and commits after the complete operation, successful control-log
+attempt, and response construction. The inner boundary covers the functional
+VMM action and commits before lifecycle or snapshot outcome logging. Only
+successful operations replace these stores; parser, preflight, backend,
+publication, restore, and response failures preserve the prior values. An
+automatic resume requested by snapshot load remains inside `vmm_load_snapshot`
+and does not write `vmm_resume_vm`. The values describe distinct boundaries,
+so no `outer >= inner` relationship is promised.
+
 Bangbang-only extensions are not part of this strict line. In particular,
 `vmm.metrics_flush_count`, string boot-run-loop status, `pmem_*` roots, vmnet
 fields, newer balloon API/device fields, extra UART fields, and the ordinary

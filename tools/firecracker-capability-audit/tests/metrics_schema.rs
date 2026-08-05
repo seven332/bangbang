@@ -101,7 +101,7 @@ fn checked_process_producer_audit_is_canonical_and_exact() {
                 record.disposition == MetricsProcessProducerDisposition::Implemented
             })
             .count(),
-        44
+        56
     );
     assert_eq!(
         audit
@@ -109,7 +109,7 @@ fn checked_process_producer_audit_is_canonical_and_exact() {
             .iter()
             .filter(|record| record.disposition == MetricsProcessProducerDisposition::Planned)
             .count(),
-        25
+        13
     );
 
     let error = validate_metrics_process_producers(&audit, &authority, &root, AuditMode::Final)
@@ -167,13 +167,26 @@ fn process_producer_audit_rejects_boundary_child_and_completion_drift() {
     api.validation.clear();
     let error = process_validation_error(&completed);
     assert!(error.contains("completed metrics process producer slice must be terminal"));
-    assert!(error.contains("API metrics producer must be implemented"));
+    assert!(error.contains("completed process metrics producer must be implemented"));
+
+    let mut completed_latency = checked_process_audit();
+    let latency = completed_latency
+        .records
+        .iter_mut()
+        .find(|record| record.delivery_issue == "#1828")
+        .expect("latency record must exist");
+    latency.disposition = MetricsProcessProducerDisposition::Planned;
+    latency.implementation.clear();
+    latency.validation.clear();
+    let error = process_validation_error(&completed_latency);
+    assert!(error.contains("completed metrics process producer slice must be terminal"));
+    assert!(error.contains("completed process metrics producer must be implemented"));
 
     let mut premature = checked_process_audit();
     let downstream = premature
         .records
         .iter_mut()
-        .find(|record| record.delivery_issue == "#1828")
+        .find(|record| record.delivery_issue == "#1829")
         .expect("downstream record must exist");
     downstream.disposition = MetricsProcessProducerDisposition::Implemented;
     downstream.implementation.push(Reference::Local {
@@ -197,7 +210,8 @@ fn process_producer_audit_rejects_neutral_aliases_and_bad_evidence() {
         .expect("API record must exist");
     api.disposition = MetricsProcessProducerDisposition::SourceNeutral;
     assert!(
-        process_validation_error(&neutral).contains("must be implemented, not neutral or zero")
+        process_validation_error(&neutral)
+            .contains("completed process metrics producer must be implemented")
     );
 
     let mut missing = checked_process_audit();

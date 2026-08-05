@@ -9,20 +9,64 @@
     {
       "field_id": "static:api_server.process_startup_time_cpu_us",
       "boundary": "process-startup",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the exact process startup clock boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Bangbang samples one process monotonic clock and one process CPU clock at startup, uses saturating elapsed arithmetic, and adds optional parent CPU time before storing the canonical values.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "single startup clock capture and saturating process diagnostics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "canonical startup metric stores"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup clock and parent CPU accounting tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:api_server.process_startup_time_us",
       "boundary": "process-startup",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the exact process startup clock boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Bangbang samples one process monotonic clock and one process CPU clock at startup, uses saturating elapsed arithmetic, and adds optional parent CPU time before storing the canonical values.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "single startup clock capture and saturating process diagnostics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "canonical startup metric stores"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "startup clock and parent CPU accounting tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:deprecated_api.deprecated_http_api_calls",
@@ -243,92 +287,362 @@
     {
       "field_id": "static:latencies_us.diff_create_snapshot",
       "boundary": "successful-outer-api-operation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the successful outer API operation latency boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker stores this latency only after the complete typed API operation succeeds; Bangbang measures from bounded request entry through successful response construction and leaves the prior value unchanged on failure.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "typed successful outer operation latency boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "typed process latency store mapping"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "controlled outer latency success and failure tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "exhaustive outer and inner latency serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:latencies_us.full_create_snapshot",
       "boundary": "successful-outer-api-operation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the successful outer API operation latency boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker stores this latency only after the complete typed API operation succeeds; Bangbang measures from bounded request entry through successful response construction and leaves the prior value unchanged on failure.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "typed successful outer operation latency boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "typed process latency store mapping"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "controlled outer latency success and failure tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "exhaustive outer and inner latency serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:latencies_us.load_snapshot",
       "boundary": "successful-outer-api-operation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the successful outer API operation latency boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker stores this latency only after the complete typed API operation succeeds; Bangbang measures from bounded request entry through successful response construction and leaves the prior value unchanged on failure.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "typed successful outer operation latency boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "typed process latency store mapping"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "controlled outer latency success and failure tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "exhaustive outer and inner latency serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:latencies_us.pause_vm",
       "boundary": "successful-outer-api-operation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the successful outer API operation latency boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker stores this latency only after the complete typed API operation succeeds; Bangbang measures from bounded request entry through successful response construction and leaves the prior value unchanged on failure.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "typed successful outer operation latency boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "typed process latency store mapping"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "controlled outer latency success and failure tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "exhaustive outer and inner latency serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:latencies_us.resume_vm",
       "boundary": "successful-outer-api-operation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the successful outer API operation latency boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker stores this latency only after the complete typed API operation succeeds; Bangbang measures from bounded request entry through successful response construction and leaves the prior value unchanged on failure.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "typed successful outer operation latency boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "typed process latency store mapping"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "controlled outer latency success and failure tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "exhaustive outer and inner latency serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:latencies_us.vmm_diff_create_snapshot",
       "boundary": "successful-inner-vmm-operation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the successful inner VMM operation latency boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker stores this latency only after the corresponding VMM operation succeeds; Bangbang commits at the functional action boundary before outcome logging and folds automatic snapshot-load resume into load.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "successful inner VMM action latency boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "typed process latency store mapping"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "controlled inner latency and automatic-resume tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "exhaustive outer and inner latency serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:latencies_us.vmm_full_create_snapshot",
       "boundary": "successful-inner-vmm-operation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the successful inner VMM operation latency boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker stores this latency only after the corresponding VMM operation succeeds; Bangbang commits at the functional action boundary before outcome logging and folds automatic snapshot-load resume into load.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "successful inner VMM action latency boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "typed process latency store mapping"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "controlled inner latency and automatic-resume tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "exhaustive outer and inner latency serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:latencies_us.vmm_load_snapshot",
       "boundary": "successful-inner-vmm-operation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the successful inner VMM operation latency boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker stores this latency only after the corresponding VMM operation succeeds; Bangbang commits at the functional action boundary before outcome logging and folds automatic snapshot-load resume into load.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "successful inner VMM action latency boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "typed process latency store mapping"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "controlled inner latency and automatic-resume tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "exhaustive outer and inner latency serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:latencies_us.vmm_pause_vm",
       "boundary": "successful-inner-vmm-operation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the successful inner VMM operation latency boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker stores this latency only after the corresponding VMM operation succeeds; Bangbang commits at the functional action boundary before outcome logging and folds automatic snapshot-load resume into load.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "successful inner VMM action latency boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "typed process latency store mapping"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "controlled inner latency and automatic-resume tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "exhaustive outer and inner latency serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:latencies_us.vmm_resume_vm",
       "boundary": "successful-inner-vmm-operation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1828",
-      "rationale": "Delivery child #1828 owns the successful inner VMM operation latency boundary and remains unresolved in this audit slice.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker stores this latency only after the corresponding VMM operation succeeds; Bangbang commits at the functional action boundary before outcome logging and folds automatic snapshot-load resume into load.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "successful inner VMM action latency boundary"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "typed process latency store mapping"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "controlled inner latency and automatic-resume tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "exhaustive outer and inner latency serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "process producer audit mutation tests"
+        }
+      ]
     },
     {
       "field_id": "static:logger.metrics_fails",

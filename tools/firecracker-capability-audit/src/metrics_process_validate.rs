@@ -10,7 +10,7 @@ use crate::{
 };
 
 const EXPECTED_PROCESS_FIELDS: usize = 69;
-const COMPLETED_DELIVERY_ISSUES: &[&str] = &["#1827"];
+const COMPLETED_DELIVERY_ISSUES: &[&str] = &["#1827", "#1828"];
 
 /// Validate exact process-producer authority against the resolved metrics schema.
 pub fn validate_metrics_process_producers(
@@ -184,11 +184,11 @@ fn validate_record(
             record.field_id
         ));
     }
-    if delivery_issue == "#1827"
+    if matches!(delivery_issue, "#1827" | "#1828")
         && record.disposition != MetricsProcessProducerDisposition::Implemented
     {
         errors.push(format!(
-            "API metrics producer must be implemented, not neutral or zero: {}",
+            "completed process metrics producer must be implemented, not neutral or zero: {}",
             record.field_id
         ));
     }
@@ -346,13 +346,13 @@ fn expected_rationale(
             "Pinned Firecracker increments this counter only after typed parsing accepts a deprecated API value; Bangbang records the redacted parse effect once."
         }
         ("#1828", MetricsProcessProducerBoundary::ProcessStartup) => {
-            "Delivery child #1828 owns the exact process startup clock boundary and remains unresolved in this audit slice."
+            "Bangbang samples one process monotonic clock and one process CPU clock at startup, uses saturating elapsed arithmetic, and adds optional parent CPU time before storing the canonical values."
         }
         ("#1828", MetricsProcessProducerBoundary::SuccessfulOuterApiOperation) => {
-            "Delivery child #1828 owns the successful outer API operation latency boundary and remains unresolved in this audit slice."
+            "Pinned Firecracker stores this latency only after the complete typed API operation succeeds; Bangbang measures from bounded request entry through successful response construction and leaves the prior value unchanged on failure."
         }
         ("#1828", MetricsProcessProducerBoundary::SuccessfulInnerVmmOperation) => {
-            "Delivery child #1828 owns the successful inner VMM operation latency boundary and remains unresolved in this audit slice."
+            "Pinned Firecracker stores this latency only after the corresponding VMM operation succeeds; Bangbang commits at the functional action boundary before outcome logging and folds automatic snapshot-load resume into load."
         }
         ("#1829", MetricsProcessProducerBoundary::LoggerLifecycle) => {
             "Delivery child #1829 owns generation-consistent logger lifecycle capture and remains unresolved in this audit slice."
