@@ -5847,6 +5847,7 @@ fn lock_rtc_device_metrics(metrics: &Mutex<RtcDeviceMetrics>) -> MutexGuard<'_, 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BalloonDiscardMetrics {
     attempts: u64,
+    completed_bytes: u64,
     advised_bytes: u64,
     skipped_bytes: u64,
     failures: u64,
@@ -5854,6 +5855,7 @@ pub struct BalloonDiscardMetrics {
 
 impl_incremental_delta!(BalloonDiscardMetrics {
     attempts,
+    completed_bytes,
     advised_bytes,
     skipped_bytes,
     failures,
@@ -5863,6 +5865,7 @@ impl BalloonDiscardMetrics {
     pub const fn new(attempts: u64, advised_bytes: u64, skipped_bytes: u64, failures: u64) -> Self {
         Self {
             attempts,
+            completed_bytes: advised_bytes,
             advised_bytes,
             skipped_bytes,
             failures,
@@ -5871,6 +5874,15 @@ impl BalloonDiscardMetrics {
 
     pub const fn attempts(self) -> u64 {
         self.attempts
+    }
+
+    pub const fn with_completed_bytes(mut self, completed_bytes: u64) -> Self {
+        self.completed_bytes = completed_bytes;
+        self
+    }
+
+    pub const fn completed_bytes(self) -> u64 {
+        self.completed_bytes
     }
 
     pub const fn advised_bytes(self) -> u64 {
@@ -5887,6 +5899,7 @@ impl BalloonDiscardMetrics {
 
     const fn is_empty(self) -> bool {
         self.attempts == 0
+            && self.completed_bytes == 0
             && self.advised_bytes == 0
             && self.skipped_bytes == 0
             && self.failures == 0
@@ -5895,6 +5908,7 @@ impl BalloonDiscardMetrics {
     const fn merged_with(self, other: Self) -> Self {
         Self {
             attempts: self.attempts.saturating_add(other.attempts),
+            completed_bytes: self.completed_bytes.saturating_add(other.completed_bytes),
             advised_bytes: self.advised_bytes.saturating_add(other.advised_bytes),
             skipped_bytes: self.skipped_bytes.saturating_add(other.skipped_bytes),
             failures: self.failures.saturating_add(other.failures),
@@ -5910,6 +5924,7 @@ impl From<VirtioBalloonDiscardOutcome> for BalloonDiscardMetrics {
             outcome.skipped_bytes(),
             outcome.failures(),
         )
+        .with_completed_bytes(outcome.completed_bytes())
     }
 }
 
@@ -5918,6 +5933,7 @@ impl From<VirtioBalloonDiscardOutcome> for BalloonDiscardMetrics {
 pub struct BalloonFreePageReportMetrics {
     count: u64,
     requested_bytes: u64,
+    completed_bytes: u64,
     advised_bytes: u64,
     skipped_bytes: u64,
     failures: u64,
@@ -5926,6 +5942,7 @@ pub struct BalloonFreePageReportMetrics {
 impl_incremental_delta!(BalloonFreePageReportMetrics {
     count,
     requested_bytes,
+    completed_bytes,
     advised_bytes,
     skipped_bytes,
     failures,
@@ -5942,6 +5959,7 @@ impl BalloonFreePageReportMetrics {
         Self {
             count,
             requested_bytes,
+            completed_bytes: advised_bytes,
             advised_bytes,
             skipped_bytes,
             failures,
@@ -5954,6 +5972,15 @@ impl BalloonFreePageReportMetrics {
 
     pub const fn requested_bytes(self) -> u64 {
         self.requested_bytes
+    }
+
+    pub const fn with_completed_bytes(mut self, completed_bytes: u64) -> Self {
+        self.completed_bytes = completed_bytes;
+        self
+    }
+
+    pub const fn completed_bytes(self) -> u64 {
+        self.completed_bytes
     }
 
     pub const fn advised_bytes(self) -> u64 {
@@ -5971,6 +5998,7 @@ impl BalloonFreePageReportMetrics {
     const fn is_empty(self) -> bool {
         self.count == 0
             && self.requested_bytes == 0
+            && self.completed_bytes == 0
             && self.advised_bytes == 0
             && self.skipped_bytes == 0
             && self.failures == 0
@@ -5980,6 +6008,7 @@ impl BalloonFreePageReportMetrics {
         Self {
             count: self.count.saturating_add(other.count),
             requested_bytes: self.requested_bytes.saturating_add(other.requested_bytes),
+            completed_bytes: self.completed_bytes.saturating_add(other.completed_bytes),
             advised_bytes: self.advised_bytes.saturating_add(other.advised_bytes),
             skipped_bytes: self.skipped_bytes.saturating_add(other.skipped_bytes),
             failures: self.failures.saturating_add(other.failures),
@@ -5996,6 +6025,7 @@ impl From<VirtioBalloonDiscardOutcome> for BalloonFreePageReportMetrics {
             outcome.skipped_bytes(),
             outcome.failures(),
         )
+        .with_completed_bytes(outcome.completed_bytes())
     }
 }
 
@@ -6141,179 +6171,63 @@ impl BalloonDeviceMetrics {
 
 #[derive(Debug, Clone, Default)]
 pub struct SharedBalloonDeviceMetrics {
-    inner: Arc<SharedBalloonDeviceMetricsInner>,
+    inner: Arc<Mutex<BalloonDeviceMetrics>>,
 }
 
 impl SharedBalloonDeviceMetrics {
     pub fn record_activation_failure(&self) {
-        record_atomic_metric(&self.inner.activate_fails, 1);
+        self.record(BalloonDeviceMetrics::new(1, 0, 0, 0, 0, 0));
     }
 
     pub fn record_notification_dispatch(&self, dispatch: &VirtioBalloonDeviceNotificationDispatch) {
-        self.record_inflations(usize_to_u64_saturating(dispatch.inflate_notifications()));
-        self.record_deflations(usize_to_u64_saturating(dispatch.deflate_notifications()));
+        let statistics_dispatch = dispatch.statistics_queue_dispatch();
+        let mut observation = BalloonDeviceMetrics::new(
+            0,
+            u64::from(dispatch.inflate_notifications() != 0),
+            u64::from(dispatch.statistics_notifications() != 0),
+            statistics_dispatch
+                .map(|queue| usize_to_u64_saturating(queue.unrecognized_statistics()))
+                .unwrap_or_default(),
+            u64::from(dispatch.deflate_notifications() != 0),
+            0,
+        );
         if let Some(queue_dispatch) = dispatch.inflate_queue_dispatch() {
-            self.record_inflate_discard(queue_dispatch.inflate_discard());
+            observation.inflate_discard = queue_dispatch.inflate_discard().into();
         }
         if let Some(queue_dispatch) = dispatch.hinting_queue_dispatch() {
-            self.record_hinting_discard(queue_dispatch.hinting_discard());
+            observation.hinting_discard = queue_dispatch.hinting_discard().into();
         }
         if let Some(queue_dispatch) = dispatch.reporting_queue_dispatch() {
-            self.record_free_page_report(queue_dispatch.reporting_discard());
+            observation.free_page_report = queue_dispatch.reporting_discard().into();
         }
-
-        let stats_updates = if dispatch.statistics_notifications() != 0 {
-            dispatch.statistics_notifications()
-        } else {
-            dispatch
-                .statistics_queue_dispatch()
-                .map(|queue| queue.completed_descriptors())
-                .unwrap_or_default()
-        };
-        self.record_statistics_updates(usize_to_u64_saturating(stats_updates));
+        self.record(observation);
     }
 
     pub fn record_statistics_update_failure(&self) {
-        record_atomic_metric(&self.inner.stats_update_fails, 1);
+        self.record(BalloonDeviceMetrics::new(0, 0, 0, 1, 0, 0));
     }
 
     pub fn record_event_failure(&self) {
-        record_atomic_metric(&self.inner.event_fails, 1);
+        self.record(BalloonDeviceMetrics::new(0, 0, 0, 0, 0, 1));
     }
 
     pub fn snapshot(&self) -> BalloonDeviceMetrics {
-        BalloonDeviceMetrics::new(
-            self.inner.activate_fails.load(Ordering::Relaxed),
-            self.inner.inflate_count.load(Ordering::Relaxed),
-            self.inner.stats_updates_count.load(Ordering::Relaxed),
-            self.inner.stats_update_fails.load(Ordering::Relaxed),
-            self.inner.deflate_count.load(Ordering::Relaxed),
-            self.inner.event_fails.load(Ordering::Relaxed),
-        )
-        .with_discard_metrics(
-            BalloonDiscardMetrics::new(
-                self.inner.inflate_discard_attempts.load(Ordering::Relaxed),
-                self.inner
-                    .inflate_discard_advised_bytes
-                    .load(Ordering::Relaxed),
-                self.inner
-                    .inflate_discard_skipped_bytes
-                    .load(Ordering::Relaxed),
-                self.inner.inflate_discard_failures.load(Ordering::Relaxed),
-            ),
-            BalloonDiscardMetrics::new(
-                self.inner.hinting_discard_attempts.load(Ordering::Relaxed),
-                self.inner
-                    .hinting_discard_advised_bytes
-                    .load(Ordering::Relaxed),
-                self.inner
-                    .hinting_discard_skipped_bytes
-                    .load(Ordering::Relaxed),
-                self.inner.hinting_discard_failures.load(Ordering::Relaxed),
-            ),
-        )
-        .with_free_page_report_metrics(BalloonFreePageReportMetrics::new(
-            self.inner.free_page_report_count.load(Ordering::Relaxed),
-            self.inner
-                .free_page_report_requested_bytes
-                .load(Ordering::Relaxed),
-            self.inner
-                .free_page_report_advised_bytes
-                .load(Ordering::Relaxed),
-            self.inner
-                .free_page_report_skipped_bytes
-                .load(Ordering::Relaxed),
-            self.inner.free_page_report_failures.load(Ordering::Relaxed),
-        ))
+        *lock_balloon_device_metrics(&self.inner)
     }
 
-    fn record_inflations(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.inflate_count, count);
-        }
-    }
-
-    fn record_deflations(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.deflate_count, count);
-        }
-    }
-
-    fn record_statistics_updates(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.stats_updates_count, count);
-        }
-    }
-
-    fn record_inflate_discard(&self, outcome: VirtioBalloonDiscardOutcome) {
-        record_balloon_discard_metrics(
-            &self.inner.inflate_discard_attempts,
-            &self.inner.inflate_discard_advised_bytes,
-            &self.inner.inflate_discard_skipped_bytes,
-            &self.inner.inflate_discard_failures,
-            outcome,
-        );
-    }
-
-    fn record_hinting_discard(&self, outcome: VirtioBalloonDiscardOutcome) {
-        record_balloon_discard_metrics(
-            &self.inner.hinting_discard_attempts,
-            &self.inner.hinting_discard_advised_bytes,
-            &self.inner.hinting_discard_skipped_bytes,
-            &self.inner.hinting_discard_failures,
-            outcome,
-        );
-    }
-
-    fn record_free_page_report(&self, outcome: VirtioBalloonDiscardOutcome) {
-        if outcome.attempts() != 0 {
-            record_atomic_metric(&self.inner.free_page_report_count, outcome.attempts());
-        }
-        if outcome.requested_bytes() != 0 {
-            record_atomic_metric(
-                &self.inner.free_page_report_requested_bytes,
-                outcome.requested_bytes(),
-            );
-        }
-        if outcome.advised_bytes() != 0 {
-            record_atomic_metric(
-                &self.inner.free_page_report_advised_bytes,
-                outcome.advised_bytes(),
-            );
-        }
-        if outcome.skipped_bytes() != 0 {
-            record_atomic_metric(
-                &self.inner.free_page_report_skipped_bytes,
-                outcome.skipped_bytes(),
-            );
-        }
-        if outcome.failures() != 0 {
-            record_atomic_metric(&self.inner.free_page_report_failures, outcome.failures());
-        }
+    fn record(&self, observation: BalloonDeviceMetrics) {
+        let mut metrics = lock_balloon_device_metrics(&self.inner);
+        *metrics = metrics.merged_with(observation);
     }
 }
 
-#[derive(Debug, Default)]
-struct SharedBalloonDeviceMetricsInner {
-    activate_fails: AtomicU64,
-    inflate_count: AtomicU64,
-    stats_updates_count: AtomicU64,
-    stats_update_fails: AtomicU64,
-    deflate_count: AtomicU64,
-    event_fails: AtomicU64,
-    inflate_discard_attempts: AtomicU64,
-    inflate_discard_advised_bytes: AtomicU64,
-    inflate_discard_skipped_bytes: AtomicU64,
-    inflate_discard_failures: AtomicU64,
-    hinting_discard_attempts: AtomicU64,
-    hinting_discard_advised_bytes: AtomicU64,
-    hinting_discard_skipped_bytes: AtomicU64,
-    hinting_discard_failures: AtomicU64,
-    free_page_report_count: AtomicU64,
-    free_page_report_requested_bytes: AtomicU64,
-    free_page_report_advised_bytes: AtomicU64,
-    free_page_report_skipped_bytes: AtomicU64,
-    free_page_report_failures: AtomicU64,
+fn lock_balloon_device_metrics(
+    metrics: &Mutex<BalloonDeviceMetrics>,
+) -> MutexGuard<'_, BalloonDeviceMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Bounded latency aggregate for one virtio-mem operation family.
@@ -6352,14 +6266,6 @@ impl MemoryHotplugLatencyMetrics {
 
     const fn delta_since(self, previous: Self) -> Self {
         let sample_count = incremental_delta(self.sample_count, previous.sample_count);
-        if sample_count == 0 {
-            return Self {
-                min_us: 0,
-                max_us: 0,
-                sum_us: 0,
-                sample_count: 0,
-            };
-        }
         Self {
             min_us: self.min_us,
             max_us: self.max_us,
@@ -6368,11 +6274,20 @@ impl MemoryHotplugLatencyMetrics {
         }
     }
 
+    const fn from_sample(latency_us: u64) -> Self {
+        Self {
+            min_us: latency_us,
+            max_us: latency_us,
+            sum_us: latency_us,
+            sample_count: 1,
+        }
+    }
+
     const fn merged_with(mut self, other: Self) -> Self {
         if other.is_empty() {
             return self;
         }
-        if self.is_empty() || other.min_us < self.min_us {
+        if self.is_empty() || self.min_us == 0 || other.min_us < self.min_us {
             self.min_us = other.min_us;
         }
         if other.max_us > self.max_us {
@@ -6641,23 +6556,30 @@ pub enum MemoryHotplugMetricOperation {
 /// Shared producer installed with one virtio-mem device before activation.
 #[derive(Debug, Clone, Default)]
 pub struct SharedMemoryHotplugDeviceMetrics {
-    inner: Arc<SharedMemoryHotplugDeviceMetricsInner>,
+    inner: Arc<Mutex<MemoryHotplugDeviceMetrics>>,
 }
 
 impl SharedMemoryHotplugDeviceMetrics {
     pub fn record_activation_failure(&self) {
-        record_atomic_metric(&self.inner.activate_fails, 1);
+        self.record(MemoryHotplugDeviceMetrics {
+            activate_fails: 1,
+            ..Default::default()
+        });
     }
 
     pub fn record_queue_events(&self, count: usize) {
         let count = usize_to_u64_saturating(count);
-        if count != 0 {
-            record_atomic_metric(&self.inner.queue_event_count, count);
-        }
+        self.record(MemoryHotplugDeviceMetrics {
+            queue_event_count: count,
+            ..Default::default()
+        });
     }
 
     pub fn record_queue_event_failure(&self) {
-        record_atomic_metric(&self.inner.queue_event_fails, 1);
+        self.record(MemoryHotplugDeviceMetrics {
+            queue_event_fails: 1,
+            ..Default::default()
+        });
     }
 
     pub fn record_operation(
@@ -6667,190 +6589,99 @@ impl SharedMemoryHotplugDeviceMetrics {
         committed_bytes: u64,
         latency_us: u64,
     ) {
-        let (latency, count, bytes, failures) = match operation {
-            MemoryHotplugMetricOperation::Plug => (
-                &self.inner.plug_agg,
-                &self.inner.plug_count,
-                Some(&self.inner.plug_bytes),
-                &self.inner.plug_fails,
-            ),
-            MemoryHotplugMetricOperation::Unplug => (
-                &self.inner.unplug_agg,
-                &self.inner.unplug_count,
-                Some(&self.inner.unplug_bytes),
-                &self.inner.unplug_fails,
-            ),
-            MemoryHotplugMetricOperation::UnplugAll => (
-                &self.inner.unplug_all_agg,
-                &self.inner.unplug_all_count,
-                None,
-                &self.inner.unplug_all_fails,
-            ),
-            MemoryHotplugMetricOperation::State => (
-                &self.inner.state_agg,
-                &self.inner.state_count,
-                None,
-                &self.inner.state_fails,
-            ),
-        };
-        record_atomic_metric(count, 1);
-        latency.record_sample(latency_us);
-        if succeeded {
-            if committed_bytes != 0
-                && let Some(bytes) = bytes
-            {
-                record_atomic_metric(bytes, committed_bytes);
+        let mut observation = MemoryHotplugDeviceMetrics::default();
+        let latency = MemoryHotplugLatencyMetrics::from_sample(latency_us);
+        match operation {
+            MemoryHotplugMetricOperation::Plug => {
+                observation.plug_agg = latency;
+                observation.plug_count = 1;
+                if succeeded {
+                    observation.plug_bytes = committed_bytes;
+                } else {
+                    observation.plug_fails = 1;
+                }
             }
-        } else {
-            record_atomic_metric(failures, 1);
+            MemoryHotplugMetricOperation::Unplug => {
+                observation.unplug_agg = latency;
+                observation.unplug_count = 1;
+                if succeeded {
+                    observation.unplug_bytes = committed_bytes;
+                } else {
+                    observation.unplug_fails = 1;
+                }
+            }
+            MemoryHotplugMetricOperation::UnplugAll => {
+                observation.unplug_all_agg = latency;
+                observation.unplug_all_count = 1;
+                if !succeeded {
+                    observation.unplug_all_fails = 1;
+                }
+            }
+            MemoryHotplugMetricOperation::State => {
+                observation.state_agg = latency;
+                observation.state_count = 1;
+                if !succeeded {
+                    observation.state_fails = 1;
+                }
+            }
         }
+        self.record(observation);
     }
 
     pub fn record_unplug_discard_failures(&self, failures: u64) {
-        if failures != 0 {
-            record_atomic_metric(&self.inner.unplug_discard_fails, failures);
-        }
+        self.record(MemoryHotplugDeviceMetrics {
+            unplug_discard_fails: failures,
+            ..Default::default()
+        });
     }
 
     pub fn record_interrupt_failure(&self) {
-        record_atomic_metric(&self.inner.interrupt_fails, 1);
+        self.record(MemoryHotplugDeviceMetrics {
+            interrupt_fails: 1,
+            ..Default::default()
+        });
     }
 
     pub fn record_rollbacks(&self, attempts: u64, failures: u64) {
-        if attempts != 0 {
-            record_atomic_metric(&self.inner.rollback_count, attempts);
-        }
-        if failures != 0 {
-            record_atomic_metric(&self.inner.rollback_fails, failures);
-        }
+        self.record(MemoryHotplugDeviceMetrics {
+            rollback_count: attempts,
+            rollback_fails: failures,
+            ..Default::default()
+        });
     }
 
     pub fn record_owner_cleanup(&self, attempts: u64, failures: u64) {
-        if attempts != 0 {
-            record_atomic_metric(&self.inner.owner_cleanup_count, attempts);
-        }
-        if failures != 0 {
-            record_atomic_metric(&self.inner.owner_cleanup_fails, failures);
-        }
+        self.record(MemoryHotplugDeviceMetrics {
+            owner_cleanup_count: attempts,
+            owner_cleanup_fails: failures,
+            ..Default::default()
+        });
     }
 
     pub fn record_teardown(&self, succeeded: bool) {
-        record_atomic_metric(&self.inner.teardown_count, 1);
-        if !succeeded {
-            record_atomic_metric(&self.inner.teardown_fails, 1);
-        }
+        self.record(MemoryHotplugDeviceMetrics {
+            teardown_count: 1,
+            teardown_fails: u64::from(!succeeded),
+            ..Default::default()
+        });
     }
 
     pub fn snapshot(&self) -> MemoryHotplugDeviceMetrics {
-        MemoryHotplugDeviceMetrics {
-            activate_fails: self.inner.activate_fails.load(Ordering::Relaxed),
-            queue_event_fails: self.inner.queue_event_fails.load(Ordering::Relaxed),
-            queue_event_count: self.inner.queue_event_count.load(Ordering::Relaxed),
-            plug_agg: self.inner.plug_agg.snapshot(),
-            plug_count: self.inner.plug_count.load(Ordering::Relaxed),
-            plug_bytes: self.inner.plug_bytes.load(Ordering::Relaxed),
-            plug_fails: self.inner.plug_fails.load(Ordering::Relaxed),
-            unplug_agg: self.inner.unplug_agg.snapshot(),
-            unplug_count: self.inner.unplug_count.load(Ordering::Relaxed),
-            unplug_bytes: self.inner.unplug_bytes.load(Ordering::Relaxed),
-            unplug_fails: self.inner.unplug_fails.load(Ordering::Relaxed),
-            unplug_discard_fails: self.inner.unplug_discard_fails.load(Ordering::Relaxed),
-            unplug_all_agg: self.inner.unplug_all_agg.snapshot(),
-            unplug_all_count: self.inner.unplug_all_count.load(Ordering::Relaxed),
-            unplug_all_fails: self.inner.unplug_all_fails.load(Ordering::Relaxed),
-            state_agg: self.inner.state_agg.snapshot(),
-            state_count: self.inner.state_count.load(Ordering::Relaxed),
-            state_fails: self.inner.state_fails.load(Ordering::Relaxed),
-            interrupt_fails: self.inner.interrupt_fails.load(Ordering::Relaxed),
-            rollback_count: self.inner.rollback_count.load(Ordering::Relaxed),
-            rollback_fails: self.inner.rollback_fails.load(Ordering::Relaxed),
-            owner_cleanup_count: self.inner.owner_cleanup_count.load(Ordering::Relaxed),
-            owner_cleanup_fails: self.inner.owner_cleanup_fails.load(Ordering::Relaxed),
-            teardown_count: self.inner.teardown_count.load(Ordering::Relaxed),
-            teardown_fails: self.inner.teardown_fails.load(Ordering::Relaxed),
-        }
+        *lock_memory_hotplug_device_metrics(&self.inner)
+    }
+
+    fn record(&self, observation: MemoryHotplugDeviceMetrics) {
+        let mut metrics = lock_memory_hotplug_device_metrics(&self.inner);
+        *metrics = metrics.merged_with(observation);
     }
 }
 
-#[derive(Debug, Default)]
-struct SharedMemoryHotplugLatencyMetricsInner {
-    state: Mutex<MemoryHotplugLatencyMetrics>,
-}
-
-impl SharedMemoryHotplugLatencyMetricsInner {
-    fn record_sample(&self, latency_us: u64) {
-        let mut state = lock_memory_hotplug_latency_metrics(&self.state);
-        if state.sample_count == 0 || latency_us < state.min_us {
-            state.min_us = latency_us;
-        }
-        if state.sample_count == 0 || latency_us > state.max_us {
-            state.max_us = latency_us;
-        }
-        state.sum_us = state.sum_us.saturating_add(latency_us);
-        state.sample_count = state.sample_count.saturating_add(1);
-    }
-
-    fn snapshot(&self) -> MemoryHotplugLatencyMetrics {
-        *lock_memory_hotplug_latency_metrics(&self.state)
-    }
-}
-
-fn lock_memory_hotplug_latency_metrics(
-    state: &Mutex<MemoryHotplugLatencyMetrics>,
-) -> MutexGuard<'_, MemoryHotplugLatencyMetrics> {
-    match state.lock() {
-        Ok(state) => state,
+fn lock_memory_hotplug_device_metrics(
+    metrics: &Mutex<MemoryHotplugDeviceMetrics>,
+) -> MutexGuard<'_, MemoryHotplugDeviceMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
         Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-#[derive(Debug, Default)]
-struct SharedMemoryHotplugDeviceMetricsInner {
-    activate_fails: AtomicU64,
-    queue_event_fails: AtomicU64,
-    queue_event_count: AtomicU64,
-    plug_agg: SharedMemoryHotplugLatencyMetricsInner,
-    plug_count: AtomicU64,
-    plug_bytes: AtomicU64,
-    plug_fails: AtomicU64,
-    unplug_agg: SharedMemoryHotplugLatencyMetricsInner,
-    unplug_count: AtomicU64,
-    unplug_bytes: AtomicU64,
-    unplug_fails: AtomicU64,
-    unplug_discard_fails: AtomicU64,
-    unplug_all_agg: SharedMemoryHotplugLatencyMetricsInner,
-    unplug_all_count: AtomicU64,
-    unplug_all_fails: AtomicU64,
-    state_agg: SharedMemoryHotplugLatencyMetricsInner,
-    state_count: AtomicU64,
-    state_fails: AtomicU64,
-    interrupt_fails: AtomicU64,
-    rollback_count: AtomicU64,
-    rollback_fails: AtomicU64,
-    owner_cleanup_count: AtomicU64,
-    owner_cleanup_fails: AtomicU64,
-    teardown_count: AtomicU64,
-    teardown_fails: AtomicU64,
-}
-
-fn record_balloon_discard_metrics(
-    attempts: &AtomicU64,
-    advised_bytes: &AtomicU64,
-    skipped_bytes: &AtomicU64,
-    failures: &AtomicU64,
-    outcome: VirtioBalloonDiscardOutcome,
-) {
-    if outcome.attempts() != 0 {
-        record_atomic_metric(attempts, outcome.attempts());
-    }
-    if outcome.advised_bytes() != 0 {
-        record_atomic_metric(advised_bytes, outcome.advised_bytes());
-    }
-    if outcome.skipped_bytes() != 0 {
-        record_atomic_metric(skipped_bytes, outcome.skipped_bytes());
-    }
-    if outcome.failures() != 0 {
-        record_atomic_metric(failures, outcome.failures());
     }
 }
 
@@ -7491,11 +7322,10 @@ mod tests {
         PmemDeviceMetricsByDevice, PmemDeviceMetricsRegistryError, ProcessLatencyBoundary,
         ProcessLatencyOperation, PutApiRequestMetrics, RtcDeviceMetrics,
         SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry,
-        SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics,
-        SharedMemoryHotplugLatencyMetricsInner, SharedMmdsMetrics, SharedNetworkInterfaceMetrics,
-        SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetrics,
-        SharedPmemDeviceMetricsRegistry, SharedProcessMetrics, SharedRtcDeviceMetrics,
-        SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics,
+        SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics,
+        SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
+        SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedProcessMetrics,
+        SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics,
         VirtioNetworkLatencyAggregate, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
@@ -10689,11 +10519,11 @@ mod tests {
             BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6)
                 .with_discard_metrics(
                     BalloonDiscardMetrics::new(7, 8, 9, 10),
-                    BalloonDiscardMetrics::new(11, 12, 13, 14),
+                    BalloonDiscardMetrics::new(11, 12, 13, 14).with_completed_bytes(25),
                 )
-                .with_free_page_report_metrics(BalloonFreePageReportMetrics::new(
-                    15, 16, 17, 18, 19,
-                )),
+                .with_free_page_report_metrics(
+                    BalloonFreePageReportMetrics::new(15, 16, 17, 18, 19).with_completed_bytes(35),
+                ),
         );
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
@@ -10708,10 +10538,10 @@ mod tests {
                 "deflate_count": 5,
                 "event_fails": 6,
                 "free_page_report_count": 15,
-                "free_page_report_freed": 17,
+                "free_page_report_freed": 35,
                 "free_page_report_fails": 19,
                 "free_page_hint_count": 11,
-                "free_page_hint_freed": 12,
+                "free_page_hint_freed": 25,
                 "free_page_hint_fails": 14,
             })
         );
@@ -10834,9 +10664,24 @@ mod tests {
         assert_eq!(second["memory_hotplug"]["plug_agg"]["max_us"], 11);
         assert_eq!(second["memory_hotplug"]["plug_agg"]["sum_us"], 11);
         assert_eq!(unchanged["memory_hotplug"]["plug_count"], 0);
-        assert_eq!(unchanged["memory_hotplug"]["plug_agg"]["min_us"], 0);
-        assert_eq!(unchanged["memory_hotplug"]["plug_agg"]["max_us"], 0);
+        assert_eq!(unchanged["memory_hotplug"]["plug_agg"]["min_us"], 7);
+        assert_eq!(unchanged["memory_hotplug"]["plug_agg"]["max_us"], 11);
         assert_eq!(unchanged["memory_hotplug"]["plug_agg"]["sum_us"], 0);
+    }
+
+    #[test]
+    fn memory_hotplug_latency_minimum_uses_firecracker_zero_sentinel() {
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
+
+        metrics.record_operation(MemoryHotplugMetricOperation::State, true, 0, 0);
+        assert_eq!(metrics.snapshot().state_agg().min_us(), 0);
+        metrics.record_operation(MemoryHotplugMetricOperation::State, true, 0, 7);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.state_agg().min_us(), 7);
+        assert_eq!(snapshot.state_agg().max_us(), 7);
+        assert_eq!(snapshot.state_agg().sum_us(), 7);
+        assert_eq!(snapshot.state_agg().sample_count(), 2);
     }
 
     #[test]
@@ -10854,47 +10699,59 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_memory_hotplug_latency_snapshots_are_coherent() {
+    fn concurrent_memory_hotplug_operation_snapshots_are_coherent() {
         const LATENCY_US: u64 = 7;
+        const COMMITTED_BYTES: u64 = 4096;
         const SAMPLE_COUNT_PER_WORKER: usize = 10_000;
         const WORKER_COUNT: usize = 4;
 
-        let latency = Arc::new(SharedMemoryHotplugLatencyMetricsInner::default());
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
         let workers = (0..WORKER_COUNT)
             .map(|_| {
-                let latency = Arc::clone(&latency);
+                let metrics = metrics.clone();
                 thread::spawn(move || {
                     for _ in 0..SAMPLE_COUNT_PER_WORKER {
-                        latency.record_sample(LATENCY_US);
+                        metrics.record_operation(
+                            MemoryHotplugMetricOperation::Plug,
+                            true,
+                            COMMITTED_BYTES,
+                            LATENCY_US,
+                        );
                     }
                 })
             })
             .collect::<Vec<_>>();
 
         for _ in 0..SAMPLE_COUNT_PER_WORKER {
-            let snapshot = latency.snapshot();
+            let snapshot = metrics.snapshot();
+            assert_eq!(snapshot.plug_agg().sample_count(), snapshot.plug_count());
             assert_eq!(
-                snapshot.sum_us(),
-                snapshot.sample_count().saturating_mul(LATENCY_US)
+                snapshot.plug_bytes(),
+                snapshot.plug_count().saturating_mul(COMMITTED_BYTES)
             );
-            if !snapshot.is_empty() {
-                assert_eq!(snapshot.min_us(), LATENCY_US);
-                assert_eq!(snapshot.max_us(), LATENCY_US);
+            assert_eq!(
+                snapshot.plug_agg().sum_us(),
+                snapshot.plug_count().saturating_mul(LATENCY_US)
+            );
+            assert_eq!(snapshot.plug_fails(), 0);
+            if snapshot.plug_count() != 0 {
+                assert_eq!(snapshot.plug_agg().min_us(), LATENCY_US);
+                assert_eq!(snapshot.plug_agg().max_us(), LATENCY_US);
             }
         }
         for worker in workers {
             worker.join().expect("latency writer should not panic");
         }
 
-        let snapshot = latency.snapshot();
+        let snapshot = metrics.snapshot();
         assert_eq!(
-            snapshot.sample_count(),
+            snapshot.plug_count(),
             u64::try_from(WORKER_COUNT * SAMPLE_COUNT_PER_WORKER)
                 .expect("test sample count should fit u64")
         );
         assert_eq!(
-            snapshot.sum_us(),
-            snapshot.sample_count().saturating_mul(LATENCY_US)
+            snapshot.plug_agg().sum_us(),
+            snapshot.plug_count().saturating_mul(LATENCY_US)
         );
     }
 

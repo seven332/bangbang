@@ -26,6 +26,7 @@ use crate::balloon::{
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
 use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::metrics::SharedBalloonDeviceMetrics;
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::{
     PCI_BAR64_SIZE, PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
@@ -1005,6 +1006,11 @@ impl PreparedSnapshotV2BalloonMmioHandler {
         &self.handler
     }
 
+    /// Attaches fresh destination-local metrics before publication.
+    pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {
+        self.handler.attach_balloon_metrics(metrics);
+    }
+
     /// Consumes the value into configuration, queue ranges, placement, and
     /// inert handler.
     pub fn into_parts(
@@ -1177,6 +1183,14 @@ impl PreparedSnapshotV2BalloonPciEndpoint {
         &self,
     ) -> &PreparedVirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
         &self.endpoint
+    }
+
+    /// Attaches fresh destination-local metrics before publication.
+    pub fn attach_metrics(
+        &self,
+        metrics: SharedBalloonDeviceMetrics,
+    ) -> Result<(), VirtioPciEndpointError> {
+        self.endpoint.endpoint().attach_balloon_metrics(metrics)
     }
 
     /// Consumes the checked continuation and retained endpoint.

@@ -43,8 +43,8 @@ including the schema-runtime timestamp producer. #1788 certifies the exact
 API, process, logger, signal, boot, and lifecycle producers through two
 implemented aggregate profiles and the field-level process audit. The checked
 device audit now assigns every #1789 field to one concrete delivery child and
-terminally certifies the 23 #1838 records; later child records remain
-nonterminal. `corpus:metrics` and the cross-producer aggregate semantic remain
+terminally certifies the 61 records delivered by #1838 and #1839; later child
+records remain nonterminal. `corpus:metrics` and the cross-producer aggregate semantic remain
 #1790-owned. A required zero therefore proves wire-shape completeness only,
 never producer completion unless its field audit is terminal.
 
@@ -218,17 +218,17 @@ Static and configured identities remain distinct; exact suffix routing splits
 mapped network fields from tap-oriented gaps and applicable vCPU exits from
 retained PIO/KVM-clock fields.
 
-After #1838, the audit contains 193 `planned`, 15
-`provisional-platform-zero`, 22 `implemented`, and one `source-neutral`
-record. The 23 terminal records cover the complete pinned entropy, pmem, RTC,
-and UART roots. `uart.flush_count` is the source-neutral record because pinned
-Firecracker declares the field but has no producer; receive-FIFO clearing and
-other Bangbang-only serial diagnostics do not feed it. The remaining planned
-and provisional records are nonterminal, carry empty implementation and
-validation arrays, and have no platform exclusion. The provisional records
-are the six retained i8042 fields plus nine vCPU PIO/KVM-clock fields; this
-label does not claim that the terminal platform evidence required by #1846
-already exists.
+After #1839, the audit contains 155 `planned`, 15
+`provisional-platform-zero`, 60 `implemented`, and one `source-neutral`
+record. The 61 terminal records cover the complete pinned entropy, pmem, RTC,
+UART, balloon, and memory-hotplug roots. `uart.flush_count` is the
+source-neutral record because pinned Firecracker declares the field but has no
+producer; receive-FIFO clearing and other Bangbang-only serial diagnostics do
+not feed it. The remaining planned and provisional records are nonterminal,
+carry empty implementation and validation arrays, and have no platform
+exclusion. The provisional records are the six retained i8042 fields plus nine
+vCPU PIO/KVM-clock fields; this label does not claim that the terminal platform
+evidence required by #1846 already exists.
 
 Entropy, pmem, RTC, and UART counters use one narrow owner-local value lock per
 immutable snapshot. A compound producer update and a snapshot therefore cannot
@@ -239,6 +239,24 @@ limiter, source, and publication failures, while a pre-dispatch host-source
 provider acquisition failure remains internal. RTC distinguishes missed
 register accesses from width/data bus failures. UART limiter drops count both
 the attempted write and the dropped byte.
+
+Balloon metrics use one owner shared by the MMIO or PCI activation path, queue
+dispatch, snapshot restoration, and metrics publication. Inflate, deflate, and
+statistics counts advance once per guest queue-processing invocation;
+`stats_update_fails` counts unrecognized guest statistic tags, while host timer
+or API update failures remain outside that pinned field. Hinting and reporting
+count accepted range descriptors, record failures per failed discard, and add
+the full descriptor length to the strict `*_freed` field only when the discard
+completes successfully. Internal advised/skipped byte diagnostics remain
+available to Bangbang but are not serialized into the strict Firecracker root.
+
+Memory-hotplug metrics record each parsed PLUG, UNPLUG, UNPLUG_ALL, or STATE
+request exactly once after completion, including failures and their elapsed
+time; byte counters advance only for committed successful mutations. The
+device owner applies each count/failure/bytes/latency tuple under one lock, so a
+snapshot cannot split one operation. Interval publication resets latency sums
+with other incremental fields but retains the upstream-style lifetime minimum
+and maximum values.
 
 Later producer children may replace only their exact records with terminal
 `implemented`, `source-neutral`, or `platform-zero` dispositions. Terminal

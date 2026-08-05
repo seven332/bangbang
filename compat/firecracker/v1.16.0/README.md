@@ -38,8 +38,8 @@ For commands and test-layer selection, see the
 - [`metrics-device-producer-audit.json`](metrics-device-producer-audit.json) is
   the human-owned delivery audit for the exact 231 fields assigned to device
   producer profiles. It records a closed operation boundary and one of the nine
-  #1789 delivery children per field. After #1838 it contains 22 implemented,
-  one source-neutral, 193 planned, and 15 provisional platform-zero records;
+  #1789 delivery children per field. After #1839 it contains 60 implemented,
+  one source-neutral, 155 planned, and 15 provisional platform-zero records;
   only the latter two groups are nonterminal and carry no evidence.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
@@ -81,7 +81,7 @@ reviewed delta.
 | [Snapshot Wave 6](snapshot-wave6-contract.md) | Exact 70-row load, artifact, version, device, tool, time/identity, portability, and downstream-owner certification |
 | [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
 | [Logger producers](logger-contract.md) | Certified 11-row logger aggregate with exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
-| [Metrics schema and producer audits](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, a terminal 69-field #1788 process audit, and an incremental 231-field #1789 device audit with #1838 terminal |
+| [Metrics schema and producer audits](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, a terminal 69-field #1788 process audit, and an incremental 231-field #1789 device audit with #1838 and #1839 terminal |
 
 ## Dispositions
 

@@ -4884,6 +4884,10 @@ fn run_production_memory_hotplug_snapshot_continuation(
         "production {transport} source should process guest PLUG requests"
     );
     assert_eq!(source_metrics["plug_fails"].as_u64(), Some(0));
+    assert_production_memory_hotplug_latency_aggregates(
+        &source_metrics,
+        &format!("production {transport} memory-hotplug source"),
+    );
     assert_http_status(
         &http_request(&source.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
         204,
@@ -5741,6 +5745,35 @@ fn run_production_memory_hotplug_snapshot_destination(
             "production {case} destination must not publish memory_hotplug.{extension}"
         );
     }
+    assert_metrics_family_fields(
+        &fixture.opened_metrics,
+        "memory_hotplug",
+        &[
+            "activate_fails",
+            "plug_agg",
+            "plug_bytes",
+            "plug_count",
+            "plug_fails",
+            "queue_event_count",
+            "queue_event_fails",
+            "state_agg",
+            "state_count",
+            "state_fails",
+            "unplug_agg",
+            "unplug_all_agg",
+            "unplug_all_count",
+            "unplug_all_fails",
+            "unplug_bytes",
+            "unplug_count",
+            "unplug_discard_fails",
+            "unplug_fails",
+        ],
+        &format!("production {case} memory-hotplug destination"),
+    );
+    assert_production_memory_hotplug_latency_aggregates(
+        &metrics,
+        &format!("production {case} memory-hotplug destination"),
+    );
     stop_running_launcher(
         &mut running,
         &format!("production {case} restored memory-hotplug destination"),
@@ -6451,6 +6484,42 @@ fn run_production_balloon_snapshot_destination(
             "production {case} should publish balloon.{field} >= {minimum}; metrics:\n{metrics}"
         );
     }
+    assert_metrics_family_fields(
+        &fixture.opened_metrics,
+        "balloon",
+        &[
+            "activate_fails",
+            "deflate_count",
+            "event_fails",
+            "free_page_hint_count",
+            "free_page_hint_fails",
+            "free_page_hint_freed",
+            "free_page_report_count",
+            "free_page_report_fails",
+            "free_page_report_freed",
+            "inflate_count",
+            "stats_update_fails",
+            "stats_updates_count",
+        ],
+        &format!("production {case} balloon destination"),
+    );
+    for field in [
+        "activate_fails",
+        "event_fails",
+        "free_page_hint_fails",
+        "free_page_report_fails",
+        "stats_update_fails",
+    ] {
+        assert_eq!(
+            production_balloon_metric_total(&fixture.opened_metrics, field),
+            0,
+            "production {case} destination balloon.{field} should remain zero; metrics:\n{metrics}"
+        );
+    }
+    assert!(
+        production_balloon_metric_total(&fixture.opened_metrics, "free_page_report_freed") > 0,
+        "production {case} destination should publish successfully freed reporting bytes; metrics:\n{metrics}"
+    );
     assert_metrics_family_extensions_absent(
         &fixture.opened_metrics,
         "balloon",
@@ -19635,6 +19704,62 @@ fn assert_metrics_family_extensions_absent(
         line_count > 0,
         "{context} should publish at least one metrics line"
     );
+}
+
+fn assert_metrics_family_fields(
+    path: &Path,
+    family: &str,
+    expected_fields: &[&str],
+    context: &str,
+) {
+    let output = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{context} metrics should be readable: {error}"));
+    let mut expected = expected_fields.to_vec();
+    expected.sort_unstable();
+    let mut line_count = 0;
+    for line in output.lines() {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|error| panic!("{context} metrics should be JSON: {error}"));
+        let object = value[family]
+            .as_object()
+            .unwrap_or_else(|| panic!("{context} metrics should contain object {family}"));
+        let mut actual = object.keys().map(String::as_str).collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "{context} metrics should contain the exact {family} fields"
+        );
+        line_count += 1;
+    }
+    assert!(
+        line_count > 0,
+        "{context} should publish at least one metrics line"
+    );
+}
+
+fn assert_production_memory_hotplug_latency_aggregates(metrics: &serde_json::Value, context: &str) {
+    for operation in ["plug", "unplug", "unplug_all", "state"] {
+        let field = format!("{operation}_agg");
+        let aggregate = metrics[field.as_str()]
+            .as_object()
+            .unwrap_or_else(|| panic!("{context} metrics should contain memory_hotplug.{field}"));
+        let mut fields = aggregate.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(fields, ["max_us", "min_us", "sum_us"]);
+        let min_us = aggregate["min_us"]
+            .as_u64()
+            .expect("memory-hotplug minimum latency should be u64");
+        let max_us = aggregate["max_us"]
+            .as_u64()
+            .expect("memory-hotplug maximum latency should be u64");
+        let sum_us = aggregate["sum_us"]
+            .as_u64()
+            .expect("memory-hotplug summed latency should be u64");
+        assert!(
+            min_us <= max_us && max_us <= sum_us,
+            "{context} memory_hotplug.{field} should satisfy min <= max <= sum"
+        );
+    }
 }
 
 fn assert_production_uart_extensions_absent(path: &Path, context: &str) {
