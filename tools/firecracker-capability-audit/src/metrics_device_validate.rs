@@ -11,7 +11,7 @@ use crate::{
 };
 
 const EXPECTED_DEVICE_FIELDS: usize = 231;
-const COMPLETED_DELIVERY_ISSUES: &[&str] = &["#1838", "#1839"];
+const COMPLETED_DELIVERY_ISSUES: &[&str] = &["#1838", "#1839", "#1840"];
 
 /// Validate exact device-producer authority against the resolved metrics schema.
 pub fn validate_metrics_device_producers(

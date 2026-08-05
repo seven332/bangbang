@@ -12130,16 +12130,59 @@ mod macos_arm64 {
         std::str::from_utf8(marker).expect("snapshot-vsock marker must be UTF-8")
     }
 
-    fn flush_direct_snapshot_vsock_metrics(
-        api_socket: &Path,
-        metrics_path: &Path,
-        expected_connections: u64,
-        context: &str,
-    ) {
-        assert_no_content_response(
-            &http_put_json(api_socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
-            &format!("FlushMetrics {context} snapshot-vsock"),
+    const SNAPSHOT_VSOCK_METRIC_FIELDS: [&str; 20] = [
+        "activate_fails",
+        "cfg_fails",
+        "conn_event_fails",
+        "conns_added",
+        "conns_killed",
+        "conns_removed",
+        "ev_queue_event_fails",
+        "killq_resync",
+        "muxer_event_fails",
+        "rx_bytes_count",
+        "rx_packets_count",
+        "rx_queue_event_count",
+        "rx_queue_event_fails",
+        "rx_read_fails",
+        "tx_bytes_count",
+        "tx_flush_fails",
+        "tx_packets_count",
+        "tx_queue_event_count",
+        "tx_queue_event_fails",
+        "tx_write_fails",
+    ];
+
+    fn snapshot_vsock_metric(vsock: &serde_json::Value, field: &str) -> u64 {
+        vsock
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .expect("snapshot-vsock metric should be an unsigned integer")
+    }
+
+    fn assert_snapshot_vsock_metrics_shape(vsock: &serde_json::Value, context: &str) {
+        let object = vsock
+            .as_object()
+            .expect("snapshot-vsock metrics should be an object");
+        assert_eq!(
+            object.len(),
+            SNAPSHOT_VSOCK_METRIC_FIELDS.len(),
+            "{context} snapshot-vsock metrics must contain the exact pinned object: {vsock}"
         );
+        for field in SNAPSHOT_VSOCK_METRIC_FIELDS {
+            assert!(
+                object
+                    .get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+                "{context} snapshot-vsock metrics must contain numeric field {field}: {vsock}"
+            );
+        }
+    }
+
+    fn latest_snapshot_vsock_metrics(
+        metrics_path: &Path,
+    ) -> (serde_json::Value, serde_json::Value) {
         let output = fs::read_to_string(metrics_path)
             .expect("snapshot-vsock metrics output should be readable");
         let generation: serde_json::Value = serde_json::from_str(
@@ -12151,21 +12194,79 @@ mod macos_arm64 {
         .expect("snapshot-vsock metrics generation should be JSON");
         let vsock = generation
             .get("vsock")
+            .cloned()
             .expect("snapshot-vsock metrics should contain a vsock object");
+        (generation, vsock)
+    }
+
+    fn flush_direct_snapshot_vsock_metrics(
+        api_socket: &Path,
+        metrics_path: &Path,
+        expected_connections: u64,
+        context: &str,
+    ) {
+        assert_no_content_response(
+            &http_put_json(api_socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+            &format!("FlushMetrics {context} snapshot-vsock"),
+        );
+        let (generation, vsock) = latest_snapshot_vsock_metrics(metrics_path);
+        assert_snapshot_vsock_metrics_shape(&vsock, context);
         assert!(
-            vsock
-                .get("conns_added")
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|count| count >= expected_connections),
+            snapshot_vsock_metric(&vsock, "conns_added") >= expected_connections,
             "{context} snapshot-vsock metrics must record at least {expected_connections} fresh connections: {generation}"
         );
-        for field in ["rx_bytes_count", "tx_bytes_count"] {
+        for field in [
+            "rx_bytes_count",
+            "rx_packets_count",
+            "tx_bytes_count",
+            "tx_packets_count",
+            "tx_queue_event_count",
+        ] {
             assert!(
-                vsock
-                    .get(field)
-                    .and_then(serde_json::Value::as_u64)
-                    .is_some_and(|count| count > 0),
+                snapshot_vsock_metric(&vsock, field) > 0,
                 "{context} snapshot-vsock metrics must record {field}: {generation}"
+            );
+        }
+        // A restored queue can retain guest-posted RX buffers and deliver host
+        // work without a fresh guest notification. Focused tests pin the
+        // source-admission semantics of the exact queue-event field.
+        assert!(
+            snapshot_vsock_metric(&vsock, "conns_removed")
+                <= snapshot_vsock_metric(&vsock, "conns_added"),
+            "{context} snapshot-vsock removals must not exceed additions: {generation}"
+        );
+        for field in [
+            "activate_fails",
+            "cfg_fails",
+            "conn_event_fails",
+            "conns_killed",
+            "ev_queue_event_fails",
+            "killq_resync",
+            "muxer_event_fails",
+            "rx_queue_event_fails",
+            "rx_read_fails",
+            "tx_flush_fails",
+            "tx_queue_event_fails",
+            "tx_write_fails",
+        ] {
+            assert_eq!(
+                snapshot_vsock_metric(&vsock, field),
+                0,
+                "{context} successful snapshot-vsock traffic must leave {field} at zero: {generation}"
+            );
+        }
+
+        assert_no_content_response(
+            &http_put_json(api_socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+            &format!("FlushMetrics {context} zero-event snapshot-vsock interval"),
+        );
+        let (zero_generation, zero_vsock) = latest_snapshot_vsock_metrics(metrics_path);
+        assert_snapshot_vsock_metrics_shape(&zero_vsock, context);
+        for field in SNAPSHOT_VSOCK_METRIC_FIELDS {
+            assert_eq!(
+                snapshot_vsock_metric(&zero_vsock, field),
+                0,
+                "{context} immediate zero-event interval must reset {field}: {zero_generation}"
             );
         }
     }

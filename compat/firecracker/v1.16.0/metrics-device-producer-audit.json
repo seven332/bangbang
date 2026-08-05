@@ -4045,182 +4045,822 @@
     {
       "field_id": "static:vsock.activate_fails",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.activate_fails` is assigned to #1840 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.activate_fails` is completed by #1840 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "self.metrics.record_activation_failure();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_device_rejects_unexpected_queue_count()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.cfg_fails",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.cfg_fails` is assigned to #1840 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.cfg_fails` is completed by #1840 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "self.metrics.record_config_failure();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_config_space_rejects_unsupported_reads()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.conn_event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.conn_event_fails` is assigned to #1840 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.conn_event_fails` is completed by #1840 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn observe_host_readiness(&self, readiness: &[VsockHostReadiness], poll_failed: bool) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn mmio_host_readiness_classifies_poll_muxer_and_connection_failures()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.conns_added",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.conns_added` is assigned to #1840 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.conns_added` is completed by #1840 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn insert_connected_guest_connection_with_active_limit("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_notifications_connect_guest_request_and_deliver_response()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.conns_killed",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.conns_killed` is assigned to #1840 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.conns_killed` is completed by #1840 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn expire_connections(&mut self, now: Instant) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn kill_queue_rebuilds_more_than_once_after_capacity_overflow()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.conns_removed",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.conns_removed` is assigned to #1840 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.conns_removed` is completed by #1840 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn normalize_source_work(&mut self) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_mmio_capture_retains_active_cursors_and_normalization_evidence()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.ev_queue_event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.ev_queue_event_fails` is assigned to #1840 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.ev_queue_event_fails` is completed by #1840 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn prepare_transport_reset_unobserved("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_transport_reset_reports_payload_and_ring_corruption()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.killq_resync",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.killq_resync` is assigned to #1840 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.killq_resync` is completed by #1840 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn rebuild_kill_queue(&mut self, record_resync: bool) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn kill_queue_rebuilds_more_than_once_after_capacity_overflow()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.muxer_event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.muxer_event_fails` is assigned to #1840 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.muxer_event_fails` is completed by #1840 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn observe_host_readiness(&self, readiness: &[VsockHostReadiness], poll_failed: bool) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn mmio_host_readiness_classifies_poll_muxer_and_connection_failures()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.rx_bytes_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.rx_bytes_count` is assigned to #1840 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.rx_bytes_count` is completed by #1840 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn poll_host_rw_payloads("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn vsock_host_read_poll_distinguishes_clean_eof_and_terminal_error_after_queued_data()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.rx_packets_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.rx_packets_count` is assigned to #1840 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.rx_packets_count` is completed by #1840 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn dispatch_pending_rx_packets("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_notifications_deliver_guest_connection_host_rw_payload_to_guest()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.rx_queue_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.rx_queue_event_count` is assigned to #1840 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.rx_queue_event_count` is completed by #1840 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn dispatch_drained_queue_notifications_at_unobserved("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_notifications_dispatch_late_host_connect_without_second_rx_notify()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.rx_queue_event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.rx_queue_event_fails` is assigned to #1840 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.rx_queue_event_fails` is completed by #1840 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn dispatch_drained_queue_notifications_at_unobserved("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_rx_queue_dispatch_preserves_request_on_used_ring_failure()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.rx_read_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.rx_read_fails` is assigned to #1840 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.rx_read_fails` is completed by #1840 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn poll_host_rw_payloads("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn vsock_host_read_poll_distinguishes_clean_eof_and_terminal_error_after_queued_data()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.tx_bytes_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.tx_bytes_count` is assigned to #1840 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.tx_bytes_count` is completed by #1840 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn forward_guest_rw_packet("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_notifications_forward_guest_rw_payload_to_host_stream()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.tx_flush_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.tx_flush_fails` is assigned to #1840 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.tx_flush_fails` is completed by #1840 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn flush_pending_guest_rw_writes(&mut self, guest_cid: u32)"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_notifications_drop_pending_guest_rw_connection_on_flush_failure()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.tx_packets_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.tx_packets_count` is assigned to #1840 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.tx_packets_count` is completed by #1840 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn forward_guest_rw_packet("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_notifications_forward_guest_rw_payload_to_host_stream()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.tx_queue_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.tx_queue_event_count` is assigned to #1840 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.tx_queue_event_count` is completed by #1840 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn dispatch_drained_queue_notifications_at_unobserved("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_notifications_dispatch_empty_tx_queue_without_interrupt()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.tx_queue_event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.tx_queue_event_fails` is assigned to #1840 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.tx_queue_event_fails` is completed by #1840 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn dispatch_drained_queue_notifications_at_unobserved("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_notifications_preserve_partial_tx_error_and_mark_interrupt()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     },
     {
       "field_id": "static:vsock.tx_write_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1840",
-      "rationale": "Pinned Firecracker field `vsock.tx_write_fails` is assigned to #1840 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vsock.tx_write_fails` is completed by #1840 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVsockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "vsock: VsockMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn forward_guest_rw_packet("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_vsock_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "fn virtio_vsock_notifications_forward_guest_rw_payload_to_host_stream()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1840"
+        }
+      ]
     }
   ]
 }

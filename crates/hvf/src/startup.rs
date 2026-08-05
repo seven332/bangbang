@@ -235,8 +235,9 @@ use bangbang_runtime::vmclock::{VMCLOCK_ABI_SIZE, VmClockAbi, VmClockRestoreUpda
 use bangbang_runtime::vsock::{
     VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES, VirtioVsockCaptureValidation,
     VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockMmioCaptureState,
-    VirtioVsockPciCaptureState, VirtioVsockReconstructionResource, VsockConfig, VsockHostWakeup,
-    VsockMmioDeviceRegistration, VsockMmioLayout,
+    VirtioVsockPciCaptureState, VirtioVsockReconstructionResource, VsockConfig, VsockHostReadiness,
+    VsockHostWakeup, VsockMmioDeviceRegistration, VsockMmioLayout,
+    attach_vsock_metrics_to_mmio_handler, observe_vsock_host_readiness_for_mmio_handler,
 };
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
 use crc64::crc64;
@@ -2266,7 +2267,7 @@ impl HvfArm64BootPciDataDevices {
             .min()
     }
 
-    fn dispatch_vsock(&mut self, memory: &mut GuestMemory, metrics: &SharedVsockDeviceMetrics) {
+    fn dispatch_vsock(&mut self, memory: &mut GuestMemory) {
         let Some(device) = self.vsock.as_mut() else {
             return;
         };
@@ -2274,20 +2275,6 @@ impl HvfArm64BootPciDataDevices {
             .published
             .endpoint()
             .dispatch_vsock_queue_notifications(memory);
-        match &result {
-            Ok(dispatch) => metrics.record_notification_dispatch(dispatch),
-            Err(error) => {
-                if let Some(completed) = error.completed_device_operation() {
-                    metrics.record_notification_dispatch(completed);
-                }
-                if let Some(source) = error.device_error() {
-                    metrics.record_notification_error(source);
-                }
-                if error.endpoint_error().is_some() {
-                    metrics.record_muxer_event_failure();
-                }
-            }
-        }
         let delivered = match &result {
             Ok(dispatch) => dispatch.needs_queue_interrupt(),
             Err(error) if error.endpoint_error().is_none() => {
@@ -11574,13 +11561,9 @@ fn capture_ready_vsock_state_with_cancel(
                         false,
                     )
                 })?;
-            let (reset_attempt, handler_identity) = prepare_vsock_transport_reset_for_device(
-                device,
-                &mut dispatcher,
-                memory,
-                owner.session_metrics,
-            )
-            .map_err(map_vsock_mmio_transport_reset_error)?;
+            let (reset_attempt, handler_identity) =
+                prepare_vsock_transport_reset_for_device(device, &mut dispatcher, memory)
+                    .map_err(map_vsock_mmio_transport_reset_error)?;
 
             retain_vsock_cancellation(
                 &mut pending_cancellation,
@@ -11593,7 +11576,6 @@ fn capture_ready_vsock_state_with_cancel(
                     signal_queue_interrupt(interrupt_line, &signaler).is_ok()
                 });
                 if !delivered {
-                    owner.session_metrics.record_event_queue_signal_failure();
                     guest_logger.log_vsock(LoggerVsockOutcome::InterruptDeliveryFailed);
                     return Err(vsock_capture_error(
                         HvfArm64BootVsockCaptureErrorKind::InterruptDelivery,
@@ -11641,7 +11623,7 @@ fn capture_ready_vsock_state_with_cancel(
             let reset_attempt = device
                 .published
                 .endpoint()
-                .prepare_vsock_transport_reset(memory, owner.session_metrics)
+                .prepare_vsock_transport_reset(memory)
                 .map_err(|_| {
                     vsock_capture_error(
                         HvfArm64BootVsockCaptureErrorKind::Reset,
@@ -16682,7 +16664,7 @@ impl HvfArm64BootSession<'_> {
                 HvfArm64BootVsockNotificationDispatchError::MapGuestMemory { source }
             })?;
             if let Some(devices) = self.pci_data_devices.as_mut() {
-                devices.dispatch_vsock(memory, &self.vsock_device_metrics);
+                devices.dispatch_vsock(memory);
             }
             return Ok(HvfArm64BootVsockNotificationDispatches::new(Vec::new()));
         }
@@ -16708,10 +16690,6 @@ impl HvfArm64BootSession<'_> {
             &self.gic,
             &self.backend.guest_logger(),
         );
-        match &result {
-            Ok(dispatches) => record_vsock_signal_metrics(&self.vsock_device_metrics, dispatches),
-            Err(_) => self.vsock_device_metrics.record_muxer_event_failure(),
-        }
         observe_vsock_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
@@ -18591,7 +18569,20 @@ fn publish_snapshot_v2_vsock_pci(
     if prepared
         .endpoint()
         .endpoint()
-        .signal_restored_vsock_transport_reset(&metrics)
+        .attach_vsock_metrics(metrics.clone())
+        .is_err()
+    {
+        drop(prepared);
+        let cleanup_failed = release_snapshot_v2_network_pci_interrupts(&mut interrupts);
+        return Err(failure(
+            HvfSnapshotV2NetworkPciBatchFailureKind::Preparation,
+            cleanup_failed,
+        ));
+    }
+    if prepared
+        .endpoint()
+        .endpoint()
+        .signal_restored_vsock_transport_reset()
         .is_err()
     {
         drop(prepared);
@@ -19299,6 +19290,7 @@ impl OwnedHvfArm64BootSession {
                 pmem_device_metrics,
                 network_interface_metrics,
                 balloon_device_metrics,
+                vsock_device_metrics,
                 entropy_device_metrics,
                 ..
             } = &mut session;
@@ -19311,6 +19303,7 @@ impl OwnedHvfArm64BootSession {
                     network: network_interface_metrics,
                     pmem: pmem_device_metrics,
                     balloon: balloon_device_metrics,
+                    vsock: vsock_device_metrics,
                     entropy: entropy_device_metrics,
                 },
             )
@@ -20191,11 +20184,12 @@ impl OwnedHvfArm64BootSession {
                         )
                         .ok()
                 });
-            let Some(handler) = reconstruction else {
+            let Some(mut handler) = reconstruction else {
                 return Err(HvfSnapshotV2NetworkMmioRestoreError::after_session(
                     session, stage,
                 ));
             };
+            handler.attach_vsock_metrics(metrics.clone());
             let registration_result = {
                 let registrations = session.restored_snapshot_v2_mmio_registrations.as_ref();
                 match (registrations, session.mmio_dispatcher.lock()) {
@@ -30695,7 +30689,7 @@ impl OwnedHvfArm64BootSession {
                 HvfArm64BootVsockNotificationDispatchError::MapGuestMemory { source }
             })?;
             if let Some(devices) = self.pci_data_devices.as_mut() {
-                devices.dispatch_vsock(memory, &self.vsock_device_metrics);
+                devices.dispatch_vsock(memory);
             }
             return Ok(HvfArm64BootVsockNotificationDispatches::new(Vec::new()));
         }
@@ -30721,10 +30715,6 @@ impl OwnedHvfArm64BootSession {
             &self.gic,
             &self.backend.guest_logger(),
         );
-        match &result {
-            Ok(dispatches) => record_vsock_signal_metrics(&self.vsock_device_metrics, dispatches),
-            Err(_) => self.vsock_device_metrics.record_muxer_event_failure(),
-        }
         observe_vsock_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
     }
@@ -30999,6 +30989,19 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
             self.runner.control(),
             self.run_loop_wakeup.clone(),
         )
+    }
+
+    fn observe_run_loop_vsock_readiness(
+        &mut self,
+        observation: &HvfArm64BootVsockReadinessObservation,
+    ) {
+        observe_run_loop_vsock_readiness(
+            &self.runtime_resources,
+            self.pci_data_devices.as_ref(),
+            &self.mmio_dispatcher,
+            &self.vsock_device_metrics,
+            observation,
+        );
     }
 
     fn take_run_loop_wakeup_request(&mut self) -> bool {
@@ -32486,6 +32489,8 @@ fn start_run_loop_wakeup_monitor(
 
     let mut read_fds = Vec::new();
     let mut write_fds = Vec::new();
+    let mut vsock_read_fds = Vec::new();
+    let mut vsock_write_fds = Vec::new();
     let mut deadline = None;
     let mut has_block_wakeup_fds = async_block_fd.is_some();
     let has_serial_input_fd = serial_input_fd.is_some();
@@ -32505,7 +32510,7 @@ fn start_run_loop_wakeup_monitor(
         let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(dispatcher)
             .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::MmioDispatcher { source })?;
         if runtime_resources.vsock_device.is_some() {
-            let (vsock_read_fds, vsock_write_fds, vsock_deadline) =
+            let (device_read_fds, device_write_fds, vsock_deadline) =
                 runtime_resources
                     .vsock_wakeup(&mut mmio_dispatcher)
                     .map_err(|source| {
@@ -32513,17 +32518,29 @@ fn start_run_loop_wakeup_monitor(
                     })?
                     .into_parts();
             read_fds
-                .try_reserve_exact(vsock_read_fds.len())
+                .try_reserve_exact(device_read_fds.len())
                 .map_err(
                     |source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source },
                 )?;
             write_fds
-                .try_reserve_exact(vsock_write_fds.len())
+                .try_reserve_exact(device_write_fds.len())
                 .map_err(
                     |source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source },
                 )?;
-            read_fds.extend(vsock_read_fds);
-            write_fds.extend(vsock_write_fds);
+            vsock_read_fds
+                .try_reserve_exact(device_read_fds.len())
+                .map_err(
+                    |source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source },
+                )?;
+            vsock_write_fds
+                .try_reserve_exact(device_write_fds.len())
+                .map_err(
+                    |source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source },
+                )?;
+            read_fds.extend(device_read_fds.iter().copied());
+            write_fds.extend(device_write_fds.iter().copied());
+            vsock_read_fds.extend(device_read_fds);
+            vsock_write_fds.extend(device_write_fds);
             deadline = earliest_deadline(deadline, vsock_deadline);
         }
         if has_mmio_block {
@@ -32559,8 +32576,16 @@ fn start_run_loop_wakeup_monitor(
         write_fds
             .try_reserve_exact(pci_write_fds.len())
             .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
-        read_fds.extend(pci_read_fds);
-        write_fds.extend(pci_write_fds);
+        vsock_read_fds
+            .try_reserve_exact(pci_read_fds.len())
+            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
+        vsock_write_fds
+            .try_reserve_exact(pci_write_fds.len())
+            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
+        read_fds.extend(pci_read_fds.iter().copied());
+        write_fds.extend(pci_write_fds.iter().copied());
+        vsock_read_fds.extend(pci_read_fds);
+        vsock_write_fds.extend(pci_write_fds);
         deadline = earliest_deadline(deadline, pci_deadline);
     }
     if let Some(devices) = pci_data_devices.filter(|devices| !devices.block.is_empty()) {
@@ -32577,11 +32602,15 @@ fn start_run_loop_wakeup_monitor(
     }
 
     HvfArm64BootRunLoopWakeupMonitor::start(
-        read_fds,
-        write_fds,
-        deadline,
-        has_block_wakeup_fds,
-        has_serial_input_fd,
+        HvfArm64BootRunLoopWakeupInputs {
+            host_read_fds: read_fds,
+            host_write_fds: write_fds,
+            vsock_read_fds,
+            vsock_write_fds,
+            deadline,
+            has_block_wakeup_fds,
+            has_serial_input_fd,
+        },
         vcpu_control,
         wakeup_token,
     )
@@ -32838,6 +32867,12 @@ trait BootSessionRunLoopSession {
         Ok(HvfArm64BootRunLoopWakeupMonitor::inactive())
     }
 
+    fn observe_run_loop_vsock_readiness(
+        &mut self,
+        _observation: &HvfArm64BootVsockReadinessObservation,
+    ) {
+    }
+
     fn take_run_loop_wakeup_request(&mut self) -> bool {
         false
     }
@@ -32928,6 +32963,49 @@ trait BootSessionRunLoopSession {
     >;
 }
 
+fn observe_run_loop_vsock_readiness(
+    runtime_resources: &Arm64BootRuntimeResources,
+    pci_data_devices: Option<&HvfArm64BootPciDataDevices>,
+    mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    metrics: &SharedVsockDeviceMetrics,
+    observation: &HvfArm64BootVsockReadinessObservation,
+) {
+    if observation.is_empty() {
+        return;
+    }
+
+    if let Some(device) = pci_data_devices.and_then(|devices| devices.vsock.as_ref()) {
+        if device
+            .published
+            .endpoint()
+            .observe_vsock_host_readiness(&observation.events, observation.poll_failed)
+            .is_err()
+        {
+            metrics.record_muxer_event_failure();
+        }
+        return;
+    }
+
+    let Some(device) = runtime_resources.vsock_device.as_ref() else {
+        metrics.record_muxer_event_failure();
+        return;
+    };
+    let Ok(mut dispatcher) = mmio_dispatcher.lock() else {
+        metrics.record_muxer_event_failure();
+        return;
+    };
+    if observe_vsock_host_readiness_for_mmio_handler(
+        &mut dispatcher,
+        device.registration.region_id(),
+        &observation.events,
+        observation.poll_failed,
+    )
+    .is_err()
+    {
+        metrics.record_muxer_event_failure();
+    }
+}
+
 impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
     fn guest_logger(&self) -> GuestLogger {
         self.backend.guest_logger()
@@ -32946,6 +33024,19 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
             self.runner.control(),
             self.run_loop_wakeup.clone(),
         )
+    }
+
+    fn observe_run_loop_vsock_readiness(
+        &mut self,
+        observation: &HvfArm64BootVsockReadinessObservation,
+    ) {
+        observe_run_loop_vsock_readiness(
+            &self.runtime_resources,
+            self.pci_data_devices.as_ref(),
+            &self.mmio_dispatcher,
+            &self.vsock_device_metrics,
+            observation,
+        );
     }
 
     fn take_run_loop_wakeup_request(&mut self) -> bool {
@@ -33526,7 +33617,7 @@ fn run_boot_session_loop_with_observer_inner(
         let monitor_has_serial_input_fd = monitor.has_serial_input_fd();
         let outcome_result = session.run_loop_vcpu_step();
         let finish_result = monitor.finish();
-        let monitor_wakeup_requested = match &outcome_result {
+        let monitor_observation = match &outcome_result {
             Ok(_) => {
                 finish_result.map_err(|source| HvfArm64BootRunLoopError::StopWakeupMonitor {
                     steps_completed: steps.saturating_add(1),
@@ -33546,6 +33637,8 @@ fn run_boot_session_loop_with_observer_inner(
         })?;
         observe_step(&outcome);
         steps += 1;
+        session.observe_run_loop_vsock_readiness(&monitor_observation.vsock);
+        let monitor_wakeup_requested = monitor_observation.wakeup_requested;
 
         match outcome {
             HvfVcpuRunStepOutcome::Canceled => {
@@ -33765,10 +33858,38 @@ fn run_boot_session_loop_with_observer_inner(
     }
 }
 
+#[derive(Debug, Default)]
+struct HvfArm64BootVsockReadinessObservation {
+    events: Vec<VsockHostReadiness>,
+    poll_failed: bool,
+}
+
+impl HvfArm64BootVsockReadinessObservation {
+    fn is_empty(&self) -> bool {
+        self.events.is_empty() && !self.poll_failed
+    }
+}
+
+#[derive(Debug, Default)]
+struct HvfArm64BootRunLoopWakeupObservation {
+    wakeup_requested: bool,
+    vsock: HvfArm64BootVsockReadinessObservation,
+}
+
 struct HvfArm64BootRunLoopWakeupMonitor {
     stop_writer: Option<UnixStream>,
-    thread: Option<JoinHandle<bool>>,
+    thread: Option<JoinHandle<HvfArm64BootRunLoopWakeupObservation>>,
     completed_wakeup: bool,
+    has_block_wakeup_fds: bool,
+    has_serial_input_fd: bool,
+}
+
+struct HvfArm64BootRunLoopWakeupInputs {
+    host_read_fds: Vec<RawFd>,
+    host_write_fds: Vec<RawFd>,
+    vsock_read_fds: Vec<RawFd>,
+    vsock_write_fds: Vec<RawFd>,
+    deadline: Option<Instant>,
     has_block_wakeup_fds: bool,
     has_serial_input_fd: bool,
 }
@@ -33818,20 +33939,36 @@ impl HvfArm64BootRunLoopWakeupMonitor {
     }
 
     fn start(
-        host_read_fds: Vec<RawFd>,
-        host_write_fds: Vec<RawFd>,
-        deadline: Option<Instant>,
-        has_block_wakeup_fds: bool,
-        has_serial_input_fd: bool,
+        inputs: HvfArm64BootRunLoopWakeupInputs,
         vcpu_control: HvfVcpuRunControl,
         wakeup_token: HvfArm64BootRunLoopWakeupToken,
     ) -> Result<Self, HvfArm64BootRunLoopWakeupMonitorError> {
+        let HvfArm64BootRunLoopWakeupInputs {
+            host_read_fds,
+            host_write_fds,
+            mut vsock_read_fds,
+            mut vsock_write_fds,
+            deadline,
+            has_block_wakeup_fds,
+            has_serial_input_fd,
+        } = inputs;
         if host_read_fds.is_empty() && host_write_fds.is_empty() && deadline.is_none() {
             return Ok(Self::inactive());
         }
 
         let (stop_reader, stop_writer) =
             UnixStream::pair().map_err(|source| Self::create_stop_pipe_error(source.kind()))?;
+        vsock_read_fds.sort_unstable();
+        vsock_read_fds.dedup();
+        vsock_write_fds.sort_unstable();
+        vsock_write_fds.dedup();
+        let mut vsock_fds = vsock_read_fds;
+        vsock_fds
+            .try_reserve_exact(vsock_write_fds.len())
+            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
+        vsock_fds.extend(vsock_write_fds);
+        vsock_fds.sort_unstable();
+        vsock_fds.dedup();
         let mut pollfds =
             run_loop_wakeup_pollfds(host_read_fds, host_write_fds, stop_reader.as_raw_fd())?;
         let pollfd_count = libc::nfds_t::try_from(pollfds.len()).map_err(|_| {
@@ -33847,6 +33984,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
                     pollfd_count,
                     stop_reader,
                     deadline,
+                    &vsock_fds,
                     vcpu_control,
                     wakeup_token,
                 )
@@ -33870,7 +34008,9 @@ impl HvfArm64BootRunLoopWakeupMonitor {
         self.has_serial_input_fd
     }
 
-    fn finish(mut self) -> Result<bool, HvfArm64BootRunLoopWakeupMonitorError> {
+    fn finish(
+        mut self,
+    ) -> Result<HvfArm64BootRunLoopWakeupObservation, HvfArm64BootRunLoopWakeupMonitorError> {
         let mut stop_signal_error = None;
         if let Some(mut stop_writer) = self.stop_writer.take() {
             match stop_writer.write_all(&RUN_LOOP_WAKEUP_MONITOR_STOP_BYTE) {
@@ -33886,19 +34026,22 @@ impl HvfArm64BootRunLoopWakeupMonitor {
             }
         }
 
-        let completed_wakeup = if let Some(thread) = self.thread.take() {
+        let observation = if let Some(thread) = self.thread.take() {
             thread
                 .join()
                 .map_err(|_| HvfArm64BootRunLoopWakeupMonitorError::ThreadPanicked)?
         } else {
-            self.completed_wakeup
+            HvfArm64BootRunLoopWakeupObservation {
+                wakeup_requested: self.completed_wakeup,
+                vsock: HvfArm64BootVsockReadinessObservation::default(),
+            }
         };
 
         if let Some(source) = stop_signal_error {
             return Err(HvfArm64BootRunLoopWakeupMonitorError::StopSignal { source });
         }
 
-        Ok(completed_wakeup)
+        Ok(observation)
     }
 
     const fn create_stop_pipe_error(
@@ -33975,13 +34118,15 @@ fn run_loop_wakeup_monitor(
     pollfd_count: libc::nfds_t,
     _stop_reader: UnixStream,
     deadline: Option<Instant>,
+    vsock_fds: &[RawFd],
     vcpu_control: HvfVcpuRunControl,
     wakeup_token: HvfArm64BootRunLoopWakeupToken,
-) -> bool {
+) -> HvfArm64BootRunLoopWakeupObservation {
     run_loop_wakeup_monitor_with(
         pollfds,
         pollfd_count,
         deadline,
+        vsock_fds,
         Instant::now,
         |pollfds, pollfd_count, timeout| {
             // SAFETY: `pollfds` is a valid mutable slice for `pollfd_count`
@@ -34005,6 +34150,7 @@ fn run_loop_wakeup_monitor_with(
     pollfds: &mut [libc::pollfd],
     pollfd_count: libc::nfds_t,
     deadline: Option<Instant>,
+    vsock_fds: &[RawFd],
     mut now: impl FnMut() -> Instant,
     mut poll: impl FnMut(
         &mut [libc::pollfd],
@@ -34012,7 +34158,7 @@ fn run_loop_wakeup_monitor_with(
         libc::c_int,
     ) -> Result<libc::c_int, io::ErrorKind>,
     mut request_wakeup: impl FnMut(),
-) -> bool {
+) -> HvfArm64BootRunLoopWakeupObservation {
     loop {
         for pollfd in pollfds.iter_mut() {
             pollfd.revents = 0;
@@ -34024,15 +34170,21 @@ fn run_loop_wakeup_monitor_with(
             Err(io::ErrorKind::Interrupted) => continue,
             Err(_) => {
                 request_wakeup();
-                return true;
+                return HvfArm64BootRunLoopWakeupObservation {
+                    wakeup_requested: true,
+                    vsock: HvfArm64BootVsockReadinessObservation {
+                        events: Vec::new(),
+                        poll_failed: !vsock_fds.is_empty(),
+                    },
+                };
             }
         };
 
         let Some(stop_pollfd) = pollfds.first() else {
-            return false;
+            return HvfArm64BootRunLoopWakeupObservation::default();
         };
         if pollfd_has_wakeup_event(stop_pollfd.revents) {
-            return false;
+            return HvfArm64BootRunLoopWakeupObservation::default();
         }
         let fd_wakeup = pollfds
             .iter()
@@ -34040,7 +34192,22 @@ fn run_loop_wakeup_monitor_with(
             .any(|pollfd| pollfd_has_wakeup_event(pollfd.revents));
         if fd_wakeup || (poll_result == 0 && deadline.is_some()) {
             request_wakeup();
-            return true;
+            let events = pollfds
+                .iter()
+                .skip(1)
+                .filter(|pollfd| {
+                    pollfd_has_wakeup_event(pollfd.revents)
+                        && vsock_fds.binary_search(&pollfd.fd).is_ok()
+                })
+                .map(|pollfd| VsockHostReadiness::from_poll_revents(pollfd.fd, pollfd.revents))
+                .collect();
+            return HvfArm64BootRunLoopWakeupObservation {
+                wakeup_requested: true,
+                vsock: HvfArm64BootVsockReadinessObservation {
+                    events,
+                    poll_failed: false,
+                },
+            };
         }
     }
 }
@@ -34804,7 +34971,6 @@ fn record_vsock_dispatch_metrics(
         .iter()
         .map(HvfArm64BootVsockNotificationDispatch::dispatch);
     record_vsock_runtime_dispatch_metrics(metrics, runtime_dispatches);
-    record_vsock_signal_metrics(metrics, dispatches);
 }
 
 fn record_vsock_runtime_dispatch_metrics<'a>(
@@ -34812,24 +34978,7 @@ fn record_vsock_runtime_dispatch_metrics<'a>(
     dispatches: impl IntoIterator<Item = &'a Arm64BootVsockNotificationDispatch>,
 ) {
     for dispatch in dispatches {
-        if let Some(dispatched) = dispatch.outcome().dispatched() {
-            metrics.record_notification_dispatch(dispatched);
-        }
-        if let Some(source) = dispatch.outcome().dispatch_error() {
-            metrics.record_notification_error(source);
-        }
         if dispatch.outcome().handler_lookup_error().is_some() {
-            metrics.record_muxer_event_failure();
-        }
-    }
-}
-
-fn record_vsock_signal_metrics(
-    metrics: &SharedVsockDeviceMetrics,
-    dispatches: &HvfArm64BootVsockNotificationDispatches,
-) {
-    for dispatch in dispatches.as_slice() {
-        if dispatch.signal_error().is_some() {
             metrics.record_muxer_event_failure();
         }
     }
@@ -36824,8 +36973,10 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         SharedNetworkInterfaceMetricsRegistry::from_interface_ids(network_interface_ids)
     };
     let balloon_device_metrics = SharedBalloonDeviceMetrics::default();
+    let vsock_device_metrics = SharedVsockDeviceMetrics::default();
     let entropy_device_metrics = SharedEntropyDeviceMetrics::default();
     bind_mmio_balloon_transport_metrics(&runtime, &mmio_dispatcher, &balloon_device_metrics)?;
+    bind_mmio_vsock_transport_metrics(&runtime, &mmio_dispatcher, &vsock_device_metrics)?;
     bind_mmio_entropy_transport_metrics(&runtime, &mmio_dispatcher, &entropy_device_metrics)?;
     bind_mmio_pmem_transport_metrics(&runtime, &mmio_dispatcher, &pmem_device_metrics)?;
     bind_mmio_network_transport_metrics(&runtime, &mmio_dispatcher, &network_interface_metrics)?;
@@ -36842,6 +36993,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
             network: &network_interface_metrics,
             pmem: &pmem_device_metrics,
             balloon: &balloon_device_metrics,
+            vsock: &vsock_device_metrics,
             entropy: &entropy_device_metrics,
         },
     )
@@ -36935,7 +37087,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         balloon_device_metrics,
         memory_hotplug_device_metrics,
         network_interface_metrics,
-        vsock_device_metrics: SharedVsockDeviceMetrics::default(),
+        vsock_device_metrics,
         entropy_device_metrics,
         gic,
         block_interrupt_lines: interrupt_lines.block,
@@ -37372,6 +37524,32 @@ fn bind_mmio_balloon_transport_metrics(
     })
 }
 
+fn bind_mmio_vsock_transport_metrics(
+    runtime: &Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    metrics: &SharedVsockDeviceMetrics,
+) -> Result<(), HvfArm64BootSessionError> {
+    let Some(device) = &runtime.vsock_device else {
+        return Ok(());
+    };
+    let mut dispatcher =
+        dispatcher
+            .lock()
+            .map_err(|_| HvfArm64BootSessionError::DeviceMetricsBinding {
+                kind: "vsock",
+                message: "MMIO dispatcher is unavailable".to_string(),
+            })?;
+    attach_vsock_metrics_to_mmio_handler(
+        &mut dispatcher,
+        device.registration.region_id(),
+        metrics.clone(),
+    )
+    .map_err(|source| HvfArm64BootSessionError::DeviceMetricsBinding {
+        kind: "vsock",
+        message: format!("failed to resolve MMIO vsock device: {source}"),
+    })
+}
+
 fn bind_mmio_pmem_transport_metrics(
     runtime: &Arm64BootRuntimeResources,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
@@ -37446,6 +37624,7 @@ struct HvfArm64BootPciDataMetrics<'a> {
     network: &'a SharedNetworkInterfaceMetricsRegistry,
     pmem: &'a SharedPmemDeviceMetricsRegistry,
     balloon: &'a SharedBalloonDeviceMetrics,
+    vsock: &'a SharedVsockDeviceMetrics,
     entropy: &'a SharedEntropyDeviceMetrics,
 }
 
@@ -37460,6 +37639,7 @@ fn prepare_pci_data_devices(
         network: network_interface_metrics,
         pmem: pmem_device_metrics,
         balloon: balloon_device_metrics,
+        vsock: vsock_device_metrics,
         entropy: entropy_device_metrics,
     } = metrics;
     let Some(validation) = runtime.pci_validation.as_ref() else {
@@ -37886,7 +38066,8 @@ fn prepare_pci_data_devices(
             endpoint_index += 1;
         }
 
-        if let Some(prepared) = vsock {
+        if let Some(mut prepared) = vsock {
+            prepared.attach_metrics(vsock_device_metrics.clone());
             let (guest_cid, uds_path, config_space, device) = prepared.into_parts();
             let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
@@ -38276,7 +38457,7 @@ mod tests {
     use bangbang_runtime::vsock::{
         VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_PACKET_HEADER_SIZE,
         VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX, VirtioVsockPacketHeader,
-        VsockConfigInput, VsockMmioLayout,
+        VsockConfigInput, VsockMmioLayout, attach_vsock_metrics_to_mmio_handler,
     };
 
     use super::{
@@ -38612,10 +38793,11 @@ mod tests {
         let mut timeouts = Vec::new();
         let mut wakeups = 0usize;
 
-        let woke = super::run_loop_wakeup_monitor_with(
+        let observation = super::run_loop_wakeup_monitor_with(
             &mut pollfds,
             1,
             Some(deadline),
+            &[],
             || times.pop_front().expect("each poll should sample time"),
             |pollfds, count, timeout| {
                 assert_eq!(pollfds.len(), 1);
@@ -38626,7 +38808,8 @@ mod tests {
             || wakeups += 1,
         );
 
-        assert!(woke);
+        assert!(observation.wakeup_requested);
+        assert!(observation.vsock.is_empty());
         assert_eq!(timeouts, [5, 3]);
         assert_eq!(wakeups, 1);
         assert!(times.is_empty());
@@ -38650,10 +38833,11 @@ mod tests {
         ];
         let mut wakeups = 0usize;
 
-        let woke = super::run_loop_wakeup_monitor_with(
+        let observation = super::run_loop_wakeup_monitor_with(
             &mut pollfds,
             2,
             Some(now),
+            &[11],
             || now,
             |pollfds, _, timeout| {
                 assert_eq!(timeout, 0);
@@ -38664,12 +38848,13 @@ mod tests {
             || wakeups += 1,
         );
 
-        assert!(!woke);
+        assert!(!observation.wakeup_requested);
+        assert!(observation.vsock.is_empty());
         assert_eq!(wakeups, 0);
     }
 
     #[test]
-    fn run_loop_wakeup_monitor_coalesces_simultaneous_fd_and_deadline_readiness() {
+    fn run_loop_wakeup_monitor_preserves_all_simultaneous_vsock_readiness_flags() {
         let now = Instant::now();
         let mut pollfds = [
             libc::pollfd {
@@ -38685,20 +38870,30 @@ mod tests {
         ];
         let mut wakeups = 0usize;
 
-        let woke = super::run_loop_wakeup_monitor_with(
+        let observation = super::run_loop_wakeup_monitor_with(
             &mut pollfds,
             2,
             Some(now),
+            &[11],
             || now,
             |pollfds, _, timeout| {
                 assert_eq!(timeout, 0);
-                pollfds[1].revents = libc::POLLIN;
+                pollfds[1].revents =
+                    libc::POLLIN | libc::POLLOUT | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
                 Ok(1)
             },
             || wakeups += 1,
         );
 
-        assert!(woke);
+        assert!(observation.wakeup_requested);
+        assert!(!observation.vsock.poll_failed);
+        assert_eq!(observation.vsock.events.len(), 1);
+        assert_eq!(observation.vsock.events[0].descriptor(), 11);
+        assert!(observation.vsock.events[0].readable());
+        assert!(observation.vsock.events[0].writable());
+        assert!(observation.vsock.events[0].error());
+        assert!(observation.vsock.events[0].hangup());
+        assert!(observation.vsock.events[0].invalid());
         assert_eq!(wakeups, 1);
     }
 
@@ -38712,10 +38907,11 @@ mod tests {
         }];
         let mut wakeups = 0usize;
 
-        let woke = super::run_loop_wakeup_monitor_with(
+        let observation = super::run_loop_wakeup_monitor_with(
             &mut pollfds,
             1,
             None,
+            &[10],
             || now,
             |_, _, timeout| {
                 assert_eq!(timeout, -1);
@@ -38724,7 +38920,9 @@ mod tests {
             || wakeups += 1,
         );
 
-        assert!(woke);
+        assert!(observation.wakeup_requested);
+        assert!(observation.vsock.poll_failed);
+        assert!(observation.vsock.events.is_empty());
         assert_eq!(wakeups, 1);
     }
 
@@ -38737,17 +38935,23 @@ mod tests {
                 .expect("test coordinator should build");
         let wakeup = super::HvfArm64BootRunLoopWakeupToken::default();
         let monitor = super::HvfArm64BootRunLoopWakeupMonitor::start(
-            Vec::new(),
-            Vec::new(),
-            Some(Instant::now() + Duration::from_secs(60 * 60)),
-            false,
-            false,
+            super::HvfArm64BootRunLoopWakeupInputs {
+                host_read_fds: Vec::new(),
+                host_write_fds: Vec::new(),
+                vsock_read_fds: Vec::new(),
+                vsock_write_fds: Vec::new(),
+                deadline: Some(Instant::now() + Duration::from_secs(60 * 60)),
+                has_block_wakeup_fds: false,
+                has_serial_input_fd: false,
+            },
             coordinator.control(),
             wakeup.clone(),
         )
         .expect("deadline-only monitor should start");
 
-        assert!(!monitor.finish().expect("monitor should stop and join"));
+        let observation = monitor.finish().expect("monitor should stop and join");
+        assert!(!observation.wakeup_requested);
+        assert!(observation.vsock.is_empty());
         assert!(!wakeup.take_wakeup_request());
         coordinator
             .shutdown()
@@ -42781,6 +42985,22 @@ mod tests {
         (parts.memory, parts.runtime, parts.mmio_dispatcher)
     }
 
+    fn bind_boot_vsock_metrics(
+        runtime: &Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> SharedVsockDeviceMetrics {
+        let metrics = SharedVsockDeviceMetrics::default();
+        let region_id = runtime
+            .vsock_device
+            .as_ref()
+            .expect("test vsock device should exist")
+            .registration
+            .region_id();
+        attach_vsock_metrics_to_mmio_handler(mmio_dispatcher, region_id, metrics.clone())
+            .expect("test vsock metrics should bind to the source owner");
+        metrics
+    }
+
     fn boot_runtime_with_balloon() -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher) {
         let kernel = temp_file("kernel-with-balloon", &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
@@ -46643,6 +46863,7 @@ mod tests {
     #[test]
     fn vsock_notification_signal_dispatch_signals_queued_tx_packet() {
         let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_vsock();
+        let metrics = bind_boot_vsock_metrics(&runtime, &mut mmio_dispatcher);
         configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
         write_vsock_tx_packet_header(&mut memory);
         write_vsock_tx_descriptors(
@@ -46692,19 +46913,16 @@ mod tests {
             DeviceInterruptKind::Queue.status().bits()
         );
         assert_eq!(read_vsock_tx_used_index(&memory), 1);
-        let metrics = SharedVsockDeviceMetrics::default();
-        super::record_vsock_dispatch_metrics(&metrics, &result);
         assert_eq!(
             metrics.snapshot(),
-            VsockDeviceMetrics::default()
-                .with_tx_queue_event_count(1)
-                .with_tx_packets_count(1)
+            VsockDeviceMetrics::default().with_tx_queue_event_count(1)
         );
     }
 
     #[test]
     fn vsock_notification_signal_dispatch_skips_rx_noop_device() {
         let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_vsock();
+        let metrics = bind_boot_vsock_metrics(&runtime, &mut mmio_dispatcher);
         configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
         notify_boot_vsock_queue(
             &mut runtime,
@@ -46743,12 +46961,7 @@ mod tests {
             ),
             0
         );
-        let metrics = SharedVsockDeviceMetrics::default();
-        super::record_vsock_dispatch_metrics(&metrics, &result);
-        assert_eq!(
-            metrics.snapshot(),
-            VsockDeviceMetrics::default().with_rx_queue_event_count(1)
-        );
+        assert_eq!(metrics.snapshot(), VsockDeviceMetrics::default());
     }
 
     #[test]
@@ -46797,6 +47010,7 @@ mod tests {
     #[test]
     fn vsock_notification_signal_dispatch_preserves_partial_error_interrupt_intent() {
         let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_vsock();
+        let metrics = bind_boot_vsock_metrics(&runtime, &mut mmio_dispatcher);
         configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
         write_vsock_tx_packet_header(&mut memory);
         write_vsock_tx_descriptors(
@@ -46835,20 +47049,16 @@ mod tests {
         assert!(completed.needs_queue_interrupt());
         assert_eq!(recorded_lines(&lines), vec![32]);
         assert_eq!(read_vsock_tx_used_index(&memory), 1);
-        let metrics = SharedVsockDeviceMetrics::default();
-        super::record_vsock_dispatch_metrics(&metrics, &result);
         assert_eq!(
             metrics.snapshot(),
-            VsockDeviceMetrics::default()
-                .with_tx_queue_event_fails(1)
-                .with_tx_queue_event_count(1)
-                .with_tx_packets_count(1)
+            VsockDeviceMetrics::default().with_tx_queue_event_fails(1)
         );
     }
 
     #[test]
     fn vsock_notification_signal_dispatch_preserves_signal_failure_per_device() {
         let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_vsock();
+        let metrics = bind_boot_vsock_metrics(&runtime, &mut mmio_dispatcher);
         configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
         write_vsock_tx_packet_header(&mut memory);
         write_vsock_tx_descriptors(
@@ -46891,14 +47101,9 @@ mod tests {
             ),
             DeviceInterruptKind::Queue.status().bits()
         );
-        let metrics = SharedVsockDeviceMetrics::default();
-        super::record_vsock_dispatch_metrics(&metrics, &result);
         assert_eq!(
             metrics.snapshot(),
-            VsockDeviceMetrics::default()
-                .with_muxer_event_fails(1)
-                .with_tx_queue_event_count(1)
-                .with_tx_packets_count(1)
+            VsockDeviceMetrics::default().with_tx_queue_event_count(1)
         );
         let capture = TestGuestLoggerCapture::new("vsock-interrupt-failure-logger");
         let observed_result: Result<_, HvfArm64BootVsockNotificationDispatchError> = Ok(result);

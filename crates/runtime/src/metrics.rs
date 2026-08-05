@@ -25,12 +25,6 @@ use crate::pmem::{
     VirtioPmemQueueDispatch,
 };
 use crate::serial::SerialOutputMetrics;
-use crate::vsock::{
-    VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
-    VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError,
-    VirtioVsockRxQueueDispatch, VirtioVsockTransportResetAttempt, VirtioVsockTransportResetError,
-    VirtioVsockTxQueueDispatch,
-};
 
 mod firecracker;
 
@@ -5234,7 +5228,7 @@ impl VsockDeviceMetrics {
 
 #[derive(Debug, Clone, Default)]
 pub struct SharedVsockDeviceMetrics {
-    inner: Arc<SharedVsockDeviceMetricsInner>,
+    inner: Arc<Mutex<VsockDeviceMetrics>>,
 }
 
 impl SharedVsockDeviceMetrics {
@@ -5244,281 +5238,37 @@ impl SharedVsockDeviceMetrics {
     }
 
     pub fn record_activation_failure(&self) {
-        record_atomic_metric(&self.inner.activate_fails, 1);
+        self.record_observation(VsockDeviceMetrics::default().with_activate_fails(1));
     }
 
     pub fn record_config_failure(&self) {
-        record_atomic_metric(&self.inner.cfg_fails, 1);
-    }
-
-    pub fn record_transport_reset_attempt(
-        &self,
-        attempt: &Result<VirtioVsockTransportResetAttempt, VirtioVsockTransportResetError>,
-    ) {
-        if matches!(
-            attempt,
-            Ok(VirtioVsockTransportResetAttempt::QueueEmpty) | Err(_)
-        ) {
-            self.record_event_queue_failure();
-        }
-    }
-
-    pub fn record_event_queue_signal_failure(&self) {
-        self.record_event_queue_failure();
-    }
-
-    pub fn record_notification_dispatch(&self, dispatch: &VirtioVsockDeviceNotificationDispatch) {
-        let rx_queue_events = vsock_queue_event_count(
-            dispatch.drained_notifications(),
-            VIRTIO_VSOCK_RX_QUEUE_INDEX,
-        );
-        let tx_queue_events = vsock_queue_event_count(
-            dispatch.drained_notifications(),
-            VIRTIO_VSOCK_TX_QUEUE_INDEX,
-        );
-        self.record_rx_queue_events(rx_queue_events);
-        self.record_tx_queue_events(tx_queue_events);
-
-        if let Some(dispatch) = dispatch.rx_queue_dispatch() {
-            self.record_rx_queue_dispatch(dispatch);
-        }
-        if let Some(dispatch) = dispatch.tx_queue_dispatch() {
-            self.record_tx_queue_dispatch(dispatch);
-        }
-
-        self.record_connections_added(usize_to_u64_saturating(
-            dispatch
-                .host_request_dispatch()
-                .completed_requests()
-                .saturating_add(dispatch.guest_request_dispatch().retained_requests()),
-        ));
-        self.record_connections_removed(usize_to_u64_saturating(
-            dispatch
-                .guest_response_dispatch()
-                .dropped_connections()
-                .saturating_add(dispatch.guest_rw_dispatch().dropped_connections())
-                .saturating_add(dispatch.guest_rst_dispatch().closed_host_connections())
-                .saturating_add(dispatch.guest_rst_dispatch().closed_guest_connections())
-                .saturating_add(dispatch.guest_shutdown_dispatch().closed_host_connections())
-                .saturating_add(
-                    dispatch
-                        .guest_shutdown_dispatch()
-                        .closed_guest_connections(),
-                ),
-        ));
-        self.record_tx_packets(
-            0,
-            usize_to_u64_saturating(dispatch.guest_rw_dispatch().forwarded_bytes()),
-        );
-        self.record_connection_event_failures(usize_to_u64_saturating(
-            dispatch
-                .host_request_dispatch()
-                .dropped_connections()
-                .saturating_add(dispatch.guest_response_dispatch().dropped_connections())
-                .saturating_add(dispatch.guest_request_dispatch().dropped_requests())
-                .saturating_add(dispatch.guest_rw_dispatch().dropped_connections()),
-        ));
-    }
-
-    pub fn record_notification_error(&self, source: &VirtioVsockDeviceNotificationError) {
-        let rx_queue_events =
-            vsock_queue_event_count(source.drained_notifications(), VIRTIO_VSOCK_RX_QUEUE_INDEX);
-        let tx_queue_events =
-            vsock_queue_event_count(source.drained_notifications(), VIRTIO_VSOCK_TX_QUEUE_INDEX);
-        self.record_rx_queue_events(rx_queue_events);
-        self.record_tx_queue_events(tx_queue_events);
-
-        match source {
-            VirtioVsockDeviceNotificationError::TxQueueDispatch { .. } => {
-                self.record_tx_queue_event_failure();
-            }
-            VirtioVsockDeviceNotificationError::RxQueueDispatch { .. } => {
-                self.record_rx_queue_event_failure();
-            }
-            VirtioVsockDeviceNotificationError::UnsupportedQueue { queue_index, .. } => {
-                self.record_unsupported_queue_failure(*queue_index);
-            }
-            VirtioVsockDeviceNotificationError::Inactive { .. } => {
-                self.record_muxer_event_failure();
-            }
-        }
-
-        if let Some(dispatch) = source.completed_tx_dispatch() {
-            self.record_tx_queue_dispatch(dispatch);
-        }
-        if let Some(dispatch) = source.completed_rx_dispatch() {
-            self.record_rx_queue_dispatch(dispatch);
-        }
+        self.record_observation(VsockDeviceMetrics::default().with_cfg_fails(1));
     }
 
     pub fn record_muxer_event_failure(&self) {
-        record_atomic_metric(&self.inner.muxer_event_fails, 1);
+        self.record_observation(VsockDeviceMetrics::default().with_muxer_event_fails(1));
     }
 
     pub fn snapshot(&self) -> VsockDeviceMetrics {
-        VsockDeviceMetrics {
-            activate_fails: self.inner.activate_fails.load(Ordering::Relaxed),
-            cfg_fails: self.inner.cfg_fails.load(Ordering::Relaxed),
-            rx_queue_event_fails: self.inner.rx_queue_event_fails.load(Ordering::Relaxed),
-            tx_queue_event_fails: self.inner.tx_queue_event_fails.load(Ordering::Relaxed),
-            ev_queue_event_fails: self.inner.ev_queue_event_fails.load(Ordering::Relaxed),
-            muxer_event_fails: self.inner.muxer_event_fails.load(Ordering::Relaxed),
-            conn_event_fails: self.inner.conn_event_fails.load(Ordering::Relaxed),
-            rx_queue_event_count: self.inner.rx_queue_event_count.load(Ordering::Relaxed),
-            tx_queue_event_count: self.inner.tx_queue_event_count.load(Ordering::Relaxed),
-            rx_bytes_count: self.inner.rx_bytes_count.load(Ordering::Relaxed),
-            tx_bytes_count: self.inner.tx_bytes_count.load(Ordering::Relaxed),
-            rx_packets_count: self.inner.rx_packets_count.load(Ordering::Relaxed),
-            tx_packets_count: self.inner.tx_packets_count.load(Ordering::Relaxed),
-            conns_added: self.inner.conns_added.load(Ordering::Relaxed),
-            conns_killed: self.inner.conns_killed.load(Ordering::Relaxed),
-            conns_removed: self.inner.conns_removed.load(Ordering::Relaxed),
-            killq_resync: self.inner.killq_resync.load(Ordering::Relaxed),
-            tx_flush_fails: self.inner.tx_flush_fails.load(Ordering::Relaxed),
-            tx_write_fails: self.inner.tx_write_fails.load(Ordering::Relaxed),
-            rx_read_fails: self.inner.rx_read_fails.load(Ordering::Relaxed),
+        *lock_vsock_device_metrics(&self.inner)
+    }
+
+    pub(crate) fn record_observation(&self, observation: VsockDeviceMetrics) {
+        if observation.is_empty() {
+            return;
         }
-    }
-
-    fn record_rx_queue_dispatch(&self, dispatch: &VirtioVsockRxQueueDispatch) {
-        let delivered_packets = dispatch
-            .delivered_requests()
-            .saturating_add(dispatch.delivered_responses())
-            .saturating_add(dispatch.delivered_reset_packets())
-            .saturating_add(dispatch.delivered_shutdown_packets())
-            .saturating_add(dispatch.delivered_credit_requests())
-            .saturating_add(dispatch.delivered_credit_updates())
-            .saturating_add(dispatch.delivered_host_rw_packets());
-        self.record_rx_packets(
-            usize_to_u64_saturating(delivered_packets),
-            usize_to_u64_saturating(dispatch.delivered_host_rw_bytes()),
-        );
-        self.record_rx_queue_failures(usize_to_u64_saturating(
-            dispatch
-                .buffer_parse_failures()
-                .saturating_add(dispatch.buffer_too_small_failures()),
-        ));
-    }
-
-    fn record_tx_queue_dispatch(&self, dispatch: &VirtioVsockTxQueueDispatch) {
-        self.record_tx_packets(usize_to_u64_saturating(dispatch.successful_packets()), 0);
-        self.record_tx_queue_failures(usize_to_u64_saturating(dispatch.parse_failures()));
-    }
-
-    fn record_rx_queue_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.rx_queue_event_count, count);
-        }
-    }
-
-    fn record_tx_queue_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.tx_queue_event_count, count);
-        }
-    }
-
-    fn record_rx_packets(&self, count: u64, bytes: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.rx_packets_count, count);
-        }
-        if bytes != 0 {
-            record_atomic_metric(&self.inner.rx_bytes_count, bytes);
-        }
-    }
-
-    fn record_tx_packets(&self, count: u64, bytes: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.tx_packets_count, count);
-        }
-        if bytes != 0 {
-            record_atomic_metric(&self.inner.tx_bytes_count, bytes);
-        }
-    }
-
-    fn record_rx_queue_failures(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.rx_queue_event_fails, count);
-        }
-    }
-
-    fn record_tx_queue_failures(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.tx_queue_event_fails, count);
-        }
-    }
-
-    fn record_tx_queue_event_failure(&self) {
-        record_atomic_metric(&self.inner.tx_queue_event_fails, 1);
-    }
-
-    fn record_rx_queue_event_failure(&self) {
-        record_atomic_metric(&self.inner.rx_queue_event_fails, 1);
-    }
-
-    fn record_event_queue_failure(&self) {
-        record_atomic_metric(&self.inner.ev_queue_event_fails, 1);
-    }
-
-    fn record_unsupported_queue_failure(&self, queue_index: usize) {
-        match queue_index {
-            VIRTIO_VSOCK_RX_QUEUE_INDEX => self.record_rx_queue_event_failure(),
-            VIRTIO_VSOCK_TX_QUEUE_INDEX => self.record_tx_queue_event_failure(),
-            VIRTIO_VSOCK_EVENT_QUEUE_INDEX => self.record_event_queue_failure(),
-            _ => self.record_muxer_event_failure(),
-        }
-    }
-
-    fn record_connections_added(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.conns_added, count);
-        }
-    }
-
-    fn record_connections_removed(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.conns_removed, count);
-        }
-    }
-
-    fn record_connection_event_failures(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.conn_event_fails, count);
-        }
+        let mut metrics = lock_vsock_device_metrics(&self.inner);
+        *metrics = metrics.merged_with(observation);
     }
 }
 
-#[derive(Debug, Default)]
-struct SharedVsockDeviceMetricsInner {
-    activate_fails: AtomicU64,
-    cfg_fails: AtomicU64,
-    rx_queue_event_fails: AtomicU64,
-    tx_queue_event_fails: AtomicU64,
-    ev_queue_event_fails: AtomicU64,
-    muxer_event_fails: AtomicU64,
-    conn_event_fails: AtomicU64,
-    rx_queue_event_count: AtomicU64,
-    tx_queue_event_count: AtomicU64,
-    rx_bytes_count: AtomicU64,
-    tx_bytes_count: AtomicU64,
-    rx_packets_count: AtomicU64,
-    tx_packets_count: AtomicU64,
-    conns_added: AtomicU64,
-    conns_killed: AtomicU64,
-    conns_removed: AtomicU64,
-    killq_resync: AtomicU64,
-    tx_flush_fails: AtomicU64,
-    tx_write_fails: AtomicU64,
-    rx_read_fails: AtomicU64,
-}
-
-fn vsock_queue_event_count(drained_notifications: &[usize], queue_index: usize) -> u64 {
-    usize_to_u64_saturating(
-        drained_notifications
-            .iter()
-            .copied()
-            .filter(|drained_queue_index| *drained_queue_index == queue_index)
-            .count(),
-    )
+fn lock_vsock_device_metrics(
+    metrics: &Mutex<VsockDeviceMetrics>,
+) -> MutexGuard<'_, VsockDeviceMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -7737,6 +7487,30 @@ mod tests {
             .with_tx_flush_fails(18)
             .with_tx_write_fails(19)
             .with_rx_read_fails(20)
+    }
+
+    fn vsock_metrics_with_each(value: u64) -> VsockDeviceMetrics {
+        VsockDeviceMetrics::default()
+            .with_activate_fails(value)
+            .with_cfg_fails(value)
+            .with_rx_queue_event_fails(value)
+            .with_tx_queue_event_fails(value)
+            .with_ev_queue_event_fails(value)
+            .with_muxer_event_fails(value)
+            .with_conn_event_fails(value)
+            .with_rx_queue_event_count(value)
+            .with_tx_queue_event_count(value)
+            .with_rx_bytes_count(value)
+            .with_tx_bytes_count(value)
+            .with_rx_packets_count(value)
+            .with_tx_packets_count(value)
+            .with_conns_added(value)
+            .with_conns_killed(value)
+            .with_conns_removed(value)
+            .with_killq_resync(value)
+            .with_tx_flush_fails(value)
+            .with_tx_write_fails(value)
+            .with_rx_read_fails(value)
     }
 
     fn entropy_metrics_with_all_fields() -> EntropyDeviceMetrics {
@@ -10170,8 +9944,31 @@ mod tests {
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
         let value = only_metrics_value(&output);
-        assert_eq!(value["vsock"]["activate_fails"], 1);
-        assert_eq!(value["vsock"]["rx_read_fails"], 20);
+        assert_eq!(
+            value["vsock"],
+            serde_json::json!({
+                "activate_fails": 1,
+                "cfg_fails": 2,
+                "rx_queue_event_fails": 3,
+                "tx_queue_event_fails": 4,
+                "ev_queue_event_fails": 5,
+                "muxer_event_fails": 6,
+                "conn_event_fails": 7,
+                "rx_queue_event_count": 8,
+                "tx_queue_event_count": 9,
+                "rx_bytes_count": 10,
+                "tx_bytes_count": 11,
+                "rx_packets_count": 12,
+                "tx_packets_count": 13,
+                "conns_added": 14,
+                "conns_killed": 15,
+                "conns_removed": 16,
+                "killq_resync": 17,
+                "tx_flush_fails": 18,
+                "tx_write_fails": 19,
+                "rx_read_fails": 20,
+            })
+        );
     }
 
     #[test]
@@ -10184,6 +9981,137 @@ mod tests {
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
         assert_eq!(only_metrics_value(&output)["vsock"]["activate_fails"], 0);
+    }
+
+    #[test]
+    fn vsock_metrics_publish_first_zero_and_later_intervals() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let metrics = SharedVsockDeviceMetrics::default();
+        metrics.record_observation(vsock_metrics_with_all_fields());
+
+        assert_eq!(
+            state.flush_with_diagnostics(
+                &MetricsDiagnostics::new().with_vsock_device_metrics(metrics.snapshot())
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            state.flush_with_diagnostics(
+                &MetricsDiagnostics::new().with_vsock_device_metrics(metrics.snapshot())
+            ),
+            Ok(true)
+        );
+        metrics.record_observation(
+            VsockDeviceMetrics::default()
+                .with_rx_bytes_count(64)
+                .with_rx_packets_count(1)
+                .with_conns_killed(1)
+                .with_conns_removed(1),
+        );
+        assert_eq!(
+            state.flush_with_diagnostics(
+                &MetricsDiagnostics::new().with_vsock_device_metrics(metrics.snapshot())
+            ),
+            Ok(true)
+        );
+
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0]["vsock"]["activate_fails"], 1);
+        assert_eq!(values[0]["vsock"]["rx_read_fails"], 20);
+        assert!(
+            values[1]["vsock"]
+                .as_object()
+                .expect("vsock root should be an object")
+                .values()
+                .all(|value| value.as_u64() == Some(0))
+        );
+        assert_eq!(values[2]["vsock"]["rx_bytes_count"], 64);
+        assert_eq!(values[2]["vsock"]["rx_packets_count"], 1);
+        assert_eq!(values[2]["vsock"]["conns_killed"], 1);
+        assert_eq!(values[2]["vsock"]["conns_removed"], 1);
+        assert_eq!(values[2]["vsock"]["tx_packets_count"], 0);
+    }
+
+    #[test]
+    fn failed_middle_vsock_publication_replays_from_last_success() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let metrics = SharedVsockDeviceMetrics::default();
+        metrics.record_observation(VsockDeviceMetrics::default().with_conns_added(1));
+        assert_eq!(
+            state.flush_with_diagnostics(
+                &MetricsDiagnostics::new().with_vsock_device_metrics(metrics.snapshot())
+            ),
+            Ok(true)
+        );
+
+        metrics.record_observation(
+            VsockDeviceMetrics::default()
+                .with_conns_killed(1)
+                .with_conns_removed(1),
+        );
+        output.fail_next_write();
+        assert_eq!(
+            state.flush_with_diagnostics(
+                &MetricsDiagnostics::new().with_vsock_device_metrics(metrics.snapshot())
+            ),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        metrics.record_observation(
+            VsockDeviceMetrics::default()
+                .with_rx_bytes_count(32)
+                .with_rx_packets_count(1),
+        );
+        assert_eq!(
+            state.flush_with_diagnostics(
+                &MetricsDiagnostics::new().with_vsock_device_metrics(metrics.snapshot())
+            ),
+            Ok(true)
+        );
+
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["vsock"]["conns_added"], 1);
+        assert_eq!(values[1]["vsock"]["conns_added"], 0);
+        assert_eq!(values[1]["vsock"]["conns_killed"], 1);
+        assert_eq!(values[1]["vsock"]["conns_removed"], 1);
+        assert_eq!(values[1]["vsock"]["rx_bytes_count"], 32);
+        assert_eq!(values[1]["vsock"]["rx_packets_count"], 1);
+    }
+
+    #[test]
+    fn ambiguously_accepted_vsock_publication_replays_at_least_once() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let metrics = SharedVsockDeviceMetrics::default();
+        metrics.record_observation(
+            VsockDeviceMetrics::default()
+                .with_tx_bytes_count(16)
+                .with_tx_packets_count(1),
+        );
+        output.accept_next_write_then_fail();
+        assert_eq!(
+            state.flush_with_diagnostics(
+                &MetricsDiagnostics::new().with_vsock_device_metrics(metrics.snapshot())
+            ),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        metrics.record_observation(VsockDeviceMetrics::default().with_tx_bytes_count(8));
+        assert_eq!(
+            state.flush_with_diagnostics(
+                &MetricsDiagnostics::new().with_vsock_device_metrics(metrics.snapshot())
+            ),
+            Ok(true)
+        );
+
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["vsock"]["tx_bytes_count"], 16);
+        assert_eq!(values[0]["vsock"]["tx_packets_count"], 1);
+        assert_eq!(values[1]["vsock"]["tx_bytes_count"], 24);
+        assert_eq!(values[1]["vsock"]["tx_packets_count"], 1);
     }
 
     #[test]
@@ -10210,16 +10138,42 @@ mod tests {
     }
 
     #[test]
-    fn vsock_metric_increment_saturates() {
+    fn vsock_compound_metric_increment_saturates_all_fields() {
         let metrics = SharedVsockDeviceMetrics::default();
-        metrics
-            .inner
-            .rx_queue_event_count
-            .store(u64::MAX - 1, Ordering::Relaxed);
+        metrics.record_observation(vsock_metrics_with_each(u64::MAX - 1));
 
-        metrics.record_rx_queue_events(3);
+        metrics.record_observation(vsock_metrics_with_each(2));
 
-        assert_eq!(metrics.snapshot().rx_queue_event_count(), u64::MAX);
+        assert_eq!(metrics.snapshot(), vsock_metrics_with_each(u64::MAX));
+    }
+
+    #[test]
+    fn vsock_compound_observation_is_never_torn_by_a_racing_snapshot() {
+        let metrics = SharedVsockDeviceMetrics::default();
+        let writer_metrics = metrics.clone();
+        let start = Arc::new(Barrier::new(2));
+        let writer_start = Arc::clone(&start);
+        let observation = VsockDeviceMetrics::default()
+            .with_rx_bytes_count(64)
+            .with_rx_packets_count(1)
+            .with_conns_killed(1)
+            .with_conns_removed(1)
+            .with_rx_read_fails(1);
+        let writer = thread::spawn(move || {
+            writer_start.wait();
+            writer_metrics.record_observation(observation);
+        });
+
+        start.wait();
+        let racing_cut = metrics.snapshot();
+        writer.join().expect("metrics writer should finish");
+        let completed_cut = metrics.snapshot();
+
+        assert!(
+            racing_cut == VsockDeviceMetrics::default() || racing_cut == observation,
+            "a collection cut may be before or after one operation, but not inside it"
+        );
+        assert_eq!(completed_cut, observation);
     }
 
     #[test]

@@ -5955,6 +5955,24 @@ mod tests {
     }
 
     #[test]
+    fn vsock_pci_poll_failure_records_on_the_attached_source_owner() {
+        let fixture = vsock_fixture();
+        let metrics = SharedVsockDeviceMetrics::default();
+        fixture
+            .endpoint
+            .attach_vsock_metrics(metrics.clone())
+            .expect("PCI vsock metrics owner should attach");
+
+        fixture
+            .endpoint
+            .observe_vsock_host_readiness(&[], true)
+            .expect("PCI vsock readiness should reach the device source");
+
+        assert_eq!(metrics.snapshot().muxer_event_fails(), 1);
+        assert_eq!(metrics.snapshot().conn_event_fails(), 0);
+    }
+
+    #[test]
     fn vsock_pci_capture_is_exact_for_inactive_and_masked_reset_state() {
         let fixture = vsock_fixture();
         let config = vsock_pci_config();
@@ -5987,7 +6005,7 @@ mod tests {
         publish_vsock_event_descriptor(&mut memory, 8);
         let reset_attempt = fixture
             .endpoint
-            .prepare_vsock_transport_reset(&mut memory, &SharedVsockDeviceMetrics::default())
+            .prepare_vsock_transport_reset(&mut memory)
             .expect("masked PCI reset should publish before capture");
         let (active_first, active_validation) = fixture
             .endpoint
@@ -6083,7 +6101,7 @@ mod tests {
 
         let attempt = fixture
             .endpoint
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect("masked transport reset should complete");
 
         assert!(matches!(
@@ -6139,7 +6157,7 @@ mod tests {
 
         let signal = fixture
             .endpoint
-            .signal_restored_vsock_transport_reset(&metrics)
+            .signal_restored_vsock_transport_reset()
             .expect("restored reset should signal");
 
         assert_eq!(signal, VirtioVsockRestoredTransportResetSignal::Signaled);
@@ -6176,7 +6194,7 @@ mod tests {
 
         let error = fixture
             .endpoint
-            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .prepare_vsock_transport_reset(&mut memory)
             .expect_err("unknown MSI-X tuple should fail after reset publication");
 
         assert!(matches!(
@@ -6201,7 +6219,11 @@ mod tests {
                 .activation
                 .pending_event_ack()
         );
-        assert_eq!(metrics.snapshot().ev_queue_event_fails(), 1);
+        assert_eq!(
+            metrics.snapshot().ev_queue_event_fails(),
+            0,
+            "MSI-X delivery is outside the vsock event-queue metric boundary"
+        );
         assert!(!format!("{error:?}").contains("deadbeef"));
     }
 
