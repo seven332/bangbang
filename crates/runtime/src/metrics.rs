@@ -7268,13 +7268,14 @@ mod tests {
     use super::{
         BalloonDeviceMetrics, BalloonDiscardMetrics, BalloonFreePageReportMetrics,
         BlockDeviceMetrics, BlockDeviceMetricsByDrive, BlockDeviceMetricsRegistryError,
-        BootRunLoopMetricStatus, EntropyDeviceMetrics, MemoryHotplugMetricOperation,
-        MetricsConfigError, MetricsConfigInput, MetricsDiagnostics, MetricsFlushError,
-        MetricsOutput, MetricsState, MmdsMetrics, NetworkInterfaceMetrics,
+        BootRunLoopMetricStatus, DeprecatedApiMetrics, EntropyDeviceMetrics, GetApiRequestMetrics,
+        MemoryHotplugMetricOperation, MetricsConfigError, MetricsConfigInput, MetricsDiagnostics,
+        MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics, NetworkInterfaceMetrics,
         NetworkInterfaceMetricsByInterface, NetworkInterfaceMetricsCaptureError,
-        NetworkInterfaceMetricsRegistryError, PmemDeviceMetrics, PmemDeviceMetricsByDevice,
-        PmemDeviceMetricsRegistryError, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        NetworkInterfaceMetricsRegistryError, PatchApiRequestMetrics, PmemDeviceMetrics,
+        PmemDeviceMetricsByDevice, PmemDeviceMetricsRegistryError, PutApiRequestMetrics,
+        RtcDeviceMetrics, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
         SharedMemoryHotplugDeviceMetrics, SharedMemoryHotplugLatencyMetricsInner,
         SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
         SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
@@ -10325,6 +10326,124 @@ mod tests {
         assert_eq!(value["api_server"]["process_startup_time_cpu_us"], u64::MAX);
 
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn api_request_metric_recorders_saturate_all_schema_fields() {
+        let mut state = MetricsState {
+            deprecated_api: DeprecatedApiMetrics {
+                deprecated_http_api_calls: u64::MAX,
+            },
+            get_api_requests: GetApiRequestMetrics {
+                balloon_count: 0,
+                hotplug_memory_count: u64::MAX,
+                instance_info_count: u64::MAX,
+                vmm_version_count: u64::MAX,
+                machine_cfg_count: u64::MAX,
+                mmds_count: u64::MAX,
+            },
+            patch_api_requests: PatchApiRequestMetrics {
+                balloon_count: 0,
+                balloon_fails: 0,
+                drive_count: u64::MAX,
+                drive_fails: u64::MAX,
+                network_count: u64::MAX,
+                network_fails: u64::MAX,
+                machine_cfg_count: u64::MAX,
+                machine_cfg_fails: u64::MAX,
+                mmds_count: u64::MAX,
+                mmds_fails: u64::MAX,
+                hotplug_memory_count: u64::MAX,
+                hotplug_memory_fails: u64::MAX,
+                pmem_count: u64::MAX,
+                pmem_fails: u64::MAX,
+            },
+            put_api_requests: PutApiRequestMetrics {
+                actions_count: u64::MAX,
+                actions_fails: u64::MAX,
+                balloon_count: 0,
+                balloon_fails: 0,
+                boot_source_count: u64::MAX,
+                boot_source_fails: u64::MAX,
+                cpu_cfg_count: u64::MAX,
+                cpu_cfg_fails: u64::MAX,
+                drive_count: u64::MAX,
+                drive_fails: u64::MAX,
+                logger_count: u64::MAX,
+                logger_fails: u64::MAX,
+                machine_cfg_count: u64::MAX,
+                machine_cfg_fails: u64::MAX,
+                metrics_count: u64::MAX,
+                metrics_fails: u64::MAX,
+                hotplug_memory_count: u64::MAX,
+                hotplug_memory_fails: u64::MAX,
+                mmds_count: u64::MAX,
+                mmds_fails: u64::MAX,
+                network_count: u64::MAX,
+                network_fails: u64::MAX,
+                pmem_count: u64::MAX,
+                pmem_fails: u64::MAX,
+                serial_count: u64::MAX,
+                serial_fails: u64::MAX,
+                vsock_count: u64::MAX,
+                vsock_fails: u64::MAX,
+            },
+            ..MetricsState::default()
+        };
+        let expected_deprecated = state.deprecated_api;
+        let expected_get = state.get_api_requests;
+        let expected_patch = state.patch_api_requests;
+        let expected_put = state.put_api_requests;
+
+        state.record_deprecated_api_call();
+        state.record_get_hotplug_memory_request();
+        state.record_get_instance_info_request();
+        state.record_get_machine_config_request();
+        state.record_get_mmds_request();
+        state.record_get_vmm_version_request();
+        state.record_patch_drive_request();
+        state.record_patch_drive_failure();
+        state.record_patch_hotplug_memory_request();
+        state.record_patch_hotplug_memory_failure();
+        state.record_patch_machine_config_request();
+        state.record_patch_machine_config_failure();
+        state.record_patch_mmds_request();
+        state.record_patch_mmds_failure();
+        state.record_patch_network_request();
+        state.record_patch_network_failure();
+        state.record_patch_pmem_request();
+        state.record_patch_pmem_failure();
+        state.record_put_actions_request();
+        state.record_put_actions_failure();
+        state.record_put_boot_source_request();
+        state.record_put_boot_source_failure();
+        state.record_put_cpu_config_request();
+        state.record_put_cpu_config_failure();
+        state.record_put_drive_request();
+        state.record_put_drive_failure();
+        state.record_put_hotplug_memory_request();
+        state.record_put_hotplug_memory_failure();
+        state.record_put_logger_request();
+        state.record_put_logger_failure();
+        state.record_put_machine_config_request();
+        state.record_put_machine_config_failure();
+        state.record_put_metrics_request();
+        state.record_put_metrics_failure();
+        state.record_put_mmds_request();
+        state.record_put_mmds_failure();
+        state.record_put_network_request();
+        state.record_put_network_failure();
+        state.record_put_pmem_request();
+        state.record_put_pmem_failure();
+        state.record_put_serial_request();
+        state.record_put_serial_failure();
+        state.record_put_vsock_request();
+        state.record_put_vsock_failure();
+
+        assert_eq!(state.deprecated_api, expected_deprecated);
+        assert_eq!(state.get_api_requests, expected_get);
+        assert_eq!(state.patch_api_requests, expected_patch);
+        assert_eq!(state.put_api_requests, expected_put);
     }
 
     #[test]

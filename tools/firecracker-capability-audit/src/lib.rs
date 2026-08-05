@@ -6,6 +6,8 @@ mod logger_upstream;
 mod logger_validate;
 mod metrics_certify;
 mod metrics_model;
+mod metrics_process_model;
+mod metrics_process_validate;
 mod metrics_upstream;
 mod metrics_validate;
 mod model;
@@ -34,6 +36,11 @@ pub use metrics_model::{
     MetricsSchemaSourceCandidate, MetricsSourceAnchor, MetricsSourceField, MetricsStaticRoot,
     MetricsUnit, MetricsValueKind,
 };
+pub use metrics_process_model::{
+    MetricsProcessProducerAudit, MetricsProcessProducerBoundary, MetricsProcessProducerDisposition,
+    MetricsProcessProducerRecord,
+};
+pub use metrics_process_validate::validate_metrics_process_producers;
 pub use metrics_upstream::derive_metrics_schema_source;
 pub use metrics_validate::validate_metrics_schema;
 pub use model::{
@@ -64,6 +71,8 @@ pub const LOGGER_PRODUCER_GENERATOR_VERSION: u32 = 1;
 pub const METRICS_SCHEMA_VERSION: u32 = 1;
 /// Current generated metrics schema source format.
 pub const METRICS_SCHEMA_GENERATOR_VERSION: u32 = 1;
+/// Current checked-in process-producer audit format.
+pub const METRICS_PROCESS_PRODUCER_AUDIT_SCHEMA_VERSION: u32 = 1;
 /// Repository-relative generated source manifest path.
 pub const SOURCE_MANIFEST_PATH: &str = "compat/firecracker/v1.16.0/source-manifest.json";
 /// Repository-relative human capability overlay path.
@@ -76,6 +85,9 @@ pub const LOGGER_PRODUCER_AUDIT_PATH: &str =
     "compat/firecracker/v1.16.0/logger-producer-audit.json";
 /// Repository-relative canonical metrics schema authority path.
 pub const METRICS_SCHEMA_AUTHORITY_PATH: &str = "compat/firecracker/v1.16.0/metrics-schema.json";
+/// Repository-relative exact process-producer audit path.
+pub const METRICS_PROCESS_PRODUCER_AUDIT_PATH: &str =
+    "compat/firecracker/v1.16.0/metrics-process-producer-audit.json";
 
 /// Error produced while reading, parsing, or deriving an inventory.
 #[derive(Debug)]
@@ -142,6 +154,22 @@ pub fn read_metrics_schema_authority(path: &Path) -> Result<MetricsSchemaAuthori
     })
 }
 
+/// Read and parse the checked process-producer audit.
+pub fn read_metrics_process_producer_audit(
+    path: &Path,
+) -> Result<MetricsProcessProducerAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!(
+            "failed to read metrics process producer audit: {error}"
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!(
+            "failed to parse metrics process producer audit: {error}"
+        ))
+    })
+}
+
 /// Serialize a generated source manifest using canonical pretty JSON.
 pub fn source_manifest_json(manifest: &SourceManifest) -> Result<Vec<u8>, AuditError> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -187,6 +215,13 @@ pub fn metrics_schema_authority_json(
     authority: &MetricsSchemaAuthority,
 ) -> Result<Vec<u8>, AuditError> {
     canonical_json(authority, "metrics schema authority")
+}
+
+/// Serialize the human process-producer audit using canonical pretty JSON.
+pub fn metrics_process_producer_audit_json(
+    audit: &MetricsProcessProducerAudit,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "metrics process producer audit")
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>, AuditError> {
