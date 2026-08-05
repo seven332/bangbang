@@ -236,7 +236,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .iter()
             .filter(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
             .count(),
-        193
+        155
     );
     assert_eq!(
         audit
@@ -254,7 +254,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .iter()
             .filter(|record| record.disposition == MetricsDeviceProducerDisposition::Implemented)
             .count(),
-        22
+        60
     );
     assert_eq!(
         audit
@@ -269,7 +269,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
     for record in audit
         .records
         .iter()
-        .filter(|record| record.delivery_issue == "#1838")
+        .filter(|record| matches!(record.delivery_issue.as_str(), "#1838" | "#1839"))
     {
         let expected = if record.field_id == "static:uart.flush_count" {
             MetricsDeviceProducerDisposition::SourceNeutral
@@ -285,7 +285,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
         audit
             .records
             .iter()
-            .filter(|record| record.delivery_issue != "#1838")
+            .filter(|record| !matches!(record.delivery_issue.as_str(), "#1838" | "#1839"))
             .all(|record| {
                 record.implementation.is_empty()
                     && record.validation.is_empty()
@@ -301,11 +301,11 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .lines()
             .filter(|line| line.contains("final metrics device producer validation rejects"))
             .count(),
-        208
+        170
     );
 }
 
-// exact #1838 disposition mutation tests
+// exact #1838 disposition mutation tests, extended through #1839
 #[test]
 fn device_producer_audit_rejects_completed_child_regression_and_future_promotion() {
     let mut implemented_regression = checked_device_audit();
@@ -313,10 +313,10 @@ fn device_producer_audit_rejects_completed_child_regression_and_future_promotion
         .records
         .iter_mut()
         .find(|record| {
-            record.delivery_issue == "#1838"
+            record.delivery_issue == "#1839"
                 && record.disposition == MetricsDeviceProducerDisposition::Implemented
         })
-        .expect("implemented #1838 record must exist")
+        .expect("implemented #1839 record must exist")
         .disposition = MetricsDeviceProducerDisposition::Planned;
     assert!(device_validation_error(&implemented_regression).contains("wrong current disposition"));
 
@@ -333,7 +333,7 @@ fn device_producer_audit_rejects_completed_child_regression_and_future_promotion
     let record = future_promotion
         .records
         .iter_mut()
-        .find(|record| record.delivery_issue == "#1839")
+        .find(|record| record.delivery_issue == "#1840")
         .expect("future child record must exist");
     record.disposition = MetricsDeviceProducerDisposition::Implemented;
     record.implementation.push(anchored_local_reference());

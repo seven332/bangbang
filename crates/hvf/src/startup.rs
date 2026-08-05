@@ -18,7 +18,7 @@ use bangbang_runtime::balloon::{
     BalloonStatsError, BalloonStatsUpdateInput, BalloonUpdateError, VIRTIO_BALLOON_DEVICE_ID,
     VirtioBalloonConfigSpace, VirtioBalloonDevice, VirtioBalloonDeviceNotificationError,
     VirtioBalloonMmioCaptureState, VirtioBalloonPciCaptureError, VirtioBalloonPciCaptureState,
-    VirtioBalloonQueueLayout,
+    VirtioBalloonQueueLayout, attach_balloon_metrics_to_mmio_handler,
 };
 use bangbang_runtime::block::async_executor::{BlockAsyncRuntimeError, SharedBlockAsyncRuntime};
 use bangbang_runtime::block::{
@@ -16874,13 +16874,9 @@ impl HvfArm64BootSession<'_> {
                 .mapped_guest_memory_mut()
                 .map_err(balloon_update_error_from_display)?;
             let result = devices.dispatch_balloon(memory, &self.balloon_device_metrics, true);
-            if result.is_err() {
-                self.balloon_device_metrics
-                    .record_statistics_update_failure();
-            }
             return result;
         }
-        let result = (|| {
+        (|| {
             let dispatches = {
                 let memory = self
                     .backend
@@ -16904,13 +16900,7 @@ impl HvfArm64BootSession<'_> {
             record_balloon_signal_metrics(&self.balloon_device_metrics, &dispatches);
 
             balloon_update_result_from_hvf_dispatches(&dispatches)
-        })();
-        if result.is_err() {
-            self.balloon_device_metrics
-                .record_statistics_update_failure();
-        }
-
-        result
+        })()
     }
 
     pub fn dispatch_entropy_queue_notifications_and_signal_interrupts(
@@ -19308,6 +19298,7 @@ impl OwnedHvfArm64BootSession {
                 block_device_metrics,
                 pmem_device_metrics,
                 network_interface_metrics,
+                balloon_device_metrics,
                 entropy_device_metrics,
                 ..
             } = &mut session;
@@ -19315,10 +19306,13 @@ impl OwnedHvfArm64BootSession {
                 backend,
                 runtime_resources,
                 mmio_dispatcher,
-                block_device_metrics,
-                network_interface_metrics,
-                pmem_device_metrics,
-                entropy_device_metrics,
+                HvfArm64BootPciDataMetrics {
+                    block: block_device_metrics,
+                    network: network_interface_metrics,
+                    pmem: pmem_device_metrics,
+                    balloon: balloon_device_metrics,
+                    entropy: entropy_device_metrics,
+                },
             )
         };
         let pci_data_devices = match pci_data_devices {
@@ -21745,10 +21739,11 @@ impl OwnedHvfArm64BootSession {
 
     fn attach_snapshot_v2_balloon_mmio(
         mut session: OwnedHvfArm64BootSession,
-        balloon: PreparedSnapshotV2BalloonMmioHandler,
+        mut balloon: PreparedSnapshotV2BalloonMmioHandler,
         registration: PreparedHvfSnapshotV2BalloonMmioRegistrationPrefix,
         fault: Option<HvfSnapshotV2BalloonMmioRestoreFault>,
     ) -> Result<OwnedHvfArm64BootSession, HvfSnapshotV2BalloonMmioRestoreError> {
+        balloon.attach_metrics(session.balloon_device_metrics.clone());
         let (_config, _queue_ranges, region, interrupt_line, handler) = balloon.into_parts();
         if session.runtime_resources.balloon_device.is_some()
             || session.runtime_resources.pci_balloon_device.is_some()
@@ -21870,7 +21865,6 @@ impl OwnedHvfArm64BootSession {
             },
         });
         session.balloon_interrupt_line = Some(interrupt_line);
-        session.balloon_device_metrics = SharedBalloonDeviceMetrics::default();
         Ok(session)
     }
 
@@ -22757,8 +22751,6 @@ impl OwnedHvfArm64BootSession {
                 HvfSnapshotV2BalloonPciRestoreFailure::Product,
             ));
         }
-        session.balloon_device_metrics = SharedBalloonDeviceMetrics::default();
-
         if let Some(entropy) = entropy {
             let Some(endpoint_plan) = entropy_endpoint else {
                 return Err(HvfSnapshotV2BalloonPciRestoreError::after_session(
@@ -22915,6 +22907,18 @@ impl OwnedHvfArm64BootSession {
                     ));
                 }
             };
+        if let Err(source) = endpoint.attach_metrics(session.balloon_device_metrics.clone()) {
+            drop(endpoint);
+            let cleanup = interrupts.release().err();
+            return Err(HvfSnapshotV2BalloonPciRestoreError::after_session(
+                session,
+                HvfSnapshotV2BalloonPciRestoreStage::Endpoint,
+                HvfSnapshotV2BalloonPciRestoreFailure::Endpoint {
+                    source: SnapshotV2BalloonPciEndpointError::Endpoint(source),
+                    cleanup,
+                },
+            ));
+        }
         if endpoint.origin() != endpoint_plan.origin()
             || endpoint.endpoint().sbdf() != endpoint_plan.sbdf()
             || endpoint.endpoint().bar_range() != endpoint_plan.bar_range()
@@ -23023,7 +23027,6 @@ impl OwnedHvfArm64BootSession {
                 ),
             ));
         }
-        session.balloon_device_metrics = SharedBalloonDeviceMetrics::default();
         Ok(session)
     }
 
@@ -25475,10 +25478,11 @@ impl OwnedHvfArm64BootSession {
             async_runtime = runtime;
         }
 
+        let balloon_device_metrics = SharedBalloonDeviceMetrics::default();
         let mut balloon_device = None;
         let mut balloon_interrupt_line = None;
         let install_result = (|| {
-            if let Some(balloon) = balloon {
+            if let Some(mut balloon) = balloon {
                 if balloon_publication_fault
                     == Some(HvfSnapshotV2BalloonMmioRestoreFault::Registration)
                 {
@@ -25487,6 +25491,7 @@ impl OwnedHvfArm64BootSession {
                         HvfSnapshotV2StorageMmioRestoreFailure::InjectedPublication,
                     ));
                 }
+                balloon.attach_metrics(balloon_device_metrics.clone());
                 let (_config, _queue_ranges, region, interrupt_line, handler) =
                     balloon.into_parts();
                 let request = [MmioRegionRequest::new(
@@ -25881,7 +25886,7 @@ impl OwnedHvfArm64BootSession {
             entropy_source: VirtioRngOsEntropySource::new(),
             block_device_metrics,
             pmem_device_metrics,
-            balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
+            balloon_device_metrics,
             memory_hotplug_device_metrics: None,
             network_interface_metrics: SharedNetworkInterfaceMetricsRegistry::default(),
             vsock_device_metrics: SharedVsockDeviceMetrics::default(),
@@ -26271,6 +26276,7 @@ impl OwnedHvfArm64BootSession {
 
         let mut block_retry_wakeup_scheduler = None;
         let mut pmem_retry_wakeup_scheduler = None;
+        let balloon_device_metrics = SharedBalloonDeviceMetrics::default();
         let mut pci_data_devices = None;
         let mut prepared_balloon_publication = None;
         let mut restored_network = None;
@@ -26468,6 +26474,19 @@ impl OwnedHvfArm64BootSession {
                         )
                     }
                 };
+            if let Err(source) = endpoint.attach_metrics(balloon_device_metrics.clone()) {
+                drop(endpoint);
+                release_unpublished_snapshot_v2_balloon_pci_interrupts(
+                    &mut interrupts,
+                    &mut cleanup,
+                );
+                fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::EndpointPreparation { index: 0 },
+                    HvfSnapshotV2StoragePciRestoreFailure::PciData(HvfArm64BootPciDataError::new(
+                        format!("failed to bind restored balloon metrics: {source}")
+                    ),)
+                );
+            }
             if endpoint.origin() != planned.origin()
                 || endpoint.endpoint().sbdf() != planned.sbdf()
                 || endpoint.endpoint().bar_range() != planned.bar_range()
@@ -27300,7 +27319,7 @@ impl OwnedHvfArm64BootSession {
             entropy_source: VirtioRngOsEntropySource::new(),
             block_device_metrics,
             pmem_device_metrics,
-            balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
+            balloon_device_metrics,
             memory_hotplug_device_metrics: None,
             network_interface_metrics: restored_network_metrics.unwrap_or_default(),
             vsock_device_metrics,
@@ -30868,13 +30887,9 @@ impl OwnedHvfArm64BootSession {
                 .mapped_guest_memory_mut()
                 .map_err(balloon_update_error_from_display)?;
             let result = devices.dispatch_balloon(memory, &self.balloon_device_metrics, true);
-            if result.is_err() {
-                self.balloon_device_metrics
-                    .record_statistics_update_failure();
-            }
             return result;
         }
-        let result = (|| {
+        (|| {
             let dispatches = {
                 let memory = self
                     .backend
@@ -30898,13 +30913,7 @@ impl OwnedHvfArm64BootSession {
             record_balloon_signal_metrics(&self.balloon_device_metrics, &dispatches);
 
             balloon_update_result_from_hvf_dispatches(&dispatches)
-        })();
-        if result.is_err() {
-            self.balloon_device_metrics
-                .record_statistics_update_failure();
-        }
-
-        result
+        })()
     }
 
     pub fn dispatch_entropy_queue_notifications_and_signal_interrupts(
@@ -36814,7 +36823,9 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     } else {
         SharedNetworkInterfaceMetricsRegistry::from_interface_ids(network_interface_ids)
     };
+    let balloon_device_metrics = SharedBalloonDeviceMetrics::default();
     let entropy_device_metrics = SharedEntropyDeviceMetrics::default();
+    bind_mmio_balloon_transport_metrics(&runtime, &mmio_dispatcher, &balloon_device_metrics)?;
     bind_mmio_entropy_transport_metrics(&runtime, &mmio_dispatcher, &entropy_device_metrics)?;
     bind_mmio_pmem_transport_metrics(&runtime, &mmio_dispatcher, &pmem_device_metrics)?;
     bind_mmio_network_transport_metrics(&runtime, &mmio_dispatcher, &network_interface_metrics)?;
@@ -36826,10 +36837,13 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         backend,
         &mut runtime,
         &mmio_dispatcher,
-        &block_device_metrics,
-        &network_interface_metrics,
-        &pmem_device_metrics,
-        &entropy_device_metrics,
+        HvfArm64BootPciDataMetrics {
+            block: &block_device_metrics,
+            network: &network_interface_metrics,
+            pmem: &pmem_device_metrics,
+            balloon: &balloon_device_metrics,
+            entropy: &entropy_device_metrics,
+        },
     )
     .map_err(|source| HvfArm64BootSessionError::PciData { source })?;
     let memory_hotplug_device_metrics = runtime
@@ -36918,7 +36932,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         entropy_retry_wakeup_scheduler,
         block_device_metrics,
         pmem_device_metrics,
-        balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
+        balloon_device_metrics,
         memory_hotplug_device_metrics,
         network_interface_metrics,
         vsock_device_metrics: SharedVsockDeviceMetrics::default(),
@@ -37332,6 +37346,32 @@ fn bind_mmio_entropy_transport_metrics(
     })
 }
 
+fn bind_mmio_balloon_transport_metrics(
+    runtime: &Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    metrics: &SharedBalloonDeviceMetrics,
+) -> Result<(), HvfArm64BootSessionError> {
+    let Some(device) = &runtime.balloon_device else {
+        return Ok(());
+    };
+    let mut dispatcher =
+        dispatcher
+            .lock()
+            .map_err(|_| HvfArm64BootSessionError::DeviceMetricsBinding {
+                kind: "balloon",
+                message: "MMIO dispatcher is unavailable".to_string(),
+            })?;
+    attach_balloon_metrics_to_mmio_handler(
+        &mut dispatcher,
+        device.registration.region_id(),
+        metrics.clone(),
+    )
+    .map_err(|source| HvfArm64BootSessionError::DeviceMetricsBinding {
+        kind: "balloon",
+        message: format!("failed to resolve MMIO balloon device: {source}"),
+    })
+}
+
 fn bind_mmio_pmem_transport_metrics(
     runtime: &Arm64BootRuntimeResources,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
@@ -37400,15 +37440,28 @@ fn bind_mmio_network_transport_metrics(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HvfArm64BootPciDataMetrics<'a> {
+    block: &'a SharedBlockDeviceMetricsRegistry,
+    network: &'a SharedNetworkInterfaceMetricsRegistry,
+    pmem: &'a SharedPmemDeviceMetricsRegistry,
+    balloon: &'a SharedBalloonDeviceMetrics,
+    entropy: &'a SharedEntropyDeviceMetrics,
+}
+
 fn prepare_pci_data_devices(
     backend: &HvfBackend,
     runtime: &mut Arm64BootRuntimeResources,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
-    block_device_metrics: &SharedBlockDeviceMetricsRegistry,
-    network_interface_metrics: &SharedNetworkInterfaceMetricsRegistry,
-    pmem_device_metrics: &SharedPmemDeviceMetricsRegistry,
-    entropy_device_metrics: &SharedEntropyDeviceMetrics,
+    metrics: HvfArm64BootPciDataMetrics<'_>,
 ) -> Result<Option<HvfArm64BootPciDataDevices>, HvfArm64BootPciDataError> {
+    let HvfArm64BootPciDataMetrics {
+        block: block_device_metrics,
+        network: network_interface_metrics,
+        pmem: pmem_device_metrics,
+        balloon: balloon_device_metrics,
+        entropy: entropy_device_metrics,
+    } = metrics;
     let Some(validation) = runtime.pci_validation.as_ref() else {
         return Ok(None);
     };
@@ -37614,7 +37667,8 @@ fn prepare_pci_data_devices(
 
     let publish_result: Result<(), HvfArm64BootPciDataError> = (|| {
         if let Some(prepared) = balloon {
-            let (config_space, available_features, queue_sizes, device) = prepared.into_parts();
+            let (config_space, available_features, queue_sizes, mut device) = prepared.into_parts();
+            device.attach_metrics(balloon_device_metrics.clone());
             let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
             let published = {
@@ -45716,6 +45770,55 @@ mod tests {
         assert_eq!(
             metrics.snapshot(),
             EntropyDeviceMetrics::default().with_activate_fails(1)
+        );
+    }
+
+    #[test]
+    fn mmio_balloon_transport_metrics_bind_activation_at_source() {
+        let (_memory, mut runtime, dispatcher) = boot_runtime_with_balloon();
+        let metrics = SharedBalloonDeviceMetrics::default();
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+        super::bind_mmio_balloon_transport_metrics(&runtime, &dispatcher, &metrics)
+            .expect("MMIO balloon metrics should bind");
+
+        let mut dispatcher = dispatcher
+            .lock()
+            .expect("MMIO balloon dispatcher should remain available");
+        for status in [
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            QUEUE_CONFIG_STATUS,
+        ] {
+            write_boot_balloon_mmio_u32(
+                &mut runtime,
+                &mut dispatcher,
+                VirtioMmioRegister::Status,
+                status,
+            );
+        }
+        let address = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .registration
+            .address()
+            .checked_add(VirtioMmioRegister::Status.offset())
+            .expect("balloon status address should not overflow");
+        let access = dispatcher
+            .lookup(address, 4)
+            .expect("balloon status access should resolve");
+        let data = MmioAccessBytes::new(&DRIVER_OK_STATUS.to_le_bytes())
+            .expect("balloon status bytes should build");
+        assert!(
+            dispatcher
+                .dispatch(MmioOperation::write(access, data).expect("status write should build"))
+                .is_err(),
+            "balloon queues that are not ready should reject activation"
+        );
+
+        assert_eq!(
+            metrics.snapshot(),
+            BalloonDeviceMetrics::new(1, 0, 0, 0, 0, 0)
         );
     }
 

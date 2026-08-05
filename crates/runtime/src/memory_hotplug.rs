@@ -3265,7 +3265,7 @@ impl VirtioMemDevice {
         mutation_executor: &mut impl VirtioMemMutationExecutor,
     ) -> Result<VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError> {
         self.metrics
-            .record_queue_events(drained_notifications.len());
+            .record_queue_events(usize::from(!drained_notifications.is_empty()));
         if drained_notifications.is_empty() {
             return Ok(VirtioMemDeviceNotificationDispatch::new(
                 drained_notifications,
@@ -6330,7 +6330,7 @@ mod tests {
             other => panic!("expected unsupported queue error, got {other:?}"),
         }
         let metrics = device.shared_metrics().snapshot();
-        assert_eq!(metrics.queue_event_count(), 2);
+        assert_eq!(metrics.queue_event_count(), 1);
         assert_eq!(metrics.queue_event_fails(), 1);
     }
 

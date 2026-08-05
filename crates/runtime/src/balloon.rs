@@ -8,6 +8,7 @@ use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryDiscardAdviser,
     GuestMemoryDiscardOutcome, GuestMemoryError, GuestMemoryRange, SystemGuestMemoryDiscardAdviser,
 };
+use crate::metrics::SharedBalloonDeviceMetrics;
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
@@ -3356,6 +3357,7 @@ impl VirtioBalloonHintingDispatchContext {
 pub struct VirtioBalloonDiscardOutcome {
     attempts: u64,
     requested_bytes: u64,
+    completed_bytes: u64,
     advised_bytes: u64,
     skipped_bytes: u64,
     failed_bytes: u64,
@@ -3371,6 +3373,11 @@ impl VirtioBalloonDiscardOutcome {
     /// Returns the total bytes requested by accepted guest ranges.
     pub const fn requested_bytes(self) -> u64 {
         self.requested_bytes
+    }
+
+    /// Returns full guest-range bytes whose discard completed successfully.
+    pub const fn completed_bytes(self) -> u64 {
+        self.completed_bytes
     }
 
     /// Returns bytes whose aligned host interiors completed zero and free advice.
@@ -3397,6 +3404,7 @@ impl VirtioBalloonDiscardOutcome {
         Self {
             attempts: self.attempts.saturating_add(other.attempts),
             requested_bytes: self.requested_bytes.saturating_add(other.requested_bytes),
+            completed_bytes: self.completed_bytes.saturating_add(other.completed_bytes),
             advised_bytes: self.advised_bytes.saturating_add(other.advised_bytes),
             skipped_bytes: self.skipped_bytes.saturating_add(other.skipped_bytes),
             failed_bytes: self.failed_bytes.saturating_add(other.failed_bytes),
@@ -3409,6 +3417,11 @@ impl VirtioBalloonDiscardOutcome {
         self.requested_bytes = self
             .requested_bytes
             .saturating_add(outcome.requested_bytes());
+        if outcome.is_complete() {
+            self.completed_bytes = self
+                .completed_bytes
+                .saturating_add(outcome.requested_bytes());
+        }
         self.advised_bytes = self.advised_bytes.saturating_add(outcome.advised_bytes());
         self.skipped_bytes = self.skipped_bytes.saturating_add(outcome.skipped_bytes());
         self.failed_bytes = self.failed_bytes.saturating_add(outcome.failed_bytes());
@@ -3434,6 +3447,7 @@ pub struct VirtioBalloonQueueDispatch {
     statistics: BalloonOptionalStats,
     statistics_reports: usize,
     statistics_oversized_reports: usize,
+    unrecognized_statistics: usize,
     statistics_pending_descriptor_head: Option<u16>,
     hinting_page_ranges: Vec<GuestMemoryRange>,
     inflate_discard: VirtioBalloonDiscardOutcome,
@@ -3470,6 +3484,10 @@ impl VirtioBalloonQueueDispatch {
 
     pub const fn statistics_oversized_reports(&self) -> usize {
         self.statistics_oversized_reports
+    }
+
+    pub const fn unrecognized_statistics(&self) -> usize {
+        self.unrecognized_statistics
     }
 
     pub const fn statistics_pending_descriptor_head(&self) -> Option<u16> {
@@ -3548,6 +3566,11 @@ impl VirtioBalloonQueueDispatch {
         payload: VirtioBalloonStatisticsDescriptorPayload,
     ) {
         self.statistics_pending_descriptor_head = Some(descriptor_head);
+        self.unrecognized_statistics = self.unrecognized_statistics.saturating_add(
+            payload
+                .stat_count()
+                .saturating_sub(payload.recognized_stat_count()),
+        );
         if let Some(stats) = payload.report_stats() {
             self.statistics_reports += 1;
             self.statistics.merge_from(stats);
@@ -4585,6 +4608,7 @@ pub struct VirtioBalloonDevice {
     hinting_guest_cmd: Option<u32>,
     hinting_last_cmd: u32,
     hinting_acknowledge_on_stop: bool,
+    metrics: Option<SharedBalloonDeviceMetrics>,
     guest_logger: Option<GuestLogger>,
 }
 
@@ -4613,6 +4637,7 @@ impl VirtioBalloonDevice {
             hinting_guest_cmd: None,
             hinting_last_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
             hinting_acknowledge_on_stop: true,
+            metrics: None,
             guest_logger: None,
         }
     }
@@ -4680,8 +4705,13 @@ impl VirtioBalloonDevice {
             hinting_guest_cmd,
             hinting_last_cmd,
             hinting_acknowledge_on_stop,
+            metrics: None,
             guest_logger: None,
         })
+    }
+
+    pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {
+        self.metrics = Some(metrics);
     }
 
     pub const fn queue_layout(&self) -> VirtioBalloonQueueLayout {
@@ -5362,6 +5392,10 @@ fn validate_balloon_accounting_capture_state(
 }
 
 impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
+    pub fn attach_balloon_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {
+        self.activation_handler_mut().attach_metrics(metrics);
+    }
+
     pub fn capture_balloon_state(
         &self,
         config: BalloonConfig,
@@ -5498,7 +5532,26 @@ impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
     }
 }
 
+pub fn attach_balloon_metrics_to_mmio_handler(
+    dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    metrics: SharedBalloonDeviceMetrics,
+) -> Result<(), MmioHandlerLookupError> {
+    dispatcher
+        .handler_mut::<VirtioBalloonMmioHandler>(region_id)?
+        .attach_balloon_metrics(metrics);
+    Ok(())
+}
+
 impl VirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
+    pub fn attach_balloon_metrics(
+        &self,
+        metrics: SharedBalloonDeviceMetrics,
+    ) -> Result<(), VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| core.activation.attach_metrics(metrics))
+    }
+
     pub fn capture_balloon_state(
         &self,
         config: BalloonConfig,
@@ -5794,7 +5847,13 @@ impl VirtioMmioDeviceActivationHandler for VirtioBalloonDevice {
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
     ) -> Result<(), VirtioMmioDeviceActivationError> {
-        self.activate_balloon(activation).map_err(Into::into)
+        let result = self.activate_balloon(activation);
+        if result.is_err()
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.record_activation_failure();
+        }
+        result.map_err(Into::into)
     }
 
     fn reset(&mut self) {
@@ -6651,6 +6710,7 @@ mod tests {
     use std::ffi::c_void;
     use std::io;
     use std::ptr::NonNull;
+    use std::thread;
 
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::logger::{LoggerConfigInput, LoggerTestCapture};
@@ -8665,6 +8725,7 @@ mod tests {
             VirtioBalloonDiscardOutcome {
                 attempts: 1,
                 requested_bytes: VIRTIO_BALLOON_PAGE_SIZE * 4,
+                completed_bytes: VIRTIO_BALLOON_PAGE_SIZE * 4,
                 advised_bytes: VIRTIO_BALLOON_PAGE_SIZE * 4,
                 skipped_bytes: 0,
                 failed_bytes: 0,
@@ -8721,6 +8782,7 @@ mod tests {
             VirtioBalloonDiscardOutcome {
                 attempts: 1,
                 requested_bytes: inflated_len,
+                completed_bytes: inflated_len,
                 advised_bytes: inflated_len,
                 skipped_bytes: 0,
                 failed_bytes: 0,
@@ -8768,6 +8830,7 @@ mod tests {
             VirtioBalloonDiscardOutcome {
                 attempts: 1,
                 requested_bytes: VIRTIO_BALLOON_PAGE_SIZE,
+                completed_bytes: 0,
                 advised_bytes: 0,
                 skipped_bytes: 0,
                 failed_bytes: VIRTIO_BALLOON_PAGE_SIZE,
@@ -8804,6 +8867,7 @@ mod tests {
             VirtioBalloonDiscardOutcome {
                 attempts: 1,
                 requested_bytes: VIRTIO_BALLOON_PAGE_SIZE,
+                completed_bytes: VIRTIO_BALLOON_PAGE_SIZE,
                 advised_bytes: VIRTIO_BALLOON_PAGE_SIZE,
                 skipped_bytes: 0,
                 failed_bytes: 0,
@@ -9546,6 +9610,7 @@ mod tests {
         let mut memory = pfn_descriptor_memory();
         let bytes = stat_payload_bytes(&[
             (VIRTIO_BALLOON_S_SWAP_OUT, 9),
+            (0xffff, 10),
             (VIRTIO_BALLOON_S_MEMFREE, 0x5678),
         ]);
         write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
@@ -9573,6 +9638,7 @@ mod tests {
         assert!(!dispatch.needs_queue_interrupt());
         assert_eq!(dispatch.statistics_reports(), 1);
         assert_eq!(dispatch.statistics_oversized_reports(), 0);
+        assert_eq!(dispatch.unrecognized_statistics(), 1);
         assert_eq!(dispatch.statistics_pending_descriptor_head(), Some(0));
         assert_eq!(dispatch.statistics().swap_out(), Some(9));
         assert_eq!(dispatch.statistics().free_memory(), Some(0x5678));
@@ -10089,6 +10155,7 @@ mod tests {
             VirtioBalloonDiscardOutcome {
                 attempts: 1,
                 requested_bytes: VIRTIO_BALLOON_PAGE_SIZE,
+                completed_bytes: 0,
                 advised_bytes: 0,
                 skipped_bytes: 0,
                 failed_bytes: VIRTIO_BALLOON_PAGE_SIZE,
@@ -10514,6 +10581,7 @@ mod tests {
             VirtioBalloonDiscardOutcome {
                 attempts: 2,
                 requested_bytes: 8192,
+                completed_bytes: 8192,
                 advised_bytes: 8192,
                 skipped_bytes: 0,
                 failed_bytes: 0,
@@ -10605,6 +10673,7 @@ mod tests {
             VirtioBalloonDiscardOutcome {
                 attempts: 4,
                 requested_bytes: 12_288,
+                completed_bytes: 4096,
                 advised_bytes: 4096,
                 skipped_bytes: 0,
                 failed_bytes: 8192,
@@ -10640,6 +10709,7 @@ mod tests {
             VirtioBalloonDiscardOutcome {
                 attempts: 1,
                 requested_bytes: 4,
+                completed_bytes: 0,
                 advised_bytes: 0,
                 skipped_bytes: 0,
                 failed_bytes: 4,
@@ -10679,6 +10749,7 @@ mod tests {
             VirtioBalloonDiscardOutcome {
                 attempts: 2,
                 requested_bytes: 8192,
+                completed_bytes: 4096,
                 advised_bytes: 4096,
                 skipped_bytes: 0,
                 failed_bytes: 4096,
@@ -10729,6 +10800,7 @@ mod tests {
             VirtioBalloonDiscardOutcome {
                 attempts: 1,
                 requested_bytes: FOUR_KIB,
+                completed_bytes: FOUR_KIB,
                 advised_bytes: 0,
                 skipped_bytes: FOUR_KIB,
                 failed_bytes: 0,
@@ -10773,6 +10845,7 @@ mod tests {
             VirtioBalloonDiscardOutcome {
                 attempts: 1,
                 requested_bytes: 4096,
+                completed_bytes: 4096,
                 advised_bytes: 4096,
                 skipped_bytes: 0,
                 failed_bytes: 0,
@@ -11215,6 +11288,37 @@ mod tests {
         ));
         assert_eq!(error.to_string(), "virtio-balloon device is already active");
         assert!(device.is_activated());
+    }
+
+    #[test]
+    fn balloon_activation_metrics_follow_the_attached_transport_owner() {
+        let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
+        let device_registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BALLOON_DEVICE_ID,
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+        );
+        let queues = configured_queue_registers(layout.queue_count());
+        let metrics = SharedBalloonDeviceMetrics::default();
+        let other = SharedBalloonDeviceMetrics::default();
+        let mut device = VirtioBalloonDevice::new(layout);
+        device.attach_metrics(metrics.clone());
+
+        VirtioMmioDeviceActivationHandler::activate(
+            &mut device,
+            activation_for_queues(&device_registers, &queues),
+        )
+        .expect("first transport activation should succeed");
+        VirtioMmioDeviceActivationHandler::activate(
+            &mut device,
+            activation_for_queues(&device_registers, &queues),
+        )
+        .expect_err("duplicate transport activation should fail");
+
+        assert_eq!(
+            metrics.snapshot(),
+            BalloonDeviceMetrics::new(1, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(other.snapshot(), BalloonDeviceMetrics::default());
     }
 
     #[test]
@@ -11962,7 +12066,7 @@ mod tests {
         metrics.record_notification_dispatch(&dispatch);
         assert_eq!(
             metrics.snapshot(),
-            BalloonDeviceMetrics::new(0, 0, 0, 0, 2, 0)
+            BalloonDeviceMetrics::new(0, 0, 0, 0, 1, 0)
         );
         assert_eq!(read_used_idx(&memory, deflate_used_ring()), 1);
         assert_eq!(read_used_element(&memory, deflate_used_ring(), 0), (0, 0));
@@ -12052,6 +12156,7 @@ mod tests {
                 inflate_discard: VirtioBalloonDiscardOutcome {
                     attempts: 2,
                     requested_bytes: 16_384,
+                    completed_bytes: 12_288,
                     advised_bytes: 8192,
                     skipped_bytes: 4096,
                     failed_bytes: 4096,
@@ -12065,6 +12170,7 @@ mod tests {
                 hinting_discard: VirtioBalloonDiscardOutcome {
                     attempts: 3,
                     requested_bytes: 24_576,
+                    completed_bytes: 24_576,
                     advised_bytes: 16_384,
                     skipped_bytes: 8192,
                     failed_bytes: 0,
@@ -12076,6 +12182,7 @@ mod tests {
                 reporting_discard: VirtioBalloonDiscardOutcome {
                     attempts: 4,
                     requested_bytes: 32_768,
+                    completed_bytes: 16_384,
                     advised_bytes: 12_288,
                     skipped_bytes: 4096,
                     failed_bytes: 16_384,
@@ -12092,12 +12199,114 @@ mod tests {
             metrics.snapshot(),
             BalloonDeviceMetrics::new(0, 1, 0, 0, 0, 0)
                 .with_discard_metrics(
-                    BalloonDiscardMetrics::new(2, 8192, 4096, 1),
-                    BalloonDiscardMetrics::new(3, 16_384, 8192, 0),
+                    BalloonDiscardMetrics::new(2, 8192, 4096, 1).with_completed_bytes(12_288),
+                    BalloonDiscardMetrics::new(3, 16_384, 8192, 0).with_completed_bytes(24_576),
                 )
-                .with_free_page_report_metrics(BalloonFreePageReportMetrics::new(
-                    4, 32_768, 12_288, 4096, 2,
-                ))
+                .with_free_page_report_metrics(
+                    BalloonFreePageReportMetrics::new(4, 32_768, 12_288, 4096, 2,)
+                        .with_completed_bytes(16_384)
+                )
+        );
+    }
+
+    #[test]
+    fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics() {
+        let dispatch = VirtioBalloonDeviceNotificationDispatch {
+            drained_notifications: vec![VIRTIO_BALLOON_STATS_QUEUE_INDEX],
+            inflate_notifications: 0,
+            deflate_notifications: 0,
+            statistics_notifications: 2,
+            hinting_notifications: 0,
+            reporting_notifications: 0,
+            inflate_queue_dispatch: None,
+            deflate_queue_dispatch: None,
+            statistics_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                completed_descriptors: 1,
+                unrecognized_statistics: 3,
+                ..Default::default()
+            }),
+            hinting_queue_dispatch: None,
+            reporting_queue_dispatch: None,
+        };
+        let metrics = SharedBalloonDeviceMetrics::default();
+
+        metrics.record_notification_dispatch(&dispatch);
+
+        assert_eq!(
+            metrics.snapshot(),
+            BalloonDeviceMetrics::new(0, 0, 1, 3, 0, 0)
+        );
+    }
+
+    #[test]
+    fn concurrent_balloon_dispatch_snapshots_are_coherent() {
+        const COMPLETED_BYTES: u64 = 4096;
+        const DISPATCHES_PER_WORKER: usize = 10_000;
+        const WORKER_COUNT: usize = 4;
+
+        let metrics = SharedBalloonDeviceMetrics::default();
+        let workers = (0..WORKER_COUNT)
+            .map(|_| {
+                let metrics = metrics.clone();
+                thread::spawn(move || {
+                    for _ in 0..DISPATCHES_PER_WORKER {
+                        metrics.record_notification_dispatch(
+                            &VirtioBalloonDeviceNotificationDispatch {
+                                drained_notifications: vec![VIRTIO_BALLOON_INFLATE_QUEUE_INDEX],
+                                inflate_notifications: 1,
+                                deflate_notifications: 0,
+                                statistics_notifications: 0,
+                                hinting_notifications: 0,
+                                reporting_notifications: 0,
+                                inflate_queue_dispatch: Some(VirtioBalloonQueueDispatch {
+                                    inflate_discard: VirtioBalloonDiscardOutcome {
+                                        attempts: 1,
+                                        requested_bytes: COMPLETED_BYTES,
+                                        completed_bytes: COMPLETED_BYTES,
+                                        advised_bytes: COMPLETED_BYTES,
+                                        skipped_bytes: 0,
+                                        failed_bytes: 0,
+                                        failures: 0,
+                                    },
+                                    ..Default::default()
+                                }),
+                                deflate_queue_dispatch: None,
+                                statistics_queue_dispatch: None,
+                                hinting_queue_dispatch: None,
+                                reporting_queue_dispatch: None,
+                            },
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for _ in 0..DISPATCHES_PER_WORKER {
+            let snapshot = metrics.snapshot();
+            assert_eq!(
+                snapshot.inflate_discard().attempts(),
+                snapshot.inflate_count()
+            );
+            assert_eq!(
+                snapshot.inflate_discard().completed_bytes(),
+                snapshot.inflate_count().saturating_mul(COMPLETED_BYTES)
+            );
+        }
+        for worker in workers {
+            worker
+                .join()
+                .expect("balloon metrics writer should not panic");
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.inflate_count(),
+            u64::try_from(WORKER_COUNT * DISPATCHES_PER_WORKER)
+                .expect("test dispatch count should fit u64")
+        );
+        assert_eq!(
+            snapshot.inflate_discard().completed_bytes(),
+            snapshot.inflate_count().saturating_mul(COMPLETED_BYTES)
         );
     }
 
@@ -13124,7 +13333,7 @@ mod tests {
         metrics.record_notification_dispatch(&dispatch);
         assert_eq!(
             metrics.snapshot(),
-            BalloonDeviceMetrics::new(0, 0, 1, 0, 0, 0)
+            BalloonDeviceMetrics::new(0, 0, 0, 0, 0, 0)
         );
         assert_eq!(
             read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),

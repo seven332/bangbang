@@ -531,110 +531,614 @@
     {
       "field_id": "static:balloon.activate_fails",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.activate_fails` is assigned to #1839 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.activate_fails` is completed by #1839 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.deflate_count",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.deflate_count` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.deflate_count` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.event_fails` is assigned to #1839 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.event_fails` is completed by #1839 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.free_page_hint_count",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.free_page_hint_count` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.free_page_hint_count` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.free_page_hint_fails",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.free_page_hint_fails` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.free_page_hint_fails` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.free_page_hint_freed",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.free_page_hint_freed` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.free_page_hint_freed` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.free_page_report_count",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.free_page_report_count` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.free_page_report_count` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.free_page_report_fails",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.free_page_report_fails` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.free_page_report_fails` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.free_page_report_freed",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.free_page_report_freed` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.free_page_report_freed` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.inflate_count",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.inflate_count` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.inflate_count` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.stats_update_fails",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.stats_update_fails` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.stats_update_fails` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.stats_updates_count",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `balloon.stats_updates_count` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `balloon.stats_updates_count` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn bind_mmio_balloon_transport_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "pub fn attach_metrics(&mut self, metrics: SharedBalloonDeviceMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBalloonDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "balloon: BalloonMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn mmio_balloon_transport_metrics_bind_activation_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_balloon_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "fn balloon_metrics_count_guest_queue_dispatch_and_unknown_statistics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_balloon_device_metrics_when_provided()"
+        }
+      ]
     },
     {
       "field_id": "static:block.activate_fails",
@@ -1214,236 +1718,1198 @@
     {
       "field_id": "static:memory_hotplug.activate_fails",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.activate_fails` is assigned to #1839 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.activate_fails` is completed by #1839 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.plug_agg.max_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.plug_agg.max_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.plug_agg.max_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.plug_agg.min_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.plug_agg.min_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.plug_agg.min_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.plug_agg.sum_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.plug_agg.sum_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.plug_agg.sum_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.plug_bytes",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.plug_bytes` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.plug_bytes` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.plug_count",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.plug_count` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.plug_count` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.plug_fails",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.plug_fails` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.plug_fails` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.queue_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.queue_event_count` is assigned to #1839 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.queue_event_count` is completed by #1839 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.queue_event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.queue_event_fails` is assigned to #1839 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.queue_event_fails` is completed by #1839 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.state_agg.max_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.state_agg.max_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.state_agg.max_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.state_agg.min_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.state_agg.min_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.state_agg.min_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.state_agg.sum_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.state_agg.sum_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.state_agg.sum_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.state_count",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.state_count` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.state_count` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.state_fails",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.state_fails` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.state_fails` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_agg.max_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_agg.max_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_agg.max_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_agg.min_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_agg.min_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_agg.min_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_agg.sum_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_agg.sum_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_agg.sum_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_all_agg.max_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_all_agg.max_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_all_agg.max_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_all_agg.min_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_all_agg.min_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_all_agg.min_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_all_agg.sum_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_all_agg.sum_us` is assigned to #1839 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_all_agg.sum_us` is completed by #1839 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_all_count",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_all_count` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_all_count` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_all_fails",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_all_fails` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_all_fails` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_bytes",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_bytes` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_bytes` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_count",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_count` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_count` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_discard_fails",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_discard_fails` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_discard_fails` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.unplug_fails",
       "boundary": "device-state",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1839",
-      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_fails` is assigned to #1839 at the `device-state` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `memory_hotplug.unplug_fails` is completed by #1839 at the `device-state` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_memory_hotplug_signal_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "fn dispatch_with_executor_and_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMemoryHotplugDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_memory_hotplug_latency("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn run_production_memory_hotplug_snapshot_destination("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn concurrent_memory_hotplug_operation_snapshots_are_coherent()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_firecracker_shaped_memory_hotplug_metrics_without_private_extensions()"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.connections_created",
