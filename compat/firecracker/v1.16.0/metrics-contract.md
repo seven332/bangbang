@@ -2,7 +2,7 @@
 
 This contract defines the checked public metrics-line authority used by
 Bangbang for the pinned Firecracker v1.16.0 arm64 target. It separates schema
-presence, shared producer policy, and incremental producer completion. The
+presence, shared producer policy, and exact producer certification. The
 machine-readable artifacts are [`metrics-schema.json`](metrics-schema.json)
 and
 [`metrics-process-producer-audit.json`](metrics-process-producer-audit.json);
@@ -21,7 +21,7 @@ The checked contract has three layers:
   they attach one closed unit, aggregation rule, producer owner/disposition,
   delivery issue, rationale, and eventual implementation/validation evidence
   to every source field.
-- `metrics-process-producer-audit.json` is the human-owned incremental audit of
+- `metrics-process-producer-audit.json` is the human-owned terminal audit of
   the exact fields selected by the process producer profile. It records each
   field's closed production boundary, delivery child, current disposition,
   rationale, and evidence without copying source shape, unit, reset, or
@@ -35,12 +35,13 @@ from an evidence-backed producer.
 
 The runtime compiles this authority into the canonical serializer and an exact
 descriptor-equality test. #1823 certifies the bounded #1787 API/schema slice,
-including the schema-runtime timestamp producer. That result does not promote
-another producer policy: #1788 still owns API, process, logger, signal, boot,
-and lifecycle producers; #1789 owns device, MMDS, vCPU, time/device,
-configured-key, and retained-neutral producers. `corpus:metrics` and the
-cross-producer aggregate semantic remain #1790-owned. A required zero therefore
-proves wire-shape completeness only, never producer completion.
+including the schema-runtime timestamp producer. #1788 certifies the exact
+API, process, logger, signal, boot, and lifecycle producers through two
+implemented aggregate profiles and the field-level audit. #1789 still owns
+device, MMDS, vCPU, time/device, configured-key, and retained-neutral
+producers. `corpus:metrics` and the cross-producer aggregate semantic remain
+#1790-owned. A required zero therefore proves wire-shape completeness only,
+never producer completion.
 
 ## Terminal API and Schema Certification
 
@@ -60,10 +61,10 @@ The terminal #1787 slice contains exactly twelve capability records:
 The scoped gate requires those exact records and their #1787 contract rows to
 be `implemented-and-verified`, while both #1790 aggregate records remain
 `audit-required`. It also pins the policy partition to one implemented
-schema-runtime timestamp profile, two planned #1788 process-lifecycle
-profiles, ten planned #1789 device profiles, and four #1789 platform-zero
-device profiles. Missing, extra, promoted, stale, or differently handed-off
-members fail closed.
+schema-runtime timestamp profile, two implemented process-lifecycle profiles,
+ten planned #1789 device profiles, and four #1789 platform-zero device
+profiles. Missing, extra, promoted, stale, or differently handed-off members
+fail closed.
 
 Focused API evidence rejects duplicate `metrics_path`, rate-limiter, and token
 bucket fields. Every token-bucket number accepts the complete JSON `u64`
@@ -77,11 +78,12 @@ then one explicit line and one normal-terminal line. Each observed record is a
 newline-terminated numeric JSON tree with the canonical timestamp and without
 Bangbang-only fields.
 
-This certification is deliberately narrower than producer or corpus closure.
-It does not complete #1788, #1789, either #1790 aggregate, tracing, durable
+This certification remains deliberately narrower than process, device, or
+corpus closure even though its current authority observes the completed #1788
+handoff. It does not complete #1789, either #1790 aggregate, tracing, durable
 delivery, remote telemetry, or a versioned extension format.
 
-## Incremental Process Producer Audit
+## Terminal Process Producer Audit
 
 The process audit is an exact, sorted bijection over the 69 static fields whose
 schema policy owner is `process`. Missing, duplicate, extra, stale, reordered,
@@ -387,15 +389,23 @@ cargo test -p bangbang-runtime metrics::tests --all-features --locked
 cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --locked
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 ```
 
 `validate --metrics-schema-final` runs repository delivery validation, the
 metrics authority delivery gate, the exact twelve-row #1787 certification, and
 the logger producer delivery gate needed by metrics collection. It validates
-the exact 69-field process audit and accepts only its recorded completed-child
-set. It permits only the explicit #1788/#1789 producer handoffs and retained
-#1790 aggregate rows; repository-global `validate --final` remains the stronger
-all-capability gate.
+the exact 69-field process audit in delivery mode. It permits only the
+completed process profiles, explicit #1789 device handoffs, and retained #1790
+aggregate rows.
+
+`validate --metrics-process-final` composes that schema certification with
+final-mode process-audit validation and logger delivery validation. It requires
+all 69 records to be terminal with their exact child, boundary, rationale,
+disposition, and tracked evidence: 64 implemented, one source-neutral, and four
+platform-zero. It does not require the ten planned or four platform-zero
+device profiles to complete and does not promote either #1790 aggregate.
+Repository-global `validate --final` remains the stronger all-capability gate.
 
 With an explicit clean sibling at the pinned commit, compare every source
 identity, Git blob, root/path/template, type/reset fact, architecture rule, and

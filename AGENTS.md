@@ -24,6 +24,9 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo fmt --all -- --check`: verify Rust formatting.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`: validate the
   checked delivery-time Firecracker inventory without a sibling checkout.
+- `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+  --metrics-process-final`: certify the exact terminal 69-field API/process metrics
+  producer scope while retaining downstream device and aggregate work.
 - `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.
 - `cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl`: verify unsupported targets compile to the launcher's explicit platform-error path.
 - `cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf`: run non-HVF tests with all targets and features enabled.

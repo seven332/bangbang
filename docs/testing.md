@@ -1539,7 +1539,7 @@ The checked metrics authority uses one envelope with a machine-owned `source`
 projection and human-owned policy profiles/mappings. It records exactly 24
 arm64 static roots and 243 static scalar paths, plus configured block/network/
 vhost-user field populations of 24/29/5. The separate human-owned
-`metrics-process-producer-audit.json` is an exact incremental mapping of the 69
+`metrics-process-producer-audit.json` is an exact terminal mapping of the 69
 fields assigned to the process profile; it records 44 implemented #1827
 request/deprecation fields, 12 implemented #1828 startup/latency fields, four
 implemented plus one source-neutral #1829 fields, and four implemented plus four
@@ -1587,16 +1587,45 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 
 Metrics-schema-final mode requires the exact twelve #1787 rows to be terminal,
 the schema-runtime timestamp profile to be implemented, both #1790 aggregates
-to remain nonterminal, and the remaining policy profiles to retain their exact
-#1788/#1789 owner/disposition partition. It also validates the exact 69-field
-process audit and its completed-child set. Focused tests inject missing, extra,
-promoted, stale, wrongly handed-off, invalid-evidence, and boundary-drift
-records; API tests cover duplicate keys, the full unsigned token-bucket
-boundary, and the exact parser-metric table; direct and contained process tests
-cover `/vm/config` privacy. The signed product oracle
+to remain nonterminal, both process-lifecycle profiles to be implemented, and
+the remaining device policy profiles to retain their exact #1789 disposition
+partition. It also validates the terminal 69-field process audit in delivery
+mode. Focused tests inject missing, extra, promoted, stale, wrongly handed-off,
+invalid-evidence, and boundary-drift records; API tests cover duplicate keys,
+the full unsigned token-bucket boundary, and the exact parser-metric table;
+direct and contained process tests cover `/vm/config` privacy. The signed
+product oracle
 `normal_bundle_certifies_metrics_schema_across_real_periodic_and_terminal_lifecycle`
 uses the unmodified 60-second scheduler and observes initial,
 Paused-periodic, Running-periodic, explicit, and terminal canonical lines.
+
+The terminal process metrics gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
+```
+
+Metrics-process-final composes metrics-schema-final's authority and downstream
+partition with final-mode validation of the exact process audit, while retaining
+logger validation in delivery mode. It requires the two implemented process
+profiles and all 69 field records to remain terminal at exactly 64 implemented,
+one source-neutral, and four platform-zero. Ten planned and four platform-zero
+device profiles remain #1789-owned, and the two aggregates remain #1790-owned.
+The composed test mutates both a field record and an aggregate process profile;
+the lower-level suite separately exercises every membership, ordering,
+ownership, boundary, child, rationale, disposition, evidence, path, and baseline
+failure rule.
+
+Current-main integration evidence is intentionally composed from the existing
+oracles: runtime publication tests cover stable cuts, partial/failing sinks,
+success-only baselines, and at-least-once retry; portable process tests cover
+orderly/abnormal final, panic, classified signals, immediate fallbacks, exact
+exits, redaction, and no duplicate line; signed direct HVF, App Sandbox, and
+production tests cover live process and contained supervisor boundaries; and
+the production periodic oracle covers initial, real 60-second Paused and
+Running, explicit, and terminal attempts. The final certification reruns the
+complete signed wrapper instead of replacing those public-boundary tests with a
+duplicate aggregate fixture.
 
 Host lifecycle logger coverage exercises backend and VM transitions, all three
 live device kinds, boot-worker observation, automatic metrics failures,
@@ -1675,6 +1704,7 @@ cargo fmt --all -- --check
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo check --workspace --all-targets --all-features --locked
 cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 cargo check -p bangbang-snapshot-tools --all-targets --all-features --locked --target aarch64-unknown-linux-musl

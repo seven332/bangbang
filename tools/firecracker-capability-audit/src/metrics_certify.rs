@@ -29,14 +29,14 @@ pub const RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS: [&str; 2] = [
 ];
 
 const EXPECTED_SCHEMA_RUNTIME_IMPLEMENTED_PROFILES: usize = 1;
-const EXPECTED_PROCESS_LIFECYCLE_PLANNED_PROFILES: usize = 2;
+const EXPECTED_PROCESS_LIFECYCLE_IMPLEMENTED_PROFILES: usize = 2;
 const EXPECTED_DEVICE_PLANNED_PROFILES: usize = 10;
 const EXPECTED_DEVICE_PLATFORM_ZERO_PROFILES: usize = 4;
 const OBSERVABILITY_CONTRACT_PATH: &str =
     "compat/firecracker/v1.16.0/observability-tools-specification-contract.md";
 
 /// Validate the terminal metrics API/schema slice without requiring later
-/// producer or aggregate owners to have reached terminal dispositions.
+/// device producer or aggregate owners to have reached terminal dispositions.
 pub fn validate_metrics_schema_compatibility(
     manifest: &SourceManifest,
     inventory: &CapabilityInventory,
@@ -94,7 +94,7 @@ pub fn validate_metrics_schema_compatibility(
     }
 
     let mut schema_runtime_implemented = 0;
-    let mut process_lifecycle_planned = 0;
+    let mut process_lifecycle_implemented = 0;
     let mut device_planned = 0;
     let mut device_platform_zero = 0;
     for profile in &metrics_authority.policy_profiles {
@@ -102,12 +102,12 @@ pub fn validate_metrics_schema_compatibility(
             (
                 MetricsProducerOwner::SchemaRuntime,
                 MetricsProducerDisposition::Implemented,
-            ) => schema_runtime_implemented += 1,
+            ) if profile.delivery_issue.is_none() => schema_runtime_implemented += 1,
             (
                 MetricsProducerOwner::ProcessLifecycle,
-                MetricsProducerDisposition::Planned,
-            ) if profile.delivery_issue.as_deref() == Some("#1788") => {
-                process_lifecycle_planned += 1;
+                MetricsProducerDisposition::Implemented,
+            ) if profile.delivery_issue.is_none() => {
+                process_lifecycle_implemented += 1;
             }
             (MetricsProducerOwner::Device, MetricsProducerDisposition::Planned)
                 if profile.delivery_issue.as_deref() == Some("#1789") =>
@@ -120,7 +120,7 @@ pub fn validate_metrics_schema_compatibility(
                 device_platform_zero += 1;
             }
             _ => errors.push(format!(
-                "metrics schema certification rejects producer policy outside the exact #1788/#1789 handoff: {}",
+                "metrics schema certification rejects producer policy outside the exact completed-process/#1789 handoff: {}",
                 profile.id
             )),
         }
@@ -133,9 +133,9 @@ pub fn validate_metrics_schema_compatibility(
             EXPECTED_SCHEMA_RUNTIME_IMPLEMENTED_PROFILES,
         ),
         (
-            "planned process-lifecycle",
-            process_lifecycle_planned,
-            EXPECTED_PROCESS_LIFECYCLE_PLANNED_PROFILES,
+            "implemented process-lifecycle",
+            process_lifecycle_implemented,
+            EXPECTED_PROCESS_LIFECYCLE_IMPLEMENTED_PROFILES,
         ),
         (
             "planned device",

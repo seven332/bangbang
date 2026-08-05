@@ -131,6 +131,20 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo check --workspace --all-targets --all-features --locked
 ```
 
+The terminal 69-field API/process metrics producer scope has a separate
+fail-closed certification gate:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
+```
+
+When the pinned sibling checkout is available at `../firecracker`, verify its
+source identities and anchors with:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- compare --firecracker ../firecracker
+```
+
 Before opening or updating a pull request, run the complete command set in
 [Running Tests](docs/testing.md#running-tests). Real Hypervisor.framework tests
 must use `scripts/run-integration-tests.sh` so their binaries are signed.

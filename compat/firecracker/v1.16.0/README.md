@@ -31,7 +31,7 @@ For commands and test-layer selection, see the
   and Python fixture; its policy profiles and exact field mappings are
   human-owned and never regenerated.
 - [`metrics-process-producer-audit.json`](metrics-process-producer-audit.json)
-  is the human-owned incremental audit for the exact 69 fields assigned to the
+  is the human-owned terminal audit for the exact 69 fields assigned to the
   process producer profile. It records one closed producer boundary, delivery
   child, disposition, rationale, and evidence set per field without duplicating
   the schema or shared field policy.
@@ -75,7 +75,7 @@ reviewed delta.
 | [Snapshot Wave 6](snapshot-wave6-contract.md) | Exact 70-row load, artifact, version, device, tool, time/identity, portability, and downstream-owner certification |
 | [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
 | [Logger producers](logger-contract.md) | Certified 11-row logger aggregate with exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
-| [Metrics schema and process producers](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, and the incremental 69-field #1788 process audit with 44 #1827 request/deprecation producers implemented |
+| [Metrics schema and process producers](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, and a terminal 69-field #1788 process audit with 64 implemented, one source-neutral, and four platform-zero records |
 
 ## Dispositions
 
@@ -141,14 +141,33 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 
 This command validates the complete capability inventory and metrics authority
 in delivery mode, requires the exact twelve #1787 capability and contract rows
-as `implemented-and-verified`, pins the one implemented schema-runtime profile
-and exact #1788/#1789 producer partition, validates the 69-field process audit
-with only completed child #1827 promoted, and requires both #1790 aggregate
-rows to remain `audit-required`. Focused parser, direct-process privacy, signed
-ordinary-production/App Sandbox privacy, and real Paused/Running 60-second
-lifecycle evidence support the terminal claim. It does not promote later
-producer, corpus, or cross-producer work; repository-global `validate --final`
-continues to fail until those unrelated records are terminal.
+as `implemented-and-verified`, pins the one implemented schema-runtime profile,
+two implemented process-lifecycle profiles, and exact downstream #1789 device
+partition, validates the terminal 69-field process audit in delivery mode, and
+requires both #1790 aggregate rows to remain `audit-required`. Focused parser,
+direct-process privacy, signed ordinary-production/App Sandbox privacy, and
+real Paused/Running 60-second lifecycle evidence support the terminal claim.
+It does not promote later device, corpus, or cross-producer work;
+repository-global `validate --final` continues to fail until those unrelated
+records are terminal.
+
+## Scoped Process Metrics Certification
+
+The completed #1788 process producer scope has its own fail-closed gate:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
+```
+
+This command retains the metrics API/schema compatibility gate and logger
+delivery validation, then applies final mode to the exact 69-field process
+audit. It requires both process-lifecycle profiles to be implemented, all four
+delivery children to be terminal, and every exact field boundary, disposition,
+and evidence reference to validate. Its closed result is 64 implemented, one
+source-neutral, and four platform-zero records. Ten planned and four
+platform-zero device profiles remain #1789-owned, while both aggregate rows
+remain `audit-required` for #1790; neither downstream scope is promoted by this
+gate.
 
 ## Contributor Update Rule
 
