@@ -505,7 +505,9 @@ fn run(
             }));
             match execution {
                 Ok(result) => result,
-                Err(payload) => finish_caught_runtime_panic(&mut vmm, payload),
+                Err(payload) => {
+                    finish_caught_runtime_panic(&mut vmm, fatal_signal_handlers.as_ref(), payload)
+                }
             }
         }
     }
@@ -513,13 +515,27 @@ fn run(
 
 fn finish_caught_runtime_panic<S>(
     vmm: &mut ProcessVmm<S>,
+    fatal_signal_handlers: Option<&FatalSignalHandlers>,
     payload: Box<dyn std::any::Any + Send>,
-) -> !
+) -> Result<(), ProcessError>
 where
     S: vmm::InstanceStartExecutor,
 {
+    panic_bridge::isolate_secondary_panic(|| vmm.record_process_panic());
+    if let Some(handlers) = fatal_signal_handlers
+        && let Err(error) = handlers.resolve_control_result(Ok(()))
+    {
+        // A fatal claim that won before the panic escaped the control owner keeps
+        // its compatible exit. The original payload stays opaque and undropped
+        // until process exit, just as it would on the immediate `_exit` path.
+        std::mem::forget(payload);
+        panic_bridge::isolate_secondary_panic(|| {
+            vmm.handle_terminal_observability(ProcessTerminalCategory::ProcessFailure);
+            let _ = vmm.flush_process_stdout(PROCESS_STDOUT_DRAIN_TIMEOUT);
+        });
+        return Err(error);
+    }
     panic_bridge::isolate_secondary_panic(|| {
-        vmm.record_process_panic();
         vmm.handle_terminal_observability(ProcessTerminalCategory::Panic);
         let _ = vmm.flush_process_stdout(PROCESS_STDOUT_DRAIN_TIMEOUT);
     });
@@ -3065,7 +3081,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::{Command as ProcessCommand, Output, Stdio};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -3123,6 +3139,7 @@ mod tests {
     const CAUGHT_RUNTIME_PANIC_CHILD_ENV: &str = "BANGBANG_CAUGHT_RUNTIME_PANIC_CHILD";
     const FATAL_SIGNAL_CLAIMED_CHILD_ENV: &str = "BANGBANG_FATAL_SIGNAL_CLAIMED_CHILD";
     const FATAL_SIGNAL_FALLBACK_CHILD_ENV: &str = "BANGBANG_FATAL_SIGNAL_FALLBACK_CHILD";
+    static NEXT_METRICS_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug, Clone)]
     struct TestInstanceStarter;
@@ -3559,8 +3576,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after unix epoch")
             .as_nanos();
+        let path_id = NEXT_METRICS_PATH_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "bangbang-main-test-{}-{nanos}-{name}.metrics",
+            "bangbang-main-test-{}-{nanos}-{path_id}-{name}.metrics",
             std::process::id()
         ))
     }
@@ -4012,7 +4030,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn trigger_sigxfsz_resource_limit() {
+    fn trigger_sigxfsz_resource_limit() -> ! {
         let fd = unlinked_signal_fixture_fd("sigxfsz");
         let limit = libc::rlimit {
             rlim_cur: 0,
@@ -4023,6 +4041,13 @@ mod tests {
         unsafe {
             assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
             let _ = libc::write(fd, b"X".as_ptr().cast(), 1);
+        }
+        loop {
+            // SAFETY: This subprocess has the production SIGXFSZ handler. Some
+            // Darwin runs return from the rejected write before dispatching the
+            // pending signal, so wait without active polling; the parent owns a
+            // fixed five-second kill deadline if delivery never occurs.
+            let _ = unsafe { libc::pause() };
         }
     }
 
@@ -6094,10 +6119,26 @@ mod tests {
             std::panic::panic_any(thrown);
         })
         .expect_err("runtime panic should be caught");
+        let (wakeup_reader, wakeup_writer) = UnixStream::pair().expect("socket pair");
+        let fatal_state = Arc::new(AtomicU32::new(super::FATAL_SIGNAL_STATE_DISARMED));
+        let fatal_signal_handlers = super::FatalSignalHandlers {
+            signal_ids: Vec::new(),
+            wakeup_reader,
+            _wakeup_writer: wakeup_writer,
+            state: Arc::clone(&fatal_state),
+        };
+        fatal_signal_handlers
+            .arm_control_interval()
+            .expect("caught-panic control interval should arm");
         let resumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::finish_caught_runtime_panic(&mut vmm, payload)
+            super::finish_caught_runtime_panic(&mut vmm, Some(&fatal_signal_handlers), payload)
         }))
         .expect_err("the original payload should resume");
+        assert_eq!(
+            fatal_state.load(Ordering::Acquire),
+            super::FATAL_SIGNAL_STATE_DISARMED,
+            "panic unwind must not leave a return-capable fatal handler armed"
+        );
         bridge.restore();
         let resumed = resumed
             .downcast::<Arc<CaughtRuntimePanicPayload>>()
@@ -6181,6 +6222,47 @@ mod tests {
                 assert!(!String::from_utf8_lossy(bytes).contains("caught-runtime-panic-secret"));
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct PanicPayloadDropProbe(Arc<AtomicBool>);
+
+    impl Drop for PanicPayloadDropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn published_fatal_signal_supersedes_caught_panic_without_dropping_payload() {
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+        let (wakeup_reader, wakeup_writer) = UnixStream::pair().expect("socket pair");
+        let state = Arc::new(AtomicU32::new(super::fatal_signal_published_state(
+            ProcessExitCode::SigHup,
+        )));
+        let handlers = super::FatalSignalHandlers {
+            signal_ids: Vec::new(),
+            wakeup_reader,
+            _wakeup_writer: wakeup_writer,
+            state,
+        };
+        let payload_dropped = Arc::new(AtomicBool::new(false));
+        let payload: Box<dyn Any + Send> =
+            Box::new(PanicPayloadDropProbe(Arc::clone(&payload_dropped)));
+
+        assert_eq!(
+            super::finish_caught_runtime_panic(&mut vmm, Some(&handlers), payload),
+            Err(ProcessError::FatalSignal(ProcessExitCode::SigHup))
+        );
+        assert!(
+            !payload_dropped.load(Ordering::Acquire),
+            "the superseded opaque panic payload must not run arbitrary Drop code"
+        );
     }
 
     #[test]

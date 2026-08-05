@@ -2997,11 +2997,12 @@ fixed record through a precreated stderr worker.
 The ordinary executable exclusively owns the process-global Rust panic hook
 after private binder dispatch and before contained bootstrap. It retains the
 exact prior hook, suppresses it throughout that interval, restores it only
-after owned VMM/contained teardown, and then resumes the original payload. This
-prevents the default hook or a caller-supplied prior hook from rendering secret
-payload data while Bangbang owns the process. Runtime logger/metrics state
-remains per-controller and does not install a hook or expose mutable global
-state.
+after owned VMM/contained teardown, and then resumes the original payload unless
+an already won fatal-signal claim supersedes it with an exact compatible exit.
+This prevents the default hook or a caller-supplied prior hook from rendering
+secret payload data while Bangbang owns the process. Runtime logger/metrics
+state remains per-controller and does not install a hook or expose mutable
+global state.
 
 The first hook invocation performs only a preinitialized attachment
 `try_lock`, fixed atomics, and at most one compare-exchange per destination. It
@@ -3024,7 +3025,10 @@ nothing, logs nothing, never unwinds, and never enters VMM cleanup. A full
 socket is already readable; every other origin, a duplicate, or an unarmed
 delivery immediately `_exit`s. Darwin makes external and synchronous
 SIGILL/SIGBUS/SIGSEGV indistinguishable, so returning from those fault handlers
-merely to publish metrics is forbidden.
+merely to publish metrics is forbidden. A caught main-runtime panic records its
+Store and atomically disarms this interval before entering its panic finalizer;
+if a fatal claim already won, that compatible exit takes precedence and the
+opaque panic payload is neither inspected nor dropped.
 
 This boundary protects confidentiality and bounds work on a catchable main
 panic; it is not a durability mechanism. Admission can race process exit, and

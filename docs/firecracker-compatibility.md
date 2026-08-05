@@ -624,6 +624,9 @@ miss which the minimal finalizer settles outside the hook. A catchable
 main-runtime panic stores `vmm.panic_count = 1` outside the hook, then attempts
 the panic terminal record and final metrics under a second catch, isolates
 contained cleanup, restores the prior hook, and resumes the original payload.
+Before its finalizer it atomically disarms any live fatal-control interval; an
+already published fatal claim instead retains its compatible exit without
+inspecting or dropping the opaque panic payload.
 All fixed panic and terminal variants are valid UTF-8 and at most 512 bytes.
 
 This is best-effort observability, not persistence. A logger or fallback worker

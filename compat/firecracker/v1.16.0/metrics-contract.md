@@ -162,7 +162,9 @@ sink failure into that field.
 
 For #1830, a caught main-runtime panic stores `vmm.panic_count = 1` outside the
 panic hook and before the existing protected terminal-observability attempt.
-The hook remains fixed-output and payload-blind; resuming the original payload,
+It first atomically disarms the fatal control interval; a claim that already won
+keeps its compatible exit and leaves the opaque payload undropped. Otherwise the
+hook remains fixed-output and payload-blind, and resuming the original payload,
 logger failure, metrics failure, and final-line idempotence are unchanged.
 `panic_count`, `signals.sighup`, `signals.sigxcpu`, and `signals.sigxfsz` are
 Firecracker Store fields and therefore remain one on later successful lines.

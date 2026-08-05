@@ -2532,12 +2532,13 @@ Fatal-signal tests keep handler safety and ordinary convergence separate.
 Pure Darwin `siginfo_t` matrices admit only matching SIGHUP/SIGXCPU/SIGXFSZ
 records with code zero and a positive non-self sender. Atomic-state tests cover
 arm, first claim, release publication, duplicate rejection, normal disarm,
-fatal precedence, a deliberately full notifier, and the bounded exact-exit
-fallback for a claim that never publishes. Dedicated subprocesses generate
-real illegal-instruction, truncated-mapping SIGBUS, invalid-address SIGSEGV,
-RLIMIT_CPU, RLIMIT_FSIZE, and self-SIGHUP delivery; each must use immediate
-compatible `_exit` without terminal records. Portable process tests send all
-seven compatible fatal signals from the parent, check every exact status,
+fatal precedence, panic-unwind disarm, published-signal precedence without
+dropping the opaque panic payload, a deliberately full notifier, and the bounded
+exact-exit fallback for a claim that never publishes. Dedicated subprocesses
+generate real illegal-instruction, truncated-mapping SIGBUS, invalid-address
+SIGSEGV, RLIMIT_CPU, RLIMIT_FSIZE, and self-SIGHUP delivery; each must use
+immediate compatible `_exit` without terminal records. Portable process tests
+send all seven compatible fatal signals from the parent, check every exact status,
 require ordinary fixed terminal records only for the three classified
 deliveries, and prove a pre-session metrics sink stays empty. A self-spawned
 caught-panic test proves
