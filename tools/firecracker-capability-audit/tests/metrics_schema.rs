@@ -3,13 +3,16 @@
 use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
-    AuditMode, METRICS_PROCESS_PRODUCER_AUDIT_PATH, METRICS_SCHEMA_AUTHORITY_PATH,
-    MetricsAggregation, MetricsArchitecture, MetricsProcessProducerAudit,
-    MetricsProcessProducerBoundary, MetricsProcessProducerDisposition, MetricsProducerDisposition,
-    MetricsProducerOwner, MetricsSchemaAuthority, MetricsUnit, MetricsValueKind, Reference,
-    SOURCE_MANIFEST_PATH, metrics_process_producer_audit_json, metrics_schema_authority_json,
+    AuditMode, METRICS_DEVICE_PRODUCER_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
+    METRICS_SCHEMA_AUTHORITY_PATH, MetricsAggregation, MetricsArchitecture,
+    MetricsDeviceProducerAudit, MetricsDeviceProducerBoundary, MetricsDeviceProducerDisposition,
+    MetricsDeviceProducerRecord, MetricsProcessProducerAudit, MetricsProcessProducerBoundary,
+    MetricsProcessProducerDisposition, MetricsProducerDisposition, MetricsProducerOwner,
+    MetricsSchemaAuthority, MetricsUnit, MetricsValueKind, PlatformExclusion, Reference,
+    SOURCE_MANIFEST_PATH, metrics_device_producer_audit_json, metrics_process_producer_audit_json,
+    metrics_schema_authority_json, read_metrics_device_producer_audit,
     read_metrics_process_producer_audit, read_metrics_schema_authority, read_source_manifest,
-    validate_metrics_process_producers, validate_metrics_schema,
+    validate_metrics_device_producers, validate_metrics_process_producers, validate_metrics_schema,
 };
 
 fn repository_root() -> PathBuf {
@@ -31,6 +34,12 @@ fn checked_process_audit() -> MetricsProcessProducerAudit {
         .expect("checked metrics process producer audit must parse")
 }
 
+fn checked_device_audit() -> MetricsDeviceProducerAudit {
+    let root = repository_root();
+    read_metrics_device_producer_audit(&root.join(METRICS_DEVICE_PRODUCER_AUDIT_PATH))
+        .expect("checked metrics device producer audit must parse")
+}
+
 fn validation_error(authority: &MetricsSchemaAuthority) -> String {
     let root = repository_root();
     let manifest = read_source_manifest(&root.join(SOURCE_MANIFEST_PATH))
@@ -45,6 +54,34 @@ fn process_validation_error(audit: &MetricsProcessProducerAudit) -> String {
     validate_metrics_process_producers(audit, &checked_authority(), &root, AuditMode::Delivery)
         .expect_err("mutated metrics process producer audit must fail")
         .to_string()
+}
+
+fn device_validation_error(audit: &MetricsDeviceProducerAudit) -> String {
+    let root = repository_root();
+    validate_metrics_device_producers(audit, &checked_authority(), &root, AuditMode::Delivery)
+        .expect_err("mutated metrics device producer audit must fail")
+        .to_string()
+}
+
+fn anchored_local_reference() -> Reference {
+    Reference::Local {
+        path: "tools/firecracker-capability-audit/src/metrics_process_validate.rs".to_string(),
+        anchor: Some("pub fn validate_metrics_process_producers".to_string()),
+    }
+}
+
+fn make_device_record_terminal(
+    audit: &mut MetricsDeviceProducerAudit,
+) -> &mut MetricsDeviceProducerRecord {
+    let record = audit
+        .records
+        .iter_mut()
+        .find(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
+        .expect("planned device record must exist");
+    record.disposition = MetricsDeviceProducerDisposition::Implemented;
+    record.implementation.push(anchored_local_reference());
+    record.validation.push(anchored_local_reference());
+    record
 }
 
 #[test]
@@ -156,6 +193,353 @@ fn checked_process_producer_audit_is_canonical_and_exact() {
 
     validate_metrics_process_producers(&audit, &authority, &root, AuditMode::Final)
         .expect("all process producer records should now be terminal");
+}
+
+#[test]
+fn checked_device_producer_audit_is_canonical_and_exact() {
+    let root = repository_root();
+    let path = root.join(METRICS_DEVICE_PRODUCER_AUDIT_PATH);
+    let authority = checked_authority();
+    let audit = checked_device_audit();
+    validate_metrics_device_producers(&audit, &authority, &root, AuditMode::Delivery)
+        .expect("checked device producer audit must validate locally");
+    assert_eq!(
+        std::fs::read(path).expect("checked device producer audit must be readable"),
+        metrics_device_producer_audit_json(&audit)
+            .expect("device producer audit must serialize canonically")
+    );
+    assert_eq!(audit.records.len(), 231);
+    for (issue, count) in [
+        ("#1838", 23),
+        ("#1839", 38),
+        ("#1840", 20),
+        ("#1841", 48),
+        ("#1842", 5),
+        ("#1843", 57),
+        ("#1844", 14),
+        ("#1845", 11),
+        ("#1846", 15),
+    ] {
+        assert_eq!(
+            audit
+                .records
+                .iter()
+                .filter(|record| record.delivery_issue == issue)
+                .count(),
+            count,
+            "{issue}"
+        );
+    }
+    assert_eq!(
+        audit
+            .records
+            .iter()
+            .filter(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
+            .count(),
+        216
+    );
+    assert_eq!(
+        audit
+            .records
+            .iter()
+            .filter(|record| {
+                record.disposition == MetricsDeviceProducerDisposition::ProvisionalPlatformZero
+            })
+            .count(),
+        15
+    );
+    assert!(audit.records.iter().all(|record| {
+        record.implementation.is_empty()
+            && record.validation.is_empty()
+            && record.platform_exclusion.is_none()
+    }));
+
+    let error = validate_metrics_device_producers(&audit, &authority, &root, AuditMode::Final)
+        .expect_err("all device producer records must remain nonterminal")
+        .to_string();
+    assert_eq!(
+        error
+            .lines()
+            .filter(|line| line.contains("final metrics device producer validation rejects"))
+            .count(),
+        231
+    );
+}
+
+#[test]
+fn device_producer_audit_rejects_membership_and_order_drift() {
+    let mut missing = checked_device_audit();
+    let removed = missing.records.remove(0);
+    let error = device_validation_error(&missing);
+    assert!(error.contains("must contain 231 records"));
+    assert!(error.contains(&format!(
+        "missing metrics device producer record: {}",
+        removed.field_id
+    )));
+
+    let mut duplicate = checked_device_audit();
+    duplicate.records.push(duplicate.records[0].clone());
+    let error = device_validation_error(&duplicate);
+    assert!(error.contains("sorted and unique"));
+    assert!(error.contains("duplicate metrics device producer record"));
+
+    let mut stale = checked_device_audit();
+    stale.records[0].field_id = "static:not.device_owned".to_string();
+    let error = device_validation_error(&stale);
+    assert!(error.contains("stale or unowned"));
+    assert!(error.contains("missing metrics device producer record"));
+
+    let mut order = checked_device_audit();
+    order.records.swap(0, 1);
+    assert!(device_validation_error(&order).contains("sorted and unique"));
+
+    let mut static_for_dynamic = checked_device_audit();
+    let dynamic = static_for_dynamic
+        .records
+        .iter_mut()
+        .find(|record| record.field_id == "dynamic:block_{drive_id}.activate_fails")
+        .expect("configured block record must exist");
+    dynamic.field_id = "static:block.activate_fails".to_string();
+    let error = device_validation_error(&static_for_dynamic);
+    assert!(error.contains("duplicate metrics device producer record"));
+    assert!(error.contains(
+        "missing metrics device producer record: dynamic:block_{drive_id}.activate_fails"
+    ));
+}
+
+#[test]
+fn device_producer_audit_rejects_child_boundary_and_rationale_drift() {
+    let mut boundary = checked_device_audit();
+    boundary.records[0].boundary = MetricsDeviceProducerBoundary::VcpuFailure;
+    assert!(device_validation_error(&boundary).contains("wrong boundary"));
+
+    let mut rationale = checked_device_audit();
+    rationale.records[0].rationale.clear();
+    assert!(device_validation_error(&rationale).contains("stale rationale"));
+
+    for (field_id, wrong_issue) in [
+        ("static:entropy.entropy_bytes", "#1839"),
+        ("static:memory_hotplug.plug_count", "#1840"),
+        ("static:vsock.conns_added", "#1841"),
+        ("dynamic:block_{drive_id}.read_count", "#1842"),
+        ("dynamic:vhost_user_block_{drive_id}.init_time_us", "#1843"),
+        ("static:mmds.rx_count", "#1844"),
+        ("dynamic:net_{iface_id}.tx_count", "#1844"),
+        ("static:net.tap_read_fails", "#1843"),
+        ("static:vcpu.exit_mmio_read", "#1846"),
+        ("static:vcpu.exit_io_in", "#1845"),
+    ] {
+        let mut audit = checked_device_audit();
+        audit
+            .records
+            .iter_mut()
+            .find(|record| record.field_id == field_id)
+            .expect("representative device record must exist")
+            .delivery_issue = wrong_issue.to_string();
+        assert!(
+            device_validation_error(&audit).contains("wrong delivery issue"),
+            "{field_id}"
+        );
+    }
+}
+
+#[test]
+fn device_producer_audit_rejects_disposition_and_nonterminal_evidence_drift() {
+    let mut planned_as_provisional = checked_device_audit();
+    planned_as_provisional
+        .records
+        .iter_mut()
+        .find(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
+        .expect("planned device record must exist")
+        .disposition = MetricsDeviceProducerDisposition::ProvisionalPlatformZero;
+    assert!(device_validation_error(&planned_as_provisional).contains("wrong current disposition"));
+
+    let mut provisional_as_planned = checked_device_audit();
+    provisional_as_planned
+        .records
+        .iter_mut()
+        .find(|record| {
+            record.disposition == MetricsDeviceProducerDisposition::ProvisionalPlatformZero
+        })
+        .expect("provisional device record must exist")
+        .disposition = MetricsDeviceProducerDisposition::Planned;
+    assert!(device_validation_error(&provisional_as_planned).contains("wrong current disposition"));
+
+    let mut premature = checked_device_audit();
+    let record = premature
+        .records
+        .iter_mut()
+        .find(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
+        .expect("planned device record must exist");
+    record.disposition = MetricsDeviceProducerDisposition::Implemented;
+    record.implementation.push(anchored_local_reference());
+    record.validation.push(anchored_local_reference());
+    assert!(device_validation_error(&premature).contains("wrong current disposition"));
+
+    let mut evidence = checked_device_audit();
+    evidence.records[0]
+        .implementation
+        .push(anchored_local_reference());
+    assert!(device_validation_error(&evidence).contains("must not claim terminal evidence"));
+}
+
+#[test]
+fn device_producer_audit_rejects_bad_terminal_evidence() {
+    let mut missing = checked_device_audit();
+    make_device_record_terminal(&mut missing)
+        .implementation
+        .clear();
+    assert!(
+        device_validation_error(&missing).contains("needs implementation and validation evidence")
+    );
+
+    let mut duplicate = checked_device_audit();
+    let record = make_device_record_terminal(&mut duplicate);
+    record.implementation.push(anchored_local_reference());
+    assert!(
+        device_validation_error(&duplicate)
+            .contains("implementation references must be sorted and unique")
+    );
+
+    let mut unsorted = checked_device_audit();
+    make_device_record_terminal(&mut unsorted).implementation = vec![
+        Reference::Github {
+            url: "https://github.com/seven332/bangbang/issues/1837".to_string(),
+        },
+        anchored_local_reference(),
+    ];
+    assert!(
+        device_validation_error(&unsorted)
+            .contains("implementation references must be sorted and unique")
+    );
+
+    let mut unsafe_path = checked_device_audit();
+    make_device_record_terminal(&mut unsafe_path).implementation[0] = Reference::Local {
+        path: "../escape.rs".to_string(),
+        anchor: Some("anything".to_string()),
+    };
+    assert!(device_validation_error(&unsafe_path).contains("path escapes repository"));
+
+    let mut missing_anchor = checked_device_audit();
+    make_device_record_terminal(&mut missing_anchor).implementation[0] = Reference::Local {
+        path: "tools/firecracker-capability-audit/src/metrics_process_validate.rs".to_string(),
+        anchor: None,
+    };
+    assert!(device_validation_error(&missing_anchor).contains("needs a stable anchor"));
+
+    let mut unresolved_anchor = checked_device_audit();
+    make_device_record_terminal(&mut unresolved_anchor).implementation[0] = Reference::Local {
+        path: "tools/firecracker-capability-audit/src/metrics_process_validate.rs".to_string(),
+        anchor: Some("this symbol does not exist".to_string()),
+    };
+    assert!(device_validation_error(&unresolved_anchor).contains("anchor does not resolve"));
+
+    let mut invalid_urls = checked_device_audit();
+    make_device_record_terminal(&mut invalid_urls)
+        .implementation
+        .push(Reference::Github {
+            url: "http://example.invalid/not-github".to_string(),
+        });
+    assert!(device_validation_error(&invalid_urls).contains("GitHub reference must name an HTTPS"));
+
+    let mut invalid_authority = checked_device_audit();
+    make_device_record_terminal(&mut invalid_authority)
+        .implementation
+        .push(Reference::Authoritative {
+            url: "http://example.invalid/platform".to_string(),
+        });
+    assert!(
+        device_validation_error(&invalid_authority)
+            .contains("authoritative reference must name an HTTPS")
+    );
+}
+
+#[test]
+fn device_producer_audit_rejects_invalid_platform_exclusions() {
+    let empty_exclusion = || PlatformExclusion {
+        upstream_contract: Vec::new(),
+        platform_evidence: Vec::new(),
+        alternatives: Vec::new(),
+        stable_behavior: Vec::new(),
+        focused_tests: Vec::new(),
+        compatibility_docs: Vec::new(),
+        security_docs: Vec::new(),
+        challenge: Reference::Github {
+            url: "https://github.com/seven332/bangbang/issues/1837".to_string(),
+        },
+    };
+
+    let mut forbidden = checked_device_audit();
+    let record = forbidden
+        .records
+        .iter_mut()
+        .find(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
+        .expect("planned device record must exist");
+    record.platform_exclusion = Some(empty_exclusion());
+    assert!(device_validation_error(&forbidden).contains("must not claim terminal evidence"));
+
+    let mut non_platform_terminal = checked_device_audit();
+    make_device_record_terminal(&mut non_platform_terminal).platform_exclusion =
+        Some(empty_exclusion());
+    assert!(
+        device_validation_error(&non_platform_terminal)
+            .contains("non-platform metrics device producer forbids exclusion evidence")
+    );
+
+    let mut missing = checked_device_audit();
+    let record = missing
+        .records
+        .iter_mut()
+        .find(|record| {
+            record.disposition == MetricsDeviceProducerDisposition::ProvisionalPlatformZero
+        })
+        .expect("provisional platform device record must exist");
+    record.disposition = MetricsDeviceProducerDisposition::PlatformZero;
+    record.implementation.push(anchored_local_reference());
+    record.validation.push(anchored_local_reference());
+    assert!(device_validation_error(&missing).contains("needs structured exclusion evidence"));
+
+    let mut incomplete = checked_device_audit();
+    let record = incomplete
+        .records
+        .iter_mut()
+        .find(|record| {
+            record.disposition == MetricsDeviceProducerDisposition::ProvisionalPlatformZero
+        })
+        .expect("provisional platform device record must exist");
+    record.disposition = MetricsDeviceProducerDisposition::PlatformZero;
+    record.implementation.push(anchored_local_reference());
+    record.validation.push(anchored_local_reference());
+    record.platform_exclusion = Some(PlatformExclusion {
+        upstream_contract: Vec::new(),
+        platform_evidence: Vec::new(),
+        alternatives: Vec::new(),
+        stable_behavior: Vec::new(),
+        focused_tests: Vec::new(),
+        compatibility_docs: Vec::new(),
+        security_docs: Vec::new(),
+        challenge: Reference::Local {
+            path: "README.md".to_string(),
+            anchor: Some("Bangbang".to_string()),
+        },
+    });
+    let error = device_validation_error(&incomplete);
+    assert!(error.contains("platform exclusion upstream_contract must not be empty"));
+    assert!(error.contains("alternatives must contain reviewed reasons"));
+    assert!(error.contains("challenge must be a GitHub reference"));
+}
+
+#[test]
+fn device_producer_audit_rejects_schema_version_and_baseline_drift() {
+    let mut schema = checked_device_audit();
+    schema.schema_version += 1;
+    assert!(device_validation_error(&schema).contains("schema_version must be 1"));
+
+    let mut baseline = checked_device_audit();
+    baseline.baseline.commit = "0".repeat(40);
+    let error = device_validation_error(&baseline);
+    assert!(error.contains("baselines differ"));
+    assert!(error.contains("not the pinned release"));
 }
 
 #[test]

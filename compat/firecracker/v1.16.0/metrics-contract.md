@@ -2,15 +2,15 @@
 
 This contract defines the checked public metrics-line authority used by
 Bangbang for the pinned Firecracker v1.16.0 arm64 target. It separates schema
-presence, shared producer policy, and exact producer certification. The
-machine-readable artifacts are [`metrics-schema.json`](metrics-schema.json)
-and
-[`metrics-process-producer-audit.json`](metrics-process-producer-audit.json);
+presence, shared producer policy, and exact producer certification. Its
+machine-readable artifacts are [`metrics-schema.json`](metrics-schema.json),
+[`metrics-process-producer-audit.json`](metrics-process-producer-audit.json),
+and [`metrics-device-producer-audit.json`](metrics-device-producer-audit.json);
 this document explains how to interpret and update them.
 
 ## Authority Boundary
 
-The checked contract has three layers:
+The checked contract has four layers:
 
 - `metrics-schema.json.source` is machine-derived from the pinned Rust serializers and
   `tests/host_tools/fcmetrics.py`. It owns inputs and Git blobs, exact roots,
@@ -26,6 +26,10 @@ The checked contract has three layers:
   field's closed production boundary, delivery child, current disposition,
   rationale, and evidence without copying source shape, unit, reset, or
   aggregation policy.
+- `metrics-device-producer-audit.json` is the human-owned delivery audit of the
+  exact fields selected by device producer profiles. It records each field's
+  closed operation boundary, concrete #1789 child, current disposition,
+  rationale, and eventual anchored evidence without copying schema policy.
 
 The policy mapping is an exact bijection over the source fields. Policy cannot
 create or remove schema identities, and source regeneration cannot manufacture
@@ -37,11 +41,11 @@ The runtime compiles this authority into the canonical serializer and an exact
 descriptor-equality test. #1823 certifies the bounded #1787 API/schema slice,
 including the schema-runtime timestamp producer. #1788 certifies the exact
 API, process, logger, signal, boot, and lifecycle producers through two
-implemented aggregate profiles and the field-level audit. #1789 still owns
-device, MMDS, vCPU, time/device, configured-key, and retained-neutral
-producers. `corpus:metrics` and the cross-producer aggregate semantic remain
-#1790-owned. A required zero therefore proves wire-shape completeness only,
-never producer completion.
+implemented aggregate profiles and the field-level process audit. The checked
+device audit now assigns every #1789 field to one concrete delivery child, but
+all records remain nonterminal. `corpus:metrics` and the cross-producer
+aggregate semantic remain #1790-owned. A required zero therefore proves
+wire-shape completeness only, never producer completion.
 
 ## Terminal API and Schema Certification
 
@@ -201,6 +205,34 @@ Linux `SYS_SECCOMP` SIGSYS faults, but macOS exposes no Linux seccomp filter
 installation or fault producer and Bangbang rejects both runtime seccomp CLI
 forms. The generic SIGSYS handler preserves exit-code compatibility only and
 must never be aliased into `seccomp.num_faults`.
+
+## Nonterminal Device Producer Audit
+
+The device audit is an exact, lexicographically sorted bijection over all 231
+schema fields owned by device producer profiles. Missing, duplicate, stale,
+reordered, or differently owned identities fail closed. Its delivery partition
+is fixed at 23 fields for #1838, 38 for #1839, 20 for #1840, 48 for #1841,
+five for #1842, 57 for #1843, 14 for #1844, 11 for #1845, and 15 for #1846.
+Static and configured identities remain distinct; exact suffix routing splits
+mapped network fields from tap-oriented gaps and applicable vCPU exits from
+retained PIO/KVM-clock fields.
+
+The initial audit contains 216 `planned` records and 15
+`provisional-platform-zero` records. Both dispositions are nonterminal, carry
+empty implementation and validation arrays, and have no platform exclusion.
+The provisional records are the six retained i8042 fields plus nine vCPU
+PIO/KVM-clock fields; this label does not claim that the terminal platform
+evidence required by #1846 already exists.
+
+Later producer children may replace only their exact records with terminal
+`implemented`, `source-neutral`, or `platform-zero` dispositions. Terminal
+records require sorted implementation and validation reference lists; each
+list must include local evidence whose anchors resolve in tracked regular
+files. Terminal platform-zero additionally requires the complete structured
+platform-exclusion evidence. Ordinary and all existing scoped validation modes
+consume this audit in delivery mode; repository-wide final mode rejects every
+nonterminal device record. A scoped device-final command and certification
+composer remain #1847 work.
 
 ## Exact Arm64 Shape
 
@@ -395,16 +427,17 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 `validate --metrics-schema-final` runs repository delivery validation, the
 metrics authority delivery gate, the exact twelve-row #1787 certification, and
 the logger producer delivery gate needed by metrics collection. It validates
-the exact 69-field process audit in delivery mode. It permits only the
-completed process profiles, explicit #1789 device handoffs, and retained #1790
-aggregate rows.
+the exact 69-field process audit and 231-field device audit in delivery mode.
+It permits only the completed process profiles, explicit nonterminal #1789
+device handoffs, and retained #1790 aggregate rows.
 
 `validate --metrics-process-final` composes that schema certification with
 final-mode process-audit validation and logger delivery validation. It requires
 all 69 records to be terminal with their exact child, boundary, rationale,
 disposition, and tracked evidence: 64 implemented, one source-neutral, and four
 platform-zero. It does not require the ten planned or four platform-zero
-device profiles to complete and does not promote either #1790 aggregate.
+device profiles or their 231 field records to complete and does not promote
+either #1790 aggregate.
 Repository-global `validate --final` remains the stronger all-capability gate.
 
 With an explicit clean sibling at the pinned commit, compare every source
@@ -427,8 +460,9 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- \
 
 The destination must not exist and cannot directly, lexically, or through a
 symlink alias any checked inventory file. Review exact source changes, then
-manually reconcile them with human policy and, when process-profile membership
-changes, the process audit. Regeneration never writes either human-owned layer.
+manually reconcile them with human policy and, when producer-profile membership
+changes, the process and device audits. Regeneration never writes any
+human-owned producer audit.
 Never copy old policy onto a changed identity without reviewing its unit,
 reset, aggregation, architecture, cardinality, producer owner, disposition,
 rationale, boundary, delivery child, and evidence.
