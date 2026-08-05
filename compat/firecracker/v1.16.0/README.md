@@ -31,7 +31,7 @@ For commands and test-layer selection, see the
   and Python fixture; its policy profiles and exact field mappings are
   human-owned and never regenerated.
 - [`metrics-process-producer-audit.json`](metrics-process-producer-audit.json)
-  is the human-owned incremental audit for the exact 69 fields assigned to the
+  is the human-owned terminal audit for the exact 69 fields assigned to the
   process producer profile. It records one closed producer boundary, delivery
   child, disposition, rationale, and evidence set per field without duplicating
   the schema or shared field policy.
