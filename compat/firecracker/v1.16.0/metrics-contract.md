@@ -255,9 +255,11 @@ packet-available callback for the exact active vmnet generation increments one
 lock-free raw event source before readiness coalescing. Full or disconnected
 wake channels and capture quiescence therefore do not erase callback
 cardinality, while a retired generation cannot contribute to a same-ID
-replacement. The source is bound to the already-published metrics generation
-before callback delivery; failed binding rolls runtime insertion back instead
-of publishing an endpoint whose events would be unobservable.
+replacement. The cumulative source is bound to the already-published metrics
+generation during startup or runtime publication; callbacks admitted before
+that bind remain visible in the source once binding completes. A failed runtime
+bind rolls the published endpoint back instead of committing an interface whose
+events would be unobservable.
 
 An actual supported-host `vmnet_read` attempt increments `tap_read_fails` only
 when the operation or its returned batch is invalid. An actual non-MMDS
