@@ -695,9 +695,10 @@ fields, newer balloon API/device fields, extra UART fields, and the ordinary
 block configuration-change value remain internal or are discarded at the
 public boundary. Adding an extension requires a separately versioned schema.
 
-The checked device-producer audit now terminally certifies all 129 #1838–#1841
-fields: 128 entropy, pmem, RTC, UART, balloon, memory-hotplug, vsock, and
-ordinary-block fields are implemented, while `uart.flush_count` is
+The checked device-producer audit now terminally certifies all 134 #1838–#1842
+fields: 133 entropy, pmem, RTC, UART, balloon, memory-hotplug, vsock,
+ordinary-block, and vhost-user-block fields are implemented, while
+`uart.flush_count` is
 source-neutral zero because pinned Firecracker has no producer for it. Each
 device owner publishes an immutable compound counter snapshot. Entropy counts
 popped requests before parse or throttling; pmem binds configuration and
@@ -718,7 +719,20 @@ where they become final. One registry capture derives static `block` from the
 same configured values used for `block_{drive_id}`; same-ID replacement starts
 a fresh interval, restore does not inherit counters, static latency extrema
 remain zero, and vhost-user state cannot contaminate the ordinary family.
-Later #1842–#1846 records remain nonterminal and repository-final certification
+
+Each vhost-user block drive has a separate coherent five-field owner shared by
+configuration, activation, and its MMIO or PCI device. Initialization covers
+connection, protocol discovery, and local frontend construction; activation
+covers the backend protocol commit after local queue validation. Only
+successful operations replace the three latency stores, protocol-stage
+activation failures and invalid configuration offsets increment the two
+interval counters, and live config refresh commits its store only after the
+replacement and configuration interrupt succeed. Strict output contains only
+configured nonempty vhost owners, replays the whole observation after failed
+publication, and starts fresh after same-ID reuse. Snapshot rejection prevents
+vhost-user owners or stores from migrating.
+
+Later #1843–#1846 records remain nonterminal and repository-final certification
 remains gated on their delivery.
 
 One flush first freezes missed-log, rate-limited-log, and SIGPIPE totals through

@@ -1374,47 +1374,257 @@
     {
       "field_id": "dynamic:vhost_user_block_{drive_id}.activate_fails",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1842",
-      "rationale": "Pinned Firecracker field `vhost_user_block_{drive_id}.activate_fails` is assigned to #1842 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vhost_user_block_{drive_id}.activate_fails` is completed by #1842 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_activation_failure();"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct VhostUserBlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "values: VhostUserBlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vhost_user_block_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_vhost_user_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn vhost_user_block_activation_stops_after_first_backend_rejection()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn vhost_metrics_are_typed_scoped_and_fresh_across_same_id_reuse()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1842"
+        }
+      ]
     },
     {
       "field_id": "dynamic:vhost_user_block_{drive_id}.activate_time_us",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1842",
-      "rationale": "Pinned Firecracker field `vhost_user_block_{drive_id}.activate_time_us` is assigned to #1842 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vhost_user_block_{drive_id}.activate_time_us` is completed by #1842 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_activation_time_us("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct VhostUserBlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "values: VhostUserBlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vhost_user_block_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_vhost_user_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn vhost_user_block_discovers_activates_notifies_and_terminalizes_over_real_descriptors()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn vhost_metrics_are_typed_scoped_and_fresh_across_same_id_reuse()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1842"
+        }
+      ]
     },
     {
       "field_id": "dynamic:vhost_user_block_{drive_id}.cfg_fails",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1842",
-      "rationale": "Pinned Firecracker field `vhost_user_block_{drive_id}.cfg_fails` is assigned to #1842 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vhost_user_block_{drive_id}.cfg_fails` is completed by #1842 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_config_failure();"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct VhostUserBlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "values: VhostUserBlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vhost_user_block_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_vhost_user_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn vhost_user_config_access_matches_firecracker_tail_and_failure_semantics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn vhost_metrics_are_typed_scoped_and_fresh_across_same_id_reuse()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1842"
+        }
+      ]
     },
     {
       "field_id": "dynamic:vhost_user_block_{drive_id}.config_change_time_us",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1842",
-      "rationale": "Pinned Firecracker field `vhost_user_block_{drive_id}.config_change_time_us` is assigned to #1842 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vhost_user_block_{drive_id}.config_change_time_us` is completed by #1842 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "metrics.record_vhost_user_config_change_time_for_drive(drive_id, duration_us);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct VhostUserBlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "values: VhostUserBlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn boot_run_loop_supervisor_records_successful_vhost_config_change_latency()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vhost_user_block_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_vhost_user_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn vhost_metrics_are_typed_scoped_and_fresh_across_same_id_reuse()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1842"
+        }
+      ]
     },
     {
       "field_id": "dynamic:vhost_user_block_{drive_id}.init_time_us",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1842",
-      "rationale": "Pinned Firecracker field `vhost_user_block_{drive_id}.init_time_us` is assigned to #1842 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vhost_user_block_{drive_id}.init_time_us` is completed by #1842 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_init_time_us(init_time_us);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct VhostUserBlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "values: VhostUserBlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vhost_user_block_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_vhost_user_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn vhost_user_block_discovers_activates_notifies_and_terminalizes_over_real_descriptors()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn vhost_metrics_are_typed_scoped_and_fresh_across_same_id_reuse()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1842"
+        }
+      ]
     },
     {
       "field_id": "static:balloon.activate_fails",

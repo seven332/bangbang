@@ -750,7 +750,14 @@ pub(super) fn build_metrics_line(
     for drive_id in configured.vhost_user_block_ids() {
         let current_metrics = current
             .diagnostics
-            .block_device_metrics_by_drive
+            .vhost_user_block_device_metrics_by_drive
+            .as_ref()
+            .and_then(|metrics| metrics.metrics.get(drive_id))
+            .map(|entry| entry.metrics)
+            .unwrap_or_default();
+        let interval_metrics = interval
+            .diagnostics
+            .vhost_user_block_device_metrics_by_drive
             .as_ref()
             .and_then(|metrics| metrics.metrics.get(drive_id))
             .map(|entry| entry.metrics)
@@ -758,8 +765,11 @@ pub(super) fn build_metrics_line(
         vhost_user_block_devices.push(DynamicMetrics {
             root: try_dynamic_root("vhost_user_block_", drive_id)?,
             values: VhostUserBlockMetrics {
+                activate_fails: interval_metrics.activate_fails,
+                cfg_fails: interval_metrics.cfg_fails,
+                init_time_us: current_metrics.init_time_us.unwrap_or_default(),
+                activate_time_us: current_metrics.activate_time_us.unwrap_or_default(),
                 config_change_time_us: current_metrics.config_change_time_us.unwrap_or_default(),
-                ..VhostUserBlockMetrics::default()
             },
         });
     }

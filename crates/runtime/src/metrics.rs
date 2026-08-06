@@ -1607,6 +1607,284 @@ impl BlockDeviceMetrics {
     }
 }
 
+/// Firecracker-compatible metrics owned exclusively by one vhost-user block device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VhostUserBlockDeviceMetrics {
+    activate_fails: u64,
+    cfg_fails: u64,
+    init_time_us: Option<u64>,
+    activate_time_us: Option<u64>,
+    config_change_time_us: Option<u64>,
+}
+
+impl VhostUserBlockDeviceMetrics {
+    fn delta_since(self, previous: Self) -> Self {
+        Self {
+            activate_fails: incremental_delta(self.activate_fails, previous.activate_fails),
+            cfg_fails: incremental_delta(self.cfg_fails, previous.cfg_fails),
+            init_time_us: (self.init_time_us != previous.init_time_us)
+                .then_some(self.init_time_us)
+                .flatten(),
+            activate_time_us: (self.activate_time_us != previous.activate_time_us)
+                .then_some(self.activate_time_us)
+                .flatten(),
+            config_change_time_us: (self.config_change_time_us != previous.config_change_time_us)
+                .then_some(self.config_change_time_us)
+                .flatten(),
+        }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.activate_fails == 0
+            && self.cfg_fails == 0
+            && self.init_time_us.is_none()
+            && self.activate_time_us.is_none()
+            && self.config_change_time_us.is_none()
+    }
+
+    pub const fn activate_fails(self) -> u64 {
+        self.activate_fails
+    }
+
+    pub const fn cfg_fails(self) -> u64 {
+        self.cfg_fails
+    }
+
+    pub const fn init_time_us(self) -> Option<u64> {
+        self.init_time_us
+    }
+
+    pub const fn activate_time_us(self) -> Option<u64> {
+        self.activate_time_us
+    }
+
+    pub const fn config_change_time_us(self) -> Option<u64> {
+        self.config_change_time_us
+    }
+
+    pub const fn with_activate_fails(mut self, activate_fails: u64) -> Self {
+        self.activate_fails = activate_fails;
+        self
+    }
+
+    pub const fn with_cfg_fails(mut self, cfg_fails: u64) -> Self {
+        self.cfg_fails = cfg_fails;
+        self
+    }
+
+    pub const fn with_init_time_us(mut self, init_time_us: u64) -> Self {
+        self.init_time_us = Some(init_time_us);
+        self
+    }
+
+    pub const fn with_activate_time_us(mut self, activate_time_us: u64) -> Self {
+        self.activate_time_us = Some(activate_time_us);
+        self
+    }
+
+    pub const fn with_config_change_time_us(mut self, config_change_time_us: u64) -> Self {
+        self.config_change_time_us = Some(config_change_time_us);
+        self
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            activate_fails: self.activate_fails.saturating_add(other.activate_fails),
+            cfg_fails: self.cfg_fails.saturating_add(other.cfg_fails),
+            init_time_us: match other.init_time_us {
+                Some(value) => Some(value),
+                None => self.init_time_us,
+            },
+            activate_time_us: match other.activate_time_us {
+                Some(value) => Some(value),
+                None => self.activate_time_us,
+            },
+            config_change_time_us: match other.config_change_time_us {
+                Some(value) => Some(value),
+                None => self.config_change_time_us,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VhostUserBlockDeviceMetricsByDrive {
+    metrics: BTreeMap<String, VhostUserBlockDeviceMetricsByDriveEntry>,
+}
+
+impl PartialEq for VhostUserBlockDeviceMetricsByDrive {
+    fn eq(&self, other: &Self) -> bool {
+        self.metrics.len() == other.metrics.len()
+            && self.metrics.iter().all(|(drive_id, entry)| {
+                other
+                    .metrics
+                    .get(drive_id)
+                    .is_some_and(|other| entry.metrics == other.metrics)
+            })
+    }
+}
+
+impl Eq for VhostUserBlockDeviceMetricsByDrive {}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct VhostUserBlockDeviceMetricsByDriveEntry {
+    generation: u64,
+    metrics: VhostUserBlockDeviceMetrics,
+}
+
+impl fmt::Debug for VhostUserBlockDeviceMetricsByDriveEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VhostUserBlockDeviceMetricsByDriveEntry")
+            .field("metrics", &self.metrics)
+            .finish()
+    }
+}
+
+impl VhostUserBlockDeviceMetricsByDrive {
+    pub fn new() -> Self {
+        Self {
+            metrics: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_drive_metrics(
+        mut self,
+        drive_id: impl Into<String>,
+        metrics: VhostUserBlockDeviceMetrics,
+    ) -> Self {
+        self.insert_drive_metrics(drive_id, metrics);
+        self
+    }
+
+    pub fn insert_drive_metrics(
+        &mut self,
+        drive_id: impl Into<String>,
+        metrics: VhostUserBlockDeviceMetrics,
+    ) {
+        self.insert_drive_metrics_at_generation(drive_id, 0, metrics);
+    }
+
+    fn insert_drive_metrics_at_generation(
+        &mut self,
+        drive_id: impl Into<String>,
+        generation: u64,
+        metrics: VhostUserBlockDeviceMetrics,
+    ) {
+        self.metrics
+            .entry(drive_id.into())
+            .and_modify(|existing| {
+                if existing.generation == generation {
+                    existing.metrics = existing.metrics.merged_with(metrics);
+                } else {
+                    *existing = VhostUserBlockDeviceMetricsByDriveEntry {
+                        generation,
+                        metrics,
+                    };
+                }
+            })
+            .or_insert(VhostUserBlockDeviceMetricsByDriveEntry {
+                generation,
+                metrics,
+            });
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.metrics.values().all(|entry| entry.metrics.is_empty())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, VhostUserBlockDeviceMetrics)> {
+        self.metrics
+            .iter()
+            .map(|(drive_id, entry)| (drive_id.as_str(), entry.metrics))
+    }
+
+    fn delta_since(&self, previous: Option<&Self>) -> Self {
+        let metrics = self
+            .metrics
+            .iter()
+            .map(|(drive_id, current)| {
+                let previous = previous
+                    .and_then(|metrics| metrics.metrics.get(drive_id))
+                    .filter(|previous| previous.generation == current.generation)
+                    .map(|previous| previous.metrics)
+                    .unwrap_or_default();
+                (
+                    drive_id.clone(),
+                    VhostUserBlockDeviceMetricsByDriveEntry {
+                        generation: current.generation,
+                        metrics: current.metrics.delta_since(previous),
+                    },
+                )
+            })
+            .collect();
+        Self { metrics }
+    }
+
+    fn merged_with(mut self, other: Self) -> Self {
+        for (drive_id, entry) in other.metrics {
+            self.insert_drive_metrics_at_generation(drive_id, entry.generation, entry.metrics);
+        }
+        self
+    }
+}
+
+/// Thread-safe producer surface for the exact five-field vhost-user block family.
+#[derive(Debug, Clone, Default)]
+pub struct SharedVhostUserBlockDeviceMetrics {
+    inner: Arc<Mutex<VhostUserBlockDeviceMetrics>>,
+}
+
+impl SharedVhostUserBlockDeviceMetrics {
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub fn record_activation_failure(&self) {
+        self.record_observation(VhostUserBlockDeviceMetrics::default().with_activate_fails(1));
+    }
+
+    pub fn record_config_failure(&self) {
+        self.record_observation(VhostUserBlockDeviceMetrics::default().with_cfg_fails(1));
+    }
+
+    pub fn record_init_time_us(&self, duration_us: u64) {
+        self.record_observation(
+            VhostUserBlockDeviceMetrics::default().with_init_time_us(duration_us),
+        );
+    }
+
+    pub fn record_activation_time_us(&self, duration_us: u64) {
+        self.record_observation(
+            VhostUserBlockDeviceMetrics::default().with_activate_time_us(duration_us),
+        );
+    }
+
+    pub fn record_config_change_time_us(&self, duration_us: u64) {
+        self.record_observation(
+            VhostUserBlockDeviceMetrics::default().with_config_change_time_us(duration_us),
+        );
+    }
+
+    pub fn snapshot(&self) -> VhostUserBlockDeviceMetrics {
+        match self.inner.lock() {
+            Ok(metrics) => *metrics,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn record_observation(&self, observation: VhostUserBlockDeviceMetrics) {
+        if observation.is_empty() {
+            return;
+        }
+        let mut metrics = match self.inner.lock() {
+            Ok(metrics) => metrics,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *metrics = metrics.merged_with(observation);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BlockDeviceMetricsByDrive {
     metrics: BTreeMap<String, BlockDeviceMetricsByDriveEntry>,
@@ -1841,6 +2119,7 @@ pub struct SharedBlockDeviceMetricsRegistry {
 pub struct BlockDeviceMetricsCapture {
     aggregate: BlockDeviceMetrics,
     per_drive: BlockDeviceMetricsByDrive,
+    vhost_user_per_drive: VhostUserBlockDeviceMetricsByDrive,
 }
 
 impl BlockDeviceMetricsCapture {
@@ -1852,8 +2131,18 @@ impl BlockDeviceMetricsCapture {
         &self.per_drive
     }
 
-    pub fn into_parts(self) -> (BlockDeviceMetrics, BlockDeviceMetricsByDrive) {
-        (self.aggregate, self.per_drive)
+    pub const fn vhost_user_per_drive(&self) -> &VhostUserBlockDeviceMetricsByDrive {
+        &self.vhost_user_per_drive
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        BlockDeviceMetrics,
+        BlockDeviceMetricsByDrive,
+        VhostUserBlockDeviceMetricsByDrive,
+    ) {
+        (self.aggregate, self.per_drive, self.vhost_user_per_drive)
     }
 }
 
@@ -1870,6 +2159,7 @@ struct BlockDeviceMetricsRegistryEntry {
     generation: u64,
     drive_id: String,
     metrics: SharedBlockDeviceMetrics,
+    vhost_user_metrics: SharedVhostUserBlockDeviceMetrics,
     lease_claimed: bool,
 }
 
@@ -1885,6 +2175,7 @@ pub struct PreparedBlockDeviceMetrics {
     generation: u64,
     drive_id: String,
     metrics: SharedBlockDeviceMetrics,
+    vhost_user_metrics: SharedVhostUserBlockDeviceMetrics,
     reserved: bool,
 }
 
@@ -1921,6 +2212,10 @@ impl PreparedBlockDeviceMetrics {
         self.metrics.clone()
     }
 
+    pub fn vhost_user_metrics(&self) -> SharedVhostUserBlockDeviceMetrics {
+        self.vhost_user_metrics.clone()
+    }
+
     pub fn publish(mut self) -> BlockDeviceMetricsLease {
         let mut state = lock_block_metrics_registry(&self.registry.per_drive);
         let reservation_count = state.reservations.len();
@@ -1943,6 +2238,7 @@ impl PreparedBlockDeviceMetrics {
             generation: self.generation,
             drive_id: self.drive_id.clone(),
             metrics: self.metrics.clone(),
+            vhost_user_metrics: self.vhost_user_metrics.clone(),
             lease_claimed: true,
         });
         drop(state);
@@ -2037,6 +2333,7 @@ impl SharedBlockDeviceMetricsRegistry {
                 generation,
                 drive_id: drive_id.to_string(),
                 metrics: SharedBlockDeviceMetrics::default(),
+                vhost_user_metrics: SharedVhostUserBlockDeviceMetrics::default(),
                 lease_claimed: false,
             });
         }
@@ -2080,6 +2377,7 @@ impl SharedBlockDeviceMetricsRegistry {
                 generation,
                 drive_id: drive_id.to_string(),
                 metrics: SharedBlockDeviceMetrics::default(),
+                vhost_user_metrics: SharedVhostUserBlockDeviceMetrics::default(),
                 lease_claimed: false,
             });
         }
@@ -2128,6 +2426,7 @@ impl SharedBlockDeviceMetricsRegistry {
                 generation,
                 drive_id,
                 metrics: SharedBlockDeviceMetrics::default(),
+                vhost_user_metrics: SharedVhostUserBlockDeviceMetrics::default(),
                 lease_claimed: false,
             });
         }
@@ -2189,6 +2488,7 @@ impl SharedBlockDeviceMetricsRegistry {
             generation,
             drive_id,
             metrics: SharedBlockDeviceMetrics::default(),
+            vhost_user_metrics: SharedVhostUserBlockDeviceMetrics::default(),
             reserved: true,
         })
     }
@@ -2256,6 +2556,18 @@ impl SharedBlockDeviceMetricsRegistry {
             .find_map(|entry| (entry.drive_id == drive_id).then(|| entry.metrics.clone()))
     }
 
+    pub fn vhost_user_per_drive(
+        &self,
+        drive_id: &str,
+    ) -> Option<SharedVhostUserBlockDeviceMetrics> {
+        lock_block_metrics_registry(&self.per_drive)
+            .entries
+            .iter()
+            .find_map(|entry| {
+                (entry.drive_id == drive_id).then(|| entry.vhost_user_metrics.clone())
+            })
+    }
+
     pub fn record_notification_dispatch_for_drive(
         &self,
         drive_id: &str,
@@ -2321,6 +2633,12 @@ impl SharedBlockDeviceMetricsRegistry {
         }
     }
 
+    pub fn record_vhost_user_config_change_time_for_drive(&self, drive_id: &str, duration_us: u64) {
+        if let Some(metrics) = self.vhost_user_per_drive(drive_id) {
+            metrics.record_config_change_time_us(duration_us);
+        }
+    }
+
     pub fn record_observation_for_drive(&self, drive_id: &str, observation: BlockDeviceMetrics) {
         if let Some(metrics) = self.per_drive(drive_id) {
             metrics.record_observation(observation);
@@ -2331,6 +2649,7 @@ impl SharedBlockDeviceMetricsRegistry {
         let state = lock_block_metrics_registry(&self.per_drive);
         let mut aggregate = BlockDeviceMetrics::default();
         let mut per_drive = BlockDeviceMetricsByDrive::new();
+        let mut vhost_user_per_drive = VhostUserBlockDeviceMetricsByDrive::new();
         for entry in &state.entries {
             let metrics = entry.metrics.snapshot();
             aggregate = aggregate.merged_with(metrics);
@@ -2339,10 +2658,19 @@ impl SharedBlockDeviceMetricsRegistry {
                 entry.generation,
                 metrics,
             );
+            let vhost_user_metrics = entry.vhost_user_metrics.snapshot();
+            if !vhost_user_metrics.is_empty() {
+                vhost_user_per_drive.insert_drive_metrics_at_generation(
+                    entry.drive_id.clone(),
+                    entry.generation,
+                    vhost_user_metrics,
+                );
+            }
         }
         BlockDeviceMetricsCapture {
             aggregate,
             per_drive,
+            vhost_user_per_drive,
         }
     }
 
@@ -2352,6 +2680,10 @@ impl SharedBlockDeviceMetricsRegistry {
 
     pub fn per_drive_snapshot(&self) -> BlockDeviceMetricsByDrive {
         self.capture().per_drive
+    }
+
+    pub fn vhost_user_per_drive_snapshot(&self) -> VhostUserBlockDeviceMetricsByDrive {
+        self.capture().vhost_user_per_drive
     }
 }
 
@@ -6524,6 +6856,7 @@ fn snapshot_network_latency(
 pub struct MetricsDiagnostics {
     block_device_metrics: Option<BlockDeviceMetrics>,
     block_device_metrics_by_drive: Option<BlockDeviceMetricsByDrive>,
+    vhost_user_block_device_metrics_by_drive: Option<VhostUserBlockDeviceMetricsByDrive>,
     pmem_device_metrics: Option<PmemDeviceMetrics>,
     pmem_device_metrics_by_device: Option<PmemDeviceMetricsByDevice>,
     network_interface_metrics: Option<NetworkInterfaceMetrics>,
@@ -6547,6 +6880,7 @@ impl MetricsDiagnostics {
         Self {
             block_device_metrics: None,
             block_device_metrics_by_drive: None,
+            vhost_user_block_device_metrics_by_drive: None,
             pmem_device_metrics: None,
             pmem_device_metrics_by_device: None,
             network_interface_metrics: None,
@@ -6576,6 +6910,14 @@ impl MetricsDiagnostics {
         block_device_metrics_by_drive: BlockDeviceMetricsByDrive,
     ) -> Self {
         self.block_device_metrics_by_drive = Some(block_device_metrics_by_drive);
+        self
+    }
+
+    pub fn with_vhost_user_block_device_metrics_by_drive(
+        mut self,
+        metrics: VhostUserBlockDeviceMetricsByDrive,
+    ) -> Self {
+        self.vhost_user_block_device_metrics_by_drive = Some(metrics);
         self
     }
 
@@ -6688,6 +7030,12 @@ impl MetricsDiagnostics {
             block_device_metrics_by_drive: self.block_device_metrics_by_drive.as_ref().map(
                 |current| current.delta_since(previous.block_device_metrics_by_drive.as_ref()),
             ),
+            vhost_user_block_device_metrics_by_drive: self
+                .vhost_user_block_device_metrics_by_drive
+                .as_ref()
+                .map(|current| {
+                    current.delta_since(previous.vhost_user_block_device_metrics_by_drive.as_ref())
+                }),
             pmem_device_metrics: self.pmem_device_metrics.map(|current| {
                 current.delta_since(previous.pmem_device_metrics.unwrap_or_default())
             }),
@@ -6746,6 +7094,13 @@ impl MetricsDiagnostics {
                 Some(existing) => existing.merged_with(metrics),
                 None => metrics,
             });
+        }
+        if let Some(metrics) = other.vhost_user_block_device_metrics_by_drive {
+            self.vhost_user_block_device_metrics_by_drive =
+                Some(match self.vhost_user_block_device_metrics_by_drive {
+                    Some(existing) => existing.merged_with(metrics),
+                    None => metrics,
+                });
         }
         if let Some(metrics) = other.pmem_device_metrics {
             self.pmem_device_metrics = Some(match self.pmem_device_metrics {
@@ -6839,6 +7194,12 @@ impl MetricsDiagnostics {
 
     pub fn block_device_metrics_by_drive(&self) -> Option<&BlockDeviceMetricsByDrive> {
         self.block_device_metrics_by_drive.as_ref()
+    }
+
+    pub fn vhost_user_block_device_metrics_by_drive(
+        &self,
+    ) -> Option<&VhostUserBlockDeviceMetricsByDrive> {
+        self.vhost_user_block_device_metrics_by_drive.as_ref()
     }
 
     pub fn pmem_device_metrics(&self) -> Option<PmemDeviceMetrics> {
@@ -7037,8 +7398,9 @@ mod tests {
         SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics,
         SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
         SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedProcessMetrics,
-        SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics,
-        VirtioNetworkLatencyAggregate, VsockDeviceMetrics,
+        SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVhostUserBlockDeviceMetrics,
+        SharedVsockDeviceMetrics, SignalMetrics, VhostUserBlockDeviceMetrics,
+        VhostUserBlockDeviceMetricsByDrive, VirtioNetworkLatencyAggregate, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::network::NetworkInterfaceConfigInput;
@@ -8836,41 +9198,73 @@ mod tests {
     }
 
     #[test]
-    fn vhost_config_change_time_is_optional_and_scoped_to_updated_drive() {
+    fn vhost_metrics_are_typed_scoped_and_fresh_across_same_id_reuse() {
         let registry = SharedBlockDeviceMetricsRegistry::from_drive_ids(["file", "vhost"]);
-        registry.record_config_change_time_for_drive("vhost", 37);
+        let vhost_metrics = registry
+            .vhost_user_per_drive("vhost")
+            .expect("vhost metrics owner should exist");
+        vhost_metrics.record_init_time_us(11);
+        vhost_metrics.record_activation_time_us(23);
+        vhost_metrics.record_config_change_time_us(37);
+        vhost_metrics.record_activation_failure();
+        vhost_metrics.record_config_failure();
 
         assert_eq!(
             registry.aggregate_snapshot().config_change_time_us(),
-            Some(37)
+            None,
+            "typed vhost stores must not contaminate the ordinary aggregate"
         );
-        let by_drive = registry.per_drive_snapshot();
+        let by_drive = registry.vhost_user_per_drive_snapshot();
         assert_eq!(
             by_drive
                 .iter()
-                .find_map(|(drive_id, metrics)| (drive_id == "vhost")
-                    .then_some(metrics.config_change_time_us())),
-            Some(Some(37))
+                .find_map(|(drive_id, metrics)| (drive_id == "vhost").then_some(metrics)),
+            Some(
+                VhostUserBlockDeviceMetrics::default()
+                    .with_activate_fails(1)
+                    .with_cfg_fails(1)
+                    .with_init_time_us(11)
+                    .with_activate_time_us(23)
+                    .with_config_change_time_us(37)
+            )
         );
-        assert!(by_drive.iter().all(|(drive_id, metrics)| {
-            drive_id != "file" || metrics.config_change_time_us().is_none()
-        }));
+        assert!(by_drive.iter().all(|(drive_id, _)| drive_id != "file"));
 
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
         let diagnostics = MetricsDiagnostics::new()
             .with_block_device_metrics(registry.aggregate_snapshot())
-            .with_block_device_metrics_by_drive(by_drive);
+            .with_block_device_metrics_by_drive(registry.per_drive_snapshot())
+            .with_vhost_user_block_device_metrics_by_drive(by_drive);
         let configured = configured_metrics_devices(&["file"], &["vhost"], &[]);
         assert_eq!(
             state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
             Ok(true)
         );
-        let value = only_metrics_value(&output);
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        let value = &values[0];
+        assert_eq!(value["vhost_user_block_vhost"]["activate_fails"], 1);
+        assert_eq!(value["vhost_user_block_vhost"]["cfg_fails"], 1);
+        assert_eq!(value["vhost_user_block_vhost"]["init_time_us"], 11);
+        assert_eq!(value["vhost_user_block_vhost"]["activate_time_us"], 23);
         assert_eq!(value["vhost_user_block_vhost"]["config_change_time_us"], 37);
         assert!(value.get("block_file").is_some());
         assert!(value.get("block_vhost").is_none());
         assert!(value["block"].get("config_change_time_us").is_none());
+        let unchanged = &values[1];
+        assert_eq!(unchanged["vhost_user_block_vhost"]["activate_fails"], 0);
+        assert_eq!(unchanged["vhost_user_block_vhost"]["cfg_fails"], 0);
+        assert_eq!(unchanged["vhost_user_block_vhost"]["init_time_us"], 11);
+        assert_eq!(unchanged["vhost_user_block_vhost"]["activate_time_us"], 23);
+        assert_eq!(
+            unchanged["vhost_user_block_vhost"]["config_change_time_us"],
+            37
+        );
 
         let old_generation = registry
             .claim_drive_lease("vhost")
@@ -8883,7 +9277,7 @@ mod tests {
             .publish();
         assert_eq!(
             registry
-                .per_drive("vhost")
+                .vhost_user_per_drive("vhost")
                 .expect("replacement generation should publish")
                 .snapshot()
                 .config_change_time_us(),
@@ -8891,11 +9285,62 @@ mod tests {
             "same-ID reinsertion must not inherit the removed generation's store"
         );
         assert_eq!(
-            registry.aggregate_snapshot().config_change_time_us(),
-            None,
-            "the aggregate is derived from the currently published generation"
+            registry.vhost_user_per_drive_snapshot(),
+            VhostUserBlockDeviceMetricsByDrive::new(),
+            "an empty replacement slot must not appear as a live vhost owner"
         );
         drop(replacement_generation);
+    }
+
+    #[test]
+    fn failed_vhost_metrics_publication_replays_counters_and_preserves_stores() {
+        let output = TestMetricsOutput::default();
+        output.fail_next_write();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new().with_vhost_user_block_device_metrics_by_drive(
+            VhostUserBlockDeviceMetricsByDrive::new().with_drive_metrics(
+                "vhost",
+                VhostUserBlockDeviceMetrics::default()
+                    .with_activate_fails(2)
+                    .with_cfg_fails(3)
+                    .with_init_time_us(5)
+                    .with_activate_time_us(7)
+                    .with_config_change_time_us(11),
+            ),
+        );
+        let configured = configured_metrics_devices(&[], &["vhost"], &[]);
+
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
+
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["vhost_user_block_vhost"]["activate_fails"], 2);
+        assert_eq!(values[0]["vhost_user_block_vhost"]["cfg_fails"], 3);
+        assert_eq!(values[0]["vhost_user_block_vhost"]["init_time_us"], 5);
+        assert_eq!(values[0]["vhost_user_block_vhost"]["activate_time_us"], 7);
+        assert_eq!(
+            values[0]["vhost_user_block_vhost"]["config_change_time_us"],
+            11
+        );
+        assert_eq!(values[1]["vhost_user_block_vhost"]["activate_fails"], 0);
+        assert_eq!(values[1]["vhost_user_block_vhost"]["cfg_fails"], 0);
+        assert_eq!(values[1]["vhost_user_block_vhost"]["init_time_us"], 5);
+        assert_eq!(values[1]["vhost_user_block_vhost"]["activate_time_us"], 7);
+        assert_eq!(
+            values[1]["vhost_user_block_vhost"]["config_change_time_us"],
+            11
+        );
     }
 
     #[test]
@@ -9061,7 +9506,10 @@ mod tests {
         let prepared = registry
             .prepare_drive("data")
             .expect("second metrics entry should prepare");
+        prepared.vhost_user_metrics().record_init_time_us(7);
         assert!(registry.per_drive("data").is_none());
+        assert!(registry.vhost_user_per_drive("data").is_none());
+        assert!(registry.vhost_user_per_drive_snapshot().is_empty());
         assert_eq!(
             registry.prepare_drive("data").unwrap_err(),
             BlockDeviceMetricsRegistryError::DuplicateDrive
@@ -9083,21 +9531,32 @@ mod tests {
         let prepared = registry
             .prepare_drive("data")
             .expect("abandoned metrics reservation should release its identity and capacity");
+        prepared.vhost_user_metrics().record_init_time_us(11);
 
         let lease = prepared.publish();
         assert!(registry.per_drive("data").is_some());
+        assert_eq!(
+            registry
+                .vhost_user_per_drive("data")
+                .expect("published typed owner should be visible")
+                .snapshot()
+                .init_time_us(),
+            Some(11)
+        );
         assert_eq!(
             registry.prepare_drive("data").unwrap_err(),
             BlockDeviceMetricsRegistryError::DuplicateDrive
         );
         drop(lease);
         assert!(registry.per_drive("data").is_none());
+        assert!(registry.vhost_user_per_drive_snapshot().is_empty());
 
         let replacement = registry
             .prepare_drive("data")
             .expect("released metrics capacity should be reusable")
             .publish();
         assert!(registry.per_drive("data").is_some());
+        assert!(registry.vhost_user_per_drive_snapshot().is_empty());
         drop(replacement);
     }
 
@@ -9150,6 +9609,35 @@ mod tests {
         metrics.record_queue_events(3);
 
         assert_eq!(metrics.snapshot().queue_event_count(), u64::MAX);
+    }
+
+    #[test]
+    fn vhost_user_block_metric_counters_saturate_and_stores_replace() {
+        let metrics = SharedVhostUserBlockDeviceMetrics::default();
+        metrics.record_observation(
+            VhostUserBlockDeviceMetrics::default()
+                .with_activate_fails(u64::MAX)
+                .with_cfg_fails(u64::MAX)
+                .with_init_time_us(3)
+                .with_activate_time_us(5)
+                .with_config_change_time_us(7),
+        );
+
+        metrics.record_activation_failure();
+        metrics.record_config_failure();
+        metrics.record_init_time_us(u64::MAX);
+        metrics.record_activation_time_us(u64::MAX);
+        metrics.record_config_change_time_us(u64::MAX);
+
+        assert_eq!(
+            metrics.snapshot(),
+            VhostUserBlockDeviceMetrics::default()
+                .with_activate_fails(u64::MAX)
+                .with_cfg_fails(u64::MAX)
+                .with_init_time_us(u64::MAX)
+                .with_activate_time_us(u64::MAX)
+                .with_config_change_time_us(u64::MAX)
+        );
     }
 
     #[test]

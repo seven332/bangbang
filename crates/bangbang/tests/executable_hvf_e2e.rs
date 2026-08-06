@@ -116,6 +116,7 @@ mod macos_arm64 {
     const VHOST_USER_BLOCK_RO_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_ro_OK";
     const VHOST_USER_BLOCK_RW_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_rw_OK";
     const VHOST_USER_BLOCK_PARTUUID: &str = "0eaa91a0-01";
+    const VHOST_USER_METRICS_DELAY: Duration = Duration::from_millis(10);
     const DIRECT_ROOTFS_ENTROPY_MARKER: &[u8] = b"BANGBANG_ENTROPY_GUEST_READ_OK";
     const DIRECT_ROOTFS_ENTROPY_LIFECYCLE_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.entropy-lifecycle=1";
     const DIRECT_ROOTFS_ENTROPY_LIFECYCLE_READY_MARKER: &[u8] = b"BANGBANG_ENTROPY_LIFECYCLE_READY";
@@ -2544,7 +2545,8 @@ mod macos_arm64 {
         let scratch_backend = VhostUserBlockBackend::start(
             &scratch_backend_socket,
             &scratch_path,
-            VhostUserBlockBackendOptions::regular(false),
+            VhostUserBlockBackendOptions::regular(false)
+                .with_metrics_delays(VHOST_USER_METRICS_DELAY),
         )
         .expect("test scratch vhost-user backend should start");
         let mut root_backend = if case.retry_rejected_discovery {
@@ -2554,7 +2556,8 @@ mod macos_arm64 {
                 VhostUserBlockBackend::start(
                     &root_backend_socket,
                     &rootfs_path,
-                    VhostUserBlockBackendOptions::regular(case.root_read_only),
+                    VhostUserBlockBackendOptions::regular(case.root_read_only)
+                        .with_metrics_delays(VHOST_USER_METRICS_DELAY),
                 )
                 .expect("test root vhost-user backend should start"),
             )
@@ -2728,7 +2731,8 @@ mod macos_arm64 {
                 VhostUserBlockBackend::start(
                     &root_backend_socket,
                     &rootfs_path,
-                    VhostUserBlockBackendOptions::regular(case.root_read_only),
+                    VhostUserBlockBackendOptions::regular(case.root_read_only)
+                        .with_metrics_delays(VHOST_USER_METRICS_DELAY),
                 )
                 .expect("replacement root vhost-user backend should start"),
             );
@@ -2967,9 +2971,17 @@ mod macos_arm64 {
             &metrics_path,
             &logger_path,
             "scratch",
+            case.refresh_scratch_config,
             GUEST_EXECUTION_TIMEOUT,
         )
         .expect("scratch backend closure should reach the public log and metrics contracts");
+        assert_vhost_user_block_metrics(
+            &metrics_path,
+            "rootfs",
+            false,
+            "direct root vhost-user metrics after unrelated discovery rejection",
+        )
+        .expect("root metrics should remain isolated from the rejected discovery generation");
         let after_disconnect = http_get(&socket_path, "/");
         assert_response_contains(
             &after_disconnect,
@@ -3152,6 +3164,7 @@ mod macos_arm64 {
         metrics_path: &Path,
         logger_path: &Path,
         drive_id: &str,
+        expect_config_change: bool,
         timeout: Duration,
     ) -> Result<(), String> {
         let started = Instant::now();
@@ -3178,6 +3191,22 @@ mod macos_arm64 {
             std::thread::sleep(Duration::from_millis(25));
         };
 
+        assert_vhost_user_block_metrics(
+            metrics_path,
+            drive_id,
+            expect_config_change,
+            "terminal vhost-user notification",
+        )
+        .map_err(|error| format!("{error}; logger:\n{logger_output}"))?;
+        Ok(())
+    }
+
+    fn assert_vhost_user_block_metrics(
+        metrics_path: &Path,
+        drive_id: &str,
+        expect_config_change: bool,
+        context: &str,
+    ) -> Result<(), String> {
         let metrics_key = format!("vhost_user_block_{drive_id}");
         let output = fs::read_to_string(metrics_path).map_err(|error| {
             format!(
@@ -3207,7 +3236,33 @@ mod macos_arm64 {
             || expected.iter().any(|field| !metrics.contains_key(*field))
         {
             return Err(format!(
-                "{metrics_key} should expose the exact Firecracker v1.16 fields; observed={metrics:?}; logger:\n{logger_output}"
+                "{context} {metrics_key} should expose the exact Firecracker v1.16 fields; observed={metrics:?}"
+            ));
+        }
+        let metric = |field: &str| {
+            metrics
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    format!("{context} {metrics_key}.{field} was not an unsigned integer")
+                })
+        };
+        if metric("activate_fails")? != 0 || metric("cfg_fails")? != 0 {
+            return Err(format!(
+                "{context} unrelated discovery, snapshot, and backend-death failures must not contaminate {metrics_key}; observed={metrics:?}"
+            ));
+        }
+        if metric("init_time_us")? == 0 || metric("activate_time_us")? == 0 {
+            return Err(format!(
+                "{context} controlled initialization and activation delays must produce nonzero {metrics_key} stores; observed={metrics:?}"
+            ));
+        }
+        let config_change_time_us = metric("config_change_time_us")?;
+        if (expect_config_change && config_change_time_us == 0)
+            || (!expect_config_change && config_change_time_us != 0)
+        {
+            return Err(format!(
+                "{context} {metrics_key}.config_change_time_us did not match refresh activity; observed={metrics:?}"
             ));
         }
         Ok(())
@@ -7626,7 +7681,8 @@ mod macos_arm64 {
         let vhost_backend = VhostUserBlockBackend::start(
             &vhost_socket_path,
             &vhost_backing_path,
-            VhostUserBlockBackendOptions::regular(false),
+            VhostUserBlockBackendOptions::regular(false)
+                .with_metrics_delays(VHOST_USER_METRICS_DELAY),
         )
         .expect("aggregate storage vhost-user backend should start");
 
@@ -8215,6 +8271,7 @@ mod macos_arm64 {
             &metrics_path,
             &logger_path,
             "vhostdata",
+            true,
             PCI_ALL_VIRTIO_GUEST_TIMEOUT,
         )
         .expect("aggregate terminal vhost-user closure should reach public observability");
@@ -8754,6 +8811,7 @@ mod macos_arm64 {
         let control_backing_path = test_dir.path().join("vhost-hotplug-control.img");
         let first_backing_path = test_dir.path().join("vhost-hotplug-first.img");
         let second_backing_path = test_dir.path().join("vhost-hotplug-second.img");
+        let metrics_path = test_dir.path().join("vhost-hotplug-metrics.out");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
         let instance_id = test_dir.instance_id();
@@ -8761,6 +8819,7 @@ mod macos_arm64 {
         create_block_backing_with_prefix(&control_backing_path, 2, &[]);
         create_block_backing_with_prefix(&first_backing_path, 1, BLOCK_HOTPLUG_HOST_ONE_MARKER);
         create_block_backing_with_prefix(&second_backing_path, 1, BLOCK_HOTPLUG_HOST_TWO_MARKER);
+        create_empty_file(&metrics_path);
         let control_backend = VhostUserBlockBackend::start(
             &control_socket_path,
             &control_backing_path,
@@ -8777,6 +8836,17 @@ mod macos_arm64 {
                 r#"{"vcpu_count":1,"mem_size_mib":256}"#,
             ),
             "PUT /machine-config vhost-user block hotplug",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/metrics",
+                &format!(
+                    r#"{{"metrics_path":{}}}"#,
+                    json_string(path_text(&metrics_path))
+                ),
+            ),
+            "PUT /metrics vhost-user block hotplug",
         );
         let boot_body = format!(
             r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
@@ -8925,13 +8995,15 @@ mod macos_arm64 {
         let first_backend = VhostUserBlockBackend::start(
             &first_socket_path,
             &first_backing_path,
-            VhostUserBlockBackendOptions::regular(false),
+            VhostUserBlockBackendOptions::regular(false)
+                .with_metrics_delays(VHOST_USER_METRICS_DELAY),
         )
         .expect("first runtime vhost-user backend should start");
         let second_backend = VhostUserBlockBackend::start(
             &second_socket_path,
             &second_backing_path,
-            VhostUserBlockBackendOptions::regular(false),
+            VhostUserBlockBackendOptions::regular(false)
+                .with_metrics_delays(VHOST_USER_METRICS_DELAY),
         )
         .expect("second runtime vhost-user backend should start");
         let first_body = format!(
@@ -8966,6 +9038,35 @@ mod macos_arm64 {
             .wait_for_activation(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
             .expect("first runtime vhost-user backend should activate");
         assert_vhost_user_memory_aperture(&first_backend.report(), "first runtime block");
+        assert_no_content_response(
+            &http_json(
+                &socket_path,
+                "PATCH",
+                "/drives/hotdata",
+                r#"{"drive_id":"hotdata"}"#,
+            ),
+            "PATCH first runtime vhost-user block metrics generation",
+        );
+        assert_eq!(
+            first_backend.report().config_requests,
+            2,
+            "first runtime generation should receive discovery and refresh requests"
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"FlushMetrics"}"#,
+            ),
+            "FlushMetrics first runtime vhost-user generation",
+        );
+        assert_vhost_user_block_metrics(
+            &metrics_path,
+            "hotdata",
+            true,
+            "first direct runtime vhost-user generation",
+        )
+        .expect("first runtime generation should expose complete metrics");
         if let Err(error) = wait_for_file_prefix_marker(
             &first_backing_path,
             BLOCK_HOTPLUG_GUEST_ONE_MARKER,
@@ -9041,6 +9142,21 @@ mod macos_arm64 {
             PCI_ALL_VIRTIO_GUEST_TIMEOUT,
         )
         .expect("guest should remove the reused runtime vhost-user PCI function");
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"FlushMetrics"}"#,
+            ),
+            "FlushMetrics reused runtime vhost-user generation",
+        );
+        assert_vhost_user_block_metrics(
+            &metrics_path,
+            "hotdata",
+            false,
+            "reused direct runtime vhost-user generation",
+        )
+        .expect("reused runtime generation should start with a fresh config store");
         assert_no_content_response(
             &http_no_body(&socket_path, "DELETE", "/drives/hotdata"),
             "final DELETE /drives/hotdata vhost-user",

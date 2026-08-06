@@ -30,7 +30,7 @@ use crate::memory::{
     GuestMemoryRange, GuestMemoryRegionBacking, GuestMemorySharedBacking,
     GuestMemorySharedBackingError,
 };
-use crate::metrics::SharedBlockDeviceMetrics;
+use crate::metrics::{SharedBlockDeviceMetrics, SharedVhostUserBlockDeviceMetrics};
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
@@ -475,6 +475,7 @@ pub struct PreparedVhostUserBlockFrontend {
     frontend: VhostUserFrontend,
     available_features: u64,
     config_bytes: [u8; VIRTIO_BLOCK_CONFIG_SIZE],
+    init_time_us: u64,
 }
 
 impl fmt::Debug for PreparedVhostUserBlockFrontend {
@@ -484,6 +485,7 @@ impl fmt::Debug for PreparedVhostUserBlockFrontend {
             .field("frontend", &self.frontend)
             .field("available_features", &"<redacted>")
             .field("config_bytes", &"<redacted>")
+            .field("init_time_us", &"<redacted>")
             .finish()
     }
 }
@@ -495,6 +497,16 @@ impl PreparedVhostUserBlockFrontend {
         stream: UnixStream,
         cache_type: DriveCacheType,
         operation_timeout: Duration,
+    ) -> Result<Self, PreparedVhostUserBlockFrontendError> {
+        Self::discover_started_at(stream, cache_type, operation_timeout, Instant::now())
+    }
+
+    /// Performs discovery after the caller has started the complete connection timer.
+    pub fn discover_started_at(
+        stream: UnixStream,
+        cache_type: DriveCacheType,
+        operation_timeout: Duration,
+        init_started_at: Instant,
     ) -> Result<Self, PreparedVhostUserBlockFrontendError> {
         let options = VhostUserFrontendOptions::firecracker_block(operation_timeout)
             .map_err(PreparedVhostUserBlockFrontendError::Frontend)?;
@@ -545,6 +557,7 @@ impl PreparedVhostUserBlockFrontend {
             frontend,
             available_features,
             config_bytes,
+            init_time_us: elapsed_microseconds_since(init_started_at),
         })
     }
 
@@ -560,8 +573,13 @@ impl PreparedVhostUserBlockFrontend {
         &self.config_bytes
     }
 
-    fn into_parts(self) -> (VhostUserFrontend, u64, [u8; VIRTIO_BLOCK_CONFIG_SIZE]) {
-        (self.frontend, self.available_features, self.config_bytes)
+    fn into_parts(self) -> (VhostUserFrontend, u64, [u8; VIRTIO_BLOCK_CONFIG_SIZE], u64) {
+        (
+            self.frontend,
+            self.available_features,
+            self.config_bytes,
+            self.init_time_us,
+        )
     }
 }
 
@@ -1389,17 +1407,20 @@ impl std::error::Error for DriveRuntimeMutationError {
 pub struct VirtioBlockConfigSpace {
     bytes: [u8; VIRTIO_BLOCK_CONFIG_SIZE],
     len: u8,
+    is_vhost_user: bool,
     capacity_sectors: u64,
     is_read_only: bool,
     cache_type: DriveCacheType,
     available_features: u64,
     metrics: Option<SharedBlockDeviceMetrics>,
+    vhost_user_metrics: Option<SharedVhostUserBlockDeviceMetrics>,
 }
 
 impl PartialEq for VirtioBlockConfigSpace {
     fn eq(&self, other: &Self) -> bool {
         self.bytes == other.bytes
             && self.len == other.len
+            && self.is_vhost_user == other.is_vhost_user
             && self.capacity_sectors == other.capacity_sectors
             && self.is_read_only == other.is_read_only
             && self.cache_type == other.cache_type
@@ -1429,11 +1450,13 @@ impl VirtioBlockConfigSpace {
         Self {
             bytes,
             len: VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE as u8,
+            is_vhost_user: false,
             capacity_sectors,
             is_read_only,
             cache_type,
             available_features,
             metrics: None,
+            vhost_user_metrics: None,
         }
     }
 
@@ -1448,12 +1471,14 @@ impl VirtioBlockConfigSpace {
         Self {
             bytes,
             len: VIRTIO_BLOCK_CONFIG_SIZE as u8,
+            is_vhost_user: true,
             capacity_sectors,
             is_read_only: available_features & virtio_feature_bit(VIRTIO_BLOCK_FEATURE_READ_ONLY)
                 != 0,
             cache_type,
             available_features,
             metrics: None,
+            vhost_user_metrics: None,
         }
     }
 
@@ -1484,6 +1509,10 @@ impl VirtioBlockConfigSpace {
     pub(crate) fn attach_metrics(&mut self, metrics: SharedBlockDeviceMetrics) {
         self.metrics = Some(metrics);
     }
+
+    pub(crate) fn attach_vhost_user_metrics(&mut self, metrics: SharedVhostUserBlockDeviceMetrics) {
+        self.vhost_user_metrics = Some(metrics);
+    }
 }
 
 impl VirtioMmioDeviceConfigHandler for VirtioBlockConfigSpace {
@@ -1491,6 +1520,23 @@ impl VirtioMmioDeviceConfigHandler for VirtioBlockConfigSpace {
         &self,
         access: VirtioMmioDeviceConfigAccess,
     ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
+        if self.is_vhost_user {
+            let result = read_vhost_user_block_config_bytes(
+                self.bytes.get(..self.config_len()).ok_or(
+                    VirtioMmioDeviceConfigError::UnsupportedRead {
+                        offset: access.offset(),
+                        len: access.len(),
+                    },
+                )?,
+                access,
+            );
+            if result.is_err()
+                && let Some(metrics) = &self.vhost_user_metrics
+            {
+                metrics.record_config_failure();
+            }
+            return result;
+        }
         let result = (|| {
             let config = self.bytes.get(..self.config_len()).ok_or(
                 VirtioMmioDeviceConfigError::UnsupportedRead {
@@ -1514,6 +1560,9 @@ impl VirtioMmioDeviceConfigHandler for VirtioBlockConfigSpace {
         access: VirtioMmioDeviceConfigAccess,
         _data: MmioAccessBytes,
     ) -> Result<(), VirtioMmioDeviceConfigError> {
+        if self.is_vhost_user {
+            return Ok(());
+        }
         if let Some(metrics) = &self.metrics {
             metrics.record_config_failure();
         }
@@ -1522,6 +1571,45 @@ impl VirtioMmioDeviceConfigHandler for VirtioBlockConfigSpace {
             len: access.len(),
         })
     }
+}
+
+fn read_vhost_user_block_config_bytes(
+    config: &[u8],
+    access: VirtioMmioDeviceConfigAccess,
+) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
+    let offset = usize::try_from(access.offset()).map_err(|_| {
+        VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        }
+    })?;
+    let suffix = config
+        .get(offset..)
+        .ok_or(VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        })?;
+    let mut bytes = [0_u8; 8];
+    let copy_len = suffix.len().min(access.len());
+    bytes
+        .get_mut(..copy_len)
+        .ok_or(VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        })?
+        .copy_from_slice(suffix.get(..copy_len).ok_or(
+            VirtioMmioDeviceConfigError::UnsupportedRead {
+                offset: access.offset(),
+                len: access.len(),
+            },
+        )?);
+    MmioAccessBytes::new(bytes.get(..access.len()).ok_or(
+        VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        },
+    )?)
+    .map_err(config_bytes_error)
 }
 
 const fn virtio_feature_bit(feature: u32) -> u64 {
@@ -6178,6 +6266,8 @@ struct VhostUserBlockBackend {
     available_features: u64,
     memory_regions: Vec<VhostUserBlockMemoryRegion>,
     state: VhostUserBlockState,
+    metrics: Option<SharedVhostUserBlockDeviceMetrics>,
+    pending_init_time_us: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -6227,9 +6317,13 @@ impl VirtioBlockDevice {
         available_features: u64,
         memory_regions: Vec<VhostUserBlockMemoryRegion>,
         device_id: VirtioBlockDeviceId,
+        discovered_init_time_us: u64,
+        construction_started_at: Instant,
     ) -> Result<Self, VhostUserNotifierError> {
         let (kick, backend_kick) = create_kick_notifier()?;
         let (call, backend_call) = create_call_notifier()?;
+        let init_time_us = discovered_init_time_us
+            .saturating_add(elapsed_microseconds_since(construction_started_at));
         Ok(Self {
             backend: VirtioBlockBackend::VhostUser(VhostUserBlockBackend {
                 frontend: Some(frontend),
@@ -6241,6 +6335,8 @@ impl VirtioBlockDevice {
                     call,
                     backend_call,
                 },
+                metrics: None,
+                pending_init_time_us: Some(init_time_us),
             }),
             device_id,
             pending_rate_limited_queue: false,
@@ -6286,6 +6382,24 @@ impl VirtioBlockDevice {
             return false;
         }
         self.metrics = Some(metrics);
+        true
+    }
+
+    pub(crate) fn attach_vhost_user_metrics(
+        &mut self,
+        metrics: SharedVhostUserBlockDeviceMetrics,
+    ) -> bool {
+        let VirtioBlockBackend::VhostUser(backend) = &mut self.backend else {
+            return false;
+        };
+        if backend.metrics.is_some() {
+            return false;
+        }
+        let Some(init_time_us) = backend.pending_init_time_us.take() else {
+            return false;
+        };
+        metrics.record_init_time_us(init_time_us);
+        backend.metrics = Some(metrics);
         true
     }
 
@@ -7250,6 +7364,7 @@ impl VhostUserBlockBackend {
             );
         }
         let queue_size = queue.available.queue_size();
+        let metrics = self.metrics.clone();
         let Some(frontend) = self.frontend.as_mut() else {
             return Err(VirtioBlockDeviceActivationError::Terminal);
         };
@@ -7277,6 +7392,7 @@ impl VhostUserBlockBackend {
         // negotiation. Linux does not know about it, so preserve it when
         // committing the guest-selected standard virtio features.
         let backend_features = driver_features | VHOST_USER_F_PROTOCOL_FEATURES;
+        let started_at = Instant::now();
         let result = (|| {
             frontend.set_features(backend_features)?;
             frontend.set_memory_table(&protocol_regions)?;
@@ -7292,11 +7408,17 @@ impl VhostUserBlockBackend {
         match result {
             Ok(()) => {
                 self.state = VhostUserBlockState::Active { kick, call };
+                if let Some(metrics) = metrics {
+                    metrics.record_activation_time_us(elapsed_microseconds_since(started_at));
+                }
                 Ok(())
             }
             Err(source) => {
                 self.frontend = None;
                 self.state = VhostUserBlockState::Terminal { was_active: false };
+                if let Some(metrics) = metrics {
+                    metrics.record_activation_failure();
+                }
                 Err(VirtioBlockDeviceActivationError::Frontend(source))
             }
         }
@@ -7715,6 +7837,7 @@ impl PreparedBlockDevice {
                 drive_id: config.drive_id().to_string(),
             });
         }
+        let construction_started_at = Instant::now();
         let memory_regions =
             VhostUserBlockMemoryRegion::from_guest_memory(memory).map_err(|source| {
                 PreparedBlockDeviceError::PrepareVhostMemory {
@@ -7722,7 +7845,8 @@ impl PreparedBlockDevice {
                     source,
                 }
             })?;
-        let (frontend, available_features, config_bytes) = frontend.into_parts();
+        let (frontend, available_features, config_bytes, discovered_init_time_us) =
+            frontend.into_parts();
         let config_space = VirtioBlockConfigSpace::from_vhost_user(
             config_bytes,
             available_features,
@@ -7734,6 +7858,8 @@ impl PreparedBlockDevice {
             available_features,
             memory_regions,
             device_id,
+            discovered_init_time_us,
+            construction_started_at,
         )
         .map_err(|source| PreparedBlockDeviceError::PrepareVhostNotifier {
             drive_id: config.drive_id().to_string(),
@@ -7786,6 +7912,18 @@ impl PreparedBlockDevice {
             return false;
         }
         self.config_space.attach_metrics(metrics);
+        true
+    }
+
+    /// Attaches the exact five-field vhost-user owner and commits pending initialization.
+    pub fn attach_vhost_user_metrics(
+        &mut self,
+        metrics: SharedVhostUserBlockDeviceMetrics,
+    ) -> bool {
+        if !self.device.attach_vhost_user_metrics(metrics.clone()) {
+            return false;
+        }
+        self.config_space.attach_vhost_user_metrics(metrics);
         true
     }
 
@@ -8620,6 +8758,22 @@ impl VirtioBlockMmioHandler {
         true
     }
 
+    /// Attaches one vhost-user owner to its config and activation producer points.
+    pub fn attach_vhost_user_block_metrics(
+        &mut self,
+        metrics: SharedVhostUserBlockDeviceMetrics,
+    ) -> bool {
+        if !self
+            .activation_handler_mut()
+            .attach_vhost_user_metrics(metrics.clone())
+        {
+            return false;
+        }
+        self.device_config_handler_mut()
+            .attach_vhost_user_metrics(metrics);
+        true
+    }
+
     pub fn block_backend_kind(&self) -> VirtioBlockBackendKind {
         self.activation_handler().backend_kind()
     }
@@ -9204,6 +9358,16 @@ pub fn attach_block_metrics_to_mmio_handler(
         .attach_block_metrics(metrics))
 }
 
+pub fn attach_vhost_user_block_metrics_to_mmio_handler(
+    dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    metrics: SharedVhostUserBlockDeviceMetrics,
+) -> Result<bool, MmioHandlerLookupError> {
+    Ok(dispatcher
+        .handler_mut::<VirtioBlockMmioHandler>(region_id)?
+        .attach_vhost_user_block_metrics(metrics))
+}
+
 impl VirtioMmioDeviceActivationHandler for VirtioBlockDevice {
     fn attach_guest_logger(&mut self, logger: GuestLogger) {
         self.guest_logger = Some(logger);
@@ -9547,7 +9711,10 @@ mod tests {
         GuestMessage, GuestMessageInterrupt, GuestMessageInterruptRegistry,
         GuestMessageInterruptSignalError,
     };
-    use crate::metrics::{BlockDeviceMetrics, SharedBlockDeviceMetrics};
+    use crate::metrics::{
+        BlockDeviceMetrics, SharedBlockDeviceMetrics, SharedVhostUserBlockDeviceMetrics,
+        VhostUserBlockDeviceMetrics,
+    };
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioHandler, MmioOperation,
         MmioRegion, MmioRegionId,
@@ -13903,6 +14070,45 @@ mod tests {
     }
 
     #[test]
+    fn vhost_user_config_access_matches_firecracker_tail_and_failure_semantics() {
+        let mut bytes = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::try_from(index).expect("config byte index should fit u8");
+        }
+        let mut config = VirtioBlockConfigSpace::from_vhost_user(
+            bytes,
+            SUPPORTED_VIRTIO_FEATURES,
+            DriveCacheType::Writeback,
+        );
+        let metrics = SharedVhostUserBlockDeviceMetrics::default();
+        config.attach_vhost_user_metrics(metrics.clone());
+
+        assert_eq!(
+            read_block_config(&config, VIRTIO_BLOCK_CONFIG_SIZE as u64 - 2, 4)
+                .expect("partial tail read should succeed")
+                .as_slice(),
+            &[58, 59, 0, 0]
+        );
+        assert_eq!(
+            read_block_config(&config, VIRTIO_BLOCK_CONFIG_SIZE as u64, 4)
+                .expect("read starting exactly at the end should succeed")
+                .as_slice(),
+            &[0, 0, 0, 0]
+        );
+        assert_eq!(metrics.snapshot().cfg_fails(), 0);
+
+        assert!(matches!(
+            read_block_config(&config, VIRTIO_BLOCK_CONFIG_SIZE as u64 + 1, 4),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { .. })
+        ));
+        assert_eq!(metrics.snapshot().cfg_fails(), 1);
+
+        write_block_config_after_driver(config, VIRTIO_BLOCK_CONFIG_SIZE as u64 + 1, &[1, 2, 3, 4])
+            .expect("vhost-user configuration writes should be ignored");
+        assert_eq!(metrics.snapshot().cfg_fails(), 1);
+    }
+
+    #[test]
     fn parses_read_request() {
         let mut memory = request_memory();
         let chain = request_chain(
@@ -14912,6 +15118,31 @@ mod tests {
         assert_eq!(ordinary_metrics.snapshot(), BlockDeviceMetrics::default());
         assert!(prepared.config_space.metrics.is_none());
         assert!(prepared.device.metrics.is_none());
+        let vhost_user_metrics = SharedVhostUserBlockDeviceMetrics::default();
+        assert!(prepared.attach_vhost_user_metrics(vhost_user_metrics.clone()));
+        assert!(
+            prepared
+                .config_space
+                .vhost_user_metrics
+                .as_ref()
+                .is_some_and(|attached| attached.shares_state_with(&vhost_user_metrics))
+        );
+        let VirtioBlockBackend::VhostUser(backend) = &prepared.device.backend else {
+            panic!("test device should retain its vhost-user backend");
+        };
+        assert!(
+            backend
+                .metrics
+                .as_ref()
+                .is_some_and(|attached| attached.shares_state_with(&vhost_user_metrics))
+        );
+        let initialized_metrics = vhost_user_metrics.snapshot();
+        assert!(initialized_metrics.init_time_us().is_some());
+        assert_eq!(initialized_metrics.activate_fails(), 0);
+        assert_eq!(initialized_metrics.cfg_fails(), 0);
+        assert_eq!(initialized_metrics.activate_time_us(), None);
+        assert_eq!(initialized_metrics.config_change_time_us(), None);
+        assert!(!prepared.attach_vhost_user_metrics(vhost_user_metrics.clone()));
         assert_eq!(prepared.drive_id(), "vhost");
         assert!(prepared.is_root_device());
         assert_eq!(
@@ -14937,6 +15168,9 @@ mod tests {
         device
             .activate_block(VirtioMmioDeviceActivation::new(&registers, &queues))
             .expect("vhost-user block should activate");
+        let activated_metrics = vhost_user_metrics.snapshot();
+        assert_eq!(activated_metrics.activate_fails(), 0);
+        assert!(activated_metrics.activate_time_us().is_some());
         let capture = LoggerTestCapture::default();
         let (_logger_state, logger) = capture.configured_guest_logger();
         VirtioMmioDeviceActivationHandler::attach_guest_logger(&mut device, logger.clone());
@@ -14976,6 +15210,7 @@ mod tests {
         ));
         assert!(device.is_activated());
         assert_eq!(device.vhost_user_call_fd(), None);
+        assert_eq!(vhost_user_metrics.snapshot(), activated_metrics);
         let terminal = device
             .dispatch_drained_queue_notifications(&mut memory, Vec::new())
             .expect_err("terminal device should reject later dispatch");
@@ -15191,6 +15426,8 @@ mod tests {
     #[test]
     fn vhost_user_block_rejects_guest_feature_and_queue_range_before_protocol_commit() {
         let (config_space, mut device, _memory) = prepare_disconnected_test_vhost_user_device();
+        let feature_metrics = SharedVhostUserBlockDeviceMetrics::default();
+        assert!(device.attach_vhost_user_metrics(feature_metrics.clone()));
         let queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
         let guest_features = config_space.available_features() & !VIRTIO_F_VERSION_1;
         let registers = VirtioMmioDeviceRegisters::new(
@@ -15209,8 +15446,15 @@ mod tests {
         ));
         assert!(!device.is_activated());
         assert!(device.vhost_user_call_fd().is_some());
+        assert_eq!(
+            feature_metrics.snapshot(),
+            VhostUserBlockDeviceMetrics::default()
+                .with_init_time_us(feature_metrics.snapshot().init_time_us().unwrap())
+        );
 
         let (config_space, mut device, _memory) = prepare_disconnected_test_vhost_user_device();
+        let queue_metrics = SharedVhostUserBlockDeviceMetrics::default();
+        assert!(device.attach_vhost_user_metrics(queue_metrics.clone()));
         let queues = configured_mmio_queue_with_device_ring(
             TEST_QUEUE_SIZE,
             u32::try_from(TEST_MEMORY_SIZE - 4).expect("test address should fit u32"),
@@ -15233,6 +15477,8 @@ mod tests {
         ));
         assert!(!device.is_activated());
         assert!(device.vhost_user_call_fd().is_some());
+        assert_eq!(queue_metrics.snapshot().activate_fails(), 0);
+        assert_eq!(queue_metrics.snapshot().activate_time_us(), None);
     }
 
     #[test]
@@ -15298,8 +15544,11 @@ mod tests {
         .expect("test shared memory layout should validate");
         let memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
             .expect("test shared guest memory should allocate");
-        let prepared = PreparedBlockDevice::from_config_with_vhost_user(&config, frontend, &memory)
-            .expect("vhost-user block should prepare");
+        let mut prepared =
+            PreparedBlockDevice::from_config_with_vhost_user(&config, frontend, &memory)
+                .expect("vhost-user block should prepare");
+        let metrics = SharedVhostUserBlockDeviceMetrics::default();
+        assert!(prepared.attach_vhost_user_metrics(metrics.clone()));
         let (_, _, config_space, mut device) = prepared.into_parts();
         let queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
         let registers = VirtioMmioDeviceRegisters::new(
@@ -15318,10 +15567,13 @@ mod tests {
         ));
         assert!(!device.is_activated());
         assert_eq!(device.vhost_user_call_fd(), None);
+        assert_eq!(metrics.snapshot().activate_fails(), 1);
+        assert_eq!(metrics.snapshot().activate_time_us(), None);
         assert!(matches!(
             device.activate_block(VirtioMmioDeviceActivation::new(&registers, &queues)),
             Err(VirtioBlockDeviceActivationError::Terminal)
         ));
+        assert_eq!(metrics.snapshot().activate_fails(), 1);
         peer.join().expect("rejecting peer should finish");
     }
 

@@ -43,7 +43,7 @@ including the schema-runtime timestamp producer. #1788 certifies the exact
 API, process, logger, signal, boot, and lifecycle producers through two
 implemented aggregate profiles and the field-level process audit. The checked
 device audit now assigns every #1789 field to one concrete delivery child and
-terminally certifies the 129 records delivered by #1838–#1841; later child
+terminally certifies the 134 records delivered by #1838–#1842; later child
 records remain nonterminal. `corpus:metrics` and the cross-producer aggregate
 semantic remain #1790-owned. A required zero therefore proves wire-shape
 completeness only, never producer completion unless its field audit is
@@ -219,11 +219,11 @@ Static and configured identities remain distinct; exact suffix routing splits
 mapped network fields from tap-oriented gaps and applicable vCPU exits from
 retained PIO/KVM-clock fields.
 
-After #1841, the audit contains 87 `planned`, 15
-`provisional-platform-zero`, 128 `implemented`, and one `source-neutral`
-record. The 129 terminal records cover the complete pinned entropy, pmem, RTC,
-UART, balloon, memory-hotplug, vsock, static block, and configured ordinary
-block roots. `uart.flush_count` is the
+After #1842, the audit contains 82 `planned`, 15
+`provisional-platform-zero`, 133 `implemented`, and one `source-neutral`
+record. The 134 terminal records cover the complete pinned entropy, pmem, RTC,
+UART, balloon, memory-hotplug, vsock, static block, configured ordinary block,
+and configured vhost-user block roots. `uart.flush_count` is the
 source-neutral record because pinned Firecracker declares the field but has no
 producer; receive-FIFO clearing and other Bangbang-only serial diagnostics do
 not feed it. The remaining planned and provisional records are nonterminal,
@@ -273,6 +273,25 @@ restored destination starts fresh. Dynamic latency retains min/max/sum; static
 latency sums `sum_us` and leaves min/max zero exactly as pinned Firecracker
 does. The baseline advances only after a complete accepted line, preserving
 whole-observation replay after failed or ambiguously accepted publication.
+
+Vhost-user block uses a separate exact five-field owner for each live drive
+generation, shared by its configuration space, activation path, and MMIO or
+PCI device. Successful initialization measures direct or contained-broker
+connection, protocol discovery, and local frontend construction; successful
+activation measures the backend protocol commit after local queue validation.
+Only protocol-stage activation failures increment `activate_fails`. Invalid
+configuration read offsets increment `cfg_fails`, while partial-tail reads are
+zero-filled to the requested transport width, exact-end reads succeed with
+zeros, and writes remain no-ops. A successful live config refresh replaces
+`config_change_time_us` only after the backend reply, local replacement, and
+configuration interrupt all succeed.
+
+The three latency values are persistent stores while the two failure values
+are reset-on-success counters. Failed or ambiguously accepted line publication
+replays the whole observation. Empty parallel metric slots are not serialized,
+ordinary and vhost-user families cannot contaminate each other, and same-ID
+reinsertion receives a fresh generation. Vhost-user block snapshots remain
+rejected, so no metric owner or store can migrate through snapshot state.
 
 Entropy, pmem, RTC, and UART counters use one narrow owner-local value lock per
 immutable snapshot. A compound producer update and a snapshot therefore cannot
