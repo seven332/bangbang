@@ -1,0 +1,389 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "records": [
+    {
+      "id": "metrics.backpressure-loss",
+      "boundary": "backpressure",
+      "disposition": "implemented",
+      "delivery_issue": "#1790",
+      "claims": [
+        "backpressure-loss-reported"
+      ],
+      "rationale": "Nonblocking automatic publication never stalls the VMM indefinitely: a full sink records one missed output, emits only a redacted worker outcome, retains the prior successful baseline, and permits a later scheduled retry.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn handle_periodic_metrics_flush"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn write_metrics_line"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "fn no_api_periodic_metrics_failure_reschedules_and_retries_delta"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn repeated_failed_flushes_accumulate_missed_metrics"
+        }
+      ]
+    },
+    {
+      "id": "metrics.configured-cardinality",
+      "boundary": "configured-cardinality",
+      "disposition": "implemented",
+      "delivery_issue": "#1790",
+      "claims": [
+        "configured-device-cardinality"
+      ],
+      "rationale": "Canonical publication admits only validated configured block, network, and vhost-user block identities, preserves exact static/configured aggregation, and fails closed beyond the 985-root and 64 MiB bounds.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn maximum_configured_recipe_has_exact_sorted_exclusive_dynamic_roots"
+        }
+      ]
+    },
+    {
+      "id": "metrics.explicit-flush",
+      "boundary": "explicit-flush",
+      "disposition": "implemented",
+      "delivery_issue": "#1790",
+      "claims": [
+        "explicit-fallible"
+      ],
+      "rationale": "Runtime FlushMetrics uses the common publication transaction, returns a stable action error on configured sink failure, and remains a successful no-op when no sink is configured.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn flush_metrics(&mut self)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "pub fn flush_metrics_with_diagnostics"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "fn returns_state_fault_for_preboot_flush_metrics_without_mutating_state"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "fn flush_metrics_after_start_writes_configured_logger_action"
+        }
+      ]
+    },
+    {
+      "id": "metrics.hotplug-reuse",
+      "boundary": "hotplug-reuse",
+      "disposition": "implemented",
+      "delivery_issue": "#1790",
+      "claims": [
+        "hotplug-generation-freshness"
+      ],
+      "rationale": "Configured metric owners join and leave canonical snapshots with device hotplug, removed identities disappear, and later reuse of the same identifier starts a fresh owner generation without replaying the retired interval.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedBlockDeviceMetricsRegistry"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedPmemDeviceMetricsRegistry"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_hotplugs_flushes_and_reuses_runtime_pmem_from_exact_unused_grants"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn vhost_metrics_are_typed_scoped_and_fresh_across_same_id_reuse"
+        }
+      ]
+    },
+    {
+      "id": "metrics.initial-session",
+      "boundary": "initial-session",
+      "disposition": "implemented",
+      "delivery_issue": "#1790",
+      "claims": [
+        "session-initial-once"
+      ],
+      "rationale": "A successfully started session makes one immediate best-effort metrics attempt, never writes before a session exists, and consumes the initial attempt even when its sink fails.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "pub(crate) fn handle_initial_metrics_flush"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "fn initial_metrics_failure_preserves_session_and_consumes_initial_attempt"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn automatic_initial_and_terminal_metrics_are_session_gated_and_idempotent"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_certifies_metrics_schema_across_real_periodic_and_terminal_lifecycle"
+        }
+      ]
+    },
+    {
+      "id": "metrics.periodic-60s",
+      "boundary": "periodic-sixty-seconds",
+      "disposition": "implemented",
+      "delivery_issue": "#1790",
+      "claims": [
+        "periodic-sixty-seconds"
+      ],
+      "rationale": "API and no-API owners derive the same 60-second deadline from the started session epoch, publish while Running or Paused, and schedule the next deadline after every best-effort attempt.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "fn handle_due_periodic_schedulers"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "handle_due_no_api_periodic_schedulers"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/periodic_metrics.rs",
+          "anchor": "FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn handle_periodic_metrics_flush"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "fn no_api_wait_periodic_metrics_timeout_flushes_after_start_without_sleeping"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/periodic_metrics.rs",
+          "anchor": "fn metrics_scheduler_uses_firecracker_interval_from_session_epoch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_certifies_metrics_schema_across_real_periodic_and_terminal_lifecycle"
+        }
+      ]
+    },
+    {
+      "id": "metrics.process-isolation",
+      "boundary": "process-isolation",
+      "disposition": "implemented",
+      "delivery_issue": "#1790",
+      "claims": [
+        "process-isolation"
+      ],
+      "rationale": "Each VMM controller owns an independent process snapshot, previous-success baseline, configured device registries, and output sink; contained grants preserve that isolation across concurrent launcher/worker sessions.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "metrics_state: metrics::MetricsState"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn with_shared_process_metrics"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_keeps_concurrent_output_grant_sessions_isolated"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn independent_metrics_states_do_not_consume_each_others_deltas"
+        }
+      ]
+    },
+    {
+      "id": "metrics.publication-transaction",
+      "boundary": "publication-transaction",
+      "disposition": "implemented",
+      "delivery_issue": "#1790",
+      "claims": [
+        "complete-line-commit-atomicity",
+        "previous-success-retry",
+        "concurrent-cut-ownership",
+        "lost-output-accounting",
+        "final-attempt-once"
+      ],
+      "rationale": "One immutable producer cut is committed only after complete JSON, newline, and flush success; a partial or ambiguously accepted failure retains the prior successful baseline, counts one lost output, replays at least once with post-cut events in the next generation, and does not reopen a consumed final attempt.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "pub(crate) fn handle_terminal_metrics_flush"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn write_metrics_line"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "fn terminal_metrics_sink_failure_preserves_result_and_consumes_final_attempt"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn cross_producer_publication_transaction_replays_a_coherent_cut_after_partial_failure"
+        }
+      ]
+    },
+    {
+      "id": "metrics.snapshot-destination",
+      "boundary": "snapshot-destination",
+      "disposition": "product-boundary",
+      "delivery_issue": "#1790",
+      "claims": [
+        "snapshot-destination-freshness"
+      ],
+      "rationale": "Metrics configuration, sink ownership, previous-success intervals, and live producer counters are not snapshot state; every restored process uses its independently configured destination and fresh product-local metric owners.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn load_snapshot"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "metrics_state: metrics::MetricsState"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn configure_snapshot_destination_metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_certifies_native_v2_storage_epochs_over_mmio_and_pci"
+        }
+      ]
+    },
+    {
+      "id": "metrics.terminal-final-attempt",
+      "boundary": "terminal-final-attempt",
+      "disposition": "implemented",
+      "delivery_issue": "#1790",
+      "claims": [
+        "terminal-best-effort-once"
+      ],
+      "rationale": "Ordinary convergence settles shutdown and logger loss before one best-effort final metrics attempt; sink failure never replaces the process result and repeated convergence cannot write another final line.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "pub(crate) fn handle_terminal_metrics_flush"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "pub(crate) fn handle_terminal_observability"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "fn terminal_logger_failure_is_counted_before_final_metrics_and_preserves_result"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "fn terminal_metrics_sink_failure_preserves_result_and_consumes_final_attempt"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn automatic_initial_and_terminal_metrics_are_session_gated_and_idempotent"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_certifies_metrics_schema_across_real_periodic_and_terminal_lifecycle"
+        }
+      ]
+    }
+  ]
+}

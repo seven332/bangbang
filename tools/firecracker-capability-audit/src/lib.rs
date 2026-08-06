@@ -8,6 +8,9 @@ mod metrics_certify;
 mod metrics_device_certify;
 mod metrics_device_model;
 mod metrics_device_validate;
+mod metrics_lifecycle_certify;
+mod metrics_lifecycle_model;
+mod metrics_lifecycle_validate;
 mod metrics_model;
 mod metrics_process_certify;
 mod metrics_process_model;
@@ -29,7 +32,7 @@ pub use logger_model::{
 pub use logger_upstream::derive_logger_producer_manifest;
 pub use logger_validate::validate_logger_producers;
 pub use metrics_certify::{
-    METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS, RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS,
+    METRICS_AGGREGATE_CAPABILITY_IDS, METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS,
     validate_metrics_schema_compatibility,
 };
 pub use metrics_device_certify::{
@@ -40,6 +43,15 @@ pub use metrics_device_model::{
     MetricsDeviceProducerRecord,
 };
 pub use metrics_device_validate::validate_metrics_device_producers;
+pub use metrics_lifecycle_certify::validate_metrics_compatibility;
+pub use metrics_lifecycle_model::{
+    MetricsLifecycleAudit, MetricsLifecycleBoundary, MetricsLifecycleClaim,
+    MetricsLifecycleDisposition, MetricsLifecycleRecord,
+};
+pub use metrics_lifecycle_validate::{
+    METRICS_LIFECYCLE_SCENARIO_IDS, METRICS_PUBLICATION_TRANSACTION_CLAIMS,
+    validate_metrics_lifecycle,
+};
 pub use metrics_model::{
     MetricsAggregation, MetricsArchitecture, MetricsCardinality, MetricsDynamicFamily,
     MetricsFieldPolicy, MetricsJsonType, MetricsPolicyProfile, MetricsProducerDisposition,
@@ -88,6 +100,8 @@ pub const METRICS_SCHEMA_GENERATOR_VERSION: u32 = 1;
 pub const METRICS_PROCESS_PRODUCER_AUDIT_SCHEMA_VERSION: u32 = 1;
 /// Current checked-in device-producer audit format.
 pub const METRICS_DEVICE_PRODUCER_AUDIT_SCHEMA_VERSION: u32 = 1;
+/// Current checked aggregate metrics lifecycle audit format.
+pub const METRICS_LIFECYCLE_AUDIT_SCHEMA_VERSION: u32 = 1;
 /// Repository-relative generated source manifest path.
 pub const SOURCE_MANIFEST_PATH: &str = "compat/firecracker/v1.16.0/source-manifest.json";
 /// Repository-relative human capability overlay path.
@@ -106,6 +120,9 @@ pub const METRICS_PROCESS_PRODUCER_AUDIT_PATH: &str =
 /// Repository-relative exact device-producer audit path.
 pub const METRICS_DEVICE_PRODUCER_AUDIT_PATH: &str =
     "compat/firecracker/v1.16.0/metrics-device-producer-audit.json";
+/// Repository-relative aggregate metrics lifecycle audit path.
+pub const METRICS_LIFECYCLE_AUDIT_PATH: &str =
+    "compat/firecracker/v1.16.0/metrics-lifecycle-audit.json";
 
 /// Error produced while reading, parsing, or deriving an inventory.
 #[derive(Debug)]
@@ -204,6 +221,16 @@ pub fn read_metrics_device_producer_audit(
     })
 }
 
+/// Read and parse the checked aggregate metrics lifecycle audit.
+pub fn read_metrics_lifecycle_audit(path: &Path) -> Result<MetricsLifecycleAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!("failed to read metrics lifecycle audit: {error}"))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!("failed to parse metrics lifecycle audit: {error}"))
+    })
+}
+
 /// Serialize a generated source manifest using canonical pretty JSON.
 pub fn source_manifest_json(manifest: &SourceManifest) -> Result<Vec<u8>, AuditError> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -263,6 +290,11 @@ pub fn metrics_device_producer_audit_json(
     audit: &MetricsDeviceProducerAudit,
 ) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "metrics device producer audit")
+}
+
+/// Serialize the aggregate metrics lifecycle audit using canonical pretty JSON.
+pub fn metrics_lifecycle_audit_json(audit: &MetricsLifecycleAudit) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "metrics lifecycle audit")
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>, AuditError> {

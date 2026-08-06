@@ -12866,7 +12866,36 @@
       "source_refs": [
         "corpus:metrics"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/metrics-lifecycle-audit.json",
+          "anchor": "metrics.publication-transaction"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_lifecycle_certify.rs",
+          "anchor": "pub fn validate_metrics_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_certifies_metrics_schema_across_real_periodic_and_terminal_lifecycle"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_aggregate_compatibility_is_terminal_and_fail_closed"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_lifecycle.rs",
+          "anchor": "fn checked_lifecycle_matrix_is_exact_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "corpus:mmds-design",
@@ -15552,7 +15581,51 @@
         "corpus:metrics",
         "corpus:specification"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/periodic_metrics.rs",
+          "anchor": "FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "pub(crate) fn handle_terminal_observability"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_lifecycle_certify.rs",
+          "anchor": "pub fn validate_metrics_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "fn terminal_metrics_sink_failure_preserves_result_and_consumes_final_attempt"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_certifies_metrics_schema_across_real_periodic_and_terminal_lifecycle"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn cross_producer_publication_transaction_replays_a_coherent_cut_after_partial_failure"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_aggregate_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "semantic.process:cli-config-readiness-and-api-socket",

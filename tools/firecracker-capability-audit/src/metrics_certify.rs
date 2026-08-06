@@ -22,8 +22,8 @@ pub const METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS: [&str; 12] = [
     "api-schema:TokenBucket",
 ];
 
-/// Aggregate metrics capabilities intentionally retained for #1790.
-pub const RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS: [&str; 2] = [
+/// Exact aggregate metrics capabilities transitioned atomically by #1790.
+pub const METRICS_AGGREGATE_CAPABILITY_IDS: [&str; 2] = [
     "corpus:metrics",
     "semantic.observability:metrics-schema-producers-flush-and-lifecycle",
 ];
@@ -76,17 +76,7 @@ pub fn validate_metrics_schema_compatibility(
             )),
         }
     }
-    for id in RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS {
-        match capabilities.get(id) {
-            Some(capability) if capability.disposition == Disposition::AuditRequired => {}
-            Some(_) => errors.push(format!(
-                "metrics schema certification requires retained audit-required capability: {id}"
-            )),
-            None => errors.push(format!(
-                "retained metrics aggregate capability is missing: {id}"
-            )),
-        }
-    }
+    validate_aggregate_transition(&capabilities, &mut errors);
     match std::fs::read_to_string(repository_root.join(OBSERVABILITY_CONTRACT_PATH)) {
         Ok(contract) => validate_owned_contract(&contract, &mut errors),
         Err(_) => errors.push(
@@ -168,6 +158,33 @@ pub fn validate_metrics_schema_compatibility(
         Ok(())
     } else {
         Err(ValidationErrors::from_messages(errors))
+    }
+}
+
+fn validate_aggregate_transition(
+    capabilities: &BTreeMap<&str, &crate::Capability>,
+    errors: &mut Vec<String>,
+) {
+    let mut dispositions = Vec::new();
+    for id in METRICS_AGGREGATE_CAPABILITY_IDS {
+        match capabilities.get(id) {
+            Some(capability) => dispositions.push(capability.disposition),
+            None => errors.push(format!("metrics aggregate capability is missing: {id}")),
+        }
+    }
+    if dispositions.len() != METRICS_AGGREGATE_CAPABILITY_IDS.len() {
+        return;
+    }
+    let retained = dispositions
+        .iter()
+        .all(|disposition| *disposition == Disposition::AuditRequired);
+    let terminal = dispositions
+        .iter()
+        .all(|disposition| *disposition == Disposition::ImplementedAndVerified);
+    if !retained && !terminal {
+        errors.push(format!(
+            "metrics schema certification requires the exact aggregate transition: both audit-required or both implemented-and-verified, found {dispositions:?}"
+        ));
     }
 }
 

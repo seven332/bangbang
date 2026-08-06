@@ -1575,7 +1575,7 @@ one vhost-user block. It requires the exact 231 device leaf paths, exactly 25
 intentional active zeros, equal replay after an ambiguous accepted write, and
 the expected idle reset/store behavior. The composed audit test rejects
 partial or platform-candidate profile promotion, evidence/anchor drift, field
-census regression, and premature #1790 promotion.
+census regression, and a hybrid #1790 transition.
 
 Focused #1838 producer coverage lives with the owning runtime modules. It
 checks entropy popped-descriptor accounting and owner attachment, exact pmem
@@ -1761,7 +1761,8 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 
 Metrics-schema-final mode requires the exact twelve #1787 rows to be terminal,
 the schema-runtime timestamp profile to be implemented, both #1790 aggregates
-to remain nonterminal, both process-lifecycle profiles to be implemented, and
+to occupy one coherent historical or terminal state, both process-lifecycle
+profiles to be implemented, and
 the device policy profiles to form either the complete historical handoff or
 the complete terminal projection, never a hybrid. It also validates the
 terminal 69-field process audit in delivery
@@ -1787,7 +1788,8 @@ implemented process profiles and all 69 field records to remain terminal at
 exactly 64 implemented, one source-neutral, and four platform-zero. The checked
 authority has ten implemented device profiles and a terminal 231-field audit,
 but this process-scoped gate still consumes that audit in delivery mode. The
-two aggregates remain #1790-owned.
+two aggregates remain #1790-owned and must form the same coherent historical or
+terminal pair.
 The composed test mutates both a field record and an aggregate process profile;
 the lower-level suite separately exercises every membership, ordering,
 ownership, boundary, child, rationale, disposition, evidence, path, and baseline
@@ -1803,8 +1805,28 @@ Metrics-device-final composes schema-final and process-final, requires the
 exact ten terminal device profile IDs and common resolvable evidence, and
 applies final validation to all 231 device records at 212 implemented, two
 source-neutral, 17 platform-zero, and zero nonterminal. The gate pins both
-#1790 aggregate capabilities to `audit-required`; it does not change snapshot
-formats or claim durable/exactly-once publication.
+#1790 aggregate capabilities to one coherent historical or terminal state; it
+consumes the lifecycle ledger in delivery mode but does not apply the aggregate
+terminal capability/owner composition, change snapshot formats, or claim
+durable/exactly-once publication.
+
+The terminal aggregate metrics gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
+```
+
+Metrics-final composes device-final with final-mode validation of the exact ten
+#1790 lifecycle records, their local anchored evidence, the terminal capability
+pair, and the matching Wave 7 owner rows. The matrix covers initial, real
+60-second periodic, explicit, terminal, backpressure, partial/failure/retry,
+configured cardinality, snapshot-destination freshness, hotplug/reuse, and
+process isolation. A scripted cross-producer transaction proves the one
+coherent process/device commit, success-only baseline, one missed output, and
+at-least-once replay after a visible prefix; separate lifecycle tests retain
+the one-shot best-effort final-attempt proof. Complete-line atomicity means the
+producer commits only after JSON, newline, and flush succeed, not that an
+external sink cannot expose a prefix.
 
 Current-main integration evidence is intentionally composed from the existing
 oracles: runtime publication tests cover stable cuts, partial/failing sinks,
@@ -1896,6 +1918,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
 cargo check --workspace --all-targets --all-features --locked
 cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 cargo check -p bangbang-snapshot-tools --all-targets --all-features --locked --target aarch64-unknown-linux-musl
@@ -2797,6 +2820,14 @@ Only JSON-plus-newline-plus-flush success advances the typed baseline. Every
 failure increments `missed_metrics_count`; ambiguous accepted prefixes replay
 at least once. Tests also require closed Display/Debug errors to omit paths,
 configured IDs, fragments, and values.
+
+The aggregate transaction oracle adds a populated configured-device cut to a
+stable process cut, accepts a known prefix before a scripted failure, injects a
+post-cut process event, and then requires one canonical retry with the original
+coherent process/device generation and one missed output. Its following idle
+line proves Incremental resets and Store retention. This establishes
+complete-line commit atomicity and at-least-once replay; it deliberately does
+not assert all-or-none visibility of bytes already accepted by the sink.
 
 Process-cut tests place missed-log, rate-limited-log, and SIGPIPE events between
 two `SeqCst` scans without sleeps, force all 64 busy retries, then require a

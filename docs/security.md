@@ -3085,15 +3085,17 @@ private error, or metrics section. The signed HVF lifecycle oracle additionally
 observes canonical initial, real 60-second Paused and Running periodic,
 explicit, and terminal records through one adopted write-only sink. This does
 not grant new authority; it observes the completed #1788 profile handoff
-without promoting #1789, closing either #1790 aggregate, or turning
-best-effort metrics into a durable audit channel.
+without treating #1789 producer evidence as schema evidence or independently
+certifying the #1790 lifecycle matrix. It does not turn best-effort metrics
+into a durable audit channel.
 
 The separate #1788 process-producer audit is now terminal for all 69 fields:
 64 implemented, one source-neutral, and four platform-zero. Its two aggregate
 schema profiles are implemented, while the dedicated
 `validate --metrics-process-final` gate applies final mode to every exact field
 record without treating the separate device audit as process evidence or
-promoting #1790 aggregates. Its
+certifying the #1790 lifecycle matrix. The two aggregate rows must still occupy
+one coherent historical or terminal state. Its
 signal/panic slice proves persistent SIGHUP/SIGXCPU/SIGXFSZ/panic Stores in the
 stable process cut, immediate platform-zero SIGILL/SIGBUS/SIGSEGV, and macOS
 platform-zero `seccomp.num_faults`. Explicit SIGSYS remains an exit-code path,
@@ -3104,12 +3106,26 @@ The dedicated `validate --metrics-device-final` gate then requires the exact
 ten implemented device profiles, resolves their common local evidence, and
 applies final mode to all 231 device records at the exact 212 implemented, two
 source-neutral, and 17 platform-zero census. It also requires both #1790
-aggregate capabilities to remain `audit-required`. The portable composition
-test exercises exactly 231 device leaves, 25 intentional active zeros, and
-ambiguous accepted-write replay; signed direct, App Sandbox, snapshot, and
-production tests retain the actual trust-boundary evidence. Profile promotion
-adds no descriptor, grant, host path, dynamic identity source, snapshot field,
-or durable-delivery claim.
+aggregate capabilities to occupy one coherent historical or terminal state;
+the device-scoped command consumes the lifecycle ledger in delivery mode but
+does not apply the aggregate terminal capability/owner composition. The
+portable composition test exercises exactly 231 device leaves, 25 intentional
+active zeros, and ambiguous accepted-write replay; signed direct, App Sandbox,
+snapshot, and production tests retain the actual trust-boundary evidence.
+Profile promotion adds no descriptor, grant, host path, dynamic identity
+source, snapshot field, or durable-delivery claim.
+
+The aggregate `validate --metrics-final` gate closes #1790 only when the exact
+ten lifecycle records, exact evidence anchors, terminal capability rows, and
+Wave 7 owner rows agree. Its composed transaction oracle binds one stable
+process cut and one device cut to a success-only baseline, reports a failed
+output, replays the prior interval, and permits only one final attempt. This is
+complete-line commit atomicity, not byte-level sink atomicity: an external
+reader may observe a prefix before failure, so delivery remains best effort,
+non-durable, and at least once after ambiguity. Metrics configuration,
+baselines, counters, sink authority, and scheduler state stay destination-local
+across snapshot restore; the matrix makes that freshness a product boundary
+rather than adding snapshot bytes.
 
 Current session-initial, periodic, explicit, normal-terminal, and classified
 external-fatal terminal metrics lines

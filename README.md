@@ -138,15 +138,22 @@ platform-zero records. The latter are the two immutable-MAC fields plus six
 arm64-retained i8042 and nine PIO/KVM-clock fields. All 231 records are
 terminal and map to ten implemented shared device profiles. The dedicated
 device gate verifies that exact profile set, its resolvable evidence, the
-212/2/17 field census, and the retained #1790 corpus boundary.
+212/2/17 field census, and the terminal #1790 lifecycle handoff.
 
-The terminal 69-field API/process and 231-field device metrics producer scopes
-have separate fail-closed certification gates:
+The terminal 69-field API/process, 231-field device, and ten-scenario aggregate
+metrics scopes have separate fail-closed certification gates:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
 ```
+
+The aggregate gate promotes exactly the metrics corpus and lifecycle semantic.
+Its checked ledger covers initial, real 60-second, explicit, terminal,
+backpressure, retry, configured cardinality, snapshot-destination freshness,
+hotplug/reuse, and process isolation behavior without claiming durable or
+exactly-once output.
 
 When the pinned sibling checkout is available at `../firecracker`, verify its
 source identities and anchors with:

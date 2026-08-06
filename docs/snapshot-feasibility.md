@@ -70,10 +70,11 @@ common virtio features and queues, interrupt/reset state, and coherent MMIO/PCI
 placement. Kind 13 has a 640-byte calculated worst case and a defensive
 64-KiB component cap. It excludes live connections, accepts, packets, wakeups,
 deadlines, metrics, descriptors, grants, sessions, and host handles.
-The #1847 device-metrics final gate does not add snapshot bytes or migrate a
-snapshot version. Device metric owners remain destination-local and fresh;
-the gate instead verifies the post-restore public line through the same exact
-231-field schema, terminal 212/2/17 device audit, and signed snapshot oracles.
+The #1790 aggregate metrics-final gate does not add snapshot bytes or migrate a
+snapshot version. Metrics configuration, sinks, previous-success baselines,
+and live process/device counters remain destination-local and fresh; the gate
+instead composes the exact schema, terminal 64/1/4 process and 212/2/17 device
+audits, one `product-boundary` lifecycle row, and signed snapshot oracles.
 The public process reconstructs the complete multi-vCPU
 platform, time/identity ownership, fresh serial endpoint, any storage owners,
 fresh entropy source/metrics/scheduler/notifier/route/endpoint owners, and fresh

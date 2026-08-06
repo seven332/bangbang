@@ -8930,6 +8930,99 @@ mod tests {
     }
 
     #[test]
+    fn cross_producer_publication_transaction_replays_a_coherent_cut_after_partial_failure() {
+        const ACCEPTED_PREFIX_BYTES: usize = 24;
+
+        let output = ScriptedMetricsOutput::new([
+            ScriptedWrite::Accept(ACCEPTED_PREFIX_BYTES),
+            ScriptedWrite::Error(ErrorKind::BrokenPipe),
+        ]);
+        let mut state = MetricsState::with_test_output(output.clone());
+        let logger_metrics = state.shared_process_metrics.logger_metrics();
+        let signal_metrics = state.shared_process_metrics.signal_metrics();
+        let post_cut_fired = Arc::new(AtomicBool::new(false));
+        state.clock = Box::new(ProcessEventClock {
+            now: UNIX_EPOCH + Duration::from_millis(1),
+            fired: Arc::clone(&post_cut_fired),
+            logger_metrics,
+            signal_metrics,
+        });
+        state.record_deprecated_api_call();
+        let block = block_metrics_with_all_fields();
+        let diagnostics = MetricsDiagnostics::new()
+            .with_block_device_metrics(block)
+            .with_block_device_metrics_by_drive(
+                BlockDeviceMetricsByDrive::new().with_drive_metrics("rootfs", block),
+            );
+        let configured = configured_metrics_devices(&["rootfs"], &[], &[]);
+
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        assert!(post_cut_fired.load(Ordering::SeqCst));
+        assert_eq!(state.process_generation, 1);
+        assert_eq!(state.previous_successful.generation, 0);
+        assert_eq!(state.logger_metrics.missed_metrics_count, 1);
+
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
+        assert_eq!(state.process_generation, 2);
+        assert_eq!(state.previous_successful.generation, 2);
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
+        assert_eq!(state.process_generation, 3);
+        assert_eq!(state.previous_successful.generation, 3);
+
+        let bytes = output.bytes();
+        let accepted_prefix = bytes
+            .get(..ACCEPTED_PREFIX_BYTES)
+            .expect("failed attempt should expose the scripted prefix");
+        let complete = std::str::from_utf8(
+            bytes
+                .get(ACCEPTED_PREFIX_BYTES..)
+                .expect("successful publications should follow the prefix"),
+        )
+        .expect("complete metrics publications should be UTF-8");
+        let lines = complete.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            accepted_prefix,
+            lines[0]
+                .as_bytes()
+                .get(..ACCEPTED_PREFIX_BYTES)
+                .expect("retry should contain the accepted prefix"),
+            "an ambiguous visible prefix must be replayed at least once"
+        );
+
+        let retry: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("retry must be one complete canonical line");
+        assert_eq!(retry["utc_timestamp_ms"], 1);
+        assert_eq!(retry["deprecated_api"]["deprecated_http_api_calls"], 1);
+        assert_eq!(retry["logger"]["missed_log_count"], 1);
+        assert_eq!(retry["logger"]["missed_metrics_count"], 1);
+        assert_eq!(retry["logger"]["rate_limited_log_count"], 1);
+        assert_eq!(retry["signals"]["sigpipe"], 1);
+        assert_eq!(retry["block_rootfs"]["update_count"], 10);
+        assert_eq!(retry["block"]["update_count"], 10);
+
+        let idle: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("idle success must be one complete line");
+        assert_eq!(idle["deprecated_api"]["deprecated_http_api_calls"], 0);
+        assert_eq!(idle["logger"]["missed_log_count"], 0);
+        assert_eq!(idle["logger"]["missed_metrics_count"], 0);
+        assert_eq!(idle["logger"]["rate_limited_log_count"], 0);
+        assert_eq!(idle["signals"]["sigpipe"], 0);
+        assert_eq!(idle["block_rootfs"]["update_count"], 0);
+        assert_eq!(idle["block_rootfs"]["read_agg"]["min_us"], 12);
+        assert_eq!(idle["block_rootfs"]["read_agg"]["sum_us"], 0);
+    }
+
+    #[test]
     fn captures_the_clock_once_for_both_serialization_passes() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
