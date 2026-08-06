@@ -10,7 +10,8 @@ The starting boundary is exact: 93 records belong to #1491 and nine records
 remain named #1373, #1378, or Wave 8 handoffs. Ownership is stable even as an
 owning child changes its rows from `audit-required` to a supported terminal
 disposition. Producer-only children #1785, #1788, and #1789 intentionally own
-no early disposition; their work feeds #1786, #1790, and #1799 respectively.
+no aggregate disposition; their merged work feeds the terminal #1786, #1790,
+and #1799 certification boundaries respectively.
 
 ## Evidence keys
 
@@ -53,6 +54,9 @@ no early disposition; their work feeds #1786, #1790, and #1799 respectively.
   ordinary-production/App Sandbox real-period lifecycle in
   `crates/api/src/http.rs`, `crates/bangbang/src/api_server.rs`, and
   `crates/launcher/tests/production_bundle_e2e.rs`.
+- **METRICS-LIFECYCLE**: exact ten-scenario aggregate authority and certifier in
+  `compat/firecracker/v1.16.0/metrics-lifecycle-audit.json` and the audit
+  tool's lifecycle validator/certifier modules.
 
 ## Core API certification
 
@@ -97,13 +101,22 @@ Running periodic, explicit, and terminal lines.
 
 The gate requires the exact #1787 row set, one implemented schema-runtime
 profile, two implemented process-lifecycle profiles, one complete nonhybrid
-device transition shape, and both #1790 aggregates still `audit-required`.
-The checked authority now uses ten implemented #1789 device profiles. The
-separate `validate --metrics-process-final` gate applies final-mode validation
-to all 69 exact #1788 producer records, while
-`validate --metrics-device-final` additionally requires the exact 231-record
-212/2/17 device census and resolvable common evidence. Neither claims #1790's
-cross-producer completion.
+device transition shape, and a coherent #1790 aggregate pair. The checked
+authority uses ten implemented #1789 device profiles. The separate
+`validate --metrics-process-final` gate applies final-mode validation to all
+69 exact #1788 producer records, while `validate --metrics-device-final`
+additionally requires the exact 231-record 212/2/17 device census and
+resolvable common evidence.
+
+The terminal `validate --metrics-final` gate composes those scopes with the
+checked ten-record lifecycle matrix. It requires exact initial, real
+60-second, explicit, terminal, backpressure, transaction, configured
+cardinality, snapshot-destination, hotplug/reuse, and process-isolation rows.
+The transaction row alone owns complete-line commit atomicity,
+previous-success retry, concurrent-cut ownership, lost-output accounting, and
+one-shot final behavior. Both #1790 capability rows and owner rows are now
+`implemented-and-verified`; partial promotion, claim/evidence drift, or a
+regressed producer census fails closed.
 
 ## X86 CPUID/MSR platform boundary
 
@@ -190,8 +203,8 @@ remain in the CPU-template contract.
 | `api-schema:Metrics` | #1787 | `implemented-and-verified` |
 | `api-schema:RateLimiter` | #1787 | `implemented-and-verified` |
 | `api-schema:TokenBucket` | #1787 | `implemented-and-verified` |
-| `corpus:metrics` | #1790 | `audit-required` |
-| `semantic.observability:metrics-schema-producers-flush-and-lifecycle` | #1790 | `audit-required` |
+| `corpus:metrics` | #1790 | `implemented-and-verified` |
+| `semantic.observability:metrics-schema-producers-flush-and-lifecycle` | #1790 | `implemented-and-verified` |
 | `corpus:tracing` | #1791 | `audit-required` |
 | `tool-argument:cpu-template-helper/template/dump/config` | #1792 | `audit-required` |
 | `tool-argument:cpu-template-helper/template/dump/output` | #1792 | `audit-required` |
@@ -247,10 +260,11 @@ remain in the CPU-template contract.
 logger operation/path/schema/property rows to `implemented-and-verified`, and
 #1810 certifies and promotes both aggregate logger rows after the exact
 producer, focused, process, signed, contained, and isolation gates pass. The
-#1787 metrics schema/API certification moves its exact twelve rows
-to `implemented-and-verified` while retaining both #1790 aggregate rows. The
-current inventory is therefore exactly 341 implemented, 44 audit-required,
-three missing-platform-feasible, and 30 proven-platform-impossible. If every other
+#1787 metrics schema/API certification moves its exact twelve rows to
+`implemented-and-verified`; #1790 now promotes its exact two aggregate rows
+after the schema, process, device, lifecycle, and signed gates pass. The current
+inventory is therefore exactly 343 implemented, 42 audit-required, three
+missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the
 prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the
 current row set, not quotas; the authoritative totals remain derived from

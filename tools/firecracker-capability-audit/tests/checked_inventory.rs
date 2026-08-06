@@ -5,17 +5,19 @@ use bangbang_firecracker_capability_audit::{
     AuditMode, CAPABILITY_INVENTORY_PATH, Disposition, LOGGER_COMPATIBILITY_CAPABILITY_IDS,
     LOGGER_PRODUCER_AUDIT_PATH, LOGGER_PRODUCER_MANIFEST_PATH, LoggerClassDisposition,
     LoggerCompiledEvent, LoggerDeliveryPolicy, LoggerNonApplicableReason,
-    METRICS_DEVICE_PRODUCER_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
+    METRICS_AGGREGATE_CAPABILITY_IDS, METRICS_DEVICE_PRODUCER_AUDIT_PATH,
+    METRICS_LIFECYCLE_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
     METRICS_SCHEMA_AUTHORITY_PATH, METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS,
     MetricsDeviceProducerDisposition, MetricsProcessProducerDisposition,
-    MetricsProducerDisposition, MetricsProducerOwner, RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS,
-    Reference, SOURCE_MANIFEST_PATH, TERMINAL_DEVICE_POLICY_PROFILE_IDS,
-    logger_producer_audit_json, logger_producer_manifest_json, read_capability_inventory,
-    read_logger_producer_audit, read_logger_producer_manifest, read_metrics_device_producer_audit,
+    MetricsProducerDisposition, MetricsProducerOwner, Reference, SOURCE_MANIFEST_PATH,
+    TERMINAL_DEVICE_POLICY_PROFILE_IDS, logger_producer_audit_json, logger_producer_manifest_json,
+    read_capability_inventory, read_logger_producer_audit, read_logger_producer_manifest,
+    read_metrics_device_producer_audit, read_metrics_lifecycle_audit,
     read_metrics_process_producer_audit, read_metrics_schema_authority, read_source_manifest,
     source_manifest_json, validate, validate_logger_compatibility, validate_logger_producers,
-    validate_metrics_device_compatibility, validate_metrics_device_producers,
-    validate_metrics_process_compatibility, validate_metrics_schema_compatibility,
+    validate_metrics_compatibility, validate_metrics_device_compatibility,
+    validate_metrics_device_producers, validate_metrics_process_compatibility,
+    validate_metrics_schema_compatibility,
 };
 
 #[test]
@@ -628,11 +630,11 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
         METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS.len()
     );
     assert_eq!(
-        RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS
+        METRICS_AGGREGATE_CAPABILITY_IDS
             .into_iter()
             .collect::<BTreeSet<_>>()
             .len(),
-        RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS.len()
+        METRICS_AGGREGATE_CAPABILITY_IDS.len()
     );
     validate_metrics_schema_compatibility(&manifest, &inventory, &authority, &repository_root)
         .expect("checked metrics API/schema compatibility scope must be terminal");
@@ -643,7 +645,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| { capability.disposition == Disposition::ImplementedAndVerified })
             .count(),
-        341
+        343
     );
     assert_eq!(
         inventory
@@ -651,7 +653,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| capability.disposition == Disposition::AuditRequired)
             .count(),
-        44
+        42
     );
     assert_eq!(
         inventory
@@ -721,22 +723,24 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
     .to_string();
     assert!(error.contains("implemented-and-verified requires validation references"));
 
-    let mut promoted_aggregate = inventory.clone();
-    promoted_aggregate
+    let mut hybrid_aggregate = inventory.clone();
+    let aggregate = hybrid_aggregate
         .capabilities
         .iter_mut()
         .find(|capability| capability.id == "corpus:metrics")
-        .expect("retained metrics corpus must exist")
-        .disposition = Disposition::ImplementedAndVerified;
+        .expect("terminal metrics corpus must exist");
+    aggregate.disposition = Disposition::AuditRequired;
+    aggregate.implementation.clear();
+    aggregate.validation.clear();
     let error = validate_metrics_schema_compatibility(
         &manifest,
-        &promoted_aggregate,
+        &hybrid_aggregate,
         &authority,
         &repository_root,
     )
-    .expect_err("promoted #1790 aggregate must fail schema certification")
+    .expect_err("hybrid #1790 aggregate transition must fail schema certification")
     .to_string();
-    assert!(error.contains("requires retained audit-required capability"));
+    assert!(error.contains("requires the exact aggregate transition"));
 
     let mut stale_schema_runtime = authority.clone();
     let profile = stale_schema_runtime
@@ -1128,24 +1132,135 @@ fn checked_metrics_device_compatibility_is_terminal_and_fail_closed() {
     assert!(error.contains("final metrics device producer validation rejects nonterminal record"));
     assert!(error.contains("exact terminal 231-record census"));
 
-    let mut promoted = inventory.clone();
-    promoted
+    let mut hybrid = inventory.clone();
+    let aggregate = hybrid
         .capabilities
         .iter_mut()
         .find(|capability| capability.id == "corpus:metrics")
-        .expect("retained metrics corpus must exist")
-        .disposition = Disposition::ImplementedAndVerified;
+        .expect("terminal metrics corpus must exist");
+    aggregate.disposition = Disposition::AuditRequired;
+    aggregate.implementation.clear();
+    aggregate.validation.clear();
     let error = validate_metrics_device_compatibility(
         &manifest,
-        &promoted,
+        &hybrid,
         &authority,
         &process_audit,
         &device_audit,
         &repository_root,
     )
-    .expect_err("premature #1790 promotion must fail device certification")
+    .expect_err("hybrid #1790 transition must fail device certification")
     .to_string();
-    assert!(error.contains("requires retained audit-required capability"));
+    assert!(error.contains("requires the exact aggregate transition"));
+}
+
+#[test]
+fn checked_metrics_aggregate_compatibility_is_terminal_and_fail_closed() {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let manifest = read_source_manifest(&repository_root.join(SOURCE_MANIFEST_PATH))
+        .expect("checked source manifest must parse");
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let authority =
+        read_metrics_schema_authority(&repository_root.join(METRICS_SCHEMA_AUTHORITY_PATH))
+            .expect("checked metrics schema authority must parse");
+    let process_audit = read_metrics_process_producer_audit(
+        &repository_root.join(METRICS_PROCESS_PRODUCER_AUDIT_PATH),
+    )
+    .expect("checked process producer audit must parse");
+    let device_audit = read_metrics_device_producer_audit(
+        &repository_root.join(METRICS_DEVICE_PRODUCER_AUDIT_PATH),
+    )
+    .expect("checked device producer audit must parse");
+    let lifecycle_audit =
+        read_metrics_lifecycle_audit(&repository_root.join(METRICS_LIFECYCLE_AUDIT_PATH))
+            .expect("checked metrics lifecycle audit must parse");
+
+    let certification_error = |inventory, lifecycle| {
+        validate_metrics_compatibility(
+            &manifest,
+            inventory,
+            &authority,
+            &process_audit,
+            &device_audit,
+            lifecycle,
+            &repository_root,
+        )
+        .expect_err("mutated aggregate metrics scope must fail certification")
+        .to_string()
+    };
+
+    validate_metrics_compatibility(
+        &manifest,
+        &inventory,
+        &authority,
+        &process_audit,
+        &device_audit,
+        &lifecycle_audit,
+        &repository_root,
+    )
+    .expect("checked aggregate metrics compatibility scope must be terminal");
+
+    let mut hybrid = inventory.clone();
+    let capability = hybrid
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == "corpus:metrics")
+        .expect("metrics corpus capability must exist");
+    capability.disposition = Disposition::AuditRequired;
+    capability.implementation.clear();
+    capability.validation.clear();
+    let error = certification_error(&hybrid, &lifecycle_audit);
+    assert!(error.contains("requires the exact aggregate transition"));
+    assert!(error.contains("requires implemented-and-verified capability"));
+
+    let mut evidence = inventory.clone();
+    evidence
+        .capabilities
+        .iter_mut()
+        .find(|capability| {
+            capability.id == "semantic.observability:metrics-schema-producers-flush-and-lifecycle"
+        })
+        .expect("metrics semantic capability must exist")
+        .validation
+        .swap(0, 1);
+    assert!(
+        certification_error(&evidence, &lifecycle_audit)
+            .contains("requires exact capability evidence")
+    );
+
+    let mut lifecycle = lifecycle_audit.clone();
+    lifecycle.records[0].claims =
+        vec![bangbang_firecracker_capability_audit::MetricsLifecycleClaim::FinalAttemptOnce];
+    let error = certification_error(&inventory, &lifecycle);
+    assert!(error.contains("stale claims"));
+    assert!(error.contains("combined transaction claims must be owned only"));
+
+    let mut regressed_device = device_audit.clone();
+    let record = regressed_device
+        .records
+        .iter_mut()
+        .find(|record| record.disposition == MetricsDeviceProducerDisposition::Implemented)
+        .expect("implemented device record must exist");
+    record.disposition = MetricsDeviceProducerDisposition::Planned;
+    record.implementation.clear();
+    record.validation.clear();
+    let error = validate_metrics_compatibility(
+        &manifest,
+        &inventory,
+        &authority,
+        &process_audit,
+        &regressed_device,
+        &lifecycle_audit,
+        &repository_root,
+    )
+    .expect_err("regressed device producer must fail aggregate certification")
+    .to_string();
+    assert!(error.contains("final metrics device producer validation rejects nonterminal record"));
 }
 
 #[test]
@@ -1642,6 +1757,9 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     let metrics_implemented = METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let metrics_aggregate_implemented = METRICS_AGGREGATE_CAPABILITY_IDS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let impossible = X86_IMPOSSIBLE.into_iter().collect::<BTreeSet<_>>();
 
     assert_eq!(owned.len(), 93, "Wave 7 owner identities must be unique");
@@ -1650,6 +1768,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert_eq!(implemented.len(), 22);
     assert_eq!(logger_implemented.len(), 11);
     assert_eq!(metrics_implemented.len(), 12);
+    assert_eq!(metrics_aggregate_implemented.len(), 2);
     assert_eq!(impossible.len(), 13);
     assert!(implemented.is_disjoint(&impossible));
     assert!(logger_implemented.is_disjoint(&implemented));
@@ -1657,9 +1776,18 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert!(metrics_implemented.is_disjoint(&implemented));
     assert!(metrics_implemented.is_disjoint(&logger_implemented));
     assert!(metrics_implemented.is_disjoint(&impossible));
+    assert!(metrics_aggregate_implemented.is_disjoint(&implemented));
+    assert!(metrics_aggregate_implemented.is_disjoint(&logger_implemented));
+    assert!(metrics_aggregate_implemented.is_disjoint(&metrics_implemented));
+    assert!(metrics_aggregate_implemented.is_disjoint(&impossible));
     assert!(implemented.union(&impossible).all(|id| owned.contains(id)));
     assert!(logger_implemented.iter().all(|id| owned.contains(id)));
     assert!(metrics_implemented.iter().all(|id| owned.contains(id)));
+    assert!(
+        metrics_aggregate_implemented
+            .iter()
+            .all(|id| owned.contains(id))
+    );
 
     for (id, owner) in WAVE_7_OWNED.into_iter().chain(RETAINED_HANDOFFS) {
         assert!(
@@ -1719,6 +1847,24 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         assert!(
             contract.contains(&format!("| `{id}` | #1787 | `implemented-and-verified` |")),
             "contract must record implemented metrics result: {id}"
+        );
+    }
+
+    for id in &metrics_aggregate_implemented {
+        let capability = by_id
+            .get(id)
+            .expect("aggregate metrics identity must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "aggregate metrics identity must be terminal: {id}"
+        );
+        assert!(!capability.implementation.is_empty());
+        assert!(!capability.validation.is_empty());
+        assert!(capability.exclusion.is_none());
+        assert!(
+            contract.contains(&format!("| `{id}` | #1790 | `implemented-and-verified` |")),
+            "contract must record implemented aggregate metrics result: {id}"
         );
     }
 
@@ -1790,6 +1936,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         .iter()
         .chain(logger_implemented.iter())
         .chain(metrics_implemented.iter())
+        .chain(metrics_aggregate_implemented.iter())
         .chain(impossible.iter())
         .copied()
         .collect::<BTreeSet<_>>();
@@ -1820,7 +1967,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
             .contains("numeric startup/resource/performance or telemetry outcomes (#1798)")
     );
     assert!(normalized_contract.contains("final cross-capability interactions (Wave 8)"));
-    assert!(normalized_contract.contains("341 implemented, 44 audit-required"));
+    assert!(normalized_contract.contains("343 implemented, 42 audit-required"));
     assert!(normalized_contract.contains("376/9/3/30"));
 }
 
@@ -2285,8 +2432,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 341);
-    assert_eq!(count(Disposition::AuditRequired), 44);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 343);
+    assert_eq!(count(Disposition::AuditRequired), 42);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3015,8 +3162,8 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 341);
-    assert_eq!(count(Disposition::AuditRequired), 44);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 343);
+    assert_eq!(count(Disposition::AuditRequired), 42);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3312,8 +3459,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 341);
-    assert_eq!(count(Disposition::AuditRequired), 44);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 343);
+    assert_eq!(count(Disposition::AuditRequired), 42);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3461,8 +3608,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 341);
-    assert_eq!(count(Disposition::AuditRequired), 44);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 343);
+    assert_eq!(count(Disposition::AuditRequired), 42);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3731,8 +3878,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 341);
-    assert_eq!(count(Disposition::AuditRequired), 44);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 343);
+    assert_eq!(count(Disposition::AuditRequired), 42);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 

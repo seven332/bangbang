@@ -29,7 +29,10 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
   producer scope while retaining separately certified device and aggregate work.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
   --metrics-device-final`: certify the exact ten-profile, 231-field terminal device
-  producer scope while retaining #1790 aggregate work.
+  producer scope while accepting only a coherent historical or terminal aggregate pair.
+- `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+  --metrics-final`: certify the terminal ten-scenario #1790 metrics lifecycle matrix
+  and its exact aggregate capability and ownership handoff.
 - `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.
 - `cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl`: verify unsupported targets compile to the launcher's explicit platform-error path.
 - `cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf`: run non-HVF tests with all targets and features enabled.

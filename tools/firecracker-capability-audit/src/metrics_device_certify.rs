@@ -69,8 +69,8 @@ const VALIDATION_EVIDENCE: [(&str, &str); 5] = [
     ),
 ];
 
-/// Validate the exact terminal device-producer scope while retaining #1790's
-/// combined publication and corpus capabilities as nonterminal work.
+/// Validate the exact terminal device-producer scope while requiring #1790's
+/// combined publication and corpus capabilities to form one coherent state.
 pub fn validate_metrics_device_compatibility(
     manifest: &SourceManifest,
     inventory: &CapabilityInventory,

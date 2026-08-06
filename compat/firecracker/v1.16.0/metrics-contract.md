@@ -5,12 +5,13 @@ Bangbang for the pinned Firecracker v1.16.0 arm64 target. It separates schema
 presence, shared producer policy, and exact producer certification. Its
 machine-readable artifacts are [`metrics-schema.json`](metrics-schema.json),
 [`metrics-process-producer-audit.json`](metrics-process-producer-audit.json),
-and [`metrics-device-producer-audit.json`](metrics-device-producer-audit.json);
-this document explains how to interpret and update them.
+[`metrics-device-producer-audit.json`](metrics-device-producer-audit.json), and
+[`metrics-lifecycle-audit.json`](metrics-lifecycle-audit.json); this document
+explains how to interpret and update them.
 
 ## Authority Boundary
 
-The checked contract has four layers:
+The checked contract has five layers:
 
 - `metrics-schema.json.source` is machine-derived from the pinned Rust serializers and
   `tests/host_tools/fcmetrics.py`. It owns inputs and Git blobs, exact roots,
@@ -30,6 +31,10 @@ The checked contract has four layers:
   exact fields selected by device producer profiles. It records each field's
   closed operation boundary, concrete #1789 child, current disposition,
   rationale, and eventual anchored evidence without copying schema policy.
+- `metrics-lifecycle-audit.json` is the human-owned terminal #1790 composition.
+  Its exact ten records describe publication triggers, transaction/loss
+  semantics, configured cardinality, snapshot destinations, hotplug/reuse, and
+  process isolation without copying any field ledger.
 
 The policy mapping is an exact bijection over the source fields. Policy cannot
 create or remove schema identities, and source regeneration cannot manufacture
@@ -45,10 +50,10 @@ implemented aggregate profiles and the field-level process audit. The checked
 device audit now assigns every #1789 field to one concrete delivery child and
 terminally certifies all 231 records delivered by #1838–#1846. #1847 promotes
 the ten unique shared device profiles and adds the composed device-final gate.
-`corpus:metrics` and
-the cross-producer aggregate semantic remain #1790-owned. A required zero therefore proves wire-shape
-completeness only, never producer completion unless its field audit is
-terminal.
+#1790 composes those terminal producer facts with the checked lifecycle matrix
+and promotes exactly `corpus:metrics` plus the cross-producer aggregate
+semantic. A required zero therefore proves wire-shape completeness only; its
+producer disposition still comes from the exact process or device audit.
 
 ## Terminal API and Schema Certification
 
@@ -66,8 +71,8 @@ The terminal #1787 slice contains exactly twelve capability records:
   `api-schema:TokenBucket`.
 
 The scoped gate requires those exact records and their #1787 contract rows to
-be `implemented-and-verified`, while both #1790 aggregate records remain
-`audit-required`. It also pins the policy partition to one implemented
+be `implemented-and-verified`, while the two #1790 aggregate records must be
+either both historical or both terminal. It also pins the policy partition to one implemented
 schema-runtime timestamp profile, two implemented process-lifecycle profiles,
 and either the exact historical ten-planned/five-platform-zero device handoff
 or the exact terminal ten-implemented device projection. Any partial or hybrid
@@ -85,10 +90,10 @@ then one explicit line and one normal-terminal line. Each observed record is a
 newline-terminated numeric JSON tree with the canonical timestamp and without
 Bangbang-only fields.
 
-This certification remains deliberately narrower than process, device, or
-corpus closure even though its current authority observes the completed #1788
-handoff. It does not complete #1789, either #1790 aggregate, tracing, durable
-delivery, remote telemetry, or a versioned extension format.
+This certification remains deliberately narrower than process, device, and
+aggregate lifecycle closure even though its current authority observes their
+terminal state. It does not independently certify the #1790 matrix, tracing,
+durable delivery, remote telemetry, or a versioned extension format.
 
 ## Terminal Process Producer Audit
 
@@ -441,7 +446,32 @@ platform-exclusion evidence. Ordinary and earlier scoped validation modes
 consume this audit in delivery mode; repository-wide final mode rejects every
 nonterminal device record. The scoped device-final command composes
 schema/process certification with final device-audit validation, exact shared
-profiles/evidence, and the 212/2/17 census while retaining #1790.
+profiles/evidence, and the 212/2/17 census. It accepts a coherent terminal
+#1790 pair but does not itself validate the lifecycle matrix in final mode.
+
+## Terminal Aggregate Lifecycle Certification
+
+The checked lifecycle audit contains exactly ten sorted #1790 records:
+initial-session, real periodic-60s, explicit-flush, terminal-final-attempt,
+backpressure-loss, publication-transaction, configured-cardinality,
+snapshot-destination, hotplug-reuse, and process-isolation. Nine are
+`implemented`; snapshot-destination is a terminal `product-boundary` because
+metrics configuration, sink ownership, interval baselines, and live counters
+are deliberately absent from snapshots and reconstructed fresh at the
+destination.
+
+The distinguished publication transaction owns exactly five combined claims:
+complete-line **commit** atomicity, previous-success retry, concurrent-cut
+ownership, lost-output accounting, and one-shot final behavior. Commit
+atomicity means producer state and the common baseline advance only after JSON,
+newline, and flush succeed. It does not retract a prefix already accepted by a
+sink; that failure is counted and followed by at-least-once replay.
+
+`validate --metrics-final` composes schema-, process-, and device-final
+certification with final validation of this exact matrix, exact capability
+evidence, and the exact terminal #1790 ownership rows. Missing/extra/reordered
+scenarios, changed claims or rationales, evidence drift, partial capability
+promotion, or any producer-census regression fails closed.
 
 ## Exact Arm64 Shape
 
@@ -632,6 +662,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
 ```
 
 `validate --metrics-schema-final` runs repository delivery validation, the
@@ -639,15 +670,15 @@ metrics authority delivery gate, the exact twelve-row #1787 certification, and
 the logger producer delivery gate needed by metrics collection. It validates
 the exact 69-field process audit and 231-field device audit in delivery mode.
 It permits only the completed schema/process profiles, one exact complete
-device transition shape, and retained #1790 aggregate rows.
+device transition shape, and one coherent historical or terminal #1790 pair.
 
 `validate --metrics-process-final` composes that schema certification with
 final-mode process-audit validation and logger delivery validation. It requires
 all 69 records to be terminal with their exact child, boundary, rationale,
 disposition, and tracked evidence: 64 implemented, one source-neutral, and four
 platform-zero. It observes the current ten implemented device profiles but
-does not itself apply final mode to their 231 field records or promote either
-#1790 aggregate.
+does not itself apply final mode to their 231 field records or certify the
+lifecycle matrix.
 
 `validate --metrics-device-final` composes the schema/process gates with final
 validation of all 231 device records. It requires exactly ten implemented
@@ -658,8 +689,18 @@ block/network/vhost-user recipe, exactly 25 intentional active zeros, static
 and configured aggregation behavior, ambiguous accepted-write replay, and idle
 retention/reset behavior. Existing focused and signed tests retain the 985-root
 maximum, concurrency, saturation, hotplug/reuse, isolation/cleanup, snapshot,
-MMIO, and PCI evidence. Neither #1790 aggregate is promoted, and the canonical
-snapshot schema is unchanged.
+MMIO, and PCI evidence. It accepts the coherent terminal #1790 pair without
+certifying its matrix, and the canonical snapshot schema is unchanged.
+
+`validate --metrics-final` composes device-final with final validation of all
+ten lifecycle records. It requires the exact five combined transaction claims,
+exact evidence vectors with resolving anchors, exact terminal owner rows, and
+both #1790 capabilities to be `implemented-and-verified`. The focused scripted
+oracle exposes a known prefix, fails publication, injects a post-cut process
+event, retries one coherent process/device line with one missed output, and
+then proves the next idle Store/Incremental generation. Existing process and
+signed tests retain final-attempt, real 60-second, snapshot, hotplug, and
+multi-process product evidence.
 Repository-global `validate --final` remains the stronger all-capability gate.
 
 With an explicit clean sibling at the pinned commit, compare every source

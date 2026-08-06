@@ -788,7 +788,9 @@ roots through real runner, device, supervisor, and collector ownership.
 All field-level device records are terminal. The dedicated
 `validate --metrics-device-final` gate additionally requires their exact
 212/2/17 census, ten implemented shared profiles, identical resolvable common
-evidence, and both #1790 aggregate capabilities to remain nonterminal.
+evidence, and both #1790 aggregate capabilities to occupy one coherent
+historical or terminal state, never a hybrid. This device-scoped gate does not
+itself certify the separate lifecycle matrix.
 
 ### Architecture-retained arm64 metric zeros
 
@@ -849,19 +851,31 @@ platform-zero signal/seccomp records, and no planned record. Missing, extra,
 duplicate, stale, unowned, incorrectly bounded, wrongly dispositioned, or
 evidence-free records fail closed. The checked authority now contains ten
 implemented device profiles, but this process-scoped gate does not apply final
-mode to the device audit. It retains both audit-required #1790 aggregates and
-does not make best-effort terminal output durable.
+mode to the device audit. It accepts only a coherent historical or terminal
+#1790 pair and does not make best-effort terminal output durable.
 
 The scoped `validate --metrics-device-final` certification composes that
 process gate with final-mode validation of the exact 231 device records. It
 rejects a partial profile promotion, reintroduced platform candidate, evidence
-drift or unresolved anchor, changed 212/2/17 census, and premature #1790
-promotion. A portable whole-inventory oracle emits exactly 231 device leaves
+drift or unresolved anchor, changed 212/2/17 census, and a hybrid #1790
+transition. A portable whole-inventory oracle emits exactly 231 device leaves
 for one ordinary block, network, and vhost-user device, requires exactly 25
 intentional active zeros, proves static/configured agreement, replays the full
 device interval after an ambiguous accepted write, and checks idle
 reset/retention. Existing signed MMIO/PCI, snapshot, App Sandbox, and production
 oracles remain the product boundary; no snapshot schema or transport changes.
+
+The aggregate `validate --metrics-final` certification composes those producer
+gates with the exact ten-record #1790 lifecycle matrix. Nine implemented
+records cover initial, real 60-second periodic, explicit, terminal,
+backpressure, configured-cardinality, hotplug/reuse, process-isolation, and
+publication-transaction behavior; snapshot-destination freshness is an
+explicit product boundary. The distinguished publication transaction has one
+exact owner for coherent process/device cuts, success-only baselines,
+concurrent-cut ownership, lost-output accounting, and a one-shot final attempt.
+Its atomicity promise is the commit decision for a complete JSON-plus-newline
+line and flush, not all-or-none external bytes: a sink may expose a prefix,
+after which the prior interval is replayed at least once.
 
 ### Metrics triggers and errors
 
@@ -4178,7 +4192,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /mmds` | implemented; `204` empty response on successful data storage | implemented only when the MMDS store already exists; otherwise `400` `fault_message` | Stores a JSON object in the process runtime using the effective MMDS data-store limit. Pre-start requests that parse successfully and reach the VMM action create the MMDS store before validating and storing data. Runtime requests require a pre-existing store, matching Firecracker's runtime MMDS handle check. Oversized data is rejected without replacing the previous value. |
 | `PATCH /mmds` | implemented after data initialization; `204` empty response | implemented after data initialization; `204` empty response | Applies RFC 7396 merge-patch semantics to the stored JSON object using the effective MMDS data-store limit. Pre-start requests that parse successfully and reach the VMM action create the MMDS store before applying the patch, but patching still requires initialized data. Runtime requests return the same MMDS not-initialized fault when the store is absent or the store exists without initialized data. Oversized patched results are rejected without mutating the previous value. |
 | `PUT /mmds/config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Stores control-plane MMDS config before startup after runtime validation rejects empty interface lists and validates that each listed interface ID already exists in the configured network interface set. A successful config request creates the process-local MMDS store even when no data has been initialized. At startup, selected interfaces enable the complete implemented bounded guest-visible MMDS packet path over MMIO or PCI; runtime config mutation remains intentionally pre-boot-only. |
-| `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Process observability state, omitted from `GET /vm/config`. Duplicate initialization and identifiable malformed requests are counted without replacing the sink; duplicate state is rejected before a contained grant claim. Configuration writes nothing. In contained mode an exact metrics-sink reference claims one `WriteOnly` regular-file descriptor, normalizes append/nonblocking status without reopening it, and retains it for the same initial, 60-second Running/Paused periodic, explicit fallible `FlushMetrics`, and best-effort terminal transaction/schema behavior. Direct paths retain current create/FIFO behavior. The scoped #1787 gate certifies this strict request/schema slice and signed product lifecycle; the separate process-final gate certifies all 69 #1788 producer records while retaining #1789 device work and both #1790 aggregates. |
+| `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Process observability state, omitted from `GET /vm/config`. Duplicate initialization and identifiable malformed requests are counted without replacing the sink; duplicate state is rejected before a contained grant claim. Configuration writes nothing. In contained mode an exact metrics-sink reference claims one `WriteOnly` regular-file descriptor, normalizes append/nonblocking status without reopening it, and retains it for the same initial, 60-second Running/Paused periodic, explicit fallible `FlushMetrics`, and best-effort terminal transaction/schema behavior. Direct paths retain current create/FIFO behavior. The scoped #1787 gate certifies this strict request/schema slice, process-final certifies all 69 #1788 records, device-final certifies all 231 #1789 records, and metrics-final certifies the ten-scenario #1790 lifecycle aggregate. None promises durable or exactly-once delivery. |
 | `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Process observability state, omitted from `GET /vm/config`. Normal execution targets a process-owned bounded stdout adapter whose nonblocking internal pipe leaves stdout flags unchanged. Worker receipt and exact loss accounting end at pipe admission; the sole stdout forwarder retries temporary backpressure but is non-durable and never joined. Repeated pre-boot requests update provided fields; path-free requests retain delivery, while direct or contained path-bearing requests prepare an append/nonblocking writer and failure-atomically send it to the stable worker. Serial capture/restoration stays independent of target commit or failure. Closed records are at most 512 bytes. API receipt/control/result, startup, action, backend, transport, panic, and terminal records omit selectors, bodies, paths, faults, and guest values; receipt-free boot-timer/backend/transport records use independent atomic suppression recovery. Queue, timeout, configured-writer write, and flush misses never change functional results. A stalled connected worker rejects replacement without spawning another generation. |
 | `PUT /serial` | implemented; `204` empty response on successful pre-boot output configuration, rate-limiter configuration, or clear request | unsupported after start; `400` `fault_message` | Serial output is process observability state, not guest configuration. Direct valid `serial_out_path` values and token-bucket `rate_limiter` values are stored without opening host resources during the request; startup opens the path, disables stdin, wraps output in the limiter when enabled, and routes guest TX bytes to it. A contained exact serial-sink reference instead adopts and retains one `WriteOnly` append/nonblocking regular-file descriptor; clear/replacement drops it, and startup moves it once without reopening the reference. With no path/grant, startup duplicates nonblocking stdout and attaches supported terminal/FIFO stdin for bounded owner-run-loop RX. A later startup failure leaves a consumed grant unavailable until validated serial reconfiguration. Malformed parser/input/grant failures preserve previous public and private state. |
 | `PUT /entropy` | implemented and verified; `204` empty response on successful configuration | unsupported after start; `400` `fault_message` | Stores the strict virtio-rng configuration before startup, including valid `bandwidth` and `ops` buckets. `GET /vm/config` returns `{}` for an unconfigured limiter or its exact configured object. `InstanceStart` attaches the host-OS-backed endpoint over selected MMIO or product PCI. Queue dispatch caps requests at 64 KiB, retains and schedules exactly one throttled descriptor, restores exact limiter state when publication cannot complete, and emits seven entropy metrics. Exact native-v2 2.8 serializes detached queue/limiter/pending/retry/transport state without random bytes, source identity, metrics, or host time and restores fresh destination owners. Signed Linux guests prove live and restored marker-gated reads, throttling, retry without another guest kick, explicit/automatic resume, recapture, immutable clones, containment, and cleanup over both transports. |

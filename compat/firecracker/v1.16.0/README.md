@@ -41,7 +41,13 @@ For commands and test-layer selection, see the
   #1789 delivery children per field. After #1846 it contains 212 implemented,
   two source-neutral, 17 terminal platform-zero, and no planned or provisional
   records. #1847 composes those facts into ten implemented shared profiles and
-  the dedicated device-final gate without promoting #1790.
+  the dedicated device-final gate.
+- [`metrics-lifecycle-audit.json`](metrics-lifecycle-audit.json) is the
+  human-owned terminal #1790 matrix for ten aggregate publication, lifecycle,
+  cardinality, snapshot-destination, hotplug, and isolation scenarios. Its
+  distinguished transaction record closes complete-line commit atomicity,
+  previous-success retry, concurrent-cut ownership, lost-output accounting,
+  and one-shot final behavior without claiming all-or-none sink visibility.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
@@ -152,12 +158,12 @@ as `implemented-and-verified`, pins the one implemented schema-runtime profile,
 two implemented process-lifecycle profiles, and either complete pre-promotion
 or terminal #1789 device partition (never a hybrid), validates the terminal
 69-field process audit in delivery mode, and
-requires both #1790 aggregate rows to remain `audit-required`. Focused parser,
+requires both #1790 aggregate rows to occupy the same historical or terminal
+state. Focused parser,
 direct-process privacy, signed ordinary-production/App Sandbox privacy, and
 real Paused/Running 60-second lifecycle evidence support the terminal claim.
-It does not promote later device, corpus, or cross-producer work;
-repository-global `validate --final` continues to fail until those unrelated
-records are terminal.
+It observes but does not itself certify the aggregate lifecycle matrix;
+repository-global `validate --final` remains broader than this scoped gate.
 
 ## Scoped Process Metrics Certification
 
@@ -174,7 +180,8 @@ delivery children to be terminal, and every exact field boundary, disposition,
 and evidence reference to validate. Its closed result is 64 implemented, one
 source-neutral, and four platform-zero records. The checked authority now has
 ten implemented device profiles, but this process-scoped gate does not certify
-their 231 field records; both aggregate rows remain `audit-required` for #1790.
+their 231 field records. It accepts only the exact coherent historical or
+terminal aggregate pair, never a partial #1790 promotion.
 
 ## Scoped Device Metrics Certification
 
@@ -192,7 +199,26 @@ platform-zero, and no nonterminal records. Whole-line runtime coverage proves
 one configured ordinary block, network, and vhost-user root produce exactly
 231 device leaves, exactly 25 intentional active zeros, at-least-once replay
 after an ambiguous accepted write, and stable idle shape. Both #1790 aggregate
-rows remain `audit-required`.
+rows may be terminal, but this device-scoped command does not certify their
+ten-scenario lifecycle evidence.
+
+## Aggregate Metrics Lifecycle Certification
+
+The completed #1790 metrics corpus and cross-producer scope has one final gate:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
+```
+
+This command composes device-final certification with final validation of the
+exact ten-record lifecycle matrix. It requires both aggregate capability rows
+to be `implemented-and-verified` with exact evidence and the Wave 7 owner rows
+to agree. The matrix covers initial, real 60-second, explicit, terminal,
+backpressure, partial/failure/retry, configured cardinality, fresh snapshot
+destinations, hotplug/reuse, and concurrent process isolation. A scripted
+cross-producer transaction proves coherent process/device commit and
+success-only baselines after a visible prefix; existing process tests prove
+the final attempt is best effort and consumed once.
 
 ## Contributor Update Rule
 
