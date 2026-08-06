@@ -1553,14 +1553,14 @@ cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --lock
 
 The adjacent human-owned `metrics-device-producer-audit.json` maps all 231
 device-owned fields to closed operation boundaries and the nine concrete #1789
-children. After #1840 it contains 80 implemented
-entropy/pmem/RTC/UART/balloon/memory-hotplug/vsock fields, one source-neutral
-`uart.flush_count`, 135 planned fields, and 15
+children. After #1841 it contains 128 implemented
+entropy/pmem/RTC/UART/balloon/memory-hotplug/vsock/ordinary-block fields, one
+source-neutral `uart.flush_count`, 87 planned fields, and 15
 provisional-platform-zero fields. Only the latter two groups are nonterminal
 and evidence-free. The same focused test checks canonical bytes, exact
 membership and partition, completed-child regression, future-child premature
 promotion, the UART-flush disposition, suffix routing, provisional state,
-anchored-evidence rules, and final-mode rejection of the remaining 150 records.
+anchored-evidence rules, and final-mode rejection of the remaining 102 records.
 
 Focused #1838 producer coverage lives with the owning runtime modules. It
 checks entropy popped-descriptor accounting and owner attachment, exact pmem
@@ -1592,6 +1592,31 @@ owners. They require delivered RX/TX packets and bytes plus admitted TX queue
 work; a restored queue may consume guest-posted RX buffers without a fresh RX
 notification, so the focused source-admission tests—not an unconditional
 positive signed counter—pin `rx_queue_event_count`.
+
+Focused #1841 coverage pins all 24 ordinary block leaves under both static
+`block` and configured `block_{drive_id}`. Runtime tests cover invalid config
+access, failed activation, one event per nonempty notification call, one event
+per retained limiter retry, remaining queue depth after every pop, empty pass,
+limiter and async-pressure stops, parse/unsupported/I/O/status failures,
+full/partial reads and writes, flush-before-status behavior, attempted I/O
+latency, saturation, and a compound record racing a snapshot. Registry tests
+derive aggregate and per-drive values from one capture, retain empty live
+generations, and treat same-ID reuse as a fresh interval. HVF tests bind the
+same owner through normal boot, native-v1/native-v2 MMIO and PCI restore, and
+runtime publication; they also prove exact-drive interrupt-failure attribution
+without duplicate outer dispatch accounting.
+
+The signed direct and production snapshot workloads validate the exact 24-leaf
+shape for `primary`, `data`, and read-only `audit` drives under both MMIO and
+PCI. Every emitted static counter must equal the saturating sum of those three
+configured roots; static latency sums match dynamic sums while static min/max
+remain zero. Successful workloads require zero activation, configuration,
+event, parse, invalid-request, and update failures, positive queue/read
+activity, expected writable-drive writes and limiter throttling, no audit
+write, fresh destination counters, resumed destination I/O, repeated
+restore/recapture, App Sandbox containment, redaction, and cleanup. Focused
+collector tests separately prove immediate zero intervals and whole-line replay
+after failed or ambiguously accepted publication.
 
 The ordinary `compare` command rederives the source projection together with
 the general and logger manifests. To create a metrics source-only candidate:
@@ -1654,7 +1679,7 @@ logger and device-audit validation in delivery mode. It requires the two
 implemented process profiles and all 69 field records to remain terminal at
 exactly 64 implemented, one source-neutral, and four platform-zero. Ten planned
 and four platform-zero device profiles remain #1789-owned; within the 231-field
-device audit, #1838–#1840 contribute 81 terminal records and the other 150
+device audit, #1838–#1841 contribute 129 terminal records and the other 102
 remain nonterminal. The two aggregates remain #1790-owned.
 The composed test mutates both a field record and an aggregate process profile;
 the lower-level suite separately exercises every membership, ordering,

@@ -244,7 +244,7 @@ fn capture_multi_block_state(
     state: &CaptureReadyBlockDeviceState,
     config: &SnapshotV2MultiBlockConfig,
 ) -> Result<SnapshotV2MultiBlockState, SnapshotV2MultiBlockDeviceGraphCaptureError> {
-    let device = *state.device();
+    let device = state.device().clone();
     let backing = device.backing();
     let expected_config_space =
         VirtioBlockConfigSpace::new(backing.len(), config.is_read_only, config.cache_type);

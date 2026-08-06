@@ -1506,6 +1506,7 @@ fn capture_ready_mmio(path: &Path) -> CaptureReadyBlockDeviceState {
     let prepared = PreparedBlockDevice::from_config_with_backing(&config, None)
         .expect("test block device should prepare");
     let (_, _, config_space, device) = prepared.into_parts();
+    let available_features = config_space.available_features();
     let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
         VIRTIO_BLOCK_DEVICE_ID,
         config_space.available_features(),
@@ -1514,7 +1515,7 @@ fn capture_ready_mmio(path: &Path) -> CaptureReadyBlockDeviceState {
         device,
     )
     .expect("test MMIO block handler should build");
-    activate_mmio_block(&mut handler, config_space.available_features());
+    activate_mmio_block(&mut handler, available_features);
     let device = handler
         .capture_block_device_state_at(&config, Instant::now())
         .expect("test MMIO block state should capture");
@@ -1698,6 +1699,7 @@ impl PciRuntimeFixture {
         let prepared = PreparedBlockDevice::from_config_with_backing(&config, None)
             .expect("test block device should prepare");
         let (_, _, config_space, device) = prepared.into_parts();
+        let available_features = config_space.available_features();
         let capacity = GuestMemoryRange::new(
             GuestAddress::new(PCI_BAR64_START),
             VIRTIO_PCI_CAPABILITY_BAR_SIZE * 2,
@@ -1729,7 +1731,7 @@ impl PciRuntimeFixture {
             registry,
         )
         .expect("test PCI block endpoint should build");
-        activate_pci_block(&endpoint, &bar, config_space.available_features());
+        activate_pci_block(&endpoint, &bar, available_features);
         Self {
             config,
             endpoint,
@@ -1899,7 +1901,7 @@ fn runtime_conversion_rejects_configuration_limiter_retry_and_mmio_policy_mismat
             config,
             state.transport().clone(),
             state.retry(),
-            *state.device(),
+            state.device().clone(),
         );
         assert_eq!(
             SnapshotV2DeviceGraph::from_capture_ready_root(
@@ -1914,7 +1916,7 @@ fn runtime_conversion_rejects_configuration_limiter_retry_and_mmio_policy_mismat
         state.config().clone(),
         state.transport().clone(),
         StorageRetryState::Immediate,
-        *state.device(),
+        state.device().clone(),
     );
     assert_eq!(
         SnapshotV2DeviceGraph::from_capture_ready_root(
@@ -1945,7 +1947,7 @@ fn runtime_conversion_rejects_configuration_limiter_retry_and_mmio_policy_mismat
             false_policy,
         )),
         state.retry(),
-        *state.device(),
+        state.device().clone(),
     );
     assert_eq!(
         SnapshotV2DeviceGraph::from_capture_ready_root(
@@ -2144,7 +2146,7 @@ fn runtime_conversion_rejects_noncanonical_pci_origin_identity_and_bar() {
             state.config().clone(),
             StorageTransportState::Pci(transport),
             state.retry(),
-            *state.device(),
+            state.device().clone(),
         );
         assert_eq!(
             SnapshotV2DeviceGraph::from_capture_ready_root(

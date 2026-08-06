@@ -30,9 +30,10 @@ use crate::memory::{
     GuestMemoryRange, GuestMemoryRegionBacking, GuestMemorySharedBacking,
     GuestMemorySharedBackingError,
 };
+use crate::metrics::SharedBlockDeviceMetrics;
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
-    MmioHandlerError, MmioRegion, MmioRegionId,
+    MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
 };
 use crate::token_bucket::{
     PersistedTokenBucketState, PersistedTokenBucketStateError, TokenBucket, TokenBucketConfig,
@@ -1384,7 +1385,7 @@ impl std::error::Error for DriveRuntimeMutationError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct VirtioBlockConfigSpace {
     bytes: [u8; VIRTIO_BLOCK_CONFIG_SIZE],
     len: u8,
@@ -1392,7 +1393,21 @@ pub struct VirtioBlockConfigSpace {
     is_read_only: bool,
     cache_type: DriveCacheType,
     available_features: u64,
+    metrics: Option<SharedBlockDeviceMetrics>,
 }
+
+impl PartialEq for VirtioBlockConfigSpace {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+            && self.len == other.len
+            && self.capacity_sectors == other.capacity_sectors
+            && self.is_read_only == other.is_read_only
+            && self.cache_type == other.cache_type
+            && self.available_features == other.available_features
+    }
+}
+
+impl Eq for VirtioBlockConfigSpace {}
 
 impl VirtioBlockConfigSpace {
     pub fn new(backing_len: u64, is_read_only: bool, cache_type: DriveCacheType) -> Self {
@@ -1418,6 +1433,7 @@ impl VirtioBlockConfigSpace {
             is_read_only,
             cache_type,
             available_features,
+            metrics: None,
         }
     }
 
@@ -1437,6 +1453,7 @@ impl VirtioBlockConfigSpace {
                 != 0,
             cache_type,
             available_features,
+            metrics: None,
         }
     }
 
@@ -1444,24 +1461,28 @@ impl VirtioBlockConfigSpace {
         Self::new(backing.len(), backing.is_read_only(), cache_type)
     }
 
-    pub const fn capacity_sectors(self) -> u64 {
+    pub const fn capacity_sectors(&self) -> u64 {
         self.capacity_sectors
     }
 
-    pub const fn is_read_only(self) -> bool {
+    pub const fn is_read_only(&self) -> bool {
         self.is_read_only
     }
 
-    pub const fn cache_type(self) -> DriveCacheType {
+    pub const fn cache_type(&self) -> DriveCacheType {
         self.cache_type
     }
 
-    pub const fn available_features(self) -> u64 {
+    pub const fn available_features(&self) -> u64 {
         self.available_features
     }
 
-    pub const fn config_len(self) -> usize {
+    pub const fn config_len(&self) -> usize {
         self.len as usize
+    }
+
+    pub(crate) fn attach_metrics(&mut self, metrics: SharedBlockDeviceMetrics) {
+        self.metrics = Some(metrics);
     }
 }
 
@@ -1470,14 +1491,22 @@ impl VirtioMmioDeviceConfigHandler for VirtioBlockConfigSpace {
         &self,
         access: VirtioMmioDeviceConfigAccess,
     ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
-        let config = self.bytes.get(..self.config_len()).ok_or(
-            VirtioMmioDeviceConfigError::UnsupportedRead {
-                offset: access.offset(),
-                len: access.len(),
-            },
-        )?;
-        let bytes = read_virtio_block_config_bytes(config, access)?;
-        MmioAccessBytes::new(bytes).map_err(config_bytes_error)
+        let result = (|| {
+            let config = self.bytes.get(..self.config_len()).ok_or(
+                VirtioMmioDeviceConfigError::UnsupportedRead {
+                    offset: access.offset(),
+                    len: access.len(),
+                },
+            )?;
+            let bytes = read_virtio_block_config_bytes(config, access)?;
+            MmioAccessBytes::new(bytes).map_err(config_bytes_error)
+        })();
+        if result.is_err()
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.record_config_failure();
+        }
+        result
     }
 
     fn write_device_config(
@@ -1485,6 +1514,9 @@ impl VirtioMmioDeviceConfigHandler for VirtioBlockConfigSpace {
         access: VirtioMmioDeviceConfigAccess,
         _data: MmioAccessBytes,
     ) -> Result<(), VirtioMmioDeviceConfigError> {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_config_failure();
+        }
         Err(VirtioMmioDeviceConfigError::UnsupportedWrite {
             offset: access.offset(),
             len: access.len(),
@@ -1714,7 +1746,7 @@ impl VirtioBlockRequest {
         backing: &BlockFileBacking,
         device_id: VirtioBlockDeviceId,
     ) -> VirtioBlockRequestExecution {
-        let (status_code, bytes_written_to_guest, outcome, latency_sample) =
+        let (status_code, bytes_written_to_guest, outcome, latency_sample, mut metric_outcome) =
             match self.execute_side_effects(memory, backing, device_id) {
                 Ok(VirtioBlockRequestSideEffect::Completed {
                     bytes_written_to_guest,
@@ -1724,29 +1756,59 @@ impl VirtioBlockRequest {
                     bytes_written_to_guest,
                     VirtioBlockRequestExecutionOutcome::Ok,
                     latency_sample,
+                    VirtioBlockRequestMetricOutcome::new(
+                        self.request_type,
+                        match self.request_type {
+                            VirtioBlockRequestType::In | VirtioBlockRequestType::Out => {
+                                self.data.map_or(0, |data| u64::from(data.len()))
+                            }
+                            VirtioBlockRequestType::Flush
+                            | VirtioBlockRequestType::GetDeviceId
+                            | VirtioBlockRequestType::Unsupported(_) => 0,
+                        },
+                        VirtioBlockRequestMetricDisposition::Success,
+                        self.request_type == VirtioBlockRequestType::Flush,
+                    ),
                 ),
                 Ok(VirtioBlockRequestSideEffect::Unsupported { request_type }) => (
                     VIRTIO_BLOCK_STATUS_UNSUPPORTED,
                     0,
                     VirtioBlockRequestExecutionOutcome::Unsupported { request_type },
                     None,
+                    VirtioBlockRequestMetricOutcome::new(
+                        self.request_type,
+                        0,
+                        VirtioBlockRequestMetricDisposition::Unsupported,
+                        false,
+                    ),
                 ),
                 Err(error) => (
                     VIRTIO_BLOCK_STATUS_IOERR,
                     0,
                     VirtioBlockRequestExecutionOutcome::IoError { error: error.error },
                     error.latency_sample,
+                    VirtioBlockRequestMetricOutcome::new(
+                        self.request_type,
+                        0,
+                        VirtioBlockRequestMetricDisposition::IoError,
+                        false,
+                    ),
                 ),
             };
 
         let (status_code, bytes_written_to_guest, outcome) =
             normalize_completion_status(status_code, bytes_written_to_guest, outcome);
+        if matches!(outcome, VirtioBlockRequestExecutionOutcome::IoError { .. }) {
+            metric_outcome.disposition = VirtioBlockRequestMetricDisposition::IoError;
+            metric_outcome.flush_succeeded = false;
+        }
         self.finish_execution(
             memory,
             status_code,
             bytes_written_to_guest,
             outcome,
             latency_sample,
+            metric_outcome,
         )
     }
 
@@ -1964,6 +2026,12 @@ impl VirtioBlockRequest {
                 error: VirtioBlockRequestExecutionError::AsyncOperation { source },
             },
             latency_sample,
+            VirtioBlockRequestMetricOutcome::new(
+                self.request_type,
+                0,
+                VirtioBlockRequestMetricDisposition::IoError,
+                false,
+            ),
         )
     }
 
@@ -1974,6 +2042,7 @@ impl VirtioBlockRequest {
         bytes_written_to_guest: u32,
         outcome: VirtioBlockRequestExecutionOutcome,
         latency_sample: Option<VirtioBlockRequestLatencySample>,
+        metric_outcome: VirtioBlockRequestMetricOutcome,
     ) -> VirtioBlockRequestExecution {
         match write_request_status(memory, self.status, status_code) {
             Ok(()) => {
@@ -1986,6 +2055,7 @@ impl VirtioBlockRequest {
                     status_code,
                     outcome,
                     latency_sample,
+                    metric_outcome,
                 )
             }
             Err(source) => {
@@ -1998,6 +2068,7 @@ impl VirtioBlockRequest {
                         source,
                     },
                     latency_sample,
+                    metric_outcome,
                 )
             }
         }
@@ -2187,12 +2258,53 @@ impl VirtioBlockRequestLatencySample {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtioBlockRequestMetricDisposition {
+    Success,
+    IoError,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VirtioBlockRequestMetricOutcome {
+    request_type: VirtioBlockRequestType,
+    transferred_bytes: u64,
+    disposition: VirtioBlockRequestMetricDisposition,
+    flush_succeeded: bool,
+}
+
+impl VirtioBlockRequestMetricOutcome {
+    const fn new(
+        request_type: VirtioBlockRequestType,
+        transferred_bytes: u64,
+        disposition: VirtioBlockRequestMetricDisposition,
+        flush_succeeded: bool,
+    ) -> Self {
+        Self {
+            request_type,
+            transferred_bytes,
+            disposition,
+            flush_succeeded,
+        }
+    }
+
+    const fn empty() -> Self {
+        Self::new(
+            VirtioBlockRequestType::GetDeviceId,
+            0,
+            VirtioBlockRequestMetricDisposition::Success,
+            false,
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct VirtioBlockRequestExecution {
     completion: VirtioBlockRequestCompletion,
     status_code: u8,
     outcome: VirtioBlockRequestExecutionOutcome,
     latency_sample: Option<VirtioBlockRequestLatencySample>,
+    metric_outcome: VirtioBlockRequestMetricOutcome,
 }
 
 impl VirtioBlockRequestExecution {
@@ -2201,7 +2313,13 @@ impl VirtioBlockRequestExecution {
         status_code: u8,
         outcome: VirtioBlockRequestExecutionOutcome,
     ) -> Self {
-        Self::new_with_latency(completion, status_code, outcome, None)
+        Self::new_with_latency(
+            completion,
+            status_code,
+            outcome,
+            None,
+            VirtioBlockRequestMetricOutcome::empty(),
+        )
     }
 
     const fn new_with_latency(
@@ -2209,12 +2327,14 @@ impl VirtioBlockRequestExecution {
         status_code: u8,
         outcome: VirtioBlockRequestExecutionOutcome,
         latency_sample: Option<VirtioBlockRequestLatencySample>,
+        metric_outcome: VirtioBlockRequestMetricOutcome,
     ) -> Self {
         Self {
             completion,
             status_code,
             outcome,
             latency_sample,
+            metric_outcome,
         }
     }
 
@@ -2232,6 +2352,10 @@ impl VirtioBlockRequestExecution {
 
     const fn latency_sample(&self) -> Option<VirtioBlockRequestLatencySample> {
         self.latency_sample
+    }
+
+    const fn metric_outcome(&self) -> VirtioBlockRequestMetricOutcome {
+        self.metric_outcome
     }
 }
 
@@ -2611,7 +2735,7 @@ impl std::error::Error for VirtioBlockSnapshotPersistenceError {
 }
 
 /// Detached, value-redacted block state retained for later persistence.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VirtioBlockDeviceCaptureState {
     config_space: VirtioBlockConfigSpace,
     device_id: VirtioBlockDeviceId,
@@ -2622,27 +2746,27 @@ pub struct VirtioBlockDeviceCaptureState {
 }
 
 impl VirtioBlockDeviceCaptureState {
-    pub const fn config_space(self) -> VirtioBlockConfigSpace {
-        self.config_space
+    pub fn config_space(&self) -> VirtioBlockConfigSpace {
+        self.config_space.clone()
     }
 
-    pub const fn device_id(self) -> VirtioBlockDeviceId {
+    pub const fn device_id(&self) -> VirtioBlockDeviceId {
         self.device_id
     }
 
-    pub const fn backing(self) -> BlockFileBackingIdentity {
+    pub const fn backing(&self) -> BlockFileBackingIdentity {
         self.backing
     }
 
-    pub const fn active_queue(self) -> Option<VirtioBlockQueueState> {
+    pub const fn active_queue(&self) -> Option<VirtioBlockQueueState> {
         self.active_queue
     }
 
-    pub const fn rate_limiter(self) -> VirtioBlockRateLimiterState {
+    pub const fn rate_limiter(&self) -> VirtioBlockRateLimiterState {
         self.rate_limiter
     }
 
-    pub const fn io_engine(self) -> BlockCaptureIoEngine {
+    pub const fn io_engine(&self) -> BlockCaptureIoEngine {
         self.io_engine
     }
 }
@@ -3152,6 +3276,14 @@ impl VirtioBlockQueue {
                 source,
             })?
         {
+            let remaining =
+                self.available
+                    .available_descriptor_count(memory)
+                    .map_err(|source| VirtioBlockQueueDispatchError::AvailableRing {
+                        completed_dispatch: Box::new(dispatch.clone()),
+                        source,
+                    })?;
+            dispatch.record_remaining_requests(remaining);
             let descriptor_head = descriptor_chain_head(&chain).ok_or_else(|| {
                 VirtioBlockQueueDispatchError::EmptyDescriptorChain {
                     completed_dispatch: Box::new(dispatch.clone()),
@@ -3190,6 +3322,7 @@ impl VirtioBlockQueue {
                     ),
                 };
 
+            dispatch.record_outcome(outcome);
             let notification_suppression =
                 self.notification_suppression(memory).map_err(|source| {
                     VirtioBlockQueueDispatchError::AvailableRing {
@@ -3211,9 +3344,10 @@ impl VirtioBlockQueue {
                     bytes_written_to_guest: completion.bytes_written_to_guest(),
                     source,
                 })?;
-            dispatch.record(outcome, publication);
+            dispatch.record_publication(publication);
         }
 
+        dispatch.finish_queue_pass();
         Ok(dispatch)
     }
 
@@ -3242,6 +3376,7 @@ impl VirtioBlockQueue {
             }
         })? {
             dispatch.record_io_engine_throttled_event();
+            dispatch.finish_queue_pass();
             return Ok(dispatch);
         }
 
@@ -3255,6 +3390,14 @@ impl VirtioBlockQueue {
                 source,
             })?
         {
+            let remaining =
+                self.available
+                    .available_descriptor_count(memory)
+                    .map_err(|source| VirtioBlockQueueDispatchError::AvailableRing {
+                        completed_dispatch: Box::new(dispatch.clone()),
+                        source,
+                    })?;
+            dispatch.record_remaining_requests(remaining);
             let descriptor_head = descriptor_chain_head(&chain).ok_or_else(|| {
                 VirtioBlockQueueDispatchError::EmptyDescriptorChain {
                     completed_dispatch: Box::new(dispatch.clone()),
@@ -3360,6 +3503,7 @@ impl VirtioBlockQueue {
             };
             self.publish_completion(memory, completion, outcome, &mut dispatch)?;
         }
+        dispatch.finish_queue_pass();
         Ok(dispatch)
     }
 
@@ -3395,47 +3539,53 @@ impl VirtioBlockQueue {
             .then(|| {
                 VirtioBlockRequestLatencySample::new(request_type, completion.total_latency_us())
             });
-            let (status_code, bytes_written_to_guest, outcome) = match completion.status() {
+            let transferred_bytes = completion.bytes_transferred();
+            let mut metric_outcome = VirtioBlockRequestMetricOutcome::new(
+                request_type,
+                transferred_bytes,
+                match completion.status() {
+                    BlockAsyncOperationStatus::Success => {
+                        VirtioBlockRequestMetricDisposition::Success
+                    }
+                    BlockAsyncOperationStatus::Failed(_) => {
+                        VirtioBlockRequestMetricDisposition::IoError
+                    }
+                },
+                completion.kind() == BlockAsyncOperationKind::Flush
+                    && completion.status() == BlockAsyncOperationStatus::Success,
+            );
+            let (mut status_code, mut bytes_written_to_guest) = match completion.status() {
                 BlockAsyncOperationStatus::Success => {
-                    let data_len = u32::try_from(completion.bytes_transferred()).map_err(|_| {
+                    let data_len = u32::try_from(transferred_bytes).map_err(|_| {
                         VirtioBlockQueueDispatchError::AsyncRuntime {
                             completed_dispatch: Box::new(dispatch.clone()),
                             source: BlockAsyncRuntimeError::ExecutorInvariant,
                         }
                     })?;
-                    let bytes_written_to_guest =
+                    (
+                        VIRTIO_BLOCK_STATUS_OK,
                         if completion.kind() == BlockAsyncOperationKind::Read {
                             data_len
                         } else {
                             0
-                        };
-                    (
-                        VIRTIO_BLOCK_STATUS_OK,
-                        bytes_written_to_guest,
-                        VirtioBlockQueueDispatchOutcome::Ok {
-                            request_type,
-                            data_len,
-                            latency_sample,
                         },
                     )
                 }
-                BlockAsyncOperationStatus::Failed(_) => (
-                    VIRTIO_BLOCK_STATUS_IOERR,
-                    0,
-                    VirtioBlockQueueDispatchOutcome::IoError { latency_sample },
-                ),
+                BlockAsyncOperationStatus::Failed(_) => (VIRTIO_BLOCK_STATUS_IOERR, 0),
             };
-            let (status_code, bytes_written_to_guest, outcome) = if bytes_written_to_guest
+            if bytes_written_to_guest
                 .checked_add(VIRTIO_BLOCK_STATUS_SIZE)
-                .is_some()
+                .is_none()
             {
-                (status_code, bytes_written_to_guest, outcome)
-            } else {
-                (
-                    VIRTIO_BLOCK_STATUS_IOERR,
-                    0,
-                    VirtioBlockQueueDispatchOutcome::IoError { latency_sample },
-                )
+                status_code = VIRTIO_BLOCK_STATUS_IOERR;
+                bytes_written_to_guest = 0;
+                metric_outcome.disposition = VirtioBlockRequestMetricDisposition::IoError;
+                metric_outcome.flush_succeeded = false;
+            }
+            let outcome = VirtioBlockQueueDispatchOutcome::Request {
+                metric_outcome,
+                latency_sample,
+                status_write_failed: false,
             };
             let status = VirtioBlockStatusDescriptor {
                 index: u16::MAX,
@@ -3448,8 +3598,11 @@ impl VirtioBlockQueue {
                     bytes_written_to_guest + VIRTIO_BLOCK_STATUS_SIZE,
                 ),
                 Err(_) => {
-                    let outcome =
-                        VirtioBlockQueueDispatchOutcome::StatusWriteFailed { latency_sample };
+                    let outcome = VirtioBlockQueueDispatchOutcome::Request {
+                        metric_outcome,
+                        latency_sample,
+                        status_write_failed: true,
+                    };
                     self.publish_completion(
                         memory,
                         VirtioBlockRequestCompletion::new(identity.descriptor_head(), 0),
@@ -3471,6 +3624,7 @@ impl VirtioBlockQueue {
         outcome: VirtioBlockQueueDispatchOutcome,
         dispatch: &mut VirtioBlockQueueDispatch,
     ) -> Result<(), VirtioBlockQueueDispatchError> {
+        dispatch.record_outcome(outcome);
         let notification_suppression = self.notification_suppression(memory).map_err(|source| {
             VirtioBlockQueueDispatchError::AvailableRing {
                 completed_dispatch: Box::new(dispatch.clone()),
@@ -3491,7 +3645,7 @@ impl VirtioBlockQueue {
                 bytes_written_to_guest: completion.bytes_written_to_guest(),
                 source,
             })?;
-        dispatch.record(outcome, publication);
+        dispatch.record_publication(publication);
         Ok(())
     }
 
@@ -3514,6 +3668,7 @@ impl VirtioBlockQueue {
 pub struct VirtioBlockQueueDispatch {
     processed_requests: usize,
     successful_requests: usize,
+    published_used_elements: u64,
     read_count: usize,
     write_count: usize,
     flush_count: usize,
@@ -3527,6 +3682,8 @@ pub struct VirtioBlockQueueDispatch {
     status_write_failures: usize,
     rate_limiter_throttled_requests: usize,
     io_engine_throttled_events: usize,
+    no_avail_buffer: u64,
+    remaining_reqs_count: u64,
     rate_limiter_retry_after: Option<Duration>,
     first_parse_failure: Option<VirtioBlockRequestError>,
     needs_queue_interrupt: bool,
@@ -3597,6 +3754,14 @@ impl VirtioBlockQueueDispatch {
         self.io_engine_throttled_events
     }
 
+    pub const fn no_avail_buffer(&self) -> u64 {
+        self.no_avail_buffer
+    }
+
+    pub const fn remaining_reqs_count(&self) -> u64 {
+        self.remaining_reqs_count
+    }
+
     pub const fn rate_limiter_retry_after(&self) -> Option<Duration> {
         self.rate_limiter_retry_after
     }
@@ -3605,59 +3770,93 @@ impl VirtioBlockQueueDispatch {
         self.needs_queue_interrupt
     }
 
-    fn record(
-        &mut self,
-        outcome: VirtioBlockQueueDispatchOutcome,
-        publication: VirtqueueUsedRingPublication,
-    ) {
-        self.processed_requests += 1;
-        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
+    fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {
+        self.processed_requests = self.processed_requests.saturating_add(1);
         if let Some(latency_sample) = outcome.latency_sample() {
             self.record_latency_sample(latency_sample);
         }
         match outcome {
-            VirtioBlockQueueDispatchOutcome::Ok {
-                request_type,
-                data_len,
+            VirtioBlockQueueDispatchOutcome::Request {
+                metric_outcome,
+                status_write_failed,
                 ..
             } => {
-                self.successful_requests += 1;
-                match request_type {
+                if metric_outcome.disposition == VirtioBlockRequestMetricDisposition::Success
+                    && !status_write_failed
+                {
+                    self.successful_requests = self.successful_requests.saturating_add(1);
+                }
+                match metric_outcome.request_type {
                     VirtioBlockRequestType::In => {
-                        self.read_count += 1;
-                        self.read_bytes = self.read_bytes.saturating_add(u64::from(data_len));
+                        self.read_bytes = self
+                            .read_bytes
+                            .saturating_add(metric_outcome.transferred_bytes);
+                        if metric_outcome.disposition
+                            == VirtioBlockRequestMetricDisposition::Success
+                        {
+                            self.read_count = self.read_count.saturating_add(1);
+                        }
                     }
                     VirtioBlockRequestType::Out => {
-                        self.write_count += 1;
-                        self.write_bytes = self.write_bytes.saturating_add(u64::from(data_len));
+                        self.write_bytes = self
+                            .write_bytes
+                            .saturating_add(metric_outcome.transferred_bytes);
+                        if metric_outcome.disposition
+                            == VirtioBlockRequestMetricDisposition::Success
+                        {
+                            self.write_count = self.write_count.saturating_add(1);
+                        }
                     }
                     VirtioBlockRequestType::Flush => {
-                        self.flush_count += 1;
+                        if metric_outcome.flush_succeeded {
+                            self.flush_count = self.flush_count.saturating_add(1);
+                        }
                     }
                     VirtioBlockRequestType::GetDeviceId
                     | VirtioBlockRequestType::Unsupported(_) => {}
                 }
+                match metric_outcome.disposition {
+                    VirtioBlockRequestMetricDisposition::Success => {}
+                    VirtioBlockRequestMetricDisposition::IoError => {
+                        self.io_errors = self.io_errors.saturating_add(1);
+                    }
+                    VirtioBlockRequestMetricDisposition::Unsupported => {
+                        self.unsupported_requests = self.unsupported_requests.saturating_add(1);
+                    }
+                }
+                if status_write_failed {
+                    self.status_write_failures = self.status_write_failures.saturating_add(1);
+                }
             }
             VirtioBlockQueueDispatchOutcome::ParseError(source) => {
-                self.parse_failures += 1;
+                self.parse_failures = self.parse_failures.saturating_add(1);
                 if self.first_parse_failure.is_none() {
                     self.first_parse_failure = Some(source);
                 }
             }
-            VirtioBlockQueueDispatchOutcome::IoError { .. } => {
-                self.io_errors += 1;
-            }
-            VirtioBlockQueueDispatchOutcome::Unsupported => {
-                self.unsupported_requests += 1;
-            }
-            VirtioBlockQueueDispatchOutcome::StatusWriteFailed { .. } => {
-                self.status_write_failures += 1;
-            }
+        }
+    }
+
+    fn record_publication(&mut self, publication: VirtqueueUsedRingPublication) {
+        self.published_used_elements = self.published_used_elements.saturating_add(1);
+        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
+    }
+
+    fn record_remaining_requests(&mut self, remaining: u16) {
+        self.remaining_reqs_count = self
+            .remaining_reqs_count
+            .saturating_add(u64::from(remaining));
+    }
+
+    fn finish_queue_pass(&mut self) {
+        if self.published_used_elements == 0 {
+            self.no_avail_buffer = self.no_avail_buffer.saturating_add(1);
         }
     }
 
     fn record_rate_limited_request(&mut self, retry_after: Duration) {
-        self.rate_limiter_throttled_requests += 1;
+        self.rate_limiter_throttled_requests =
+            self.rate_limiter_throttled_requests.saturating_add(1);
         self.rate_limiter_retry_after = Some(match self.rate_limiter_retry_after {
             Some(existing) => existing.min(retry_after),
             None => retry_after,
@@ -3693,53 +3892,33 @@ impl VirtioBlockQueueDispatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VirtioBlockQueueDispatchOutcome {
-    Ok {
-        request_type: VirtioBlockRequestType,
-        data_len: u32,
+    Request {
+        metric_outcome: VirtioBlockRequestMetricOutcome,
         latency_sample: Option<VirtioBlockRequestLatencySample>,
+        status_write_failed: bool,
     },
     ParseError(VirtioBlockRequestError),
-    IoError {
-        latency_sample: Option<VirtioBlockRequestLatencySample>,
-    },
-    Unsupported,
-    StatusWriteFailed {
-        latency_sample: Option<VirtioBlockRequestLatencySample>,
-    },
 }
 
 impl VirtioBlockQueueDispatchOutcome {
     const fn from_request_execution(
-        request: &VirtioBlockRequest,
+        _request: &VirtioBlockRequest,
         execution: &VirtioBlockRequestExecution,
     ) -> Self {
-        match execution.outcome() {
-            VirtioBlockRequestExecutionOutcome::Ok => Self::Ok {
-                request_type: request.request_type(),
-                data_len: match request.data() {
-                    Some(data) => data.len(),
-                    None => 0,
-                },
-                latency_sample: execution.latency_sample(),
-            },
-            VirtioBlockRequestExecutionOutcome::IoError { .. } => Self::IoError {
-                latency_sample: execution.latency_sample(),
-            },
-            VirtioBlockRequestExecutionOutcome::Unsupported { .. } => Self::Unsupported,
-            VirtioBlockRequestExecutionOutcome::StatusWriteFailed { .. } => {
-                Self::StatusWriteFailed {
-                    latency_sample: execution.latency_sample(),
-                }
-            }
+        Self::Request {
+            metric_outcome: execution.metric_outcome(),
+            latency_sample: execution.latency_sample(),
+            status_write_failed: matches!(
+                execution.outcome(),
+                VirtioBlockRequestExecutionOutcome::StatusWriteFailed { .. }
+            ),
         }
     }
 
     const fn latency_sample(&self) -> Option<VirtioBlockRequestLatencySample> {
         match self {
-            Self::Ok { latency_sample, .. }
-            | Self::IoError { latency_sample }
-            | Self::StatusWriteFailed { latency_sample } => *latency_sample,
-            Self::ParseError(_) | Self::Unsupported => None,
+            Self::Request { latency_sample, .. } => *latency_sample,
+            Self::ParseError(_) => None,
         }
     }
 }
@@ -6024,6 +6203,7 @@ pub struct VirtioBlockDevice {
     device_id: VirtioBlockDeviceId,
     pending_rate_limited_queue: bool,
     guest_logger: Option<GuestLogger>,
+    metrics: Option<SharedBlockDeviceMetrics>,
 }
 
 impl VirtioBlockDevice {
@@ -6038,6 +6218,7 @@ impl VirtioBlockDevice {
             device_id,
             pending_rate_limited_queue: false,
             guest_logger: None,
+            metrics: None,
         }
     }
 
@@ -6064,6 +6245,7 @@ impl VirtioBlockDevice {
             device_id,
             pending_rate_limited_queue: false,
             guest_logger: None,
+            metrics: None,
         })
     }
 
@@ -6095,7 +6277,16 @@ impl VirtioBlockDevice {
             device_id,
             pending_rate_limited_queue,
             guest_logger: None,
+            metrics: None,
         }
+    }
+
+    pub(crate) fn attach_metrics(&mut self, metrics: SharedBlockDeviceMetrics) -> bool {
+        if !matches!(self.backend, VirtioBlockBackend::File { .. }) {
+            return false;
+        }
+        self.metrics = Some(metrics);
+        true
     }
 
     pub fn backing(&self) -> Option<&BlockFileBacking> {
@@ -6675,8 +6866,29 @@ impl VirtioBlockDevice {
         drained_notifications: Vec<usize>,
     ) -> Result<VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError> {
         let had_pending_rate_limited_queue = self.pending_rate_limited_queue;
+        if let Some(metrics) = &self.metrics {
+            if !drained_notifications.is_empty() {
+                metrics.record_queue_events(1);
+            } else if had_pending_rate_limited_queue {
+                metrics.record_rate_limiter_event();
+            }
+        }
         let result =
             self.dispatch_drained_queue_notifications_unobserved(memory, drained_notifications);
+        if let Some(metrics) = &self.metrics {
+            match &result {
+                Ok(dispatch) => {
+                    if let Some(queue_dispatch) = dispatch.queue_dispatch() {
+                        metrics.record_queue_dispatch(queue_dispatch);
+                    }
+                }
+                Err(error) => {
+                    if let Some(queue_dispatch) = error.completed_dispatch() {
+                        metrics.record_queue_dispatch(queue_dispatch);
+                    }
+                }
+            }
+        }
         self.observe_notification_result(&result, had_pending_rate_limited_queue);
         result
     }
@@ -7278,6 +7490,16 @@ impl VirtioBlockLiveUpdateError {
     pub const fn terminal(&self) -> bool {
         matches!(self, Self::AsyncTerminal(_) | Self::Queue(_))
     }
+
+    pub const fn completed_dispatch(&self) -> Option<&VirtioBlockQueueDispatch> {
+        match self {
+            Self::Queue(source) => Some(source.completed_dispatch()),
+            Self::UnsupportedBackend
+            | Self::MissingReplacementBacking
+            | Self::AsyncPreparation(_)
+            | Self::AsyncTerminal(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for VirtioBlockLiveUpdateError {
@@ -7464,7 +7686,7 @@ impl PreparedBlockDevice {
             rate_limiter,
             pending_rate_limited_queue,
         } = parts;
-        Self::validate_snapshot_backing(&backing, config_space)?;
+        Self::validate_snapshot_backing(&backing, config_space.clone())?;
         let device = VirtioBlockDevice::from_snapshot_parts(
             backing,
             device_id,
@@ -7534,8 +7756,8 @@ impl PreparedBlockDevice {
         self.is_root_device
     }
 
-    pub const fn config_space(&self) -> VirtioBlockConfigSpace {
-        self.config_space
+    pub fn config_space(&self) -> VirtioBlockConfigSpace {
+        self.config_space.clone()
     }
 
     pub const fn io_engine(&self) -> Option<DriveIoEngine> {
@@ -7552,6 +7774,18 @@ impl PreparedBlockDevice {
 
     pub fn device_mut(&mut self) -> &mut VirtioBlockDevice {
         &mut self.device
+    }
+
+    /// Attaches one coherent owner to both ordinary block metric sources.
+    ///
+    /// Vhost-user block devices intentionally retain their separate metric
+    /// family and reject an ordinary owner.
+    pub fn attach_metrics(&mut self, metrics: SharedBlockDeviceMetrics) -> bool {
+        if !self.device.attach_metrics(metrics.clone()) {
+            return false;
+        }
+        self.config_space.attach_metrics(metrics);
+        true
     }
 
     pub fn bind_async_runtime(
@@ -8347,9 +8581,17 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioBlockD
         &mut self,
         memory: &mut GuestMemory,
     ) -> Result<VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError> {
-        let dispatch = self
-            .activation_handler_mut()
-            .publish_quiesced_async_completions(memory);
+        let dispatch = {
+            let activation = self.activation_handler_mut();
+            let dispatch = activation.publish_quiesced_async_completions(memory);
+            if let Some(metrics) = &activation.metrics {
+                match &dispatch {
+                    Ok(completed) => metrics.record_queue_dispatch(completed),
+                    Err(source) => metrics.record_queue_dispatch(source.completed_dispatch()),
+                }
+            }
+            dispatch
+        };
         let needs_queue_interrupt = match &dispatch {
             Ok(dispatch) => dispatch.needs_queue_interrupt(),
             Err(error) => error.completed_dispatch().needs_queue_interrupt(),
@@ -8362,6 +8604,21 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioBlockD
 }
 
 impl VirtioBlockMmioHandler {
+    /// Attaches one ordinary per-drive metrics owner to both source objects.
+    ///
+    /// Returns `false` for vhost-user block so its separate metric family
+    /// cannot accidentally populate ordinary `block_{drive_id}` values.
+    pub fn attach_block_metrics(&mut self, metrics: SharedBlockDeviceMetrics) -> bool {
+        if !self
+            .activation_handler_mut()
+            .attach_metrics(metrics.clone())
+        {
+            return false;
+        }
+        self.device_config_handler_mut().attach_metrics(metrics);
+        true
+    }
+
     pub fn block_backend_kind(&self) -> VirtioBlockBackendKind {
         self.activation_handler().backend_kind()
     }
@@ -8375,7 +8632,7 @@ impl VirtioBlockMmioHandler {
         config: &DriveConfig,
     ) -> Result<VirtioBlockSnapshotPersistenceBinding, VirtioBlockSnapshotPersistenceError> {
         self.activation_handler()
-            .snapshot_persistence_binding(*self.device_config_handler(), config)
+            .snapshot_persistence_binding(self.device_config_handler().clone(), config)
     }
 
     pub fn persist_block_snapshot_backing(
@@ -8383,7 +8640,7 @@ impl VirtioBlockMmioHandler {
         config: &DriveConfig,
     ) -> Result<(), VirtioBlockSnapshotPersistenceError> {
         self.activation_handler()
-            .persist_snapshot_backing(*self.device_config_handler(), config)
+            .persist_snapshot_backing(self.device_config_handler().clone(), config)
     }
 
     pub fn block_async_binding(
@@ -8397,12 +8654,29 @@ impl VirtioBlockMmioHandler {
         config: &DriveConfig,
         now: Instant,
     ) -> Result<VirtioBlockDeviceCaptureState, VirtioBlockDeviceCaptureError> {
-        self.activation_handler()
-            .capture_state_at(*self.device_config_handler(), config, now)
+        self.activation_handler().capture_state_at(
+            self.device_config_handler().clone(),
+            config,
+            now,
+        )
     }
 }
 
 impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
+    pub fn attach_block_metrics(
+        &self,
+        metrics: SharedBlockDeviceMetrics,
+    ) -> Result<bool, VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| {
+            if !core.activation.attach_metrics(metrics.clone()) {
+                return false;
+            }
+            core.device_config.attach_metrics(metrics);
+            true
+        })
+    }
+
     pub fn block_backend_kind(&self) -> Result<VirtioBlockBackendKind, VirtioPciEndpointError> {
         let work = self.admit_device_work()?;
         work.with_core_mut(|core| core.activation.backend_kind())
@@ -8417,7 +8691,7 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
             .map_err(VirtioBlockPciSnapshotPersistenceError::Endpoint)?;
         work.with_core_mut(|core| {
             core.activation
-                .snapshot_persistence_binding(core.device_config, config)
+                .snapshot_persistence_binding(core.device_config.clone(), config)
         })
         .map_err(VirtioBlockPciSnapshotPersistenceError::Endpoint)?
         .map_err(VirtioBlockPciSnapshotPersistenceError::Persistence)
@@ -8432,7 +8706,7 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
             .map_err(VirtioBlockPciSnapshotPersistenceError::Endpoint)?;
         work.with_core_mut(|core| {
             core.activation
-                .persist_snapshot_backing(core.device_config, config)
+                .persist_snapshot_backing(core.device_config.clone(), config)
         })
         .map_err(VirtioBlockPciSnapshotPersistenceError::Endpoint)?
         .map_err(VirtioBlockPciSnapshotPersistenceError::Persistence)
@@ -8458,7 +8732,7 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
         let device = work
             .with_core_mut(|core| {
                 core.activation
-                    .capture_state_at(core.device_config, config, now)
+                    .capture_state_at(core.device_config.clone(), config, now)
             })
             .map_err(VirtioBlockPciCaptureError::Endpoint)?
             .map_err(VirtioBlockPciCaptureError::Device)?;
@@ -8482,6 +8756,12 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
         let dispatch = work
             .with_core_mut(|core| {
                 let dispatch = core.activation.publish_quiesced_async_completions(memory);
+                if let Some(metrics) = &core.activation.metrics {
+                    match &dispatch {
+                        Ok(completed) => metrics.record_queue_dispatch(completed),
+                        Err(source) => metrics.record_queue_dispatch(source.completed_dispatch()),
+                    }
+                }
                 let needs_queue_interrupt = match &dispatch {
                     Ok(dispatch) => dispatch.needs_queue_interrupt(),
                     Err(error) => error.completed_dispatch().needs_queue_interrupt(),
@@ -8495,6 +8775,9 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
         let endpoint = work.drain_interrupt_intents();
         if endpoint.is_err() {
             let _ = work.with_core_mut(|core| {
+                if let Some(metrics) = &core.activation.metrics {
+                    metrics.record_event_failure();
+                }
                 if let Some(logger) = &core.activation.guest_logger {
                     logger.log_block(LoggerBlockOutcome::InterruptDeliveryFailed);
                 }
@@ -8552,6 +8835,9 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
         let endpoint = work.drain_interrupt_intents();
         if endpoint.is_err() {
             let _ = work.with_core_mut(|core| {
+                if let Some(metrics) = &core.activation.metrics {
+                    metrics.record_event_failure();
+                }
                 if let Some(logger) = &core.activation.guest_logger {
                     logger.log_block(LoggerBlockOutcome::InterruptDeliveryFailed);
                 }
@@ -8570,8 +8856,11 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
         let backing_changed = backing.is_some();
         work.with_core_mut(|core| {
             if let Some(backing) = backing {
-                let config_space =
+                let mut config_space =
                     VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
+                if let Some(metrics) = &core.activation.metrics {
+                    config_space.attach_metrics(metrics.clone());
+                }
                 core.activation
                     .refresh_backing(backing)
                     .map_err(|_| VirtioPciEndpointError::UnsupportedDeviceOperation)?;
@@ -8590,6 +8879,9 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
             let endpoint = work.drain_interrupt_intents();
             if endpoint.is_err() {
                 let _ = work.with_core_mut(|core| {
+                    if let Some(metrics) = &core.activation.metrics {
+                        metrics.record_event_failure();
+                    }
                     if let Some(logger) = &core.activation.guest_logger {
                         logger.log_block(LoggerBlockOutcome::InterruptDeliveryFailed);
                     }
@@ -8621,18 +8913,33 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
         let file_state_changed = config_space.is_some() || mode == DriveLiveUpdateMode::Replacement;
         let update = work
             .with_core_mut(|core| {
-                let dispatch = core.activation.update_file_backend_with_opened(
+                let update = core.activation.update_file_backend_with_opened(
                     memory,
                     config,
                     backing,
                     rate_limiter_update,
                     mode,
                     shared_runtime,
-                )?;
+                );
+                if let Some(metrics) = &core.activation.metrics {
+                    match &update {
+                        Ok(dispatch) => metrics.record_queue_dispatch(dispatch),
+                        Err(source) => {
+                            if let Some(dispatch) = source.completed_dispatch() {
+                                metrics.record_queue_dispatch(dispatch);
+                            }
+                        }
+                    }
+                }
+                let dispatch = update?;
                 if dispatch.needs_queue_interrupt() {
                     core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 0 });
                 }
                 if let Some(config_space) = config_space {
+                    let mut config_space = config_space;
+                    if let Some(metrics) = &core.activation.metrics {
+                        config_space.attach_metrics(metrics.clone());
+                    }
                     core.device_config = config_space;
                     core.device.increment_config_generation();
                     core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
@@ -8648,6 +8955,9 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
             };
         if endpoint.is_err() {
             let _ = work.with_core_mut(|core| {
+                if let Some(metrics) = &core.activation.metrics {
+                    metrics.record_event_failure();
+                }
                 if let Some(logger) = &core.activation.guest_logger {
                     logger.log_block(LoggerBlockOutcome::InterruptDeliveryFailed);
                 }
@@ -8665,9 +8975,22 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
         VirtioBlockQueueDispatch,
         VirtioPciDeviceOperationError<VirtioBlockLiveUpdateError, VirtioBlockQueueDispatch>,
     > {
-        self.with_quiesced_core_mut(|core| core.activation.retire_async(memory))
-            .map_err(VirtioPciDeviceOperationError::Endpoint)?
-            .map_err(|source| VirtioPciDeviceOperationError::Device(Box::new(source)))
+        self.with_quiesced_core_mut(|core| {
+            let result = core.activation.retire_async(memory);
+            if let Some(metrics) = &core.activation.metrics {
+                match &result {
+                    Ok(dispatch) => metrics.record_queue_dispatch(dispatch),
+                    Err(source) => {
+                        if let Some(dispatch) = source.completed_dispatch() {
+                            metrics.record_queue_dispatch(dispatch);
+                        }
+                    }
+                }
+            }
+            result
+        })
+        .map_err(VirtioPciDeviceOperationError::Endpoint)?
+        .map_err(|source| VirtioPciDeviceOperationError::Device(Box::new(source)))
     }
 
     pub fn refresh_vhost_user_block_config(
@@ -8687,7 +9010,7 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
                     .map_err(|source| DriveUpdateError::ActiveSessionCommand {
                         message: source.to_string(),
                     })?;
-                let snapshot = (core.device, core.device_config);
+                let snapshot = (core.device, core.device_config.clone());
                 core.device_config = config_space;
                 core.device.increment_config_generation();
                 core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
@@ -8760,7 +9083,7 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
                 message: source.to_string(),
             })?;
         let transport_snapshot = self.transport_state();
-        let config_snapshot = *self.device_config_handler();
+        let config_snapshot = self.device_config_handler().clone();
         *self.device_config_handler_mut() = config_space;
         self.increment_config_generation();
         self.mark_config_interrupt_pending();
@@ -8799,7 +9122,10 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
         config: &DriveConfig,
         backing: BlockFileBacking,
     ) -> Result<(), DriveUpdateError> {
-        let config_space = VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
+        let mut config_space = VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
+        if let Some(metrics) = &self.activation_handler().metrics {
+            config_space.attach_metrics(metrics.clone());
+        }
 
         self.activation_handler_mut()
             .refresh_backing(backing)
@@ -8831,7 +9157,7 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
         let config_space = backing
             .as_ref()
             .map(|backing| VirtioBlockConfigSpace::from_backing(backing, config.cache_type()));
-        let dispatch = self
+        let update = self
             .activation_handler_mut()
             .update_file_backend_with_opened(
                 memory,
@@ -8840,17 +9166,41 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
                 rate_limiter_update,
                 mode,
                 shared_runtime,
-            )?;
+            );
+        if let Some(metrics) = &self.activation_handler().metrics {
+            match &update {
+                Ok(dispatch) => metrics.record_queue_dispatch(dispatch),
+                Err(source) => {
+                    if let Some(dispatch) = source.completed_dispatch() {
+                        metrics.record_queue_dispatch(dispatch);
+                    }
+                }
+            }
+        }
+        let dispatch = update?;
         if dispatch.needs_queue_interrupt() {
             self.mark_queue_interrupt_pending(0);
         }
-        if let Some(config_space) = config_space {
+        if let Some(mut config_space) = config_space {
+            if let Some(metrics) = &self.activation_handler().metrics {
+                config_space.attach_metrics(metrics.clone());
+            }
             *self.device_config_handler_mut() = config_space;
             self.increment_config_generation();
             self.mark_config_interrupt_pending();
         }
         Ok(dispatch)
     }
+}
+
+pub fn attach_block_metrics_to_mmio_handler(
+    dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    metrics: SharedBlockDeviceMetrics,
+) -> Result<bool, MmioHandlerLookupError> {
+    Ok(dispatcher
+        .handler_mut::<VirtioBlockMmioHandler>(region_id)?
+        .attach_block_metrics(metrics))
 }
 
 impl VirtioMmioDeviceActivationHandler for VirtioBlockDevice {
@@ -8862,7 +9212,13 @@ impl VirtioMmioDeviceActivationHandler for VirtioBlockDevice {
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
     ) -> Result<(), VirtioMmioDeviceActivationError> {
-        self.activate_block(activation).map_err(Into::into)
+        let result = self.activate_block(activation).map_err(Into::into);
+        if result.is_err()
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.record_activation_failure();
+        }
+        result
     }
 
     fn reset(&mut self) {
@@ -9779,6 +10135,7 @@ mod tests {
         thread::JoinHandle<()>,
     ) {
         let (config_space, device, memory, peer) = vhost_user_refresh_device(refreshed_config);
+        let guest_features = config_space.available_features() & !VHOST_USER_F_PROTOCOL_FEATURES;
         let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
             VIRTIO_BLOCK_DEVICE_ID,
             config_space.available_features(),
@@ -9787,7 +10144,6 @@ mod tests {
             device,
         )
         .expect("vhost-user block handler should build");
-        let guest_features = config_space.available_features() & !VHOST_USER_F_PROTOCOL_FEATURES;
         handler
             .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
             .expect("vhost-user refresh handler should accept ACKNOWLEDGE");
@@ -9983,7 +10339,7 @@ mod tests {
         endpoint
             .admit_device_work()
             .expect("test PCI endpoint work should admit")
-            .with_core_mut(|core| (core.device.config_generation(), core.device_config))
+            .with_core_mut(|core| (core.device.config_generation(), core.device_config.clone()))
             .expect("test PCI endpoint state should remain available")
     }
 
@@ -10306,11 +10662,11 @@ mod tests {
     }
 
     fn read_block_config(
-        config: VirtioBlockConfigSpace,
+        config: &VirtioBlockConfigSpace,
         offset: u64,
         len: u64,
     ) -> Result<MmioAccessBytes, VirtioMmioRegisterHandlerError> {
-        block_config_handler(config).read_access(virtio_mmio_access(
+        block_config_handler(config.clone()).read_access(virtio_mmio_access(
             VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset,
             len,
         ))
@@ -11528,6 +11884,33 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains(sensitive_id));
         assert!(!rendered.contains("private-runtime-backing-1420"));
+    }
+
+    #[test]
+    fn prepared_file_block_attaches_one_metrics_owner_to_both_sources() {
+        let file = temp_file("prepared-block-metrics-owner.img", &[0; 512]);
+        let config = DriveConfigInput::new("rootfs", "rootfs", file.as_path(), true)
+            .validate()
+            .expect("file-backed drive config should validate");
+        let mut prepared = PreparedBlockDevice::from_config_with_backing(&config, None)
+            .expect("file-backed block device should prepare");
+        let metrics = SharedBlockDeviceMetrics::default();
+
+        assert!(prepared.attach_metrics(metrics.clone()));
+
+        let config_metrics = prepared
+            .config_space
+            .metrics
+            .as_ref()
+            .expect("ordinary config source should retain the metrics owner");
+        let device_metrics = prepared
+            .device
+            .metrics
+            .as_ref()
+            .expect("ordinary device source should retain the metrics owner");
+        assert!(metrics.shares_state_with(config_metrics));
+        assert!(metrics.shares_state_with(device_metrics));
+        assert!(config_metrics.shares_state_with(device_metrics));
     }
 
     #[test]
@@ -13064,6 +13447,22 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_config_space_records_only_failed_accesses() {
+        let metrics = SharedBlockDeviceMetrics::default();
+        let mut config = VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe);
+        config.attach_metrics(metrics.clone());
+
+        assert!(read_block_config(&config, 0, 8).is_ok());
+        assert!(read_block_config(&config, 8, 1).is_err());
+        assert!(write_block_config_after_driver(config, 0, &[0]).is_err());
+
+        assert_eq!(
+            metrics.snapshot(),
+            BlockDeviceMetrics::default().with_cfg_fails(2)
+        );
+    }
+
+    #[test]
     fn block_handler_refresh_updates_backing_config_generation_and_interrupt() {
         let first = temp_file("refresh-first.img", &[0; 512]);
         let second = temp_file("refresh-second.img", &[0; 1024]);
@@ -13215,7 +13614,7 @@ mod tests {
     fn vhost_user_block_handler_refresh_failure_preserves_config_and_generation() {
         let (mut handler, _memory, peer) =
             vhost_user_refresh_handler(TestVhostUserConfigReply::Malformed);
-        let original = *handler.device_config_handler();
+        let original = handler.device_config_handler().clone();
 
         let error = handler
             .refresh_vhost_user_block_config(DriveCacheType::Unsafe)
@@ -13242,7 +13641,7 @@ mod tests {
         let (mut handler, _memory, peer) =
             vhost_user_refresh_handler(TestVhostUserConfigReply::Exact(refreshed));
         let original_transport = handler.transport_state();
-        let original_config = *handler.device_config_handler();
+        let original_config = handler.device_config_handler().clone();
 
         let error = handler
             .refresh_vhost_user_block_config_with_signal(DriveCacheType::Unsafe, || {
@@ -13422,19 +13821,19 @@ mod tests {
         let expected = sectors.to_le_bytes();
 
         assert_eq!(
-            read_block_config(config, 0, 8)
+            read_block_config(&config, 0, 8)
                 .expect("full capacity read should succeed")
                 .as_slice(),
             expected.as_slice()
         );
         assert_eq!(
-            read_block_config(config, 1, 2)
+            read_block_config(&config, 1, 2)
                 .expect("partial capacity read should succeed")
                 .as_slice(),
             &[0x03, 0x02]
         );
         assert_eq!(
-            read_block_config(config, 4, 4)
+            read_block_config(&config, 4, 4)
                 .expect("high capacity word read should succeed")
                 .as_slice(),
             &[0, 0, 0, 0]
@@ -13447,13 +13846,13 @@ mod tests {
         let expected = config.capacity_sectors().to_le_bytes();
 
         assert_eq!(
-            read_block_config(config, 7, 1)
+            read_block_config(&config, 7, 1)
                 .expect("last capacity byte should read")
                 .as_slice(),
             expected.get(7..8).expect("test slice should exist")
         );
         assert_eq!(
-            read_block_config(config, 4, 4)
+            read_block_config(&config, 4, 4)
                 .expect("read ending at capacity boundary should succeed")
                 .as_slice(),
             expected.get(4..8).expect("test slice should exist")
@@ -13465,11 +13864,11 @@ mod tests {
         let config = VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe);
 
         assert!(matches!(
-            read_block_config(config, 8, 1),
+            read_block_config(&config, 8, 1),
             Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 8, len: 1 })
         ));
         assert!(matches!(
-            read_block_config(config, 7, 2),
+            read_block_config(&config, 7, 2),
             Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 7, len: 2 })
         ));
     }
@@ -14486,8 +14885,14 @@ mod tests {
                 )
                 .expect("test online memory view should insert");
         }
-        let prepared = PreparedBlockDevice::from_config_with_vhost_user(&config, frontend, &memory)
-            .expect("vhost-user block should prepare with shared memory");
+        let mut prepared =
+            PreparedBlockDevice::from_config_with_vhost_user(&config, frontend, &memory)
+                .expect("vhost-user block should prepare with shared memory");
+        let ordinary_metrics = SharedBlockDeviceMetrics::default();
+        assert!(!prepared.attach_metrics(ordinary_metrics.clone()));
+        assert_eq!(ordinary_metrics.snapshot(), BlockDeviceMetrics::default());
+        assert!(prepared.config_space.metrics.is_none());
+        assert!(prepared.device.metrics.is_none());
         assert_eq!(prepared.drive_id(), "vhost");
         assert!(prepared.is_root_device());
         assert_eq!(
@@ -15123,6 +15528,8 @@ mod tests {
         let file = temp_file("block-device-trait-error.img", &sector_payload(0x66));
         let backing = open_backing(file.as_path(), false).expect("backing should open");
         let mut device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID);
+        let metrics = SharedBlockDeviceMetrics::default();
+        assert!(device.attach_metrics(metrics.clone()));
         let queues = configured_mmio_queue(TEST_QUEUE_SIZE, false);
         let registers = block_device_registers();
 
@@ -15141,6 +15548,10 @@ mod tests {
             }
         }
         assert!(device.active_queue().is_none());
+        assert_eq!(
+            metrics.snapshot(),
+            BlockDeviceMetrics::default().with_activate_fails(1)
+        );
     }
 
     #[test]
@@ -16130,7 +16541,12 @@ mod tests {
         else {
             panic!("partial publication should report an uncertain used-ring write");
         };
-        assert_eq!(*completed_dispatch, VirtioBlockQueueDispatch::default());
+        assert_eq!(completed_dispatch.processed_requests(), 1);
+        assert_eq!(completed_dispatch.successful_requests(), 1);
+        assert_eq!(completed_dispatch.read_count(), 1);
+        assert_eq!(completed_dispatch.read_bytes(), VIRTIO_BLOCK_SECTOR_SIZE);
+        assert_eq!(completed_dispatch.published_used_elements, 0);
+        assert!(completed_dispatch.read_latency_aggregate().is_some());
         assert_eq!(descriptor_head, 0);
         assert_eq!(
             bytes_written_to_guest,
@@ -16236,7 +16652,7 @@ mod tests {
         assert_eq!(completed.processed_requests(), 1);
         assert_eq!(completed.successful_requests(), 0);
         assert_eq!(completed.read_count(), 0);
-        assert_eq!(completed.read_bytes(), 0);
+        assert_eq!(completed.read_bytes(), 128);
         assert_eq!(completed.io_errors(), 1);
         assert!(completed.read_latency_aggregate().is_some());
         assert!(completed.needs_queue_interrupt());
@@ -16427,7 +16843,10 @@ mod tests {
         metrics.record_queue_dispatch(&dispatch);
         assert_eq!(
             metrics.snapshot(),
-            BlockDeviceMetrics::default().with_io_engine_throttled_events(1)
+            BlockDeviceMetrics::default()
+                .with_no_avail_buffer(1)
+                .with_io_engine_throttled_events(1)
+                .with_remaining_reqs_count(1)
         );
 
         release_sender
@@ -16737,6 +17156,8 @@ mod tests {
         .expect("rate limiter should be enabled");
         let mut device =
             VirtioBlockDevice::new(backing, TEST_DEVICE_ID).with_rate_limiter(rate_limiter);
+        let metrics = SharedBlockDeviceMetrics::default();
+        assert!(device.attach_metrics(metrics.clone()));
         let VirtioBlockBackend::File { active_queue, .. } = &mut device.backend else {
             panic!("test device should use a file backend");
         };
@@ -16751,6 +17172,10 @@ mod tests {
         assert_eq!(first_queue.processed_requests(), 1);
         assert!(first_queue.rate_limiter_retry_after().is_some());
         assert!(device.has_pending_rate_limited_queue());
+        let first_metrics = metrics.snapshot();
+        assert_eq!(first_metrics.queue_event_count(), 1);
+        assert_eq!(first_metrics.rate_limiter_event_count(), 0);
+        assert_eq!(first_metrics.flush_count(), 1);
 
         let retry = device
             .dispatch_drained_queue_notifications(&mut memory, Vec::new())
@@ -16763,6 +17188,10 @@ mod tests {
         assert!(retry_queue.rate_limiter_retry_after().is_some());
         assert!(device.has_pending_rate_limited_queue());
         assert_eq!(read_used_index(&memory), 1);
+        let retry_metrics = metrics.snapshot();
+        assert_eq!(retry_metrics.queue_event_count(), 1);
+        assert_eq!(retry_metrics.rate_limiter_event_count(), 1);
+        assert_eq!(retry_metrics.flush_count(), 1);
     }
 
     #[test]
@@ -17131,7 +17560,8 @@ mod tests {
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.status_write_failures(), 1);
         assert_eq!(dispatch.successful_requests(), 0);
-        assert_eq!(dispatch.read_count(), 0);
+        assert_eq!(dispatch.read_count(), 1);
+        assert_eq!(dispatch.read_bytes(), VIRTIO_BLOCK_SECTOR_SIZE);
         assert_eq!(dispatch.write_count(), 0);
         assert_eq!(dispatch.flush_count(), 0);
         assert_eq!(dispatch.io_errors(), 0);
@@ -17144,7 +17574,8 @@ mod tests {
         assert_eq!(
             metrics.snapshot(),
             BlockDeviceMetrics::default()
-                .with_execute_fails(1)
+                .with_read_bytes(VIRTIO_BLOCK_SECTOR_SIZE)
+                .with_read_count(1)
                 .with_read_agg(read_agg)
         );
         assert_eq!(

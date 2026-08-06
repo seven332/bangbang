@@ -18,6 +18,7 @@ use crate::block::{
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestMemory, GuestMemoryRange};
 use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::metrics::SharedBlockDeviceMetrics;
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::PciSbdf;
 use crate::snapshot_device_v2::{
@@ -231,7 +232,7 @@ impl SnapshotV2MultiBlockRestorePlan {
         }
 
         for (record, backing) in self.records.iter().zip(&backings) {
-            PreparedBlockDevice::validate_snapshot_backing(backing, record.config_space)
+            PreparedBlockDevice::validate_snapshot_backing(backing, record.config_space.clone())
                 .map_err(SnapshotV2MultiBlockBundleError::Backing)?;
         }
 
@@ -410,7 +411,7 @@ impl PreparedSnapshotV2MultiBlockRecord {
         self.device.is_root_device()
     }
 
-    pub const fn config_space(&self) -> VirtioBlockConfigSpace {
+    pub fn config_space(&self) -> VirtioBlockConfigSpace {
         self.device.config_space()
     }
 
@@ -618,6 +619,15 @@ pub struct PreparedSnapshotV2MultiBlockPciRecord {
 }
 
 impl PreparedSnapshotV2MultiBlockPciRecord {
+    /// Attaches a fresh destination-local ordinary block metrics owner.
+    pub fn attach_metrics(&mut self, metrics: SharedBlockDeviceMetrics) -> bool {
+        if !self.device.attach_metrics(metrics.clone()) {
+            return false;
+        }
+        self.config_space.attach_metrics(metrics);
+        true
+    }
+
     pub const fn key(&self) -> SnapshotV2DeviceKey {
         self.key
     }
@@ -2618,7 +2628,7 @@ mod tests {
                     is_root: record.is_root,
                     io_engine: record.io_engine,
                     cache_type: record.cache_type,
-                    config_space: record.config_space,
+                    config_space: record.config_space.clone(),
                     device_id: record.device_id,
                     queue_ranges: record.queue_ranges,
                     active_queue: record.active_queue.clone(),

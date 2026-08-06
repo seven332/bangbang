@@ -1751,7 +1751,7 @@ impl Arm64BootBlockNotificationDispatch {
 
 #[derive(Debug)]
 pub enum Arm64BootBlockNotificationOutcome {
-    Dispatched(VirtioBlockDeviceNotificationDispatch),
+    Dispatched(Box<VirtioBlockDeviceNotificationDispatch>),
     DispatchFailed(VirtioBlockDeviceNotificationError),
     HandlerLookupFailed(MmioHandlerLookupError),
 }
@@ -1777,9 +1777,9 @@ impl Arm64BootBlockNotificationOutcome {
         }
     }
 
-    pub const fn dispatched(&self) -> Option<&VirtioBlockDeviceNotificationDispatch> {
+    pub fn dispatched(&self) -> Option<&VirtioBlockDeviceNotificationDispatch> {
         match self {
-            Self::Dispatched(dispatch) => Some(dispatch),
+            Self::Dispatched(dispatch) => Some(dispatch.as_ref()),
             Self::DispatchFailed(_) | Self::HandlerLookupFailed(_) => None,
         }
     }
@@ -3671,7 +3671,9 @@ impl Arm64BootRuntimeResources {
             let region_id = device.registration.region_id();
             let outcome = match mmio_dispatcher.handler_mut::<VirtioBlockMmioHandler>(region_id) {
                 Ok(handler) => match handler.dispatch_block_queue_notifications(memory) {
-                    Ok(dispatch) => Arm64BootBlockNotificationOutcome::Dispatched(dispatch),
+                    Ok(dispatch) => {
+                        Arm64BootBlockNotificationOutcome::Dispatched(Box::new(dispatch))
+                    }
                     Err(source) => Arm64BootBlockNotificationOutcome::DispatchFailed(source),
                 },
                 Err(source) => Arm64BootBlockNotificationOutcome::HandlerLookupFailed(source),
