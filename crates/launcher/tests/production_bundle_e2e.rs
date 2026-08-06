@@ -17488,6 +17488,7 @@ fn wait_for_canonical_output_metrics_lines(
             if lines.len() == expected {
                 for line in &lines {
                     assert_canonical_metrics_tree(line, "metrics");
+                    assert_architecture_retained_platform_zero_metrics(line, context);
                     assert!(line["utc_timestamp_ms"].as_u64().is_some());
                     assert_eq!(line["vmm"]["panic_count"].as_u64(), Some(0));
                     assert!(line["vmm"].get("metrics_flush_count").is_none());
@@ -17501,6 +17502,62 @@ fn wait_for_canonical_output_metrics_lines(
             "timed out after {timeout:?} waiting for {expected} {context} metrics lines; output:\n{output}"
         );
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn assert_architecture_retained_platform_zero_metrics(value: &serde_json::Value, context: &str) {
+    let i8042 = value
+        .get("i8042")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("{context} metrics should contain an i8042 object"));
+    assert_eq!(
+        i8042.len(),
+        6,
+        "{context} metrics i8042 shape should be exact"
+    );
+    for field in [
+        "error_count",
+        "missed_read_count",
+        "missed_write_count",
+        "read_count",
+        "reset_count",
+        "write_count",
+    ] {
+        assert_eq!(
+            i8042.get(field).and_then(serde_json::Value::as_u64),
+            Some(0),
+            "{context} metrics must retain literal zero i8042.{field}"
+        );
+    }
+
+    let vcpu = value
+        .get("vcpu")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("{context} metrics should contain a vcpu object"));
+    for field in ["exit_io_in", "exit_io_out", "kvmclock_ctrl_fails"] {
+        assert_eq!(
+            vcpu.get(field).and_then(serde_json::Value::as_u64),
+            Some(0),
+            "{context} metrics must retain literal zero vcpu.{field}"
+        );
+    }
+    for aggregate_name in ["exit_io_in_agg", "exit_io_out_agg"] {
+        let aggregate = vcpu
+            .get(aggregate_name)
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| panic!("{context} metrics should contain vcpu.{aggregate_name}"));
+        assert_eq!(
+            aggregate.len(),
+            3,
+            "{context} metrics {aggregate_name} shape should be exact"
+        );
+        for field in ["min_us", "max_us", "sum_us"] {
+            assert_eq!(
+                aggregate.get(field).and_then(serde_json::Value::as_u64),
+                Some(0),
+                "{context} metrics must retain literal zero vcpu.{aggregate_name}.{field}"
+            );
+        }
     }
 }
 

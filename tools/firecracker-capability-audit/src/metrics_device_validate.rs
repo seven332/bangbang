@@ -7,13 +7,24 @@ use crate::{
     METRICS_DEVICE_PRODUCER_AUDIT_SCHEMA_VERSION, MetricsDeviceProducerAudit,
     MetricsDeviceProducerBoundary, MetricsDeviceProducerDisposition, MetricsDeviceProducerRecord,
     MetricsPolicyProfile, MetricsProducerDisposition, MetricsProducerOwner, MetricsSchemaAuthority,
-    MetricsSourceField, Reference, ValidationErrors,
+    MetricsSourceField, PlatformExclusion, Reference, ValidationErrors,
 };
 
 const EXPECTED_DEVICE_FIELDS: usize = 231;
 const COMPLETED_DELIVERY_ISSUES: &[&str] = &[
-    "#1838", "#1839", "#1840", "#1841", "#1842", "#1843", "#1844", "#1845",
+    "#1838", "#1839", "#1840", "#1841", "#1842", "#1843", "#1844", "#1845", "#1846",
 ];
+
+const ARCHITECTURE_RETAINED_CHALLENGE_URL: &str =
+    "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984";
+const APPLE_HVF_EXIT_REASON_URL: &str =
+    "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t";
+const APPLE_HVF_VCPU_EXIT_URL: &str =
+    "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t";
+const FIRECRACKER_SOURCE_URL: &str = "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src";
+const I8042_LITERAL_ZERO_ANCHOR: &str = "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },";
+const EXIT_IO_IN_AGG_LITERAL_ZERO_ANCHOR: &str = "exit_io_in_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },";
+const EXIT_IO_OUT_AGG_LITERAL_ZERO_ANCHOR: &str = "exit_io_out_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },";
 
 /// Validate exact device-producer authority against the resolved metrics schema.
 pub fn validate_metrics_device_producers(
@@ -274,6 +285,11 @@ fn validate_record(
                         context.repository_root,
                         errors,
                     );
+                    if record.delivery_issue == "#1846" {
+                        validate_architecture_retained_platform_zero_record(
+                            record, path, exclusion, errors,
+                        );
+                    }
                 }
                 (MetricsDeviceProducerDisposition::PlatformZero, None) => errors.push(format!(
                     "terminal platform-zero metrics device producer needs structured exclusion evidence: {}",
@@ -286,6 +302,205 @@ fn validate_record(
                 (_, None) => {}
             }
         }
+    }
+}
+
+fn validate_architecture_retained_platform_zero_record(
+    record: &MetricsDeviceProducerRecord,
+    path: &str,
+    exclusion: &PlatformExclusion,
+    errors: &mut Vec<String>,
+) {
+    let Some(expected_exclusion) = expected_architecture_retained_exclusion(path) else {
+        errors.push(format!(
+            "#1846 terminal platform-zero record is outside the exact architecture-retained set: {}",
+            record.field_id
+        ));
+        return;
+    };
+    let expected_implementation = architecture_retained_implementation(path);
+    if record.implementation != expected_implementation {
+        errors.push(format!(
+            "#1846 terminal platform-zero record has wrong exact target/backend/machine or literal-zero implementation evidence: {}",
+            record.field_id
+        ));
+    }
+    let expected_validation = architecture_retained_validation();
+    if record.validation != expected_validation {
+        errors.push(format!(
+            "#1846 terminal platform-zero record has wrong exact portable/signed validation evidence: {}",
+            record.field_id
+        ));
+    }
+    if exclusion != &expected_exclusion {
+        errors.push(format!(
+            "#1846 terminal platform-zero record has wrong exact field, target, backend, machine, or Challenge exclusion evidence: {}",
+            record.field_id
+        ));
+    }
+}
+
+fn expected_architecture_retained_exclusion(path: &str) -> Option<PlatformExclusion> {
+    let upstream_contract = architecture_retained_upstream_contract(path)?;
+    let alternatives = vec![
+        format!(
+            "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `{path}` rather than implement its current-platform producer."
+        ),
+        architecture_retained_non_aliasing_alternative(path)?.to_string(),
+    ];
+    Some(PlatformExclusion {
+        upstream_contract,
+        platform_evidence: architecture_retained_platform_evidence(),
+        alternatives,
+        stable_behavior: architecture_retained_implementation(path),
+        focused_tests: architecture_retained_validation(),
+        compatibility_docs: vec![
+            local_reference(
+                "compat/firecracker/v1.16.0/metrics-contract.md",
+                "### arm64-retained i8042, PIO, and KVM-clock platform zeros",
+            ),
+            local_reference(
+                "docs/firecracker-compatibility.md",
+                "### Architecture-retained arm64 metric zeros",
+            ),
+        ],
+        security_docs: vec![local_reference(
+            "docs/security.md",
+            "### Architecture-retained metric identity and non-aliasing",
+        )],
+        challenge: Reference::Github {
+            url: ARCHITECTURE_RETAINED_CHALLENGE_URL.to_string(),
+        },
+    })
+}
+
+fn architecture_retained_upstream_contract(path: &str) -> Option<Vec<Reference>> {
+    let producer = match path {
+        "i8042.error_count" | "i8042.reset_count" => "/devices/legacy/i8042.rs#L248-L266",
+        "i8042.missed_read_count" | "i8042.read_count" => "/devices/legacy/i8042.rs#L214-L244",
+        "i8042.missed_write_count" | "i8042.write_count" => "/devices/legacy/i8042.rs#L248-L336",
+        "vcpu.exit_io_in"
+        | "vcpu.exit_io_in_agg.max_us"
+        | "vcpu.exit_io_in_agg.min_us"
+        | "vcpu.exit_io_in_agg.sum_us" => "/arch/x86_64/vcpu.rs#L717-L731",
+        "vcpu.exit_io_out"
+        | "vcpu.exit_io_out_agg.max_us"
+        | "vcpu.exit_io_out_agg.min_us"
+        | "vcpu.exit_io_out_agg.sum_us" => "/arch/x86_64/vcpu.rs#L717-L742",
+        "vcpu.kvmclock_ctrl_fails" => "/arch/x86_64/vcpu.rs#L268-L283",
+        _ => return None,
+    };
+    let mut references = Vec::new();
+    if path.starts_with("i8042.") {
+        references.push(authoritative_reference(&format!(
+            "{FIRECRACKER_SOURCE_URL}/device_manager/legacy.rs#L7-L66"
+        )));
+    }
+    references.push(authoritative_reference(&format!(
+        "{FIRECRACKER_SOURCE_URL}{producer}"
+    )));
+    Some(references)
+}
+
+fn architecture_retained_non_aliasing_alternative(path: &str) -> Option<String> {
+    if path.starts_with("i8042.") {
+        return Some(format!(
+            "Relabeling PL031 RTC or PSCI activity as `{path}` would fabricate an i8042 event."
+        ));
+    }
+    if path.starts_with("vcpu.exit_io_") {
+        return Some(format!(
+            "Relabeling HVF MMIO activity as `{path}` would fabricate a KVM PIO event and duplicate the existing MMIO family."
+        ));
+    }
+    (path == "vcpu.kvmclock_ctrl_fails").then(|| {
+        format!(
+            "Relabeling HVF pause/resume or PVTime activity as `{path}` would fabricate a KVM_KVMCLOCK_CTRL failure."
+        )
+    })
+}
+
+fn architecture_retained_implementation(path: &str) -> Vec<Reference> {
+    vec![
+        local_reference(
+            "crates/hvf/src/backend.rs",
+            "pub fn is_supported_target() -> bool",
+        ),
+        local_reference("crates/hvf/src/exit.rs", "pub enum HvfVcpuExit {"),
+        local_reference(
+            "crates/hvf/src/startup.rs",
+            "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),",
+        ),
+        local_reference(
+            "crates/runtime/src/metrics/firecracker.rs",
+            architecture_retained_literal_anchor(path),
+        ),
+    ]
+}
+
+fn architecture_retained_literal_anchor(path: &str) -> &'static str {
+    if path.starts_with("i8042.") {
+        I8042_LITERAL_ZERO_ANCHOR
+    } else if path == "vcpu.exit_io_in" {
+        "exit_io_in: 0,"
+    } else if path.starts_with("vcpu.exit_io_in_agg.") {
+        EXIT_IO_IN_AGG_LITERAL_ZERO_ANCHOR
+    } else if path == "vcpu.exit_io_out" {
+        "exit_io_out: 0,"
+    } else if path.starts_with("vcpu.exit_io_out_agg.") {
+        EXIT_IO_OUT_AGG_LITERAL_ZERO_ANCHOR
+    } else {
+        "kvmclock_ctrl_fails: 0,"
+    }
+}
+
+fn architecture_retained_platform_evidence() -> Vec<Reference> {
+    vec![
+        local_reference(
+            "crates/hvf/src/backend.rs",
+            "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))",
+        ),
+        local_reference("crates/hvf/src/exit.rs", "pub enum HvfVcpuExit {"),
+        local_reference(
+            "crates/hvf/src/startup.rs",
+            "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),",
+        ),
+        authoritative_reference(APPLE_HVF_EXIT_REASON_URL),
+        authoritative_reference(APPLE_HVF_VCPU_EXIT_URL),
+    ]
+}
+
+fn architecture_retained_validation() -> Vec<Reference> {
+    vec![
+        local_reference(
+            "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "fn assert_architecture_retained_platform_zero_metrics(",
+        ),
+        local_reference(
+            "crates/launcher/tests/production_bundle_e2e.rs",
+            "fn assert_architecture_retained_platform_zero_metrics(",
+        ),
+        local_reference(
+            "crates/runtime/src/metrics.rs",
+            "fn assert_architecture_retained_platform_zero_metrics(",
+        ),
+        local_reference(
+            "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()",
+        ),
+    ]
+}
+
+fn local_reference(path: &str, anchor: &str) -> Reference {
+    Reference::Local {
+        path: path.to_string(),
+        anchor: Some(anchor.to_string()),
+    }
+}
+
+fn authoritative_reference(url: &str) -> Reference {
+    Reference::Authoritative {
+        url: url.to_string(),
     }
 }
 
@@ -419,7 +634,7 @@ fn expected_delivery_issue(path: &str) -> Option<&'static str> {
         "net" | "net_{iface_id}" if is_tap_gap(suffix) => "#1844",
         "net" | "net_{iface_id}" => "#1843",
         "interrupts" => "#1845",
-        "vcpu" if is_provisional_vcpu_suffix(suffix) => "#1846",
+        "vcpu" if architecture_retained_vcpu_suffix(suffix) => "#1846",
         "vcpu" => "#1845",
         "i8042" => "#1846",
         _ => return None,
@@ -437,7 +652,7 @@ fn expected_boundary(path: &str) -> Option<MetricsDeviceProducerBoundary> {
                 .then_some(Boundary::InterruptLifecycle);
         }
         "mmds" => return mmds_suffix(suffix).then_some(Boundary::MmdsDataPath),
-        "vcpu" if is_provisional_vcpu_suffix(suffix) => {
+        "vcpu" if architecture_retained_vcpu_suffix(suffix) => {
             return Some(Boundary::ArchitectureRetained);
         }
         "vcpu" if suffix == "failures" => return Some(Boundary::VcpuFailure),
@@ -486,7 +701,8 @@ fn expected_terminal_disposition(path: &str) -> Option<MetricsDeviceProducerDisp
     if matches!(
         path,
         "net.mac_address_updates" | "net_{iface_id}.mac_address_updates"
-    ) {
+    ) || is_architecture_retained_platform_zero(path)
+    {
         return Some(MetricsDeviceProducerDisposition::PlatformZero);
     }
     expected_delivery_issue(path)
@@ -500,6 +716,12 @@ fn expected_rationale(
     boundary: MetricsDeviceProducerBoundary,
     completed: bool,
 ) -> String {
+    if completed && delivery_issue == "#1846" {
+        return format!(
+            "Pinned Firecracker field `{path}` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `{}` boundary.",
+            boundary.as_str()
+        );
+    }
     if completed {
         format!(
             "Pinned Firecracker field `{path}` is completed by {delivery_issue} at the `{}` boundary with exact implementation and validation evidence.",
@@ -517,7 +739,13 @@ fn is_provisional_platform_zero(path: &str) -> bool {
     let (root, suffix) = path.split_once('.').unwrap_or((path, ""));
     (matches!(root, "net" | "net_{iface_id}") && suffix == "mac_address_updates")
         || root == "i8042"
-        || (root == "vcpu" && is_provisional_vcpu_suffix(suffix))
+        || (root == "vcpu" && architecture_retained_vcpu_suffix(suffix))
+}
+
+fn is_architecture_retained_platform_zero(path: &str) -> bool {
+    let (root, suffix) = path.split_once('.').unwrap_or((path, ""));
+    (root == "i8042" && architecture_suffix(suffix))
+        || (root == "vcpu" && architecture_retained_vcpu_suffix(suffix))
 }
 
 fn is_tap_gap(suffix: &str) -> bool {
@@ -533,7 +761,7 @@ fn is_tap_gap(suffix: &str) -> bool {
     )
 }
 
-fn is_provisional_vcpu_suffix(suffix: &str) -> bool {
+fn architecture_retained_vcpu_suffix(suffix: &str) -> bool {
     suffix == "kvmclock_ctrl_fails"
         || suffix == "exit_io_in"
         || suffix.starts_with("exit_io_in_agg.")

@@ -3109,6 +3109,25 @@ therefore not a capability claim. Configured ordinary block, network, and
 vhost-user identities receive roots even when their producer registry is empty,
 while unconfigured identities do not appear.
 
+### Architecture-retained metric identity and non-aliasing
+
+Fifteen required Firecracker keys are terminal literal zeros only under the
+current `aarch64-apple-darwin` Hypervisor.framework and MMIO/PL031/PSCI machine
+premises. Six i8042 counters require the absent x86 PC controller, its PIO
+ports, IRQ, and reset event. Eight PIO count/latency leaves require KVM
+`IoIn`/`IoOut` exits and an x86 PIO bus. `vcpu.kvmclock_ctrl_fails` requires a
+failed `KVM_KVMCLOCK_CTRL` ioctl. Apple HVF exposes none of those identities.
+
+Treating PL031 or PSCI as i8042, MMIO as PIO, or HVF pause/PVTime failures as
+KVM-clock failures would fabricate events, risk double counting, and conceal a
+future machine/backend expansion. The checked audit therefore binds every
+leaf to its pinned producer and exact target/backend/machine and literal-zero
+anchors. Portable and signed tests require all 15 values to remain zero beside
+real guest MMIO, interrupt, pause/resume, snapshot, periodic, and terminal
+activity. Evidence copied from a neighboring leaf or another target/backend,
+a PC PIO/i8042 premise, and a weakened initializer are rejected. A future
+x86/KVM or other-machine implementation must reopen the limitation review.
+
 The strict line excludes Bangbang-only `vmm.metrics_flush_count`, string boot
 status, dynamic pmem roots, vmnet fields, newer balloon API/device fields, extra
 UART diagnostics, and ordinary-block configuration-change values. Internal

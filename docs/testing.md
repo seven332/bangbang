@@ -1553,14 +1553,13 @@ cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --lock
 
 The adjacent human-owned `metrics-device-producer-audit.json` maps all 231
 device-owned fields to closed operation boundaries and the nine concrete #1789
-children. After #1845 it contains 212 implemented fields, two source-neutral
-fields (`uart.flush_count` and `mmds.rx_bad_eth`), two terminal platform-zero
-`mac_address_updates` fields, no planned fields, and 15
-provisional-platform-zero fields. Only the last group is nonterminal and
-evidence-free. The same focused test checks canonical bytes, exact
-membership and partition, completed-child regression, future-child premature
-promotion, the UART-flush disposition, suffix routing, provisional state,
-anchored-evidence rules, and final-mode rejection of the remaining 15 records.
+children. After #1846 it contains 212 implemented fields, two source-neutral
+fields (`uart.flush_count` and `mmds.rx_bad_eth`), 17 terminal platform-zero
+fields, and no planned or provisional fields. The same focused test checks
+canonical bytes, exact membership and partition, completed-child regression,
+the UART/MMDS source-neutral dispositions, suffix routing, anchored evidence,
+field-specific architecture exclusions, and final-mode acceptance of all 231
+terminal records.
 
 Focused #1838 producer coverage lives with the owning runtime modules. It
 checks entropy popped-descriptor accounting and owner attachment, exact pmem
@@ -1689,6 +1688,26 @@ vCPU MMIO and interrupt totals with zero failures and every latency aggregate
 leaf present. These checks validate real HVF and process wiring without
 claiming the x86-only PIO/KVM-clock fields assigned to #1846.
 
+### Architecture-retained platform-zero metrics validation
+
+Focused #1846 coverage makes the six i8042 and nine PIO/KVM-clock output
+initializers explicit and requires their exact zero objects across active
+intervals with nonzero MMIO, vCPU failure, and interrupt neighbors. Audit
+mutations reject missing/generic evidence, evidence copied between leaves,
+another target or backend, a changed PIO/i8042 machine premise, a nonliteral
+initializer anchor, and a different Challenge. Each record independently
+binds its pinned Firecracker producer even when latency leaves share one
+upstream dispatch site.
+
+The signed executable helper checks every inspected source, paused/restored,
+and automatically resumed native-v2 metrics line; those workloads perform
+guest storage I/O, MMIO, interrupts, pause/resume, and snapshot continuation.
+The production-bundle canonical-line helper applies the same assertion to
+initial, real 60-second Paused/Running periodic, explicit, terminal, and
+contained fatal output through the App Sandbox worker and launcher. Run the
+complete wrapper without `--allow-unsupported` and without a PTY so the real
+HVF and production serial stdio boundaries are exercised.
+
 The ordinary `compare` command rederives the source projection together with
 the general and logger manifests. To create a metrics source-only candidate:
 
@@ -1749,9 +1768,10 @@ partition with final-mode validation of the exact process audit, while retaining
 logger and device-audit validation in delivery mode. It requires the two
 implemented process profiles and all 69 field records to remain terminal at
 exactly 64 implemented, one source-neutral, and four platform-zero. Ten planned
-and five platform-zero device profiles remain #1789-owned; within the 231-field
-device audit, #1838–#1845 contribute 216 terminal records and the other 15
-remain nonterminal. The two aggregates remain #1790-owned.
+and five platform-zero device profiles remain #1789-owned pending #1847's
+whole-device promotion; within the 231-field device audit, #1838–#1846 are all
+terminal at 212 implemented, two source-neutral, and 17 platform-zero. The two
+aggregates remain #1790-owned.
 The composed test mutates both a field record and an aggregate process profile;
 the lower-level suite separately exercises every membership, ordering,
 ownership, boundary, child, rationale, disposition, evidence, path, and baseline

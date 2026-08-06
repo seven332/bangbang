@@ -835,7 +835,14 @@ pub(super) fn build_metrics_line(
             vmm_version_count: interval.get_api_requests.vmm_version_count,
             hotplug_memory_count: interval.get_api_requests.hotplug_memory_count,
         },
-        i8042: I8042Metrics::default(),
+        i8042: I8042Metrics {
+            error_count: 0,
+            missed_read_count: 0,
+            missed_write_count: 0,
+            read_count: 0,
+            reset_count: 0,
+            write_count: 0,
+        },
         rtc: RtcMetrics {
             error_count: rtc.error_count,
             missed_read_count: rtc.missed_read_count,
@@ -942,9 +949,22 @@ pub(super) fn build_metrics_line(
         },
         seccomp: SeccompMetrics::default(),
         vcpu: VcpuMetrics {
+            exit_io_in: 0,
+            exit_io_out: 0,
             exit_mmio_read: interval_vcpu.exit_mmio_read(),
             exit_mmio_write: interval_vcpu.exit_mmio_write(),
             failures: interval_vcpu.failures(),
+            kvmclock_ctrl_fails: 0,
+            exit_io_in_agg: LatencyAggregate {
+                min_us: 0,
+                max_us: 0,
+                sum_us: 0,
+            },
+            exit_io_out_agg: LatencyAggregate {
+                min_us: 0,
+                max_us: 0,
+                sum_us: 0,
+            },
             exit_mmio_read_agg: LatencyAggregate {
                 min_us: current_vcpu.exit_mmio_read_agg().min_us(),
                 max_us: current_vcpu.exit_mmio_read_agg().max_us(),
@@ -955,7 +975,6 @@ pub(super) fn build_metrics_line(
                 max_us: current_vcpu.exit_mmio_write_agg().max_us(),
                 sum_us: interval_vcpu.exit_mmio_write_agg().sum_us(),
             },
-            ..VcpuMetrics::default()
         },
         vmm: VmmMetrics {
             panic_count: current.panic_count,

@@ -7744,6 +7744,32 @@ mod tests {
         values.into_iter().next().expect("one metrics value")
     }
 
+    fn assert_architecture_retained_platform_zero_metrics(value: &serde_json::Value) {
+        assert_eq!(
+            value["i8042"],
+            serde_json::json!({
+                "error_count": 0,
+                "missed_read_count": 0,
+                "missed_write_count": 0,
+                "read_count": 0,
+                "reset_count": 0,
+                "write_count": 0,
+            })
+        );
+        let vcpu = &value["vcpu"];
+        assert_eq!(vcpu["exit_io_in"], 0);
+        assert_eq!(vcpu["exit_io_out"], 0);
+        assert_eq!(vcpu["kvmclock_ctrl_fails"], 0);
+        assert_eq!(
+            vcpu["exit_io_in_agg"],
+            serde_json::json!({"min_us": 0, "max_us": 0, "sum_us": 0})
+        );
+        assert_eq!(
+            vcpu["exit_io_out_agg"],
+            serde_json::json!({"min_us": 0, "max_us": 0, "sum_us": 0})
+        );
+    }
+
     fn metrics_values_from_text(output: &str) -> Vec<serde_json::Value> {
         output
             .lines()
@@ -9286,6 +9312,9 @@ mod tests {
 
         let values = metrics_values(&output);
         assert_eq!(values.len(), 2);
+        for value in &values {
+            assert_architecture_retained_platform_zero_metrics(value);
+        }
         assert_eq!(values[0]["vcpu"]["exit_mmio_read"], 2);
         assert_eq!(values[0]["vcpu"]["exit_mmio_write"], 1);
         assert_eq!(values[0]["vcpu"]["failures"], 1);

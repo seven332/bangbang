@@ -132,11 +132,12 @@ cargo check --workspace --all-targets --all-features --locked
 ```
 
 The ordinary audit also validates the exact 231-field device producer
-authority for #1789. The completed #1838–#1845 slices contribute 212
-implemented device records, two source-neutral records, and two terminal
-platform-zero `mac_address_updates` records. No planned records remain; the
-15 provisional platform-zero records are assigned to the final architecture
-closure.
+authority for #1789. The completed #1838–#1846 slices contribute 212
+implemented device records, two source-neutral records, and 17 terminal
+platform-zero records. The latter are the two immutable-MAC fields plus six
+arm64-retained i8042 and nine PIO/KVM-clock fields. All 231 records are
+terminal, while #1847 still owns the dedicated whole-device gate and shared
+profile promotion.
 
 The terminal 69-field API/process metrics producer scope has a separate
 fail-closed certification gate:

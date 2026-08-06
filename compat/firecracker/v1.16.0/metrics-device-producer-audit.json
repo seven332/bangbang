@@ -4858,56 +4858,956 @@
     {
       "field_id": "static:i8042.error_count",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `i8042.error_count` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `i8042.error_count` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/device_manager/legacy.rs#L7-L66"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/legacy/i8042.rs#L248-L266"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `i8042.error_count` rather than implement its current-platform producer.",
+          "Relabeling PL031 RTC or PSCI activity as `i8042.error_count` would fabricate an i8042 event."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:i8042.missed_read_count",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `i8042.missed_read_count` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `i8042.missed_read_count` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/device_manager/legacy.rs#L7-L66"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/legacy/i8042.rs#L214-L244"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `i8042.missed_read_count` rather than implement its current-platform producer.",
+          "Relabeling PL031 RTC or PSCI activity as `i8042.missed_read_count` would fabricate an i8042 event."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:i8042.missed_write_count",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `i8042.missed_write_count` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `i8042.missed_write_count` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/device_manager/legacy.rs#L7-L66"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/legacy/i8042.rs#L248-L336"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `i8042.missed_write_count` rather than implement its current-platform producer.",
+          "Relabeling PL031 RTC or PSCI activity as `i8042.missed_write_count` would fabricate an i8042 event."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:i8042.read_count",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `i8042.read_count` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `i8042.read_count` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/device_manager/legacy.rs#L7-L66"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/legacy/i8042.rs#L214-L244"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `i8042.read_count` rather than implement its current-platform producer.",
+          "Relabeling PL031 RTC or PSCI activity as `i8042.read_count` would fabricate an i8042 event."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:i8042.reset_count",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `i8042.reset_count` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `i8042.reset_count` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/device_manager/legacy.rs#L7-L66"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/legacy/i8042.rs#L248-L266"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `i8042.reset_count` rather than implement its current-platform producer.",
+          "Relabeling PL031 RTC or PSCI activity as `i8042.reset_count` would fabricate an i8042 event."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:i8042.write_count",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `i8042.write_count` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `i8042.write_count` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/device_manager/legacy.rs#L7-L66"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/legacy/i8042.rs#L248-L336"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `i8042.write_count` rather than implement its current-platform producer.",
+          "Relabeling PL031 RTC or PSCI activity as `i8042.write_count` would fabricate an i8042 event."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "i8042: I8042Metrics {\n            error_count: 0,\n            missed_read_count: 0,\n            missed_write_count: 0,\n            read_count: 0,\n            reset_count: 0,\n            write_count: 0,\n        },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:interrupts.config_updates",
@@ -8941,74 +9841,1242 @@
     {
       "field_id": "static:vcpu.exit_io_in",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `vcpu.exit_io_in` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_io_in` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "exit_io_in: 0,"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/x86_64/vcpu.rs#L717-L731"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `vcpu.exit_io_in` rather than implement its current-platform producer.",
+          "Relabeling HVF MMIO activity as `vcpu.exit_io_in` would fabricate a KVM PIO event and duplicate the existing MMIO family."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "exit_io_in: 0,"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:vcpu.exit_io_in_agg.max_us",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `vcpu.exit_io_in_agg.max_us` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_io_in_agg.max_us` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "exit_io_in_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/x86_64/vcpu.rs#L717-L731"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `vcpu.exit_io_in_agg.max_us` rather than implement its current-platform producer.",
+          "Relabeling HVF MMIO activity as `vcpu.exit_io_in_agg.max_us` would fabricate a KVM PIO event and duplicate the existing MMIO family."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "exit_io_in_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:vcpu.exit_io_in_agg.min_us",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `vcpu.exit_io_in_agg.min_us` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_io_in_agg.min_us` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "exit_io_in_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/x86_64/vcpu.rs#L717-L731"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `vcpu.exit_io_in_agg.min_us` rather than implement its current-platform producer.",
+          "Relabeling HVF MMIO activity as `vcpu.exit_io_in_agg.min_us` would fabricate a KVM PIO event and duplicate the existing MMIO family."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "exit_io_in_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:vcpu.exit_io_in_agg.sum_us",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `vcpu.exit_io_in_agg.sum_us` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_io_in_agg.sum_us` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "exit_io_in_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/x86_64/vcpu.rs#L717-L731"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `vcpu.exit_io_in_agg.sum_us` rather than implement its current-platform producer.",
+          "Relabeling HVF MMIO activity as `vcpu.exit_io_in_agg.sum_us` would fabricate a KVM PIO event and duplicate the existing MMIO family."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "exit_io_in_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:vcpu.exit_io_out",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `vcpu.exit_io_out` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_io_out` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "exit_io_out: 0,"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/x86_64/vcpu.rs#L717-L742"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `vcpu.exit_io_out` rather than implement its current-platform producer.",
+          "Relabeling HVF MMIO activity as `vcpu.exit_io_out` would fabricate a KVM PIO event and duplicate the existing MMIO family."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "exit_io_out: 0,"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:vcpu.exit_io_out_agg.max_us",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `vcpu.exit_io_out_agg.max_us` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_io_out_agg.max_us` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "exit_io_out_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/x86_64/vcpu.rs#L717-L742"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `vcpu.exit_io_out_agg.max_us` rather than implement its current-platform producer.",
+          "Relabeling HVF MMIO activity as `vcpu.exit_io_out_agg.max_us` would fabricate a KVM PIO event and duplicate the existing MMIO family."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "exit_io_out_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:vcpu.exit_io_out_agg.min_us",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `vcpu.exit_io_out_agg.min_us` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_io_out_agg.min_us` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "exit_io_out_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/x86_64/vcpu.rs#L717-L742"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `vcpu.exit_io_out_agg.min_us` rather than implement its current-platform producer.",
+          "Relabeling HVF MMIO activity as `vcpu.exit_io_out_agg.min_us` would fabricate a KVM PIO event and duplicate the existing MMIO family."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "exit_io_out_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:vcpu.exit_io_out_agg.sum_us",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `vcpu.exit_io_out_agg.sum_us` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_io_out_agg.sum_us` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "exit_io_out_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/x86_64/vcpu.rs#L717-L742"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `vcpu.exit_io_out_agg.sum_us` rather than implement its current-platform producer.",
+          "Relabeling HVF MMIO activity as `vcpu.exit_io_out_agg.sum_us` would fabricate a KVM PIO event and duplicate the existing MMIO family."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "exit_io_out_agg: LatencyAggregate {\n                min_us: 0,\n                max_us: 0,\n                sum_us: 0,\n            },"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:vcpu.exit_mmio_read",
@@ -9472,11 +11540,157 @@
     {
       "field_id": "static:vcpu.kvmclock_ctrl_fails",
       "boundary": "architecture-retained",
-      "disposition": "provisional-platform-zero",
+      "disposition": "platform-zero",
       "delivery_issue": "#1846",
-      "rationale": "Pinned Firecracker field `vcpu.kvmclock_ctrl_fails` is assigned to #1846 at the `architecture-retained` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.kvmclock_ctrl_fails` has no identity-preserving producer on Bangbang's aarch64-apple-darwin Hypervisor.framework MMIO/PL031/PSCI machine; #1846 certifies its required public value as a terminal literal zero at the `architecture-retained` boundary.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "pub fn is_supported_target() -> bool"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/exit.rs",
+          "anchor": "pub enum HvfVcpuExit {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "kvmclock_ctrl_fails: 0,"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/x86_64/vcpu.rs#L268-L283"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "cfg!(all(target_os = \"macos\", target_arch = \"aarch64\"))"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_exit_reason_t"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_exit_t"
+          }
+        ],
+        "alternatives": [
+          "Adding x86 PC port I/O or KVM to the supported arm64 HVF machine would change the target/backend/machine contract for `vcpu.kvmclock_ctrl_fails` rather than implement its current-platform producer.",
+          "Relabeling HVF pause/resume or PVTime activity as `vcpu.kvmclock_ctrl_fails` would fabricate a KVM_KVMCLOCK_CTRL failure."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/backend.rs",
+            "anchor": "pub fn is_supported_target() -> bool"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/exit.rs",
+            "anchor": "pub enum HvfVcpuExit {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/startup.rs",
+            "anchor": "rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "kvmclock_ctrl_fails: 0,"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn assert_architecture_retained_platform_zero_metrics("
+          },
+          {
+            "kind": "local",
+            "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+            "anchor": "fn device_producer_audit_rejects_architecture_retained_platform_scope_drift()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### arm64-retained i8042, PIO, and KVM-clock platform zeros"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### Architecture-retained arm64 metric zeros"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### Architecture-retained metric identity and non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1846#issuecomment-5205139984"
+        }
+      }
     },
     {
       "field_id": "static:vsock.activate_fails",

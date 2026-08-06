@@ -43,9 +43,9 @@ including the schema-runtime timestamp producer. #1788 certifies the exact
 API, process, logger, signal, boot, and lifecycle producers through two
 implemented aggregate profiles and the field-level process audit. The checked
 device audit now assigns every #1789 field to one concrete delivery child and
-terminally certifies the 216 records delivered by #1838–#1845; later child
-records remain nonterminal. `corpus:metrics` and the cross-producer aggregate
-semantic remain #1790-owned. A required zero therefore proves wire-shape
+terminally certifies all 231 records delivered by #1838–#1846; #1847 still
+owns the whole-device gate and shared-profile promotion. `corpus:metrics` and
+the cross-producer aggregate semantic remain #1790-owned. A required zero therefore proves wire-shape
 completeness only, never producer completion unless its field audit is
 terminal.
 
@@ -219,22 +219,20 @@ Static and configured identities remain distinct; exact suffix routing splits
 mapped network fields from tap-oriented gaps and applicable vCPU exits from
 retained PIO/KVM-clock fields.
 
-After #1845, the audit contains no `planned`, 15
-`provisional-platform-zero`, 212 `implemented`, two `source-neutral`, and two
-`platform-zero` records. The 216 terminal records additionally cover all 56
-applicable configured and static network fields, all 13 MMDS fields, and the
-11 applicable vCPU/interrupt fields.
+After #1846, the audit contains no `planned` or
+`provisional-platform-zero`, 212 `implemented`, two `source-neutral`, and 17
+`platform-zero` records. All 231 records additionally cover all 56 applicable
+configured and static network fields, all 13 MMDS fields, and the complete
+retained vCPU/interrupt/i8042 schema.
 `uart.flush_count` remains
 source-neutral because pinned Firecracker declares it without a producer.
 `mmds.rx_bad_eth` is also source-neutral: Bangbang classifies and parses the
 same immutable owned packet, so Firecracker's zero-copy mutation window cannot
 occur and no broader malformed-frame event is aliased into the field. The
-remaining provisional records are nonterminal, carry empty implementation and
-validation arrays, and have no platform exclusion. They are the six retained
-i8042 fields plus nine vCPU
-PIO/KVM-clock fields;
-this label does not claim that the terminal platform evidence required by
-#1846 already exists.
+six retained i8042 fields plus nine vCPU PIO/KVM-clock fields are terminal
+platform-zero under the exact #1846 target/backend/machine evidence described
+below. This field-level closure does not promote the five shared device schema
+profiles; #1847 owns that whole-device gate.
 
 Network metrics use one generation-bearing per-interface owner. A single
 registry capture produces both configured `net_{iface_id}` values and the
@@ -313,6 +311,36 @@ once; and restore counts each validated active entry it reconstructs. Disabling,
 identical, invalid, or still-masked writes do not count. Snapshot state carries
 neither metric root; every destination begins fresh and publication retains
 the same whole-line retry contract.
+
+### arm64-retained i8042, PIO, and KVM-clock platform zeros
+
+#1846 closes exactly 15 required numeric leaves as terminal platform-zero for
+Bangbang's current `aarch64-apple-darwin` Hypervisor.framework machine. Pinned
+Firecracker compiles and serializes the i8042 metric object on arm64, but its
+six increments require the x86-only PC controller registered at ports
+`0x60..0x64` and IRQ 1. Bangbang constructs MMIO serial and PL031 RTC, and
+arm64 reset uses PSCI; PL031 access, PSCI reset, and general device failures
+cannot be relabeled as i8042 activity.
+
+Pinned `exit_io_in`/`exit_io_out` counts and latency leaves are produced only
+around KVM `IoIn`/`IoOut` dispatch through an x86 PIO bus. Apple's arm64 HVF
+exit contract exposes canceled, exception, virtual-timer, and unknown exits;
+Bangbang decodes exceptions into HVC, SYS64, or MMIO and records MMIO under its
+own implemented family. Likewise `kvmclock_ctrl_fails` means failure of the
+x86-only `KVM_KVMCLOCK_CTRL` ioctl, not HVF pause/resume or ARM PVTime work.
+
+The canonical builder explicitly writes zero into every one of these leaves.
+Portable active-interval tests keep them zero beside nonzero MMIO, vCPU
+failure, and interrupt observations. Signed executable source/paused/restored/
+automatically resumed snapshot workloads and every canonical production-bundle
+initial, Paused/Running periodic, explicit, terminal, and contained-failure
+line assert the exact six-field i8042 object and nine vCPU leaves remain zero.
+Each audit record binds its own pinned producer, Apple authority, supported
+target, HVF exit model, MMIO/PL031/PSCI machine premise, literal initializer,
+tests, docs, and accepted Challenge. Generic evidence, neighboring-field
+reuse, another target/backend, a PIO/i8042 machine, or a nonliteral initializer
+fails the checked audit. A future x86/KVM backend or PC PIO machine must reopen
+these classifications rather than inherit them.
 
 Vsock uses one coherent saturating owner from configuration and activation
 through MMIO/PCI dispatch, HVF readiness, snapshot normalization, restore, and
