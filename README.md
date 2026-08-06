@@ -132,10 +132,10 @@ cargo check --workspace --all-targets --all-features --locked
 ```
 
 The ordinary audit also validates the exact 231-field device producer
-authority for #1789. The completed #1838–#1843 slices contribute 189
-implemented device records and two source-neutral records: `uart.flush_count`
-and the immutable-packet-path `mmds.rx_bad_eth`. Twenty-five planned and 15
-provisional platform-zero records remain across the later children.
+authority for #1789. The completed #1838–#1844 slices contribute 201
+implemented device records, two source-neutral records, and two terminal
+platform-zero `mac_address_updates` records. Eleven planned and 15 provisional
+platform-zero records remain across the later children.
 
 The terminal 69-field API/process metrics producer scope has a separate
 fail-closed certification gate:

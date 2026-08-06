@@ -3437,6 +3437,7 @@ pub struct NetworkInterfaceMetrics {
     no_rx_avail_buffer: u64,
     no_tx_avail_buffer: u64,
     rx_queue_event_count: u64,
+    rx_tap_event_count: u64,
     rx_bytes_count: u64,
     rx_packets_count: u64,
     rx_fails: u64,
@@ -3453,6 +3454,9 @@ pub struct NetworkInterfaceMetrics {
     tx_rate_limiter_throttled: u64,
     tx_remaining_reqs_count: u64,
     tx_spoofed_mac_count: u64,
+    tap_read_fails: u64,
+    tap_write_fails: u64,
+    tap_write_latency: VirtioNetworkLatencyAggregate,
     vmnet_read_count: u64,
     vmnet_read_fails: u64,
     vmnet_read_packets_count: u64,
@@ -3482,6 +3486,10 @@ impl NetworkInterfaceMetrics {
             rx_queue_event_count: incremental_delta(
                 self.rx_queue_event_count,
                 previous.rx_queue_event_count,
+            ),
+            rx_tap_event_count: incremental_delta(
+                self.rx_tap_event_count,
+                previous.rx_tap_event_count,
             ),
             rx_bytes_count: incremental_delta(self.rx_bytes_count, previous.rx_bytes_count),
             rx_packets_count: incremental_delta(self.rx_packets_count, previous.rx_packets_count),
@@ -3522,6 +3530,12 @@ impl NetworkInterfaceMetrics {
             tx_spoofed_mac_count: incremental_delta(
                 self.tx_spoofed_mac_count,
                 previous.tx_spoofed_mac_count,
+            ),
+            tap_read_fails: incremental_delta(self.tap_read_fails, previous.tap_read_fails),
+            tap_write_fails: incremental_delta(self.tap_write_fails, previous.tap_write_fails),
+            tap_write_latency: network_latency_delta(
+                self.tap_write_latency,
+                previous.tap_write_latency,
             ),
             vmnet_read_count: incremental_delta(self.vmnet_read_count, previous.vmnet_read_count),
             vmnet_read_fails: incremental_delta(self.vmnet_read_fails, previous.vmnet_read_fails),
@@ -3569,7 +3583,7 @@ const fn network_latency_delta(
         current.min_us(),
         current.max_us(),
         incremental_delta(current.sum_us(), previous.sum_us()),
-        incremental_delta(current.samples(), previous.samples()),
+        current.samples(),
     )
 }
 
@@ -3581,6 +3595,7 @@ impl NetworkInterfaceMetrics {
             && self.no_rx_avail_buffer == 0
             && self.no_tx_avail_buffer == 0
             && self.rx_queue_event_count == 0
+            && self.rx_tap_event_count == 0
             && self.rx_bytes_count == 0
             && self.rx_packets_count == 0
             && self.rx_fails == 0
@@ -3597,6 +3612,9 @@ impl NetworkInterfaceMetrics {
             && self.tx_rate_limiter_throttled == 0
             && self.tx_remaining_reqs_count == 0
             && self.tx_spoofed_mac_count == 0
+            && self.tap_read_fails == 0
+            && self.tap_write_fails == 0
+            && self.tap_write_latency.samples() == 0
             && self.vmnet_read_count == 0
             && self.vmnet_read_fails == 0
             && self.vmnet_read_packets_count == 0
@@ -3631,6 +3649,10 @@ impl NetworkInterfaceMetrics {
 
     pub const fn rx_queue_event_count(self) -> u64 {
         self.rx_queue_event_count
+    }
+
+    pub const fn rx_tap_event_count(self) -> u64 {
+        self.rx_tap_event_count
     }
 
     pub const fn rx_bytes_count(self) -> u64 {
@@ -3701,6 +3723,18 @@ impl NetworkInterfaceMetrics {
         self.tx_spoofed_mac_count
     }
 
+    pub const fn tap_read_fails(self) -> u64 {
+        self.tap_read_fails
+    }
+
+    pub const fn tap_write_fails(self) -> u64 {
+        self.tap_write_fails
+    }
+
+    pub const fn tap_write_latency(self) -> VirtioNetworkLatencyAggregate {
+        self.tap_write_latency
+    }
+
     pub const fn vmnet_read_count(self) -> u64 {
         self.vmnet_read_count
     }
@@ -3768,6 +3802,11 @@ impl NetworkInterfaceMetrics {
 
     pub const fn with_rx_queue_event_count(mut self, rx_queue_event_count: u64) -> Self {
         self.rx_queue_event_count = rx_queue_event_count;
+        self
+    }
+
+    pub const fn with_rx_tap_event_count(mut self, rx_tap_event_count: u64) -> Self {
+        self.rx_tap_event_count = rx_tap_event_count;
         self
     }
 
@@ -3861,6 +3900,24 @@ impl NetworkInterfaceMetrics {
         self
     }
 
+    pub const fn with_tap_read_fails(mut self, tap_read_fails: u64) -> Self {
+        self.tap_read_fails = tap_read_fails;
+        self
+    }
+
+    pub const fn with_tap_write_fails(mut self, tap_write_fails: u64) -> Self {
+        self.tap_write_fails = tap_write_fails;
+        self
+    }
+
+    pub const fn with_tap_write_latency(
+        mut self,
+        tap_write_latency: VirtioNetworkLatencyAggregate,
+    ) -> Self {
+        self.tap_write_latency = tap_write_latency;
+        self
+    }
+
     pub const fn with_vmnet_read_count(mut self, vmnet_read_count: u64) -> Self {
         self.vmnet_read_count = vmnet_read_count;
         self
@@ -3937,6 +3994,9 @@ impl NetworkInterfaceMetrics {
             rx_queue_event_count: self
                 .rx_queue_event_count
                 .saturating_add(other.rx_queue_event_count),
+            rx_tap_event_count: self
+                .rx_tap_event_count
+                .saturating_add(other.rx_tap_event_count),
             rx_bytes_count: self.rx_bytes_count.saturating_add(other.rx_bytes_count),
             rx_packets_count: self.rx_packets_count.saturating_add(other.rx_packets_count),
             rx_fails: self.rx_fails.saturating_add(other.rx_fails),
@@ -3969,6 +4029,9 @@ impl NetworkInterfaceMetrics {
             tx_spoofed_mac_count: self
                 .tx_spoofed_mac_count
                 .saturating_add(other.tx_spoofed_mac_count),
+            tap_read_fails: self.tap_read_fails.saturating_add(other.tap_read_fails),
+            tap_write_fails: self.tap_write_fails.saturating_add(other.tap_write_fails),
+            tap_write_latency: self.tap_write_latency.merged_with(other.tap_write_latency),
             vmnet_read_count: self.vmnet_read_count.saturating_add(other.vmnet_read_count),
             vmnet_read_fails: self.vmnet_read_fails.saturating_add(other.vmnet_read_fails),
             vmnet_read_packets_count: self
@@ -4122,9 +4185,43 @@ impl NetworkInterfaceMetricsByInterface {
     }
 }
 
+/// A lock-free cumulative observation source for Apple packet-available
+/// callbacks. One source belongs to exactly one live interface generation.
+#[derive(Clone, Default)]
+pub struct NetworkInterfaceTapEventSource {
+    count: Arc<AtomicU64>,
+}
+
+impl NetworkInterfaceTapEventSource {
+    /// Records accepted callbacks with saturating arithmetic.
+    pub fn record_events(&self, count: u64) {
+        record_atomic_metric_seq_cst(&self.count, count);
+    }
+
+    pub fn snapshot(&self) -> u64 {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.count, &other.count)
+    }
+}
+
+impl fmt::Debug for NetworkInterfaceTapEventSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NetworkInterfaceTapEventSource(<shared>)")
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedNetworkInterfaceMetricsState {
+    metrics: NetworkInterfaceMetrics,
+    tap_event_source: Option<NetworkInterfaceTapEventSource>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SharedNetworkInterfaceMetrics {
-    inner: Arc<Mutex<NetworkInterfaceMetrics>>,
+    inner: Arc<Mutex<SharedNetworkInterfaceMetricsState>>,
 }
 
 impl SharedNetworkInterfaceMetrics {
@@ -4132,8 +4229,25 @@ impl SharedNetworkInterfaceMetrics {
         if observation.is_empty() {
             return;
         }
-        let mut metrics = lock_network_interface_metrics(&self.inner);
-        *metrics = metrics.merged_with(observation);
+        let mut state = lock_network_interface_metrics(&self.inner);
+        state.metrics = state.metrics.merged_with(observation);
+    }
+
+    /// Binds the exact callback source for this live interface generation.
+    /// Rebinding the same source is idempotent; a different source is rejected.
+    fn bind_tap_event_source(
+        &self,
+        source: NetworkInterfaceTapEventSource,
+    ) -> Result<(), NetworkInterfaceMetricsRegistryError> {
+        let mut state = lock_network_interface_metrics(&self.inner);
+        match state.tap_event_source.as_ref() {
+            None => {
+                state.tap_event_source = Some(source);
+                Ok(())
+            }
+            Some(existing) if existing.shares_state_with(&source) => Ok(()),
+            Some(_) => Err(NetworkInterfaceMetricsRegistryError::ObservationSourceAlreadyBound),
+        }
     }
 
     pub fn record_notification_dispatch(&self, dispatch: &VirtioNetworkDeviceNotificationDispatch) {
@@ -4233,7 +4347,14 @@ impl SharedNetworkInterfaceMetrics {
     }
 
     pub fn snapshot(&self) -> NetworkInterfaceMetrics {
-        *lock_network_interface_metrics(&self.inner)
+        let state = lock_network_interface_metrics(&self.inner);
+        let tap_event_count = state
+            .tap_event_source
+            .as_ref()
+            .map_or(0, NetworkInterfaceTapEventSource::snapshot);
+        state.metrics.merged_with(
+            NetworkInterfaceMetrics::default().with_rx_tap_event_count(tap_event_count),
+        )
     }
 
     #[cfg(test)]
@@ -4243,8 +4364,8 @@ impl SharedNetworkInterfaceMetrics {
 }
 
 fn lock_network_interface_metrics(
-    metrics: &Mutex<NetworkInterfaceMetrics>,
-) -> MutexGuard<'_, NetworkInterfaceMetrics> {
+    metrics: &Mutex<SharedNetworkInterfaceMetricsState>,
+) -> MutexGuard<'_, SharedNetworkInterfaceMetricsState> {
     match metrics.lock() {
         Ok(metrics) => metrics,
         Err(poisoned) => poisoned.into_inner(),
@@ -4293,6 +4414,9 @@ fn network_tx_dispatch_observation(
 fn network_backend_observation(metrics: VirtioNetworkBackendMetrics) -> NetworkInterfaceMetrics {
     NetworkInterfaceMetrics::default()
         .with_tx_spoofed_mac_count(metrics.tx_spoofed_mac_count())
+        .with_tap_read_fails(metrics.tap_read_fails())
+        .with_tap_write_fails(metrics.tap_write_fails())
+        .with_tap_write_latency(metrics.tap_write_latency())
         .with_vmnet_read_count(metrics.vmnet_read_count())
         .with_vmnet_read_fails(metrics.vmnet_read_fails())
         .with_vmnet_read_packets_count(metrics.vmnet_read_packets_count())
@@ -4582,6 +4706,7 @@ pub enum NetworkInterfaceMetricsRegistryError {
     DuplicateInterface,
     UnknownInterface,
     LeaseAlreadyClaimed,
+    ObservationSourceAlreadyBound,
     Capacity,
     GenerationExhausted,
 }
@@ -4597,6 +4722,9 @@ impl fmt::Display for NetworkInterfaceMetricsRegistryError {
             }
             Self::LeaseAlreadyClaimed => {
                 formatter.write_str("network metrics interface lease is already claimed")
+            }
+            Self::ObservationSourceAlreadyBound => {
+                formatter.write_str("network metrics callback observation source is already bound")
             }
             Self::Capacity => formatter.write_str("failed to reserve network metrics capacity"),
             Self::GenerationExhausted => {
@@ -4776,6 +4904,22 @@ impl SharedNetworkInterfaceMetricsRegistry {
             .entries
             .iter()
             .find_map(|entry| (entry.iface_id == iface_id).then(|| entry.metrics.clone()))
+    }
+
+    /// Binds one generation-owned packet-available source to the currently
+    /// published metrics owner for `iface_id`.
+    pub fn bind_tap_event_source_for_interface(
+        &self,
+        iface_id: &str,
+        source: NetworkInterfaceTapEventSource,
+    ) -> Result<(), NetworkInterfaceMetricsRegistryError> {
+        let state = lock_network_metrics_registry(&self.per_interface);
+        let entry = state
+            .entries
+            .iter()
+            .find(|entry| entry.iface_id == iface_id)
+            .ok_or(NetworkInterfaceMetricsRegistryError::UnknownInterface)?;
+        entry.metrics.bind_tap_event_source(source)
     }
 
     pub fn record_notification_dispatch_for_interface(
@@ -7262,16 +7406,17 @@ mod tests {
         MemoryHotplugMetricOperation, MetricsConfigError, MetricsConfigInput, MetricsDiagnostics,
         MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics, NetworkInterfaceMetrics,
         NetworkInterfaceMetricsByInterface, NetworkInterfaceMetricsCaptureError,
-        NetworkInterfaceMetricsRegistryError, PatchApiRequestMetrics, PmemDeviceMetrics,
-        PmemDeviceMetricsByDevice, PmemDeviceMetricsRegistryError, ProcessLatencyBoundary,
-        ProcessLatencyOperation, PutApiRequestMetrics, RtcDeviceMetrics,
-        SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry,
-        SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics,
-        SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
-        SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedProcessMetrics,
-        SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVhostUserBlockDeviceMetrics,
-        SharedVsockDeviceMetrics, SignalMetrics, VhostUserBlockDeviceMetrics,
-        VhostUserBlockDeviceMetricsByDrive, VirtioNetworkLatencyAggregate, VsockDeviceMetrics,
+        NetworkInterfaceMetricsRegistryError, NetworkInterfaceTapEventSource,
+        PatchApiRequestMetrics, PmemDeviceMetrics, PmemDeviceMetricsByDevice,
+        PmemDeviceMetricsRegistryError, ProcessLatencyBoundary, ProcessLatencyOperation,
+        PutApiRequestMetrics, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics, SharedNetworkInterfaceMetrics,
+        SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetrics,
+        SharedPmemDeviceMetricsRegistry, SharedProcessMetrics, SharedRtcDeviceMetrics,
+        SharedSignalMetrics, SharedVhostUserBlockDeviceMetrics, SharedVsockDeviceMetrics,
+        SignalMetrics, VhostUserBlockDeviceMetrics, VhostUserBlockDeviceMetricsByDrive,
+        VirtioNetworkLatencyAggregate, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::network::NetworkInterfaceConfigInput;
@@ -7619,6 +7764,7 @@ mod tests {
             .with_no_rx_avail_buffer(4)
             .with_no_tx_avail_buffer(5)
             .with_rx_queue_event_count(6)
+            .with_rx_tap_event_count(31)
             .with_rx_bytes_count(7)
             .with_rx_packets_count(8)
             .with_rx_fails(9)
@@ -7635,6 +7781,9 @@ mod tests {
             .with_tx_rate_limiter_throttled(20)
             .with_tx_remaining_reqs_count(21)
             .with_tx_spoofed_mac_count(22)
+            .with_tap_read_fails(32)
+            .with_tap_write_fails(33)
+            .with_tap_write_latency(VirtioNetworkLatencyAggregate::new(34, 35, 69, 2))
             .with_vmnet_read_count(23)
             .with_vmnet_read_fails(24)
             .with_vmnet_read_packets_count(25)
@@ -9894,7 +10043,19 @@ mod tests {
 
         let value = only_metrics_value(&output);
         assert_eq!(value["net"]["activate_fails"], 1);
+        assert_eq!(value["net"]["mac_address_updates"], 0);
         assert_eq!(value["net"]["rx_bytes_count"], 7);
+        assert_eq!(value["net"]["rx_tap_event_count"], 31);
+        assert_eq!(value["net"]["tap_read_fails"], 32);
+        assert_eq!(value["net"]["tap_write_fails"], 33);
+        assert_eq!(value["net"]["tap_write_agg"]["min_us"], 0);
+        assert_eq!(value["net"]["tap_write_agg"]["max_us"], 0);
+        assert_eq!(value["net"]["tap_write_agg"]["sum_us"], 69);
+        assert_eq!(value["net_eth0"]["tap_write_fails"], 33);
+        assert_eq!(value["net_eth0"]["tap_write_agg"]["min_us"], 34);
+        assert_eq!(value["net_eth0"]["tap_write_agg"]["max_us"], 35);
+        assert_eq!(value["net_eth0"]["tap_write_agg"]["sum_us"], 69);
+        assert_eq!(value["net_eth0"]["mac_address_updates"], 0);
         assert_eq!(value["net"]["tx_remaining_reqs_count"], 21);
         assert_eq!(value["net_eth0"]["tx_spoofed_mac_count"], 22);
         assert!(value["net"].get("vmnet_read_count").is_none());
@@ -10008,12 +10169,12 @@ mod tests {
     fn network_backend_metrics_preserve_exact_attempt_result_and_latency_counts() {
         let metrics = SharedNetworkInterfaceMetrics::default();
         let mut backend = VirtioNetworkBackendMetrics::default();
-        backend.record_vmnet_read(4, Ok(2), Duration::from_micros(5));
-        backend.record_vmnet_read(4, Ok(0), Duration::from_micros(7));
-        backend.record_vmnet_read(4, Err(()), Duration::from_micros(11));
-        backend.record_vmnet_write(3, Ok(3), Duration::from_micros(13));
-        backend.record_vmnet_write(3, Ok(1), Duration::from_micros(17));
-        backend.record_vmnet_write(3, Err(()), Duration::from_micros(19));
+        backend.record_supported_host_read_attempt(4, Ok(2), Duration::from_micros(5));
+        backend.record_supported_host_read_attempt(4, Ok(0), Duration::from_micros(7));
+        backend.record_supported_host_read_attempt(4, Err(()), Duration::from_micros(11));
+        backend.record_supported_host_write_attempt(3, Ok(3), Duration::from_micros(13));
+        backend.record_supported_host_write_attempt(3, Ok(1), Duration::from_micros(17));
+        backend.record_supported_host_write_attempt(3, Err(()), Duration::from_micros(19));
         backend.record_spoofed_mac();
 
         metrics.record_backend_metrics(backend);
@@ -10022,6 +10183,9 @@ mod tests {
             metrics.snapshot(),
             NetworkInterfaceMetrics::default()
                 .with_tx_spoofed_mac_count(1)
+                .with_tap_read_fails(1)
+                .with_tap_write_fails(1)
+                .with_tap_write_latency(VirtioNetworkLatencyAggregate::new(13, 19, 49, 3))
                 .with_vmnet_read_count(3)
                 .with_vmnet_read_fails(1)
                 .with_vmnet_read_packets_count(2)
@@ -10033,6 +10197,71 @@ mod tests {
                 .with_vmnet_read_latency(VirtioNetworkLatencyAggregate::new(5, 11, 23, 3))
                 .with_vmnet_write_latency(VirtioNetworkLatencyAggregate::new(13, 19, 49, 3))
         );
+    }
+
+    #[test]
+    fn broad_vmnet_diagnostics_do_not_implicitly_become_tap_metrics() {
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        let mut backend = VirtioNetworkBackendMetrics::default();
+        backend.record_vmnet_read(1, Err(()), Duration::from_micros(3));
+        backend.record_vmnet_write(1, Err(()), Duration::from_micros(5));
+
+        metrics.record_backend_metrics(backend);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.vmnet_read_fails(), 1);
+        assert_eq!(snapshot.vmnet_write_fails(), 1);
+        assert_eq!(snapshot.tap_read_fails(), 0);
+        assert_eq!(snapshot.tap_write_fails(), 0);
+        assert_eq!(snapshot.tap_write_latency().samples(), 0);
+    }
+
+    #[test]
+    fn network_tap_event_source_is_saturating_idempotent_and_generation_local() {
+        let registry =
+            SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(["eth0"], 1)
+                .expect("bounded network metrics registry should allocate");
+        let source = NetworkInterfaceTapEventSource::default();
+        source.record_events(2);
+        registry
+            .bind_tap_event_source_for_interface("eth0", source.clone())
+            .expect("pre-binding callbacks should attach to the live owner");
+        registry
+            .bind_tap_event_source_for_interface("eth0", source.clone())
+            .expect("rebinding the identical source should be idempotent");
+        assert_eq!(registry.aggregate_snapshot().rx_tap_event_count(), 2);
+
+        source.record_events(u64::MAX);
+        assert_eq!(registry.aggregate_snapshot().rx_tap_event_count(), u64::MAX);
+        assert_eq!(
+            registry.bind_tap_event_source_for_interface(
+                "eth0",
+                NetworkInterfaceTapEventSource::default(),
+            ),
+            Err(NetworkInterfaceMetricsRegistryError::ObservationSourceAlreadyBound)
+        );
+
+        let old_lease = registry
+            .claim_interface_lease("eth0")
+            .expect("startup metrics generation should be claimable");
+        drop(old_lease);
+        let replacement = registry
+            .prepare_interface("eth0")
+            .expect("same-ID replacement should prepare")
+            .publish();
+        let replacement_source = NetworkInterfaceTapEventSource::default();
+        registry
+            .bind_tap_event_source_for_interface("eth0", replacement_source.clone())
+            .expect("replacement source should bind to the fresh generation");
+        source.record_events(1);
+        assert_eq!(
+            registry.aggregate_snapshot().rx_tap_event_count(),
+            0,
+            "retired generation sources must not leak into replacements"
+        );
+        replacement_source.record_events(1);
+        assert_eq!(registry.aggregate_snapshot().rx_tap_event_count(), 1);
+        drop(replacement);
     }
 
     #[test]
@@ -10537,7 +10766,11 @@ mod tests {
                 NetworkInterfaceMetrics::default()
                     .with_rx_count(1)
                     .with_rx_packets_count(1)
-                    .with_rx_bytes_count(64),
+                    .with_rx_bytes_count(64)
+                    .with_rx_tap_event_count(2)
+                    .with_tap_read_fails(3)
+                    .with_tap_write_fails(4)
+                    .with_tap_write_latency(VirtioNetworkLatencyAggregate::new(5, 7, 12, 2)),
             )
             .with_network_interface_metrics_by_interface(
                 NetworkInterfaceMetricsByInterface::new().with_interface_metrics(
@@ -10545,7 +10778,11 @@ mod tests {
                     NetworkInterfaceMetrics::default()
                         .with_rx_count(1)
                         .with_rx_packets_count(1)
-                        .with_rx_bytes_count(64),
+                        .with_rx_bytes_count(64)
+                        .with_rx_tap_event_count(2)
+                        .with_tap_read_fails(3)
+                        .with_tap_write_fails(4)
+                        .with_tap_write_latency(VirtioNetworkLatencyAggregate::new(5, 7, 12, 2)),
                 ),
             )
             .with_mmds_metrics(
@@ -10573,11 +10810,29 @@ mod tests {
         let values = metrics_values(&output);
         assert_eq!(values.len(), 2);
         assert_eq!(values[0]["net_eth0"]["rx_count"], 1);
+        assert_eq!(values[0]["net_eth0"]["rx_tap_event_count"], 2);
+        assert_eq!(values[0]["net_eth0"]["tap_read_fails"], 3);
+        assert_eq!(values[0]["net_eth0"]["tap_write_fails"], 4);
+        assert_eq!(values[0]["net_eth0"]["tap_write_agg"]["min_us"], 5);
+        assert_eq!(values[0]["net_eth0"]["tap_write_agg"]["max_us"], 7);
+        assert_eq!(values[0]["net_eth0"]["tap_write_agg"]["sum_us"], 12);
+        assert_eq!(values[0]["net"]["tap_write_agg"]["min_us"], 0);
+        assert_eq!(values[0]["net"]["tap_write_agg"]["max_us"], 0);
+        assert_eq!(values[0]["net"]["tap_write_agg"]["sum_us"], 12);
         assert_eq!(values[0]["net"]["rx_bytes_count"], 64);
         assert_eq!(values[0]["mmds"]["tx_count"], 1);
         assert_eq!(values[0]["mmds"]["tx_frames"], 1);
         assert_eq!(values[0]["mmds"]["tx_bytes"], 128);
         assert_eq!(values[1]["net_eth0"]["rx_count"], 0);
+        assert_eq!(values[1]["net_eth0"]["rx_tap_event_count"], 0);
+        assert_eq!(values[1]["net_eth0"]["tap_read_fails"], 0);
+        assert_eq!(values[1]["net_eth0"]["tap_write_fails"], 0);
+        assert_eq!(values[1]["net_eth0"]["tap_write_agg"]["min_us"], 5);
+        assert_eq!(values[1]["net_eth0"]["tap_write_agg"]["max_us"], 7);
+        assert_eq!(values[1]["net_eth0"]["tap_write_agg"]["sum_us"], 0);
+        assert_eq!(values[1]["net"]["tap_write_agg"]["min_us"], 0);
+        assert_eq!(values[1]["net"]["tap_write_agg"]["max_us"], 0);
+        assert_eq!(values[1]["net"]["tap_write_agg"]["sum_us"], 0);
         assert_eq!(values[1]["net"]["rx_bytes_count"], 0);
         assert_eq!(values[1]["mmds"]["tx_count"], 0);
         assert_eq!(values[1]["mmds"]["tx_frames"], 0);

@@ -785,7 +785,9 @@ fn is_platform_zero(path: &str) -> bool {
     path.starts_with("i8042.")
         || matches!(
             path,
-            "vcpu.exit_io_in"
+            "net.mac_address_updates"
+                | "net_{iface_id}.mac_address_updates"
+                | "vcpu.exit_io_in"
                 | "vcpu.exit_io_out"
                 | "vcpu.exit_io_in_agg.min_us"
                 | "vcpu.exit_io_in_agg.max_us"
@@ -925,6 +927,8 @@ mod tests {
     #[test]
     fn only_exact_arm64_neutral_fields_are_platform_zero() {
         assert!(is_platform_zero("i8042.read_count"));
+        assert!(is_platform_zero("net.mac_address_updates"));
+        assert!(is_platform_zero("net_{iface_id}.mac_address_updates"));
         assert!(is_platform_zero("vcpu.exit_io_in_agg.sum_us"));
         assert!(!is_platform_zero("vcpu.exit_mmio_read_agg.sum_us"));
         assert!(!is_platform_zero("rtc.error_count"));

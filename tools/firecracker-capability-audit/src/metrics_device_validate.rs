@@ -11,7 +11,9 @@ use crate::{
 };
 
 const EXPECTED_DEVICE_FIELDS: usize = 231;
-const COMPLETED_DELIVERY_ISSUES: &[&str] = &["#1838", "#1839", "#1840", "#1841", "#1842", "#1843"];
+const COMPLETED_DELIVERY_ISSUES: &[&str] = &[
+    "#1838", "#1839", "#1840", "#1841", "#1842", "#1843", "#1844",
+];
 
 /// Validate exact device-producer authority against the resolved metrics schema.
 pub fn validate_metrics_device_producers(
@@ -481,6 +483,12 @@ fn expected_terminal_disposition(path: &str) -> Option<MetricsDeviceProducerDisp
     if matches!(path, "uart.flush_count" | "mmds.rx_bad_eth") {
         return Some(MetricsDeviceProducerDisposition::SourceNeutral);
     }
+    if matches!(
+        path,
+        "net.mac_address_updates" | "net_{iface_id}.mac_address_updates"
+    ) {
+        return Some(MetricsDeviceProducerDisposition::PlatformZero);
+    }
     expected_delivery_issue(path)
         .is_some_and(|issue| COMPLETED_DELIVERY_ISSUES.contains(&issue))
         .then_some(MetricsDeviceProducerDisposition::Implemented)
@@ -507,7 +515,9 @@ fn expected_rationale(
 
 fn is_provisional_platform_zero(path: &str) -> bool {
     let (root, suffix) = path.split_once('.').unwrap_or((path, ""));
-    root == "i8042" || (root == "vcpu" && is_provisional_vcpu_suffix(suffix))
+    (matches!(root, "net" | "net_{iface_id}") && suffix == "mac_address_updates")
+        || root == "i8042"
+        || (root == "vcpu" && is_provisional_vcpu_suffix(suffix))
 }
 
 fn is_tap_gap(suffix: &str) -> bool {

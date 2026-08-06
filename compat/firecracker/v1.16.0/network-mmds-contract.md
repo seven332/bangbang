@@ -131,11 +131,11 @@ the exact native-v2 2.11 snapshot/session rows. Two broad rows remain
   headers, supports transactional merged chains with exact `num_buffers`, and
   retains source ownership across capacity, limiter, memory, publication, or
   interrupt failure.
-- Callback code only publishes coalesced generation-tagged readiness. All queue,
-  packet, limiter, metric, MMDS, and configuration mutation remains on the
-  owner thread. Teardown retires readiness, disables and drains the callback,
-  stops vmnet, and releases the generation in that order; uncertain cleanup is
-  terminal.
+- Callback code increments only a saturating raw-event source and publishes
+  coalesced generation-tagged readiness. All queue, packet, limiter, compound
+  metric, MMDS, and configuration mutation remains on the owner thread.
+  Teardown retires readiness, disables and drains the callback, stops vmnet,
+  and releases the generation in that order; uncertain cleanup is terminal.
 - Each selected interface owns an independent MMDS ARP/TCP/output state while
   sharing the VM data store and token authority. MMDS output precedes backend
   RX, protocol deadlines share the owner scheduler, and one retained output is
@@ -156,6 +156,36 @@ the exact native-v2 2.11 snapshot/session rows. Two broad rows remain
   instance identity. Fresh processes reject peer tokens. Keys, tokens, instance
   IDs, packet bytes, MACs, interface names, UUIDs, and raw framework values do
   not enter ordinary diagnostics or capture state.
+
+## TAP-oriented metrics boundary
+
+The #1844 producer slice maps Firecracker's remaining TAP-shaped public fields
+onto real Apple host operations while keeping vmnet-only diagnostics out of the
+canonical line. One active-generation packet-available callback contributes
+one `rx_tap_event_count` before readiness coalescing, including while capture
+temporarily defers the wake. Deferred internal republishing contributes no
+second event, and retirement drains admission before the metrics generation can
+be removed or reused.
+
+Only an attempted host `vmnet_read` can contribute `tap_read_fails`. Only an
+attempted non-MMDS `vmnet_write` batch can contribute `tap_write_fails` and one
+latency sample; failures retain their latency, and a valid completed prefix is
+not reclassified as a failed system operation. Pre-host normalization,
+allocation, MMDS routing, queue, limiter, and guest-publication failures keep
+their existing distinct fields. Static `net` is derived from the same captured
+configured roots, summing event/failure counts and latency sums while leaving
+aggregate latency minima/maxima zero. Failed line publication replays the
+whole interval, and snapshot/restore starts with fresh metrics sources.
+
+`mac_address_updates` is the exact platform exception. Firecracker's producer
+belongs to a guest write into its mutable virtio MAC configuration; Apple vmnet
+returns an interface MAC as creation identity and exposes no live setter.
+Bangbang's live guest MAC, realized host profile, uniqueness reservation,
+spoof filter, and captured configuration remain immutable for one interface
+generation, and virtio configuration writes are rejected. Dynamic and static
+`mac_address_updates` therefore remain stable zero. Runtime interface
+replacement is teardown plus construction of a different generation, not an
+alias for the missing in-place operation.
 
 ## Capture and production boundaries
 

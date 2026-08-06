@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use bangbang_runtime::memory::GuestMemory;
+use bangbang_runtime::metrics::NetworkInterfaceTapEventSource;
 pub(crate) use bangbang_runtime::mmds_network::{
     MmdsNetworkStackBuildError, MmdsNetworkStackError, MmdsNetworkStackHandle,
     MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError, MmdsPacketDetour,
@@ -47,6 +48,7 @@ struct VmnetPacketReadinessState {
     event: AtomicU64,
     scheduled: AtomicBool,
     estimated_packets: AtomicUsize,
+    tap_event_source: NetworkInterfaceTapEventSource,
     signal: SyncSender<()>,
 }
 
@@ -95,6 +97,12 @@ impl VmnetPacketReadinessState {
         if !self.active.load(Ordering::Acquire) {
             return;
         }
+        self.publication_in_flight.fetch_add(1, Ordering::AcqRel);
+        if !self.active.load(Ordering::Acquire) {
+            self.publication_in_flight.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        self.tap_event_source.record_events(1);
         self.estimated_packets.store(
             estimate
                 .and_then(|estimate| usize::try_from(estimate).ok())
@@ -102,19 +110,12 @@ impl VmnetPacketReadinessState {
                 .clamp(1, VMNET_MAX_PACKETS_PER_OPERATION),
             Ordering::Release,
         );
-        self.try_publish_event();
+        self.publish_event_while_admitted();
+        self.publication_in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn try_publish_event(&self) {
         if !self.active.load(Ordering::Acquire) {
-            return;
-        }
-        if self.quiesced.load(Ordering::Acquire) {
-            self.publication_in_flight.fetch_add(1, Ordering::AcqRel);
-            if self.active.load(Ordering::Acquire) {
-                self.defer_publication();
-            }
-            self.publication_in_flight.fetch_sub(1, Ordering::AcqRel);
             return;
         }
         self.publication_in_flight.fetch_add(1, Ordering::AcqRel);
@@ -122,9 +123,22 @@ impl VmnetPacketReadinessState {
             self.publication_in_flight.fetch_sub(1, Ordering::AcqRel);
             return;
         }
+        self.publish_event_while_admitted();
+        self.publication_in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn publish_event_while_admitted(&self) {
+        if self.quiesced.load(Ordering::Acquire) {
+            if self.active.load(Ordering::Acquire) {
+                self.defer_publication();
+            }
+            return;
+        }
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
         if self.quiesced.load(Ordering::Acquire) {
             self.defer_publication();
-            self.publication_in_flight.fetch_sub(1, Ordering::AcqRel);
             return;
         }
         let previous = self
@@ -138,7 +152,6 @@ impl VmnetPacketReadinessState {
         if previous & VMNET_READINESS_READY_BIT == 0 {
             self.schedule_if_ready();
         }
-        self.publication_in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn defer_publication(&self) {
@@ -222,6 +235,7 @@ impl VmnetPacketReadinessLease {
             event: AtomicU64::new(0),
             scheduled: AtomicBool::new(false),
             estimated_packets: AtomicUsize::new(1),
+            tap_event_source: NetworkInterfaceTapEventSource::default(),
             signal,
         });
         let callback_state = Arc::clone(&state);
@@ -235,6 +249,10 @@ impl VmnetPacketReadinessLease {
         VmnetPacketReadinessConsumer {
             state: Arc::clone(&self.state),
         }
+    }
+
+    fn tap_event_source(&self) -> NetworkInterfaceTapEventSource {
+        self.state.tap_event_source.clone()
     }
 
     fn retire(&self) {
@@ -743,6 +761,12 @@ where
         self.readiness_lease
             .as_ref()
             .is_some_and(VmnetPacketReadinessLease::take_scheduled)
+    }
+
+    pub(crate) fn tap_event_source(&self) -> Option<NetworkInterfaceTapEventSource> {
+        self.readiness_lease
+            .as_ref()
+            .map(VmnetPacketReadinessLease::tap_event_source)
     }
 
     pub(crate) fn has_persistent_readiness(&self) -> bool {
@@ -1335,13 +1359,16 @@ where
         let duration = started.elapsed();
         let completed = match write_result {
             Ok(completed) if completed <= requested => {
-                self.metrics
-                    .record_vmnet_write(requested, Ok(completed), duration);
+                self.metrics.record_supported_host_write_attempt(
+                    requested,
+                    Ok(completed),
+                    duration,
+                );
                 completed
             }
             Ok(_) => {
                 self.metrics
-                    .record_vmnet_write(requested, Err(()), duration);
+                    .record_supported_host_write_attempt(requested, Err(()), duration);
                 self.buffer.clear();
                 self.ranges.clear();
                 return Err(VirtioNetworkTxPacketSinkError::new(
@@ -1350,7 +1377,7 @@ where
             }
             Err(source) => {
                 self.metrics
-                    .record_vmnet_write(requested, Err(()), duration);
+                    .record_supported_host_write_attempt(requested, Err(()), duration);
                 self.buffer.clear();
                 self.ranges.clear();
                 return Err(tx_vmnet_error(source));
@@ -1747,8 +1774,11 @@ where
         let packet_count = match read_result {
             Ok(packet_count) => packet_count,
             Err(source) => {
-                self.backend_metrics
-                    .record_vmnet_read(estimated_packets, Err(()), duration);
+                self.backend_metrics.record_supported_host_read_attempt(
+                    estimated_packets,
+                    Err(()),
+                    duration,
+                );
                 return Err(rx_vmnet_error(source));
             }
         };
@@ -1778,12 +1808,18 @@ where
             Ok(())
         })();
         if let Err(source) = validation {
-            self.backend_metrics
-                .record_vmnet_read(estimated_packets, Err(()), duration);
+            self.backend_metrics.record_supported_host_read_attempt(
+                estimated_packets,
+                Err(()),
+                duration,
+            );
             return Err(source);
         }
-        self.backend_metrics
-            .record_vmnet_read(estimated_packets, Ok(packet_count), duration);
+        self.backend_metrics.record_supported_host_read_attempt(
+            estimated_packets,
+            Ok(packet_count),
+            duration,
+        );
         if let Some(readiness) = &self.readiness {
             if packet_count < estimated_packets {
                 readiness.state.clear_if_unchanged(event_snapshot);
@@ -2577,6 +2613,7 @@ mod tests {
             state.publish(estimate);
         }
 
+        assert_eq!(lease.tap_event_source().snapshot(), 4);
         assert_eq!(receiver.try_recv(), Ok(()));
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
         assert!(lease.take_scheduled());
@@ -2596,6 +2633,7 @@ mod tests {
         let (full_lease, _callback) = super::VmnetPacketReadinessLease::new(2, full_signal);
         let full_state = Arc::clone(&full_lease.state);
         full_state.publish(Some(4));
+        assert_eq!(full_lease.tap_event_source().snapshot(), 1);
         assert!(full_state.is_ready());
         assert!(full_lease.take_scheduled());
         assert_eq!(full_receiver.try_recv(), Ok(()));
@@ -2607,6 +2645,7 @@ mod tests {
             super::VmnetPacketReadinessLease::new(3, disconnected_signal);
         let disconnected_state = Arc::clone(&disconnected_lease.state);
         disconnected_state.publish(Some(1));
+        assert_eq!(disconnected_lease.tap_event_source().snapshot(), 1);
         assert!(disconnected_state.is_ready());
         assert!(disconnected_lease.take_scheduled());
     }
@@ -2627,6 +2666,7 @@ mod tests {
 
         callback.publish_for_test(Some(7));
         callback.publish_for_test(Some(3));
+        assert_eq!(lease.tap_event_source().snapshot(), 2);
         assert_eq!(state.snapshot(), 0);
         assert!(!lease.take_scheduled());
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
@@ -2663,6 +2703,7 @@ mod tests {
             publisher
                 .join()
                 .expect("racing callback thread should finish");
+            assert_eq!(lease.tap_event_source().snapshot(), 1);
 
             let during_capture = lease.state.snapshot();
             assert!(during_capture == 0 || during_capture & 1 == 1);
@@ -2683,6 +2724,7 @@ mod tests {
             .quiesce_publication()
             .expect("active readiness owner should quiesce");
         callback.publish_for_test(Some(1));
+        assert_eq!(lease.tap_event_source().snapshot(), 1);
         lease.retire();
         drop(guard);
 
@@ -2706,6 +2748,7 @@ mod tests {
                 .join()
                 .expect("racing readiness callback should finish");
 
+            assert!(lease.tap_event_source().snapshot() <= 1);
             assert!(!lease.state.is_ready());
             assert!(!lease.take_scheduled());
         }
@@ -2719,12 +2762,14 @@ mod tests {
         drop(old_lease);
 
         old_state.publish(Some(1));
+        assert_eq!(old_state.tap_event_source.snapshot(), 0);
         assert!(!old_state.is_ready());
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
 
         let (replacement, _replacement_callback) =
             super::VmnetPacketReadinessLease::new(41, signal);
         replacement.state.publish(Some(1));
+        assert_eq!(replacement.tap_event_source().snapshot(), 1);
         assert_eq!(receiver.try_recv(), Ok(()));
         assert!(replacement.take_scheduled());
         assert!(replacement.state.is_ready());
@@ -2804,6 +2849,7 @@ mod tests {
         let backend_metrics = packet_io.rx_source().take_backend_metrics();
         assert_eq!(backend_metrics.vmnet_read_count(), 2);
         assert_eq!(backend_metrics.vmnet_read_fails(), 0);
+        assert_eq!(backend_metrics.tap_read_fails(), 0);
         assert_eq!(backend_metrics.vmnet_read_packets_count(), 3);
         assert_eq!(backend_metrics.vmnet_read_partial_batches(), 1);
         assert_eq!(backend_metrics.vmnet_read_latency().samples(), 2);
@@ -2912,9 +2958,11 @@ mod tests {
         let backend_metrics = packet_io.tx_sink().take_backend_metrics();
         assert_eq!(backend_metrics.vmnet_write_count(), 1);
         assert_eq!(backend_metrics.vmnet_write_fails(), 0);
+        assert_eq!(backend_metrics.tap_write_fails(), 0);
         assert_eq!(backend_metrics.vmnet_write_packets_count(), 1);
         assert_eq!(backend_metrics.vmnet_write_partial_batches(), 1);
         assert_eq!(backend_metrics.vmnet_write_latency().samples(), 1);
+        assert_eq!(backend_metrics.tap_write_latency().samples(), 1);
         assert_eq!(
             packet_io.tx_sink().take_backend_metrics(),
             super::VirtioNetworkBackendMetrics::default()
@@ -2951,9 +2999,11 @@ mod tests {
         let backend_metrics = packet_io.tx_sink().take_backend_metrics();
         assert_eq!(backend_metrics.vmnet_write_count(), 1);
         assert_eq!(backend_metrics.vmnet_write_fails(), 1);
+        assert_eq!(backend_metrics.tap_write_fails(), 1);
         assert_eq!(backend_metrics.vmnet_write_packets_count(), 0);
         assert_eq!(backend_metrics.vmnet_write_partial_batches(), 0);
         assert_eq!(backend_metrics.vmnet_write_latency().samples(), 1);
+        assert_eq!(backend_metrics.tap_write_latency().samples(), 1);
     }
 
     #[test]
@@ -3077,6 +3127,8 @@ mod tests {
         assert_eq!(metrics.tx_spoofed_mac_count(), 0);
         assert_eq!(metrics.vmnet_write_count(), 0);
         assert_eq!(metrics.vmnet_write_packets_count(), 0);
+        assert_eq!(metrics.tap_write_fails(), 0);
+        assert_eq!(metrics.tap_write_latency().samples(), 0);
     }
 
     #[test]
@@ -3123,6 +3175,16 @@ mod tests {
             .expect("test state lock should succeed");
         assert_eq!(state.backend.write_calls, 0);
         assert!(state.backend.written_packets.is_empty());
+        drop(state);
+        assert_eq!(
+            packet_io
+                .tx_sink()
+                .take_backend_metrics()
+                .tap_write_latency()
+                .samples(),
+            0,
+            "pre-host size rejection must not create a TAP write sample"
+        );
     }
 
     #[test]
@@ -3232,6 +3294,8 @@ mod tests {
         let metrics = packet_io.tx_sink().take_backend_metrics();
         assert_eq!(metrics.tx_spoofed_mac_count(), 1);
         assert_eq!(metrics.vmnet_write_packets_count(), 1);
+        assert_eq!(metrics.tap_write_fails(), 0);
+        assert_eq!(metrics.tap_write_latency().samples(), 1);
     }
 
     #[test]
@@ -3285,6 +3349,11 @@ mod tests {
                 .message()
                 .contains("failed to read virtio-net TX payload descriptor 1")
         );
+        assert_eq!(
+            packet_io.tx_sink().take_backend_metrics().tap_write_fails(),
+            0,
+            "pre-host guest staging failures are not TAP write attempts"
+        );
     }
 
     #[test]
@@ -3303,6 +3372,10 @@ mod tests {
         assert!(error.message().contains(
             "vmnet TX packet write failed: vmnet_write returned an unexpected packet count"
         ));
+        let backend_metrics = packet_io.tx_sink().take_backend_metrics();
+        assert_eq!(backend_metrics.vmnet_write_fails(), 1);
+        assert_eq!(backend_metrics.tap_write_fails(), 1);
+        assert_eq!(backend_metrics.tap_write_latency().samples(), 1);
     }
 
     #[test]
@@ -3389,6 +3462,9 @@ mod tests {
         assert!(error.message().contains(
             "vmnet RX packet read failed: vmnet_read returned an unexpected packet count"
         ));
+        let backend_metrics = packet_io.rx_source().take_backend_metrics();
+        assert_eq!(backend_metrics.vmnet_read_fails(), 1);
+        assert_eq!(backend_metrics.tap_read_fails(), 1);
     }
 
     #[test]
@@ -3411,6 +3487,7 @@ mod tests {
         let backend_metrics = packet_io.rx_source().take_backend_metrics();
         assert_eq!(backend_metrics.vmnet_read_count(), 1);
         assert_eq!(backend_metrics.vmnet_read_fails(), 1);
+        assert_eq!(backend_metrics.tap_read_fails(), 1);
         assert_eq!(backend_metrics.vmnet_read_packets_count(), 0);
         assert_eq!(backend_metrics.vmnet_read_partial_batches(), 0);
         assert_eq!(backend_metrics.vmnet_read_latency().samples(), 1);
@@ -3432,6 +3509,7 @@ mod tests {
         let backend_metrics = packet_io.rx_source().take_backend_metrics();
         assert_eq!(backend_metrics.vmnet_read_count(), 1);
         assert_eq!(backend_metrics.vmnet_read_fails(), 1);
+        assert_eq!(backend_metrics.tap_read_fails(), 1);
         assert_eq!(backend_metrics.vmnet_read_packets_count(), 0);
         assert_eq!(backend_metrics.vmnet_read_latency().samples(), 1);
     }
@@ -3452,6 +3530,7 @@ mod tests {
         let backend_metrics = packet_io.rx_source().take_backend_metrics();
         assert_eq!(backend_metrics.vmnet_read_count(), 1);
         assert_eq!(backend_metrics.vmnet_read_fails(), 1);
+        assert_eq!(backend_metrics.tap_read_fails(), 1);
         assert_eq!(backend_metrics.vmnet_read_packets_count(), 0);
         assert_eq!(backend_metrics.vmnet_read_partial_batches(), 0);
         assert_eq!(backend_metrics.vmnet_read_latency().samples(), 1);

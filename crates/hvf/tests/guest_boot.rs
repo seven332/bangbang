@@ -2233,6 +2233,13 @@ fn assert_signed_guest_network_semantics(
     assert_eq!(metrics.tx_packets_count(), 0);
     assert_eq!(metrics.tx_bytes_count(), 0);
     assert_eq!(metrics.tx_spoofed_mac_count(), 0);
+    assert_eq!(metrics.rx_tap_event_count(), 0);
+    assert_eq!(metrics.tap_read_fails(), 0);
+    assert_eq!(metrics.tap_write_fails(), 0);
+    assert_eq!(metrics.tap_write_latency().samples(), 0);
+    assert_eq!(metrics.tap_write_latency().sum_us(), 0);
+    assert_eq!(metrics.tap_write_latency().min_us(), 0);
+    assert_eq!(metrics.tap_write_latency().max_us(), 0);
     assert!(metrics.rx_bytes_count() > 48 * 1024);
     assert!(metrics.rx_rate_limiter_throttled() > 0);
     assert!(metrics.rx_rate_limiter_event_count() > 0);

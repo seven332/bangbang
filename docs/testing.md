@@ -1553,13 +1553,14 @@ cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --lock
 
 The adjacent human-owned `metrics-device-producer-audit.json` maps all 231
 device-owned fields to closed operation boundaries and the nine concrete #1789
-children. After #1843 it contains 189 implemented fields, two source-neutral
-fields (`uart.flush_count` and `mmds.rx_bad_eth`), 25 planned fields, and 15
+children. After #1844 it contains 201 implemented fields, two source-neutral
+fields (`uart.flush_count` and `mmds.rx_bad_eth`), two terminal platform-zero
+`mac_address_updates` fields, 11 planned fields, and 15
 provisional-platform-zero fields. Only the latter two groups are nonterminal
 and evidence-free. The same focused test checks canonical bytes, exact
 membership and partition, completed-child regression, future-child premature
 promotion, the UART-flush disposition, suffix routing, provisional state,
-anchored-evidence rules, and final-mode rejection of the remaining 40 records.
+anchored-evidence rules, and final-mode rejection of the remaining 26 records.
 
 Focused #1838 producer coverage lives with the owning runtime modules. It
 checks entropy popped-descriptor accounting and owner attachment, exact pmem
@@ -1645,6 +1646,29 @@ contained MMIO/PCI helpers assert positive MMDS response RX, zero public network
 TX/spoof/failure values for MMDS-only traffic, and equality between the static
 network root and its configured roots without claiming credentialed vmnet.
 
+### TAP-oriented network metrics validation
+
+Focused #1844 coverage pins the remaining 14 configured/static network leaves.
+Callback tests distinguish raw active-generation admissions from coalesced
+readiness wakes, preserve counts across quiescence and full/disconnected signal
+channels, omit internal deferred republishing, drain retirement, and reject
+same-ID stale-source leakage. Host adapter tests exercise successful, partial,
+failed, malformed-count, MMDS-only, and pre-host read/write paths so only real
+vmnet operations contribute TAP-shaped failures and each attempted non-MMDS
+write batch contributes one latency sample. Registry and canonical serializer
+tests cover saturating source counters, single binding, static/configured
+projection, persistent dynamic latency extrema, static-zero extrema, whole-line
+retry, and stable-zero MAC-update fields.
+
+The signed MMIO/PCI virtio-net semantic tests remain deliberately MMDS-only.
+They now assert that `rx_tap_event_count`, `tap_read_fails`,
+`tap_write_fails`, and every write-latency component stay zero in that run while
+the existing guest RX and limiter observations are positive. This proves
+transport wiring and non-aliasing without claiming external vmnet connectivity
+or inventing a host operation. Credentialed positive vmnet connectivity remains
+under #1378. The portable injected-vmnet tests are the deterministic positive
+producer proof for #1844.
+
 The ordinary `compare` command rederives the source projection together with
 the general and logger manifests. To create a metrics source-only candidate:
 
@@ -1705,8 +1729,8 @@ partition with final-mode validation of the exact process audit, while retaining
 logger and device-audit validation in delivery mode. It requires the two
 implemented process profiles and all 69 field records to remain terminal at
 exactly 64 implemented, one source-neutral, and four platform-zero. Ten planned
-and four platform-zero device profiles remain #1789-owned; within the 231-field
-device audit, #1838–#1843 contribute 191 terminal records and the other 40
+and five platform-zero device profiles remain #1789-owned; within the 231-field
+device audit, #1838–#1844 contribute 205 terminal records and the other 26
 remain nonterminal. The two aggregates remain #1790-owned.
 The composed test mutates both a field record and an aggregate process profile;
 the lower-level suite separately exercises every membership, ordering,
