@@ -23,6 +23,9 @@ Each detailed subject has one primary document:
   compact current-status and evidence index.
 - [Firecracker v1.16.0 Capability Inventory](compat/firecracker/v1.16.0/README.md)
   owns the pinned structural scope, reviewed dispositions, and evidence rules.
+- [Firecracker-shaped Developer Tracing](compat/firecracker/v1.16.0/tracing-contract.md)
+  owns the opt-in feature, exact production scope set, record/privacy envelope,
+  delivery policy, and explicit nonclaims.
 - [Snapshot Feasibility](docs/snapshot-feasibility.md) owns bangbang-native
   snapshot formats, version behavior, capture/restore semantics, and nonclaims.
 - [Wave 6 Snapshot Certification](compat/firecracker/v1.16.0/snapshot-wave6-contract.md)
@@ -140,10 +143,11 @@ terminal and map to ten implemented shared device profiles. The dedicated
 device gate verifies that exact profile set, its resolvable evidence, the
 212/2/17 field census, and the terminal #1790 lifecycle handoff.
 
-The terminal 69-field API/process, 231-field device, and ten-scenario aggregate
-metrics scopes have separate fail-closed certification gates:
+The terminal tracing, 69-field API/process, 231-field device, and ten-scenario
+aggregate metrics scopes have separate fail-closed certification gates:
 
 ```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
@@ -154,6 +158,12 @@ Its checked ledger covers initial, real 60-second, explicit, terminal,
 backpressure, retry, configured cardinality, snapshot-destination freshness,
 hotplug/reuse, and process isolation behavior without claiming durable or
 exactly-once output.
+
+Developer tracing is compile-time opt-in (`--features tracing`) and remains
+absent from default builds. VMM scopes use the configured logger Trace
+level/module filter; snapshot tools additionally require `BANGBANG_TRACE=*` or
+a matching module prefix. Run `scripts/report-tracing-overhead.sh` for the
+descriptive release binary-size and scope-cost report.
 
 When the pinned sibling checkout is available at `../firecracker`, verify its
 source identities and anchors with:

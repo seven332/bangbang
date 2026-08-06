@@ -16,6 +16,8 @@ use bangbang_hvf::{
     HvfNativeSnapshotDocument, HvfNativeSnapshotRegisterRemovalOutcome,
     HvfNativeSnapshotRegisterRemovalReport, HvfNativeSnapshotRegisterRemovalRequest,
 };
+#[cfg(all(feature = "tracing", unix))]
+use bangbang_runtime::logger::ToolTraceSession;
 #[cfg(target_os = "macos")]
 use bangbang_runtime::snapshot_rebase::{
     SnapshotV2DiffRebaseCleanup, SnapshotV2DiffRebaseCommit, SnapshotV2DiffRebaseCommitFailure,
@@ -417,6 +419,14 @@ fn directory_sync_message(directory_sync: Option<io::ErrorKind>) -> String {
 
 /// Executes one request through the shared path transaction.
 pub fn execute_rebase(tool: RebaseTool, request: RebaseRequest) -> ExitCode {
+    #[cfg(all(feature = "tracing", unix))]
+    let trace_session = ToolTraceSession::from_environment();
+    #[cfg(all(feature = "tracing", unix))]
+    bangbang_runtime::bangbang_trace_scope!(
+        trace_session.trace_logger(),
+        "bangbang_snapshot_tools::command",
+        "execute_rebase",
+    );
     #[cfg(target_os = "macos")]
     {
         let signals = match CancellationSignals::install() {
@@ -449,6 +459,14 @@ pub fn execute_rebase(tool: RebaseTool, request: RebaseRequest) -> ExitCode {
 
 /// Executes one descriptor-anchored native snapshot inspection.
 pub fn execute_snapshot_info(view: SnapshotInfoView, path: PathBuf) -> ExitCode {
+    #[cfg(all(feature = "tracing", unix))]
+    let trace_session = ToolTraceSession::from_environment();
+    #[cfg(all(feature = "tracing", unix))]
+    bangbang_runtime::bangbang_trace_scope!(
+        trace_session.trace_logger(),
+        "bangbang_snapshot_tools::command",
+        "execute_snapshot_info",
+    );
     #[cfg(unix)]
     {
         execute_snapshot_info_unix(SnapshotInfoRequest { view, path }).emit()
@@ -552,6 +570,14 @@ pub fn execute_snapshot_register_removal(
     input: PathBuf,
     output: PathBuf,
 ) -> ExitCode {
+    #[cfg(all(feature = "tracing", unix))]
+    let trace_session = ToolTraceSession::from_environment();
+    #[cfg(all(feature = "tracing", unix))]
+    bangbang_runtime::bangbang_trace_scope!(
+        trace_session.trace_logger(),
+        "bangbang_snapshot_tools::command",
+        "execute_snapshot_register_removal",
+    );
     #[cfg(unix)]
     {
         let reviewed = match HvfNativeSnapshotRegisterRemovalRequest::try_new(&register_ids) {

@@ -7,6 +7,7 @@ repository.workspace = true
 [features]
 default = []
 grant-integration-probe = ["dep:bangbang-pager", "bangbang-runtime/test-support"]
+tracing = ["bangbang-runtime/tracing"]
 
 [dependencies]
 bangbang-api = { path = "../api" }

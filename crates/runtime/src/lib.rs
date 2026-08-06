@@ -1,5 +1,19 @@
 //! Backend-neutral VM runtime boundary.
 
+/// Enters one fixed developer-tracing scope when the consuming crate enables
+/// its `tracing` feature.
+///
+/// The complete logger expression and guard declaration are removed from
+/// builds without that consuming-crate feature. Module and scope values are
+/// literals so the checked tracing audit can reject dynamic fields.
+#[macro_export]
+macro_rules! bangbang_trace_scope {
+    ($logger:expr, $module:literal, $scope:literal $(,)?) => {
+        #[cfg(feature = "tracing")]
+        let _bangbang_trace_scope = ($logger).enter_fixed($module, $scope);
+    };
+}
+
 pub mod balloon;
 pub mod block;
 pub mod boot;
@@ -742,6 +756,12 @@ impl VmmController {
     /// Returns the narrow process-owned asynchronous logger capability.
     pub fn async_logger(&self) -> logger::AsyncLogger {
         self.logger_state.async_logger()
+    }
+
+    /// Returns the feature-gated bounded-host developer tracer.
+    #[cfg(feature = "tracing")]
+    pub fn trace_logger(&self) -> logger::TraceLogger {
+        self.logger_state.trace_logger()
     }
 
     pub fn guest_logger(&self) -> logger::GuestLogger {
@@ -1899,6 +1919,11 @@ impl VmmController {
     }
 
     pub fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
+        crate::bangbang_trace_scope!(
+            self.trace_logger(),
+            "bangbang_runtime::controller",
+            "handle_action",
+        );
         let invalidates_snapshot_load_freshness = action.invalidates_snapshot_load_freshness();
         let result = self.handle_action_inner(action);
         if result.is_ok() && invalidates_snapshot_load_freshness {

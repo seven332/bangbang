@@ -647,8 +647,35 @@ direct MMIO/PCI, and ordinary-production/App Sandbox evidence. The signed
 process oracle accepts exactly the 41 emitted API method/route pairs and the
 closed action, control, host, guest, device, snapshot, panic, and final
 vocabularies. Certification does not broaden this best-effort contract into a
-durability guarantee and does not claim developer tracing, complete metrics,
-or unrelated observability/tooling work.
+durability guarantee or fold developer tracing, complete metrics, or unrelated
+observability/tooling work into the ordinary logger scope.
+
+### Opt-in developer tracing
+
+The `tracing` Cargo feature provides Firecracker-shaped developer entry/exit
+diagnostics without claiming Firecracker's source-rewrite mechanism. It is
+absent from default and default-release builds: the consumer-side macro removes
+the logger expression and guard completely. With the feature enabled, Trace
+level and module filtering occur before per-thread stack work. Standalone
+snapshot tools additionally require `BANGBANG_TRACE=*` or a matching nonempty
+module prefix.
+
+Each thread has a fixed 32-scope nested path, and an admitted scope emits at
+most one entry and one exit through the existing 512-byte logger encoder.
+Normal return, unwind, forgotten-inner cleanup, overlapping threads, filter
+rejection, and delivery failure preserve stack and functional-result behavior.
+API/VMM scopes use bounded host delivery, virtio-MMIO scopes use nonblocking
+guest delivery, and tool scopes reuse an eight-batch worker with 100 ms bounds.
+
+The record admits only literal module and scope, opaque Rust thread identity,
+and `enter`/`exit` phase, plus configured level/normalized-origin prefixes.
+Paths, environment values, payloads, guest values, identities, credentials,
+addresses, selectors, descriptors, registers, timestamps, and errors are not
+fields. The exact eight production calls and all evidence are locked by
+[`tracing-audit.json`](../compat/firecracker/v1.16.0/tracing-audit.json) and
+`validate --tracing-final`. Binary-size and timing output from
+`scripts/report-tracing-overhead.sh` is descriptive; no portable timing,
+durable-delivery, or default-production-enablement claim is made.
 
 ### Metrics field and transaction model
 
@@ -953,8 +980,9 @@ broad cross-host portability.
 
 ### Stable product boundaries
 
-The ordinary CLI has no production rotation, syslog, journald, tracing, remote
-telemetry, or resource-broker policy. Logger and metrics state remains
+The ordinary default CLI has no production rotation, syslog, journald, tracing,
+remote telemetry, or resource-broker policy; tracing exists only in an
+explicit feature build under the contract above. Logger and metrics state remains
 per-controller; only the executable's bounded ownership interval uses the
 process-global panic hook. It carries no worker/double-panic/abort or crash-stop
 durability claim; classified external fatal signals receive only one ordinary
@@ -4550,9 +4578,10 @@ Their eventual support level should follow the endpoint matrix:
   retains only its legacy six UART bytes, rejects nonrepresentable RX state,
   and excludes host endpoints, the output buffer, path, limiter state, and
   counters
-- durable catch-all worker/double-panic/abort/fatal observability and production rotation,
-  syslog, journald, tracing, or remote telemetry; the implemented logger and
-  strict metrics schema do not fabricate unconfigured dynamic devices or
+- durable catch-all worker/double-panic/abort/fatal observability and production
+  rotation, syslog, journald, remote telemetry, default-enabled or durable
+  tracing, or sensitive dynamic trace fields; the implemented logger and strict
+  metrics schema do not fabricate unconfigured dynamic devices or
   non-Firecracker extension fields
 - memory hotplug beyond the implemented block-granular selected MMIO-or-PCI
   lifecycle, Firecracker-shaped singleton metrics, exact shared-aperture

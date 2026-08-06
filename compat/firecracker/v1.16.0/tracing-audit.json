@@ -1,0 +1,307 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "issue": "#1791",
+  "feature": {
+    "name": "tracing",
+    "default_enabled": false,
+    "release_default_enabled": false,
+    "tool_runtime_filter_environment": "BANGBANG_TRACE"
+  },
+  "limits": {
+    "max_depth": 32,
+    "max_record_bytes": 512,
+    "max_records_per_scope": 2,
+    "tool_queue_capacity": 8,
+    "tool_receipt_timeout_ms": 100
+  },
+  "phases": [
+    "enter",
+    "exit"
+  ],
+  "allowed_fields": [
+    "module",
+    "thread",
+    "scope",
+    "phase"
+  ],
+  "forbidden_fields": [
+    "addresses",
+    "credentials",
+    "descriptors",
+    "environment-values",
+    "errors",
+    "guest-values",
+    "host-paths",
+    "identities",
+    "payloads",
+    "registers",
+    "selectors",
+    "timestamps"
+  ],
+  "call_sites": [
+    {
+      "id": "api.handle-request",
+      "path": "crates/bangbang/src/api_server.rs",
+      "category": "api",
+      "module": "bangbang::api_server",
+      "scope": "handle_request_bytes_with_limit",
+      "delivery": "bounded-host",
+      "rationale": "Bounds one parsed HTTP request across typed dispatch without recording request bytes or values.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "handle_request_bytes_with_limit"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "fn executable_tracing_is_nested_filtered_and_value_free"
+        }
+      ]
+    },
+    {
+      "id": "device.virtio-mmio-read",
+      "path": "crates/runtime/src/virtio_mmio.rs",
+      "category": "device",
+      "module": "bangbang_runtime::device::virtio_mmio",
+      "scope": "read_access",
+      "delivery": "nonblocking-guest",
+      "rationale": "Marks one typed virtio-MMIO read boundary without recording address, register, or guest value.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "pub fn read_access("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "fn tracing_records_typed_reads_and_writes_without_guest_values"
+        }
+      ]
+    },
+    {
+      "id": "device.virtio-mmio-write",
+      "path": "crates/runtime/src/virtio_mmio.rs",
+      "category": "device",
+      "module": "bangbang_runtime::device::virtio_mmio",
+      "scope": "write_access",
+      "delivery": "nonblocking-guest",
+      "rationale": "Marks one typed virtio-MMIO write boundary without recording address, register, or guest value.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "pub fn write_access("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "fn tracing_records_typed_reads_and_writes_without_guest_values"
+        }
+      ]
+    },
+    {
+      "id": "runtime.handle-action",
+      "path": "crates/runtime/src/lib.rs",
+      "category": "vmm",
+      "module": "bangbang_runtime::controller",
+      "scope": "handle_action",
+      "delivery": "bounded-host",
+      "rationale": "Bounds controller action execution while leaving action values and results to their typed owners.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "pub fn handle_action(&mut self, action: VmmAction)"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "fn executable_tracing_is_nested_filtered_and_value_free"
+        }
+      ]
+    },
+    {
+      "id": "tool.rebase",
+      "path": "tools/snapshot-tools/src/lib.rs",
+      "category": "tool",
+      "module": "bangbang_snapshot_tools::command",
+      "scope": "execute_rebase",
+      "delivery": "bounded-tool",
+      "rationale": "Bounds the public rebase command without recording artifact paths, failures, or snapshot contents.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "pub fn execute_rebase("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "fn tool_tracing_requires_a_matching_runtime_filter_and_preserves_diagnostics"
+        }
+      ]
+    },
+    {
+      "id": "tool.snapshot-info",
+      "path": "tools/snapshot-tools/src/lib.rs",
+      "category": "tool",
+      "module": "bangbang_snapshot_tools::command",
+      "scope": "execute_snapshot_info",
+      "delivery": "bounded-tool",
+      "rationale": "Bounds the public inspection command without recording artifact paths, failures, or decoded values.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "pub fn execute_snapshot_info("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "fn tool_tracing_requires_a_matching_runtime_filter_and_preserves_diagnostics"
+        }
+      ]
+    },
+    {
+      "id": "tool.snapshot-register-removal",
+      "path": "tools/snapshot-tools/src/lib.rs",
+      "category": "tool",
+      "module": "bangbang_snapshot_tools::command",
+      "scope": "execute_snapshot_register_removal",
+      "delivery": "bounded-tool",
+      "rationale": "Bounds the public register-removal command without recording artifact paths, registers, or values.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/src/lib.rs",
+          "anchor": "pub fn execute_snapshot_register_removal("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "fn tool_tracing_requires_a_matching_runtime_filter_and_preserves_diagnostics"
+        }
+      ]
+    },
+    {
+      "id": "vmm.handle-action",
+      "path": "crates/bangbang/src/vmm.rs",
+      "category": "vmm",
+      "module": "bangbang::vmm",
+      "scope": "handle_action",
+      "delivery": "bounded-host",
+      "rationale": "Bounds process-owned VMM action dispatch without recording action bodies, resources, or results.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn handle_action(&mut self, action: VmmAction)"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "fn executable_tracing_is_nested_filtered_and_value_free"
+        }
+      ]
+    }
+  ],
+  "nonclaims": [
+    "Firecracker source-rewrite or instrumentation-mechanism identity",
+    "durable trace delivery",
+    "platform-independent timing thresholds",
+    "production tracing enabled by default"
+  ],
+  "implementation": [
+    {
+      "kind": "local",
+      "path": "crates/runtime/src/lib.rs",
+      "anchor": "macro_rules! bangbang_trace_scope"
+    },
+    {
+      "kind": "local",
+      "path": "crates/runtime/src/logger/delivery.rs",
+      "anchor": "pub(super) const fn for_tool_tracing"
+    },
+    {
+      "kind": "local",
+      "path": "crates/runtime/src/logger/event.rs",
+      "anchor": "pub(super) fn encode_trace"
+    },
+    {
+      "kind": "local",
+      "path": "crates/runtime/src/logger/tracing.rs",
+      "anchor": "pub struct TraceLogger"
+    },
+    {
+      "kind": "local",
+      "path": "tools/firecracker-capability-audit/src/tracing_validate.rs",
+      "anchor": "pub fn validate_tracing_audit"
+    }
+  ],
+  "validation": [
+    {
+      "kind": "local",
+      "path": "compat/firecracker/v1.16.0/tracing-contract.md",
+      "anchor": "Terminal certification"
+    },
+    {
+      "kind": "local",
+      "path": "crates/bangbang/tests/process_e2e.rs",
+      "anchor": "fn executable_tracing_is_nested_filtered_and_value_free"
+    },
+    {
+      "kind": "local",
+      "path": "crates/runtime/src/logger/tracing.rs",
+      "anchor": "fn records_nested_entry_exit_and_normalized_origin"
+    },
+    {
+      "kind": "local",
+      "path": "crates/runtime/src/virtio_mmio.rs",
+      "anchor": "fn tracing_records_typed_reads_and_writes_without_guest_values"
+    },
+    {
+      "kind": "local",
+      "path": "crates/runtime/tests/tracing_feature.rs",
+      "anchor": "fn trace_scope_macro_evaluates_only_in_tracing_builds"
+    },
+    {
+      "kind": "local",
+      "path": "scripts/report-tracing-overhead.sh",
+      "anchor": "trace_marker=\"trace module=\""
+    },
+    {
+      "kind": "local",
+      "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+      "anchor": "fn checked_tracing_compatibility_is_terminal_and_fail_closed"
+    },
+    {
+      "kind": "local",
+      "path": "tools/snapshot-tools/tests/cli.rs",
+      "anchor": "fn tool_tracing_requires_a_matching_runtime_filter_and_preserves_diagnostics"
+    }
+  ]
+}

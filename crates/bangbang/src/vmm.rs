@@ -132,6 +132,8 @@ use bangbang_runtime::boot_timer::BootTimerMmioLayout;
 use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::entropy::{EntropyConfig, EntropyMmioLayout};
 use bangbang_runtime::lazy_memory::LazyGuestMemoryConsumerProfile;
+#[cfg(feature = "tracing")]
+use bangbang_runtime::logger::TraceLogger;
 use bangbang_runtime::logger::{
     EmergencyLogger, GuestLogger, LoggerApiControlOutcome, LoggerApiResultOutcome, LoggerApiRoute,
     LoggerApiWorkerOutcome, LoggerConfigInput, LoggerDeviceKind, LoggerHttpMethod,
@@ -5487,6 +5489,11 @@ impl ProcessLatencyClock for SystemProcessLatencyClock {
 pub(crate) trait VmmRequestHandler {
     fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 
+    #[cfg(feature = "tracing")]
+    fn trace_logger(&mut self) -> TraceLogger {
+        TraceLogger::default()
+    }
+
     fn handle_get_request(&mut self, request: GetApiRequest) -> Result<VmmData, VmmActionError>;
 
     fn handle_patch_request(&mut self, request: PatchApiRequest)
@@ -6093,6 +6100,11 @@ where
     }
 
     pub(crate) fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
+        bangbang_runtime::bangbang_trace_scope!(
+            self.controller.trace_logger(),
+            "bangbang::vmm",
+            "handle_action",
+        );
         let had_started_session = self.has_started_session();
         let live_device_lifecycle = self.live_device_lifecycle_action(&action);
         self.live_device_backend_attempted = false;
@@ -10788,6 +10800,11 @@ impl<S> VmmRequestHandler for ProcessVmm<S>
 where
     S: InstanceStartExecutor,
 {
+    #[cfg(feature = "tracing")]
+    fn trace_logger(&mut self) -> TraceLogger {
+        self.controller.trace_logger()
+    }
+
     fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         ProcessVmm::handle_action(self, action)
     }

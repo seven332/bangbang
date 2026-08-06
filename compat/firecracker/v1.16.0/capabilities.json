@@ -13731,11 +13731,80 @@
     {
       "id": "corpus:tracing",
       "family": "observability",
-      "summary": "Audit all applicable capability claims owned by the pinned tracing source corpus.",
+      "summary": "The applicable Firecracker v1.16 developer-tracing contract is implemented and verified as an opt-in, default-absent feature. Exact literal API, VMM, controller, virtio-MMIO, and snapshot-tool scopes emit bounded per-thread nested enter/exit records through the existing logger worker; level/module filters run before stack work, device delivery is nonblocking, host/tool delivery is bounded, and loss cannot replace functional results. Records admit only literal module/scope, opaque Rust thread identity, and phase, with fixed 32-scope and 512-byte bounds. Default builds do not evaluate the logger expression or contain the fixed trace marker, while standalone tools additionally require BANGBANG_TRACE runtime admission. The terminal audit locks the exact eight production calls and excludes sensitive values, durable delivery, source-rewrite mechanism identity, default production enablement, and portable timing thresholds.",
       "source_refs": [
         "corpus:tracing"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/tracing-audit.json",
+          "anchor": "api.handle-request"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "macro_rules! bangbang_trace_scope"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/event.rs",
+          "anchor": "pub(super) fn encode_trace"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/tracing.rs",
+          "anchor": "pub struct TraceLogger"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/tracing_validate.rs",
+          "anchor": "pub fn validate_tracing_audit"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/tracing-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "fn executable_tracing_is_nested_filtered_and_value_free"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/logger/tracing.rs",
+          "anchor": "fn records_nested_entry_exit_and_normalized_origin"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "fn tracing_records_typed_reads_and_writes_without_guest_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/tests/tracing_feature.rs",
+          "anchor": "fn trace_scope_macro_evaluates_only_in_tracing_builds"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/report-tracing-overhead.sh",
+          "anchor": "trace_marker=\"trace module=\""
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_tracing_compatibility_is_terminal_and_fail_closed"
+        },
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "fn tool_tracing_requires_a_matching_runtime_filter_and_preserves_diagnostics"
+        }
+      ]
     },
     {
       "id": "corpus:vsock",
@@ -15487,7 +15556,7 @@
     {
       "id": "semantic.observability:logger-delivery-filtering-loss-and-redaction",
       "family": "observability",
-      "summary": "Logger configuration, delivery, filtering, loss, and redaction are implemented and verified as one process-local best-effort contract. Normal VMM execution installs a bounded worker-mediated stdout target; strict preboot /logger updates replace path-bearing targets failure-atomically and retain the current target for path-free updates, while full VM configuration omits observability authority. Fixed API, action, host, worker, guest, transport, device, snapshot, signal, panic, and final records apply module and level filters before independent bounded limiters and nonblocking admission; every delivery failure is loss-accounted without changing API, VM, snapshot, guest, or process results. Records are bounded UTF-8 and exclude paths, selectors, identities, descriptors, errors, credentials, payloads, addresses, registers, timestamps, and guest values. Signed direct and ordinary-production/App Sandbox tests cover MMIO/PCI reachability, write-only grants, pathname replacement, containment, cleanup, and two-process isolation. Delivery is not durable, and developer tracing remains separately owned by #1791.",
+      "summary": "Logger configuration, delivery, filtering, loss, and redaction are implemented and verified as one process-local best-effort contract. Normal VMM execution installs a bounded worker-mediated stdout target; strict preboot /logger updates replace path-bearing targets failure-atomically and retain the current target for path-free updates, while full VM configuration omits observability authority. Fixed API, action, host, worker, guest, transport, device, snapshot, signal, panic, and final records apply module and level filters before independent bounded limiters and nonblocking admission; every delivery failure is loss-accounted without changing API, VM, snapshot, guest, or process results. Records are bounded UTF-8 and exclude paths, selectors, identities, descriptors, errors, credentials, payloads, addresses, registers, timestamps, and guest values. Signed direct and ordinary-production/App Sandbox tests cover MMIO/PCI reachability, write-only grants, pathname replacement, containment, cleanup, and two-process isolation. Delivery is not durable; the separately feature-gated developer-tracing contract is terminally owned by #1791 and is not folded into ordinary logger producer classes.",
       "source_refs": [
         "corpus:logger",
         "corpus:tracing"

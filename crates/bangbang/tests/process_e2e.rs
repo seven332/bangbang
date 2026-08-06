@@ -3124,6 +3124,102 @@ fn executable_logs_api_request_methods_and_paths_without_bodies() {
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
 }
 
+#[cfg(feature = "tracing")]
+#[test]
+fn executable_tracing_is_nested_filtered_and_value_free() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("tracing-api.socket");
+    let logger_path = test_dir.path().join("tracing.log");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let logger_path_json = json_string(path_text(&logger_path));
+    let logger_body = format!(
+        r#"{{
+            "log_path":{logger_path_json},
+            "level":"Trace",
+            "module":"bangbang"
+        }}"#
+    );
+    let logger_response = http_put_json(&socket_path, "/logger", &logger_body);
+    assert_no_content_response(&logger_response, "tracing PUT /logger");
+
+    let private_value = "private-tracing-api-body-value";
+    let mmds_body = format!(r#"{{"secret":"{private_value}"}}"#);
+    let response = http_put_json(&socket_path, "/mmds", &mmds_body);
+    assert_no_content_response(&response, "traced PUT /mmds");
+
+    let output = fs::read_to_string(&logger_path).expect("trace output should be readable");
+    let trace_lines = output
+        .lines()
+        .filter(|line| line.starts_with("trace "))
+        .collect::<Vec<_>>();
+    assert_eq!(trace_lines.len(), 6, "trace output:\n{output}");
+    for (line, (module, scope_and_phase)) in trace_lines.iter().zip([
+        (
+            "module=bangbang::api_server",
+            "scope=handle_request_bytes_with_limit phase=enter",
+        ),
+        (
+            "module=bangbang::vmm",
+            "scope=handle_request_bytes_with_limit::handle_action phase=enter",
+        ),
+        (
+            "module=bangbang_runtime::controller",
+            "scope=handle_request_bytes_with_limit::handle_action::handle_action phase=enter",
+        ),
+        (
+            "module=bangbang_runtime::controller",
+            "scope=handle_request_bytes_with_limit::handle_action::handle_action phase=exit",
+        ),
+        (
+            "module=bangbang::vmm",
+            "scope=handle_request_bytes_with_limit::handle_action phase=exit",
+        ),
+        (
+            "module=bangbang::api_server",
+            "scope=handle_request_bytes_with_limit phase=exit",
+        ),
+    ]) {
+        assert!(line.contains(module), "unexpected trace module: {line}");
+        assert!(
+            line.contains(scope_and_phase),
+            "unexpected trace scope/phase: {line}"
+        );
+    }
+    assert!(!output.contains(private_value));
+    assert!(!output.contains(&instance_id));
+
+    let api_only_body = r#"{"level":"Trace","module":"bangbang::api_server"}"#;
+    let api_only_response = http_put_json(&socket_path, "/logger", api_only_body);
+    assert_no_content_response(&api_only_response, "path-free tracing filter update");
+    let before_api_only = fs::read(&logger_path)
+        .expect("trace output should remain readable")
+        .len();
+
+    let version_response = http_get(&socket_path, "/version");
+    assert_ok_response(&version_response, "module-filtered traced GET /version");
+    let output = fs::read(&logger_path).expect("filtered trace output should be readable");
+    let suffix = output
+        .get(before_api_only..)
+        .expect("trace output should retain its previous prefix");
+    let suffix = String::from_utf8_lossy(suffix);
+    let trace_lines = suffix
+        .lines()
+        .filter(|line| line.starts_with("trace "))
+        .collect::<Vec<_>>();
+    assert_eq!(trace_lines.len(), 2, "filtered trace output:\n{suffix}");
+    assert!(
+        trace_lines
+            .iter()
+            .all(|line| line.contains("module=bangbang::api_server"))
+    );
+    assert!(!suffix.contains("module=bangbang::vmm"));
+    assert!(!suffix.contains("module=bangbang_runtime::controller"));
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "traced bangbang");
+}
+
 #[test]
 fn executable_configures_writeback_drive_cache_type() {
     let test_dir = TestDir::new();

@@ -1974,6 +1974,11 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
         &self,
         access: MmioAccess,
     ) -> Result<MmioAccessBytes, VirtioMmioRegisterHandlerError> {
+        crate::bangbang_trace_scope!(
+            self.guest_logger.trace_logger(),
+            "bangbang_runtime::device::virtio_mmio",
+            "read_access",
+        );
         let operation = MmioOperation::read(access)
             .map_err(|source| VirtioMmioRegisterHandlerError::InvalidOperation { source })?;
         match decode_virtio_mmio_access(&operation)
@@ -1992,6 +1997,11 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
         access: MmioAccess,
         data: MmioAccessBytes,
     ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        crate::bangbang_trace_scope!(
+            self.guest_logger.trace_logger(),
+            "bangbang_runtime::device::virtio_mmio",
+            "write_access",
+        );
         let operation = MmioOperation::write(access, data)
             .map_err(|source| VirtioMmioRegisterHandlerError::InvalidOperation { source })?;
         match decode_virtio_mmio_access(&operation)
@@ -3405,7 +3415,7 @@ mod tests {
         VirtioMmioRegisterStateError, VirtioMmioTransportStateError, decode_virtio_mmio_access,
     };
     use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatusError};
-    use crate::logger::{LoggerState, LoggerTransportOutcome};
+    use crate::logger::{LoggerConfigInput, LoggerLevel, LoggerState, LoggerTransportOutcome};
     use crate::memory::GuestAddress;
     use crate::mmio::{
         MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
@@ -5199,6 +5209,77 @@ mod tests {
         }
         assert!(!output.contains("activation-secret"));
         assert!(!output.contains("descriptor=19"));
+    }
+
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn tracing_records_typed_reads_and_writes_without_guest_values() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut logger_state = LoggerState::default();
+        logger_state.configure_test_writer(RecordingWriter(output.clone()));
+        logger_state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_level(LoggerLevel::Trace)
+                    .with_module("bangbang_runtime::device::virtio_mmio"),
+            )
+            .expect("trace logger should configure");
+        let logger = logger_state.guest_logger();
+
+        let mut handler =
+            VirtioMmioRegisterHandler::new(2, 0x2a, &[8]).expect("block handler should build");
+        handler.attach_guest_logger(logger.clone());
+        let read = handler
+            .read_access(access(VirtioMmioRegister::MagicValue.offset(), 4))
+            .expect("traced magic read should succeed");
+        assert_eq!(read.as_slice(), VIRTIO_MMIO_MAGIC_VALUE.to_le_bytes());
+        let private_guest_value = 0xfeed_cafe_u32;
+        let error = handler
+            .write_access(
+                access(VirtioMmioRegister::DriverFeaturesSel.offset(), 4),
+                MmioAccessBytes::new(&private_guest_value.to_le_bytes())
+                    .expect("selector bytes should fit"),
+            )
+            .expect_err("traced private selector value should retain its typed rejection");
+        assert_eq!(
+            error,
+            VirtioMmioRegisterHandlerError::DeviceRegisterWrite {
+                register: VirtioMmioRegister::DriverFeaturesSel,
+                source: VirtioMmioRegisterStateError::UnsupportedFeaturePage {
+                    selector: private_guest_value,
+                },
+            }
+        );
+        assert!(logger.wait_for_delivery_for_test());
+
+        let output = String::from_utf8(
+            output
+                .lock()
+                .expect("recording output should not be poisoned")
+                .clone(),
+        )
+        .expect("trace output should be UTF-8");
+        assert_eq!(output.matches(" phase=enter\n").count(), 2);
+        assert_eq!(output.matches(" phase=exit\n").count(), 2);
+        assert!(output.contains(" scope=read_access phase=enter"));
+        assert!(output.contains(" scope=write_access phase=exit"));
+        assert!(!output.contains(&format!("{private_guest_value:x}")));
+        assert!(!output.contains("feed"));
+
+        assert!(logger_state.disconnect_delivery_for_test());
+        assert!(
+            handler
+                .read_access(access(VirtioMmioRegister::MagicValue.offset(), 4))
+                .is_ok()
+        );
+        assert!(
+            handler
+                .write_access(
+                    access(VirtioMmioRegister::DriverFeaturesSel.offset(), 4),
+                    MmioAccessBytes::new(&0_u32.to_le_bytes()).expect("selector bytes should fit"),
+                )
+                .is_ok()
+        );
     }
 
     #[test]

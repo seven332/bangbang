@@ -48,6 +48,11 @@ For commands and test-layer selection, see the
   distinguished transaction record closes complete-line commit atomicity,
   previous-success retry, concurrent-cut ownership, lost-output accounting,
   and one-shot final behavior without claiming all-or-none sink visibility.
+- [`tracing-audit.json`](tracing-audit.json) is the human-owned terminal #1791
+  authority for the opt-in feature, fixed limits and fields, exact eight
+  literal production scopes, delivery classes, privacy rules, evidence, and
+  nonclaims. Its validator scans production Rust syntax instead of trusting
+  the declared call-site list.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
@@ -89,6 +94,7 @@ reviewed delta.
 | [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
 | [Logger producers](logger-contract.md) | Certified 11-row logger aggregate with exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
 | [Metrics schema and producer audits](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, a terminal 69-field #1788 process audit, and the device-final ten-profile/231-field #1789 certification with #1838–#1846 terminal |
+| [Developer tracing](tracing-contract.md) | Terminal opt-in feature contract, exact eight-call AST closure, fixed nesting/record/tool-delivery bounds, privacy, loss/result preservation, runtime tool admission, release diagnostics, and explicit mechanism/timing nonclaims |
 
 ## Dispositions
 
@@ -143,6 +149,21 @@ class or alter another capability's disposition. Repository-global
 `validate --final` remains the stronger all-capabilities completion gate and
 must continue to fail while any unrelated `audit-required` or
 `missing-platform-feasible` record or device producer remains nonterminal.
+
+## Scoped Developer-Tracing Certification
+
+The terminal tracing corpus has a separate checked gate:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
+```
+
+This command composes terminal logger certification with the checked tracing
+authority in final mode and consumes unrelated metrics authorities in delivery
+mode. It requires the exact eight literal production macro calls, feature and
+release-default policy, fixed stack/record/tool-delivery limits, closed fields,
+anchored evidence, and the single #1791 contract/capability row. It does not
+relax repository-global `validate --final` or promote any logger or metrics row.
 
 ## Scoped Metrics Schema Certification
 
@@ -235,4 +256,5 @@ Review candidate identity changes before updating a machine-owned projection.
 Never use regeneration to alter `capabilities.json`,
 `logger-producer-audit.json`, `metrics-process-producer-audit.json`, or the
 human policy projections in `metrics-schema.json`. The human-owned
-`metrics-device-producer-audit.json` likewise has no regeneration command.
+`metrics-device-producer-audit.json`, `metrics-lifecycle-audit.json`, and
+`tracing-audit.json` likewise have no regeneration command.
