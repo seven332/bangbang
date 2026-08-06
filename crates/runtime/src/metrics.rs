@@ -1626,10 +1626,19 @@ impl PartialEq for BlockDeviceMetricsByDrive {
 
 impl Eq for BlockDeviceMetricsByDrive {}
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct BlockDeviceMetricsByDriveEntry {
     generation: u64,
     metrics: BlockDeviceMetrics,
+}
+
+impl fmt::Debug for BlockDeviceMetricsByDriveEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlockDeviceMetricsByDriveEntry")
+            .field("metrics", &self.metrics)
+            .finish()
+    }
 }
 
 impl BlockDeviceMetricsByDrive {
@@ -9017,6 +9026,10 @@ mod tests {
         let replacement = replacement.publish();
 
         let current = registry.capture();
+        assert!(
+            !format!("{current:?}").contains("generation"),
+            "private block metrics generations must stay out of Debug output"
+        );
         let delta = current.per_drive().delta_since(Some(original.per_drive()));
         assert_eq!(
             delta,
