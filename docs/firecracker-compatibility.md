@@ -695,9 +695,10 @@ fields, newer balloon API/device fields, extra UART fields, and the ordinary
 block configuration-change value remain internal or are discarded at the
 public boundary. Adding an extension requires a separately versioned schema.
 
-The checked device-producer audit now terminally certifies all 191 #1838–#1843
-fields: 189 device fields are implemented, while `uart.flush_count` and
-`mmds.rx_bad_eth` are source-neutral zeros. The former has no pinned
+The checked device-producer audit now terminally certifies all 205 #1838–#1844
+fields: 201 device fields are implemented, `uart.flush_count` and
+`mmds.rx_bad_eth` are source-neutral zeros, and both configured/static
+`mac_address_updates` fields are terminal platform-zero. The former has no pinned
 Firecracker producer; the latter's pinned zero-copy mutation window is absent
 because Bangbang admits and parses one immutable owned packet. Each
 device owner publishes an immutable compound counter snapshot. Entropy counts
@@ -732,6 +733,8 @@ configured nonempty vhost owners, replays the whole observation after failed
 publication, and starts fresh after same-ID reuse. Snapshot rejection prevents
 vhost-user owners or stores from migrating.
 
+### TAP-oriented network metrics on vmnet
+
 Network interfaces likewise publish through one coherent, generation-bearing
 owner. A single registry cut supplies both `net_{iface_id}` and static `net`,
 so static fields are exactly the saturating sum of configured roots, zero roots
@@ -741,6 +744,27 @@ TX count/packet/bytes; MMDS detours remain MMDS traffic and cannot increment
 the TAP-path spoof field. Guest descriptor/buffer failures remain separate from
 malformed packets and backend failures, and interrupt creation failures are
 charged only to affected interface generations.
+
+Each active-generation Apple packet-available callback contributes exactly one
+`rx_tap_event_count` before readiness coalescing. Full/disconnected wake
+channels and capture quiescence do not erase raw callback cardinality; deferred
+internal publication contributes no second event, and retired callbacks cannot
+leak into a replacement generation. Only actual `vmnet_read` failures populate
+`tap_read_fails`. Each actual non-MMDS `vmnet_write` batch records one
+`tap_write_agg` latency sample on success or failure and increments
+`tap_write_fails` only when the host operation or returned batch is invalid.
+Valid short prefixes remain successful operations. The broader internal vmnet
+diagnostics do not implicitly enter Firecracker fields.
+
+Apple supplies the interface MAC during construction and exposes no public
+live-MAC setter equivalent to Firecracker's writable virtio configuration
+bytes. Bangbang rejects guest configuration writes and keeps requested,
+realized, snapshot, uniqueness, and spoof-check identities immutable for one
+generation. `mac_address_updates` is therefore stable zero for both configured
+and static roots; runtime teardown/replacement is not relabeled as an in-place
+MAC update. The exact platform evidence and rejected alternatives are recorded
+in the metrics audit and the
+[security boundary](security.md#vmnet-identity-and-tap-metric-non-aliasing).
 
 MMDS metrics share one coherent process-local owner across that VM's selected
 interfaces. Missing and invalid tokens are observed for both V1 and V2.
@@ -788,7 +812,7 @@ implemented process-lifecycle policy profiles and an exact final-mode 69-field
 audit: 64 implemented records, the one source-neutral logger record, four
 platform-zero signal/seccomp records, and no planned record. Missing, extra,
 duplicate, stale, unowned, incorrectly bounded, wrongly dispositioned, or
-evidence-free records fail closed. The gate retains ten planned plus four
+evidence-free records fail closed. The gate retains ten planned plus five
 platform-zero #1789 device profiles and both audit-required #1790 aggregates;
 it does not certify device/corpus completion or make best-effort terminal
 output durable.

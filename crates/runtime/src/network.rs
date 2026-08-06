@@ -1552,6 +1552,9 @@ pub struct VirtioNetworkBackendMetrics {
     vmnet_write_packets_count: u64,
     vmnet_write_partial_batches: u64,
     tx_spoofed_mac_count: u64,
+    tap_read_fails: u64,
+    tap_write_fails: u64,
+    tap_write_latency: VirtioNetworkLatencyAggregate,
     vmnet_read_latency: VirtioNetworkLatencyAggregate,
     vmnet_write_latency: VirtioNetworkLatencyAggregate,
 }
@@ -1591,6 +1594,18 @@ impl VirtioNetworkBackendMetrics {
 
     pub const fn tx_spoofed_mac_count(self) -> u64 {
         self.tx_spoofed_mac_count
+    }
+
+    pub const fn tap_read_fails(self) -> u64 {
+        self.tap_read_fails
+    }
+
+    pub const fn tap_write_fails(self) -> u64 {
+        self.tap_write_fails
+    }
+
+    pub const fn tap_write_latency(self) -> VirtioNetworkLatencyAggregate {
+        self.tap_write_latency
     }
 
     pub const fn vmnet_read_latency(self) -> VirtioNetworkLatencyAggregate {
@@ -1649,6 +1664,38 @@ impl VirtioNetworkBackendMetrics {
         }
     }
 
+    /// Records one real supported-host read operation at the Firecracker TAP
+    /// compatibility boundary while retaining the broader vmnet diagnostics.
+    pub fn record_supported_host_read_attempt(
+        &mut self,
+        requested: usize,
+        completed: Result<usize, ()>,
+        duration: Duration,
+    ) {
+        self.record_vmnet_read(requested, completed, duration);
+        if completed.is_err() {
+            self.tap_read_fails = self.tap_read_fails.saturating_add(1);
+        }
+    }
+
+    /// Records one real non-MMDS supported-host write operation at the
+    /// Firecracker TAP compatibility boundary while retaining vmnet batch
+    /// diagnostics. Valid partial prefixes are successful host operations.
+    pub fn record_supported_host_write_attempt(
+        &mut self,
+        requested: usize,
+        completed: Result<usize, ()>,
+        duration: Duration,
+    ) {
+        self.record_vmnet_write(requested, completed, duration);
+        self.tap_write_latency = self
+            .tap_write_latency
+            .merged_with(VirtioNetworkLatencyAggregate::from_sample(duration));
+        if completed.is_err() {
+            self.tap_write_fails = self.tap_write_fails.saturating_add(1);
+        }
+    }
+
     pub fn record_spoofed_mac(&mut self) {
         self.tx_spoofed_mac_count = self.tx_spoofed_mac_count.saturating_add(1);
     }
@@ -1678,6 +1725,9 @@ impl VirtioNetworkBackendMetrics {
             tx_spoofed_mac_count: self
                 .tx_spoofed_mac_count
                 .saturating_add(other.tx_spoofed_mac_count),
+            tap_read_fails: self.tap_read_fails.saturating_add(other.tap_read_fails),
+            tap_write_fails: self.tap_write_fails.saturating_add(other.tap_write_fails),
+            tap_write_latency: self.tap_write_latency.merged_with(other.tap_write_latency),
             vmnet_read_latency: self
                 .vmnet_read_latency
                 .merged_with(other.vmnet_read_latency),

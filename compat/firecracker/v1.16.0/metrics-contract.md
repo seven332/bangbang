@@ -43,7 +43,7 @@ including the schema-runtime timestamp producer. #1788 certifies the exact
 API, process, logger, signal, boot, and lifecycle producers through two
 implemented aggregate profiles and the field-level process audit. The checked
 device audit now assigns every #1789 field to one concrete delivery child and
-terminally certifies the 191 records delivered by #1838–#1843; later child
+terminally certifies the 205 records delivered by #1838–#1844; later child
 records remain nonterminal. `corpus:metrics` and the cross-producer aggregate
 semantic remain #1790-owned. A required zero therefore proves wire-shape
 completeness only, never producer completion unless its field audit is
@@ -68,7 +68,7 @@ The scoped gate requires those exact records and their #1787 contract rows to
 be `implemented-and-verified`, while both #1790 aggregate records remain
 `audit-required`. It also pins the policy partition to one implemented
 schema-runtime timestamp profile, two implemented process-lifecycle profiles,
-ten planned #1789 device profiles, and four #1789 platform-zero device
+ten planned #1789 device profiles, and five #1789 platform-zero device
 profiles. Missing, extra, promoted, stale, or differently handed-off members
 fail closed.
 
@@ -219,18 +219,19 @@ Static and configured identities remain distinct; exact suffix routing splits
 mapped network fields from tap-oriented gaps and applicable vCPU exits from
 retained PIO/KVM-clock fields.
 
-After #1843, the audit contains 25 `planned`, 15
-`provisional-platform-zero`, 189 `implemented`, and two `source-neutral`
-records. The 191 terminal records additionally cover all 44 mapped configured
-and static network fields plus all 13 MMDS fields. `uart.flush_count` remains
+After #1844, the audit contains 11 `planned`, 15
+`provisional-platform-zero`, 201 `implemented`, two `source-neutral`, and two
+`platform-zero` records. The 205 terminal records additionally cover all 56
+applicable configured and static network fields plus all 13 MMDS fields.
+`uart.flush_count` remains
 source-neutral because pinned Firecracker declares it without a producer.
 `mmds.rx_bad_eth` is also source-neutral: Bangbang classifies and parses the
 same immutable owned packet, so Firecracker's zero-copy mutation window cannot
 occur and no broader malformed-frame event is aliased into the field. The
 remaining planned and provisional records are nonterminal, carry empty
-implementation and validation arrays, and have no platform exclusion. The 14
-#1844 network records remain the Linux-TAP-oriented gap. The provisional
-records are the six retained i8042 fields plus nine vCPU PIO/KVM-clock fields;
+implementation and validation arrays, and have no platform exclusion. The
+provisional records are the six retained i8042 fields plus nine vCPU
+PIO/KVM-clock fields;
 this label does not claim that the terminal platform evidence required by
 #1846 already exists.
 
@@ -245,6 +246,40 @@ boundaries. MMDS uses one coherent process-local owner: `tx_count` records a
 successful stack write attempt, while `tx_frames` and `tx_bytes` commit only
 when the retained frame reaches guest RX. Failed publication replays the whole
 network/MMDS interval and advances the baseline only after success.
+
+### TAP-oriented network producer closure
+
+#1844 closes the remaining 14 configured/static network records without
+pretending that macOS exposes a Linux TAP device. Each admitted
+packet-available callback for the exact active vmnet generation increments one
+lock-free raw event source before readiness coalescing. Full or disconnected
+wake channels and capture quiescence therefore do not erase callback
+cardinality, while a retired generation cannot contribute to a same-ID
+replacement. The source is bound to the already-published metrics generation
+before callback delivery; failed binding rolls runtime insertion back instead
+of publishing an endpoint whose events would be unobservable.
+
+An actual supported-host `vmnet_read` attempt increments `tap_read_fails` only
+when the operation or its returned batch is invalid. An actual non-MMDS
+`vmnet_write` batch contributes one `tap_write_agg` latency sample whether it
+succeeds or fails and increments `tap_write_fails` only for a failed or invalid
+operation; a valid short prefix remains a successful host operation. Broader
+vmnet batch diagnostics stay internal and cannot implicitly populate these
+Firecracker fields. The interval sum and failure/event counters advance only
+after a successful whole-line publication. Latency minima and maxima retain
+their latest Store values across unchanged intervals and failed writes;
+configured values derive the static sum, whose minimum and maximum stay zero.
+
+Pinned Firecracker increments `mac_address_updates` for an accepted guest
+write to the virtio MAC configuration bytes. Apple vmnet instead fixes the MAC
+in the created interface identity and returns it during start; the public SDK
+has no live MAC mutation operation. Bangbang rejects virtio configuration
+writes and keeps requested, realized, snapshot, spoof-check, and uniqueness
+identity immutable for the generation. Both configured and static
+`mac_address_updates` are consequently terminal platform-zero values with
+upstream, Apple, alternative, behavior, focused-test, compatibility, security,
+and Challenge evidence. Replacing a vmnet interface is a lifecycle change and
+is not counted as an in-place MAC update.
 
 Vsock uses one coherent saturating owner from configuration and activation
 through MMIO/PCI dispatch, HVF readiness, snapshot normalization, restore, and
@@ -546,7 +581,7 @@ device handoffs, and retained #1790 aggregate rows.
 final-mode process-audit validation and logger delivery validation. It requires
 all 69 records to be terminal with their exact child, boundary, rationale,
 disposition, and tracked evidence: 64 implemented, one source-neutral, and four
-platform-zero. It does not require the ten planned or four platform-zero
+platform-zero. It does not require the ten planned or five platform-zero
 device profiles or their 231 field records to complete and does not promote
 either #1790 aggregate.
 Repository-global `validate --final` remains the stronger all-capability gate.

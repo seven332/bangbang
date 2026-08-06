@@ -7383,6 +7383,17 @@
       "validation": []
     },
     {
+      "id": "count-sum-across-configured-devices-device-platform-zero",
+      "unit": "count",
+      "aggregation": "sum-across-configured-devices",
+      "producer_owner": "device",
+      "producer_disposition": "platform-zero",
+      "delivery_issue": "#1789",
+      "rationale": "The arm64 schema retains this Linux/x86-oriented field as a required numeric neutral value; #1789 owns terminal evidence.",
+      "implementation": [],
+      "validation": []
+    },
+    {
       "id": "microseconds-maximum-device-planned",
       "unit": "microseconds",
       "aggregation": "maximum",
@@ -7684,7 +7695,7 @@
     },
     {
       "field_id": "dynamic:net_{iface_id}.mac_address_updates",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-platform-zero"
     },
     {
       "field_id": "dynamic:net_{iface_id}.no_rx_avail_buffer",
@@ -8268,7 +8279,7 @@
     },
     {
       "field_id": "static:net.mac_address_updates",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-platform-zero"
     },
     {
       "field_id": "static:net.no_rx_avail_buffer",

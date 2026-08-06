@@ -236,7 +236,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .iter()
             .filter(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
             .count(),
-        25
+        11
     );
     assert_eq!(
         audit
@@ -254,7 +254,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .iter()
             .filter(|record| record.disposition == MetricsDeviceProducerDisposition::Implemented)
             .count(),
-        189
+        201
     );
     assert_eq!(
         audit
@@ -266,10 +266,20 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .count(),
         2
     );
+    assert_eq!(
+        audit
+            .records
+            .iter()
+            .filter(|record| {
+                record.disposition == MetricsDeviceProducerDisposition::PlatformZero
+            })
+            .count(),
+        2
+    );
     for record in audit.records.iter().filter(|record| {
         matches!(
             record.delivery_issue.as_str(),
-            "#1838" | "#1839" | "#1840" | "#1841" | "#1842" | "#1843"
+            "#1838" | "#1839" | "#1840" | "#1841" | "#1842" | "#1843" | "#1844"
         )
     }) {
         let expected = if matches!(
@@ -277,13 +287,23 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             "static:uart.flush_count" | "static:mmds.rx_bad_eth"
         ) {
             MetricsDeviceProducerDisposition::SourceNeutral
+        } else if matches!(
+            record.field_id.as_str(),
+            "dynamic:net_{iface_id}.mac_address_updates" | "static:net.mac_address_updates"
+        ) {
+            MetricsDeviceProducerDisposition::PlatformZero
         } else {
             MetricsDeviceProducerDisposition::Implemented
         };
         assert_eq!(record.disposition, expected, "{}", record.field_id);
         assert!(!record.implementation.is_empty(), "{}", record.field_id);
         assert!(!record.validation.is_empty(), "{}", record.field_id);
-        assert!(record.platform_exclusion.is_none(), "{}", record.field_id);
+        assert_eq!(
+            record.platform_exclusion.is_some(),
+            expected == MetricsDeviceProducerDisposition::PlatformZero,
+            "{}",
+            record.field_id
+        );
     }
     assert!(
         audit
@@ -292,7 +312,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .filter(|record| {
                 !matches!(
                     record.delivery_issue.as_str(),
-                    "#1838" | "#1839" | "#1840" | "#1841" | "#1842" | "#1843"
+                    "#1838" | "#1839" | "#1840" | "#1841" | "#1842" | "#1843" | "#1844"
                 )
             })
             .all(|record| {
@@ -310,7 +330,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .lines()
             .filter(|line| line.contains("final metrics device producer validation rejects"))
             .count(),
-        40
+        26
     );
 }
 
@@ -318,6 +338,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
 // exact #1838 disposition mutation tests, extended through #1841
 // exact #1838 disposition mutation tests, extended through #1842
 // exact #1838 disposition mutation tests, extended through #1843
+// exact #1838 disposition mutation tests, extended through #1844
 #[test]
 fn device_producer_audit_rejects_completed_child_regression_and_future_promotion() {
     let mut implemented_regression = checked_device_audit();
@@ -325,10 +346,10 @@ fn device_producer_audit_rejects_completed_child_regression_and_future_promotion
         .records
         .iter_mut()
         .find(|record| {
-            record.delivery_issue == "#1843"
+            record.delivery_issue == "#1844"
                 && record.disposition == MetricsDeviceProducerDisposition::Implemented
         })
-        .expect("implemented #1843 record must exist")
+        .expect("implemented #1844 record must exist")
         .disposition = MetricsDeviceProducerDisposition::Planned;
     assert!(device_validation_error(&implemented_regression).contains("wrong current disposition"));
 
@@ -356,7 +377,7 @@ fn device_producer_audit_rejects_completed_child_regression_and_future_promotion
     let record = future_promotion
         .records
         .iter_mut()
-        .find(|record| record.delivery_issue == "#1844")
+        .find(|record| record.delivery_issue == "#1845")
         .expect("future child record must exist");
     record.disposition = MetricsDeviceProducerDisposition::Implemented;
     record.implementation.push(anchored_local_reference());
@@ -865,9 +886,9 @@ fn checked_metrics_authority_has_exact_completed_process_and_later_owner_partiti
             MetricsProducerOwner::Device,
             MetricsProducerDisposition::PlatformZero,
         ),
-        4
+        5
     );
-    assert_eq!(authority.policy_profiles.len(), 17);
+    assert_eq!(authority.policy_profiles.len(), 18);
     let root = repository_root();
     let manifest = read_source_manifest(&root.join(SOURCE_MANIFEST_PATH))
         .expect("checked source manifest must parse");

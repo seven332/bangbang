@@ -1085,15 +1085,39 @@ and uncertain; failed stop is never retried or reused. Diagnostics omit MAC,
 UUID, bridge/interface names, returned bounds, XPC contents, raw handles, and
 unknown framework values.
 
+### vmnet identity and TAP-metric non-aliasing
+
+The MAC returned through `vmnet_mac_address_key` and its optional interface-ID
+association are interface-construction identity. Apple's public vmnet API
+offers start, stop, packet-event, read, and write operations, but no setter that
+changes that MAC on a live interface. Bangbang therefore keeps requested and
+realized MACs, uniqueness reservations, spoof filtering, snapshot profile, and
+guest configuration immutable for each published generation. Guest virtio
+configuration writes are rejected, and both Firecracker
+`net.mac_address_updates` identities remain stable zero. Replacing an interface
+cannot be counted as an update because it retires one callback, host handle,
+metrics generation, and connectivity identity before constructing another.
+
+This zero is a platform boundary rather than a hidden failure counter. Invalid
+configuration access continues to use `cfg_fails`; spoofed guest transmission
+continues to use `tx_spoofed_mac_count`; lifecycle replacement keeps its normal
+API and owner failure behavior. None is aliased into `mac_address_updates`.
+The positive TAP-shaped fields are likewise tied only to real vmnet operations:
+active callback admission, actual host reads, and actual non-MMDS host writes.
+Internal readiness retries, MMDS traffic, and pre-host validation cannot
+manufacture those observations.
+
 The backend registers only the packet-available event. Its serial callback
-captures a restricted generation publisher, not guest memory, device queues,
-packet bytes, configuration, limiters, or public metrics. It atomically retains
-readiness and a bounded optional estimate, then uses a nonblocking capacity-one
-signal; the estimate is only a hint and a full or disconnected signal path does
-not clear readiness. A separate provider-owned bridge performs the potentially
-locking vCPU wake outside Apple's callback queue. Owner-thread dispatch selects
-the exact live generation, issues at most one realized host batch per pass, and
-parks retained work while the guest has no RX buffer or a limiter is blocked.
+captures a restricted generation publisher and a saturating raw-event source,
+not guest memory, device queues, packet bytes, configuration, limiters, or the
+compound metrics registry. It increments that source only after active
+generation admission, atomically retains readiness and a bounded optional
+estimate, then uses a nonblocking capacity-one signal; the estimate is only a
+hint and a full or disconnected signal path does not clear readiness. A
+separate provider-owned bridge performs the potentially locking vCPU wake
+outside Apple's callback queue. Owner-thread dispatch selects the exact live
+generation, issues at most one realized host batch per pass, and parks retained
+work while the guest has no RX buffer or a limiter is blocked.
 
 RX and TX aggregate storage is allocated before interface publication and is
 bounded by the validated profile, 200 packets, 256 KiB, per-packet size, and

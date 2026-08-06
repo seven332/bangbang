@@ -1266,11 +1266,111 @@
     {
       "field_id": "dynamic:net_{iface_id}.mac_address_updates",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "platform-zero",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.mac_address_updates` is assigned to #1844 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.mac_address_updates` is completed by #1844 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn write_device_config("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_network_interface_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_config_space_rejects_writes_after_driver_status()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/virtio/net/device.rs#L1044-L1054"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/vmnet"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/vmnet/vmnet_interface_id_key"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/vmnet/vmnet_mac_address_key"
+          }
+        ],
+        "alternatives": [
+          "Aliasing immutable requested or realized MAC identity to a live-update counter would fabricate an event that Apple vmnet does not expose.",
+          "Replacing the active vmnet interface to emulate a MAC update changes lifecycle and connectivity identity rather than implementing Firecracker's in-place virtio configuration write."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/network.rs",
+            "anchor": "fn write_device_config("
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn writes_network_interface_metrics_when_provided()"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/network.rs",
+            "anchor": "fn virtio_network_config_space_rejects_writes_after_driver_status()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### TAP-oriented network producer closure"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### TAP-oriented network metrics on vmnet"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### vmnet identity and TAP-metric non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1844#issuecomment-5202056404"
+        }
+      }
     },
     {
       "field_id": "dynamic:net_{iface_id}.no_rx_avail_buffer",
@@ -1739,56 +1839,248 @@
     {
       "field_id": "dynamic:net_{iface_id}.rx_tap_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_tap_event_count` is assigned to #1844 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_tap_event_count` is completed by #1844 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "self.tap_event_source.record_events(1);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct NetworkInterfaceTapEventSource"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn packet_readiness_coalesces_storms_and_survives_full_or_disconnected_signals()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_tap_event_source_is_saturating_idempotent_and_generation_local()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tap_read_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tap_read_fails` is assigned to #1844 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tap_read_fails` is completed by #1844 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "self.backend_metrics.record_supported_host_read_attempt("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub fn record_supported_host_read_attempt("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn rx_source_reports_vmnet_read_failure()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn broad_vmnet_diagnostics_do_not_implicitly_become_tap_metrics()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tap_write_agg.max_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tap_write_agg.max_us` is assigned to #1844 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tap_write_agg.max_us` is completed by #1844 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "record_supported_host_write_attempt("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub fn record_supported_host_write_attempt("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn tx_sink_stages_guest_bytes_and_maps_short_batch_prefix()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tap_write_agg.min_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tap_write_agg.min_us` is assigned to #1844 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tap_write_agg.min_us` is completed by #1844 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "record_supported_host_write_attempt("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub fn record_supported_host_write_attempt("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn tx_sink_stages_guest_bytes_and_maps_short_batch_prefix()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tap_write_agg.sum_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tap_write_agg.sum_us` is assigned to #1844 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tap_write_agg.sum_us` is completed by #1844 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "record_supported_host_write_attempt("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub fn record_supported_host_write_attempt("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn tx_sink_stages_guest_bytes_and_maps_short_batch_prefix()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tap_write_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tap_write_fails` is assigned to #1844 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tap_write_fails` is completed by #1844 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "record_supported_host_write_attempt("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub fn record_supported_host_write_attempt("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn tx_sink_reports_vmnet_write_failure()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn broad_vmnet_diagnostics_do_not_implicitly_become_tap_metrics()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_bytes_count",
@@ -6650,11 +6942,111 @@
     {
       "field_id": "static:net.mac_address_updates",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "platform-zero",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net.mac_address_updates` is assigned to #1844 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.mac_address_updates` is completed by #1844 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_network_metrics(aggregate: &mut NetworkMetrics, metrics: &NetworkMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn write_device_config("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_network_interface_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_config_space_rejects_writes_after_driver_status()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ],
+      "platform_exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/virtio/net/device.rs#L1044-L1054"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/vmnet"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/vmnet/vmnet_interface_id_key"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/vmnet/vmnet_mac_address_key"
+          }
+        ],
+        "alternatives": [
+          "Aliasing immutable requested or realized MAC identity to a live-update counter would fabricate an event that Apple vmnet does not expose.",
+          "Replacing the active vmnet interface to emulate a MAC update changes lifecycle and connectivity identity rather than implementing Firecracker's in-place virtio configuration write."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics/firecracker.rs",
+            "anchor": "fn add_network_metrics(aggregate: &mut NetworkMetrics, metrics: &NetworkMetrics) {"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/network.rs",
+            "anchor": "fn write_device_config("
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/metrics.rs",
+            "anchor": "fn writes_network_interface_metrics_when_provided()"
+          },
+          {
+            "kind": "local",
+            "path": "crates/runtime/src/network.rs",
+            "anchor": "fn virtio_network_config_space_rejects_writes_after_driver_status()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/metrics-contract.md",
+            "anchor": "### TAP-oriented network producer closure"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "### TAP-oriented network metrics on vmnet"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "### vmnet identity and TAP-metric non-aliasing"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1844#issuecomment-5202056404"
+        }
+      }
     },
     {
       "field_id": "static:net.no_rx_avail_buffer",
@@ -7118,56 +7510,248 @@
     {
       "field_id": "static:net.rx_tap_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net.rx_tap_event_count` is assigned to #1844 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.rx_tap_event_count` is completed by #1844 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "self.tap_event_source.record_events(1);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_network_metrics(aggregate: &mut NetworkMetrics, metrics: &NetworkMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn packet_readiness_coalesces_storms_and_survives_full_or_disconnected_signals()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_network_interface_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "static:net.tap_read_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net.tap_read_fails` is assigned to #1844 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tap_read_fails` is completed by #1844 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "self.backend_metrics.record_supported_host_read_attempt("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_network_metrics(aggregate: &mut NetworkMetrics, metrics: &NetworkMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub fn record_supported_host_read_attempt("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn rx_source_reports_vmnet_read_failure()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_network_interface_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "static:net.tap_write_agg.max_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net.tap_write_agg.max_us` is assigned to #1844 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tap_write_agg.max_us` is completed by #1844 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "record_supported_host_write_attempt("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_network_metrics(aggregate: &mut NetworkMetrics, metrics: &NetworkMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub fn record_supported_host_write_attempt("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn tx_sink_stages_guest_bytes_and_maps_short_batch_prefix()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_network_interface_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "static:net.tap_write_agg.min_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net.tap_write_agg.min_us` is assigned to #1844 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tap_write_agg.min_us` is completed by #1844 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "record_supported_host_write_attempt("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_network_metrics(aggregate: &mut NetworkMetrics, metrics: &NetworkMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub fn record_supported_host_write_attempt("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn tx_sink_stages_guest_bytes_and_maps_short_batch_prefix()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_network_interface_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "static:net.tap_write_agg.sum_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net.tap_write_agg.sum_us` is assigned to #1844 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tap_write_agg.sum_us` is completed by #1844 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "record_supported_host_write_attempt("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_network_metrics(aggregate: &mut NetworkMetrics, metrics: &NetworkMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub fn record_supported_host_write_attempt("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn tx_sink_stages_guest_bytes_and_maps_short_batch_prefix()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_network_interface_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "static:net.tap_write_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1844",
-      "rationale": "Pinned Firecracker field `net.tap_write_fails` is assigned to #1844 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tap_write_fails` is completed by #1844 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "record_supported_host_write_attempt("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_network_metrics(aggregate: &mut NetworkMetrics, metrics: &NetworkMetrics) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub fn record_supported_host_write_attempt("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn tx_sink_reports_vmnet_write_failure()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_network_interface_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1844"
+        }
+      ]
     },
     {
       "field_id": "static:net.tx_bytes_count",

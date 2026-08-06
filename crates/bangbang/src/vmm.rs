@@ -149,11 +149,11 @@ use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, MmdsMetrics,
     NetworkInterfaceMetrics, NetworkInterfaceMetricsCaptureError,
     NetworkInterfaceMetricsCaptureState, NetworkInterfaceMetricsLease,
-    NetworkInterfaceMetricsRegistryError, ProcessLatencyBoundary, ProcessLatencyOperation,
-    SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-    SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics, SharedNetworkInterfaceMetricsRegistry,
-    SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedSignalMetrics,
-    SharedVsockDeviceMetrics,
+    NetworkInterfaceMetricsRegistryError, NetworkInterfaceTapEventSource, ProcessLatencyBoundary,
+    ProcessLatencyOperation, SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+    SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics,
+    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
+    SharedSignalMetrics, SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigError, MmdsConfigInput, MmdsContentInput, MmdsState, MmdsStateHandle,
@@ -18559,6 +18559,20 @@ where
             }
             return Err(primary);
         }
+        let metrics = self.session.shared_network_interface_metrics();
+        if let Err(primary) = self
+            .packet_io
+            .bind_published_network_metrics(&published, metrics.as_ref())
+        {
+            let cleanup = self.remove_runtime_network_device(config.iface_id());
+            let message = match cleanup {
+                Ok(()) => primary.to_string(),
+                Err(cleanup) => format!(
+                    "{primary}; also failed to remove the unbound runtime network endpoint: {cleanup}"
+                ),
+            };
+            return Err(NetworkRuntimeMutationError::TerminalInsertion { message });
+        }
         Ok(())
     }
 
@@ -19834,6 +19848,13 @@ where
         match self {
             Self::MmdsOnly(_) => false,
             Self::Vmnet(packet_io) => packet_io.take_scheduled_readiness(),
+        }
+    }
+
+    fn tap_event_source(&self) -> Option<NetworkInterfaceTapEventSource> {
+        match self {
+            Self::MmdsOnly(_) => None,
+            Self::Vmnet(packet_io) => packet_io.tap_event_source(),
         }
     }
 
@@ -21472,6 +21493,56 @@ where
         self.start_readiness_bridge_if_needed(false)
     }
 
+    fn bind_network_metrics(
+        &self,
+        metrics: &SharedNetworkInterfaceMetricsRegistry,
+    ) -> Result<(), BackendError> {
+        for entry in &self.entries {
+            let Some(source) = entry.packet_io.tap_event_source() else {
+                continue;
+            };
+            metrics
+                .bind_tap_event_source_for_interface(&entry.iface_id, source)
+                .map_err(|_| {
+                    BackendError::InvalidState(
+                        "vmnet callback metrics source does not match the live interface owner",
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn bind_published_network_metrics(
+        &self,
+        published: &PublishedProcessNetworkPacketIoEntry,
+        metrics: &SharedNetworkInterfaceMetricsRegistry,
+    ) -> Result<(), BackendError> {
+        if published.registry_id != self.registry_id || published.owner != self.owner {
+            return Err(BackendError::InvalidState(
+                "vmnet callback metrics source has invalid registry authority",
+            ));
+        }
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.generation == published.generation && entry.iface_id == published.iface_id
+            })
+            .ok_or(BackendError::InvalidState(
+                "vmnet callback metrics source generation is unavailable",
+            ))?;
+        let Some(source) = entry.packet_io.tap_event_source() else {
+            return Ok(());
+        };
+        metrics
+            .bind_tap_event_source_for_interface(&entry.iface_id, source)
+            .map_err(|_| {
+                BackendError::InvalidState(
+                    "vmnet callback metrics source does not match the published interface owner",
+                )
+            })
+    }
+
     fn start_readiness_bridge_if_needed(
         &mut self,
         preparing_vmnet: bool,
@@ -21614,6 +21685,21 @@ pub(crate) trait ProcessRuntimeNetworkPacketIoProvider:
         Ok(())
     }
 
+    fn bind_network_metrics(
+        &mut self,
+        _metrics: Option<&SharedNetworkInterfaceMetricsRegistry>,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn bind_published_network_metrics(
+        &mut self,
+        _published: &Self::PublishedEntry,
+        _metrics: Option<&SharedNetworkInterfaceMetricsRegistry>,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     fn shutdown_packet_io(&mut self) -> Result<(), BackendError> {
         Ok(())
     }
@@ -21656,6 +21742,27 @@ impl ProcessRuntimeNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
         wake: Arc<dyn Fn() + Send + Sync + 'static>,
     ) -> Result<(), BackendError> {
         ProcessNetworkPacketIoRegistry::bind_readiness_wake(self, wake)
+    }
+
+    fn bind_network_metrics(
+        &mut self,
+        metrics: Option<&SharedNetworkInterfaceMetricsRegistry>,
+    ) -> Result<(), BackendError> {
+        let metrics = metrics.ok_or(BackendError::InvalidState(
+            "network metrics registry is unavailable for vmnet callback binding",
+        ))?;
+        ProcessNetworkPacketIoRegistry::bind_network_metrics(self, metrics)
+    }
+
+    fn bind_published_network_metrics(
+        &mut self,
+        published: &Self::PublishedEntry,
+        metrics: Option<&SharedNetworkInterfaceMetricsRegistry>,
+    ) -> Result<(), BackendError> {
+        let metrics = metrics.ok_or(BackendError::InvalidState(
+            "network metrics registry is unavailable for vmnet callback binding",
+        ))?;
+        ProcessNetworkPacketIoRegistry::bind_published_network_metrics(self, published, metrics)
     }
 
     fn shutdown_packet_io(&mut self) -> Result<(), BackendError> {
@@ -31097,6 +31204,8 @@ where
         &mut self,
         control: Self::Control,
     ) -> Result<(), BackendError> {
+        let metrics = self.session.shared_network_interface_metrics();
+        self.packet_io.bind_network_metrics(metrics.as_ref())?;
         self.packet_io.bind_readiness_wake(Arc::new(move || {
             let _ = control.request_wakeup();
         }))
@@ -50009,6 +50118,11 @@ mod tests {
             .expect("vmnet provider should build");
         let callback = recorded_packet_callback(&callbacks, "eth0");
         callback.publish_for_test(Some(3));
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0"]);
+        provider
+            .bind_network_metrics(&metrics)
+            .expect("prebind callback source should attach to metrics");
+        assert_eq!(metrics.aggregate_snapshot().rx_tap_event_count(), 1);
         let wake_count = Arc::new(AtomicU64::new(0));
         let worker_wake_count = Arc::clone(&wake_count);
 
@@ -50060,6 +50174,15 @@ mod tests {
             )
             .expect("vmnet provider should build");
         let stale_callback = recorded_packet_callback(&callbacks, "eth0");
+        let metrics =
+            SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(["eth0"], 1)
+                .expect("bounded callback metrics should allocate");
+        provider
+            .bind_network_metrics(&metrics)
+            .expect("initial callback source should bind");
+        let initial_metrics_lease = metrics
+            .claim_interface_lease("eth0")
+            .expect("initial metrics generation should be claimable");
         let mut removed = provider
             .take_interface("eth0")
             .expect("first generation should be removable");
@@ -50067,6 +50190,11 @@ mod tests {
             .stop()
             .expect("first generation should stop exactly");
         drop(removed);
+        drop(initial_metrics_lease);
+        let replacement_metrics_lease = metrics
+            .prepare_interface("eth0")
+            .expect("replacement metrics generation should prepare")
+            .publish();
 
         let prepared = provider
             .prepare_entry_with_factory(
@@ -50077,15 +50205,21 @@ mod tests {
             )
             .expect("replacement generation should prepare");
         provider.publish_prepared(prepared);
+        provider
+            .bind_network_metrics(&metrics)
+            .expect("replacement callback source should bind");
         let replacement_callback = recorded_packet_callback(&callbacks, "eth0");
 
         stale_callback.publish_for_test(Some(1));
+        assert_eq!(metrics.aggregate_snapshot().rx_tap_event_count(), 0);
         assert!(!provider.take_scheduled_packet_readiness());
         assert!(!provider.has_packet_readiness(test_boot_network_device().interface()));
 
         replacement_callback.publish_for_test(Some(1));
+        assert_eq!(metrics.aggregate_snapshot().rx_tap_event_count(), 1);
         assert!(provider.take_scheduled_packet_readiness());
         assert!(provider.has_packet_readiness(test_boot_network_device().interface()));
+        drop(replacement_metrics_lease);
     }
 
     #[test]
@@ -50101,6 +50235,10 @@ mod tests {
             )
             .expect("capture vmnet provider should build");
         let callback = recorded_packet_callback(&callbacks, "eth0");
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0"]);
+        provider
+            .bind_network_metrics(&metrics)
+            .expect("capture callback source should bind");
         let mmds_state = MmdsStateHandle::default();
 
         let publication_guard = provider
@@ -50108,6 +50246,16 @@ mod tests {
             .expect("capture should quiesce callback publication");
         callback.publish_for_test(Some(2));
         assert!(!provider.take_scheduled_packet_readiness());
+        assert_eq!(
+            metrics
+                .capture_state()
+                .expect("quiesced callback count should capture")
+                .entries()[0]
+                .metrics()
+                .rx_tap_event_count(),
+            1,
+            "readiness quiescence must not coalesce raw callback metrics"
+        );
         let first = provider
             .prepare_capture(&configs, None, &mmds_state, None, Instant::now())
             .expect("stable vmnet ownership should prepare for capture");
