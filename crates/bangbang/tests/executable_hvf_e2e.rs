@@ -17531,6 +17531,10 @@ mod macos_arm64 {
             .collect::<Vec<_>>();
         assert!(!values.is_empty(), "{context} should emit metrics lines");
         for (line_index, value) in values.iter().enumerate() {
+            assert_architecture_retained_platform_zero_metrics(
+                value,
+                &format!("{context} line {line_index}"),
+            );
             let root = value.as_object().unwrap_or_else(|| {
                 panic!("{context} metrics line {line_index} should be an object")
             });
@@ -17661,17 +17665,21 @@ mod macos_arm64 {
                 "{context} should report restored pmem limiter progress; metrics:\n{output}"
             );
         }
-        assert!(
-            output.lines().all(|line| {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                    return false;
-                };
+        for (line_index, line) in output.lines().enumerate() {
+            let value = serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                panic!("{context} metrics line {line_index} should parse: {error}")
+            });
+            assert_architecture_retained_platform_zero_metrics(
+                &value,
+                &format!("{context} line {line_index}"),
+            );
+            assert!(
                 value
                     .as_object()
-                    .is_some_and(|root| !root.keys().any(|key| key.starts_with("pmem_")))
-            }),
-            "{context} must not publish dynamic pmem roots; metrics:\n{output}"
-        );
+                    .is_some_and(|root| !root.keys().any(|key| key.starts_with("pmem_"))),
+                "{context} must not publish dynamic pmem roots; metrics:\n{output}"
+            );
+        }
     }
 
     fn snapshot_pmem_metric_total_if_readable(path: &Path, field: &str) -> u64 {
@@ -18538,6 +18546,7 @@ mod macos_arm64 {
         };
 
         for line in &lines {
+            assert_architecture_retained_platform_zero_metrics(line, "signed executable");
             assert!(line["utc_timestamp_ms"].as_u64().is_some());
             assert_eq!(line["vmm"]["panic_count"], 0);
             assert!(line["vmm"].get("metrics_flush_count").is_none());
@@ -18838,6 +18847,12 @@ mod macos_arm64 {
                 )
             })
         };
+        for (line_index, line) in lines.iter().enumerate() {
+            assert_architecture_retained_platform_zero_metrics(
+                line,
+                &format!("signed MMIO/interrupt line {line_index}"),
+            );
+        }
         let reads = sum("/vcpu/exit_mmio_read");
         let writes = sum("/vcpu/exit_mmio_write");
         assert!(
@@ -18854,6 +18869,61 @@ mod macos_arm64 {
             for field in ["min_us", "max_us", "sum_us"] {
                 let pointer = format!("/vcpu/exit_mmio_{direction}_agg/{field}");
                 let _ = sum(&pointer);
+            }
+        }
+    }
+
+    fn assert_architecture_retained_platform_zero_metrics(
+        value: &serde_json::Value,
+        context: &str,
+    ) {
+        let i8042 = value
+            .get("i8042")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| panic!("{context} should contain an i8042 object"));
+        assert_eq!(i8042.len(), 6, "{context} i8042 shape should be exact");
+        for field in [
+            "error_count",
+            "missed_read_count",
+            "missed_write_count",
+            "read_count",
+            "reset_count",
+            "write_count",
+        ] {
+            assert_eq!(
+                i8042.get(field).and_then(serde_json::Value::as_u64),
+                Some(0),
+                "{context} must retain literal zero i8042.{field}"
+            );
+        }
+
+        let vcpu = value
+            .get("vcpu")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| panic!("{context} should contain a vcpu object"));
+        for field in ["exit_io_in", "exit_io_out", "kvmclock_ctrl_fails"] {
+            assert_eq!(
+                vcpu.get(field).and_then(serde_json::Value::as_u64),
+                Some(0),
+                "{context} must retain literal zero vcpu.{field}"
+            );
+        }
+        for aggregate_name in ["exit_io_in_agg", "exit_io_out_agg"] {
+            let aggregate = vcpu
+                .get(aggregate_name)
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{context} should contain vcpu.{aggregate_name}"));
+            assert_eq!(
+                aggregate.len(),
+                3,
+                "{context} {aggregate_name} shape should be exact"
+            );
+            for field in ["min_us", "max_us", "sum_us"] {
+                assert_eq!(
+                    aggregate.get(field).and_then(serde_json::Value::as_u64),
+                    Some(0),
+                    "{context} must retain literal zero vcpu.{aggregate_name}.{field}"
+                );
             }
         }
     }

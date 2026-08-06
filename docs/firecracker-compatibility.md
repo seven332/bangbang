@@ -695,12 +695,13 @@ fields, newer balloon API/device fields, extra UART fields, and the ordinary
 block configuration-change value remain internal or are discarded at the
 public boundary. Adding an extension requires a separately versioned schema.
 
-The checked device-producer audit now terminally certifies all 216 #1838–#1845
+The checked device-producer audit now terminally certifies all 231 #1838–#1846
 fields: 212 device fields are implemented, `uart.flush_count` and
 `mmds.rx_bad_eth` are source-neutral zeros, and both configured/static
-`mac_address_updates` fields are terminal platform-zero. The former has no pinned
-Firecracker producer; the latter's pinned zero-copy mutation window is absent
-because Bangbang admits and parses one immutable owned packet. Each
+`mac_address_updates` fields plus the 15 architecture-retained fields are
+terminal platform-zero. `uart.flush_count` has no pinned Firecracker producer;
+the `mmds.rx_bad_eth` zero-copy mutation window is absent because Bangbang
+admits and parses one immutable owned packet. Each
 device owner publishes an immutable compound counter snapshot. Entropy counts
 popped requests before parse or throttling; pmem binds configuration and
 activation failures to both the exact current generation and aggregate; RTC
@@ -785,8 +786,32 @@ table-update, and restore boundaries as `config_updates`. Signed guest and
 executable output checks bind those
 roots through real runner, device, supervisor, and collector ownership.
 
-Only the #1846 architecture-retained records remain nonterminal, so
-repository-final device certification remains gated on that delivery.
+All field-level device records are now terminal. The dedicated whole-device
+gate and shared device-profile promotion remain gated on #1847.
+
+### Architecture-retained arm64 metric zeros
+
+The strict line retains six `i8042` fields, eight vCPU PIO count/latency
+fields, and `vcpu.kvmclock_ctrl_fails` as literal zeros on the supported
+`aarch64-apple-darwin` Hypervisor.framework machine. Firecracker's i8042
+serializer is cross-architecture, but construction, ports `0x60..0x64`, IRQ 1,
+and every one of its increments are x86-only. Bangbang's corresponding arm64
+machine uses MMIO serial, PL031 RTC, and PSCI; none has i8042 event identity.
+
+Firecracker's PIO leaves surround KVM `IoIn`/`IoOut` dispatch through an x86
+PIO bus. Apple exposes no arm64 PIO vCPU exit, and Bangbang records decoded
+MMIO separately. `kvmclock_ctrl_fails` surrounds only the x86
+`KVM_KVMCLOCK_CTRL` ioctl; HVF pause/resume and ARM PVTime are not aliases.
+The builder initializes all 15 leaves explicitly, and portable plus signed
+MMIO/interrupt, pause/resume, snapshot, periodic, explicit, and terminal
+workloads require the exact zero values on every inspected line.
+
+The device audit checks a distinct upstream identity statement for every leaf
+and exact shared target/backend/machine premises. Reusing a neighboring field's
+exclusion, replacing macOS arm64 or HVF, adding a PC PIO/i8042 premise, or
+weakening the literal initializer fails. These decisions do not apply to a
+future x86/KVM backend or different machine model, which must reopen producer
+implementation instead of inheriting the zero classification.
 
 One flush first freezes missed-log, rate-limited-log, and SIGPIPE totals through
 two fixed-order `SeqCst` scans separated by a `SeqCst` fence. Equal monotonic
