@@ -4804,18 +4804,29 @@ fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)
     let metrics = latest.get(&key).unwrap_or_else(|| {
         panic!("production {context} metrics should include {key}; line:\n{latest_line}")
     });
-    for field in [
-        "rx_count",
-        "rx_packets_count",
-        "tx_count",
-        "tx_packets_count",
-    ] {
+    for field in ["rx_count", "rx_packets_count", "rx_bytes_count"] {
         assert!(
             metrics
                 .get(field)
                 .and_then(serde_json::Value::as_u64)
                 .is_some_and(|value| value > 0),
             "production {context} metrics should report nonzero {key}.{field}; line:\n{latest_line}"
+        );
+    }
+    assert_eq!(metrics["rx_count"], metrics["rx_packets_count"]);
+    for field in [
+        "tx_count",
+        "tx_packets_count",
+        "tx_bytes_count",
+        "tx_spoofed_mac_count",
+        "rx_fails",
+        "tx_fails",
+        "tx_malformed_frames",
+    ] {
+        assert_eq!(
+            metrics.get(field).and_then(serde_json::Value::as_u64),
+            Some(0),
+            "production {context} metrics should report zero {key}.{field}; line:\n{latest_line}"
         );
     }
     assert_eq!(
@@ -4825,10 +4836,67 @@ fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)
         Some(0),
         "production {context} metrics should report no {key} event failures; line:\n{latest_line}"
     );
+    let mmds = latest.get("mmds").unwrap_or_else(|| {
+        panic!("production {context} metrics should include MMDS activity; line:\n{latest_line}")
+    });
+    for field in [
+        "rx_accepted",
+        "rx_count",
+        "tx_count",
+        "tx_frames",
+        "tx_bytes",
+        "connections_created",
+    ] {
+        assert!(
+            mmds.get(field)
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|value| value > 0),
+            "production {context} metrics should report nonzero mmds.{field}; line:\n{latest_line}"
+        );
+    }
+    for field in [
+        "rx_accepted_err",
+        "rx_accepted_unusual",
+        "rx_bad_eth",
+        "tx_errors",
+    ] {
+        assert_eq!(mmds[field], 0);
+    }
     assert!(
-        latest.get("mmds").is_some(),
-        "production {context} metrics should include MMDS activity; line:\n{latest_line}"
+        mmds["connections_destroyed"]
+            .as_u64()
+            .zip(mmds["connections_created"].as_u64())
+            .is_some_and(|(destroyed, created)| destroyed <= created)
     );
+    let net = latest
+        .get("net")
+        .expect("static network metrics should exist");
+    for field in [
+        "activate_fails",
+        "cfg_fails",
+        "event_fails",
+        "no_rx_avail_buffer",
+        "no_tx_avail_buffer",
+        "rx_bytes_count",
+        "rx_count",
+        "rx_event_rate_limiter_count",
+        "rx_fails",
+        "rx_packets_count",
+        "rx_queue_event_count",
+        "rx_rate_limiter_throttled",
+        "tx_bytes_count",
+        "tx_count",
+        "tx_fails",
+        "tx_malformed_frames",
+        "tx_packets_count",
+        "tx_queue_event_count",
+        "tx_rate_limiter_event_count",
+        "tx_rate_limiter_throttled",
+        "tx_remaining_reqs_count",
+        "tx_spoofed_mac_count",
+    ] {
+        assert_eq!(net[field], metrics[field]);
+    }
 }
 
 fn wait_for_network_mmds_snapshot_markers(path: &Path, markers: &[(u64, &[u8])], context: &str) {

@@ -14326,7 +14326,13 @@ mod macos_arm64 {
         let Some(own_metrics) = latest.get(&own_key) else {
             return false;
         };
-        if latest.get(&peer_key).is_some() || latest.get("mmds").is_none() {
+        let Some(mmds) = latest.get("mmds") else {
+            return false;
+        };
+        let Some(net) = latest.get("net") else {
+            return false;
+        };
+        if latest.get(&peer_key).is_some() {
             return false;
         }
         if own_metrics
@@ -14337,19 +14343,90 @@ mod macos_arm64 {
             return false;
         }
 
-        [
-            "rx_count",
-            "rx_packets_count",
-            "tx_count",
-            "tx_packets_count",
-        ]
-        .iter()
-        .all(|field| {
-            own_metrics
-                .get(*field)
+        let rx_count = own_metrics
+            .get("rx_count")
+            .and_then(serde_json::Value::as_u64);
+        let rx_packets = own_metrics
+            .get("rx_packets_count")
+            .and_then(serde_json::Value::as_u64);
+        rx_count.is_some_and(|value| value > 0)
+            && rx_count == rx_packets
+            && own_metrics
+                .get("rx_bytes_count")
                 .and_then(serde_json::Value::as_u64)
                 .is_some_and(|value| value > 0)
-        })
+            && [
+                "tx_count",
+                "tx_packets_count",
+                "tx_bytes_count",
+                "tx_spoofed_mac_count",
+                "rx_fails",
+                "tx_fails",
+                "tx_malformed_frames",
+            ]
+            .iter()
+            .all(|field| own_metrics.get(*field).and_then(serde_json::Value::as_u64) == Some(0))
+            && [
+                "rx_count",
+                "rx_packets_count",
+                "rx_bytes_count",
+                "activate_fails",
+                "cfg_fails",
+                "event_fails",
+                "no_rx_avail_buffer",
+                "no_tx_avail_buffer",
+                "rx_event_rate_limiter_count",
+                "rx_fails",
+                "rx_queue_event_count",
+                "rx_rate_limiter_throttled",
+                "tx_bytes_count",
+                "tx_count",
+                "tx_fails",
+                "tx_malformed_frames",
+                "tx_packets_count",
+                "tx_queue_event_count",
+                "tx_rate_limiter_event_count",
+                "tx_rate_limiter_throttled",
+                "tx_remaining_reqs_count",
+                "tx_spoofed_mac_count",
+            ]
+            .iter()
+            .all(|field| net.get(*field) == own_metrics.get(*field))
+            && [
+                "rx_accepted",
+                "rx_count",
+                "tx_count",
+                "tx_frames",
+                "tx_bytes",
+                "connections_created",
+            ]
+            .iter()
+            .all(|field| {
+                mmds.get(*field)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|value| value > 0)
+            })
+            && [
+                "rx_accepted_err",
+                "rx_accepted_unusual",
+                "rx_bad_eth",
+                "tx_errors",
+            ]
+            .iter()
+            .all(|field| mmds.get(*field).and_then(serde_json::Value::as_u64) == Some(0))
+            && mmds
+                .get("tx_count")
+                .and_then(serde_json::Value::as_u64)
+                .zip(mmds.get("tx_frames").and_then(serde_json::Value::as_u64))
+                .is_some_and(|(attempts, frames)| attempts >= frames)
+            && mmds
+                .get("connections_destroyed")
+                .and_then(serde_json::Value::as_u64)
+                .zip(
+                    mmds.get("connections_created")
+                        .and_then(serde_json::Value::as_u64),
+                )
+                .is_some_and(|(destroyed, created)| destroyed <= created)
     }
 
     fn concurrent_mmds_private_fragments(
@@ -18586,12 +18663,7 @@ mod macos_arm64 {
             let metrics = latest.get(&key).unwrap_or_else(|| {
                 panic!("latest metrics output should include {key}; line:\n{latest_line}")
             });
-            for field in [
-                "rx_count",
-                "rx_packets_count",
-                "tx_count",
-                "tx_packets_count",
-            ] {
+            for field in ["rx_count", "rx_packets_count", "rx_bytes_count"] {
                 let value = metrics
                     .get(field)
                     .and_then(serde_json::Value::as_u64)
@@ -18605,6 +18677,22 @@ mod macos_arm64 {
                     "latest metrics output should report nonzero {key}.{field}; line:\n{latest_line}"
                 );
             }
+            assert_eq!(metrics["rx_count"], metrics["rx_packets_count"]);
+            for field in [
+                "tx_count",
+                "tx_packets_count",
+                "tx_bytes_count",
+                "tx_spoofed_mac_count",
+                "rx_fails",
+                "tx_fails",
+                "tx_malformed_frames",
+            ] {
+                assert_eq!(
+                    metrics.get(field).and_then(serde_json::Value::as_u64),
+                    Some(0),
+                    "latest metrics output should report zero {key}.{field}; line:\n{latest_line}"
+                );
+            }
             assert_eq!(
                 metrics
                     .get("event_fails")
@@ -18613,10 +18701,76 @@ mod macos_arm64 {
                 "latest metrics output should report no {key} event failures; line:\n{latest_line}"
             );
         }
+        let mmds = latest.get("mmds").unwrap_or_else(|| {
+            panic!(
+                "latest metrics output should include shared MMDS activity; line:\n{latest_line}"
+            )
+        });
+        for field in [
+            "rx_accepted",
+            "rx_count",
+            "tx_count",
+            "tx_frames",
+            "tx_bytes",
+            "connections_created",
+        ] {
+            assert!(
+                mmds.get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|value| value > 0),
+                "latest metrics output should report nonzero mmds.{field}; line:\n{latest_line}"
+            );
+        }
+        for field in [
+            "rx_accepted_err",
+            "rx_accepted_unusual",
+            "rx_bad_eth",
+            "tx_errors",
+        ] {
+            assert_eq!(mmds[field], 0);
+        }
         assert!(
-            latest.get("mmds").is_some(),
-            "latest metrics output should include shared MMDS activity; line:\n{latest_line}"
+            mmds["connections_destroyed"]
+                .as_u64()
+                .zip(mmds["connections_created"].as_u64())
+                .is_some_and(|(destroyed, created)| destroyed <= created)
         );
+        let net = latest
+            .get("net")
+            .expect("static network metrics should exist");
+        for field in [
+            "activate_fails",
+            "cfg_fails",
+            "event_fails",
+            "no_rx_avail_buffer",
+            "no_tx_avail_buffer",
+            "rx_bytes_count",
+            "rx_count",
+            "rx_event_rate_limiter_count",
+            "rx_fails",
+            "rx_packets_count",
+            "rx_queue_event_count",
+            "rx_rate_limiter_throttled",
+            "tx_bytes_count",
+            "tx_count",
+            "tx_fails",
+            "tx_malformed_frames",
+            "tx_packets_count",
+            "tx_queue_event_count",
+            "tx_rate_limiter_event_count",
+            "tx_rate_limiter_throttled",
+            "tx_remaining_reqs_count",
+            "tx_spoofed_mac_count",
+        ] {
+            let expected = iface_ids.iter().fold(0_u64, |sum, iface_id| {
+                sum.saturating_add(
+                    latest[format!("net_{iface_id}")][field]
+                        .as_u64()
+                        .expect("configured network metric should be numeric"),
+                )
+            });
+            assert_eq!(net[field], expected);
+        }
     }
 
     fn assert_vm_state_latency_metrics_output(path: &Path) {

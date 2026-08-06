@@ -3999,9 +3999,39 @@ impl NetworkInterfaceMetrics {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct NetworkInterfaceMetricsByInterface {
-    metrics: BTreeMap<String, NetworkInterfaceMetrics>,
+    metrics: BTreeMap<String, NetworkInterfaceMetricsByInterfaceEntry>,
+}
+
+impl PartialEq for NetworkInterfaceMetricsByInterface {
+    fn eq(&self, other: &Self) -> bool {
+        self.metrics.len() == other.metrics.len()
+            && self.metrics.iter().all(|(iface_id, entry)| {
+                other
+                    .metrics
+                    .get(iface_id)
+                    .is_some_and(|other| entry.metrics == other.metrics)
+            })
+    }
+}
+
+impl Eq for NetworkInterfaceMetricsByInterface {}
+
+impl fmt::Debug for NetworkInterfaceMetricsByInterface {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NetworkInterfaceMetricsByInterface")
+            .field("interfaces", &self.metrics.len())
+            .field("metrics", &"<captured>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct NetworkInterfaceMetricsByInterfaceEntry {
+    generation: u64,
+    metrics: NetworkInterfaceMetrics,
 }
 
 impl NetworkInterfaceMetricsByInterface {
@@ -4025,22 +4055,41 @@ impl NetworkInterfaceMetricsByInterface {
         iface_id: impl Into<String>,
         metrics: NetworkInterfaceMetrics,
     ) {
+        self.insert_interface_metrics_at_generation(iface_id, 0, metrics);
+    }
+
+    fn insert_interface_metrics_at_generation(
+        &mut self,
+        iface_id: impl Into<String>,
+        generation: u64,
+        metrics: NetworkInterfaceMetrics,
+    ) {
         self.metrics
             .entry(iface_id.into())
-            .and_modify(|existing| *existing = existing.merged_with(metrics))
-            .or_insert(metrics);
+            .and_modify(|existing| {
+                if existing.generation == generation {
+                    existing.metrics = existing.metrics.merged_with(metrics);
+                } else {
+                    *existing = NetworkInterfaceMetricsByInterfaceEntry {
+                        generation,
+                        metrics,
+                    };
+                }
+            })
+            .or_insert(NetworkInterfaceMetricsByInterfaceEntry {
+                generation,
+                metrics,
+            });
     }
 
     pub fn is_empty(&self) -> bool {
-        self.metrics
-            .values()
-            .all(|metrics| NetworkInterfaceMetrics::is_empty(*metrics))
+        self.metrics.values().all(|entry| entry.metrics.is_empty())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, NetworkInterfaceMetrics)> {
         self.metrics
             .iter()
-            .map(|(iface_id, metrics)| (iface_id.as_str(), *metrics))
+            .map(|(iface_id, entry)| (iface_id.as_str(), entry.metrics))
     }
 
     fn delta_since(&self, previous: Option<&Self>) -> Self {
@@ -4050,17 +4099,24 @@ impl NetworkInterfaceMetricsByInterface {
             .map(|(iface_id, current)| {
                 let previous = previous
                     .and_then(|metrics| metrics.metrics.get(iface_id))
-                    .copied()
+                    .filter(|previous| previous.generation == current.generation)
+                    .map(|previous| previous.metrics)
                     .unwrap_or_default();
-                (iface_id.clone(), current.delta_since(previous))
+                (
+                    iface_id.clone(),
+                    NetworkInterfaceMetricsByInterfaceEntry {
+                        generation: current.generation,
+                        metrics: current.metrics.delta_since(previous),
+                    },
+                )
             })
             .collect();
         Self { metrics }
     }
 
     fn merged_with(mut self, other: Self) -> Self {
-        for (iface_id, metrics) in other.metrics {
-            self.insert_interface_metrics(iface_id, metrics);
+        for (iface_id, entry) in other.metrics {
+            self.insert_interface_metrics_at_generation(iface_id, entry.generation, entry.metrics);
         }
         self
     }
@@ -4068,10 +4124,18 @@ impl NetworkInterfaceMetricsByInterface {
 
 #[derive(Debug, Clone, Default)]
 pub struct SharedNetworkInterfaceMetrics {
-    inner: Arc<SharedNetworkInterfaceMetricsInner>,
+    inner: Arc<Mutex<NetworkInterfaceMetrics>>,
 }
 
 impl SharedNetworkInterfaceMetrics {
+    pub fn record_observation(&self, observation: NetworkInterfaceMetrics) {
+        if observation.is_empty() {
+            return;
+        }
+        let mut metrics = lock_network_interface_metrics(&self.inner);
+        *metrics = metrics.merged_with(observation);
+    }
+
     pub fn record_notification_dispatch(&self, dispatch: &VirtioNetworkDeviceNotificationDispatch) {
         let rx_queue_events = dispatch
             .drained_notifications()
@@ -4085,271 +4149,185 @@ impl SharedNetworkInterfaceMetrics {
             .copied()
             .filter(|queue_index| *queue_index == VIRTIO_NET_TX_QUEUE_INDEX)
             .count();
-        self.record_rx_queue_events(usize_to_u64_saturating(rx_queue_events));
-        self.record_tx_queue_events(usize_to_u64_saturating(tx_queue_events));
-        if dispatch.rx_rate_limiter_event() {
-            record_atomic_metric(&self.inner.rx_rate_limiter_event_count, 1);
-        }
-        if dispatch.tx_rate_limiter_event() {
-            record_atomic_metric(&self.inner.tx_rate_limiter_event_count, 1);
-        }
-        if dispatch
-            .tx_queue_dispatch()
-            .is_some_and(|dispatch| dispatch.processed_frames() == 0)
-        {
-            record_atomic_metric(&self.inner.no_tx_avail_buffer, 1);
-        }
+        let mut observation = NetworkInterfaceMetrics::default()
+            .with_rx_queue_event_count(usize_to_u64_saturating(rx_queue_events))
+            .with_tx_queue_event_count(usize_to_u64_saturating(tx_queue_events))
+            .with_rx_rate_limiter_event_count(u64::from(dispatch.rx_rate_limiter_event()))
+            .with_tx_rate_limiter_event_count(u64::from(dispatch.tx_rate_limiter_event()))
+            .with_no_tx_avail_buffer(u64::from(
+                dispatch
+                    .tx_queue_dispatch()
+                    .is_some_and(|dispatch| dispatch.processed_frames() == 0),
+            ));
         if let Some(dispatch) = dispatch.rx_queue_dispatch() {
-            self.record_rx_queue_dispatch(dispatch);
+            observation = observation.merged_with(network_rx_dispatch_observation(dispatch));
         }
         if let Some(dispatch) = dispatch.tx_queue_dispatch() {
-            self.record_tx_queue_dispatch(dispatch);
+            observation = observation.merged_with(network_tx_dispatch_observation(dispatch));
         }
         if let Some(dispatch) = dispatch.post_tx_rx_queue_dispatch() {
-            self.record_rx_queue_dispatch(dispatch);
+            observation = observation.merged_with(network_rx_dispatch_observation(dispatch));
         }
+        self.record_observation(observation);
+    }
+
+    pub fn record_notification_error(&self, source: &VirtioNetworkDeviceNotificationError) {
+        let rx_queue_events = source
+            .drained_notifications()
+            .iter()
+            .copied()
+            .filter(|queue_index| *queue_index == VIRTIO_NET_RX_QUEUE_INDEX)
+            .count();
+        let tx_queue_events = source
+            .drained_notifications()
+            .iter()
+            .copied()
+            .filter(|queue_index| *queue_index == VIRTIO_NET_TX_QUEUE_INDEX)
+            .count();
+        let mut observation = NetworkInterfaceMetrics::default()
+            .with_rx_queue_event_count(usize_to_u64_saturating(rx_queue_events))
+            .with_tx_queue_event_count(usize_to_u64_saturating(tx_queue_events))
+            .with_event_fails(1);
+        if let Some(dispatch) = source.completed_initial_rx_dispatch() {
+            observation = observation.merged_with(network_rx_dispatch_observation(dispatch));
+        }
+        if let Some(dispatch) = source.completed_tx_dispatch() {
+            observation = observation.merged_with(network_tx_dispatch_observation(dispatch));
+        }
+        if let Some(dispatch) = source.completed_rx_dispatch() {
+            observation = observation.merged_with(network_rx_dispatch_observation(dispatch));
+        }
+        self.record_observation(observation);
     }
 
     pub fn record_rx_queue_dispatch(&self, dispatch: &VirtioNetworkRxQueueDispatch) {
-        let delivered_packets = usize_to_u64_saturating(dispatch.delivered_packets());
-        self.record_rx_packets(
-            delivered_packets,
-            dispatch.deliveries().iter().fold(0, |sum, delivery| {
-                sum.saturating_add(u64::from(delivery.bytes_written_to_guest()))
-            }),
-        );
-        self.record_rx_failures(usize_to_u64_saturating(
-            dispatch
-                .buffer_parse_failures()
-                .saturating_add(dispatch.buffer_too_small_failures())
-                .saturating_add(dispatch.source_failures()),
-        ));
-        record_atomic_metric(
-            &self.inner.no_rx_avail_buffer,
-            usize_to_u64_saturating(dispatch.no_available_buffers()),
-        );
-        let throttled = usize_to_u64_saturating(dispatch.rate_limiter_throttled_packets());
-        record_atomic_metric(&self.inner.rx_rate_limiter_throttled, throttled);
-        self.record_backend_metrics(dispatch.backend_metrics());
+        self.record_observation(network_rx_dispatch_observation(dispatch));
     }
 
     pub fn record_tx_queue_dispatch(&self, dispatch: &VirtioNetworkTxQueueDispatch) {
-        let successful_frames = usize_to_u64_saturating(dispatch.sink_successful_frames());
-        self.record_tx_packets(successful_frames, dispatch.sink_successful_bytes());
-        self.record_tx_malformed_frames(usize_to_u64_saturating(dispatch.malformed_frames()));
-        self.record_tx_failures(usize_to_u64_saturating(dispatch.sink_failures()));
-        let throttled = usize_to_u64_saturating(dispatch.rate_limiter_throttled_frames());
-        record_atomic_metric(&self.inner.tx_rate_limiter_throttled, throttled);
-        record_atomic_metric(
-            &self.inner.tx_remaining_reqs_count,
-            dispatch.remaining_requests(),
-        );
-        self.record_backend_metrics(dispatch.backend_metrics());
+        self.record_observation(network_tx_dispatch_observation(dispatch));
     }
 
     pub fn record_event_failure(&self) {
-        record_atomic_metric(&self.inner.event_fails, 1);
+        self.record_observation(NetworkInterfaceMetrics::default().with_event_fails(1));
     }
 
     pub fn record_activation_failure(&self) {
-        record_atomic_metric(&self.inner.activate_fails, 1);
+        self.record_observation(NetworkInterfaceMetrics::default().with_activate_fails(1));
     }
 
     pub fn record_config_failure(&self) {
-        record_atomic_metric(&self.inner.cfg_fails, 1);
+        self.record_observation(NetworkInterfaceMetrics::default().with_cfg_fails(1));
     }
 
     pub fn record_rx_queue_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.rx_queue_event_count, count);
-        }
+        self.record_observation(
+            NetworkInterfaceMetrics::default().with_rx_queue_event_count(count),
+        );
     }
 
     pub fn record_tx_queue_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.tx_queue_event_count, count);
-        }
+        self.record_observation(
+            NetworkInterfaceMetrics::default().with_tx_queue_event_count(count),
+        );
     }
 
     pub fn snapshot(&self) -> NetworkInterfaceMetrics {
-        NetworkInterfaceMetrics {
-            activate_fails: self.inner.activate_fails.load(Ordering::Relaxed),
-            cfg_fails: self.inner.cfg_fails.load(Ordering::Relaxed),
-            event_fails: self.inner.event_fails.load(Ordering::Relaxed),
-            no_rx_avail_buffer: self.inner.no_rx_avail_buffer.load(Ordering::Relaxed),
-            no_tx_avail_buffer: self.inner.no_tx_avail_buffer.load(Ordering::Relaxed),
-            rx_queue_event_count: self.inner.rx_queue_event_count.load(Ordering::Relaxed),
-            rx_bytes_count: self.inner.rx_bytes_count.load(Ordering::Relaxed),
-            rx_packets_count: self.inner.rx_packets_count.load(Ordering::Relaxed),
-            rx_fails: self.inner.rx_fails.load(Ordering::Relaxed),
-            rx_count: self.inner.rx_count.load(Ordering::Relaxed),
-            rx_rate_limiter_event_count: self
-                .inner
-                .rx_rate_limiter_event_count
-                .load(Ordering::Relaxed),
-            rx_rate_limiter_throttled: self.inner.rx_rate_limiter_throttled.load(Ordering::Relaxed),
-            tx_bytes_count: self.inner.tx_bytes_count.load(Ordering::Relaxed),
-            tx_malformed_frames: self.inner.tx_malformed_frames.load(Ordering::Relaxed),
-            tx_fails: self.inner.tx_fails.load(Ordering::Relaxed),
-            tx_count: self.inner.tx_count.load(Ordering::Relaxed),
-            tx_packets_count: self.inner.tx_packets_count.load(Ordering::Relaxed),
-            tx_queue_event_count: self.inner.tx_queue_event_count.load(Ordering::Relaxed),
-            tx_rate_limiter_event_count: self
-                .inner
-                .tx_rate_limiter_event_count
-                .load(Ordering::Relaxed),
-            tx_rate_limiter_throttled: self.inner.tx_rate_limiter_throttled.load(Ordering::Relaxed),
-            tx_remaining_reqs_count: self.inner.tx_remaining_reqs_count.load(Ordering::Relaxed),
-            tx_spoofed_mac_count: self.inner.tx_spoofed_mac_count.load(Ordering::Relaxed),
-            vmnet_read_count: self.inner.vmnet_read_count.load(Ordering::Relaxed),
-            vmnet_read_fails: self.inner.vmnet_read_fails.load(Ordering::Relaxed),
-            vmnet_read_packets_count: self.inner.vmnet_read_packets_count.load(Ordering::Relaxed),
-            vmnet_read_partial_batches: self
-                .inner
-                .vmnet_read_partial_batches
-                .load(Ordering::Relaxed),
-            vmnet_write_count: self.inner.vmnet_write_count.load(Ordering::Relaxed),
-            vmnet_write_fails: self.inner.vmnet_write_fails.load(Ordering::Relaxed),
-            vmnet_write_packets_count: self.inner.vmnet_write_packets_count.load(Ordering::Relaxed),
-            vmnet_write_partial_batches: self
-                .inner
-                .vmnet_write_partial_batches
-                .load(Ordering::Relaxed),
-            vmnet_read_latency: snapshot_network_latency(&self.inner.vmnet_read_latency),
-            vmnet_write_latency: snapshot_network_latency(&self.inner.vmnet_write_latency),
-        }
+        *lock_network_interface_metrics(&self.inner)
     }
 
-    fn record_rx_packets(&self, count: u64, bytes: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.rx_count, count);
-            record_atomic_metric(&self.inner.rx_packets_count, count);
-        }
-        if bytes != 0 {
-            record_atomic_metric(&self.inner.rx_bytes_count, bytes);
-        }
-    }
-
-    fn record_rx_failures(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.rx_fails, count);
-        }
-    }
-
-    fn record_tx_packets(&self, count: u64, bytes: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.tx_count, count);
-            record_atomic_metric(&self.inner.tx_packets_count, count);
-        }
-        if bytes != 0 {
-            record_atomic_metric(&self.inner.tx_bytes_count, bytes);
-        }
-    }
-
-    fn record_tx_malformed_frames(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.tx_malformed_frames, count);
-        }
-    }
-
-    fn record_tx_failures(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.tx_fails, count);
-        }
-    }
-
+    #[cfg(test)]
     fn record_backend_metrics(&self, metrics: VirtioNetworkBackendMetrics) {
-        record_atomic_metric(&self.inner.vmnet_read_count, metrics.vmnet_read_count());
-        record_atomic_metric(&self.inner.vmnet_read_fails, metrics.vmnet_read_fails());
-        record_atomic_metric(
-            &self.inner.vmnet_read_packets_count,
-            metrics.vmnet_read_packets_count(),
-        );
-        record_atomic_metric(
-            &self.inner.vmnet_read_partial_batches,
-            metrics.vmnet_read_partial_batches(),
-        );
-        record_atomic_metric(&self.inner.vmnet_write_count, metrics.vmnet_write_count());
-        record_atomic_metric(&self.inner.vmnet_write_fails, metrics.vmnet_write_fails());
-        record_atomic_metric(
-            &self.inner.vmnet_write_packets_count,
-            metrics.vmnet_write_packets_count(),
-        );
-        record_atomic_metric(
-            &self.inner.vmnet_write_partial_batches,
-            metrics.vmnet_write_partial_batches(),
-        );
-        record_atomic_metric(
-            &self.inner.tx_spoofed_mac_count,
-            metrics.tx_spoofed_mac_count(),
-        );
-        record_network_latency(&self.inner.vmnet_read_latency, metrics.vmnet_read_latency());
-        record_network_latency(
-            &self.inner.vmnet_write_latency,
-            metrics.vmnet_write_latency(),
-        );
+        self.record_observation(network_backend_observation(metrics));
     }
 }
 
-#[derive(Debug)]
-struct NetworkLatencyAtomicMetrics {
-    min_us: AtomicU64,
-    max_us: AtomicU64,
-    sum_us: AtomicU64,
-    samples: AtomicU64,
-}
-
-impl Default for NetworkLatencyAtomicMetrics {
-    fn default() -> Self {
-        Self {
-            min_us: AtomicU64::new(u64::MAX),
-            max_us: AtomicU64::new(0),
-            sum_us: AtomicU64::new(0),
-            samples: AtomicU64::new(0),
-        }
+fn lock_network_interface_metrics(
+    metrics: &Mutex<NetworkInterfaceMetrics>,
+) -> MutexGuard<'_, NetworkInterfaceMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
-#[derive(Debug, Default)]
-struct SharedNetworkInterfaceMetricsInner {
-    activate_fails: AtomicU64,
-    cfg_fails: AtomicU64,
-    event_fails: AtomicU64,
-    no_rx_avail_buffer: AtomicU64,
-    no_tx_avail_buffer: AtomicU64,
-    rx_queue_event_count: AtomicU64,
-    rx_bytes_count: AtomicU64,
-    rx_packets_count: AtomicU64,
-    rx_fails: AtomicU64,
-    rx_count: AtomicU64,
-    rx_rate_limiter_event_count: AtomicU64,
-    rx_rate_limiter_throttled: AtomicU64,
-    tx_bytes_count: AtomicU64,
-    tx_malformed_frames: AtomicU64,
-    tx_fails: AtomicU64,
-    tx_count: AtomicU64,
-    tx_packets_count: AtomicU64,
-    tx_queue_event_count: AtomicU64,
-    tx_rate_limiter_event_count: AtomicU64,
-    tx_rate_limiter_throttled: AtomicU64,
-    tx_remaining_reqs_count: AtomicU64,
-    tx_spoofed_mac_count: AtomicU64,
-    vmnet_read_count: AtomicU64,
-    vmnet_read_fails: AtomicU64,
-    vmnet_read_packets_count: AtomicU64,
-    vmnet_read_partial_batches: AtomicU64,
-    vmnet_write_count: AtomicU64,
-    vmnet_write_fails: AtomicU64,
-    vmnet_write_packets_count: AtomicU64,
-    vmnet_write_partial_batches: AtomicU64,
-    vmnet_read_latency: NetworkLatencyAtomicMetrics,
-    vmnet_write_latency: NetworkLatencyAtomicMetrics,
+fn network_rx_dispatch_observation(
+    dispatch: &VirtioNetworkRxQueueDispatch,
+) -> NetworkInterfaceMetrics {
+    let delivered_packets = usize_to_u64_saturating(dispatch.delivered_packets());
+    let delivered_bytes = dispatch.deliveries().iter().fold(0_u64, |sum, delivery| {
+        sum.saturating_add(u64::from(delivery.bytes_written_to_guest()))
+    });
+    let guest_failures = dispatch
+        .buffer_parse_failures()
+        .saturating_add(dispatch.buffer_too_small_failures());
+    NetworkInterfaceMetrics::default()
+        .with_rx_count(delivered_packets)
+        .with_rx_packets_count(delivered_packets)
+        .with_rx_bytes_count(delivered_bytes)
+        .with_rx_fails(usize_to_u64_saturating(guest_failures))
+        .with_no_rx_avail_buffer(usize_to_u64_saturating(dispatch.no_available_buffers()))
+        .with_rx_rate_limiter_throttled(usize_to_u64_saturating(
+            dispatch.rate_limiter_throttled_packets(),
+        ))
+        .merged_with(network_backend_observation(dispatch.backend_metrics()))
+}
+
+fn network_tx_dispatch_observation(
+    dispatch: &VirtioNetworkTxQueueDispatch,
+) -> NetworkInterfaceMetrics {
+    let forwarded_frames = usize_to_u64_saturating(dispatch.externally_forwarded_frames());
+    NetworkInterfaceMetrics::default()
+        .with_tx_count(forwarded_frames)
+        .with_tx_packets_count(forwarded_frames)
+        .with_tx_bytes_count(dispatch.externally_forwarded_bytes())
+        .with_tx_malformed_frames(usize_to_u64_saturating(dispatch.malformed_frames()))
+        .with_tx_fails(usize_to_u64_saturating(dispatch.descriptor_failures()))
+        .with_tx_rate_limiter_throttled(usize_to_u64_saturating(
+            dispatch.rate_limiter_throttled_frames(),
+        ))
+        .with_tx_remaining_reqs_count(dispatch.remaining_requests())
+        .merged_with(network_backend_observation(dispatch.backend_metrics()))
+}
+
+fn network_backend_observation(metrics: VirtioNetworkBackendMetrics) -> NetworkInterfaceMetrics {
+    NetworkInterfaceMetrics::default()
+        .with_tx_spoofed_mac_count(metrics.tx_spoofed_mac_count())
+        .with_vmnet_read_count(metrics.vmnet_read_count())
+        .with_vmnet_read_fails(metrics.vmnet_read_fails())
+        .with_vmnet_read_packets_count(metrics.vmnet_read_packets_count())
+        .with_vmnet_read_partial_batches(metrics.vmnet_read_partial_batches())
+        .with_vmnet_write_count(metrics.vmnet_write_count())
+        .with_vmnet_write_fails(metrics.vmnet_write_fails())
+        .with_vmnet_write_packets_count(metrics.vmnet_write_packets_count())
+        .with_vmnet_write_partial_batches(metrics.vmnet_write_partial_batches())
+        .with_vmnet_read_latency(metrics.vmnet_read_latency())
+        .with_vmnet_write_latency(metrics.vmnet_write_latency())
 }
 
 #[derive(Debug, Clone)]
 pub struct SharedNetworkInterfaceMetricsRegistry {
-    aggregate: SharedNetworkInterfaceMetrics,
     per_interface: Arc<Mutex<NetworkInterfaceMetricsRegistryState>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkInterfaceMetricsCapture {
+    aggregate: NetworkInterfaceMetrics,
+    per_interface: NetworkInterfaceMetricsByInterface,
+}
+
+impl NetworkInterfaceMetricsCapture {
+    pub const fn aggregate(&self) -> NetworkInterfaceMetrics {
+        self.aggregate
+    }
+
+    pub const fn per_interface(&self) -> &NetworkInterfaceMetricsByInterface {
+        &self.per_interface
+    }
+
+    pub fn into_parts(self) -> (NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface) {
+        (self.aggregate, self.per_interface)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -4486,7 +4464,6 @@ impl NetworkInterfaceMetricsLease {
     #[doc(hidden)]
     pub fn belongs_to(&self, registry: &SharedNetworkInterfaceMetricsRegistry) -> bool {
         self.registered
-            && Arc::ptr_eq(&self.registry.aggregate.inner, &registry.aggregate.inner)
             && Arc::ptr_eq(&self.registry.per_interface, &registry.per_interface)
             && lock_network_metrics_registry(&registry.per_interface)
                 .entries
@@ -4634,19 +4611,17 @@ impl std::error::Error for NetworkInterfaceMetricsRegistryError {}
 impl Default for SharedNetworkInterfaceMetricsRegistry {
     fn default() -> Self {
         Self {
-            aggregate: SharedNetworkInterfaceMetrics::default(),
             per_interface: Arc::new(Mutex::new(NetworkInterfaceMetricsRegistryState::default())),
         }
     }
 }
 
 impl SharedNetworkInterfaceMetricsRegistry {
-    /// Returns whether two handles share the complete aggregate and
-    /// per-interface registry identity.
+    /// Returns whether two handles share the complete per-interface registry
+    /// identity.
     #[doc(hidden)]
     pub fn shares_state_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.aggregate.inner, &other.aggregate.inner)
-            && Arc::ptr_eq(&self.per_interface, &other.per_interface)
+        Arc::ptr_eq(&self.per_interface, &other.per_interface)
     }
 
     pub fn from_interface_ids<'a>(iface_ids: impl IntoIterator<Item = &'a str>) -> Self {
@@ -4668,7 +4643,6 @@ impl SharedNetworkInterfaceMetricsRegistry {
         }
         let next_generation = u64::try_from(entries.len()).unwrap_or(u64::MAX);
         Self {
-            aggregate: SharedNetworkInterfaceMetrics::default(),
             per_interface: Arc::new(Mutex::new(NetworkInterfaceMetricsRegistryState {
                 capacity: entries.len(),
                 entries,
@@ -4712,7 +4686,6 @@ impl SharedNetworkInterfaceMetricsRegistry {
         let next_generation = u64::try_from(entries.len())
             .map_err(|_| NetworkInterfaceMetricsRegistryError::GenerationExhausted)?;
         Ok(Self {
-            aggregate: SharedNetworkInterfaceMetrics::default(),
             per_interface: Arc::new(Mutex::new(NetworkInterfaceMetricsRegistryState {
                 entries,
                 reservations,
@@ -4798,10 +4771,6 @@ impl SharedNetworkInterfaceMetricsRegistry {
         })
     }
 
-    pub fn aggregate(&self) -> SharedNetworkInterfaceMetrics {
-        self.aggregate.clone()
-    }
-
     pub fn per_interface(&self, iface_id: &str) -> Option<SharedNetworkInterfaceMetrics> {
         lock_network_metrics_registry(&self.per_interface)
             .entries
@@ -4814,7 +4783,6 @@ impl SharedNetworkInterfaceMetricsRegistry {
         iface_id: &str,
         dispatch: &VirtioNetworkDeviceNotificationDispatch,
     ) {
-        self.aggregate.record_notification_dispatch(dispatch);
         if let Some(metrics) = self.per_interface(iface_id) {
             metrics.record_notification_dispatch(dispatch);
         }
@@ -4825,55 +4793,24 @@ impl SharedNetworkInterfaceMetricsRegistry {
         iface_id: &str,
         source: &VirtioNetworkDeviceNotificationError,
     ) {
-        let rx_queue_events = source
-            .drained_notifications()
-            .iter()
-            .copied()
-            .filter(|queue_index| *queue_index == VIRTIO_NET_RX_QUEUE_INDEX)
-            .count();
-        let tx_queue_events = source
-            .drained_notifications()
-            .iter()
-            .copied()
-            .filter(|queue_index| *queue_index == VIRTIO_NET_TX_QUEUE_INDEX)
-            .count();
-        self.record_queue_events_for_interface(
-            iface_id,
-            usize_to_u64_saturating(rx_queue_events),
-            usize_to_u64_saturating(tx_queue_events),
-        );
-        self.record_event_failure_for_interface(iface_id);
-        if let Some(dispatch) = source.completed_initial_rx_dispatch() {
-            self.record_rx_queue_dispatch_for_interface(iface_id, dispatch);
+        if let Some(metrics) = self.per_interface(iface_id) {
+            metrics.record_notification_error(source);
         }
-        if let Some(dispatch) = source.completed_tx_dispatch() {
-            self.record_tx_queue_dispatch_for_interface(iface_id, dispatch);
-        }
-        if let Some(dispatch) = source.completed_rx_dispatch() {
-            self.record_rx_queue_dispatch_for_interface(iface_id, dispatch);
-        }
-    }
-
-    pub fn record_event_failure(&self) {
-        self.aggregate.record_event_failure();
     }
 
     pub fn record_event_failure_for_interface(&self, iface_id: &str) {
-        self.aggregate.record_event_failure();
         if let Some(metrics) = self.per_interface(iface_id) {
             metrics.record_event_failure();
         }
     }
 
     pub fn record_activation_failure_for_interface(&self, iface_id: &str) {
-        self.aggregate.record_activation_failure();
         if let Some(metrics) = self.per_interface(iface_id) {
             metrics.record_activation_failure();
         }
     }
 
     pub fn record_config_failure_for_interface(&self, iface_id: &str) {
-        self.aggregate.record_config_failure();
         if let Some(metrics) = self.per_interface(iface_id) {
             metrics.record_config_failure();
         }
@@ -4884,7 +4821,6 @@ impl SharedNetworkInterfaceMetricsRegistry {
         iface_id: &str,
         dispatch: &VirtioNetworkRxQueueDispatch,
     ) {
-        self.aggregate.record_rx_queue_dispatch(dispatch);
         if let Some(metrics) = self.per_interface(iface_id) {
             metrics.record_rx_queue_dispatch(dispatch);
         }
@@ -4895,34 +4831,48 @@ impl SharedNetworkInterfaceMetricsRegistry {
         iface_id: &str,
         dispatch: &VirtioNetworkTxQueueDispatch,
     ) {
-        self.aggregate.record_tx_queue_dispatch(dispatch);
         if let Some(metrics) = self.per_interface(iface_id) {
             metrics.record_tx_queue_dispatch(dispatch);
         }
     }
 
     pub fn record_queue_events_for_interface(&self, iface_id: &str, rx_count: u64, tx_count: u64) {
-        self.aggregate.record_rx_queue_events(rx_count);
-        self.aggregate.record_tx_queue_events(tx_count);
         if let Some(metrics) = self.per_interface(iface_id) {
-            metrics.record_rx_queue_events(rx_count);
-            metrics.record_tx_queue_events(tx_count);
+            metrics.record_observation(
+                NetworkInterfaceMetrics::default()
+                    .with_rx_queue_event_count(rx_count)
+                    .with_tx_queue_event_count(tx_count),
+            );
+        }
+    }
+
+    pub fn capture(&self) -> NetworkInterfaceMetricsCapture {
+        let state = lock_network_metrics_registry(&self.per_interface);
+        let mut aggregate = NetworkInterfaceMetrics::default();
+        let mut per_interface = NetworkInterfaceMetricsByInterface::new();
+        for entry in &state.entries {
+            let metrics = entry.metrics.snapshot();
+            aggregate = aggregate.merged_with(metrics);
+            if !metrics.is_empty() {
+                per_interface.insert_interface_metrics_at_generation(
+                    entry.iface_id.clone(),
+                    entry.generation,
+                    metrics,
+                );
+            }
+        }
+        NetworkInterfaceMetricsCapture {
+            aggregate,
+            per_interface,
         }
     }
 
     pub fn aggregate_snapshot(&self) -> NetworkInterfaceMetrics {
-        self.aggregate.snapshot()
+        self.capture().aggregate
     }
 
     pub fn per_interface_snapshot(&self) -> NetworkInterfaceMetricsByInterface {
-        let mut snapshot = NetworkInterfaceMetricsByInterface::new();
-        for entry in &lock_network_metrics_registry(&self.per_interface).entries {
-            let metrics = entry.metrics.snapshot();
-            if !metrics.is_empty() {
-                snapshot.insert_interface_metrics(entry.iface_id.clone(), metrics);
-            }
-        }
-        snapshot
+        self.capture().per_interface
     }
 
     /// Captures every live generation, including entries whose counters are
@@ -4938,6 +4888,7 @@ impl SharedNetworkInterfaceMetricsRegistry {
             return Err(NetworkInterfaceMetricsCaptureError::CapacityMismatch);
         }
         let mut entries = Vec::new();
+        let mut aggregate = NetworkInterfaceMetrics::default();
         entries
             .try_reserve_exact(state.entries.len())
             .map_err(|_| NetworkInterfaceMetricsCaptureError::Allocation)?;
@@ -4959,14 +4910,16 @@ impl SharedNetworkInterfaceMetricsRegistry {
             {
                 return Err(NetworkInterfaceMetricsCaptureError::DuplicateGeneration);
             }
+            let metrics = entry.metrics.snapshot();
+            aggregate = aggregate.merged_with(metrics);
             entries.push(NetworkInterfaceMetricsCaptureEntry {
                 generation: entry.generation,
                 iface_id: entry.iface_id.clone(),
-                metrics: entry.metrics.snapshot(),
+                metrics,
             });
         }
         Ok(NetworkInterfaceMetricsCaptureState {
-            aggregate: self.aggregate.snapshot(),
+            aggregate,
             entries,
             next_generation: state.next_generation,
         })
@@ -5176,7 +5129,7 @@ impl MmdsMetrics {
 
 #[derive(Debug, Clone, Default)]
 pub struct SharedMmdsMetrics {
-    inner: Arc<SharedMmdsMetricsInner>,
+    inner: Arc<Mutex<MmdsMetrics>>,
 }
 
 impl SharedMmdsMetrics {
@@ -5185,86 +5138,72 @@ impl SharedMmdsMetrics {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    fn record_observation(&self, observation: MmdsMetrics) {
+        if observation.is_empty() {
+            return;
+        }
+        let mut metrics = lock_mmds_metrics(&self.inner);
+        *metrics = metrics.merged_with(observation);
+    }
+
     pub fn record_rx_accepted(&self) {
-        record_atomic_metric(&self.inner.rx_accepted, 1);
+        self.record_observation(MmdsMetrics::default().with_rx_accepted(1));
     }
 
     pub fn record_rx_accepted_error(&self) {
-        record_atomic_metric(&self.inner.rx_accepted_err, 1);
+        self.record_observation(MmdsMetrics::default().with_rx_accepted_err(1));
     }
 
     pub fn record_rx_accepted_unusual(&self) {
-        record_atomic_metric(&self.inner.rx_accepted_unusual, 1);
-    }
-
-    pub fn record_rx_bad_eth(&self) {
-        record_atomic_metric(&self.inner.rx_bad_eth, 1);
+        self.record_observation(MmdsMetrics::default().with_rx_accepted_unusual(1));
     }
 
     pub fn record_rx_invalid_token(&self) {
-        record_atomic_metric(&self.inner.rx_invalid_token, 1);
+        self.record_observation(MmdsMetrics::default().with_rx_invalid_token(1));
     }
 
     pub fn record_rx_no_token(&self) {
-        record_atomic_metric(&self.inner.rx_no_token, 1);
+        self.record_observation(MmdsMetrics::default().with_rx_no_token(1));
     }
 
     pub fn record_rx_count(&self) {
-        record_atomic_metric(&self.inner.rx_count, 1);
+        self.record_observation(MmdsMetrics::default().with_rx_count(1));
+    }
+
+    pub fn record_tx_attempt(&self) {
+        self.record_observation(MmdsMetrics::default().with_tx_count(1));
     }
 
     pub fn record_tx_frame(&self, len: usize) {
-        record_atomic_metric(&self.inner.tx_count, 1);
-        record_atomic_metric(&self.inner.tx_frames, 1);
-        record_atomic_metric(&self.inner.tx_bytes, usize_to_u64_saturating(len));
+        self.record_observation(
+            MmdsMetrics::default()
+                .with_tx_frames(1)
+                .with_tx_bytes(usize_to_u64_saturating(len)),
+        );
     }
 
     pub fn record_tx_error(&self) {
-        record_atomic_metric(&self.inner.tx_errors, 1);
+        self.record_observation(MmdsMetrics::default().with_tx_errors(1));
     }
 
     pub fn record_connection_created(&self) {
-        record_atomic_metric(&self.inner.connections_created, 1);
+        self.record_observation(MmdsMetrics::default().with_connections_created(1));
     }
 
     pub fn record_connection_destroyed(&self) {
-        record_atomic_metric(&self.inner.connections_destroyed, 1);
+        self.record_observation(MmdsMetrics::default().with_connections_destroyed(1));
     }
 
     pub fn snapshot(&self) -> MmdsMetrics {
-        MmdsMetrics {
-            rx_accepted: self.inner.rx_accepted.load(Ordering::Relaxed),
-            rx_accepted_err: self.inner.rx_accepted_err.load(Ordering::Relaxed),
-            rx_accepted_unusual: self.inner.rx_accepted_unusual.load(Ordering::Relaxed),
-            rx_bad_eth: self.inner.rx_bad_eth.load(Ordering::Relaxed),
-            rx_invalid_token: self.inner.rx_invalid_token.load(Ordering::Relaxed),
-            rx_no_token: self.inner.rx_no_token.load(Ordering::Relaxed),
-            rx_count: self.inner.rx_count.load(Ordering::Relaxed),
-            tx_bytes: self.inner.tx_bytes.load(Ordering::Relaxed),
-            tx_count: self.inner.tx_count.load(Ordering::Relaxed),
-            tx_errors: self.inner.tx_errors.load(Ordering::Relaxed),
-            tx_frames: self.inner.tx_frames.load(Ordering::Relaxed),
-            connections_created: self.inner.connections_created.load(Ordering::Relaxed),
-            connections_destroyed: self.inner.connections_destroyed.load(Ordering::Relaxed),
-        }
+        *lock_mmds_metrics(&self.inner)
     }
 }
 
-#[derive(Debug, Default)]
-struct SharedMmdsMetricsInner {
-    rx_accepted: AtomicU64,
-    rx_accepted_err: AtomicU64,
-    rx_accepted_unusual: AtomicU64,
-    rx_bad_eth: AtomicU64,
-    rx_invalid_token: AtomicU64,
-    rx_no_token: AtomicU64,
-    rx_count: AtomicU64,
-    tx_bytes: AtomicU64,
-    tx_count: AtomicU64,
-    tx_errors: AtomicU64,
-    tx_frames: AtomicU64,
-    connections_created: AtomicU64,
-    connections_destroyed: AtomicU64,
+fn lock_mmds_metrics(metrics: &Mutex<MmdsMetrics>) -> MutexGuard<'_, MmdsMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -6769,10 +6708,6 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-fn record_atomic_metric(metric: &AtomicU64, increment: u64) {
-    record_atomic_metric_with_ordering(metric, increment, Ordering::Relaxed);
-}
-
 fn record_atomic_metric_seq_cst(metric: &AtomicU64, increment: u64) {
     let mut current = metric.load(Ordering::SeqCst);
     while current != u64::MAX {
@@ -6785,70 +6720,6 @@ fn record_atomic_metric_seq_cst(metric: &AtomicU64, increment: u64) {
             Ok(_) => return,
             Err(observed) => current = observed,
         }
-    }
-}
-
-fn record_atomic_metric_release(metric: &AtomicU64, increment: u64) {
-    record_atomic_metric_with_ordering(metric, increment, Ordering::Release);
-}
-
-fn record_atomic_metric_with_ordering(metric: &AtomicU64, increment: u64, success: Ordering) {
-    let mut current = metric.load(Ordering::Relaxed);
-    loop {
-        let next = current.saturating_add(increment);
-        match metric.compare_exchange_weak(current, next, success, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-fn record_atomic_min_metric(metric: &AtomicU64, value: u64) {
-    let mut current = metric.load(Ordering::Relaxed);
-    while value < current {
-        match metric.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-fn record_atomic_max_metric(metric: &AtomicU64, value: u64) {
-    let mut current = metric.load(Ordering::Relaxed);
-    while value > current {
-        match metric.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-fn record_network_latency(
-    metrics: &NetworkLatencyAtomicMetrics,
-    aggregate: VirtioNetworkLatencyAggregate,
-) {
-    if aggregate.samples() == 0 {
-        return;
-    }
-    record_atomic_min_metric(&metrics.min_us, aggregate.min_us());
-    record_atomic_max_metric(&metrics.max_us, aggregate.max_us());
-    record_atomic_metric(&metrics.sum_us, aggregate.sum_us());
-    record_atomic_metric_release(&metrics.samples, aggregate.samples());
-}
-
-fn snapshot_network_latency(
-    metrics: &NetworkLatencyAtomicMetrics,
-) -> VirtioNetworkLatencyAggregate {
-    let samples = metrics.samples.load(Ordering::Acquire);
-    if samples == 0 {
-        VirtioNetworkLatencyAggregate::default()
-    } else {
-        VirtioNetworkLatencyAggregate::new(
-            metrics.min_us.load(Ordering::Relaxed),
-            metrics.max_us.load(Ordering::Relaxed),
-            metrics.sum_us.load(Ordering::Relaxed),
-            samples,
-        )
     }
 }
 
@@ -10105,6 +9976,35 @@ mod tests {
     }
 
     #[test]
+    fn network_compound_observation_is_never_torn_by_a_racing_snapshot() {
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        let observation = NetworkInterfaceMetrics::default()
+            .with_rx_count(1)
+            .with_rx_packets_count(1)
+            .with_rx_bytes_count(64)
+            .with_vmnet_read_count(1)
+            .with_vmnet_read_packets_count(1)
+            .with_vmnet_read_latency(VirtioNetworkLatencyAggregate::new(7, 7, 7, 1));
+        let start = Arc::new(Barrier::new(2));
+        let writer_metrics = metrics.clone();
+        let writer_start = Arc::clone(&start);
+        let writer = thread::spawn(move || {
+            writer_start.wait();
+            writer_metrics.record_observation(observation);
+        });
+
+        start.wait();
+        let racing_cut = metrics.snapshot();
+        writer.join().expect("network metrics writer should finish");
+
+        assert!(
+            racing_cut == NetworkInterfaceMetrics::default() || racing_cut == observation,
+            "one coherent network observation must be entirely before or after a snapshot cut"
+        );
+        assert_eq!(metrics.snapshot(), observation);
+    }
+
+    #[test]
     fn network_backend_metrics_preserve_exact_attempt_result_and_latency_counts() {
         let metrics = SharedNetworkInterfaceMetrics::default();
         let mut backend = VirtioNetworkBackendMetrics::default();
@@ -10238,6 +10138,116 @@ mod tests {
     }
 
     #[test]
+    fn network_metrics_same_id_replacement_starts_a_fresh_output_interval() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let configured = configured_metrics_devices(&[], &[], &["eth0"]);
+        let registry =
+            SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(["eth0"], 1)
+                .expect("bounded network metrics registry should allocate");
+        registry
+            .per_interface("eth0")
+            .expect("initial interface metrics should exist")
+            .record_observation(NetworkInterfaceMetrics::default().with_rx_count(2));
+        let first = registry.capture();
+        let (aggregate, per_interface) = first.into_parts();
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(
+                &MetricsDiagnostics::new()
+                    .with_network_interface_metrics(aggregate)
+                    .with_network_interface_metrics_by_interface(per_interface),
+                &configured,
+            ),
+            Ok(true)
+        );
+
+        let initial = registry
+            .claim_interface_lease("eth0")
+            .expect("initial interface metrics should be claimable");
+        drop(initial);
+        let replacement = registry
+            .prepare_interface("eth0")
+            .expect("same-ID replacement should prepare")
+            .publish();
+        registry
+            .per_interface("eth0")
+            .expect("replacement metrics should exist")
+            .record_observation(NetworkInterfaceMetrics::default().with_rx_count(3));
+        let second = registry.capture();
+        let (aggregate, per_interface) = second.into_parts();
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(
+                &MetricsDiagnostics::new()
+                    .with_network_interface_metrics(aggregate)
+                    .with_network_interface_metrics_by_interface(per_interface),
+                &configured,
+            ),
+            Ok(true)
+        );
+
+        let values = metrics_values(&output);
+        assert_eq!(values[0]["net_eth0"]["rx_count"], 2);
+        assert_eq!(values[0]["net"]["rx_count"], 2);
+        assert_eq!(values[1]["net_eth0"]["rx_count"], 3);
+        assert_eq!(values[1]["net"]["rx_count"], 3);
+        drop(replacement);
+    }
+
+    #[test]
+    fn network_output_aggregates_only_configured_dynamic_roots() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new()
+            .with_network_interface_metrics(NetworkInterfaceMetrics::default().with_rx_count(999))
+            .with_network_interface_metrics_by_interface(
+                NetworkInterfaceMetricsByInterface::new()
+                    .with_interface_metrics(
+                        "eth0",
+                        NetworkInterfaceMetrics::default()
+                            .with_rx_count(u64::MAX)
+                            .with_rx_packets_count(2),
+                    )
+                    .with_interface_metrics(
+                        "eth1",
+                        NetworkInterfaceMetrics::default()
+                            .with_rx_count(1)
+                            .with_rx_packets_count(3),
+                    )
+                    .with_interface_metrics(
+                        "not-configured",
+                        NetworkInterfaceMetrics::default().with_rx_packets_count(100),
+                    ),
+            );
+        let configured = configured_metrics_devices(&[], &[], &["eth0", "eth1", "eth2"]);
+
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
+
+        let value = only_metrics_value(&output);
+        assert_eq!(value["net_eth0"]["rx_count"], u64::MAX);
+        assert_eq!(value["net_eth1"]["rx_count"], 1);
+        assert_eq!(value["net_eth2"]["rx_count"], 0);
+        assert!(value.get("net_not-configured").is_none());
+        assert_eq!(value["net"]["rx_count"], u64::MAX);
+        assert_eq!(value["net"]["rx_packets_count"], 5);
+    }
+
+    #[test]
+    fn network_metrics_by_interface_debug_redacts_identity_and_values() {
+        let metrics = NetworkInterfaceMetricsByInterface::new().with_interface_metrics(
+            "secret-interface",
+            NetworkInterfaceMetrics::default().with_rx_bytes_count(123_456),
+        );
+        let debug = format!("{metrics:?}");
+
+        assert!(debug.contains("interfaces: 1"));
+        assert!(!debug.contains("secret-interface"));
+        assert!(!debug.contains("123456"));
+    }
+
+    #[test]
     fn network_metrics_preparation_is_invisible_and_published_lease_is_exact() {
         let registry =
             SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(["eth0"], 2)
@@ -10340,10 +10350,9 @@ mod tests {
     #[test]
     fn network_metric_increment_saturates() {
         let metrics = SharedNetworkInterfaceMetrics::default();
-        metrics
-            .inner
-            .rx_queue_event_count
-            .store(u64::MAX - 1, Ordering::Relaxed);
+        metrics.record_observation(
+            NetworkInterfaceMetrics::default().with_rx_queue_event_count(u64::MAX - 1),
+        );
 
         metrics.record_rx_queue_events(3);
 
@@ -10457,10 +10466,10 @@ mod tests {
         first.record_rx_accepted();
         first.record_rx_accepted_error();
         first.record_rx_accepted_unusual();
-        first.record_rx_bad_eth();
         first.record_rx_invalid_token();
         first.record_rx_no_token();
         first.record_rx_count();
+        first.record_tx_attempt();
         first.record_tx_frame(7);
         first.record_tx_error();
         first.record_connection_created();
@@ -10472,7 +10481,6 @@ mod tests {
                 .with_rx_accepted(1)
                 .with_rx_accepted_err(1)
                 .with_rx_accepted_unusual(1)
-                .with_rx_bad_eth(1)
                 .with_rx_invalid_token(1)
                 .with_rx_no_token(1)
                 .with_rx_count(1)
@@ -10489,14 +10497,91 @@ mod tests {
     #[test]
     fn mmds_metric_increment_saturates() {
         let metrics = SharedMmdsMetrics::default();
-        metrics
-            .inner
-            .tx_bytes
-            .store(u64::MAX - 1, Ordering::Relaxed);
+        metrics.record_observation(MmdsMetrics::default().with_tx_bytes(u64::MAX - 1));
 
         metrics.record_tx_frame(3);
 
         assert_eq!(metrics.snapshot().tx_bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn mmds_frame_observation_is_never_torn_by_a_racing_snapshot() {
+        let metrics = SharedMmdsMetrics::default();
+        let start = Arc::new(Barrier::new(2));
+        let writer_metrics = metrics.clone();
+        let writer_start = Arc::clone(&start);
+        let writer = thread::spawn(move || {
+            writer_start.wait();
+            writer_metrics.record_tx_frame(64);
+        });
+
+        start.wait();
+        let racing_cut = metrics.snapshot();
+        writer.join().expect("MMDS metrics writer should finish");
+        let observation = MmdsMetrics::default().with_tx_bytes(64).with_tx_frames(1);
+
+        assert!(
+            racing_cut == MmdsMetrics::default() || racing_cut == observation,
+            "one coherent MMDS frame observation must be entirely before or after a snapshot cut"
+        );
+        assert_eq!(metrics.snapshot(), observation);
+    }
+
+    #[test]
+    fn failed_network_and_mmds_publication_replays_then_emits_zero_interval() {
+        let output = TestMetricsOutput::default();
+        output.fail_next_write();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new()
+            .with_network_interface_metrics(
+                NetworkInterfaceMetrics::default()
+                    .with_rx_count(1)
+                    .with_rx_packets_count(1)
+                    .with_rx_bytes_count(64),
+            )
+            .with_network_interface_metrics_by_interface(
+                NetworkInterfaceMetricsByInterface::new().with_interface_metrics(
+                    "eth0",
+                    NetworkInterfaceMetrics::default()
+                        .with_rx_count(1)
+                        .with_rx_packets_count(1)
+                        .with_rx_bytes_count(64),
+                ),
+            )
+            .with_mmds_metrics(
+                MmdsMetrics::default()
+                    .with_rx_count(1)
+                    .with_tx_count(1)
+                    .with_tx_frames(1)
+                    .with_tx_bytes(128),
+            );
+        let configured = configured_metrics_devices(&[], &[], &["eth0"]);
+
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
+
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["net_eth0"]["rx_count"], 1);
+        assert_eq!(values[0]["net"]["rx_bytes_count"], 64);
+        assert_eq!(values[0]["mmds"]["tx_count"], 1);
+        assert_eq!(values[0]["mmds"]["tx_frames"], 1);
+        assert_eq!(values[0]["mmds"]["tx_bytes"], 128);
+        assert_eq!(values[1]["net_eth0"]["rx_count"], 0);
+        assert_eq!(values[1]["net"]["rx_bytes_count"], 0);
+        assert_eq!(values[1]["mmds"]["tx_count"], 0);
+        assert_eq!(values[1]["mmds"]["tx_frames"], 0);
+        assert_eq!(values[1]["mmds"]["tx_bytes"], 0);
     }
 
     #[test]
@@ -11309,9 +11394,9 @@ mod tests {
     fn balloon_metric_increment_saturates() {
         let metric = AtomicU64::new(u64::MAX - 1);
 
-        super::record_atomic_metric(&metric, 5);
+        super::record_atomic_metric_seq_cst(&metric, 5);
 
-        assert_eq!(metric.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(metric.load(Ordering::SeqCst), u64::MAX);
     }
 
     #[test]

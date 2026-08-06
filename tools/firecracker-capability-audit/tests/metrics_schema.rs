@@ -236,7 +236,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .iter()
             .filter(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
             .count(),
-        82
+        25
     );
     assert_eq!(
         audit
@@ -254,7 +254,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .iter()
             .filter(|record| record.disposition == MetricsDeviceProducerDisposition::Implemented)
             .count(),
-        133
+        189
     );
     assert_eq!(
         audit
@@ -264,15 +264,18 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
                 record.disposition == MetricsDeviceProducerDisposition::SourceNeutral
             })
             .count(),
-        1
+        2
     );
     for record in audit.records.iter().filter(|record| {
         matches!(
             record.delivery_issue.as_str(),
-            "#1838" | "#1839" | "#1840" | "#1841" | "#1842"
+            "#1838" | "#1839" | "#1840" | "#1841" | "#1842" | "#1843"
         )
     }) {
-        let expected = if record.field_id == "static:uart.flush_count" {
+        let expected = if matches!(
+            record.field_id.as_str(),
+            "static:uart.flush_count" | "static:mmds.rx_bad_eth"
+        ) {
             MetricsDeviceProducerDisposition::SourceNeutral
         } else {
             MetricsDeviceProducerDisposition::Implemented
@@ -289,7 +292,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .filter(|record| {
                 !matches!(
                     record.delivery_issue.as_str(),
-                    "#1838" | "#1839" | "#1840" | "#1841" | "#1842"
+                    "#1838" | "#1839" | "#1840" | "#1841" | "#1842" | "#1843"
                 )
             })
             .all(|record| {
@@ -307,13 +310,14 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .lines()
             .filter(|line| line.contains("final metrics device producer validation rejects"))
             .count(),
-        97
+        40
     );
 }
 
 // exact #1838 disposition mutation tests, extended through #1840
 // exact #1838 disposition mutation tests, extended through #1841
 // exact #1838 disposition mutation tests, extended through #1842
+// exact #1838 disposition mutation tests, extended through #1843
 #[test]
 fn device_producer_audit_rejects_completed_child_regression_and_future_promotion() {
     let mut implemented_regression = checked_device_audit();
@@ -321,10 +325,10 @@ fn device_producer_audit_rejects_completed_child_regression_and_future_promotion
         .records
         .iter_mut()
         .find(|record| {
-            record.delivery_issue == "#1842"
+            record.delivery_issue == "#1843"
                 && record.disposition == MetricsDeviceProducerDisposition::Implemented
         })
-        .expect("implemented #1842 record must exist")
+        .expect("implemented #1843 record must exist")
         .disposition = MetricsDeviceProducerDisposition::Planned;
     assert!(device_validation_error(&implemented_regression).contains("wrong current disposition"));
 
@@ -337,11 +341,22 @@ fn device_producer_audit_rejects_completed_child_regression_and_future_promotion
         .disposition = MetricsDeviceProducerDisposition::Implemented;
     assert!(device_validation_error(&source_neutral_drift).contains("wrong current disposition"));
 
+    let mut mmds_source_neutral_drift = checked_device_audit();
+    mmds_source_neutral_drift
+        .records
+        .iter_mut()
+        .find(|record| record.field_id == "static:mmds.rx_bad_eth")
+        .expect("MMDS rx_bad_eth record must exist")
+        .disposition = MetricsDeviceProducerDisposition::Implemented;
+    assert!(
+        device_validation_error(&mmds_source_neutral_drift).contains("wrong current disposition")
+    );
+
     let mut future_promotion = checked_device_audit();
     let record = future_promotion
         .records
         .iter_mut()
-        .find(|record| record.delivery_issue == "#1843")
+        .find(|record| record.delivery_issue == "#1844")
         .expect("future child record must exist");
     record.disposition = MetricsDeviceProducerDisposition::Implemented;
     record.implementation.push(anchored_local_reference());

@@ -140,6 +140,18 @@ the exact native-v2 2.11 snapshot/session rows. Two broad rows remain
   sharing the VM data store and token authority. MMDS output precedes backend
   RX, protocol deadlines share the owner scheduler, and one retained output is
   consumed only after guest RX commit.
+- Each interface also owns one coherent, generation-bearing metric value. One
+  registry capture produces configured roots and their static saturating sum;
+  zero roots remain present, deletion removes the exact generation, same-ID
+  reuse starts fresh, and failed publication replays the full interval.
+- Public network TX count/packet/bytes describe successful external forwarding
+  only. MMDS detours do not feed those fields or TAP-path spoof accounting.
+  Descriptor/buffer failures, malformed frames, limiter state, remaining work,
+  and affected-interface interrupt failures keep distinct source boundaries.
+- MMDS token failures cover V1 and V2. A successful stack write attempt records
+  `tx_count`; guest delivery records the retained frame and bytes once.
+  `rx_bad_eth` stays source-neutral because admission and parsing observe the
+  same immutable owned packet rather than Firecracker's mutable zero-copy view.
 - V2 tokens are opaque, bounded, expiry-authenticated, and bound to immutable
   instance identity. Fresh processes reject peer tokens. Keys, tokens, instance
   IDs, packet bytes, MACs, interface names, UUIDs, and raw framework values do
