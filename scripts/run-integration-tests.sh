@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-supported_tests=(hvf_lifecycle guest_boot native_v2_process executable_hvf_e2e app_sandbox production_bundle)
+supported_tests=(hvf_lifecycle guest_boot native_v2_process executable_hvf_e2e cpu_template_helper app_sandbox production_bundle)
 
 usage() {
   cat <<'EOF'
@@ -15,8 +15,8 @@ Options:
   --allow-unsupported  Exit 0 instead of 1 when the host cannot execute HVF.
   --test NAME          Run one integration test target. Can be repeated.
                        Supported values: hvf_lifecycle, guest_boot,
-                       native_v2_process, executable_hvf_e2e, app_sandbox,
-                       production_bundle.
+                       native_v2_process, executable_hvf_e2e,
+                       cpu_template_helper, app_sandbox, production_bundle.
   -h, --help           Show this help.
 
 Arguments after -- are passed to each signed Rust test binary or executable
@@ -336,6 +336,70 @@ build_executable_hvf_e2e() {
     --no-run
 }
 
+build_cpu_template_helper_e2e() {
+  local cargo_messages="$tmp_dir/cargo-test-cpu-template-helper.json"
+  local test_bins_file="$tmp_dir/test-bins-cpu-template-helper"
+
+  cargo build \
+    -p bangbang-cpu-template-helper \
+    --bin cpu-template-helper \
+    --all-features \
+    --locked \
+    --target "$target_triple"
+
+  cpu_template_helper_unsigned_bin="$repo_root/target/$target_triple/debug/cpu-template-helper"
+  cpu_template_helper_signed_bin="$tmp_dir/cpu-template-helper"
+  scripts/sign-hvf-binary.sh \
+    "$cpu_template_helper_unsigned_bin" \
+    "$cpu_template_helper_signed_bin"
+
+  cargo test \
+    -p bangbang-cpu-template-helper \
+    --test hvf_e2e \
+    --all-features \
+    --locked \
+    --target "$target_triple" \
+    --no-run \
+    --message-format=json \
+    > "$cargo_messages"
+
+  python3 - "$cargo_messages" > "$test_bins_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as messages:
+    for line in messages:
+        message = json.loads(line)
+        target = message.get("target", {})
+        executable = message.get("executable")
+
+        if (
+            message.get("reason") == "compiler-artifact"
+            and executable is not None
+            and target.get("name") == "hvf_e2e"
+            and "test" in target.get("kind", [])
+        ):
+            sys.stdout.write(executable)
+            sys.stdout.write("\0")
+PY
+
+  local test_bins=()
+  local test_bin
+  while IFS= read -r -d "" test_bin; do
+    if [[ -n "$test_bin" ]]; then
+      test_bins+=("$test_bin")
+    fi
+  done < "$test_bins_file"
+
+  if [[ "${#test_bins[@]}" -ne 1 ]]; then
+    echo "failed to locate the unique CPU-template helper e2e executable" >&2
+    exit 1
+  fi
+
+  cpu_template_helper_e2e_bin="$tmp_dir/cpu-template-helper-hvf-e2e"
+  scripts/sign-hvf-binary.sh "${test_bins[0]}" "$cpu_template_helper_e2e_bin"
+}
+
 build_signed_snapshot_tools() {
   if [[ -n "$snapshot_rebase_snap_bin" || -n "$snapshot_editor_bin" ]]; then
     if [[ -x "$snapshot_rebase_snap_bin" && -x "$snapshot_editor_bin" ]]; then
@@ -516,6 +580,9 @@ signed_test_names=()
 signed_test_bins=()
 executable_hvf_e2e_bangbang=""
 native_v2_process_bin=""
+cpu_template_helper_signed_bin=""
+cpu_template_helper_unsigned_bin=""
+cpu_template_helper_e2e_bin=""
 snapshot_rebase_snap_bin=""
 snapshot_editor_bin=""
 app_sandbox_hvf_bin=""
@@ -536,6 +603,9 @@ for test_name in "${selected_tests[@]}"; do
       ;;
     native_v2_process)
       build_native_v2_process_test
+      ;;
+    cpu_template_helper)
+      build_cpu_template_helper_e2e
       ;;
     guest_boot | hvf_lifecycle)
       build_and_sign_test "$test_name"
@@ -603,6 +673,18 @@ for index in "${!signed_test_bins[@]}"; do
       ;;
   esac
 done
+
+if contains cpu_template_helper "${selected_tests[@]}"; then
+  if [[ "${#test_args[@]}" -eq 0 ]]; then
+    BANGBANG_CPU_TEMPLATE_HELPER_E2E_BIN="$cpu_template_helper_signed_bin" \
+      BANGBANG_CPU_TEMPLATE_HELPER_E2E_UNSIGNED_BIN="$cpu_template_helper_unsigned_bin" \
+      "$cpu_template_helper_e2e_bin" --test-threads=1
+  else
+    BANGBANG_CPU_TEMPLATE_HELPER_E2E_BIN="$cpu_template_helper_signed_bin" \
+      BANGBANG_CPU_TEMPLATE_HELPER_E2E_UNSIGNED_BIN="$cpu_template_helper_unsigned_bin" \
+      "$cpu_template_helper_e2e_bin" --test-threads=1 "${test_args[@]}"
+  fi
+fi
 
 if contains native_v2_process "${selected_tests[@]}"; then
   for signed_snapshot_test in \

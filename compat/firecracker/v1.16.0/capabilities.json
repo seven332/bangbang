@@ -16550,29 +16550,206 @@
     {
       "id": "tool-argument:cpu-template-helper/template/dump/config",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the public cpu-template-helper template dump config argument and its preboot configuration semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
+      "summary": "Parse the complete bounded Firecracker-shaped config document and project only its machine and CPU actions into the real HVF dump inspection request.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/dump/config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "pub(crate) fn capture_common_arm64_cpu_template_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "pub fn inspect_effective_arm64_cpu_template"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "pub fn run_cli_with_provider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/main.rs",
+          "anchor": "fn main() -> ExitCode"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/provider.rs",
+          "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "fn capture_plan_uses_the_exact_runtime_census_and_native_widths"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn help_and_version_are_the_only_portable_stdout_successes"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_two_vcpu_default_dump_is_canonical_private_and_reparseable"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_helper_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/template/dump/output",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the public cpu-template-helper template dump output argument and its artifact-publication semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
+      "summary": "Publish canonical private dump JSON only to an absent output path through the synchronized same-directory no-replace transaction.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/dump/output"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "pub(crate) fn capture_common_arm64_cpu_template_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "pub fn inspect_effective_arm64_cpu_template"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "pub fn run_cli_with_provider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/main.rs",
+          "anchor": "fn main() -> ExitCode"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/provider.rs",
+          "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "fn capture_plan_uses_the_exact_runtime_census_and_native_widths"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn help_and_version_are_the_only_portable_stdout_successes"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_two_vcpu_default_dump_is_canonical_private_and_reparseable"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_helper_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/template/dump/template",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the public cpu-template-helper template dump template argument and its template-selection semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
+      "summary": "Parse one bounded strict custom template and apply it after the valid configuration selection for real HVF dump inspection.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/dump/template"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "pub(crate) fn capture_common_arm64_cpu_template_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "pub fn inspect_effective_arm64_cpu_template"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "pub fn run_cli_with_provider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/main.rs",
+          "anchor": "fn main() -> ExitCode"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/provider.rs",
+          "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "fn capture_plan_uses_the_exact_runtime_census_and_native_widths"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn help_and_version_are_the_only_portable_stdout_successes"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_two_vcpu_default_dump_is_canonical_private_and_reparseable"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_helper_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/template/strip/paths",
@@ -16595,20 +16772,138 @@
     {
       "id": "tool-argument:cpu-template-helper/template/verify/config",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the public cpu-template-helper template verify config argument and its preboot configuration semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
+      "summary": "Parse the complete bounded Firecracker-shaped config document and project its requested vCPU topology and CPU selection into real HVF verification.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/verify/config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "pub(crate) fn capture_common_arm64_cpu_template_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "pub fn inspect_effective_arm64_cpu_template"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "pub fn run_cli_with_provider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/main.rs",
+          "anchor": "fn main() -> ExitCode"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/provider.rs",
+          "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "fn capture_plan_uses_the_exact_runtime_census_and_native_widths"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn help_and_version_are_the_only_portable_stdout_successes"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_two_vcpu_default_dump_is_canonical_private_and_reparseable"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_helper_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/template/verify/template",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the public cpu-template-helper template verify template argument and its verification semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
+      "summary": "Parse an explicit strict custom template with final precedence and compare its filtered requests against the topology-common HVF checkpoint.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/verify/template"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "pub(crate) fn capture_common_arm64_cpu_template_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "pub fn inspect_effective_arm64_cpu_template"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "pub fn run_cli_with_provider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/main.rs",
+          "anchor": "fn main() -> ExitCode"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/provider.rs",
+          "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "fn capture_plan_uses_the_exact_runtime_census_and_native_widths"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn help_and_version_are_the_only_portable_stdout_successes"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_two_vcpu_default_dump_is_canonical_private_and_reparseable"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_helper_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:jailer/cgroup",
@@ -18007,11 +18302,70 @@
     {
       "id": "tool-operation:cpu-template-helper/template/dump",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the public cpu-template-helper template dump operation, preboot CPU view, template selection, and output artifact; Wave 2 supplies only the consumed CPU model and capture primitives.",
+      "summary": "Run the strict signed template dump command over a disposable real all-vCPU HVF application checkpoint and publish canonical retained modifiers.",
       "source_refs": [
         "tool-operation:cpu-template-helper/template/dump"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "pub(crate) fn capture_common_arm64_cpu_template_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "pub fn inspect_effective_arm64_cpu_template"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "pub fn run_cli_with_provider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/main.rs",
+          "anchor": "fn main() -> ExitCode"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/provider.rs",
+          "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "fn capture_plan_uses_the_exact_runtime_census_and_native_widths"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn help_and_version_are_the_only_portable_stdout_successes"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_two_vcpu_default_dump_is_canonical_private_and_reparseable"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_helper_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-operation:cpu-template-helper/template/strip",
@@ -18025,11 +18379,70 @@
     {
       "id": "tool-operation:cpu-template-helper/template/verify",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the public cpu-template-helper template verify operation and its preboot apply/capture comparison contract; Wave 2 supplies only the consumed CPU model and capture primitives.",
+      "summary": "Run the strict signed template verify command through production all-vCPU apply/readback and silent value-redacted comparison.",
       "source_refs": [
         "tool-operation:cpu-template-helper/template/verify"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "pub(crate) fn capture_common_arm64_cpu_template_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "pub fn inspect_effective_arm64_cpu_template"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "pub fn run_cli_with_provider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/main.rs",
+          "anchor": "fn main() -> ExitCode"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/provider.rs",
+          "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "fn capture_plan_uses_the_exact_runtime_census_and_native_widths"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn help_and_version_are_the_only_portable_stdout_successes"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_two_vcpu_default_dump_is_canonical_private_and_reparseable"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_helper_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-operation:firecracker/run",

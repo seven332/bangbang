@@ -7,10 +7,21 @@ publish = false
 
 [dependencies]
 bangbang-api = { path = "../../crates/api" }
+bangbang-hvf = { path = "../../crates/hvf" }
 bangbang-runtime = { path = "../../crates/runtime" }
+clap = { version = "=4.6.1", features = ["derive"] }
 rustix = { version = "=1.1.4", features = ["fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.140"
+
+[[bin]]
+name = "cpu-template-helper"
+path = "src/main.rs"
+
+[[test]]
+name = "hvf_e2e"
+path = "tests/hvf_e2e.rs"
+test = false
 
 [lints]
 workspace = true

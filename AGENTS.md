@@ -14,6 +14,9 @@ This is a Rust workspace for `bangbang`, a macOS-oriented VMM scaffold intended 
   static-code validation, and the outer worker supervisor.
 - `tools/firecracker-capability-audit` -> package
   `bangbang-firecracker-capability-audit`: checked v1.16.0 scope inventory validator.
+- `tools/cpu-template-helper` -> package `bangbang-cpu-template-helper`: signed
+  Firecracker-shaped arm64 CPU-template dump/verify executable and portable
+  format/input/publication library.
 - `compat/firecracker/v1.16.0`: pinned machine source manifest and human capability overlays.
 - `README.md`: current project scope and build instructions.
 
@@ -25,6 +28,9 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`: validate the
   checked delivery-time Firecracker inventory without a sibling checkout.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+  --cpu-template-helper-final`: certify the exact terminal seven-row
+  CPU-template dump/verify scope while retaining strip, fingerprint, and corpus work.
+- `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
   --metrics-process-final`: certify the exact terminal 69-field API/process metrics
   producer scope while retaining separately certified device and aggregate work.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
@@ -35,6 +41,7 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
   and its exact aggregate capability and ownership handoff.
 - `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.
 - `cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl`: verify unsupported targets compile to the launcher's explicit platform-error path.
+- `cargo check -p bangbang-cpu-template-helper --all-targets --all-features --locked --target aarch64-unknown-linux-musl`: verify unsupported targets compile to the helper's explicit platform-error path.
 - `cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf`: run non-HVF tests with all targets and features enabled.
 - `cargo test -p bangbang-hvf --lib --all-features --locked`: run unsigned HVF unit tests.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: run lint checks with warnings treated as errors.
@@ -43,6 +50,7 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed HVF lifecycle target.
 - `cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed guest boot target.
 - `cargo clippy -p bangbang-launcher --test production_bundle_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed production bundle target.
+- `cargo clippy -p bangbang-cpu-template-helper --test hvf_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed CPU-template helper target.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`: build documentation without dependency docs.
 - `scripts/run-integration-tests.sh`: sign and run HVF-backed integration tests on macOS Apple Silicon; use `--allow-unsupported` only for CI runners that cannot execute HVF.
 - `scripts/build-production-bundle.sh --output /path/to/Bangbang.app`: build,
@@ -69,6 +77,9 @@ Unsafe code must stay isolated behind small FFI wrappers, with `SAFETY:` comment
 Use Rust’s built-in test framework with `#[test]`. Add focused unit tests for argument parsing, error formatting, and backend state transitions as those surfaces grow. Test names should describe behavior, such as `parse_help_arg` or `displays_hypervisor_error`.
 
 Real Hypervisor.framework integration tests must run through `scripts/run-integration-tests.sh` so binaries are signed and unsupported hosts are handled explicitly. HVF crate integration tests live in `crates/hvf/tests/`; executable-level HVF e2e tests may live under the owning executable crate as dedicated `test = false` Cargo targets. The production bundle target lives under `crates/launcher/tests/` and must be run through the same wrapper so the real nested signatures and App Sandbox boundary are exercised. Do not run or add real HVF integration tests through the unsigned workspace test path.
+The CPU-template helper's signed process target is
+`tools/cpu-template-helper/tests/hvf_e2e.rs` and is selected with
+`scripts/run-integration-tests.sh --test cpu_template_helper`.
 
 ## Commit & Pull Request Guidelines
 

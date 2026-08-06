@@ -129,7 +129,9 @@ name = "bangbang-cpu-template-helper"
 version = "0.1.0"
 dependencies = [
  "bangbang-api",
+ "bangbang-hvf",
  "bangbang-runtime",
+ "clap",
  "rustix",
  "serde",
  "serde_json",

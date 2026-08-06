@@ -342,6 +342,17 @@ impl<'vm> HvfVcpuTopology<'vm> {
         )
     }
 
+    pub(crate) fn capture_common_arm64_cpu_template_values(
+        &self,
+        registers: &[crate::cpu_template::HvfArm64CpuTemplateRegister],
+    ) -> Result<Vec<crate::cpu_template::HvfArm64CpuTemplateValue>, HvfArm64CpuTemplateError> {
+        crate::cpu_template::capture_common_arm64_cpu_template_values(
+            &self.runners,
+            &self.mpidrs,
+            registers,
+        )
+    }
+
     pub(crate) fn apply_retained_arm64_cpu_template_state(
         &self,
         state: &HvfArm64CpuTemplateApplicationState,

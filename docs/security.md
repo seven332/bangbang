@@ -1848,13 +1848,18 @@ is resource-specific:
   executor/backend construction because live writes cannot establish its
   documented Neoverse V1 source model on Apple Silicon. The complete boundary
   is checked in `compat/firecracker/v1.16.0/cpu-template-contract.md`.
-  The library-only CPU-template helper foundation adds no ambient resource or
-  hypervisor authority. It parses complete config documents but projects only
-  machine and CPU actions, never opening paths from unrelated sections. Config
-  and template files are capped at 1 MiB and opened close-on-exec, no-follow,
-  and nonblocking; only descriptor-confirmed regular UTF-8 files are read.
-  Diagnostics omit paths, register identities, masks, values, and provider
-  internals.
+  The public CPU-template helper is a separately signed direct executable. It
+  has the invoking user's file authority and the Hypervisor.framework signing
+  entitlement; it is not the production App Sandbox worker and receives no
+  launcher grants. It parses complete config documents but projects only
+  machine and CPU actions, never opening paths from boot, drive, logger,
+  metrics, snapshot, or device sections. Config and template files are capped
+  at 1 MiB and opened close-on-exec, no-follow, and nonblocking; only
+  descriptor-confirmed regular UTF-8 files are read. The provider creates only
+  one disposable VM plus the requested ordered vCPUs, with no guest memory,
+  kernel, GIC, devices, or run loop. All-vCPU shutdown/drop and VM destruction
+  complete before success. Diagnostics omit paths, register identities, masks,
+  values, effective readbacks, and provider internals.
   Helper output is absent-only: an owner-only same-directory stage is written,
   synchronized, identity-checked, and committed by exclusive `NOREPLACE`
   rename. Precommit cleanup removes only the captured stage identity. A changed
@@ -1862,9 +1867,9 @@ is resource-specific:
   object untouched. After rename, final-state or directory-durability failure
   is postcommit uncertainty and is never presented as rollback. This is
   no-clobber integrity, not content authentication or authority over hostile
-  ancestor directories. The complete helper-specific boundary is checked in
-  `compat/firecracker/v1.16.0/cpu-template-helper-contract.md`; real all-vCPU
-  HVF capture and signed public-process evidence remain #1862 work.
+  ancestor directories. The complete helper-specific boundary and signed
+  real-HVF evidence are checked in
+  `compat/firecracker/v1.16.0/cpu-template-helper-contract.md`.
   Breakpoint value registers can expose guest virtual addresses, Context IDs,
   or VMIDs. Watchpoint value registers expose guest data virtual addresses, and
   their controls can encode access type, byte selection, linking, and enabled

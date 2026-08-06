@@ -59,7 +59,7 @@ crates/vhost-user Portable vhost-user frontend protocol foundations
 tools/firecracker-capability-audit
                   Checked Firecracker source/capability inventory validator
 tools/cpu-template-helper
-                  Library-only portable CPU-template helper foundation
+                  Signed Firecracker-shaped CPU-template dump/verify helper
 tools/seccompiler Firecracker-compatible offline seccompiler artifact tool
 tools/snapshot-tools
                   Firecracker-shaped native memory rebase, inspection, and reviewed editing
@@ -105,6 +105,20 @@ curl --unix-socket /tmp/bangbang.socket \
 Run `cargo run -p bangbang -- --help` for the accepted process arguments. The
 canonical option semantics, API state model, endpoint behavior, and exit status
 are in the [compatibility document](docs/firecracker-compatibility.md#process-startup-cli).
+The CPU-template helper must be signed for Hypervisor.framework before it can
+inspect an effective profile:
+
+```sh
+cargo build -p bangbang-cpu-template-helper --bin cpu-template-helper --locked
+scripts/sign-hvf-binary.sh target/debug/cpu-template-helper /tmp/cpu-template-helper
+/tmp/cpu-template-helper template dump --config /path/to/config.json --output /path/to/cpu_config.json
+/tmp/cpu-template-helper template verify --config /path/to/config.json --template /path/to/template.json
+```
+
+Dump output defaults to a new `cpu_config.json` and never replaces an existing
+path. Verify requires a selected nonempty custom template. The exact command,
+format, redaction, and platform boundary is in
+[CPU-template dump and verify](docs/firecracker-compatibility.md#cpu-template-dump-and-verify-helper).
 The snapshot rebase, deterministic state-inspection, and reviewed register-edit
 surfaces are in [Snapshot Rebase Tools](docs/firecracker-compatibility.md#snapshot-rebase-tools)
 and [Snapshot State Inspection and Reviewed Editing](docs/firecracker-compatibility.md#snapshot-state-inspection-and-reviewed-editing).
@@ -145,11 +159,13 @@ terminal and map to ten implemented shared device profiles. The dedicated
 device gate verifies that exact profile set, its resolvable evidence, the
 212/2/17 field census, and the terminal #1790 lifecycle handoff.
 
-The terminal tracing, 69-field API/process, 231-field device, and ten-scenario
-aggregate metrics scopes have separate fail-closed certification gates:
+The terminal tracing, CPU-template dump/verify, 69-field API/process,
+231-field device, and ten-scenario aggregate metrics scopes have separate
+fail-closed certification gates:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
