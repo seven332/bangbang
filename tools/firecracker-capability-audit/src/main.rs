@@ -14,12 +14,12 @@ use bangbang_firecracker_capability_audit::{
     read_logger_producer_audit, read_logger_producer_manifest, read_metrics_device_producer_audit,
     read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
     read_metrics_schema_authority, read_source_manifest, read_tracing_audit, source_manifest_json,
-    validate, validate_logger_compatibility, validate_logger_producers,
-    validate_metrics_compatibility, validate_metrics_device_compatibility,
-    validate_metrics_device_producers, validate_metrics_lifecycle,
-    validate_metrics_process_compatibility, validate_metrics_process_producers,
-    validate_metrics_schema, validate_metrics_schema_compatibility, validate_tracing_audit,
-    validate_tracing_compatibility,
+    validate, validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
+    validate_logger_compatibility, validate_logger_producers, validate_metrics_compatibility,
+    validate_metrics_device_compatibility, validate_metrics_device_producers,
+    validate_metrics_lifecycle, validate_metrics_process_compatibility,
+    validate_metrics_process_producers, validate_metrics_schema,
+    validate_metrics_schema_compatibility, validate_tracing_audit, validate_tracing_compatibility,
 };
 
 fn main() -> ExitCode {
@@ -64,6 +64,7 @@ enum ValidateMode {
     MetricsProcessFinal,
     MetricsDeviceFinal,
     MetricsFinal,
+    CpuTemplateHelperFinal,
 }
 
 fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
@@ -76,8 +77,9 @@ fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
         [flag] if flag == "--metrics-process-final" => Ok(ValidateMode::MetricsProcessFinal),
         [flag] if flag == "--metrics-device-final" => Ok(ValidateMode::MetricsDeviceFinal),
         [flag] if flag == "--metrics-final" => Ok(ValidateMode::MetricsFinal),
+        [flag] if flag == "--cpu-template-helper-final" => Ok(ValidateMode::CpuTemplateHelperFinal),
         _ => Err(AuditError::new(
-            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, or --metrics-final flag",
+            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, --metrics-final, or --cpu-template-helper-final flag",
         )),
     }
 }
@@ -98,6 +100,11 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     let metrics_lifecycle_audit =
         read_metrics_lifecycle_audit(&root.join(METRICS_LIFECYCLE_AUDIT_PATH))?;
     let tracing_audit = read_tracing_audit(&root.join(TRACING_AUDIT_PATH))?;
+    validate_cpu_template_helper_transition(&inventory).map_err(|errors| {
+        AuditError::new(format!(
+            "CPU-template helper transition validation errors:\n{errors}"
+        ))
+    })?;
     let audit_mode = match mode {
         ValidateMode::Delivery => AuditMode::Delivery,
         ValidateMode::Final => AuditMode::Final,
@@ -363,6 +370,61 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
             )?;
             return Ok(
                 "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid for the terminal aggregate metrics compatibility scope"
+                    .to_string(),
+            );
+        }
+        ValidateMode::CpuTemplateHelperFinal => {
+            validate_cpu_template_helper_compatibility(&manifest, &inventory, &root).map_err(
+                |errors| {
+                    AuditError::new(format!(
+                        "CPU-template helper compatibility validation errors:\n{errors}"
+                    ))
+                },
+            )?;
+            validate_logger_producers(&logger_manifest, &logger_audit, &root, AuditMode::Delivery)
+                .map_err(|errors| {
+                    AuditError::new(format!("logger producer validation errors:\n{errors}"))
+                })?;
+            validate_metrics_schema(&metrics_authority, &manifest, &root, AuditMode::Delivery)
+                .map_err(|errors| {
+                    AuditError::new(format!("metrics schema validation errors:\n{errors}"))
+                })?;
+            validate_metrics_process_producers(
+                &metrics_process_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics process producer validation errors:\n{errors}"
+                ))
+            })?;
+            validate_metrics_device_producers(
+                &metrics_device_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics device producer validation errors:\n{errors}"
+                ))
+            })?;
+            validate_metrics_lifecycle(
+                &metrics_lifecycle_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!("metrics lifecycle validation errors:\n{errors}"))
+            })?;
+            validate_tracing_audit(&tracing_audit, &root, AuditMode::Delivery).map_err(
+                |errors| AuditError::new(format!("tracing audit validation errors:\n{errors}")),
+            )?;
+            return Ok(
+                "Firecracker capability inventory, CPU-template helper, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid for the terminal CPU-template dump and verify compatibility scope"
                     .to_string(),
             );
         }
@@ -720,7 +782,7 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
+    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final | --cpu-template-helper-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
 }
 
 #[cfg(test)]
@@ -767,6 +829,10 @@ mod tests {
             parse_validate_mode(&["--metrics-final".to_string()]).unwrap(),
             ValidateMode::MetricsFinal
         );
+        assert_eq!(
+            parse_validate_mode(&["--cpu-template-helper-final".to_string()]).unwrap(),
+            ValidateMode::CpuTemplateHelperFinal
+        );
 
         for invalid in [
             vec!["--unknown".to_string()],
@@ -787,6 +853,10 @@ mod tests {
             vec![
                 "--metrics-device-final".to_string(),
                 "--metrics-final".to_string(),
+            ],
+            vec![
+                "--metrics-final".to_string(),
+                "--cpu-template-helper-final".to_string(),
             ],
         ] {
             let error = parse_validate_mode(&invalid).expect_err("mode should be rejected");
@@ -827,6 +897,13 @@ mod tests {
         let message = run_validate(&["--metrics-final".to_string()])
             .expect("terminal aggregate metrics validation must pass");
         assert!(message.contains("terminal aggregate metrics compatibility scope"));
+    }
+
+    #[test]
+    fn cpu_template_helper_final_mode_certifies_the_terminal_scope() {
+        let message = run_validate(&["--cpu-template-helper-final".to_string()])
+            .expect("terminal CPU-template helper validation must pass");
+        assert!(message.contains("terminal CPU-template dump and verify compatibility scope"));
     }
 
     #[test]

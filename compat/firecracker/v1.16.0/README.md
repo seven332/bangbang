@@ -77,7 +77,7 @@ reviewed delta.
 | [Machine memory](machine-memory-contract.md) | Machine-memory configuration, backing, dirty tracking, and exact platform boundaries |
 | [Machine lifecycle](machine-lifecycle-audit.md) | VM lifecycle, vCPU ownership, pause/resume, power sessions, and snapshot-ready coordination |
 | [CPU templates](cpu-template-contract.md) | Reviewed arm64 profile, selection, application, snapshot boundary, and KVM/static exclusions |
-| [CPU-template helper foundation](cpu-template-helper-contract.md) | Portable helper format, config projection, provider contract, bounded input, and absent-only publication |
+| [CPU-template dump and verify helper](cpu-template-helper-contract.md) | Strict public CLI, real all-vCPU HVF capture, portable format, config projection, bounded input, redaction, and absent-only publication |
 | [Device hotplug](device-hotplug-contract.md) | Runtime block, pmem, and network transactions and their aggregate ownership |
 | [Storage](storage-contract.md) | Block/pmem live and snapshot composition |
 | [Balloon](balloon-contract.md) | Balloon API, queue/accounting behavior, and native-v2 state |

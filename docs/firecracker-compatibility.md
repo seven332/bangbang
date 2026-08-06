@@ -313,6 +313,46 @@ Exact bounds, replacement/GET/snapshot behavior, expert-risk limits, signed
 evidence, and remaining Wave 7 helper/portability ownership are in the checked
 [CPU-template contract](../compat/firecracker/v1.16.0/cpu-template-contract.md).
 
+### CPU-Template Dump and Verify Helper
+
+The `cpu-template-helper` executable implements exactly the pinned
+Firecracker v1.16.0 `template dump` and `template verify` operations. Dump
+accepts optional `--config/-c` and `--template/-t` inputs plus
+`--output/-o`, which defaults to `cpu_config.json`. Verify accepts the same
+optional inputs except output and requires their final selection to be a
+nonempty custom template. A complete config document is parsed strictly, but
+only its machine and CPU actions are projected; an explicit template is
+validated and applied last.
+
+The executable requires macOS arm64, Hypervisor.framework availability, and a
+binary signed with the Hypervisor entitlement. Its one-shot provider creates a
+disposable VM and the requested vCPU topology without memory, kernel, GIC,
+devices, or a run loop. It applies through the production all-vCPU template
+path and captures all 80 reviewed descriptor slots on every vCPU at the
+application/readback checkpoint. Baseline entries must be available and equal
+across the topology. Only ACTLR on pre-macOS 15 and ZFR0/SMFR0 on pre-macOS
+15.2 may be represented as unavailable. The provider shuts down the complete
+topology and destroys the VM before returning; teardown failure cannot produce
+a successful result.
+
+Dump emits only available retained entries, so boot-owned X0, PC, and PSTATE
+remain excluded. The JSON is deterministic, uses exact-width bitmaps, ends in
+one newline, and is published with mode `0600` to an absent destination via a
+same-directory synchronized `NOREPLACE` transaction. Verify compares each
+requested value as `(effective & filter) == value` and emits no success output.
+Both input kinds are bounded to 1 MiB regular UTF-8 files opened no-follow and
+nonblocking. Invalid invocation exits 2 with one fixed diagnostic; operational
+failure exits 1 with a bounded category-only diagnostic; help, version, and
+successful operations exit 0. Paths, register identities, masks, values,
+readbacks, and provider internals are never reported.
+
+This scope does not implement `template strip`, fingerprint dump/compare, the
+upstream helper/template corpora, a persistent inspection VM, guest execution,
+or a distinct-host compatibility decision. Those identities remain separately
+owned by #1793–#1795. The exact format, publication, security, evidence, and
+terminal audit gate are in the checked
+[CPU-template helper contract](../compat/firecracker/v1.16.0/cpu-template-helper-contract.md).
+
 ## X86 CPUID and MSR platform boundary
 
 Firecracker's CPUID leaf/register and MSR modifier schemas are executable

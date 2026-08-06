@@ -1,9 +1,11 @@
-//! Portable contract foundation for Firecracker-shaped CPU-template tools.
+//! Firecracker-shaped CPU-template dump and verification support.
 
+pub mod cli;
 pub mod document;
 pub mod input;
 pub mod profile;
 pub mod projection;
+pub mod provider;
 pub mod publication;
 
 /// Maximum accepted config, template, or emitted template document size.

@@ -140,6 +140,25 @@ absence are directly tested. The contract does not claim Firecracker's source
 rewrite mechanism, durable delivery, tracing enabled by default, sensitive
 dynamic fields, or portable timing thresholds.
 
+## CPU-template dump and verify certification
+
+The exact seven #1792 rows are terminal under
+`validate --cpu-template-helper-final`. The gate requires one coherent
+transition, exact anchored implementation and validation evidence, the strict
+public binary, and the signed real-HVF five-case harness. Effective capture
+uses one disposable VM and the complete requested vCPU topology, production
+template apply/readback, all 80 descriptor slots, explicit platform-version
+availability, and teardown-before-success. Canonical dump publication is
+private and absent-only; verify success is silent; every failure is bounded
+and value/path-redacted.
+
+The gate also pins all 14 #1793–#1795 strip, fingerprint, corpus, and aggregate
+rows to their exact evidence-free `audit-required` handoff. It does not infer a
+host fingerprint, cross-host portability, guest execution, or completion of
+those separately owned scopes. The detailed command, format, publication, and
+security contract is in
+[CPU-template helper dump and verify](cpu-template-helper-contract.md).
+
 ## X86 CPUID/MSR platform boundary
 
 All 13 CPUID/MSR identities are executable x86_64 contracts. ARM register
@@ -228,13 +247,13 @@ remain in the CPU-template contract.
 | `corpus:metrics` | #1790 | `implemented-and-verified` |
 | `semantic.observability:metrics-schema-producers-flush-and-lifecycle` | #1790 | `implemented-and-verified` |
 | `corpus:tracing` | #1791 | `implemented-and-verified` |
-| `tool-argument:cpu-template-helper/template/dump/config` | #1792 | `audit-required` |
-| `tool-argument:cpu-template-helper/template/dump/output` | #1792 | `audit-required` |
-| `tool-argument:cpu-template-helper/template/dump/template` | #1792 | `audit-required` |
-| `tool-argument:cpu-template-helper/template/verify/config` | #1792 | `audit-required` |
-| `tool-argument:cpu-template-helper/template/verify/template` | #1792 | `audit-required` |
-| `tool-operation:cpu-template-helper/template/dump` | #1792 | `audit-required` |
-| `tool-operation:cpu-template-helper/template/verify` | #1792 | `audit-required` |
+| `tool-argument:cpu-template-helper/template/dump/config` | #1792 | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/template/dump/output` | #1792 | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/template/dump/template` | #1792 | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/template/verify/config` | #1792 | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/template/verify/template` | #1792 | `implemented-and-verified` |
+| `tool-operation:cpu-template-helper/template/dump` | #1792 | `implemented-and-verified` |
+| `tool-operation:cpu-template-helper/template/verify` | #1792 | `implemented-and-verified` |
 | `tool-argument:cpu-template-helper/template/strip/paths` | #1793 | `audit-required` |
 | `tool-argument:cpu-template-helper/template/strip/suffix` | #1793 | `audit-required` |
 | `tool-operation:cpu-template-helper/template/strip` | #1793 | `audit-required` |
@@ -286,8 +305,10 @@ producer, focused, process, signed, contained, and isolation gates pass. The
 `implemented-and-verified`; #1790 now promotes its exact two aggregate rows
 after the schema, process, device, lifecycle, and signed gates pass. #1791
 promotes the single tracing corpus row after its feature, AST, privacy,
-delivery, process, device, tool, and release-marker gates pass. The current
-inventory is therefore exactly 344 implemented, 41 audit-required, three
+delivery, process, device, tool, and release-marker gates pass. #1792 promotes
+its exact seven CPU-template dump/verify operation and argument rows after the
+portable actual-process and signed real-HVF gates pass, while #1793–#1795 stay
+unchanged. The current inventory is therefore exactly 351 implemented, 34 audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the
 prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the

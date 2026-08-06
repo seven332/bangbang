@@ -1,4 +1,4 @@
-# CPU-template Helper Foundation Contract
+# CPU-template Helper Dump and Verify Contract
 
 This contract owns the portable format, selection, provider, input, and
 publication boundary for Firecracker v1.16.0 CPU-template dump and verify
@@ -6,29 +6,29 @@ work. The runtime register allowlist, application order, readback, boot
 precedence, and platform exclusions remain owned by the
 [CPU-template contract](cpu-template-contract.md).
 
-## Delivery status
+## Terminal certification
 
-Issue [#1861](https://github.com/seven332/bangbang/issues/1861) supplies a
-library-only `bangbang-cpu-template-helper` foundation. It deliberately has no
-binary target, command-line parser, Hypervisor.framework dependency, or
-production effective-profile provider. Tests may supply a fake provider, but
-production code cannot report a successful dump or verification without a
-caller-provided implementation of the provider contract.
-
-Issue [#1862](https://github.com/seven332/bangbang/issues/1862) owns the public
-executable, real signed HVF provider, command behavior, and end-to-end
-promotion gate. Until that slice is merged, these seven checked identities
-remain exactly `audit-required`:
+Issue [#1861](https://github.com/seven332/bangbang/issues/1861) supplied the
+portable `bangbang-cpu-template-helper` format, selection, input, provider, and
+publication foundation. Issue
+[#1862](https://github.com/seven332/bangbang/issues/1862) adds the public
+executable and a real signed HVF provider, then promotes exactly these seven
+checked identities:
 
 | Capability identity | Current disposition |
 | --- | --- |
-| `tool-argument:cpu-template-helper/template/dump/config` | `audit-required` |
-| `tool-argument:cpu-template-helper/template/dump/output` | `audit-required` |
-| `tool-argument:cpu-template-helper/template/dump/template` | `audit-required` |
-| `tool-argument:cpu-template-helper/template/verify/config` | `audit-required` |
-| `tool-argument:cpu-template-helper/template/verify/template` | `audit-required` |
-| `tool-operation:cpu-template-helper/template/dump` | `audit-required` |
-| `tool-operation:cpu-template-helper/template/verify` | `audit-required` |
+| `tool-argument:cpu-template-helper/template/dump/config` | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/template/dump/output` | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/template/dump/template` | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/template/verify/config` | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/template/verify/template` | `implemented-and-verified` |
+| `tool-operation:cpu-template-helper/template/dump` | `implemented-and-verified` |
+| `tool-operation:cpu-template-helper/template/verify` | `implemented-and-verified` |
+
+The scoped `validate --cpu-template-helper-final` gate requires that exact
+seven-row terminal transition and exact evidence. It also fails if any strip,
+fingerprint, helper-corpus, template-corpus, or aggregate CPU-template row
+owned by #1793–#1795 moves from `audit-required`.
 
 ## Configuration and selection
 
@@ -52,7 +52,7 @@ invent a separate machine/CPU state machine.
 ## Descriptor and provider authority
 
 The runtime crate owns the exact sorted 80-entry arm64 descriptor census used
-by both accepted custom-template decoding and future effective capture. Each
+by both accepted custom-template decoding and effective capture. Each
 descriptor binds a Firecracker/KVM-shaped compatibility identity to one typed
 U32, U64, or U128 runtime target, its admitted filter, boot disposition, and
 availability class. The serialized identity is a compatibility token; it does
@@ -76,9 +76,15 @@ Verify requires a selected nonempty custom template, captures once at the
 application checkpoint, and compares each requested entry as
 `(effective & filter) == value`. A missing descriptor, unavailable requested
 entry, or mismatch fails without exposing the identity, mask, expected value,
-or effective value. Extra profile entries do not affect the result. The future
-HVF provider must obtain a real common result for every configured vCPU; this
-library does not synthesize that platform evidence.
+or effective value. Extra profile entries do not affect the result.
+
+The production HVF provider creates one disposable VM and the requested
+ordered vCPU topology without memory, kernel, GIC, devices, or a run loop. It
+applies the selected template through the same production all-vCPU path,
+captures every available descriptor on every vCPU, and accepts a value only
+when it is common across the complete topology. It always shuts down and drops
+the topology before destroying the VM; a teardown failure overrides a prior
+success so no artifact can certify an incompletely released inspection.
 
 ## Template document
 
@@ -133,17 +139,24 @@ permissions of the selected directory.
 
 ## Diagnostics, exit classes, and evidence
 
-All library errors and custom `Debug` implementations are bounded and omit
+All errors and custom `Debug` implementations are bounded and omit
 paths, config values, register identities, filters, target values, effective
-values, and provider internals. The reserved public exit classes are 0 for
-success, 1 for an operational failure, and 2 for invocation failure. #1862
-owns the exact mapping from public commands and arguments to those classes.
+values, and provider internals. The executable admits only `template dump` and
+`template verify` with the pinned five Firecracker arguments. Help and version
+write stdout and exit 0; command success is silent; invalid invocation writes
+one fixed stderr line and exits 2; operational failure writes one fixed,
+category-only stderr line and exits 1.
 
 Portable tests cover parser sharing, production projection parity, descriptor
 census and decoder closure, canonical round trips, selection precedence,
 identity-bound profiles, optional availability, filtered verification,
 bounded no-follow input, collision preservation, short writes, synchronization
 faults, identity replacement, cleanup uncertainty, and postcommit uncertainty.
-The audit guard also proves that the package remains library-only and that the
-seven public capability identities remain nonterminal. Real provider and
-process evidence must run through the signed integration wrapper in #1862.
+Portable actual-process tests cover help/version, strict invocation, bounded
+input, redaction, no-template behavior, and unsupported or unsigned HVF
+failure without publication. A separately signed five-case harness covers
+two-vCPU canonical dump and permissions, mixed U32/U64/U128 verify and
+selection precedence, explicit optional-register outcomes, mismatch and
+collision retry, unsigned rejection, and boot-owned X0/PC/PSTATE checkpoint
+semantics. The harness runs through `scripts/run-integration-tests.sh` and the
+audit guard proves the exact seven terminal rows and retained later scopes.

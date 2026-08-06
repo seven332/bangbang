@@ -4,8 +4,8 @@ use std::fmt;
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::cpu::{
-    ArmIdRegister, ArmRegister32, ArmRegister64, ArmRegister128, ArmRegisterAvailability,
-    ArmRegisterModifier, CustomCpuTemplate,
+    ArmCpuTemplateRegister, ArmIdRegister, ArmRegister32, ArmRegister64, ArmRegister128,
+    ArmRegisterAvailability, ArmRegisterModifier, CustomCpuTemplate,
 };
 
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
@@ -425,15 +425,6 @@ impl MappedModifier {
         }
     }
 
-    const fn accepts_baseline(self, baseline: HvfArm64CpuTemplateValue) -> bool {
-        matches!(
-            (self, baseline),
-            (Self::U32 { .. }, HvfArm64CpuTemplateValue::U32(_))
-                | (Self::U64 { .. }, HvfArm64CpuTemplateValue::U64(_))
-                | (Self::U128 { .. }, HvfArm64CpuTemplateValue::U128(_))
-        )
-    }
-
     const fn logical_values(self) -> (HvfArm64CpuTemplateValue, HvfArm64CpuTemplateValue) {
         match self {
             Self::U32 { filter, value, .. } => (
@@ -482,57 +473,73 @@ impl PreparedHvfArm64CpuTemplate {
     pub(crate) fn from_runtime(
         template: &CustomCpuTemplate,
     ) -> Result<Self, HvfArm64CpuTemplateError> {
-        Self::from_runtime_with_macos_15_2_availability(
+        Self::from_runtime_with_availability(
             template,
+            crate::ffi::macos_15_system_registers_available,
             crate::ffi::macos_15_2_system_registers_available,
         )
     }
 
-    fn from_runtime_with_macos_15_2_availability(
+    fn from_runtime_with_availability(
         template: &CustomCpuTemplate,
+        macos_15_available: impl FnOnce() -> bool,
         macos_15_2_available: impl FnOnce() -> bool,
     ) -> Result<Self, HvfArm64CpuTemplateError> {
         let mut modifiers = Vec::with_capacity(template.modifiers().len());
+        let mut requires_macos_15 = false;
         let mut requires_macos_15_2 = false;
         for modifier in template.modifiers().iter().copied() {
+            let register = match modifier {
+                ArmRegisterModifier::U32 { register, .. } => ArmCpuTemplateRegister::U32(register),
+                ArmRegisterModifier::U64 { register, .. } => {
+                    match register.availability() {
+                        ArmRegisterAvailability::MacOs15_0 => requires_macos_15 = true,
+                        ArmRegisterAvailability::MacOs15_2 => requires_macos_15_2 = true,
+                        ArmRegisterAvailability::Baseline => {}
+                    }
+                    ArmCpuTemplateRegister::U64(register)
+                }
+                ArmRegisterModifier::U128 { register, .. } => {
+                    ArmCpuTemplateRegister::U128(register)
+                }
+            };
+            let mapped = map_arm64_cpu_template_register(register)?;
             let modifier = match modifier {
-                ArmRegisterModifier::U32 {
-                    register,
-                    filter,
-                    value,
-                } => MappedModifier::U32 {
-                    register: match register {
-                        ArmRegister32::Fpcr => HvfRegister::FPCR,
-                        ArmRegister32::Fpsr => HvfRegister::FPSR,
-                    },
-                    filter,
-                    value,
-                },
-                ArmRegisterModifier::U64 {
-                    register,
-                    filter,
-                    value,
-                } => {
-                    requires_macos_15_2 |=
-                        register.availability() == ArmRegisterAvailability::MacOs15_2;
-                    MappedModifier::U64 {
-                        register: map_u64_register(register)?,
+                ArmRegisterModifier::U32 { filter, value, .. } => match mapped {
+                    HvfArm64CpuTemplateRegister::U32(register) => MappedModifier::U32 {
+                        register,
                         filter,
                         value,
+                    },
+                    HvfArm64CpuTemplateRegister::U64(_) | HvfArm64CpuTemplateRegister::U128(_) => {
+                        return Err(HvfArm64CpuTemplateError::InvalidRuntimeRegister);
                     }
-                }
-                ArmRegisterModifier::U128 {
-                    register: ArmRegister128::Q(register),
-                    filter,
-                    value,
-                } => MappedModifier::U128 {
-                    register: HvfSimdFpRegister::q(register.index())
-                        .ok_or(HvfArm64CpuTemplateError::InvalidRuntimeRegister)?,
-                    filter,
-                    value,
+                },
+                ArmRegisterModifier::U64 { filter, value, .. } => match mapped {
+                    HvfArm64CpuTemplateRegister::U64(register) => MappedModifier::U64 {
+                        register,
+                        filter,
+                        value,
+                    },
+                    HvfArm64CpuTemplateRegister::U32(_) | HvfArm64CpuTemplateRegister::U128(_) => {
+                        return Err(HvfArm64CpuTemplateError::InvalidRuntimeRegister);
+                    }
+                },
+                ArmRegisterModifier::U128 { filter, value, .. } => match mapped {
+                    HvfArm64CpuTemplateRegister::U128(register) => MappedModifier::U128 {
+                        register,
+                        filter,
+                        value,
+                    },
+                    HvfArm64CpuTemplateRegister::U32(_) | HvfArm64CpuTemplateRegister::U64(_) => {
+                        return Err(HvfArm64CpuTemplateError::InvalidRuntimeRegister);
+                    }
                 },
             };
             modifiers.push(modifier);
+        }
+        if requires_macos_15 && !macos_15_available() {
+            return Err(HvfArm64CpuTemplateError::OptionalSystemRegisterUnavailable);
         }
         if requires_macos_15_2 && !macos_15_2_available() {
             return Err(HvfArm64CpuTemplateError::OptionalSystemRegisterUnavailable);
@@ -635,6 +642,26 @@ fn map_u64_register(
     })
 }
 
+pub(crate) fn map_arm64_cpu_template_register(
+    register: ArmCpuTemplateRegister,
+) -> Result<HvfArm64CpuTemplateRegister, HvfArm64CpuTemplateError> {
+    Ok(match register {
+        ArmCpuTemplateRegister::U32(register) => HvfArm64CpuTemplateRegister::U32(match register {
+            ArmRegister32::Fpcr => HvfRegister::FPCR,
+            ArmRegister32::Fpsr => HvfRegister::FPSR,
+        }),
+        ArmCpuTemplateRegister::U64(register) => {
+            HvfArm64CpuTemplateRegister::U64(map_u64_register(register)?)
+        }
+        ArmCpuTemplateRegister::U128(ArmRegister128::Q(register)) => {
+            HvfArm64CpuTemplateRegister::U128(
+                HvfSimdFpRegister::q(register.index())
+                    .ok_or(HvfArm64CpuTemplateError::InvalidRuntimeRegister)?,
+            )
+        }
+    })
+}
+
 const CPU_TEMPLATE_TAG_FPCR: u16 = 1;
 const CPU_TEMPLATE_TAG_FPSR: u16 = 2;
 const CPU_TEMPLATE_TAG_X0: u16 = 3;
@@ -660,7 +687,7 @@ const CPU_TEMPLATE_TAG_ACTLR_EL1: u16 = 51;
 const CPU_TEMPLATE_TAG_Q0: u16 = 52;
 const CPU_TEMPLATE_TAG_Q31: u16 = CPU_TEMPLATE_TAG_Q0 + 31;
 
-fn cpu_template_register_width(
+pub(crate) fn cpu_template_register_width(
     register: HvfArm64CpuTemplateRegister,
 ) -> HvfArm64CpuTemplateValueWidth {
     match register {
@@ -670,7 +697,7 @@ fn cpu_template_register_width(
     }
 }
 
-fn cpu_template_register_tag(
+pub(crate) fn cpu_template_register_tag(
     register: HvfArm64CpuTemplateRegister,
 ) -> Option<HvfArm64CpuTemplateRegisterTag> {
     let tag = match register {
@@ -973,7 +1000,7 @@ impl fmt::Display for HvfArm64CpuTemplateError {
                 "arm64 CPU-template runtime register was outside its validated finite profile",
             ),
             Self::OptionalSystemRegisterUnavailable => f.write_str(
-                "arm64 CPU-template optional system registers require macOS 15.2 or newer",
+                "an arm64 CPU-template optional system register is unavailable on this macOS version",
             ),
             Self::InvalidTopology {
                 member_count,
@@ -1080,6 +1107,14 @@ pub(crate) fn apply_arm64_cpu_template_with_state(
     template: &PreparedHvfArm64CpuTemplate,
 ) -> Result<HvfArm64CpuTemplateApplicationState, HvfArm64CpuTemplateError> {
     apply_custom_cpu_template_with_state(runners, mpidrs, template)
+}
+
+pub(crate) fn capture_common_arm64_cpu_template_values(
+    runners: &[HvfVcpuRunner<'_>],
+    mpidrs: &[u64],
+    registers: &[HvfArm64CpuTemplateRegister],
+) -> Result<Vec<HvfArm64CpuTemplateValue>, HvfArm64CpuTemplateError> {
+    read_common_cpu_template_values_with(runners, mpidrs, registers)
 }
 
 pub(crate) fn apply_retained_arm64_cpu_template_state(
@@ -1201,68 +1236,13 @@ fn apply_custom_cpu_template_with_state<M: CpuTemplateMember>(
         .copied()
         .map(MappedModifier::register)
         .collect::<Vec<_>>();
-    let mut baselines = Vec::with_capacity(members.len());
-    for (member_index, (member, &mpidr)) in members.iter().zip(mpidrs).enumerate() {
-        let baseline = member
-            .read_cpu_template_baseline(&registers)
-            .map_err(|source| HvfArm64CpuTemplateError::BaselineRead {
-                member_index,
-                mpidr,
-                completed_members: baselines.len(),
-                source: Box::new(source),
-            })?;
-        if baseline.len() != modifiers.len() {
-            return Err(HvfArm64CpuTemplateError::BaselineLength {
-                member_index,
-                mpidr,
-                completed_members: baselines.len() + 1,
-                expected: modifiers.len(),
-                actual: baseline.len(),
-            });
-        }
-        baselines.push(baseline);
-    }
-
-    let Some(common_baseline) = baselines.first() else {
-        return Ok(HvfArm64CpuTemplateApplicationState {
-            entries: Vec::new(),
-        });
-    };
+    let common_baseline = read_common_cpu_template_values_with(members, mpidrs, &registers)?;
     let Some(&common_mpidr) = mpidrs.first() else {
         return Err(HvfArm64CpuTemplateError::InvalidTopology {
             member_count: members.len(),
             mpidr_count: mpidrs.len(),
         });
     };
-    for (member_index, (baseline, &mpidr)) in baselines.iter().zip(mpidrs).enumerate() {
-        if let Some(completed_modifiers) = modifiers
-            .iter()
-            .copied()
-            .zip(baseline.iter().copied())
-            .position(|(modifier, value)| !modifier.accepts_baseline(value))
-        {
-            return Err(HvfArm64CpuTemplateError::BaselineWidth {
-                member_index,
-                mpidr,
-                completed_members: baselines.len(),
-                completed_modifiers,
-            });
-        }
-    }
-    for (member_index, (baseline, &mpidr)) in baselines.iter().zip(mpidrs).enumerate().skip(1) {
-        if let Some(completed_modifiers) = baseline
-            .iter()
-            .zip(common_baseline)
-            .position(|(actual, expected)| actual != expected)
-        {
-            return Err(HvfArm64CpuTemplateError::BaselineMismatch {
-                member_index,
-                mpidr,
-                completed_members: baselines.len(),
-                completed_modifiers,
-            });
-        }
-    }
 
     let mut targets = Vec::with_capacity(modifiers.len());
     for (modifier, baseline) in modifiers
@@ -1274,7 +1254,7 @@ fn apply_custom_cpu_template_with_state<M: CpuTemplateMember>(
             return Err(HvfArm64CpuTemplateError::BaselineWidth {
                 member_index: 0,
                 mpidr: common_mpidr,
-                completed_members: baselines.len(),
+                completed_members: members.len(),
                 completed_modifiers: targets.len(),
             });
         };
@@ -1306,6 +1286,81 @@ fn apply_custom_cpu_template_with_state<M: CpuTemplateMember>(
     entries.sort_unstable_by_key(HvfArm64CpuTemplateApplicationEntry::tag);
     HvfArm64CpuTemplateApplicationState::try_new(entries)
         .map_err(|_| HvfArm64CpuTemplateError::InvalidRuntimeRegister)
+}
+
+fn read_common_cpu_template_values_with<M: CpuTemplateMember>(
+    members: &[M],
+    mpidrs: &[u64],
+    registers: &[HvfArm64CpuTemplateRegister],
+) -> Result<Vec<HvfArm64CpuTemplateValue>, HvfArm64CpuTemplateError> {
+    if members.is_empty() || members.len() != mpidrs.len() {
+        return Err(HvfArm64CpuTemplateError::InvalidTopology {
+            member_count: members.len(),
+            mpidr_count: mpidrs.len(),
+        });
+    }
+
+    let mut member_values = Vec::with_capacity(members.len());
+    for (member_index, (member, &mpidr)) in members.iter().zip(mpidrs).enumerate() {
+        let values = member
+            .read_cpu_template_baseline(registers)
+            .map_err(|source| HvfArm64CpuTemplateError::BaselineRead {
+                member_index,
+                mpidr,
+                completed_members: member_values.len(),
+                source: Box::new(source),
+            })?;
+        if values.len() != registers.len() {
+            return Err(HvfArm64CpuTemplateError::BaselineLength {
+                member_index,
+                mpidr,
+                completed_members: member_values.len() + 1,
+                expected: registers.len(),
+                actual: values.len(),
+            });
+        }
+        member_values.push(values);
+    }
+
+    for (member_index, (values, &mpidr)) in member_values.iter().zip(mpidrs).enumerate() {
+        if let Some(completed_modifiers) = registers
+            .iter()
+            .copied()
+            .zip(values.iter().copied())
+            .position(|(register, value)| cpu_template_register_width(register) != value.width())
+        {
+            return Err(HvfArm64CpuTemplateError::BaselineWidth {
+                member_index,
+                mpidr,
+                completed_members: member_values.len(),
+                completed_modifiers,
+            });
+        }
+    }
+
+    let common =
+        member_values
+            .first()
+            .cloned()
+            .ok_or(HvfArm64CpuTemplateError::InvalidTopology {
+                member_count: members.len(),
+                mpidr_count: mpidrs.len(),
+            })?;
+    for (member_index, (values, &mpidr)) in member_values.iter().zip(mpidrs).enumerate().skip(1) {
+        if let Some(completed_modifiers) = values
+            .iter()
+            .zip(&common)
+            .position(|(actual, expected)| actual != expected)
+        {
+            return Err(HvfArm64CpuTemplateError::BaselineMismatch {
+                member_index,
+                mpidr,
+                completed_members: member_values.len(),
+                completed_modifiers,
+            });
+        }
+    }
+    Ok(common)
 }
 
 pub(crate) trait HvfArm64CpuTemplateAccess {
@@ -2383,20 +2438,22 @@ mod tests {
     }
 
     fn prepare(modifiers: Vec<CpuConfigArmRegisterModifier>) -> PreparedHvfArm64CpuTemplate {
-        prepare_with_macos_15_2_availability(modifiers, true)
+        prepare_with_availability(modifiers, true, true)
             .expect("validated test CPU template should map to HVF")
     }
 
-    fn prepare_with_macos_15_2_availability(
+    fn prepare_with_availability(
         modifiers: Vec<CpuConfigArmRegisterModifier>,
+        macos_15_available: bool,
         macos_15_2_available: bool,
     ) -> Result<PreparedHvfArm64CpuTemplate, HvfArm64CpuTemplateError> {
         let template = CpuConfigInput::new(Vec::new(), modifiers, Vec::new())
             .into_custom_template()
             .expect("test template should validate")
             .expect("test template should be nonempty");
-        PreparedHvfArm64CpuTemplate::from_runtime_with_macos_15_2_availability(
+        PreparedHvfArm64CpuTemplate::from_runtime_with_availability(
             &template,
+            move || macos_15_available,
             move || macos_15_2_available,
         )
     }
@@ -2577,31 +2634,39 @@ mod tests {
             KVM_REG_ARM64_ID_AA64ZFR0_EL1,
             KVM_REG_ARM64_ID_AA64SMFR0_EL1,
         ] {
-            let error = prepare_with_macos_15_2_availability(vec![modifier(id, 0, 0)], false)
+            let error = prepare_with_availability(vec![modifier(id, 0, 0)], true, false)
                 .expect_err("optional system register must honor the public OS boundary");
             assert_eq!(
                 error,
                 HvfArm64CpuTemplateError::OptionalSystemRegisterUnavailable
             );
             let display = error.to_string();
-            assert!(display.contains("macOS 15.2"));
+            assert!(display.contains("unavailable"));
             for secret in ["c024", "c025", "filter", "value", "baseline"] {
                 assert!(!display.contains(secret));
             }
             assert!(std::error::Error::source(&error).is_none());
         }
 
-        for id in [KVM_REG_ARM64_ID_AA64PFR1_EL1, KVM_REG_ARM64_ACTLR_EL1] {
-            prepare_with_macos_15_2_availability(vec![modifier(id, 0, 0)], false)
-                .expect("baseline and macOS-15-tier registers must not use the 15.2 gate");
-        }
+        prepare_with_availability(
+            vec![modifier(KVM_REG_ARM64_ID_AA64PFR1_EL1, 0, 0)],
+            false,
+            false,
+        )
+        .expect("baseline registers must not use an optional OS gate");
+        assert_eq!(
+            prepare_with_availability(vec![modifier(KVM_REG_ARM64_ACTLR_EL1, 0, 0)], false, true,)
+                .expect_err("ACTLR must honor the public macOS 15 boundary"),
+            HvfArm64CpuTemplateError::OptionalSystemRegisterUnavailable
+        );
 
         assert_eq!(
-            prepare_with_macos_15_2_availability(
+            prepare_with_availability(
                 vec![
                     modifier(KVM_REG_ARM64_ID_AA64PFR0_EL1, 0, 0),
                     modifier(KVM_REG_ARM64_ID_AA64ZFR0_EL1, 0, 0),
                 ],
+                true,
                 false,
             )
             .expect_err("mixed template must fail during static availability preflight"),
@@ -2610,22 +2675,51 @@ mod tests {
 
         let ordinary = CpuConfigInput::new(
             Vec::new(),
-            vec![
-                modifier(KVM_REG_ARM64_ID_AA64PFR1_EL1, 0, 0),
-                modifier(KVM_REG_ARM64_ACTLR_EL1, 0, 0),
-            ],
+            vec![modifier(KVM_REG_ARM64_ID_AA64PFR1_EL1, 0, 0)],
             Vec::new(),
         )
         .into_custom_template()
         .expect("ordinary template should validate")
         .expect("ordinary template should be nonempty");
         let calls = Cell::new(0);
-        PreparedHvfArm64CpuTemplate::from_runtime_with_macos_15_2_availability(&ordinary, || {
-            calls.set(calls.get() + 1);
-            false
-        })
+        PreparedHvfArm64CpuTemplate::from_runtime_with_availability(
+            &ordinary,
+            || {
+                calls.set(calls.get() + 1);
+                false
+            },
+            || {
+                calls.set(calls.get() + 1);
+                false
+            },
+        )
         .expect("ordinary targets must not acquire a macOS 15.2 dependency");
         assert_eq!(calls.get(), 0);
+
+        let macos_15 = CpuConfigInput::new(
+            Vec::new(),
+            vec![modifier(KVM_REG_ARM64_ACTLR_EL1, 0, 0)],
+            Vec::new(),
+        )
+        .into_custom_template()
+        .expect("macOS 15 template should validate")
+        .expect("macOS 15 template should be nonempty");
+        let macos_15_calls = Cell::new(0);
+        let macos_15_2_calls = Cell::new(0);
+        PreparedHvfArm64CpuTemplate::from_runtime_with_availability(
+            &macos_15,
+            || {
+                macos_15_calls.set(macos_15_calls.get() + 1);
+                true
+            },
+            || {
+                macos_15_2_calls.set(macos_15_2_calls.get() + 1);
+                false
+            },
+        )
+        .expect("available macOS 15 target should prepare");
+        assert_eq!(macos_15_calls.get(), 1);
+        assert_eq!(macos_15_2_calls.get(), 0);
 
         let optional = CpuConfigInput::new(
             Vec::new(),
@@ -2639,10 +2733,17 @@ mod tests {
         .expect("optional template should validate")
         .expect("optional template should be nonempty");
         let calls = Cell::new(0);
-        PreparedHvfArm64CpuTemplate::from_runtime_with_macos_15_2_availability(&optional, || {
-            calls.set(calls.get() + 1);
-            true
-        })
+        PreparedHvfArm64CpuTemplate::from_runtime_with_availability(
+            &optional,
+            || {
+                calls.set(calls.get() + 1);
+                false
+            },
+            || {
+                calls.set(calls.get() + 1);
+                true
+            },
+        )
         .expect("available optional targets should prepare");
         assert_eq!(calls.get(), 1);
     }
@@ -2758,6 +2859,49 @@ mod tests {
         let debug = format!("{application:?}");
         assert!(debug.contains(CPU_TEMPLATE_VALUE_REDACTED));
         assert!(!debug.contains("123456789abcdef0"));
+    }
+
+    #[test]
+    fn common_capture_reads_every_member_without_applying_targets() {
+        let template = canonical_template();
+        let registers = template
+            .modifiers
+            .iter()
+            .copied()
+            .map(MappedModifier::register)
+            .collect::<Vec<_>>();
+        let values = [
+            HvfArm64CpuTemplateValue::U64(1),
+            HvfArm64CpuTemplateValue::U64(2),
+            HvfArm64CpuTemplateValue::U64(3),
+            HvfArm64CpuTemplateValue::U64(4),
+        ];
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let members = [0, 1].map(|index| FakeMember {
+            index,
+            baseline: values.to_vec(),
+            fail_read: false,
+            fail_apply: false,
+            events: Rc::clone(&events),
+        });
+
+        assert_eq!(
+            read_common_cpu_template_values_with(&members, &[0, 1], &registers),
+            Ok(values.to_vec())
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                Event::Read {
+                    member: 0,
+                    registers: registers.clone(),
+                },
+                Event::Read {
+                    member: 1,
+                    registers,
+                },
+            ]
+        );
     }
 
     #[test]

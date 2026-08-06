@@ -1173,25 +1173,29 @@ fixed success/failure markers, never report values. Run both through
 rootfs builder requires the installed stable `aarch64-unknown-linux-musl`
 target and embeds the deterministic static helper.
 
-The library-only CPU-template helper foundation has a separate portable gate:
+The CPU-template helper has portable, scoped-audit, and signed real-HVF gates:
 
 ```sh
 cargo test -p bangbang-api --locked
 cargo test -p bangbang-runtime --all-features --locked --lib cpu
-cargo test -p bangbang-cpu-template-helper --locked
+cargo test -p bangbang-cpu-template-helper --all-targets --all-features --locked
 cargo test -p bangbang --all-features --locked helper_cpu_inspection_projection_matches_production_actions
-cargo test -p bangbang-firecracker-capability-audit --test checked_inventory cpu_template_helper_foundation_policy_is_stable --locked
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
+scripts/run-integration-tests.sh --test cpu_template_helper
 ```
 
 These tests prove shared duplicate-safe config parsing, exact production action
 projection, the runtime-owned descriptor census and accepted decoder, canonical
 format round trips, identity-bound provider profiles, optional availability,
 filter comparison, bounded regular-file input, value/path redaction, and the
-exclusive publication fault matrix. They do not prove a public command or real
-effective capture. #1862 must add the executable and production provider, run
-its direct and App Sandbox process matrix through
-`scripts/run-integration-tests.sh` without `--allow-unsupported`, and only then
-promote the seven dump/verify capability rows.
+exclusive publication fault matrix. Portable actual-process cases additionally
+prove strict help/version/invocation behavior and that unsupported or unsigned
+HVF failures publish nothing. The signed five-case harness proves real
+two-vCPU canonical dump, mixed-width verify and selection precedence, explicit
+ACTLR/ZFR0/SMFR0 availability outcomes, mismatch/collision/retry behavior, and
+boot-owned X0/PC/PSTATE checkpoint semantics. Run the wrapper without
+`--allow-unsupported` for local or self-hosted evidence so a host that cannot
+execute HVF fails rather than silently omitting the gate.
 SVE/SME identification signed tests require macOS 15.2 and must capture ZFR0
 and SMFR0 twice from one idle real vCPU. They may assert same-vCPU stability but
 must not hard-code one feature model, enable SVE/SME, enter streaming mode,
@@ -1959,12 +1963,14 @@ cargo fmt --all -- --check
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
 cargo check --workspace --all-targets --all-features --locked
 cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl
+cargo check -p bangbang-cpu-template-helper --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 cargo check -p bangbang-snapshot-tools --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 cargo test -p bangbang-hvf --lib --all-features --locked
@@ -1974,6 +1980,7 @@ cargo clippy -p bangbang --test app_sandbox_process_e2e --all-features --locked 
 cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings
 cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings
 cargo clippy -p bangbang-launcher --test production_bundle_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
+cargo clippy -p bangbang-cpu-template-helper --test hvf_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
 
@@ -1994,9 +2001,15 @@ Run one signed integration test target when the change is narrower:
 scripts/run-integration-tests.sh --test hvf_lifecycle
 scripts/run-integration-tests.sh --test guest_boot
 scripts/run-integration-tests.sh --test executable_hvf_e2e
+scripts/run-integration-tests.sh --test cpu_template_helper
 scripts/run-integration-tests.sh --test app_sandbox
 scripts/run-integration-tests.sh --test production_bundle
 ```
+
+The `cpu_template_helper` target builds the real helper for
+`aarch64-apple-darwin`, keeps one unsigned copy for the entitlement-failure
+oracle, signs a separate copy, then signs and runs its disabled-by-default
+`hvf_e2e` harness. It does not boot a guest or package an App Sandbox bundle.
 
 The `app_sandbox` target is integration-only. It packages the existing
 `hvf_lifecycle` binary and the real `bangbang` executable as minimal app

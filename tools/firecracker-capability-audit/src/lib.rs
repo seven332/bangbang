@@ -1,5 +1,6 @@
 //! Firecracker capability inventory parsing, validation, and source comparison.
 
+mod cpu_template_helper_certify;
 mod logger_certify;
 mod logger_model;
 mod logger_upstream;
@@ -24,6 +25,10 @@ mod tracing_validate;
 mod upstream;
 mod validate;
 
+pub use cpu_template_helper_certify::{
+    CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS, CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS,
+    validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
+};
 pub use logger_certify::{LOGGER_COMPATIBILITY_CAPABILITY_IDS, validate_logger_compatibility};
 pub use logger_model::{
     LoggerClassDisposition, LoggerCompiledEvent, LoggerDeliveryPolicy, LoggerField,

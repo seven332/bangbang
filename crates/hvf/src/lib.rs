@@ -4,6 +4,7 @@ mod backend;
 mod cache;
 mod coordinator;
 mod cpu_template;
+mod cpu_template_inspection;
 mod dirty;
 mod exit;
 mod ffi;
@@ -51,6 +52,11 @@ pub use cpu_template::{
     HvfArm64CpuTemplateApplicationState, HvfArm64CpuTemplateApplicationStateError,
     HvfArm64CpuTemplateError, HvfArm64CpuTemplateRegisterTag, HvfArm64CpuTemplateValue,
     HvfArm64CpuTemplateValueWidth, HvfArm64CpuTemplateVcpuError,
+};
+pub use cpu_template_inspection::{
+    HvfArm64CpuTemplateInspectionError, HvfArm64CpuTemplateInspectionStage,
+    HvfArm64CpuTemplateProfile, HvfArm64CpuTemplateProfileEntry, HvfArm64CpuTemplateProfileStatus,
+    inspect_effective_arm64_cpu_template,
 };
 pub use dirty::{
     HvfDirtyWriteEpochResetError, HvfDirtyWriteFaultError, HvfDirtyWriteProtectionFailure,

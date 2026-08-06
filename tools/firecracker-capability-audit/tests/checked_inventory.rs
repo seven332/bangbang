@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
-    AuditMode, CAPABILITY_INVENTORY_PATH, Disposition, LOGGER_COMPATIBILITY_CAPABILITY_IDS,
+    AuditMode, CAPABILITY_INVENTORY_PATH, CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+    CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS, Disposition, LOGGER_COMPATIBILITY_CAPABILITY_IDS,
     LOGGER_PRODUCER_AUDIT_PATH, LOGGER_PRODUCER_MANIFEST_PATH, LoggerClassDisposition,
     LoggerCompiledEvent, LoggerDeliveryPolicy, LoggerNonApplicableReason,
     METRICS_AGGREGATE_CAPABILITY_IDS, METRICS_DEVICE_PRODUCER_AUDIT_PATH,
@@ -16,10 +17,12 @@ use bangbang_firecracker_capability_audit::{
     read_logger_producer_manifest, read_metrics_device_producer_audit,
     read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
     read_metrics_schema_authority, read_source_manifest, read_tracing_audit, source_manifest_json,
-    tracing_audit_json, validate, validate_logger_compatibility, validate_logger_producers,
-    validate_metrics_compatibility, validate_metrics_device_compatibility,
-    validate_metrics_device_producers, validate_metrics_process_compatibility,
-    validate_metrics_schema_compatibility, validate_tracing_audit, validate_tracing_compatibility,
+    tracing_audit_json, validate, validate_cpu_template_helper_compatibility,
+    validate_cpu_template_helper_transition, validate_logger_compatibility,
+    validate_logger_producers, validate_metrics_compatibility,
+    validate_metrics_device_compatibility, validate_metrics_device_producers,
+    validate_metrics_process_compatibility, validate_metrics_schema_compatibility,
+    validate_tracing_audit, validate_tracing_compatibility,
 };
 
 #[test]
@@ -750,7 +753,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| { capability.disposition == Disposition::ImplementedAndVerified })
             .count(),
-        344
+        351
     );
     assert_eq!(
         inventory
@@ -758,7 +761,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| capability.disposition == Disposition::AuditRequired)
             .count(),
-        41
+        34
     );
     assert_eq!(
         inventory
@@ -1868,6 +1871,9 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     let tracing_implemented = TRACING_COMPATIBILITY_CAPABILITY_IDS
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let cpu_template_helper_implemented = CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let impossible = X86_IMPOSSIBLE.into_iter().collect::<BTreeSet<_>>();
 
     assert_eq!(owned.len(), 93, "Wave 7 owner identities must be unique");
@@ -1878,6 +1884,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert_eq!(metrics_implemented.len(), 12);
     assert_eq!(metrics_aggregate_implemented.len(), 2);
     assert_eq!(tracing_implemented.len(), 1);
+    assert_eq!(cpu_template_helper_implemented.len(), 7);
     assert_eq!(impossible.len(), 13);
     assert!(implemented.is_disjoint(&impossible));
     assert!(logger_implemented.is_disjoint(&implemented));
@@ -1894,6 +1901,12 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert!(tracing_implemented.is_disjoint(&metrics_implemented));
     assert!(tracing_implemented.is_disjoint(&metrics_aggregate_implemented));
     assert!(tracing_implemented.is_disjoint(&impossible));
+    assert!(cpu_template_helper_implemented.is_disjoint(&implemented));
+    assert!(cpu_template_helper_implemented.is_disjoint(&logger_implemented));
+    assert!(cpu_template_helper_implemented.is_disjoint(&metrics_implemented));
+    assert!(cpu_template_helper_implemented.is_disjoint(&metrics_aggregate_implemented));
+    assert!(cpu_template_helper_implemented.is_disjoint(&tracing_implemented));
+    assert!(cpu_template_helper_implemented.is_disjoint(&impossible));
     assert!(implemented.union(&impossible).all(|id| owned.contains(id)));
     assert!(logger_implemented.iter().all(|id| owned.contains(id)));
     assert!(metrics_implemented.iter().all(|id| owned.contains(id)));
@@ -1903,6 +1916,11 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
             .all(|id| owned.contains(id))
     );
     assert!(tracing_implemented.iter().all(|id| owned.contains(id)));
+    assert!(
+        cpu_template_helper_implemented
+            .iter()
+            .all(|id| owned.contains(id))
+    );
 
     for (id, owner) in WAVE_7_OWNED.into_iter().chain(RETAINED_HANDOFFS) {
         assert!(
@@ -1999,6 +2017,24 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         );
     }
 
+    for id in &cpu_template_helper_implemented {
+        let capability = by_id
+            .get(id)
+            .expect("CPU-template helper identity must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "CPU-template helper identity must be terminal: {id}"
+        );
+        assert!(!capability.implementation.is_empty());
+        assert!(!capability.validation.is_empty());
+        assert!(capability.exclusion.is_none());
+        assert!(
+            contract.contains(&format!("| `{id}` | #1792 | `implemented-and-verified` |")),
+            "contract must record implemented CPU-template helper result: {id}"
+        );
+    }
+
     for id in &impossible {
         let capability = by_id.get(id).expect("x86 identity must exist");
         assert_eq!(capability.source_refs, [*id]);
@@ -2069,6 +2105,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         .chain(metrics_implemented.iter())
         .chain(metrics_aggregate_implemented.iter())
         .chain(tracing_implemented.iter())
+        .chain(cpu_template_helper_implemented.iter())
         .chain(impossible.iter())
         .copied()
         .collect::<BTreeSet<_>>();
@@ -2099,22 +2136,12 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
             .contains("numeric startup/resource/performance or telemetry outcomes (#1798)")
     );
     assert!(normalized_contract.contains("final cross-capability interactions (Wave 8)"));
-    assert!(normalized_contract.contains("344 implemented, 41 audit-required"));
+    assert!(normalized_contract.contains("351 implemented, 34 audit-required"));
     assert!(normalized_contract.contains("376/9/3/30"));
 }
 
 #[test]
-fn cpu_template_helper_foundation_policy_is_stable() {
-    const HELPER_CAPABILITIES: [&str; 7] = [
-        "tool-argument:cpu-template-helper/template/dump/config",
-        "tool-argument:cpu-template-helper/template/dump/output",
-        "tool-argument:cpu-template-helper/template/dump/template",
-        "tool-argument:cpu-template-helper/template/verify/config",
-        "tool-argument:cpu-template-helper/template/verify/template",
-        "tool-operation:cpu-template-helper/template/dump",
-        "tool-operation:cpu-template-helper/template/verify",
-    ];
-
+fn checked_cpu_template_helper_compatibility_is_terminal_and_fail_closed() {
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|tools| tools.parent())
@@ -2122,6 +2149,8 @@ fn cpu_template_helper_foundation_policy_is_stable() {
         .to_path_buf();
     let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
         .expect("checked capability inventory must parse");
+    let manifest = read_source_manifest(&repository_root.join(SOURCE_MANIFEST_PATH))
+        .expect("checked source manifest must parse");
     let by_id = inventory
         .capabilities
         .iter()
@@ -2131,41 +2160,92 @@ fn cpu_template_helper_foundation_policy_is_stable() {
     let contract = std::fs::read_to_string(repository_root.join(contract_path))
         .expect("CPU-template helper contract must be readable");
 
+    validate_cpu_template_helper_compatibility(&manifest, &inventory, &repository_root)
+        .expect("checked CPU-template dump and verify scope must be terminal");
+
     assert_eq!(
-        HELPER_CAPABILITIES
+        CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS
             .into_iter()
             .collect::<BTreeSet<_>>()
             .len(),
-        7,
-        "CPU-template helper capability set must remain exact"
+        CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS.len(),
+        "CPU-template helper capability set must remain exact and duplicate-free"
     );
-    for id in HELPER_CAPABILITIES {
+    for id in CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS {
         let capability = by_id
             .get(id)
             .unwrap_or_else(|| panic!("CPU-template helper capability must exist: {id}"));
         assert_eq!(
             capability.disposition,
-            Disposition::AuditRequired,
-            "library-only foundation must not promote public helper behavior: {id}"
+            Disposition::ImplementedAndVerified,
+            "dump and verify capability must remain terminal: {id}"
         );
         assert_eq!(
             contract
-                .matches(&format!("| `{id}` | `audit-required` |"))
+                .matches(&format!("| `{id}` | `implemented-and-verified` |"))
                 .count(),
             1,
-            "helper contract must contain one exact nonterminal row: {id}"
+            "helper contract must contain one exact terminal row: {id}"
         );
     }
-    assert!(contract.contains("#1862"));
+    for id in CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS {
+        let capability = by_id
+            .get(id)
+            .unwrap_or_else(|| panic!("retained helper capability must exist: {id}"));
+        assert_eq!(capability.disposition, Disposition::AuditRequired, "{id}");
+        assert!(capability.implementation.is_empty(), "{id}");
+        assert!(capability.validation.is_empty(), "{id}");
+    }
 
     let package_root = repository_root.join("tools/cpu-template-helper");
     let package_manifest = std::fs::read_to_string(package_root.join("Cargo.toml"))
         .expect("CPU-template helper package manifest must be readable");
     assert!(package_root.join("src/lib.rs").is_file());
-    assert!(!package_root.join("src/main.rs").exists());
-    assert!(!package_root.join("src/bin").exists());
-    assert!(!package_manifest.contains("[[bin]]"));
-    assert!(!package_manifest.contains("bangbang-hvf"));
+    assert!(package_root.join("src/main.rs").is_file());
+    assert!(package_manifest.contains("[[bin]]"));
+    assert!(package_manifest.contains("bangbang-hvf"));
+
+    let mut hybrid = inventory.clone();
+    let capability = hybrid
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS[0])
+        .expect("owned capability must exist");
+    capability.disposition = Disposition::AuditRequired;
+    capability.implementation.clear();
+    capability.validation.clear();
+    let error = validate_cpu_template_helper_transition(&hybrid)
+        .expect_err("partial #1792 transition must fail")
+        .to_string();
+    assert!(error.contains("exact historical #1792 handoff or the exact terminal transition"));
+
+    let mut historical = inventory.clone();
+    for capability in &mut historical.capabilities {
+        if CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS.contains(&capability.id.as_str()) {
+            capability.disposition = Disposition::AuditRequired;
+            capability.implementation.clear();
+            capability.validation.clear();
+        }
+    }
+    validate_cpu_template_helper_transition(&historical)
+        .expect("exact historical #1792 handoff must remain accepted by delivery validation");
+    let error =
+        validate_cpu_template_helper_compatibility(&manifest, &historical, &repository_root)
+            .expect_err("terminal certification must reject the historical handoff")
+            .to_string();
+    assert!(error.contains("requires implemented-and-verified capability"));
+
+    let mut leaked = inventory.clone();
+    leaked
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS[0])
+        .expect("retained capability must exist")
+        .disposition = Disposition::ImplementedAndVerified;
+    let error = validate_cpu_template_helper_transition(&leaked)
+        .expect_err("#1792 must not promote later helper scope")
+        .to_string();
+    assert!(error.contains("remain exactly audit-required"));
 }
 
 #[test]
@@ -2629,8 +2709,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 344);
-    assert_eq!(count(Disposition::AuditRequired), 41);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 351);
+    assert_eq!(count(Disposition::AuditRequired), 34);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3359,8 +3439,8 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 344);
-    assert_eq!(count(Disposition::AuditRequired), 41);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 351);
+    assert_eq!(count(Disposition::AuditRequired), 34);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3656,8 +3736,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 344);
-    assert_eq!(count(Disposition::AuditRequired), 41);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 351);
+    assert_eq!(count(Disposition::AuditRequired), 34);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3805,8 +3885,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 344);
-    assert_eq!(count(Disposition::AuditRequired), 41);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 351);
+    assert_eq!(count(Disposition::AuditRequired), 34);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3820,7 +3900,7 @@ fn delivery_closure_policy_is_stable() {
         "semantic.lifecycle:smp-psci-and-vcpu-ownership",
         "semantic.memory:machine-sizing-hugepages-and-dirty-tracking",
     ];
-    const WAVE_7_ORIGINAL: [&str; 22] = [
+    const WAVE_7_ORIGINAL: [&str; 15] = [
         "corpus:cpu-template-helper",
         "corpus:cpu-templates",
         "corpus:rootfs-and-kernel",
@@ -3831,18 +3911,11 @@ fn delivery_closure_policy_is_stable() {
         "tool-argument:cpu-template-helper/fingerprint/dump/config",
         "tool-argument:cpu-template-helper/fingerprint/dump/output",
         "tool-argument:cpu-template-helper/fingerprint/dump/template",
-        "tool-argument:cpu-template-helper/template/dump/config",
-        "tool-argument:cpu-template-helper/template/dump/output",
-        "tool-argument:cpu-template-helper/template/dump/template",
         "tool-argument:cpu-template-helper/template/strip/paths",
         "tool-argument:cpu-template-helper/template/strip/suffix",
-        "tool-argument:cpu-template-helper/template/verify/config",
-        "tool-argument:cpu-template-helper/template/verify/template",
         "tool-operation:cpu-template-helper/fingerprint/compare",
         "tool-operation:cpu-template-helper/fingerprint/dump",
-        "tool-operation:cpu-template-helper/template/dump",
         "tool-operation:cpu-template-helper/template/strip",
-        "tool-operation:cpu-template-helper/template/verify",
     ];
     const PROMOTED_API: [&str; 18] = [
         "api-operation:GET /machine-config",
@@ -4075,8 +4148,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 344);
-    assert_eq!(count(Disposition::AuditRequired), 41);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 351);
+    assert_eq!(count(Disposition::AuditRequired), 34);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 
@@ -4088,6 +4161,16 @@ fn delivery_closure_policy_is_stable() {
                 .disposition,
             Disposition::ImplementedAndVerified,
             "original record must remain implemented: {id}"
+        );
+    }
+    for id in CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS {
+        assert_eq!(
+            by_id
+                .get(id)
+                .expect("terminal CPU-template helper record must exist")
+                .disposition,
+            Disposition::ImplementedAndVerified,
+            "CPU-template helper record must remain terminal: {id}"
         );
     }
     for id in WAVE_7_ORIGINAL {
@@ -4113,6 +4196,7 @@ fn delivery_closure_policy_is_stable() {
     let original = IMPLEMENTED_ORIGINAL
         .into_iter()
         .chain(WAVE_7_ORIGINAL)
+        .chain(CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS)
         .chain(["corpus:hugepages"])
         .collect::<BTreeSet<_>>();
     assert_eq!(
